@@ -1,0 +1,23 @@
+%% C4 Level 1 — System Context
+%% Diagrams as code. Render with any Mermaid renderer.
+graph TB
+    subgraph external[" "]
+        apps["Applications<br/>(Drive product, S3 clients,<br/>future collaborative editor)"]
+        ops["Operators"]
+    end
+
+    system["<b>Distributed Storage System</b><br/>globally scalable, atomically consistent<br/>file storage foundation"]
+
+    subgraph deps["External dependencies"]
+        coord["Coordination service<br/>(etcd, prod)"]
+        cpdb["Global control-plane DB<br/>(CockroachDB / TiDB)"]
+        otel["Observability backend<br/>(operator's choice via OTLP)"]
+        hw["Provider compute & storage<br/>(organized into zones)"]
+    end
+
+    apps -->|"S3 / FUSE / WebDAV / SDK"| system
+    ops -->|"management API (gRPC/REST)"| system
+    system -->|"OTLP telemetry"| otel
+    system -->|"coordination"| coord
+    system -->|"global namespace & placement"| cpdb
+    system -->|"runs on"| hw

@@ -1,0 +1,19 @@
+%% Runtime view — the write path and its commit point
+%% Diagrams as code. Render with any Mermaid renderer.
+sequenceDiagram
+    participant C as Client library
+    participant L as Pending-chunk ledger
+    participant D as D servers
+    participant M as Metadata store
+
+    Note over C,M: File does NOT exist yet
+    C->>L: 1. Register chunk IDs (leased)
+    C->>C: 2a. Chunk + erasure-code
+    C->>D: 2b. Write fragments directly (parallel, bulk data)
+    D-->>C: checksums verified
+    Note over C,D: Fragments exist but are unreferenced garbage
+    C->>M: 3. Atomic commit: chunk map + state=COMMITTED + version++ (conditional on prior version)
+    Note over M: THIS is the commit point — the file now exists
+    M-->>C: committed (or conflict → retry)
+    C->>L: 4. Release ledger entries
+    Note over C,M: Crash before 3 → leased garbage (GC). Crash 3→4 → custodian sweep.

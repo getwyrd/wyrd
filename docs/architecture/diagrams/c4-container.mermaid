@@ -1,0 +1,46 @@
+%% C4 Level 2 — Containers (the layer model)
+%% Diagrams as code. Render with any Mermaid renderer.
+graph TB
+    client(["Application"])
+
+    subgraph L1["L1 — Access layer (stateless)"]
+        s3["S3 gateway"]
+        other["FUSE / WebDAV / SDK"]
+    end
+
+    subgraph L2["L2 — Global control plane (global consensus)"]
+        ns["Namespace DB<br/>(CockroachDB / TiDB)"]
+        place["Placement service"]
+        reg["Zone registry"]
+    end
+
+    subgraph L3["L3 — Cross-zone replication (off the data path)"]
+        repl["Replication workers<br/>(NATS JetStream)"]
+        gcust["Global custodians"]
+    end
+
+    subgraph L4["L4 — Zonal file system (per datacenter)"]
+        meta["Metadata store<br/>(redb / TiKV)"]
+        dserv["D servers<br/>(dumb chunk storage)"]
+        cust["Custodians<br/>(GC / scrub / repair)"]
+        lib["Client library<br/>(EC, commit) — embedded in L1"]
+    end
+
+    subgraph L5["L5 — Bootstrap & coordination"]
+        etcd["Coordination<br/>(etcd / in-memory)"]
+    end
+
+    client -->|"request"| s3
+    s3 -.->|"embeds"| lib
+    s3 -->|"namespace / placement"| place
+    place --> ns
+    place --> reg
+    lib -->|"metadata commit"| meta
+    lib -->|"direct fragment writes (bulk data)"| dserv
+    cust --> meta
+    cust --> dserv
+    repl -->|"copy chunks between zones"| dserv
+    gcust --> ns
+    s3 -.->|"discovery"| etcd
+    cust -.->|"leader election, locks"| etcd
+    dserv -.->|"registration"| etcd
