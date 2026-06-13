@@ -1,0 +1,41 @@
+name: adr-immutability
+
+# ADRs are append-only (see docs/README.md and docs/adr/README.md): an accepted
+# decision record is never edited, only superseded by a later ADR. This check
+# fails any pull request that modifies, deletes, or renames an already-accepted
+# ADR file. Adding new ADRs is allowed, and the docs/adr/README.md index stays
+# editable (a new ADR adds a row there).
+
+on:
+  pull_request:
+    paths:
+      - 'docs/adr/**'
+
+permissions:
+  contents: read
+
+jobs:
+  adr-immutability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject changes to accepted ADRs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Allow Added (A); reject Modified/Deleted/Renamed of numbered ADR
+          # files. The docs/adr/[0-9]*.md glob excludes README.md by design.
+          changed=$(git diff --name-status --diff-filter=MDR \
+            "$BASE_SHA" "$HEAD_SHA" -- 'docs/adr/[0-9]*.md')
+          if [ -n "$changed" ]; then
+            echo "Immutable ADRs were changed:"
+            echo "$changed"
+            echo
+            echo "ADRs are append-only — supersede with a new ADR instead of editing."
+            exit 1
+          fi
+          echo "No accepted ADRs were modified."
