@@ -6,10 +6,11 @@ name: adr-immutability
 # ADR file. Adding new ADRs is allowed, and the docs/adr/README.md index stays
 # editable (a new ADR adds a row there).
 
+# Runs on every pull request (no path filter) so the check always reports a
+# status — required for it to be usable as a required status check. When a PR
+# touches no accepted ADR, the job passes cheaply.
 on:
   pull_request:
-    paths:
-      - 'docs/adr/**'
 
 permissions:
   contents: read
