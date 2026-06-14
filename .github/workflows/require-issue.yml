@@ -1,0 +1,51 @@
+name: require-issue
+
+# Workflow governance: every pull request must reference a real issue, for
+# traceability. The PR title or body must mention an issue (e.g. "Closes #12",
+# "Refs #12", "#12", or an issue URL), and that number must resolve to an actual
+# issue -- not a pull request -- in this repository.
+#
+# No paths filter: the check always runs and reports a status, so it can serve
+# as a required status check. It re-runs when the PR is edited, so adding the
+# reference after opening clears the check.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  require-issue:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - name: Require a real linked issue
+        run: |
+          set -uo pipefail
+          text="$PR_TITLE
+          $PR_BODY"
+          # Collect candidate numbers from "#N" and ".../issues/N" forms.
+          nums=$(printf '%s\n' "$text" | grep -oiE '(#|issues/)[0-9]+' | grep -oE '[0-9]+' | sort -un)
+          if [ -z "$nums" ]; then
+            echo "::error::This PR must reference an issue (e.g. 'Closes #12') in its title or body. None found."
+            exit 1
+          fi
+          for n in $nums; do
+            # The issues endpoint returns a .pull_request object only for PRs;
+            # absence of it (and a successful fetch) means it is a real issue.
+            kind=$(gh api "repos/$REPO/issues/$n" --jq 'if .pull_request then "pr" else "issue" end' 2>/dev/null) || kind="missing"
+            case "$kind" in
+              issue) echo "OK: references issue #$n"; exit 0 ;;
+              pr)    echo "note: #$n is a pull request, not an issue" ;;
+              *)     echo "note: #$n does not exist" ;;
+            esac
+          done
+          echo "::error::No referenced number resolves to a real issue. Open an issue and reference it (e.g. 'Closes #N')."
+          exit 1
