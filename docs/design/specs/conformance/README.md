@@ -1,5 +1,8 @@
 # Conformance vectors
 
+> **Status: DRAFT — normative; tracks chunk-format v1 (v0, unstable).**
+> Uses [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords: MUST, SHOULD, MAY.
+
 Test vectors that any implementation of the on-disk format
 (`../chunk-format/v1.md`) MUST satisfy. They live *with* the spec, in the
 repository, so the spec and the reference implementation stay honest with each
