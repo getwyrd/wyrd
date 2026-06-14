@@ -25,6 +25,7 @@ references it. Format follows the lightweight Nygard template (see ADR-0001).
 | [0015](0015-consistency-contract.md) | Consistency contract: home-zone authority, version-fence reserved | Accepted |
 | [0016](0016-monorepo-and-crate-structure.md) | Monorepo and evolving crate structure | Accepted |
 | [0017](0017-project-name-and-norn-scheme.md) | Project name (Wyrd) and the Norn component scheme | Accepted |
+| [0018](0018-reserve-hooks-for-hyperscale-identity-consumer.md) | Reserve hooks for a hyperscale identity consumer | Accepted |
 
 ## Why not ... ?
 
