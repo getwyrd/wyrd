@@ -19,3 +19,14 @@ target
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Local Claude tool state (not shared)
+/docs/.claude/
+/docs/.claudian/
+# Obsidian: track vault config, ignore per-user UI/session state and plugin code
+# (the enabled plugins are recorded in community-plugins.json; install them via
+# Obsidian — see docs/publishing/tools/README.md).
+/docs/.obsidian/workspace.json
+/docs/.obsidian/workspace-mobile.json
+/docs/.obsidian/cache
+/docs/.obsidian/plugins/
