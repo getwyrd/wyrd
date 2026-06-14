@@ -20,6 +20,10 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Generated docs-site output + build cache (see docs/publishing/tools/README.md)
+/build/
+/.cache/
+
 # Local Claude tool state (not shared)
 /docs/.claude/
 /docs/.claudian/

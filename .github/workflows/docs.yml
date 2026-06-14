@@ -1,0 +1,60 @@
+name: docs
+
+# Renders the documentation under docs/ into the hand-rolled static site and
+# publishes the WHOLE site (bespoke landing + rendered docs) to the getwyrd.dev
+# repo's main branch. The wyrd repo is the single source of truth; getwyrd.dev is
+# a generated mirror, served at the apex domain via GitHub Pages (deploy-from-
+# branch: main / root).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch: {}
+
+# ---------------------------------------------------------------------------
+# Before the first run: (1) enable deploy keys for the getwyrd org
+# (org Settings -> Repository -> Deploy keys -> Enabled), and (2) add a repo
+# secret DOCS_DEPLOY_KEY -- the PRIVATE half of an ed25519 keypair whose PUBLIC
+# half is registered as a write-enabled deploy key on the getwyrd.dev repo.
+# getwyrd.dev Pages already serves main/root with CNAME = getwyrd.dev; this
+# workflow overwrites that branch's contents.
+# ---------------------------------------------------------------------------
+env:
+  DOCS_REPO: "getwyrd/getwyrd.dev"
+  SITE_DOMAIN: "getwyrd.dev"
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install renderer dependency
+        run: pip install "markdown-it-py[linkify]==3.0.0"
+
+      - name: Lint docs (Obsidian syntax + spec markers)
+        run: python3 docs/publishing/tools/lint_docs.py
+
+      - name: Render site (fails the build on any dangling internal link)
+        run: python3 docs/publishing/tools/render_site.py --check --out ./build
+
+      - name: Deploy to getwyrd.dev
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          deploy_key: ${{ secrets.DOCS_DEPLOY_KEY }}
+          external_repository: ${{ env.DOCS_REPO }}
+          publish_branch: main
+          publish_dir: ./build
+          cname: ${{ env.SITE_DOMAIN }}
+          commit_message: "site: publish from wyrd@${{ github.sha }}"
