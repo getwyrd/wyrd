@@ -52,7 +52,7 @@ using the product-style `get-` handle only in the URL:
 - Project name: **Wyrd**
 - GitHub org: `github.com/getwyrd`
 - Repository: `github.com/getwyrd/wyrd` (the repo itself is named `wyrd`)
-- Domain: `getwyrd.com`
+- Domain: `getwyrd.dev`
 - Primary crate: `wyrd-core` (the bare `wyrd` crate being taken); additional
   crates follow `wyrd-*` per the workspace split in ADR-0016.
 

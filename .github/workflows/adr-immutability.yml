@@ -1,10 +1,10 @@
 name: adr-immutability
 
-# ADRs are append-only (see docs/README.md and docs/adr/README.md): an accepted
-# decision record is never edited, only superseded by a later ADR. This check
-# fails any pull request that modifies, deletes, or renames an already-accepted
-# ADR file. Adding new ADRs is allowed, and the docs/adr/README.md index stays
-# editable (a new ADR adds a row there).
+# ADRs are append-only (see docs/README.md and docs/design/adr/README.md): an
+# accepted decision record is never edited, only superseded by a later ADR. This
+# check fails any pull request that modifies, deletes, or renames an
+# already-accepted ADR file. Adding new ADRs is allowed, and the
+# docs/design/adr/README.md index stays editable (a new ADR adds a row there).
 
 # Runs on every pull request (no path filter) so the check always reports a
 # status — required for it to be usable as a required status check. When a PR
@@ -29,9 +29,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           # Allow Added (A); reject Modified/Deleted/Renamed of numbered ADR
-          # files. The docs/adr/[0-9]*.md glob excludes README.md by design.
+          # files. The docs/design/adr/[0-9]*.md glob excludes README.md by design.
           changed=$(git diff --name-status --diff-filter=MDR \
-            "$BASE_SHA" "$HEAD_SHA" -- 'docs/adr/[0-9]*.md')
+            "$BASE_SHA" "$HEAD_SHA" -- 'docs/design/adr/[0-9]*.md')
           if [ -n "$changed" ]; then
             echo "Immutable ADRs were changed:"
             echo "$changed"

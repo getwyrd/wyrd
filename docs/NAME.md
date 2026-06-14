@@ -28,4 +28,4 @@ keeps, faithfully, whatever you weave into it.
 ---
 
 *Naming and the component scheme are recorded as a permanent decision in
-[ADR-0017](adr/0017-project-name-and-norn-scheme.md).*
+[ADR-0017](design/adr/0017-project-name-and-norn-scheme.md).*
