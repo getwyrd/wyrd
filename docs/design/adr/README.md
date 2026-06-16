@@ -14,7 +14,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 |---|-------|--------|
 | [0001](0001-record-architecture-decisions.md) | Record architecture decisions | Proposed |
 | [0002](0002-spec-first-on-disk-format-only.md) | Spec-first for the on-disk format only | Proposed |
-| [0003](0003-apache-2-license-and-dco.md) | Apache 2.0 license and DCO sign-off | Proposed |
+| [0003](0003-apache-2-license-and-dco.md) | Licensing, and dependency-selection criteria | Proposed |
 | [0004](0004-rust-as-implementation-language.md) | Rust as the implementation language | Proposed |
 | [0005](0005-single-provider-closed-federation.md) | Single-provider, closed federation | Proposed |
 | [0006](0006-etcd-for-coordination.md) | etcd for coordination; openraft reserved | Proposed |
