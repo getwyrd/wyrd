@@ -1,0 +1,47 @@
+# The getwyrd.dev landing page, as structured content.
+#
+# Rendered to / by docs/publishing/tools/render_site.py through
+# templates/home.html; the *design* lives in that template + assets/style.css,
+# so editing here never touches markup. Text fields accept inline Markdown
+# (**bold**, *italic*, [links](/abs/url/), &nbsp; etc.); links should be
+# absolute site URLs (the build's link check verifies them). This is also the
+# shape a Git-based CMS (e.g. Sveltia) would later edit with a visual form.
+
+meta:
+  title: "Wyrd — distributed file storage with atomic writes"
+  description: "Wyrd is a globally scalable distributed file storage foundation with atomic writes. Written in Rust, Apache-2.0. Currently in the design phase."
+  og_title: "Wyrd — distributed file storage with atomic writes"
+  og_description: "A globally scalable distributed storage foundation. Atomic writes, erasure coding, single binary to global fleet. Rust, Apache-2.0."
+
+hero:
+  status: "Current Status: exploring the idea — architecture & specs in work"
+  title: "What is&nbsp;written, stays&nbsp;written."
+  lede: "Wyrd should be a globally scalable distributed file storage foundation with atomic writes. Built in Rust, Apache-2.0."
+  pron: "**wyrd** &nbsp;/wɪəd/&nbsp; — Old English for *fate*. Yes, it sounds like “weird.” Anyone who has run distributed storage at 3&nbsp;a.m. will agree that is the correct word."
+  ctas:
+    - { label: "Read the architecture", href: "/architecture/", primary: true, arrow: true }
+    - { label: "Read the decisions", href: "/adr/" }
+    - { label: "Contribute on GitHub", href: "https://github.com/getwyrd/wyrd" }
+
+sections:
+  - eyebrow: "What it is"
+    heading: "A foundation to build cloud products on."
+    body:
+      - "Wyrd is the layer a mid-sized cloud provider could build a worldwide storage product on — a Drive-like service, an S3-compatible object store, or the backend for a collaborative editor. It keeps metadata and bulk data architecturally separate, yet every write commits as a single, indivisible act: from the caller’s point of view, a write either happened in full or not at all."
+      - "The model follows the Colossus-class lineage — a global control plane over per-zone storage, with bulk data flowing directly between client and storage servers so throughput scales with the fleet rather than through a bottleneck. One static binary on a laptop for development; a multi-region deployment in production. The same system, configured differently."
+
+  - eyebrow: "Why it exists"
+    heading: "The combination is the gap."
+    body:
+      - "There are many of systems that do part, but no open source that combines all of it: a rigorous atomic commit point, a globally consistent namespace, erasure coding within a zone and geo-replication across zones, pluggable metadata and chunk backends behind narrow interfaces, an on-disk format specified so the data outlives the software that wrote it — and correctness treated as the headline feature, verified with deterministic simulation testing from day one."
+    props:
+      - { term: "atomic",    desc: "**Commit-point atomicity.** A write is linearized at a single point. No torn state, no half-written files, ever observable." }
+      - { term: "global",    desc: "**One namespace, many zones.** A strongly consistent global directory tree; per-file writes linearize at a home zone." }
+      - { term: "durable",   desc: "**Configurable per zone.** Replication or Reed-Solomon erasure coding within a zone; whole-copy geo-replication across them." }
+      - { term: "pluggable", desc: "**Narrow backends.** Embedded store for development, distributed store for production — behind the same interface." }
+      - { term: "provable",  desc: "**Correctness as a feature.** Deterministic simulation testing: every bug reproduces from a seed." }
+
+  - eyebrow: "The name"
+    heading: "Wyrd — the woven whole."
+    note: "A storage system is, in the end, a keeper of *wyrd*: it holds what was written, weaves in what is being written, and carries the debts of what it still owes. The whole woven state is the Wyrd; the Norns are the ones who tend it."
+    quote: "The Norns weave the Wyrd."

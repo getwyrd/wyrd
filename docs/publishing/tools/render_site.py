@@ -2,16 +2,20 @@
 """render_site.py -- render the Wyrd docs into the static getwyrd.dev site.
 
 The wyrd repo is the single source of truth: documentation is hand-written
-Markdown under `docs/` (the same files edited in Obsidian). This script renders
-that Markdown into the bespoke hand-rolled HTML site -- the paper/Norn aesthetic
-defined by `docs/publishing/site/assets/style.css` and the page chrome in
-`docs/publishing/templates/page.html`. The whole site (landing + docs) is what
+Markdown under `docs/` (the same files edited in Obsidian); the landing page is
+authored as structured content in `docs/index.yml`. This script renders that
+into the bespoke hand-rolled HTML site -- the paper/Norn aesthetic defined by
+`docs/publishing/site/assets/style.css` and the page chrome in
+`docs/publishing/templates/` (`page.html` for docs, `home.html` for the
+full-bleed landing). The whole site (landing + docs) is what
 CI publishes to the getwyrd.dev repo's `main` branch (see docs.yml); getwyrd.dev
 is a generated mirror, not hand-edited.
 
 Output structure (served at the apex domain getwyrd.dev):
 
-    /                          docs/publishing/site/index.html   (bespoke landing)
+    /                          docs/index.yml (structured content) rendered
+                               through templates/home.html, the full-bleed
+                               bespoke landing template
     /docs/                     docs/design/README.md             (docs hub)
     /architecture/             generated index + the numbered docs
     /architecture/<nn>-*.html  docs/design/architecture/<nn>-*.md
@@ -51,6 +55,7 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import yaml
 from markdown_it import MarkdownIt
 from markdown_it.common.utils import escapeHtml
 
@@ -61,6 +66,8 @@ DOCS_ROOT = PUBLISHING.parent
 REPO_ROOT = DOCS_ROOT.parent
 SITE_DIR = PUBLISHING / "site"
 TEMPLATE = PUBLISHING / "templates" / "page.html"
+HOME_TEMPLATE = PUBLISHING / "templates" / "home.html"
+HOME_DATA = DOCS_ROOT / "index.yml"
 
 # Pinned so the published site is reproducible; fetched at build time into the
 # output (build/ is git-ignored), never committed to this repo.
@@ -258,6 +265,7 @@ class Renderer:
         self.out = out
         self.md = make_md()
         self.template = TEMPLATE.read_text(encoding="utf-8")
+        self.home_template = HOME_TEMPLATE.read_text(encoding="utf-8")
         self.url_map: dict[str, str] = {}
         self.titles: dict[str, str] = {}   # url -> title
         self.dangling: list[str] = []
@@ -324,6 +332,85 @@ class Renderer:
         rewrite_links(tokens, rel, self.url_map, self.dangling)
         body = self.md.renderer.render(tokens, self.md.options, env)
         return finish_tasklists(body), bool(env.get("has_mermaid"))
+
+    # -- the bespoke landing page (docs/index.yml -> /) --
+    def inline(self, text: str) -> str:
+        """Render a single text field's inline Markdown (bold/italic/links/
+        entities), with no surrounding <p>. Empty input -> empty string."""
+        return self.md.renderInline(text or "").strip()
+
+    def home_content(self, data: dict) -> str:
+        """Build the landing body HTML from the structured index.yml content.
+        The design (classes, layout) is fixed here + in style.css; index.yml
+        only supplies the words."""
+        hero = data.get("hero") or {}
+        ctas = []
+        for c in hero.get("ctas") or []:
+            cls = "btn primary" if c.get("primary") else "btn"
+            arrow = ' <span class="arr" aria-hidden="true">→</span>' if c.get("arrow") else ""
+            ctas.append(f'    <a class="{cls}" href="{html.escape(c["href"])}">'
+                        f'{self.inline(c["label"])}{arrow}</a>')
+        cta_block = ('  <div class="cta-row">\n' + "\n".join(ctas) + "\n  </div>\n") if ctas else ""
+        hero_html = (
+            '<div class="wrap">\n  <div class="hero">\n'
+            f'    <span class="status"><span class="dot" aria-hidden="true"></span>{self.inline(hero.get("status", ""))}</span>\n'
+            '    <hr class="thread-rule">\n'
+            f'    <h1>{self.inline(hero.get("title", ""))}</h1>\n'
+            f'    <p class="lede">{self.inline(hero.get("lede", ""))}</p>\n'
+            f'    <p class="pron">{self.inline(hero.get("pron", ""))}</p>\n'
+            f"{cta_block}"
+            "  </div>\n</div>\n"
+        )
+
+        sections = []
+        for s in data.get("sections") or []:
+            parts = [f'    <p class="eyebrow">{self.inline(s.get("eyebrow", ""))}</p>',
+                     f'    <h2>{self.inline(s.get("heading", ""))}</h2>']
+            for para in s.get("body") or []:
+                parts.append(f'    <p class="muted">{self.inline(para)}</p>')
+            if s.get("props"):
+                lis = "\n".join(
+                    f'      <li><span class="term">{self.inline(p["term"])}</span>'
+                    f'<span class="desc">{self.inline(p["desc"])}</span></li>'
+                    for p in s["props"]
+                )
+                parts.append(f'    <ul class="props">\n{lis}\n    </ul>')
+            if s.get("norns"):
+                cards = "\n".join(
+                    '      <div class="norn">\n'
+                    f'        <p class="n-name">{self.inline(n["name"])}</p>\n'
+                    f'        <p class="n-gloss">{self.inline(n["gloss"])}</p>\n'
+                    f'        <p class="n-role">{self.inline(n["role"])}</p>\n'
+                    "      </div>"
+                    for n in s["norns"]
+                )
+                parts.append(f'    <div class="norns">\n{cards}\n    </div>')
+            if s.get("note"):
+                quote = (f' <span class="quote">{self.inline(s["quote"])}</span>'
+                         if s.get("quote") else "")
+                parts.append(f'    <p class="name-note">{self.inline(s["note"])}{quote}</p>')
+            sections.append("  <section>\n" + "\n".join(parts) + "\n  </section>")
+        sections_html = '<div class="wrap">\n' + "\n".join(sections) + "\n</div>\n"
+
+        return hero_html + "\n" + sections_html
+
+    def render_home(self):
+        if not HOME_DATA.exists():
+            return
+        data = yaml.safe_load(HOME_DATA.read_text(encoding="utf-8")) or {}
+        meta = data.get("meta") or {}
+        title = meta.get("title", "Wyrd")
+        desc = meta.get("description", "Wyrd documentation.")
+        page = (
+            self.home_template
+            .replace("{{TITLE}}", html.escape(title))
+            .replace("{{DESCRIPTION}}", html.escape(desc))
+            .replace("{{OG_TITLE}}", html.escape(meta.get("og_title", title)))
+            .replace("{{OG_DESCRIPTION}}", html.escape(meta.get("og_description", desc)))
+            .replace("{{CONTENT}}", self.home_content(data))
+        )
+        dest = self.out / "index.html"
+        dest.write_text(page, encoding="utf-8")
 
     # -- per-source page --
     def render_source(self, rel: str, path: Path, url: str):
@@ -469,6 +556,7 @@ class Renderer:
         for rel, path, url in sources:
             self.render_source(rel, path, url)
         self.build_indexes()
+        self.render_home()
         self.copy_site()
         self.ensure_mermaid()
 

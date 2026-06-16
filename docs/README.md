@@ -14,7 +14,8 @@ as a static site to `getwyrd.dev`.
 | Path | What it is |
 |------|------------|
 | [`design/`](design/README.md) | **Start here.** The documentation itself — architecture, specifications, decision records, and proposals — organized into four document classes with different change processes. |
-| [`publishing/`](https://github.com/getwyrd/wyrd/tree/main/docs/publishing) | The build/publish tooling (`render_site.py`) that renders this tree to the static site, plus the site's landing page, stylesheet, and page template. Not part of the published documentation. |
+| [`index.yml`](index.yml) | The `getwyrd.dev` landing page as structured content (hero, sections, props, Norns) — no markup, rendered to the site root `/`. |
+| [`publishing/`](https://github.com/getwyrd/wyrd/tree/main/docs/publishing) | The build/publish tooling (`render_site.py`) that renders this tree to the static site, plus the site's stylesheet and page templates. Not part of the published documentation. |
 | [`NAME.md`](https://github.com/getwyrd/wyrd/blob/main/docs/NAME.md) | Why the project is called "Wyrd." |
 
 New here? Read [the design documentation overview](design/README.md) for how the
