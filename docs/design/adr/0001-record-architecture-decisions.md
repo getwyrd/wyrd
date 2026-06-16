@@ -30,10 +30,16 @@ ADRs live in `docs/design/adr/` and are named `NNNN-kebab-title.md`, where `NNNN
 The `Status:` field in an ADR's header is the source of truth for its state. An ADR moves through:
 
 - **Proposed** — written up but not yet ratified. A Proposed ADR is a working draft: it may be edited freely while discussion continues (normally in the pull request that introduces it).
-- **Accepted** — ratified. An ADR is moved to Accepted by a deliberate edit to its `Status:` line once the decision is agreed in review. **This transition is the act of acceptance; it is intentional, not an automatic consequence of merging.** From this point the ADR is immutable (see below).
+- **Accepted** — ratified. An ADR is moved to Accepted by a deliberate edit to its `Status:` line once the **architecture board** agrees the decision in review (see *Who accepts an ADR* below). **This transition is the act of acceptance; it is intentional, not an automatic consequence of merging.** From this point the ADR is immutable (see below).
 - **Superseded** — a later ADR has replaced the decision; recorded as `Superseded by ADR-NNNN` (see "Immutability").
 
 During the initial design phase the whole foundational set is deliberately held at **Proposed** until it has been reviewed and ratified together — being too quick to mark decisions Accepted is itself a mistake this process guards against.
+
+### Who accepts an ADR
+
+Authority to accept an ADR — to move it from Proposed to Accepted — rests with the **architecture board**, whose members are elected by the project's maintainers. A Proposed ADR is accepted when the board agrees the decision, in review on its pull request; that agreement is the ratification, and the merge records it. The same board decides when an Accepted ADR is superseded by a later one.
+
+This is stated so that acceptance is never an individual author's or a single maintainer's act. The board's size, term, voting threshold, and the procedure by which maintainers elect it are project governance and are **[OPEN]** — to be recorded separately (e.g. in a `GOVERNANCE.md`) as the maintainer group forms.
 
 ### Immutability, and how a decision changes
 
