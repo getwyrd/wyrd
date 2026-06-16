@@ -10,19 +10,21 @@ Obsidian, in Git, or in any editor.
 
 | File | Purpose |
 |------|---------|
-| `render_site.py` | Renders `docs/**/*.md` → static HTML in `./build`, using `../templates/page.html` for chrome and `../site/` for the landing page and assets. Rewrites relative `.md`/`.mermaid` links to output URLs, generates section indexes, renders each `architecture/diagrams/*.mermaid` as a client-side Mermaid page, and (`--check`) fails on any dangling internal link. |
+| `render_site.py` | Renders `docs/**/*.md` → static HTML in `./build`, using `../templates/page.html` for chrome and `../site/` for assets. Renders the landing page (`/`) from `docs/index.yml` through `../templates/home.html`. Rewrites relative `.md`/`.mermaid` links to output URLs, generates section indexes, renders each `architecture/diagrams/*.mermaid` as a client-side Mermaid page, and (`--check`) fails on any dangling internal link. |
 | `lint_docs.py` | Fails the build on Obsidian-only `[[wikilink]]` / `![[embed]]` syntax, and on a normative spec missing its status/stability marker. |
-| `../site/` | The bespoke landing page (`index.html`), stylesheet (`assets/style.css`), `CNAME`, and `.nojekyll`. Copied verbatim into the output. |
+| `../site/` | The stylesheet (`assets/style.css`), `CNAME`, and `.nojekyll`. Copied verbatim into the output. |
 | `../templates/page.html` | The page chrome wrapped around every rendered doc: `{{TITLE}}`, `{{DESCRIPTION}}`, `{{DOC_HEADER}}`, `{{CONTENT}}`, `{{SCRIPTS}}`. |
+| `../templates/home.html` | The full-bleed landing template (chrome + `{{CONTENT}}`); `render_site.py` fills `{{CONTENT}}` from `docs/index.yml`. |
 | `../../../.github/workflows/docs.yml` | Lints, renders, and deploys the whole site to getwyrd.dev `main` on every push to `main` that touches docs. (Lives at the repo root under `.github/workflows/`.) |
 
 ## Local build
 
-One Python dependency (the `[linkify]` extra enables bare-URL autolinking, as on
-GitHub/Obsidian; the renderer also runs without it, just no autolinking):
+Two Python dependencies — `markdown-it-py` (the `[linkify]` extra enables
+bare-URL autolinking, as on GitHub/Obsidian; the renderer also runs without it,
+just no autolinking) and `PyYAML` (reads the landing page's `index.yml`):
 
 ```sh
-pip install "markdown-it-py[linkify]"   # CI pins markdown-it-py[linkify]==3.0.0
+pip install "markdown-it-py[linkify]" PyYAML   # CI pins ==3.0.0 / ==6.0.2
 ```
 
 Then, from the repo root:

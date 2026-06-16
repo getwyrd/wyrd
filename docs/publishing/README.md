@@ -18,8 +18,9 @@ docs/**/*.md   →   render_site.py + page.html + style.css   →   static HTML 
 ```
 
 **getwyrd.dev is a generated mirror.** It is no longer hand-edited: the landing
-page, stylesheet, and page template live here in `publishing/site/` and
-`publishing/templates/`, and CI overwrites getwyrd.dev's `main` branch with the
+page is authored as structured content (`docs/index.yml` — words only, no
+markup), and the stylesheet and page templates live here in `publishing/site/`
+and `publishing/templates/`; CI overwrites getwyrd.dev's `main` branch with the
 built site. There is a single web property — the apex domain `getwyrd.dev` —
 serving both the landing page (`/`) and the rendered docs (`/architecture/`,
 `/adr/`, `/specs/`, `/proposals/`, `/name.html`).
@@ -32,6 +33,7 @@ serving both the landing page (`/`) and the rendered docs (`/architecture/`,
 │   └── docs.yml              ← CI: lint → render → publish to getwyrd.dev (GitHub reads it here)
 └── docs/
     ├── README.md             ← GitHub-facing index of the docs/ folder (not published)
+    ├── index.yml             ← the landing page as structured content (no markup)  → /
     ├── NAME.md               ← the name essay              → /name.html
     ├── design/               ← the four document classes   → /architecture/ /adr/ /specs/ /proposals/
     │   ├── README.md         ← reader-facing docs hub       → /docs/
@@ -42,12 +44,12 @@ serving both the landing page (`/`) and the rendered docs (`/architecture/`,
     │   └── proposals/
     └── publishing/           ← build tooling + site inputs (excluded from the published docs)
         ├── site/
-        │   ├── index.html    ← the bespoke landing page (edited here)
         │   ├── assets/style.css
         │   ├── CNAME         ← getwyrd.dev
         │   └── .nojekyll
         ├── templates/
-        │   └── page.html     ← chrome wrapped around every rendered doc ({{TITLE}}, {{CONTENT}}, …)
+        │   ├── page.html     ← chrome wrapped around every rendered doc ({{TITLE}}, {{CONTENT}}, …)
+        │   └── home.html     ← full-bleed landing template, filled from index.yml ({{TITLE}}, {{CONTENT}}, …)
         └── tools/
             ├── render_site.py   ← renders docs/ → ./build, copies site/, audits links
             └── lint_docs.py     ← guards: no Obsidian [[wikilinks]]; specs carry status markers
@@ -58,7 +60,10 @@ serving both the landing page (`/`) and the rendered docs (`/architecture/`,
 `render_site.py` walks the four document classes plus `NAME.md` and the design
 hub, computes each source's output URL, renders Markdown to HTML, **rewrites
 relative `.md`/`.mermaid` links to their output URLs**, and wraps the result in
-`templates/page.html`. Section index pages (`/architecture/`, `/specs/`, …) are
+`templates/page.html`. The landing page is different: it renders to `/` from the
+structured content in `docs/index.yml` (hero, sections, props, Norns — only the
+words) through the full-bleed `templates/home.html`; inline Markdown in its text
+fields is supported. Section index pages (`/architecture/`, `/specs/`, …) are
 generated; `adr/` and `proposals/` use their `README.md`. Each
 `architecture/diagrams/*.mermaid` becomes a page that renders client-side via a
 vendored `mermaid.min.js` (fetched at build time into `./build`, never committed).

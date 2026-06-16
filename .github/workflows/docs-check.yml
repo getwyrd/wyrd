@@ -27,8 +27,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install renderer dependency
-        run: pip install "markdown-it-py[linkify]==3.0.0"
+      - name: Install renderer dependencies
+        run: pip install "markdown-it-py[linkify]==3.0.0" "PyYAML==6.0.2"
 
       - name: Lint docs (Obsidian syntax + spec markers)
         run: python3 docs/publishing/tools/lint_docs.py
