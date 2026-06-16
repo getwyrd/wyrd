@@ -1,0 +1,29 @@
+{
+  // --- Linting: run clippy on save instead of plain `cargo check` ---
+  // Same cost as check (it's a superset), catches far more. The one
+  // setting I'd call mandatory for a correctness-first project.
+  "rust-analyzer.check.command": "clippy",
+  // Lint tests, benches, and examples too — not just the default bin/lib.
+  "rust-analyzer.check.allTargets": true,
+
+  // --- Feature handling on a workspace with optional backends ---
+  // "all" analyzes code behind every feature flag (redb AND tikv,
+  // in-memory AND etcd), so dead-on-arrival cfg'd code still gets
+  // checked. It's heavier; if indexing gets sluggish as crates grow,
+  // switch to an explicit list of the features you actually develop against.
+  "rust-analyzer.cargo.features": "all",
+
+  // --- Formatting ---
+  "editor.formatOnSave": true,
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+
+  // --- Quality-of-life ---
+  "editor.semanticHighlighting.enabled": true,
+  // Keep the file watcher off build output — meaningful CPU saving on
+  // a workspace that produces a large target/ dir.
+  "files.watcherExclude": {
+    "**/target/**": true
+  }
+}
