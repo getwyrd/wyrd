@@ -26,6 +26,8 @@ Output structure (served at the apex domain getwyrd.dev):
     /specs/**/*.html           docs/design/specs/**/*.md
     /proposals/                docs/design/proposals/README.md + generated list
     /proposals/**/*.html       docs/design/proposals/**/*.md
+    /references.html           docs/references.yml (structured content) rendered
+                               through templates/page.html
     /name.html                 docs/NAME.md
 
 Design notes:
@@ -68,6 +70,7 @@ SITE_DIR = PUBLISHING / "site"
 TEMPLATE = PUBLISHING / "templates" / "page.html"
 HOME_TEMPLATE = PUBLISHING / "templates" / "home.html"
 HOME_DATA = DOCS_ROOT / "index.yml"
+REFERENCES_DATA = DOCS_ROOT / "references.yml"
 
 # Pinned so the published site is reproducible; fetched at build time into the
 # output (build/ is git-ignored), never committed to this repo.
@@ -442,6 +445,40 @@ class Renderer:
         dest = self.out / "index.html"
         dest.write_text(page, encoding="utf-8")
 
+    # -- the references page (docs/references.yml -> /references.html) --
+    def references_content(self, data: dict) -> str:
+        """Build the references body HTML from the structured references.yml: an
+        intro, then a heading + list of linked sources per group. Inline-Markdown
+        text fields are rendered with renderInline; hrefs are emitted verbatim
+        (absolute site URLs or external), so the --check audit verifies them."""
+        title = (data.get("meta") or {}).get("title", "Prior art & foundations")
+        parts = [f"<h1>{self.inline(title)}</h1>"]
+        if data.get("intro"):
+            parts.append(f'<p>{self.inline(data["intro"])}</p>')
+        for group in data.get("groups") or []:
+            parts.append(f'<h2>{self.inline(group.get("heading", ""))}</h2>')
+            if group.get("intro"):
+                parts.append(f'<p>{self.inline(group["intro"])}</p>')
+            lis = []
+            for item in group.get("items") or []:
+                label = self.inline(item.get("title", ""))
+                href = item.get("href")
+                head = f'<a href="{html.escape(href)}">{label}</a>' if href else label
+                note = item.get("note")
+                lis.append(f'    <li>{head}{(" — " + self.inline(note)) if note else ""}</li>')
+            if lis:
+                parts.append("  <ul>\n" + "\n".join(lis) + "\n  </ul>")
+        return "\n".join(parts)
+
+    def render_references(self):
+        if not REFERENCES_DATA.exists():
+            return
+        data = yaml.safe_load(REFERENCES_DATA.read_text(encoding="utf-8")) or {}
+        meta = data.get("meta") or {}
+        self.cur_desc = meta.get("description", "Prior art and foundations for Wyrd.")
+        self.emit("/references.html", meta.get("title", "Prior art & foundations"),
+                  self.references_content(data), "", has_mermaid=False)
+
     # -- per-source page --
     def render_source(self, rel: str, path: Path, url: str):
         # section-root READMEs and the design hub are built as index pages later
@@ -588,6 +625,7 @@ class Renderer:
             self.render_source(rel, path, url)
         self.build_indexes()
         self.render_home()
+        self.render_references()
         self.copy_site()
         self.ensure_mermaid()
 
