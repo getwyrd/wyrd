@@ -21,6 +21,7 @@ hero:
   ctas:
     - { label: "Read the architecture", href: "/architecture/", primary: true, arrow: true }
     - { label: "Read the decisions", href: "/adr/" }
+    - { label: "Prior art", href: "/references.html" }
     - { label: "Contribute on GitHub", href: "https://github.com/getwyrd/wyrd" }
 
 sections:

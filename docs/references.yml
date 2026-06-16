@@ -1,0 +1,96 @@
+# The getwyrd.dev "Prior art & foundations" page, as structured content.
+#
+# Rendered to /references.html by docs/publishing/tools/render_site.py through
+# templates/page.html (the standard doc chrome); the *design* lives in that
+# template + assets/style.css, so editing here never touches markup. Text fields
+# (intro, group intro, item note) accept inline Markdown (**bold**, *italic*,
+# [links](/abs/url/)); links must be absolute site URLs or full external URLs —
+# the build's --check link audit verifies every internal one resolves.
+#
+# This is the credibility page: a dead link here undercuts it. Confirm any new
+# URL resolves before committing.
+
+meta:
+  title: "Prior art & foundations"
+  description: "The lineage, prior art, and commodity foundations Wyrd descends from, was designed against, and builds on."
+
+intro: >-
+  Wyrd did not appear from nowhere. Its shape descends from a known lineage of
+  distributed storage systems, it was designed in deliberate contrast to its
+  closest open-source sibling, and it consumes well-solved commodity primitives
+  rather than reinventing them. The sources below are grouped by the role each
+  played.
+
+groups:
+  - heading: "Architectural lineage"
+    intro: >-
+      The systems whose architecture Wyrd follows: metadata and bulk data kept
+      separate, dumb storage servers, intelligence in a thick client and
+      background maintenance services, a single metadata commit as the point of
+      atomicity.
+    items:
+      - title: "Colossus — Google's file system"
+        href: "https://cloud.google.com/blog/products/storage-data-transfer/a-peek-behind-colossus-googles-file-system"
+        note: "The canonical public description of the architecture Wyrd descends from: a horizontally scalable metadata service (Curators), dumb “D” file servers, client-side erasure coding, and a direct client-to-server data path."
+      - title: "Colossus — data placement"
+        href: "https://cloud.google.com/blog/products/storage-data-transfer/how-colossus-optimizes-data-placement-for-performance"
+        note: "The companion post on how Colossus places and tiers data across storage media for performance and cost."
+      - title: "Tectonic — Meta's exabyte-scale filesystem (FAST '21)"
+        href: "https://www.usenix.org/conference/fast21/presentation/pan"
+        note: "The strongest single influence on Wyrd's metadata model. Its layered metadata schema and the authors' account of what they would do differently directly informed the inode/dirent design and the choice of a multi-key-transactional metadata store (see [ADR-0008](/adr/0008-tikv-metadata-and-pluggable-backends.html))."
+      - title: "Tectonic — paper (PDF)"
+        href: "https://www.usenix.org/system/files/fast21-pan.pdf"
+        note: "The full paper."
+
+  - heading: "Prior art we studied"
+    intro: >-
+      Systems we engaged with seriously — the closest sibling, and the
+      incumbents the “why not just harden the existing thing?” question must be
+      answered against.
+    items:
+      - title: "Garage / Deuxfleurs"
+        href: "https://garagehq.deuxfleurs.fr/"
+        note: "The most mission-aligned open-source sibling: Rust, sovereign, self-hostable, geo-distributed, publicly funded. Garage makes the *opposite* core trade-offs — eventual consistency with CRDTs and whole-copy replication, by deliberate design — where Wyrd chooses strong consistency, a linearizable commit point, and erasure coding. Kindred in values, complementary in design."
+      - title: "Garage — design goals"
+        href: "https://garagehq.deuxfleurs.fr/documentation/design/goals/"
+        note: "Their goals page, which states the no-erasure-coding, no-POSIX, eventual-consistency non-goals explicitly — the clearest evidence of where Wyrd's design center diverges."
+      - title: "Garage — source"
+        href: "https://git.deuxfleurs.fr/Deuxfleurs/garage"
+      - title: "Garage — NLnet/NGI grant"
+        href: "https://nlnet.nl/project/Garage/"
+        note: "A model for the European sovereign-infrastructure funding path."
+
+  - heading: "Conceptual influences"
+    intro: "Ideas, not systems, that shaped specific decisions."
+    items:
+      - title: "Delta Lake"
+        href: "https://people.eecs.berkeley.edu/~matei/papers/2020/vldb_delta_lake.pdf"
+        note: "The commit-point idea in a different domain: a single linearizable metadata operation makes a write visible, with data staged invisibly beforehand — the conceptual ancestor of Wyrd's atomic commit."
+
+  - heading: "Foundations we build on"
+    intro: >-
+      The hard, well-solved commodity primitives Wyrd consumes rather than
+      rebuilds. The novelty budget is spent on the commit protocol, not on
+      re-solving consensus or transactional storage.
+    items:
+      - title: "etcd"
+        href: "https://etcd.io/"
+        note: "Coordination: service discovery, leader election, locks with fencing (see [ADR-0006](/adr/0006-etcd-for-coordination.html))."
+      - title: "TiKV"
+        href: "https://tikv.org/"
+        note: "The production metadata backend, behind the `MetadataStore` trait; native multi-key transactions are the reason it was chosen over an HBase-style store (see [ADR-0008](/adr/0008-tikv-metadata-and-pluggable-backends.html))."
+      - title: "CockroachDB"
+        href: "https://www.cockroachlabs.com/"
+        note: "A Spanner-class option for the L2 global control plane."
+      - title: "OpenTelemetry"
+        href: "https://opentelemetry.io/"
+        note: "The single instrumentation commitment; storage and visualization backends stay the operator's choice (see [ADR-0012](/adr/0012-opentelemetry-instrumentation.html))."
+      - title: "madsim"
+        href: "https://github.com/madsim-rs/madsim"
+        note: "Deterministic simulation testing for async Rust (see [ADR-0009](/adr/0009-deterministic-simulation-testing.html))."
+      - title: "turmoil"
+        href: "https://github.com/tokio-rs/turmoil"
+        note: "Deterministic network simulation for testing (see [ADR-0009](/adr/0009-deterministic-simulation-testing.html))."
+      - title: "reed-solomon-simd"
+        href: "https://crates.io/crates/reed-solomon-simd"
+        note: "The erasure-coding library used in the client data path (see [ADR-0004](/adr/0004-rust-as-implementation-language.html))."
