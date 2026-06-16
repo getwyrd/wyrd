@@ -103,6 +103,29 @@ def strip_frontmatter(text: str) -> str:
     return _FRONTMATTER_RE.sub("", text, count=1)
 
 
+def parse_frontmatter(text: str) -> dict:
+    """Parse a leading YAML frontmatter block into a dict (empty if none/invalid)."""
+    m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        data = yaml.safe_load(m.group(1))
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def doc_meta_html(fm: dict) -> str:
+    """A '.doc-meta' line built from frontmatter (status, date); '' if neither."""
+    bits = []
+    if fm.get("status"):
+        bits.append(f"Status: {html.escape(str(fm['status']))}")
+    when = fm.get("created") or fm.get("date")
+    if when:
+        bits.append(html.escape(str(when)))
+    return " · ".join(bits)
+
+
 def read_title(text: str, fallback: str) -> str:
     for line in strip_frontmatter(text).splitlines():
         m = _H1_RE.match(line)
@@ -157,6 +180,8 @@ def out_url(rel: str) -> str | None:
     if not rel.startswith("design/"):
         return None  # docs/README.md (GitHub-facing) and anything else: unpublished
     rest = rel[len("design/"):]
+    if rest.startswith("templates/"):
+        return None  # authoring scaffolding (ADR/proposal/architecture), not published
     if rest.endswith("README.md"):
         d = rest[: -len("README.md")].rstrip("/")
         return f"/{d}/" if d else "/docs/"
@@ -297,12 +322,17 @@ class Renderer:
 
     # -- emit one templated page --
     def emit(self, url: str, title: str, content_html: str, doc_class: str,
-             has_mermaid: bool):
+             has_mermaid: bool, doc_meta: str = ""):
+        rows = ""
         if doc_class:
+            rows += f'    <p class="doc-class">{html.escape(doc_class)}</p>\n'
+        if doc_meta:
+            rows += f'    <p class="doc-meta">{doc_meta}</p>\n'
+        if rows:
             header = (
                 '<div class="wrap">\n  <header class="doc-header">\n'
-                f'    <p class="doc-class">{html.escape(doc_class)}</p>\n'
-                "  </header>\n</div>"
+                + rows
+                + "  </header>\n</div>"
             )
         else:
             header = ""
@@ -431,7 +461,8 @@ class Renderer:
         title = read_title(text, prettify(path.stem))
         self.cur_desc = description_of(text)
         body, has_mermaid = self.render_markdown(rel, text)
-        self.emit(url, title, body, SECTION_CLASS.get(section, ""), has_mermaid)
+        self.emit(url, title, body, SECTION_CLASS.get(section, ""), has_mermaid,
+                  doc_meta_html(parse_frontmatter(text)))
 
     # -- generated list of a section's pages --
     def section_list_html(self, section: str, exclude: set[str]) -> str:

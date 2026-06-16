@@ -1,12 +1,20 @@
+---
+created: 13.06.2026 11:57
+type: architecture
+status: living
+tags:
+  - architecture
+  - quality
+  - risks
+  - glossary
+---
 # 10–12. Quality, risks, and glossary
 
-> Living document. Combines arc42 sections 10 (quality scenarios), 11 (risks and
-> technical debt), and 12 (glossary), trimmed to what earns its maintenance.
+> Living document. Combines arc42 sections 10 (quality scenarios), 11 (risks and technical debt), and 12 (glossary), trimmed to what earns its maintenance.
 
 ## 10. Quality scenarios
 
-Concrete, measurable scenarios that operationalize the quality goals (section
-1.3). Numbers are targets to be set during implementation; the *shape* is fixed.
+Concrete, measurable scenarios that operationalize the quality goals (section 1.3). Numbers are targets to be set during implementation; the *shape* is fixed.
 
 | # | Scenario | Measure |
 |---|----------|---------|
@@ -20,8 +28,7 @@ Concrete, measurable scenarios that operationalize the quality goals (section
 | Q8 | Rolling upgrade across a version-skewed fleet | No downtime, no data errors, neighbors interoperate across one version gap |
 | Q9 | Operator drains a D server | Data evacuated while maintaining redundancy and failure-domain invariants throughout; resumable; observable progress |
 
-These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in the
-DR runbook drills otherwise (Q4, Q8, Q9).
+These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in the DR runbook drills otherwise (Q4, Q8, Q9).
 
 ## 11. Risks and technical debt
 
@@ -37,8 +44,7 @@ DR runbook drills otherwise (Q4, Q8, Q9).
 
 ### Conscious exclusions (not debt — decisions)
 
-- Cross-provider / untrusted federation (ADR-0005) — reversible, with stated
-  cost.
+- Cross-provider / untrusted federation (ADR-0005) — reversible, with stated cost.
 - Full POSIX semantics over EC storage (FUSE is second-class).
 - Single-binary as a production tier (ADR-0014).
 
