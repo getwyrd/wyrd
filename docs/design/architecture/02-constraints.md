@@ -1,3 +1,11 @@
+---
+created: 13.06.2026 11:57
+type: architecture
+status: living
+tags:
+  - architecture
+  - constraints
+---
 # 2. Constraints
 
 > Living document.
@@ -15,13 +23,8 @@
 
 ## 2.2 Organizational constraints
 
-- **Small founding team.** Favors a monorepo, a single language, off-the-shelf
-  components for the genuinely hard distributed-systems primitives (consensus,
-  transactions, coordination), and a build order that produces a working system
-  early.
-- **Open-source, contributor-dependent.** Favors excellent onboarding docs,
-  well-marked good-first-issues in non-hot-path code, and a clear contribution
-  roadmap (the build order in section 9).
+- **Small founding team.** Favors a monorepo, a single language, off-the-shelf components for the genuinely hard distributed-systems primitives (consensus, transactions, coordination), and a build order that produces a working system early.
+- **Open-source, contributor-dependent.** Favors excellent onboarding docs, well-marked good-first-issues in non-hot-path code, and a clear contribution roadmap (the build order in section 9).
 - **Provenance via DCO**, not a CLA (ADR-0003). Every commit is signed off.
 
 ## 2.3 Conventions
@@ -29,5 +32,4 @@
 - Diagrams as code (Mermaid / D2), reviewed in PRs.
 - Documentation lives in-repo and is reviewed alongside code.
 - Architectural decisions are recorded as ADRs at the time they are made.
-- The deterministic-simulation-testing harness is a first-class dependency, not
-  a test-time afterthought (see ADR-0009).
+- The deterministic-simulation-testing harness is a first-class dependency, not a test-time afterthought (see ADR-0009).
