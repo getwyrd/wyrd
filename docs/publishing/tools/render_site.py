@@ -28,6 +28,7 @@ Output structure (served at the apex domain getwyrd.dev):
     /proposals/**/*.html       docs/design/proposals/**/*.md
     /references.html           docs/references.yml (structured content) rendered
                                through templates/page.html
+    /governance.html           docs/governance/GOVERNANCE.md
     /name.html                 docs/NAME.md
 
 Design notes:
@@ -178,6 +179,8 @@ def out_url(rel: str) -> str | None:
     if the file is not published."""
     if rel == "NAME.md":
         return "/name.html"
+    if rel == "governance/GOVERNANCE.md":
+        return "/governance.html"
     if rel == "design/README.md":
         return "/docs/"
     if not rel.startswith("design/"):
@@ -304,7 +307,8 @@ class Renderer:
     def discover(self) -> list[tuple[str, Path, str]]:
         """Return (rel, path, url) for every published source; populate url_map."""
         sources: list[tuple[str, Path, str]] = []
-        candidates = [DOCS_ROOT / "NAME.md", DOCS_ROOT / "design" / "README.md"]
+        candidates = [DOCS_ROOT / "NAME.md", DOCS_ROOT / "governance" / "GOVERNANCE.md",
+                      DOCS_ROOT / "design" / "README.md"]
         candidates += sorted((DOCS_ROOT / "design").rglob("*.md"))
         candidates += sorted((DOCS_ROOT / "design").rglob("*.mermaid"))
         for path in candidates:
