@@ -68,12 +68,13 @@ done), and whether it is a **stopping/release point**.
 - **Retires:** the risk of building the `chunk-format` crate against an
   unspecified layout and having to rewrite readers.
 - **Needs:** nothing; it is the first work item.
-- **Done when:** `specs/chunk-format/v1.md` has its byte layout, field widths,
-  endianness, checksum-algorithm identifier, and EC-scheme identifiers filled in
-  (no `[TO BE SPECIFIED]`), with at least one conformance vector in
-  `specs/conformance/`. Stays **v0/unstable** until validated (the spec's own
-  rule); `v1` is stamped only after a second reader or a sustained
-  fault-injection run.
+- **Done when:** ✅ **the byte layout is specified and decided** —
+  `specs/chunk-format/v1.md` is complete (no `[TO BE SPECIFIED]`), with the
+  trade-offs recorded in ADR-0019. What remains is mechanical and lands with the
+  `chunk-format` crate at M0: at least one conformance vector in
+  `specs/conformance/`. The format stays **v0/unstable** until validated (the
+  spec's own rule); `v1` is stamped only after a second independent reader or a
+  sustained fault-injection run.
 - **Stopping point:** no — it is a prerequisite, not a deliverable on its own.
 
 This is the only artifact detailed spec-first up front. Everything else is
@@ -169,8 +170,8 @@ no second zone.
 
 #### M6 — Global control plane, L2 *(Step 3)*
 
-- **Proves:** the geo-distributed namespace and placement, and the home-zone
-  authority consistency contract, operate across zones.
+- **Proves:** the geo-distributed namespace and placement (ADR-0020), and the
+  home-zone authority consistency contract, operate across zones.
 - **Retires:** the risk in the global, strongly-consistent namespace and in the
   per-file home-zone routing.
 - **Needs:** M5 (replicated data for the namespace to point across zones to).
@@ -235,8 +236,8 @@ from an armchair would be false precision).
 
 | Open question | Disposition | Reason |
 |---------------|-------------|--------|
-| Checksum algorithm for the fragment header (crc32c vs. blake3), field widths, endianness | **Resolve now → ADR + fold into format spec** | Blocks the format spec, which blocks M0. A reasoned decision (integrity-only vs. cryptographic; performance) is possible without measurement. |
-| EC-scheme identifier encoding in the format | **Resolve now → into format spec** | Same blocker; must be fixed before any fragment is written. |
+| Checksum algorithm for the fragment header (crc32c vs. blake3), field widths, endianness | **✅ Resolved → ADR-0019** | A reasoned decision (integrity-only vs. cryptographic; performance): crc32c default, blake3 reserved, little-endian, fixed-width — folded into the format spec. |
+| EC-scheme identifier encoding in the format | **✅ Resolved → ADR-0019** | Fixed before any fragment is written: `ec_scheme_type` / `ec_k` / `ec_m` / `ec_fragment_index` in the header. |
 | Small-file **inline threshold** (the byte size below which data is inlined in metadata) | **Defer to measurement** | Genuinely empirical — the right threshold depends on the metadata tier's behavior under a real small-file workload (M3–M4). Picking a number now is false precision. Record *why* deferred. |
 | Chunk / stripe size | **Defer to measurement** | Same: a throughput/overhead trade best set against M1 benchmarks. |
 | Whether minimal S3 lives in `server` or warrants a `gateway-s3` crate at M0 | **Resolve now → trivial, into 0001** | A crate-boundary call, cheap to decide; combined `server` for M0, split later (ADR-0016 evolution rule). |
@@ -245,6 +246,18 @@ from an armchair would be false precision).
 Each "resolve now" row that is a genuine architectural decision becomes an ADR in
 the 0018+ range; the format-internal ones fold directly into
 `specs/chunk-format/v1.md` rather than getting their own ADR.
+
+### What this proposal deliberately does not order
+
+The arc orders the **risk-retiring core** (M0–M7). Several *decided* capabilities are deliberately **not** milestones, because they attach to the core as features rather than gating it as uncertainties:
+
+- **Encryption at rest** (ADR-0021) — optional, per-tenant. Its format hooks (`flags`, `encryption_scheme`, the header extension) are reserved from M0; the feature itself is built when a tenant needs it, never on the critical path.
+- **Multi-tenancy** (ADR-0022) — namespace / quota / rate isolation. Its enforcement points (the L1 gateway, L2) arrive with those layers (M2+, M6); the model layers on, it does not reorder the arc.
+- **The hyperscale identity consumer** (ADR-0018) — a *consumer* of the substrate, reserved-only; built, if ever, on top of a finished Step 3.
+- **Observability dashboards and the management UI** — the durability-plane *telemetry* is emitted from M3 (the custodians, ADR-0011); dashboards and the web UI (ADR-0013) are cheap to add later and carry no ordering risk.
+- **Wire / RPC surfaces and metadata schemas** — implementation-first behind versioned protobuf (ADR-0002), discovered correctly only by building them; never specified up front.
+
+The rule: if a capability does not *retire a load-bearing risk*, it attaches to a milestone — it is not a milestone of its own.
 
 ## Alternatives considered
 
