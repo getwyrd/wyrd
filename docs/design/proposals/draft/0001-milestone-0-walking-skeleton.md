@@ -25,7 +25,13 @@ Building this slice first de-risks the project's central claim before any breadt
 
 In scope: S3 PUT/GET (minimal) → client library (chunk + commit) → embedded metadata store (redb) → filesystem chunk store → in-memory coordination, plus the `testkit` DST harness and the commit-protocol property tests.
 
-Explicitly **out** of M0 (deferred to the risk-ordered widening in [§9][s9]): erasure coding (`replication(1)`/`none` only), networked gRPC D servers, custodians, TiKV, and every cross-zone layer (L2/L3). Their *hooks* are respected where retrofitting is expensive (see Backward compatibility).
+Explicitly **out** of M0 (deferred to the risk-ordered widening in [§9][s9]): erasure coding (`replication(1)`/`none` only), networked gRPC D servers, custodians, TiKV, every cross-zone layer (L2/L3), and **observability / telemetry**. Their *hooks* are respected where retrofitting is expensive (see Backward compatibility).
+
+Observability is deliberately **not implemented in M0**: the durability-plane telemetry is emitted by the custodians ([ADR-0011][a11]), so it arrives with them at M3; the instrumentation seam is OpenTelemetry ([ADR-0012][a12]), wired at that point; and M0 is verified by DST, not by metrics. Unlike the append/CAS/watch and version-fence hooks, it needs **no reserved seat now** — attaching telemetry at the custodian is not an expensive retrofit.
+
+### Deliverable
+
+M0's output is a **proof, not a product**: a single binary that runs S3 PUT → four-phase commit → byte-identical GET in one process, plus a **seed-reproducible DST proof that the commit is atomic** (the property tests below), the trait and test scaffold (`ChunkStore` / `MetadataStore` / `Coordination` + `testkit`) every later milestone attaches to, and the on-disk format fixed (v0/unstable) with a conformance vector. It is a credible, publishable proof-of-concept — *the central claim is no longer a claim* — even if nothing follows. It is explicitly **not** deployable (no EC, no networked servers, no durability promise); a usable single-zone product is M4.
 
 ### Workspace and crate scaffold (coarse start, [ADR-0016][a16])
 
@@ -42,6 +48,45 @@ A Cargo workspace, starting **coarse** and splitting later. Trait boundaries exi
 | `xtask` | Codegen, conformance-vector run | `cargo xtask <thing>`; no `make` ([ADR-0016][a16]) |
 
 CI adds `cargo build/test/fmt/clippy`; the `adr-immutability` check already exists.
+
+### Logical view
+
+M0 collapses the L1–L5 layer model into a **single process** — a vertical slice through L1, L4, and L5, behind the three trait seams. There is no L2 (namespace/placement) or L3 (cross-zone) yet; the concretes are M0-trivial, but the seams are real from day one.
+
+```mermaid
+graph TB
+    client(["S3 client"])
+
+    subgraph proc["server — single process, one machine"]
+        s3["S3 PUT/GET<br/>(L1, minimal)"]
+        lib["Client library<br/>chunk + 4-phase commit (L4)"]
+
+        subgraph traits["trait seams — fixed at M0"]
+            ms["MetadataStore"]
+            cs["ChunkStore"]
+            co["Coordination"]
+        end
+
+        redb["redb<br/>(embedded metadata)"]
+        fs["filesystem<br/>(chunk store)"]
+        mem["in-memory"]
+        fmt["chunk-format<br/>(fragment header)"]
+        proto["proto<br/>(message shapes)"]
+    end
+
+    testkit["testkit — DST harness<br/>(abstract time/disk, seed runner)"]
+
+    client -->|"PUT / GET"| s3
+    s3 --> lib
+    lib --> ms --> redb
+    lib --> cs --> fs
+    lib --> co --> mem
+    lib -. uses .-> fmt
+    lib -. uses .-> proto
+    testkit -. drives, injects faults .-> lib
+```
+
+Deferred to later milestones, absent from M0: L2 (namespace DB, placement, zone registry), L3 (cross-zone replication, global custodians), networked gRPC D servers, custodians, and erasure coding.
 
 ### Metadata model — redb behind `MetadataStore` ([§5 L4][s5])
 
@@ -74,6 +119,27 @@ Crash between 3 and 4 leaves ledger entries for a sweep; crash before 3 leaves l
 - **S3 PUT/GET** in `server`: PUT object → client write path; GET → read path (single fragment, since `replication(1)`). Just enough for an end-to-end test; full S3 semantics are deferred.
 - **In-memory `Coordination`** behind the trait: discovery / leader election / locks are trivial in one process, but the trait shape is fixed now so etcd drops in later as a composition change.
 
+### Configuration
+
+M0's configuration surface is deliberately small — one process, one machine. Outline of the knobs that exist (the *format* — file / env / flags — is an implementation detail, not decided here):
+
+- **server** — the S3 gateway
+  - `listen` — bind address for PUT/GET (e.g. `127.0.0.1:9000`)
+- **metadata** — `MetadataStore` (redb at M0)
+  - `path` — the redb database file
+- **chunks** — `ChunkStore` (filesystem at M0)
+  - `dir` — the chunk-store root directory
+- **commit** — commit-protocol parameters
+  - `pending_lease` — expiry on intent-phase chunks (the GC ledger entry)
+- **format** — on-disk format
+  - `durability` — `none` | `replication(n)` | `rs(k,m)`; **fixed to `replication(1)`/`none` at M0**, recorded per chunk
+
+**Hardcoded defaults at M0, not yet knobs:** the small-file **inline threshold** and **chunk/stripe size** (the `[OPEN]` empirical parameters, deferred to measurement) and the **checksum algorithm** (a format-level `[TO BE SPECIFIED]` decision, carried as an id in the header).
+
+**Not configuration at M0:** backend selection is **code composition in `server`** (redb / filesystem / in-memory), not a runtime flag — swapping a backend is a composition change, not config ([ADR-0008][a8]). Zone/region, replication factor, placement policy, coordination endpoints, and telemetry have no config because L2, networked coordination, and observability are not in M0. The **DST seed** is a test-runner input, not server config.
+
+The full "same system, configured differently" profile model ([ADR-0014][a14]) and the declarative, API-first management surface ([ADR-0013][a13]) arrive with L2 and the custodians — not at M0. M0 config is just *where is the data, what port, how long are leases.*
+
 ### DST harness + property tests — attach at M0 ([ADR-0009][a9])
 
 `testkit` provides abstract time/disk and a single-threaded, seed-reproducible runner. The commit-protocol property tests assert the core invariants:
@@ -81,6 +147,31 @@ Crash between 3 and 4 leaves ledger entries for a sweep; crash before 3 leaves l
 - Concurrent writers to the same inode: **exactly one commit wins**; the loser observes the version conflict.
 - A reader sees either the pre-commit or post-commit version, **never a hybrid**.
 - **Fault injection**: crash between phases 3 and 4 → the file is either fully visible or not at all, and no committed chunk-map entry references a fragment the sweep would reclaim.
+
+### Test harness implementation
+
+The harness has **two tiers, kept distinct**:
+
+- **Tier 1 — DST correctness (`testkit`), from M0, no containers.** Production logic is written against `testkit`'s abstract time / disk / (later) network plus the trait seams, then run in a single-threaded, seed-reproducible simulator. **madsim** is the primary runtime — it simulates time, scheduling, network, and randomness ([ADR-0009][a9]). A container is deliberately *not* used here: it would reintroduce the real clock, scheduler, and network that DST exists to remove, breaking reproducibility. Entry points are `cargo test` (property tests) and `cargo xtask` (longer sim campaigns, conformance vectors); it runs on a laptop and in CI.
+- **Tier 2 — integration against real backends, from M2+, containers.** When the in-process redb/filesystem stores are swapped for networked gRPC D servers, TiKV, and etcd, those services run under docker-compose / testcontainers for (non-deterministic) integration tests, and Jepsen drives adversarial consistency against a real cluster. None of this exists in M0.
+
+For M0 the only tier is Tier 1: in-process DST on madsim — no containers, no services.
+
+### Environment, and what is not tested yet
+
+- **Hardware:** a single developer machine — laptop or workstation. Everything is one process (embedded redb, filesystem chunks, in-memory coordination), and DST simulates concurrency and faults deterministically, so M0 needs no cluster, no networked nodes, and no infrastructure. The first hardware beyond a laptop appears at M2 (networked D servers).
+- **Correctness** is the whole point and is covered above: deterministic simulation (`testkit`, seed-reproducible), the commit-protocol property tests, fault injection, and the format conformance vectors — all in CI (`cargo build/test/fmt/clippy`).
+- **Performance is deliberately out of scope for M0.** DST abstracts time and runs single-threaded, so it proves correctness, not throughput — wall-clock numbers from the simulation are meaningless. Real benchmarks begin at M1 (Reed-Solomon micro-benchmarks in CI); the throughput-scaling claim (architecture §10, scenario Q6) is only measurable at M2+ on real hardware. The empirical open questions (small-file inline threshold, chunk/stripe size) are deferred to those measurements, not guessed now.
+
+### CI
+
+GitHub Actions — the repo's existing platform (`adr-immutability` and `docs` workflows already run). M0 adds a `ci` workflow that is a thin caller of **`cargo xtask ci`** (logic in Rust, not YAML, so it runs identically on a laptop — [ADR-0016][a16]), gating every PR on:
+
+- `cargo fmt --check`, `cargo clippy -D warnings`, `cargo build`, `cargo test` — the DST commit-protocol property tests run here, on madsim ([ADR-0009][a9]);
+- `cargo xtask conformance` — the `chunk-format` reader against `specs/conformance/` ([ADR-0002][a2]);
+- **DCO** sign-off on every commit and **`cargo-deny`** (permissive-license allowlist + RUSTSEC advisories), enforcing [ADR-0003][a3] in CI.
+
+All on `ubuntu-latest`, deterministic, with no services or containers (Tier 1). A DST seed that finds a bug is committed as a permanent regression test. The integration tier (containers, Jepsen, benchmarks) arrives with the networked milestones, not M0. The full testing-and-CI strategy is [ADR-0009][a9].
 
 ## Alternatives considered
 
@@ -120,4 +211,4 @@ Crash between 3 and 4 leaves ledger entries for a sweep; crash before 3 leaves l
 - Does the minimal S3 surface stay in `server` for M0, or warrant a `gateway-s3` crate immediately?
 - redb key encoding (byte order of `<id>`, dirent name normalization).
 
-[s4]: ../../architecture/04-solution-strategy.md [s5]: ../../architecture/05-building-block-view.md [s9]: ../../architecture/09-build-order-and-roadmap.md [spec]: ../../specs/chunk-format/v1.md [a2]: ../../adr/0002-spec-first-on-disk-format-only.md [a7]: ../../adr/0007-reserve-append-cas-watch.md [a9]: ../../adr/0009-deterministic-simulation-testing.md [a10]: ../../adr/0010-pluggable-deployment-substrate.md [a15]: ../../adr/0015-consistency-contract.md [a16]: ../../adr/0016-monorepo-and-crate-structure.md
+[s4]: ../../architecture/04-solution-strategy.md [s5]: ../../architecture/05-building-block-view.md [s9]: ../../architecture/09-build-order-and-roadmap.md [spec]: ../../specs/chunk-format/v1.md [a2]: ../../adr/0002-spec-first-on-disk-format-only.md [a7]: ../../adr/0007-reserve-append-cas-watch.md [a9]: ../../adr/0009-deterministic-simulation-testing.md [a10]: ../../adr/0010-pluggable-deployment-substrate.md [a15]: ../../adr/0015-consistency-contract.md [a16]: ../../adr/0016-monorepo-and-crate-structure.md [a3]: ../../adr/0003-apache-2-license-and-dco.md [a8]: ../../adr/0008-tikv-metadata-and-pluggable-backends.md [a11]: ../../adr/0011-durability-telemetry-and-declarative-management.md [a12]: ../../adr/0012-opentelemetry-instrumentation.md [a13]: ../../adr/0013-api-first-management.md [a14]: ../../adr/0014-single-binary-dev-only.md
