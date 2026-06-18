@@ -3,7 +3,7 @@ created: 13.06.2026 12:16
 type: proposal
 status: draft
 author: Eduard Ralph
-tracking-issue: TBD
+tracking-issue: "#73"
 tags:
   - proposal
   - milestone-0
@@ -189,14 +189,17 @@ All on `ubuntu-latest`, deterministic, with no services or containers (Tier 1). 
 
 ### Suggested PR sequence (each with its own definition of done)
 
-1. Workspace scaffold + `traits` + `testkit` skeleton + CI.
-2. `chunk-format` encode/decode against the spec ([ADR-0019][a19]) + first conformance vector.
-3. redb `MetadataStore` (inode / dirent / ledger) behind the trait.
-4. Filesystem `ChunkStore` behind the trait.
-5. Client library: chunk → write fragment → four-phase commit.
-6. In-memory `Coordination`.
-7. Minimal S3 PUT/GET in `server` + end-to-end write/read test.
-8. DST commit-protocol property tests + crash-between-3-and-4 fault injection.
+Each step is one PR, tracked under the **M0** milestone (parent tracker in the `tracking-issue` frontmatter):
+
+1. **Workspace scaffold** — `traits`, `proto`, `testkit` skeleton, `xtask`, and CI (`cargo xtask ci`, cargo-deny, DCO).
+2. **`chunk-format`** encode/decode against the spec ([ADR-0019][a19]) + first conformance vectors.
+3. **redb `MetadataStore`** (inode / dirent / pending ledger / `meta:version`) behind the trait.
+4. **Filesystem `ChunkStore`** behind the trait.
+5. **Client write/commit path** — the four phases + the minimal test-invoked ledger-sweep.
+6. **Client read path** — chunk map → fragment → checksum verify → return.
+7. **In-memory `Coordination`** behind the trait.
+8. **Minimal S3 PUT/GET** in `server` + end-to-end write/read test.
+9. **DST property tests** + crash-between-3-and-4 fault injection.
 
 ## Backward compatibility
 
