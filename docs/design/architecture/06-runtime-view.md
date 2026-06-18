@@ -42,6 +42,8 @@ Every recovery action is itself commit-point-atomic. A crashed repair job leaves
 
 The metric that matters: **time-to-repair vs. failure rate**. Durability ("the nines") is essentially the probability that more than *m* fragments fail within one repair window. Fast, parallel repair matters more than wide encoding. This is why repair-queue depth and time-to-repair are first-class telemetry (ADR-0011), not vanity metrics.
 
+**Repair vs. serve.** A D-server loss makes both clients (read reconstruction, section 6.2) and custodians (repair reconstruction) read the surviving fragments, so they contend. Repair reads are throttled **below** foreground reads to protect read latency — but repair priority **rises as redundancy falls**, so a chunk near its durability floor (close to losing its *m*-th fragment) preempts foreground work. Durability is gate-zero (goal 1); latency yields to it only when redundancy is genuinely threatened. This dynamic priority is part of the admission/backpressure model (section 8.9).
+
 ## 6.4 Cross-zone replication and zone-loss recovery
 
 - **Replication** (L3): after a home-zone commit, replication workers copy chunks to other zones per policy. The remote replica becomes readable only when its record commits in L2 — never mid-copy.

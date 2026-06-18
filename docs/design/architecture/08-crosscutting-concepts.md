@@ -94,3 +94,14 @@ Multi-tenancy is **logical, not physical** (single-provider, ADR-0005): tenants 
 - **Performance** — per-tenant rate limits at the access layer, and placement spreads a tenant across failure domains, containing noisy neighbours.
 
 Enforcement lives at L1 (authentication, rate) and L2 (authorization, quota), never below — D servers and the metadata store stay tenant-oblivious, trusting an admitted request. The storage tier stays dumb; the policy tier stays centralized.
+
+## 8.9 Admission control and backpressure
+
+The system **fails closed** under pressure: a write is admitted only when identity, quota, capacity, and failure-domain room all allow it, and is refused with a clear, retryable signal otherwise — never a silent half-write or a durability corner cut.
+
+- **Quota / rate** — the gateway checks the tenant's quota and rate limit (section 8.8) at admission; over a hard limit it rejects (429-style), backpressuring the client.
+- **Zone full** — per-failure-domain utilization is the binding capacity signal (section 7.3): when a domain has no room for the configured EC scheme, placement (L2) redirects new writes to a zone with capacity, or rejects if residency policy forbids the redirect. Running out of room *in one domain* blocks EC writes before total capacity is exhausted.
+- **Metadata tier saturated** — backpressure propagates to clients; the metadata tier is shardable (goal 2), so sustained pressure is a scaling signal surfaced by telemetry, not a failure.
+- **Repair vs. serve** — see section 6.3: repair reads are throttled below foreground reads, but their priority rises as redundancy falls, so a chunk near its durability floor preempts. Durability (goal 1) outranks latency.
+
+The principle throughout: shed or slow load predictably, surface it on the capacity and durability planes (section 8.3), and never trade correctness for admission.
