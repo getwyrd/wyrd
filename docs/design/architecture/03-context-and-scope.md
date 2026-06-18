@@ -40,3 +40,5 @@ All inbound interfaces authenticate at the access layer (section 8.5): OIDC for 
 - Cross-provider or untrusted-operator federation (ADR-0005).
 - Application-level collaborative-editing logic (storage primitives only).
 - The observability storage/visualization stack — recommended and shipped as a reference, but not a dependency the binary is aware of (ADR-0012).
+
+See section 11 for the full catalogue of conscious exclusions.

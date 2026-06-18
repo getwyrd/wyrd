@@ -16,19 +16,19 @@ tags:
 
 Concrete, measurable scenarios that operationalize the quality goals (section 1.3). Numbers are targets to be set during implementation; the *shape* is fixed.
 
-| # | Scenario | Measure |
-|---|----------|---------|
-| Q1 | A D server is lost from a zone | All affected chunks return to full redundancy within time-to-repair budget T, with no read errors during repair (reads reconstruct from survivors) |
-| Q2 | Silent bit rot corrupts a fragment | Scrubber detects it within scrub-cycle period P, before the data is needed; reconstruction follows |
-| Q3 | A write is interrupted at any point | No torn state observable; either the old version or the new, never a hybrid; orphaned fragments collected by GC |
-| Q4 | A zone is lost entirely | Under-replicated files re-replicated from survivors within budget; bounded by cross-region bandwidth |
-| Q5 | Concurrent writers to the same file | Exactly one commit wins (version conflict); the other retries or fails cleanly |
-| Q6 | Aggregate write throughput vs. cluster size | Scales close to linearly with D-server count, divided by EC amplification (~1.5× for RS(6,3)) |
-| Q7 | Small-file (sub-threshold) workload | Dominated by metadata-op rate, not byte rate; served by the inline path; scales with the metadata tier |
-| Q8 | Rolling upgrade across a version-skewed fleet | No downtime, no data errors, neighbors interoperate across one version gap |
-| Q9 | Operator drains a D server | Data evacuated while maintaining redundancy and failure-domain invariants throughout; resumable; observable progress |
+| # | Scenario | Measure | Goal |
+|---|----------|---------|------|
+| Q1 | A D server is lost from a zone | All affected chunks return to full redundancy within time-to-repair budget T, with no read errors during repair (reads reconstruct from survivors) | 1 |
+| Q2 | Silent bit rot corrupts a fragment | Scrubber detects it within scrub-cycle period P, before the data is needed; reconstruction follows | 1 |
+| Q3 | A write is interrupted at any point | No torn state observable; either the old version or the new, never a hybrid; orphaned fragments collected by GC | 1 |
+| Q4 | A zone is lost entirely | Under-replicated files re-replicated from survivors within budget; bounded by cross-region bandwidth | 1 |
+| Q5 | Concurrent writers to the same file | Exactly one commit wins (version conflict); the other retries or fails cleanly | 1 |
+| Q6 | Aggregate write throughput vs. cluster size | Scales close to linearly with D-server count, divided by EC amplification (~1.5× for RS(6,3)) | 2 |
+| Q7 | Small-file (sub-threshold) workload | Dominated by metadata-op rate, not byte rate; served by the inline path; scales with the metadata tier | 2 |
+| Q8 | Rolling upgrade across a version-skewed fleet | No downtime, no data errors, neighbors interoperate across one version gap (section 8.7) | 3 |
+| Q9 | Operator drains a D server | Data evacuated while maintaining redundancy and failure-domain invariants throughout; resumable; observable progress | 3 |
 
-These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in the DR runbook drills otherwise (Q4, Q8, Q9).
+These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in the DR runbook drills otherwise (Q4, Q8, Q9). Goals 4 (scale range) and 5 (replaceability) are validated *structurally* — the same binary running every deployment profile (section 7) and backend swaps as composition tests — rather than by a load/fault scenario.
 
 ## 11. Risks and technical debt
 
@@ -48,6 +48,8 @@ These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in 
 - Cross-provider / untrusted federation (ADR-0005) — reversible, with stated cost.
 - Full POSIX semantics over EC storage (FUSE is second-class).
 - Single-binary as a production tier (ADR-0014).
+- Application-level logic (collaborative-editing merge / OT / CRDT) — only the storage primitives are in scope, with append / CAS / watch reserved (ADR-0007).
+- The observability storage / visualization stack — shipped as a reference, never a dependency the binary is aware of (ADR-0012).
 
 ## 12. Glossary
 
@@ -55,6 +57,7 @@ These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in 
 |------|---------|
 | Commit point | The single linearizable metadata mutation that makes a write visible. The locus of the atomicity guarantee. |
 | Zone | One datacenter/region's complete L4+L5 stack. The unit of atomicity and intra-provider federation. |
+| Control plane | L2 specifically — the global namespace, placement, and zone registry (section 5). Distinct from the *management surface* (the operator API, ADR-0013), which is occasionally also called "control". |
 | D server | A "dumb" storage server: stores and returns fragments by chunk ID, verifies checksums; no placement or metadata logic. |
 | Custodian | A background maintenance service: GC, scrub, reconstruction, rebalancing (L4) or cross-zone re-replication (L3). |
 | Chunk | The unit of placement and erasure coding; a file is split into chunks. |
