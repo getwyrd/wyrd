@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the four-level participation ladder, and the founding-maintainer bootstrap (below); the criteria and thresholds within each level remain **[OPEN]**. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
+> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the four-level participation ladder, the founding-maintainer bootstrap, and the architecture-board composition (below); the criteria and thresholds within each level remain **[OPEN]**. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
 
 ## Purpose
 
@@ -55,13 +55,14 @@ A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph 
 
 ### Architecture board
 
-The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../design/adr/0001-record-architecture-decisions.md). Its members are **elected by the maintainers**.
+The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../design/adr/0001-record-architecture-decisions.md). Its members are **elected by the maintainers** and **may be drawn from any participation level** — a board seat reflects judgement on the architecture, not rank on the ladder.
 
-- **Size:** **[OPEN]**.
+- **Size:** **at least three** members.
+- **Chair:** the **founding maintainer**.
+- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle: its agreement on an ADR's pull request *is* the ratification. The numeric threshold among the members (simple majority vs. full consensus) is **[OPEN]**.
+- **Bootstrap — fewer than three members.** Until the board reaches three, the **chair (the founding maintainer) may make acceptance decisions**. To remain consistent with ADR-0001 — acceptance is never a single maintainer's act — these interim decisions are **provisional**: the board reviews and confirms them once it is constituted. *(If instead the chair's bootstrap acceptances are meant to be final, that is a true exception to ADR-0001 and must be enacted by a superseding ADR, not this document.)*
 - **Term and re-election cadence:** **[OPEN]**.
 - **Election procedure** — how maintainers nominate and vote: **[OPEN]**.
-- **Decision rule for accepting an ADR** — quorum, majority, or full consensus of the board: **[OPEN]**.
-- **Chair / tie-breaking:** **[OPEN]**.
 
 ## Decision-making
 
