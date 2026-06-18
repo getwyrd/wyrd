@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, and the founding-maintainer bootstrap (below). Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
+> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the four-level participation ladder, and the founding-maintainer bootstrap (below); the criteria and thresholds within each level remain **[OPEN]**. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
 
 ## Purpose
 
@@ -19,19 +19,39 @@ It complements, and does not override, the per-class processes documented elsewh
 
 ## Roles
 
-### Contributors
+Participation is a ladder of four levels, each earned from the one below. Higher rungs carry more authority and more responsibility; all of them rest on the same contribution-under-DCO basis (ADR-0003). The architecture board (further below) is **not** a rung on this ladder — it is a body drawn from the maintainers.
 
-Anyone who opens an issue or a pull request. Contributions are accepted under the project's license and DCO sign-off (ADR-0003). No special status is required to contribute.
+| Level | In one line | GitHub mapping |
+|-------|-------------|----------------|
+| **Contributor** | anyone who opens an issue or PR | — (any account) |
+| **Associate** | a trusted contributor with triage rights, on the path to maintainer | repo **Triage** |
+| **Maintainer** | reviews and **merges**, triages, elects the architecture board | `maintainers` team, **Maintain** |
+| **Founding maintainer** | the genesis seed that bootstraps the project | org **Owner / Admin** |
 
-### Maintainers
+### Contributor
 
-Maintainers review and merge contributions, triage issues, and elect the architecture board (below). **New maintainers are elected by the existing maintainers.**
+Anyone who opens an issue or a pull request. Contributions are accepted under the project's license and DCO sign-off (ADR-0003). No special status is required, and most participants never need more.
 
-**Bootstrap — the founding maintainer.** A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. Until a second maintainer is elected, the founding maintainer holds the role solely and is therefore the sole elector of the initial architecture board (whose size and election rule remain **[OPEN]** below).
+### Associate
 
-- **How one becomes a maintainer** — elected by the existing maintainers (above); the nomination criteria and confirmation threshold remain **[OPEN]**.
+A contributor recognised for sustained, quality work, granted **triage** rights — labelling, assigning, and shepherding issues and pull requests, and reviewing — but **without merge authority**. It is the deliberate step between Contributor and Maintainer: trusted people help run the project before they hold the keys, and it is where a prospective maintainer is observed.
+
+- **How one becomes an Associate** — nominated by a maintainer for a track record of good contributions; confirmation rule **[OPEN]**.
+- **Inactivity / removal:** **[OPEN]**.
+
+### Maintainer
+
+Maintainers review and **merge** contributions, triage, set day-to-day direction, and **elect the architecture board** (below). **New maintainers are elected by the existing maintainers**, normally promoted from Associates.
+
+- **How one becomes a maintainer** — elected by the existing maintainers; nomination criteria and confirmation threshold **[OPEN]**.
 - **Day-to-day decision rule** for routine changes (e.g. lazy consensus on pull requests): **[OPEN]**.
 - **Inactivity / removal policy:** **[OPEN]**.
+
+### Founding maintainer
+
+A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. The founding maintainer is a full Maintainer plus the **bootstrap authority** the genesis requires: until a second maintainer is elected, they hold the maintainer role solely and are the sole elector of the initial architecture board (whose size and election rule remain **[OPEN]** below).
+
+- The bootstrap authority is **transitional** — it exists only until the maintainer group and the board are established. Whether the founding maintainer keeps any standing afterward (e.g. tie-break, emeritus) is **[OPEN]**.
 
 ### Architecture board
 
