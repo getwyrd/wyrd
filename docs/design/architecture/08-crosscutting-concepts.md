@@ -81,3 +81,27 @@ A half-upgraded fleet is the normal state during a rolling upgrade (constraint 2
 **Two compatibility axes.** *Wire*: every inter-component contract is versioned protobuf (`proto`), evolved by addition — neighbours interoperate across at least a one-version gap, so fields are never repurposed and removals lag deprecation by a release. *On-disk*: the chunk/fragment format carries its own version and EC-scheme id (ADR-0002, ADR-0019); a reader accepts every format version it claims to support, because data outlives the software that wrote it — old-format data is read, never rejected.
 
 **Tested, not hoped.** Skew is exercised under the deterministic-simulation harness (ADR-0009): a simulated zone runs mixed-version nodes from a seed and asserts the commit protocol and read path stay correct across the gap. On-disk compatibility is pinned by conformance vectors per format version (`specs/conformance/`) that every reader must accept, and a mixed-version matrix in CI gates the one-version-gap guarantee (Q8) — the structural complement to the load/fault scenarios in section 10.
+
+## 8.8 Multi-tenancy
+
+The primary deployment is a provider serving many tenants on shared infrastructure (section 1.4), so a **tenant** is a first-class unit — a namespace partition plus an identity domain, carrying its own policy (residency, replication factor, encryption, quotas, rate limits). See ADR-0022.
+
+Multi-tenancy is **logical, not physical** (single-provider, ADR-0005): tenants share zones, D servers, and the metadata tiers. Isolation is the composition of four boundaries, each enforced at a definite point:
+
+- **Namespace** — the L2 global namespace is partitioned per tenant; cross-tenant naming or traversal is impossible by construction (ADR-0020).
+- **Data** — per-tenant envelope encryption makes the boundary cryptographic; D servers hold opaque, mixed-tenant ciphertext (ADR-0021).
+- **Capacity** — per-tenant quotas checked at admission in the gateway against the tenant's L2 record (section 8.9).
+- **Performance** — per-tenant rate limits at the access layer, and placement spreads a tenant across failure domains, containing noisy neighbours.
+
+Enforcement lives at L1 (authentication, rate) and L2 (authorization, quota), never below — D servers and the metadata store stay tenant-oblivious, trusting an admitted request. The storage tier stays dumb; the policy tier stays centralized.
+
+## 8.9 Admission control and backpressure
+
+The system **fails closed** under pressure: a write is admitted only when identity, quota, capacity, and failure-domain room all allow it, and is refused with a clear, retryable signal otherwise — never a silent half-write or a durability corner cut.
+
+- **Quota / rate** — the gateway checks the tenant's quota and rate limit (section 8.8) at admission; over a hard limit it rejects (429-style), backpressuring the client.
+- **Zone full** — per-failure-domain utilization is the binding capacity signal (section 7.3): when a domain has no room for the configured EC scheme, placement (L2) redirects new writes to a zone with capacity, or rejects if residency policy forbids the redirect. Running out of room *in one domain* blocks EC writes before total capacity is exhausted.
+- **Metadata tier saturated** — backpressure propagates to clients; the metadata tier is shardable (goal 2), so sustained pressure is a scaling signal surfaced by telemetry, not a failure.
+- **Repair vs. serve** — see section 6.3: repair reads are throttled below foreground reads, but their priority rises as redundancy falls, so a chunk near its durability floor preempts. Durability (goal 1) outranks latency.
+
+The principle throughout: shed or slow load predictably, surface it on the capacity and durability planes (section 8.3), and never trade correctness for admission.
