@@ -64,3 +64,5 @@ These are the forces the architecture is optimized for, in priority order: when 
 - **Single-provider federation only.** Regions and nodes cooperate *within one provider*. There is no cross-provider or untrusted-operator operation. This is a deliberate exclusion that removes a large amount of protocol surface (see ADR-0005); it is reversible if cross-provider federation is ever required.
 - **The single-binary / NAS-class profile is for development and evaluation only**, not a supported production tier (ADR-0014). Production durability begins at the real multi-node backends with proper failure-domain separation.
 - The system provides storage primitives. Application-level concerns (collaborative-editing merge logic, OT/CRDT engines) are out of scope, though the storage primitives needed to support them (atomic append, compare-and-set, change notification) are reserved from the start (ADR-0007).
+
+These and the other deliberate exclusions are catalogued in section 11 (conscious exclusions).

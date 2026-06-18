@@ -73,3 +73,11 @@ The trust model follows from single-provider, closed federation (ADR-0005): one 
 ## 8.6 The thick client and the conformance suite
 
 The client library embeds chunking, EC, the commit protocol, and failover — so a second-language client (e.g. a Python SDK for an application team) cannot be a thin shim; it must re-implement all of it identically or it will write data the reference client cannot read, or commit non-atomically. This is why the on-disk format is a real spec with conformance vectors (`specs/`), and why a longer-term option is to expose the thick logic via a Rust core with FFI bindings rather than inviting risky reimplementation.
+
+## 8.7 Compatibility and version skew
+
+A half-upgraded fleet is the normal state during a rolling upgrade (constraint 2.1, scenario Q8), so version skew is designed for, not treated as an incident.
+
+**Two compatibility axes.** *Wire*: every inter-component contract is versioned protobuf (`proto`), evolved by addition — neighbours interoperate across at least a one-version gap, so fields are never repurposed and removals lag deprecation by a release. *On-disk*: the chunk/fragment format carries its own version and EC-scheme id (ADR-0002, ADR-0019); a reader accepts every format version it claims to support, because data outlives the software that wrote it — old-format data is read, never rejected.
+
+**Tested, not hoped.** Skew is exercised under the deterministic-simulation harness (ADR-0009): a simulated zone runs mixed-version nodes from a seed and asserts the commit protocol and read path stay correct across the gap. On-disk compatibility is pinned by conformance vectors per format version (`specs/conformance/`) that every reader must accept, and a mixed-version matrix in CI gates the one-version-gap guarantee (Q8) — the structural complement to the load/fault scenarios in section 10.
