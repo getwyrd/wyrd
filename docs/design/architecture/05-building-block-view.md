@@ -42,14 +42,14 @@ The brain of the multi-zone system: the one component with a global, authoritati
 
 | Component | Technology | Responsibility |
 |-----------|------------|----------------|
-| Global namespace DB | TiDB/TiKV (Spanner-class; Apache-2.0, CNCF) | Directory tree, file→home-zone mapping, ACLs, sharing, quotas. Synchronously consensus-replicated. |
+| Global namespace DB | redb (single-zone) / TiDB (multi-region), behind `NamespaceStore` trait (ADR-0020) | Directory tree, file→home-zone mapping, ACLs, sharing, quotas. Globally linearizable, synchronously geo-replicated. |
 | Placement service | Rust, policy engine | Decides home zone and replica set per file from policy (residency, replication factor, cost tier, capacity) |
 | Zone registry | in the namespace DB | Every zone: region, capacity, utilization, health, capabilities |
 | Identity & auth | OIDC for users; internal mTLS PKI for services | Trust fabric (single-provider, so internal PKI not cross-org) |
 
 Holds *metadata about metadata* — kilobytes per file. Consulted on namespace and placement operations (create, rename, share, delete, "where do I read this"), which are rare relative to data operations and ideally cached by clients.
 
-The default L2 backend is the Apache-2.0, CNCF **TiKV** stack — **TiDB** for the SQL surface over it — with **YugabyteDB** or **PostgreSQL** as alternatives behind the `MetadataStore` trait (ADR-0008). CockroachDB is Spanner-class and works as a backend, but it is **not** a default: it moved to a source-available (non-OSI) licence in 2024, which is at odds with the project's fully-open, sovereignty-friendly substrate goal.
+The default L2 backend is the Apache-2.0, CNCF **TiKV** stack — **TiDB** for the SQL surface over it — with **YugabyteDB** or **PostgreSQL** as alternatives behind the `NamespaceStore` trait (ADR-0020). CockroachDB is Spanner-class and works as a backend, but it is **not** a default: it moved to a source-available (non-OSI) licence in 2024, which is at odds with the project's fully-open, sovereignty-friendly substrate goal.
 
 ---
 
@@ -121,7 +121,7 @@ The Colossus-style bootstrap recursion bottoms out here: etcd depends on nothing
 |---------|------------|------------------|
 | Wire contracts | protobuf + prost | `proto` |
 | On-disk format | versioned, spec-first | `chunk-format` + `specs/chunk-format/` |
-| Pluggability seams | trait definitions, no impls | `traits` (`ChunkStore`, `MetadataStore`, `Coordination`) |
+| Pluggability seams | trait definitions, no impls | `traits` (`ChunkStore`, `MetadataStore`, `NamespaceStore`, `Coordination`) |
 | Telemetry | OpenTelemetry (OTLP) | `telemetry` (ADR-0012) |
 | Simulation testing | madsim / turmoil | `testkit` (ADR-0009) |
 | Composition / the binary | wires all concretes | `server` |

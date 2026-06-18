@@ -30,6 +30,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0016](0016-monorepo-and-crate-structure.md) | Monorepo and evolving crate structure | Proposed |
 | [0017](0017-project-name-and-norn-scheme.md) | Project name (Wyrd) and the Norn component scheme | Proposed |
 | [0018](0018-reserve-hooks-for-hyperscale-identity-consumer.md) | Reserve hooks for a hyperscale identity consumer | Proposed |
+| [0020](0020-global-namespace-store.md) | Global namespace store (L2) and the NamespaceStore trait | Proposed |
 
 ## Why not ... ?
 
