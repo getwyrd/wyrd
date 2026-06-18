@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Only the parts already anchored in an accepted ADR are firm; everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
+> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, and the founding-maintainer bootstrap (below). Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
 
 ## Purpose
 
@@ -25,9 +25,11 @@ Anyone who opens an issue or a pull request. Contributions are accepted under th
 
 ### Maintainers
 
-Maintainers review and merge contributions, triage issues, and elect the architecture board (below).
+Maintainers review and merge contributions, triage issues, and elect the architecture board (below). **New maintainers are elected by the existing maintainers.**
 
-- **How one becomes a maintainer** — criteria and the nomination / confirmation procedure: **[OPEN]**.
+**Bootstrap — the founding maintainer.** A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. Until a second maintainer is elected, the founding maintainer holds the role solely and is therefore the sole elector of the initial architecture board (whose size and election rule remain **[OPEN]** below).
+
+- **How one becomes a maintainer** — elected by the existing maintainers (above); the nomination criteria and confirmation threshold remain **[OPEN]**.
 - **Day-to-day decision rule** for routine changes (e.g. lazy consensus on pull requests): **[OPEN]**.
 - **Inactivity / removal policy:** **[OPEN]**.
 
