@@ -1,0 +1,17 @@
+%% Runtime view — the read path: two-hop metadata resolution + k-of-n reconstruction
+%% Diagrams as code. Render with any Mermaid renderer.
+sequenceDiagram
+    participant C as Client library
+    participant N as Global namespace (L2)
+    participant M as Metadata store (L4, home zone)
+    participant D as D servers (home zone)
+
+    C->>N: 1. Resolve path → file id + home zone (+ ACL)
+    N-->>C: home zone (cached after first use)
+    C->>M: 2. Fetch chunk map: fragments, locations, EC scheme
+    M-->>C: chunk map (cached after first read)
+    C->>D: 3. Read any k of n fragments (parallel)
+    D-->>C: fragments (slowest n−k ignored)
+    C->>C: 4. Verify checksums + reconstruct
+    Note over C,N: Steady state — both metadata hops cached → straight to D servers
+    Note over C,D: Consistency-sensitive reads route to the home zone; stale-tolerant may use a replica

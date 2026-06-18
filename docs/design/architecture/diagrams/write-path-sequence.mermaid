@@ -2,11 +2,14 @@
 %% Diagrams as code. Render with any Mermaid renderer.
 sequenceDiagram
     participant C as Client library
+    participant Z as Placement / namespace (L2)
     participant L as Pending-chunk ledger
     participant D as D servers
-    participant M as Metadata store
+    participant M as Metadata store (home zone)
 
-    Note over C,M: File does NOT exist yet
+    C->>Z: 0. Resolve/assign home zone (placement; cached)
+    Z-->>C: home zone
+    Note over C,M: Steps 1–4 run in the home zone. File does NOT exist yet
     C->>L: 1. Register chunk IDs (leased)
     C->>C: 2a. Chunk + erasure-code
     C->>D: 2b. Write fragments directly (parallel, bulk data)
