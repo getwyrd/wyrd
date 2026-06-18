@@ -20,7 +20,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0006](0006-etcd-for-coordination.md) | etcd for coordination; openraft reserved | Proposed |
 | [0007](0007-reserve-append-cas-watch.md) | Reserve append / CAS / watch primitives | Proposed |
 | [0008](0008-tikv-metadata-and-pluggable-backends.md) | TiKV metadata store and pluggable backends | Proposed |
-| [0009](0009-deterministic-simulation-testing.md) | Deterministic simulation testing as first-class | Proposed |
+| [0009](0009-deterministic-simulation-testing.md) | Testing strategy | Proposed |
 | [0010](0010-pluggable-deployment-substrate.md) | Pluggable deployment substrate; Kubernetes optional | Proposed |
 | [0011](0011-durability-telemetry-and-declarative-management.md) | Durability telemetry and declarative management | Proposed |
 | [0012](0012-opentelemetry-instrumentation.md) | OpenTelemetry instrumentation; storage/viz agnostic | Proposed |
