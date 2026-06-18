@@ -40,7 +40,7 @@ These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in 
 | Contributor on-ramp (Rust) | Smaller drive-by-contributor pool; steeper ramp | Excellent CONTRIBUTING; good-first-issues in non-hot-path crates; coarse-to-fine crate split so newcomers aren't lost in plumbing |
 | Compile times on a large workspace | Slows iteration | Disciplined crate split (the trait boundaries are also compile-unit boundaries); start coarser, split as needed |
 | Treating etcd as a database | The classic L5 failure mode; etcd is wonderful until used as a store | Architectural rule: nothing data-proportional in L5; sized in kilobytes |
-| Spanner-class store operational weight | CockroachDB/TiDB are heavy for L2 | Justified because L2 is small and off the data path; revisit only if it proves a bottleneck |
+| Spanner-class store operational weight | A full SQL store (TiDB, YugabyteDB) is heavy for L2 | Justified because L2 is small and off the data path; revisit only if it proves a bottleneck |
 
 ### Conscious exclusions (not debt — decisions)
 
