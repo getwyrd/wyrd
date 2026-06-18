@@ -33,6 +33,8 @@ See `diagrams/c4-context.mermaid` for the diagram. In prose:
 | OTLP telemetry | outbound | OTLP | Push to operator's collector; also a Prometheus scrape endpoint (ADR-0012) |
 | Coordination | internal | etcd gRPC | Production; in-memory in dev (ADR-0006) |
 
+All inbound interfaces authenticate at the access layer (section 8.5): OIDC for the Drive / WebDAV / SDK surfaces, S3 Signature V4 for the S3 API, OIDC + mTLS for management. Internal service-to-service traffic is mTLS under the provider CA (ADR-0005).
+
 ## 3.3 What is explicitly out of context
 
 - Cross-provider or untrusted-operator federation (ADR-0005).
