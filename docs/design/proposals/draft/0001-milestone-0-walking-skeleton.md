@@ -11,7 +11,7 @@ tags:
 ---
 # Proposal: Milestone 0 — the walking skeleton (implementation plan)
 
-> This is the bootstrap proposal: the implementation plan for the project's first vertical slice. It is filed as a proposal because the template fields map cleanly onto an implementation plan and the process is deliberately lightweight this early (see `../README.md`). It records *how* M0 is built; the *why* of the architecture lives in the ADRs it references.
+> This is the bootstrap proposal: the implementation plan for the project's first vertical slice. It is filed as a proposal because the template fields map cleanly onto an implementation plan and the process is deliberately lightweight this early (see `../README.md`). It records *how* M0 is built; the *why* of the architecture lives in the ADRs it references. M0 is the first slice of the whole [implementation arc](0002-implementation-arc.md) (proposal 0002), which orders every milestone it begins.
 
 ## Motivation
 
@@ -201,13 +201,17 @@ All on `ubuntu-latest`, deterministic, with no services or containers (Tier 1). 
 ## Backward compatibility
 
 - **On-disk format**: the byte layout is fixed by [ADR-0019][a19] / [the spec][spec] (still **v0 / unstable** until validated, then stamped `v1`); M0 implements it. No existing data to migrate.
-- **Deferred-with-reserved-seats** honored now because retrofitting is expensive ([§9][s9]): append/CAS/watch primitives ([ADR-0007][a7]) accommodated by the ledger + schema shape; the `meta:version` fence counter reserved ([ADR-0015][a15]); trait seams for etcd/TiKV/openraft.
+- **Deferred-with-reserved-seats** honored now because retrofitting is expensive ([§9][s9]): append/CAS/watch primitives ([ADR-0007][a7]) accommodated by the ledger + schema shape; the `meta:version` fence counter reserved ([ADR-0015][a15]); trait seams for etcd/TiKV/openraft; and the chunk format's **encryption reservation** (`flags`, `encryption_scheme`, header extension), which the M0 writer fills with zeros ([ADR-0019][a19], [ADR-0021][a21]).
 - **API / deployments**: none yet, so nothing to stay compatible with.
 
 ## Open questions
 
-- Small-file **inline threshold** ([§5][s5] mentions inlining): implement in M0 or defer to the EC widening step?
-- Does the minimal S3 surface stay in `server` for M0, or warrant a `gateway-s3` crate immediately?
-- redb key encoding (byte order of `<id>`, dirent name normalization).
+All of M0's originally-open questions are now dispositioned (cf. proposal 0002's open-questions triage):
 
-[s4]: ../../architecture/04-solution-strategy.md [s5]: ../../architecture/05-building-block-view.md [s9]: ../../architecture/09-build-order-and-roadmap.md [spec]: ../../specs/chunk-format/v1.md [a2]: ../../adr/0002-spec-first-on-disk-format-only.md [a7]: ../../adr/0007-reserve-append-cas-watch.md [a9]: ../../adr/0009-deterministic-simulation-testing.md [a10]: ../../adr/0010-pluggable-deployment-substrate.md [a15]: ../../adr/0015-consistency-contract.md [a16]: ../../adr/0016-monorepo-and-crate-structure.md [a3]: ../../adr/0003-apache-2-license-and-dco.md [a8]: ../../adr/0008-tikv-metadata-and-pluggable-backends.md [a11]: ../../adr/0011-durability-telemetry-and-declarative-management.md [a12]: ../../adr/0012-opentelemetry-instrumentation.md [a13]: ../../adr/0013-api-first-management.md [a14]: ../../adr/0014-single-binary-dev-only.md [a19]: ../../adr/0019-chunk-format-layout.md [a20]: ../../adr/0020-global-namespace-store.md
+- **Small-file inline threshold** ([§5][s5]) — **deferred to measurement** (empirical; set against M1+ benchmarks), so it is *not* implemented in M0.
+- **Minimal S3 in `server` vs a `gateway-s3` crate** — **combined `server` at M0**, split later under the crate-evolution rule ([ADR-0016][a16]).
+- **redb key encoding** (byte order of `<id>`, dirent name normalization) — **settled during M0** as an implementation detail of the first metadata backend, recorded in-code and in the architecture doc.
+
+No open question blocks M0.
+
+[s4]: ../../architecture/04-solution-strategy.md [s5]: ../../architecture/05-building-block-view.md [s9]: ../../architecture/09-build-order-and-roadmap.md [spec]: ../../specs/chunk-format/v1.md [a2]: ../../adr/0002-spec-first-on-disk-format-only.md [a7]: ../../adr/0007-reserve-append-cas-watch.md [a9]: ../../adr/0009-deterministic-simulation-testing.md [a10]: ../../adr/0010-pluggable-deployment-substrate.md [a15]: ../../adr/0015-consistency-contract.md [a16]: ../../adr/0016-monorepo-and-crate-structure.md [a3]: ../../adr/0003-apache-2-license-and-dco.md [a8]: ../../adr/0008-tikv-metadata-and-pluggable-backends.md [a11]: ../../adr/0011-durability-telemetry-and-declarative-management.md [a12]: ../../adr/0012-opentelemetry-instrumentation.md [a13]: ../../adr/0013-api-first-management.md [a14]: ../../adr/0014-single-binary-dev-only.md [a19]: ../../adr/0019-chunk-format-layout.md [a20]: ../../adr/0020-global-namespace-store.md [a21]: ../../adr/0021-encryption-at-rest-and-key-management.md
