@@ -32,6 +32,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0018](0018-reserve-hooks-for-hyperscale-identity-consumer.md) | Reserve hooks for a hyperscale identity consumer | Proposed |
 | [0020](0020-global-namespace-store.md) | Global namespace store (L2) and the NamespaceStore trait | Proposed |
 | [0021](0021-encryption-at-rest-and-key-management.md) | Encryption at rest and key management | Proposed |
+| [0022](0022-multi-tenancy-model.md) | Multi-tenancy model | Proposed |
 
 ## Why not ... ?
 
