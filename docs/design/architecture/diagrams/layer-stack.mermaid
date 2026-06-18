@@ -1,0 +1,14 @@
+%% Layer stack — the L1–L5 model (building-block view, section 5)
+%% Diagrams as code. Render with any Mermaid renderer.
+%% Decisive split: L1–L3 span zones (global scope); L4–L5 live within a single zone.
+graph TB
+    subgraph spanning["Span zones — global scope"]
+        L1["<b>L1 — Access layer</b><br/>S3 / FUSE / WebDAV / SDK gateways<br/>stateless"]
+        L2["<b>L2 — Global control plane</b><br/>namespace · placement · ACLs · registry<br/>global consensus"]
+        L3["<b>L3 — Cross-zone replication</b><br/>async chunk copy · global custodians<br/>off the data path"]
+    end
+    subgraph zonal["Within one zone — per datacenter"]
+        L4["<b>L4 — Zonal file system</b><br/>metadata store · D servers · custodians · client library"]
+        L5["<b>L5 — Bootstrap & coordination</b><br/>discovery · leader election · locks · config"]
+    end
+    L1 --- L2 --- L3 --- L4 --- L5

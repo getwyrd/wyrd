@@ -9,7 +9,7 @@ tags:
 ---
 # 1. Introduction and goals
 
-> Status: living document. Reflects decisions through the initial design phase. Open questions are marked **[OPEN]** inline.>
+> Status: living document. Reflects decisions through the initial design phase. Open questions are marked **[OPEN]** inline.
 
 ## 1.1 What this is
 
