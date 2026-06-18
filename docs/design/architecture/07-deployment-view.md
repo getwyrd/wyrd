@@ -12,15 +12,17 @@ tags:
 
 ## 7.1 The three deployment profiles
 
-The same codebase, composed differently. The composition lives in the `server` crate; switching profiles swaps backends behind the `ChunkStore`, `MetadataStore`, and `Coordination` traits.
+The same codebase, composed differently. The composition lives in the `server` crate; switching profiles swaps backends behind the `ChunkStore`, `MetadataStore`, `NamespaceStore`, and `Coordination` traits.
 
-| Profile | Coordination | Metadata | Chunk store | Durability | Status |
-|---------|--------------|----------|-------------|------------|--------|
-| Single binary (dev) | in-memory | redb (embedded) | filesystem | none / replication(1) | Dev & eval only (ADR-0014) |
-| Small multi-node | 3-node etcd | TiKV (small) / redb | local-disk D servers | replication(n) or rs(k,m) | Production |
-| Provider fleet | dedicated etcd per zone | TiKV | local-disk D servers | rs(k,m) | Production |
+| Profile | Coordination | Metadata (L4) | Global plane (L2/L3) | Chunk store | Durability | Status |
+|---------|--------------|---------------|----------------------|-------------|------------|--------|
+| Single binary (dev) | in-memory | redb (embedded) | none — single-zone | filesystem | none / replication(1) | Dev & eval only (ADR-0014) |
+| Small multi-node | 3-node etcd | TiKV (small) / redb | none — single-zone | local-disk D servers | replication(n) or rs(k,m) | Production |
+| Provider fleet | dedicated etcd per zone | TiKV | TiDB + L3 replication (multi-region) | local-disk D servers | rs(k,m) | Production |
 
 The single-binary profile collapses all components into one process: gateway, embedded metadata, one logical D server, custodians, in-memory coordination. It exists for development and evaluation and carries **no production durability promise** — a single chassis cannot deliver independent failure domains.
+
+**There is no separate L2/L3 below the multi-zone tier.** The single-binary and small-multi-node profiles are *single-zone*: there is one home zone, so file→home-zone is trivial and the global namespace folds into the zonal store — `NamespaceStore` is backed by the same redb instance as `MetadataStore`, and cross-zone replication (L3) does not exist. A distinct, geo-distributed **L2** (TiDB behind `NamespaceStore`, ADR-0020) and the **L3** replication layer appear only at the **provider-fleet** profile — the first genuinely multi-region tier. This is why the build order (section 9) puts L2/L3 last.
 
 ## 7.2 Deployment substrate (pluggable)
 
