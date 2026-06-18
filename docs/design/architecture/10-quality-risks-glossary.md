@@ -41,6 +41,7 @@ These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in 
 | Compile times on a large workspace | Slows iteration | Disciplined crate split (the trait boundaries are also compile-unit boundaries); start coarser, split as needed |
 | Treating etcd as a database | The classic L5 failure mode; etcd is wonderful until used as a store | Architectural rule: nothing data-proportional in L5; sized in kilobytes |
 | Spanner-class store operational weight | A full SQL store (TiDB, YugabyteDB) is heavy for L2 | Justified because L2 is small and off the data path; revisit only if it proves a bottleneck |
+| Key management as a new failure domain | Encryption puts the KMS on the read/write path for encrypted tenants; a KMS outage or a lost KEK is catastrophic | Pluggable `KeyService`; bounded-lifetime DEK caching; fail closed on KMS loss without losing ciphertext durability; KEK backups independent of the system (ADR-0021) |
 
 ### Conscious exclusions (not debt — decisions)
 
