@@ -53,7 +53,7 @@ A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph 
 
 - **chairs the architecture board** (below) — a **standing** role;
 - **retains a veto over any change to this governance document** (see *Amending this document*) — **standing**; it does not expire with the bootstrap;
-- holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and chair of the initial board (whose size/rule remain **[OPEN]** below) — which is **transitional** and dissolves once the board is constituted.
+- holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and chair of the initial board — which is **transitional** and dissolves once the board is constituted.
 
 Any further standing (e.g. emeritus) is **[OPEN]**.
 
