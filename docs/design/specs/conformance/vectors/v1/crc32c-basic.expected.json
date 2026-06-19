@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "flags": 0,
+  "checksum_algo": "crc32c",
+  "encryption_scheme": "none",
+  "ec_scheme_type": "none",
+  "ec_k": 1,
+  "ec_m": 0,
+  "ec_fragment_index": 0,
+  "chunk_id": "1339673755198158349044581307228491536",
+  "payload_length": "11",
+  "payload_hex": "68656c6c6f20777972640a"
+}

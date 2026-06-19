@@ -5,11 +5,21 @@
 //! must be readable by software written years later. The byte layout is fully
 //! specified in `docs/design/specs/chunk-format/v1.md` (ADR-0019).
 //!
-//! This crate is a **stub at Milestone 0.1**. The 44-byte v1 header
-//! encode/decode, the header and payload checksums, and the conformance reader
-//! land in Milestone 0.2 (issue #65).
+//! The format is **v0/unstable**: the layout may still change and is stamped
+//! `v1` only once validated by a second independent reader or a sustained
+//! fault-injection run (the spec's own rule).
 
 #![forbid(unsafe_code)]
+
+mod codec;
+mod error;
+mod header;
+
+pub use codec::{decode, encode, DecodedFragment};
+pub use error::FragmentError;
+pub use header::{
+    ChecksumAlgo, EcSchemeType, EncryptionScheme, FragmentHeader, CORE_HEADER_LEN, FLAG_ENCRYPTED,
+};
 
 /// The magic that begins every Wyrd fragment: ASCII `"WYRD"` (ADR-0019).
 pub const MAGIC: u32 = 0x5759_5244;

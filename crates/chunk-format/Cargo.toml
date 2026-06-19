@@ -9,3 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+crc32c.workspace = true
+
+[dev-dependencies]
+# Seeded round-trip property tests reuse the deterministic simulator (ADR-0009).
+wyrd-testkit.workspace = true

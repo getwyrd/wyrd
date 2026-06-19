@@ -1,0 +1,2 @@
+error: EncryptedPayloadUnsupported
+flags bit 0 is set; a v1 reader must refuse to return the payload
