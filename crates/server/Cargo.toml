@@ -16,3 +16,14 @@ path = "src/main.rs"
 wyrd-core.workspace = true
 wyrd-traits.workspace = true
 wyrd-coordination-mem.workspace = true
+
+[dev-dependencies]
+# `server` is the one crate that wires concretes (ADR-0010), so the four-phase
+# write-path integration tests live here, exercised against the real redb +
+# filesystem backends and seeded by testkit.
+wyrd-chunk-format.workspace = true
+wyrd-metadata-redb.workspace = true
+wyrd-chunkstore-fs.workspace = true
+wyrd-testkit.workspace = true
+pollster.workspace = true
+tempfile.workspace = true
