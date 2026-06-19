@@ -645,6 +645,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-coordination-mem"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "pollster",
+ "wyrd-traits",
+]
+
+[[package]]
 name = "wyrd-core"
 version = "0.0.0"
 dependencies = [
@@ -682,7 +692,9 @@ dependencies = [
 name = "wyrd-server"
 version = "0.0.0"
 dependencies = [
+ "wyrd-coordination-mem",
  "wyrd-core",
+ "wyrd-traits",
 ]
 
 [[package]]
