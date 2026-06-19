@@ -50,12 +50,9 @@ Maintainers review and **merge** contributions, triage, set day-to-day direction
 
 ### Founding maintainer
 
-A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. The founding maintainer is a full Maintainer, and additionally:
+A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. The founding maintainer is a full Maintainer who additionally holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and **chair** of the initial board. This authority is **transitional** and dissolves once the board is constituted (after which the board elects its own chair); the founding maintainer holds **no standing power** beyond it.
 
-- **retains a veto over any change to this governance document** (see *Amending this document*) — **standing**; it does not expire with the bootstrap;
-- holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and **chair** of the initial board — which is **transitional** and dissolves once the board is constituted (after which the board elects its own chair).
-
-The founding maintainer may be elected board chair like any member, but does not hold it automatically. The founding-maintainer role **voids after one year of inactivity** and is then **left empty** — not re-filled or inherited. Its standing power (the governance veto) lapses with it; the project then continues under the maintainers and the board.
+The founding maintainer may be elected board chair like any member, but does not hold it automatically. The founding-maintainer role **voids after one year of inactivity** and is then **left empty** — not re-filled or inherited; the project then continues under the maintainers and the board.
 
 ### Emeritus
 
@@ -80,10 +77,10 @@ The body with authority to **accept** and **supersede** the project's binding de
 | Enhancement proposal | `../design/proposals/` (draft → accepted) | Architecture board |
 | Specification version bump | `../design/specs/` (strict change process) | Architecture board |
 | Routine code change | Pull-request review | Maintainers |
-| Changes to *this* document | See below | Unanimous maintainers + founding-maintainer veto |
+| Changes to *this* document | See below | Unanimous maintainers |
 
 A **new feature** is never a routine change: it enters through an enhancement proposal (`../design/proposals/`) and is therefore the **architecture board's** decision, not an individual maintainer's merge.
 
 ## Amending this document
 
-Changes are made by pull request and require the **approval of all maintainers** (unanimous). The **founding maintainer additionally holds a veto** — no amendment takes effect over the founding maintainer's objection, even with unanimous maintainer approval. During bootstrap, with a single maintainer, that approval and the veto are the same person's.
+Changes are made by pull request and require the **approval of all maintainers** (unanimous). During bootstrap, with a single maintainer, that is the founding maintainer's approval alone.
