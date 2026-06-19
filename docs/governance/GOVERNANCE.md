@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the four-level participation ladder, the founding-maintainer bootstrap, and the architecture-board composition (below); the criteria and thresholds within each level remain **[OPEN]**. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
+> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the full four-level participation ladder (advancement, election thresholds, inactivity/removal, emeritus), the founding-maintainer powers, and the entire architecture board. The remaining **[OPEN]** items — noted inline — are the maintainers' day-to-day decision rule and who approves enhancement proposals, spec version bumps, and governance amendments. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
 
 ## Purpose
 
