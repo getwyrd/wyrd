@@ -633,6 +633,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-chunkstore-fs"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "pollster",
+ "tempfile",
+ "wyrd-chunk-format",
+ "wyrd-traits",
+]
+
+[[package]]
 name = "wyrd-core"
 version = "0.0.0"
 dependencies = [
