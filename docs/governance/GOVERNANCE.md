@@ -30,7 +30,7 @@ Participation is a ladder of four levels, each earned from the one below. Higher
 
 ### Contributor
 
-Anyone who opens an issue or a pull request. Contributions are accepted under the project's license and DCO sign-off (ADR-0003). No special status is required, and most participants never need more.
+Anyone who opens an issue or a pull request. Contributions are accepted under the project's license and DCO sign-off (ADR-0003), and everyone who participates is held to the [Code of Conduct](CODE_OF_CONDUCT.md). No special status is required, and most participants never need more.
 
 ### Associate
 
@@ -43,7 +43,7 @@ A contributor recognised for sustained, quality work, granted **triage** rights 
 
 Maintainers review and **merge** contributions, triage, set day-to-day direction, and **elect the architecture board** (below). **New maintainers are elected by the existing maintainers**, normally promoted from Associates.
 
-- **How one becomes a maintainer** — elected by the existing maintainers, from candidates with a **proven track record as a Contributor or Associate spanning at least a year**; confirmation is by a **unanimous vote of all existing maintainers**.
+- **How one becomes a maintainer** — elected by the existing maintainers, from candidates with a **proven track record as a Contributor or Associate spanning at least a year**; confirmation is by a **two-thirds majority of the existing maintainers**.
 - **Day-to-day decision rule** — a maintainer decides **individually** on routine pull requests; only changes that touch a **spec, proposal, or ADR** go to the architecture board.
 - **Inactivity:** a Maintainer is removed after **one year** of inactivity, and may later return as **emeritus** (below).
 - **Cadence:** the maintainers hold at least one meeting a year — the *"state of the solution"* — to review the project's direction.
@@ -52,23 +52,22 @@ Maintainers review and **merge** contributions, triage, set day-to-day direction
 
 A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. The founding maintainer is a full Maintainer, and additionally:
 
-- **chairs the architecture board** (below) — a **standing** role;
 - **retains a veto over any change to this governance document** (see *Amending this document*) — **standing**; it does not expire with the bootstrap;
-- holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and chair of the initial board — which is **transitional** and dissolves once the board is constituted.
+- holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and **chair** of the initial board — which is **transitional** and dissolves once the board is constituted (after which the board elects its own chair).
 
-The founding-maintainer role **voids after one year of inactivity** and is then **left empty** — not re-filled or inherited. Its standing powers (the board chair and the governance veto) lapse with it; the project then continues under the maintainers and the board.
+The founding maintainer may be elected board chair like any member, but does not hold it automatically. The founding-maintainer role **voids after one year of inactivity** and is then **left empty** — not re-filled or inherited. Its standing power (the governance veto) lapses with it; the project then continues under the maintainers and the board.
 
 ### Emeritus
 
-A former **Associate** or **Maintainer** — removed for inactivity, or having stepped down — holds **emeritus** standing. An emeritus may be **re-elected to their former level without re-proving the track record** it normally requires (the year as Contributor or Associate for a Maintainer; the contribution record for an Associate). The level's confirmation step still applies — a second maintainer's agreement for an Associate, a unanimous maintainer vote for a Maintainer.
+A former **Associate** or **Maintainer** — removed for inactivity, or having stepped down — holds **emeritus** standing. An emeritus may be **re-elected to their former level without re-proving the track record** it normally requires (the year as Contributor or Associate for a Maintainer; the contribution record for an Associate). The level's confirmation step still applies — a second maintainer's agreement for an Associate, a two-thirds maintainer vote for a Maintainer.
 
 ### Architecture board
 
 The body with authority to **accept** and **supersede** the project's binding decisions — **ADRs** (per [ADR-0001](../design/adr/0001-record-architecture-decisions.md)), **specifications**, and **enhancement proposals**. Its members are **elected by the maintainers** and **may be drawn from any participation level** — a board seat reflects judgement on the architecture, not rank on the ladder.
 
 - **Size:** **at least three** members.
-- **Chair:** the **founding maintainer**.
-- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle, and ratifies specifications and enhancement proposals through their own folder processes; ratification is by **simple majority** of the members, recorded as agreement on the pull request.
+- **Chair:** **elected by the board, unanimously** (during bootstrap the founding maintainer chairs — see below).
+- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle, and ratifies specifications and enhancement proposals through their own folder processes; ratification is by a **two-thirds majority** of the members, recorded as agreement on the pull request.
 - **Bootstrap — fewer than three members.** Until the board reaches three, the **chair (the founding maintainer) may make acceptance decisions**. To remain consistent with ADR-0001 — acceptance is never a single maintainer's act — these interim decisions are **provisional**: the board reviews and confirms them once it is constituted. *(If instead the chair's bootstrap acceptances are meant to be final, that is a true exception to ADR-0001 and must be enacted by a superseding ADR, not this document.)*
 - **Term:** elected members serve **two years** and may stand for re-election (the founding maintainer chairs *ex officio*, independent of these terms).
 - **Election procedure:** board members are elected by a **majority of the maintainers**.
