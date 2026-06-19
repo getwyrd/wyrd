@@ -68,41 +68,96 @@ pub trait ChunkStore: Send + Sync {
 /// The authoritative metadata store: inodes, dirents, chunk maps, the
 /// pending-chunk GC ledger, and version counters.
 ///
-/// It hosts the single atomic mutation that *is* the commit point (building-block
-/// view): a commit either lands in full or not at all. The request/outcome
-/// shapes are coarse placeholders at M0 and will be replaced by the `proto`
-/// commit messages as the four-phase protocol lands.
+/// Deliberately a **narrow key/value primitive** (ADR-0008): get, prefix scan,
+/// and a single atomic [`commit`](MetadataStore::commit) of a [`WriteBatch`]
+/// guarded by multi-key preconditions. Filesystem semantics — inode/dirent
+/// records, version compare-and-set, the pending-chunk ledger — are expressed
+/// *through* this primitive by the metadata model in `core`, never baked into
+/// the trait, which keeps the layer honest about the KV features it depends on
+/// and makes a backend swap (redb → TiKV) a composition change (ADR-0010).
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
     /// Read the raw value stored under `key`, if any.
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
 
-    /// Apply the commit as a single atomic mutation. This is the commit point;
-    /// it succeeds only if every effect lands together.
-    async fn commit(&self, mutation: CommitMutation) -> Result<CommitOutcome>;
+    /// Return every `(key, value)` whose key begins with `prefix`, e.g. every
+    /// dirent under a parent. Order is unspecified.
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>>;
 
-    /// Append a chunk id to the pending-chunk GC ledger, marking it
-    /// provisionally written but not yet referenced by a committed chunk map.
-    async fn ledger_append(&self, id: ChunkId) -> Result<()>;
-
-    /// Remove chunk ids from the GC ledger once they are referenced by a
-    /// committed chunk map (the ledger-sweep step of the write protocol).
-    async fn ledger_sweep(&self, ids: &[ChunkId]) -> Result<()>;
+    /// Apply `batch` as a single atomic mutation — the commit point. Either
+    /// every precondition holds and every put/delete lands, or nothing changes.
+    /// Returns [`CommitOutcome::Conflict`] (not `Err`) when a precondition fails,
+    /// so a stale writer is rejected distinguishably from a backend fault.
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome>;
 }
 
-/// A coarse placeholder for the atomic commit mutation. Replaced by the `proto`
-/// commit message once the four-phase protocol is implemented (M0.5).
+/// The result of a [`commit`](MetadataStore::commit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    /// All preconditions held; the batch was applied.
+    Committed,
+    /// A precondition did not hold; nothing was written (e.g. a stale-version
+    /// writer, or a name that already exists).
+    Conflict,
+}
+
+/// A precondition the store checks atomically before applying a [`WriteBatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Precondition {
+    /// The key whose current value is constrained.
+    pub key: Vec<u8>,
+    /// The required current value: `Some(bytes)` to require an exact match,
+    /// `None` to require the key be absent.
+    pub expected: Option<Bytes>,
+}
+
+/// A set of preconditions plus puts and deletes, applied atomically by
+/// [`commit`](MetadataStore::commit). Build it with the helpers below.
 #[derive(Debug, Clone, Default)]
-pub struct CommitMutation {
-    /// Opaque serialized mutation payload at M0.
-    pub payload: Bytes,
+pub struct WriteBatch {
+    /// Conditions that must all hold for the batch to apply.
+    pub preconditions: Vec<Precondition>,
+    /// Keys to set to the given values.
+    pub puts: Vec<(Vec<u8>, Bytes)>,
+    /// Keys to remove.
+    pub deletes: Vec<Vec<u8>>,
 }
 
-/// The result of a successful commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CommitOutcome {
-    /// The version counter value established by this commit.
-    pub version: u64,
+impl WriteBatch {
+    /// An empty batch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Require `key` to currently equal `value`.
+    pub fn require(mut self, key: impl Into<Vec<u8>>, value: impl Into<Bytes>) -> Self {
+        self.preconditions.push(Precondition {
+            key: key.into(),
+            expected: Some(value.into()),
+        });
+        self
+    }
+
+    /// Require `key` to currently be absent.
+    pub fn require_absent(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.preconditions.push(Precondition {
+            key: key.into(),
+            expected: None,
+        });
+        self
+    }
+
+    /// Set `key` to `value`.
+    pub fn put(mut self, key: impl Into<Vec<u8>>, value: impl Into<Bytes>) -> Self {
+        self.puts.push((key.into(), value.into()));
+        self
+    }
+
+    /// Remove `key`.
+    pub fn delete(mut self, key: impl Into<Vec<u8>>) -> Self {
+        self.deletes.push(key.into());
+        self
+    }
 }
 
 /// Bootstrap and coordination (L5): service discovery, leader election, locks

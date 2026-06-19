@@ -6,6 +6,6 @@
 //! seams, never on concrete backends — only the `server` binary wires
 //! concretes (ADR-0010).
 //!
-//! Stub at Milestone 0.1.
-
 #![forbid(unsafe_code)]
+
+pub mod metadata;
