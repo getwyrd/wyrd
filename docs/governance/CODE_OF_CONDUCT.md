@@ -1,15 +1,15 @@
 ---
 created: 19.06.2026 17:35
 type: governance
-status: draft
+status: adopted
 tags:
   - governance
   - code-of-conduct
   - values
 ---
-# Contributor Covenant 3.0 Code of Conduct
+# Code of Conduct — adoption of Contributor Covenant 3.0 
 
-> **Status: DRAFT — pending ratification.** Wyrd adopts the [Contributor Covenant 3.0](https://www.contributor-covenant.org/version/3/0/) (below). The **project principles** below adapt [The Apache Way](https://apache.org/theapacheway/). In Wyrd, the Covenant's "Community Moderators" are the **maintainers and the architecture board**; violations are reported to **policy@getwyrd.dev**; and removing an Associate, Maintainer, or board member as enforcement follows the *Removal for cause* process in [GOVERNANCE.md](GOVERNANCE.md). Contributor Covenant 3.0 is licensed CC BY-SA 4.0; this adaptation is shared under the same licence.
+> **Status: ADOPTED.** Wyrd adopts the [Contributor Covenant 3.0](https://www.contributor-covenant.org/version/3/0/) (below). The **project principles** below adapt [The Apache Way](https://apache.org/theapacheway/). In Wyrd, the Covenant's "Community Moderators" are the **maintainers and the architecture board**; violations are reported to **policy@getwyrd.dev**; and removing an Associate, Maintainer, or board member as enforcement follows the *Removal for cause* process in [GOVERNANCE.md](GOVERNANCE.md). Contributor Covenant 3.0 is licensed CC BY-SA 4.0; this adaptation is shared under the same licence.
 
 ## Project principles
 

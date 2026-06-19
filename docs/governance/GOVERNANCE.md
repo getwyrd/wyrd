@@ -1,7 +1,7 @@
 ---
 created: 17.06.2026 00:56
 type: governance
-status: draft
+status: ratified
 tags:
   - governance
   - process
@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — complete, pending ratification.** This records the project's decision-making structure. All roles, the architecture board, and the amendment process are now specified — **no [OPEN] items remain**. Under the amendment rule below, ratification is the unanimous act of the maintainers (currently just the founding maintainer); merging this document is that act.
+> **Status: RATIFIED.** This records the project's decision-making structure — roles, the architecture board, and the decision and amendment processes. Ratified by the founding maintainer (the sole maintainer during bootstrap) per the amendment rule below; further changes follow that process.
 
 ## Purpose
 
@@ -92,6 +92,8 @@ This is the enforcement backstop the Code of Conduct refers to: deliberate and d
 | Removal for cause | *Removal for cause* (above) | Two maintainers (Associate); two-thirds (Maintainer, board) |
 
 A **new feature** is never a routine change: it enters through an enhancement proposal (`../design/proposals/`) and is therefore the **architecture board's** decision, not an individual maintainer's merge.
+
+An ADR — and likewise a specification or proposal — is moved to **Accepted** only when it carries **no unresolved `[OPEN]` items**: open questions must be resolved, or deferred to a named follow-up, before ratification.
 
 ## Amending this document
 
