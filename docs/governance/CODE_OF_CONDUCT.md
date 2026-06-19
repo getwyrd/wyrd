@@ -9,15 +9,19 @@ tags:
 ---
 # Contributor Covenant 3.0 Code of Conduct
 
-> **Status: DRAFT — pending ratification.** Wyrd adopts the [Contributor Covenant 3.0](https://www.contributor-covenant.org/version/3/0/) (below). The **Values** below state what Wyrd is built to achieve. In Wyrd, the Covenant's "Community Moderators" are the **maintainers and the architecture board**; violations are reported to **policy@getwyrd.dev**; and removing an Associate, Maintainer, or board member as enforcement follows the *Removal for cause* process in [GOVERNANCE.md](GOVERNANCE.md). Contributor Covenant 3.0 is licensed CC BY-SA 4.0; this adaptation is shared under the same licence.
+> **Status: DRAFT — pending ratification.** Wyrd adopts the [Contributor Covenant 3.0](https://www.contributor-covenant.org/version/3/0/) (below). The **project principles** below adapt [The Apache Way](https://apache.org/theapacheway/). In Wyrd, the Covenant's "Community Moderators" are the **maintainers and the architecture board**; violations are reported to **policy@getwyrd.dev**; and removing an Associate, Maintainer, or board member as enforcement follows the *Removal for cause* process in [GOVERNANCE.md](GOVERNANCE.md). Contributor Covenant 3.0 is licensed CC BY-SA 4.0; this adaptation is shared under the same licence.
 
-## Values
+## Project principles
 
-These are the values Wyrd exists to advance — what the project is *for*:
+Wyrd's project principles adapt **[The Apache Way](https://apache.org/theapacheway/)** — the operating philosophy of the Apache Software Foundation:
 
-- **Competition.** Hyperscale storage has been the preserve of a few giants who keep the software private, so anyone building at global scale must rent it from them. Wyrd is the open foundation that breaks that moat: any provider, or any open-source system, can build a worldwide-scalable storage product on it and compete with the incumbents on merit, not access.
-- **Sovereignty.** Whoever runs Wyrd controls it. It is fully open, vendor-neutral, and assembled from dependencies chosen for control-resilience (ADR-0003) — no single vendor, platform, or jurisdiction can lock you in, pull the rug, or dictate terms. Operators keep their data, their infrastructure, and their freedom to leave.
-- **Worldwide equality.** Exabyte-scale, atomically-consistent storage should not be the privilege of the wealthy or the well-located. Wyrd puts the foundation that a handful of hyperscalers hold today into the hands of a small provider, a public institution, or a startup anywhere — leveling access to the substrate the modern internet runs on.
+- **Community over code.** A healthy community is the higher priority; strong communities fix code problems, and the foundation is meant to outlast any single contribution or contributor.
+- **Earned authority.** Everyone may take part; influence is earned through publicly visible merit, not employer or title. Merit does not expire — hence the emeritus path back into a former role.
+- **A community of peers.** People take part as individuals, not as organizations; roles carry responsibility, not rank.
+- **Open communication.** Decisions about the code and the project are made in the open and on the record — issues, pull requests, ADRs, and proposals — so anyone can follow along and join asynchronously.
+- **Consensus, with a vote to unblock.** We seek consensus to keep momentum; where a decision must be forced, the documented maintainer and board thresholds resolve it.
+- **Responsible oversight.** Governance is principles-based and self-governing: peer review, license compliance (DCO — ADR-0003), security, and care for the community are shared duties — the maintainers' and the board's most of all.
+- **Independence.** Wyrd is vendor-neutral: no organization gains special privilege or directional control through employment or sponsorship.
 
 ## Our Pledge
 
