@@ -1,7 +1,7 @@
 ---
 created: 13.06.2026 11:57
 type: adr
-status: Proposed
+status: Accepted
 tags:
   - adr
   - testing
