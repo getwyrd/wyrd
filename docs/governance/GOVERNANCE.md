@@ -37,15 +37,16 @@ Anyone who opens an issue or a pull request. Contributions are accepted under th
 A contributor recognised for sustained, quality work, granted **triage** rights — labelling, assigning, and shepherding issues and pull requests, and reviewing — but **without merge authority**. It is the deliberate step between Contributor and Maintainer: trusted people help run the project before they hold the keys, and it is where a prospective maintainer is observed.
 
 - **How one becomes an Associate** — **nominated by a maintainer** for a track record of good contributions, and approved once a **second maintainer agrees** (two maintainers suffice).
-- **Inactivity / removal:** **[OPEN]**.
+- **Inactivity:** an Associate is removed after **six months** of inactivity, and may later return as **emeritus** (below).
 
 ### Maintainer
 
 Maintainers review and **merge** contributions, triage, set day-to-day direction, and **elect the architecture board** (below). **New maintainers are elected by the existing maintainers**, normally promoted from Associates.
 
-- **How one becomes a maintainer** — elected by the existing maintainers, from candidates with a **proven track record as a Contributor or Associate spanning at least a year**; the confirmation threshold remains **[OPEN]**.
+- **How one becomes a maintainer** — elected by the existing maintainers, from candidates with a **proven track record as a Contributor or Associate spanning at least a year**; confirmation is by a **unanimous vote of all existing maintainers**.
 - **Day-to-day decision rule** for routine changes (e.g. lazy consensus on pull requests): **[OPEN]**.
-- **Inactivity / removal policy:** **[OPEN]**.
+- **Inactivity:** a Maintainer is removed after **one year** of inactivity, and may later return as **emeritus** (below).
+- **Cadence:** the maintainers hold at least one meeting a year — the *"state of the solution"* — to review the project's direction.
 
 ### Founding maintainer
 
@@ -55,7 +56,11 @@ A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph 
 - **retains a veto over any change to this governance document** (see *Amending this document*) — **standing**; it does not expire with the bootstrap;
 - holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and chair of the initial board — which is **transitional** and dissolves once the board is constituted.
 
-Any further standing (e.g. emeritus) is **[OPEN]**.
+Any further standing for the founding maintainer beyond the bootstrap (e.g. a permanent role) is **[OPEN]**.
+
+### Emeritus
+
+A former **Associate** or **Maintainer** — removed for inactivity, or having stepped down — holds **emeritus** standing. An emeritus may be **re-elected to their former level without re-proving the track record** it normally requires (the year as Contributor or Associate for a Maintainer; the contribution record for an Associate). The level's confirmation step still applies — a second maintainer's agreement for an Associate, a unanimous maintainer vote for a Maintainer.
 
 ### Architecture board
 
