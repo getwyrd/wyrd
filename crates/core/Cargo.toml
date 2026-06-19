@@ -12,3 +12,6 @@ publish.workspace = true
 wyrd-traits.workspace = true
 wyrd-proto.workspace = true
 wyrd-chunk-format.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true

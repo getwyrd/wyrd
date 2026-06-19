@@ -1,0 +1,22 @@
+[package]
+name = "wyrd-metadata-redb"
+description = "redb-backed MetadataStore implementation: embedded, pure-Rust, single-process (ADR-0008). Concrete backend wired in by `server`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+wyrd-traits.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+redb.workspace = true
+
+[dev-dependencies]
+# The conformance/property tests exercise the model (core) against a real redb
+# store, driven by pollster (sync redb never yields) and seeded by testkit.
+wyrd-core.workspace = true
+wyrd-testkit.workspace = true
+pollster.workspace = true
