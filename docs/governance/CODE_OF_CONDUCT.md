@@ -9,15 +9,13 @@ tags:
 ---
 # Code of Conduct
 
-> **Status: DRAFT.** Inspired by the [Apache Software Foundation Code of Conduct](https://www.apache.org/foundation/policies/conduct.html); the **Values** below adapt [The Apache Way](https://apache.org/theapacheway/). The reporting contact must be filled in before ratification. Referenced by [GOVERNANCE.md](GOVERNANCE.md).
+> **Status: DRAFT — pending ratification.** Referenced by [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Scope
 
 This Code of Conduct applies to everyone who takes part in the Wyrd project — contributors, associates, maintainers, and the architecture board — in every project space: repositories, issues and pull requests, discussions, chat, and any event held in the project's name.
 
 ## Values
-
-Wyrd's values adapt **[The Apache Way](https://apache.org/theapacheway/)** — the operating philosophy of the Apache Software Foundation — to this project:
 
 - **Community over code.** A healthy community is the higher priority; strong communities fix code problems, and the foundation is meant to outlast any single contribution or contributor.
 - **Earned authority.** Everyone may take part; influence is earned through publicly visible merit, not employer or title. Merit does not expire — hence the emeritus path back into a former role.
@@ -40,11 +38,11 @@ In the spirit of the Apache Software Foundation's Code of Conduct, we ask everyo
 
 ## Unacceptable behaviour
 
-Harassment, discrimination, personal attacks, sustained disruption, publishing others' private information, and any conduct that would reasonably make others feel unsafe or unwelcome are not tolerated, in any project space.
+Harassment, discrimination, personal attacks, sustained disruption, publishing others' private information, and any conduct that would reasonably make others feel unsafe or unwelcome are not tolerated.
 
 ## Reporting and enforcement
 
-If you believe someone is violating this Code of Conduct, report it to **TBD** — a confidential contact to be designated before ratification. Reports are handled discreetly. The maintainers and the architecture board are responsible for clarifying and enforcing this Code and may take any action they deem appropriate, up to and including removal from the project.
+If you believe someone is violating this Code of Conduct, report it to **policy@getwyrd.dev**. Reports are handled discreetly. The maintainers and the architecture board are responsible for clarifying and enforcing this Code and may take any action they deem appropriate, up to and including removal from the project.
 
 ---
 

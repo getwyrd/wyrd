@@ -84,3 +84,7 @@ A **new feature** is never a routine change: it enters through an enhancement pr
 ## Amending this document
 
 Changes are made by pull request and require the **approval of all maintainers** (unanimous). During bootstrap, with a single maintainer, that is the founding maintainer's approval alone.
+
+## Contact
+
+Questions or concerns about governance, conduct, or project policy: **policy@getwyrd.dev**.
