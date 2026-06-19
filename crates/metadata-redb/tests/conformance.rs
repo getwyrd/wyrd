@@ -214,10 +214,10 @@ fn version_cas_rejects_a_stale_writer() {
             let map_a: Vec<u128> = vec![sim.gen(), sim.gen()];
             let map_b: Vec<u128> = vec![sim.gen()];
 
-            let a = metadata::commit_chunk_map(&s, id, &prior, map_a.clone())
+            let a = metadata::commit_chunk_map(&s, id, &prior, map_a.clone(), prior.size)
                 .await
                 .unwrap();
-            let b = metadata::commit_chunk_map(&s, id, &prior, map_b)
+            let b = metadata::commit_chunk_map(&s, id, &prior, map_b, prior.size)
                 .await
                 .unwrap();
             assert_eq!(

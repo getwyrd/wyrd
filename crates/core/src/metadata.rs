@@ -143,18 +143,19 @@ pub async fn rename(
     store.commit(batch).await
 }
 
-/// Commit a chunk map onto an inode at the commit point, bumping its version
-/// **conditional on the prior record** (full-value compare-and-set). A writer
-/// holding a stale `prior` loses with [`CommitOutcome::Conflict`]; exactly one
-/// concurrent writer wins.
+/// Commit a chunk map and size onto an inode at the commit point, bumping its
+/// version **conditional on the prior record** (full-value compare-and-set). A
+/// writer holding a stale `prior` loses with [`CommitOutcome::Conflict`];
+/// exactly one concurrent writer wins.
 pub async fn commit_chunk_map(
     store: &impl MetadataStore,
     id: InodeId,
     prior: &InodeRecord,
     chunk_map: Vec<ChunkId>,
+    size: u64,
 ) -> Result<CommitOutcome> {
     let next = InodeRecord {
-        size: prior.size,
+        size,
         chunk_map,
         state: InodeState::Committed,
         version: prior.version + 1,

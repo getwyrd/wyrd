@@ -692,8 +692,14 @@ dependencies = [
 name = "wyrd-server"
 version = "0.0.0"
 dependencies = [
+ "pollster",
+ "tempfile",
+ "wyrd-chunk-format",
+ "wyrd-chunkstore-fs",
  "wyrd-coordination-mem",
  "wyrd-core",
+ "wyrd-metadata-redb",
+ "wyrd-testkit",
  "wyrd-traits",
 ]
 
