@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the full four-level participation ladder (advancement, election thresholds, inactivity/removal, emeritus), the founding-maintainer powers, and the entire architecture board. The remaining **[OPEN]** items — noted inline — are the maintainers' day-to-day decision rule and who approves enhancement proposals, spec version bumps, and governance amendments. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
+> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the full four-level participation ladder (advancement, election thresholds, inactivity/removal, emeritus), the founding-maintainer powers, and the entire architecture board. The remaining **[OPEN]** items — noted inline — are the maintainers' day-to-day decision rule, the founding maintainer's role beyond the bootstrap, and the wider governance-amendment rule. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
 
 ## Purpose
 
@@ -64,11 +64,11 @@ A former **Associate** or **Maintainer** — removed for inactivity, or having s
 
 ### Architecture board
 
-The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../design/adr/0001-record-architecture-decisions.md). Its members are **elected by the maintainers** and **may be drawn from any participation level** — a board seat reflects judgement on the architecture, not rank on the ladder.
+The body with authority to **accept** and **supersede** the project's binding decisions — **ADRs** (per [ADR-0001](../design/adr/0001-record-architecture-decisions.md)), **specifications**, and **enhancement proposals**. Its members are **elected by the maintainers** and **may be drawn from any participation level** — a board seat reflects judgement on the architecture, not rank on the ladder.
 
 - **Size:** **at least three** members.
 - **Chair:** the **founding maintainer**.
-- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle; ratification is by **simple majority** of the members, recorded as agreement on the ADR's pull request.
+- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle, and ratifies specifications and enhancement proposals through their own folder processes; ratification is by **simple majority** of the members, recorded as agreement on the pull request.
 - **Bootstrap — fewer than three members.** Until the board reaches three, the **chair (the founding maintainer) may make acceptance decisions**. To remain consistent with ADR-0001 — acceptance is never a single maintainer's act — these interim decisions are **provisional**: the board reviews and confirms them once it is constituted. *(If instead the chair's bootstrap acceptances are meant to be final, that is a true exception to ADR-0001 and must be enacted by a superseding ADR, not this document.)*
 - **Term:** elected members serve **two years** and may stand for re-election (the founding maintainer chairs *ex officio*, independent of these terms).
 - **Election procedure:** board members are elected by a **majority of the maintainers**.
@@ -78,8 +78,8 @@ The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../
 | Decision type | Process | Authority |
 |---------------|---------|-----------|
 | Architecture decision (ADR) | [ADR-0001](../design/adr/0001-record-architecture-decisions.md) lifecycle (Proposed → Accepted → Superseded) | Architecture board |
-| Enhancement proposal | `../design/proposals/` (draft → accepted) | **[OPEN]** — board, maintainers, or both |
-| Specification version bump | `../design/specs/` (strict change process) | **[OPEN]** |
+| Enhancement proposal | `../design/proposals/` (draft → accepted) | Architecture board |
+| Specification version bump | `../design/specs/` (strict change process) | Architecture board |
 | Routine code change | Pull-request review | Maintainers |
 | Changes to *this* document | See below | Founding-maintainer veto; wider rule **[OPEN]** |
 
