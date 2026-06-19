@@ -36,7 +36,7 @@ Anyone who opens an issue or a pull request. Contributions are accepted under th
 
 A contributor recognised for sustained, quality work, granted **triage** rights — labelling, assigning, and shepherding issues and pull requests, and reviewing — but **without merge authority**. It is the deliberate step between Contributor and Maintainer: trusted people help run the project before they hold the keys, and it is where a prospective maintainer is observed.
 
-- **How one becomes an Associate** — nominated by a maintainer for a track record of good contributions; confirmation rule **[OPEN]**.
+- **How one becomes an Associate** — **nominated by a maintainer** for a track record of good contributions, and approved once a **second maintainer agrees** (two maintainers suffice).
 - **Inactivity / removal:** **[OPEN]**.
 
 ### Maintainer
@@ -63,7 +63,7 @@ The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../
 
 - **Size:** **at least three** members.
 - **Chair:** the **founding maintainer**.
-- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle: its agreement on an ADR's pull request *is* the ratification. The numeric threshold among the members (simple majority vs. full consensus) is **[OPEN]**.
+- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle; ratification is by **simple majority** of the members, recorded as agreement on the ADR's pull request.
 - **Bootstrap — fewer than three members.** Until the board reaches three, the **chair (the founding maintainer) may make acceptance decisions**. To remain consistent with ADR-0001 — acceptance is never a single maintainer's act — these interim decisions are **provisional**: the board reviews and confirms them once it is constituted. *(If instead the chair's bootstrap acceptances are meant to be final, that is a true exception to ADR-0001 and must be enacted by a superseding ADR, not this document.)*
 - **Term:** elected members serve **two years** and may stand for re-election (the founding maintainer chairs *ex officio*, independent of these terms).
 - **Election procedure:** board members are elected by a **majority of the maintainers**.
