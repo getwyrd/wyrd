@@ -1,0 +1,19 @@
+[package]
+name = "wyrd-chunkstore-fs"
+description = "Filesystem-backed ChunkStore: stores fragment bytes by chunk id and verifies their self-describing checksums (ADR-0010, ADR-0019). A 'D server' in the small."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+wyrd-traits.workspace = true
+wyrd-chunk-format.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+pollster.workspace = true
+tempfile.workspace = true
