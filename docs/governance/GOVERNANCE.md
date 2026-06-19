@@ -43,15 +43,19 @@ A contributor recognised for sustained, quality work, granted **triage** rights 
 
 Maintainers review and **merge** contributions, triage, set day-to-day direction, and **elect the architecture board** (below). **New maintainers are elected by the existing maintainers**, normally promoted from Associates.
 
-- **How one becomes a maintainer** — elected by the existing maintainers; nomination criteria and confirmation threshold **[OPEN]**.
+- **How one becomes a maintainer** — elected by the existing maintainers, from candidates with a **proven track record as a Contributor or Associate spanning at least a year**; the confirmation threshold remains **[OPEN]**.
 - **Day-to-day decision rule** for routine changes (e.g. lazy consensus on pull requests): **[OPEN]**.
 - **Inactivity / removal policy:** **[OPEN]**.
 
 ### Founding maintainer
 
-A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. The founding maintainer is a full Maintainer plus the **bootstrap authority** the genesis requires: until a second maintainer is elected, they hold the maintainer role solely and are the sole elector of the initial architecture board (whose size and election rule remain **[OPEN]** below).
+A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. The founding maintainer is a full Maintainer, and additionally:
 
-- The bootstrap authority is **transitional** — it exists only until the maintainer group and the board are established. Whether the founding maintainer keeps any standing afterward (e.g. tie-break, emeritus) is **[OPEN]**.
+- **chairs the architecture board** (below) — a **standing** role;
+- **retains a veto over any change to this governance document** (see *Amending this document*) — **standing**; it does not expire with the bootstrap;
+- holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and chair of the initial board (whose size/rule remain **[OPEN]** below) — which is **transitional** and dissolves once the board is constituted.
+
+Any further standing (e.g. emeritus) is **[OPEN]**.
 
 ### Architecture board
 
@@ -72,8 +76,8 @@ The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../
 | Enhancement proposal | `../design/proposals/` (draft → accepted) | **[OPEN]** — board, maintainers, or both |
 | Specification version bump | `../design/specs/` (strict change process) | **[OPEN]** |
 | Routine code change | Pull-request review | Maintainers |
-| Changes to *this* document | See below | **[OPEN]** |
+| Changes to *this* document | See below | Founding-maintainer veto; wider rule **[OPEN]** |
 
 ## Amending this document
 
-**[OPEN]** — the process for changing governance itself (who approves, and by what majority) is not yet decided. Until it is, this document remains a DRAFT and is authoritative only for the parts that restate an accepted ADR.
+Changes are made by pull request. The **founding maintainer retains a veto** over any governance change — no amendment takes effect over the founding maintainer's objection. The wider approval rule (which body proposes and ratifies an amendment, and by what majority, alongside that veto) remains **[OPEN]**. Until it is settled, this document remains a DRAFT, authoritative only for the parts that restate an accepted ADR or record a decision the founding maintainer has made.
