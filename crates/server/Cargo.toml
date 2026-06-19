@@ -1,6 +1,6 @@
 [package]
 name = "wyrd-server"
-description = "The single binary that wires concrete backends behind the trait seams (ADR-0010). Stub at M0.1."
+description = "The Wyrd single binary and S3 gateway: the one crate that wires concrete backends behind the trait seams (ADR-0010)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,17 +13,18 @@ name = "wyrd"
 path = "src/main.rs"
 
 [dependencies]
+# `server` is the one crate that knows concretes (ADR-0010): it wires the redb
+# metadata store, the filesystem chunk store, and the in-memory coordination
+# behind the trait seams.
 wyrd-core.workspace = true
 wyrd-traits.workspace = true
-wyrd-coordination-mem.workspace = true
-
-[dev-dependencies]
-# `server` is the one crate that wires concretes (ADR-0010), so the four-phase
-# write-path integration tests live here, exercised against the real redb +
-# filesystem backends and seeded by testkit.
-wyrd-chunk-format.workspace = true
 wyrd-metadata-redb.workspace = true
 wyrd-chunkstore-fs.workspace = true
-wyrd-testkit.workspace = true
+wyrd-coordination-mem.workspace = true
+bytes.workspace = true
 pollster.workspace = true
+
+[dev-dependencies]
+wyrd-chunk-format.workspace = true
+wyrd-testkit.workspace = true
 tempfile.workspace = true

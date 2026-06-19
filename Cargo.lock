@@ -692,6 +692,7 @@ dependencies = [
 name = "wyrd-server"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "pollster",
  "tempfile",
  "wyrd-chunk-format",
