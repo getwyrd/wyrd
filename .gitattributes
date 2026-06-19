@@ -1,0 +1,4 @@
+# Conformance vectors are raw fragment bytes against the normative on-disk
+# format (ADR-0002/ADR-0019). They must round-trip byte-for-byte on every
+# platform, so git must never apply text/line-ending normalization to them.
+*.fragment binary

@@ -1,0 +1,2 @@
+error: TruncatedHeader
+buffer is shorter than the 44-byte core header

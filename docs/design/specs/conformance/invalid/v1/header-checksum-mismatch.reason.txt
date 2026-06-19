@@ -1,0 +1,2 @@
+error: HeaderChecksumMismatch
+a header byte was altered without updating header_checksum

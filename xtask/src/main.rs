@@ -10,6 +10,9 @@
 
 #![forbid(unsafe_code)]
 
+mod conformance;
+mod vectors;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -18,6 +21,7 @@ fn main() -> ExitCode {
     let result = match task.as_deref() {
         Some("ci") => run_ci(),
         Some("conformance") => run_conformance(),
+        Some("gen-vectors") => run_gen_vectors(),
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
             print_usage();
@@ -39,7 +43,7 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!("usage: cargo xtask <ci|conformance>");
+    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors>");
 }
 
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
@@ -62,24 +66,57 @@ fn run_ci() -> Result<(), String> {
     Ok(())
 }
 
-/// Run the format conformance vectors against the reference reader.
-///
-/// Stub at M0.1: there is no reader and there are no vectors yet, so this
-/// reports an empty run and succeeds. M0.2 (issue #65) replaces this with a
-/// walk of `docs/design/specs/conformance/{vectors,invalid}/v1/`.
+/// Run the committed conformance vectors against the reference reader.
 fn run_conformance() -> Result<(), String> {
-    let vectors = workspace_root().join("docs/design/specs/conformance/vectors/v1");
-    if vectors.is_dir() {
-        // Defensive: once #65 lands the vectors, this stub must not silently
-        // pass them. Fail loudly so the placeholder is replaced.
-        return Err(format!(
-            "conformance vectors exist at {} but the reader is still the M0.1 stub; \
-             implement the reader (issue #65)",
-            vectors.display()
-        ));
+    conformance::run()
+}
+
+/// (Re)generate the committed conformance vectors deterministically. Run by a
+/// maintainer when the vector set changes; CI runs `conformance` (read-only),
+/// never this. The produced bytes must be byte-identical run to run.
+fn run_gen_vectors() -> Result<(), String> {
+    use std::fs;
+
+    let valid_dir = vectors::valid_dir();
+    let invalid_dir = vectors::invalid_dir();
+    fs::create_dir_all(&valid_dir).map_err(|e| format!("{}: {e}", valid_dir.display()))?;
+    fs::create_dir_all(&invalid_dir).map_err(|e| format!("{}: {e}", invalid_dir.display()))?;
+
+    for v in vectors::valid_vectors() {
+        let bytes = wyrd_chunk_format::encode(&v.header, &v.payload);
+        // Build expected.json from a real decode, so it matches the reader exactly.
+        let decoded = wyrd_chunk_format::decode(&bytes)
+            .map_err(|e| format!("generated `{}` does not decode: {e}", v.name))?;
+        let expected = vectors::ExpectedFragment::from_decoded(&decoded);
+        let json = serde_json::to_string_pretty(&expected)
+            .map_err(|e| format!("serialize {}: {e}", v.name))?;
+
+        write(&valid_dir.join(format!("{}.fragment", v.name)), &bytes)?;
+        write(
+            &valid_dir.join(format!("{}.expected.json", v.name)),
+            format!("{json}\n").as_bytes(),
+        )?;
     }
-    println!("xtask conformance: no vectors yet (M0.1 stub; reader lands in M0.2)");
+
+    for v in vectors::invalid_vectors() {
+        let reason = format!("error: {}\n{}\n", v.expected_variant, v.reason);
+        write(&invalid_dir.join(format!("{}.fragment", v.name)), &v.bytes)?;
+        write(
+            &invalid_dir.join(format!("{}.reason.txt", v.name)),
+            reason.as_bytes(),
+        )?;
+    }
+
+    println!(
+        "xtask gen-vectors: wrote vectors to {} and {}",
+        valid_dir.display(),
+        invalid_dir.display()
+    );
     Ok(())
+}
+
+fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Run `cargo deny check` — the machine-checked license + advisory wall
@@ -136,7 +173,7 @@ fn is_ci() -> bool {
 
 /// The workspace root, derived from this crate's manifest directory
 /// (`<root>/xtask`).
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask crate is nested under the workspace root")
