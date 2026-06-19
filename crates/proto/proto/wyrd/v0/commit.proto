@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+// Minimal commit wire shapes for Milestone 0. The commit is the single atomic
+// mutation in the metadata store (building-block view); these shapes are coarse
+// and will firm up as the four-phase protocol lands (M0.5).
+package wyrd.v0;
+
+import "wyrd/v0/chunk.proto";
+
+message CommitRequest {
+  // Path being committed, relative to the namespace root.
+  string path = 1;
+  // The chunk ids that make up the object's content, in order.
+  repeated ChunkId chunks = 2;
+  // Total object length in bytes.
+  uint64 length = 3;
+}
+
+message CommitResponse {
+  // The version counter value established by this commit.
+  uint64 version = 1;
+}

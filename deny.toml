@@ -1,0 +1,38 @@
+# The machine-checked dependency wall (ADR-0003 §2): a permissive license
+# allowlist that denies adopter-infecting copyleft (AGPL) and source-available
+# "paywall" licenses (BSL/SSPL), plus the RUSTSEC advisory database. A
+# contribution that pulls in a disqualified license or a vulnerable crate fails
+# `cargo deny check` in CI.
+
+[advisories]
+# Fail on any RUSTSEC advisory for a crate in the dependency graph.
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive / clearly-licensed only (ADR-0003 §2). This list is the set
+# currently encountered in the dependency graph; anything not on it is a build
+# failure, so adding a new license is a deliberate, reviewed decision — exactly
+# the "encode the test" intent of ADR-0003.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Foundation for later dependency hygiene; nothing banned outright yet.
+multiple-versions = "allow"
+wildcards = "deny"
+# Internal workspace crates are referenced by path and so carry a wildcard
+# version; that is expected and not the registry-wildcard hazard we deny.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

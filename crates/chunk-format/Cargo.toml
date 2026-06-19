@@ -1,0 +1,11 @@
+[package]
+name = "wyrd-chunk-format"
+description = "Reference encoder/decoder for the versioned on-disk fragment format (ADR-0019). Stub at M0.1; the v1 header codec lands in M0.2."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]

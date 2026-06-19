@@ -1,0 +1,4 @@
+# `cargo xtask <thing>` runs the project's automation without a working `make`
+# on any OS (ADR-0016).
+[alias]
+xtask = "run --quiet --package xtask --"

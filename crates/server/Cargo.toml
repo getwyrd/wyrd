@@ -1,0 +1,16 @@
+[package]
+name = "wyrd-server"
+description = "The single binary that wires concrete backends behind the trait seams (ADR-0010). Stub at M0.1."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wyrd"
+path = "src/main.rs"
+
+[dependencies]
+wyrd-core.workspace = true
