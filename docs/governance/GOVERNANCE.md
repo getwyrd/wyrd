@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Firm so far: the parts anchored in an accepted ADR, the full four-level participation ladder (advancement, election thresholds, inactivity/removal, emeritus), the founding-maintainer powers, and the entire architecture board. The remaining **[OPEN]** items — noted inline — are the maintainers' day-to-day decision rule, the founding maintainer's role beyond the bootstrap, and the wider governance-amendment rule. Everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
+> **Status: DRAFT — complete, pending ratification.** This records the project's decision-making structure. All roles, the architecture board, and the amendment process are now specified — **no [OPEN] items remain**. Under the amendment rule below, ratification is the unanimous act of the maintainers (currently just the founding maintainer); merging this document is that act.
 
 ## Purpose
 
@@ -44,7 +44,7 @@ A contributor recognised for sustained, quality work, granted **triage** rights 
 Maintainers review and **merge** contributions, triage, set day-to-day direction, and **elect the architecture board** (below). **New maintainers are elected by the existing maintainers**, normally promoted from Associates.
 
 - **How one becomes a maintainer** — elected by the existing maintainers, from candidates with a **proven track record as a Contributor or Associate spanning at least a year**; confirmation is by a **unanimous vote of all existing maintainers**.
-- **Day-to-day decision rule** for routine changes (e.g. lazy consensus on pull requests): **[OPEN]**.
+- **Day-to-day decision rule** — a maintainer decides **individually** on routine pull requests; only changes that touch a **spec, proposal, or ADR** go to the architecture board.
 - **Inactivity:** a Maintainer is removed after **one year** of inactivity, and may later return as **emeritus** (below).
 - **Cadence:** the maintainers hold at least one meeting a year — the *"state of the solution"* — to review the project's direction.
 
@@ -56,7 +56,7 @@ A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph 
 - **retains a veto over any change to this governance document** (see *Amending this document*) — **standing**; it does not expire with the bootstrap;
 - holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and chair of the initial board — which is **transitional** and dissolves once the board is constituted.
 
-Any further standing for the founding maintainer beyond the bootstrap (e.g. a permanent role) is **[OPEN]**.
+The founding-maintainer role **voids after one year of inactivity** and is then **left empty** — not re-filled or inherited. Its standing powers (the board chair and the governance veto) lapse with it; the project then continues under the maintainers and the board.
 
 ### Emeritus
 
@@ -81,8 +81,10 @@ The body with authority to **accept** and **supersede** the project's binding de
 | Enhancement proposal | `../design/proposals/` (draft → accepted) | Architecture board |
 | Specification version bump | `../design/specs/` (strict change process) | Architecture board |
 | Routine code change | Pull-request review | Maintainers |
-| Changes to *this* document | See below | Founding-maintainer veto; wider rule **[OPEN]** |
+| Changes to *this* document | See below | Unanimous maintainers + founding-maintainer veto |
+
+A **new feature** is never a routine change: it enters through an enhancement proposal (`../design/proposals/`) and is therefore the **architecture board's** decision, not an individual maintainer's merge.
 
 ## Amending this document
 
-Changes are made by pull request. The **founding maintainer retains a veto** over any governance change — no amendment takes effect over the founding maintainer's objection. The wider approval rule (which body proposes and ratifies an amendment, and by what majority, alongside that veto) remains **[OPEN]**. Until it is settled, this document remains a DRAFT, authoritative only for the parts that restate an accepted ADR or record a decision the founding maintainer has made.
+Changes are made by pull request and require the **approval of all maintainers** (unanimous). The **founding maintainer additionally holds a veto** — no amendment takes effect over the founding maintainer's objection, even with unanimous maintainer approval. During bootstrap, with a single maintainer, that approval and the veto are the same person's.
