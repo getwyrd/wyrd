@@ -42,7 +42,7 @@ Harassment, discrimination, personal attacks, sustained disruption, publishing o
 
 ## Reporting and enforcement
 
-If you believe someone is violating this Code of Conduct, report it to **policy@getwyrd.dev**. Reports are handled discreetly. The maintainers and the architecture board are responsible for clarifying and enforcing this Code and may take any action they deem appropriate, up to and including removal from the project.
+If you believe someone is violating this Code of Conduct, report it to **policy@getwyrd.dev**. Reports are handled discreetly. The maintainers and the architecture board are responsible for clarifying and enforcing this Code and may take any action they deem appropriate, up to and including removal from the project (the *Removal for cause* path in [GOVERNANCE.md](GOVERNANCE.md)).
 
 ---
 

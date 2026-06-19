@@ -69,6 +69,17 @@ The body with authority to **accept** and **supersede** the project's binding de
 - **Term:** elected members serve **two years** and may stand for re-election (the founding maintainer chairs *ex officio*, independent of these terms).
 - **Election procedure:** board members are elected by a **majority of the maintainers**.
 
+### Removal for cause
+
+Separately from the inactivity rules above, anyone may be removed for **cause** — a serious or sustained breach of the [Code of Conduct](CODE_OF_CONDUCT.md), or acting against the project's interests — whether or not they are active:
+
+- An **Associate** is removed by the agreement of **two maintainers**.
+- A **Maintainer** is removed by a **two-thirds vote of the other maintainers**.
+- A **board member** is removed by a **two-thirds vote of the maintainers**; the vacated seat is re-filled by the normal election.
+- The **founding maintainer**, being a Maintainer, is removed under the Maintainer rule once other maintainers exist; during bootstrap, with no other maintainer, the role can lapse only through inactivity.
+
+This is the enforcement backstop the Code of Conduct refers to: deliberate and documented, never summary.
+
 ## Decision-making
 
 | Decision type | Process | Authority |
@@ -78,6 +89,7 @@ The body with authority to **accept** and **supersede** the project's binding de
 | Specification version bump | `../design/specs/` (strict change process) | Architecture board |
 | Routine code change | Pull-request review | Maintainers |
 | Changes to *this* document | See below | Unanimous maintainers |
+| Removal for cause | *Removal for cause* (above) | Two maintainers (Associate); two-thirds (Maintainer, board) |
 
 A **new feature** is never a routine change: it enters through an enhancement proposal (`../design/proposals/`) and is therefore the **architecture board's** decision, not an individual maintainer's merge.
 
