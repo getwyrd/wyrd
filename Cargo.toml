@@ -14,6 +14,7 @@ members = [
     "crates/core",
     "crates/metadata-redb",
     "crates/chunkstore-fs",
+    "crates/coordination-mem",
     "crates/server",
     "xtask",
 ]
@@ -35,6 +36,7 @@ wyrd-testkit = { path = "crates/testkit" }
 wyrd-core = { path = "crates/core" }
 wyrd-metadata-redb = { path = "crates/metadata-redb" }
 wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
+wyrd-coordination-mem = { path = "crates/coordination-mem" }
 
 # Shared third-party dependencies, version-pinned once here.
 async-trait = "0.1"

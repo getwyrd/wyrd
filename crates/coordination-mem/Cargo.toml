@@ -1,0 +1,19 @@
+[package]
+name = "wyrd-coordination-mem"
+description = "In-memory Coordination: trivial single-process service discovery, leader election, locks, and config behind the trait seam (ADR-0006). etcd is the production backend wired in by `server`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+wyrd-traits.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+# The conformance suite is written against the trait surface and driven by
+# pollster (the in-memory methods never yield).
+pollster.workspace = true
