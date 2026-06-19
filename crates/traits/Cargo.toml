@@ -1,0 +1,13 @@
+[package]
+name = "wyrd-traits"
+description = "Pluggability-seam trait definitions (ChunkStore, MetadataStore, Coordination). Definitions only — no implementations (ADR-0010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true

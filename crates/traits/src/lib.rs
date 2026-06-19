@@ -1,0 +1,155 @@
+//! Pluggability-seam trait definitions for Wyrd.
+//!
+//! These traits are the keystone of the architecture's dependency rule
+//! (ADR-0010): implementations and consumers depend on this crate, never on
+//! each other's concretes, and only the `server` binary wires concretes
+//! together. That is what makes "swap redb for TiKV" or "in-memory for etcd" a
+//! composition change rather than a refactor.
+//!
+//! This crate contains **definitions only — no implementations**. The
+//! signatures are intentionally coarse at Milestone 0 and will firm up as the
+//! commit protocol and the deterministic-simulation harness (ADR-0009) pin the
+//! semantics. Every trait is `async` and object-safe (via [`async_trait`]) so a
+//! single deterministic simulator can drive real and faked backends through the
+//! same surface.
+
+#![forbid(unsafe_code)]
+
+use async_trait::async_trait;
+use bytes::Bytes;
+
+/// A 128-bit chunk identifier (ADR-0019). Wide enough to be minted without
+/// central coordination, which suits the direct-write data path.
+pub type ChunkId = u128;
+
+/// A monotonic fencing token handed out with a lock or leadership grant, so a
+/// stale holder's writes can be rejected after it has lost the lock.
+pub type FencingToken = u64;
+
+/// The boxed error type used across the trait surface at Milestone 0. Concrete
+/// backends surface their own error detail through it; richer typed errors are
+/// a later refinement once the failure modes are pinned by an implementation.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// A convenience result alias for the trait surface.
+pub type Result<T> = std::result::Result<T, BoxError>;
+
+/// A coarse health signal a backend reports about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// Serving normally.
+    Healthy,
+    /// Reachable but degraded (e.g. a disk nearing capacity).
+    Degraded,
+    /// Not serving.
+    Unhealthy,
+}
+
+/// Stores and retrieves erasure-coded chunk fragments by chunk id.
+///
+/// Deliberately dumb (building-block view, L4): no placement logic and no
+/// metadata. A fragment is the on-disk bytes specified by `chunk-format`
+/// (ADR-0019); this trait moves those bytes and verifies their integrity, but
+/// does not interpret them beyond the format's own checksums.
+#[async_trait]
+pub trait ChunkStore: Send + Sync {
+    /// Persist a fragment's bytes under `id`. Implementations verify the
+    /// fragment's self-describing checksums before acknowledging.
+    async fn put_fragment(&self, id: ChunkId, fragment: Bytes) -> Result<()>;
+
+    /// Fetch a fragment's bytes, or `Ok(None)` if this store holds no fragment
+    /// for `id`. Implementations verify integrity before returning bytes.
+    async fn get_fragment(&self, id: ChunkId) -> Result<Option<Bytes>>;
+
+    /// Report this store's current health.
+    async fn health(&self) -> Result<Health>;
+}
+
+/// The authoritative metadata store: inodes, dirents, chunk maps, the
+/// pending-chunk GC ledger, and version counters.
+///
+/// It hosts the single atomic mutation that *is* the commit point (building-block
+/// view): a commit either lands in full or not at all. The request/outcome
+/// shapes are coarse placeholders at M0 and will be replaced by the `proto`
+/// commit messages as the four-phase protocol lands.
+#[async_trait]
+pub trait MetadataStore: Send + Sync {
+    /// Read the raw value stored under `key`, if any.
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
+
+    /// Apply the commit as a single atomic mutation. This is the commit point;
+    /// it succeeds only if every effect lands together.
+    async fn commit(&self, mutation: CommitMutation) -> Result<CommitOutcome>;
+
+    /// Append a chunk id to the pending-chunk GC ledger, marking it
+    /// provisionally written but not yet referenced by a committed chunk map.
+    async fn ledger_append(&self, id: ChunkId) -> Result<()>;
+
+    /// Remove chunk ids from the GC ledger once they are referenced by a
+    /// committed chunk map (the ledger-sweep step of the write protocol).
+    async fn ledger_sweep(&self, ids: &[ChunkId]) -> Result<()>;
+}
+
+/// A coarse placeholder for the atomic commit mutation. Replaced by the `proto`
+/// commit message once the four-phase protocol is implemented (M0.5).
+#[derive(Debug, Clone, Default)]
+pub struct CommitMutation {
+    /// Opaque serialized mutation payload at M0.
+    pub payload: Bytes,
+}
+
+/// The result of a successful commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CommitOutcome {
+    /// The version counter value established by this commit.
+    pub version: u64,
+}
+
+/// Bootstrap and coordination (L5): service discovery, leader election, locks
+/// with fencing tokens, and zone-wide config with change notification.
+///
+/// Losing coordination loses no data (established connections keep working from
+/// cached state); what is lost is the ability to *react* until it returns.
+#[async_trait]
+pub trait Coordination: Send + Sync {
+    /// Register this member under `key` with a lease that must be renewed, so a
+    /// crashed member's registration expires (leased service discovery).
+    async fn register(&self, key: &str, value: Bytes) -> Result<Lease>;
+
+    /// Discover the current members registered under `key`.
+    async fn discover(&self, key: &str) -> Result<Vec<Bytes>>;
+
+    /// Campaign to become the single active leader for `key`. Resolves when
+    /// leadership is granted, carrying a fencing token for the term.
+    async fn elect_leader(&self, key: &str) -> Result<Leadership>;
+
+    /// Acquire a distributed lock on `key`, returning a fenced grant.
+    async fn lock(&self, key: &str) -> Result<LockGuard>;
+
+    /// Read the current zone-wide config value for `key`. Change notification
+    /// (watch) is a later refinement on this seam.
+    async fn get_config(&self, key: &str) -> Result<Option<Bytes>>;
+}
+
+/// A renewable lease backing a registration; dropping or letting it expire
+/// withdraws the registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lease {
+    /// Opaque lease identifier assigned by the coordination backend.
+    pub id: u64,
+}
+
+/// A granted leadership term, fenced by a monotonic token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Leadership {
+    /// The fencing token for this term; rises on every new leadership grant.
+    pub token: FencingToken,
+}
+
+/// A held distributed lock, fenced by a monotonic token so a stale holder's
+/// writes can be rejected after it has lost the lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockGuard {
+    /// The fencing token for this lock acquisition.
+    pub token: FencingToken,
+}

@@ -1,0 +1,42 @@
+# Wyrd Cargo workspace.
+#
+# Coarse-to-fine crate structure (ADR-0016): start with foundation crates plus a
+# combined `core`, and split as boundaries firm up. The dependency rule
+# (ADR-0010): implementations and consumers depend on `traits`, never on each
+# other's concretes; only the `server` binary wires concretes together.
+[workspace]
+resolver = "2"
+members = [
+    "crates/chunk-format",
+    "crates/proto",
+    "crates/traits",
+    "crates/testkit",
+    "crates/core",
+    "crates/server",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.96"
+license = "Apache-2.0"
+repository = "https://github.com/getwyrd/wyrd"
+publish = false
+
+[workspace.dependencies]
+# Foundation crates, referenced by path so the workspace builds standalone.
+wyrd-chunk-format = { path = "crates/chunk-format" }
+wyrd-proto = { path = "crates/proto" }
+wyrd-traits = { path = "crates/traits" }
+wyrd-testkit = { path = "crates/testkit" }
+wyrd-core = { path = "crates/core" }
+
+# Shared third-party dependencies, version-pinned once here.
+async-trait = "0.1"
+bytes = "1"
+prost = "0.13"
+prost-build = "0.13"
+protox = "0.7"
+rand = "0.8"
+rand_chacha = "0.3"

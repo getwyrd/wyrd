@@ -1,0 +1,5 @@
+# Pin the toolchain so fmt/clippy/build behave identically on a laptop and in CI
+# (ADR-0009: CI is xtask-driven and runs the same checks locally).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]

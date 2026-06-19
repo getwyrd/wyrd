@@ -1,0 +1,78 @@
+name: ci
+
+# The Rust gate (ADR-0009): a thin caller of `cargo xtask ci`, so the same
+# checks — fmt, clippy (-D warnings), build, test, cargo-deny, conformance —
+# run identically on a laptop and here. CI logic lives in Rust (xtask), not
+# YAML (ADR-0016). A second job enforces DCO sign-off on pull requests
+# (ADR-0003 §1).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain pinned by rust-toolchain.toml (with rustfmt and
+      # clippy) on first use.
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Prebuilt binary, so the license/advisory wall costs seconds, not a
+      # from-source compile.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
+  dco:
+    # Provenance check: every commit in a PR must carry a DCO sign-off
+    # (ADR-0003 §1). Same gh-api idiom as require-issue.yml; re-runs on edit so
+    # adding the sign-off clears the check.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Require a DCO sign-off on every commit
+        run: |
+          set -uo pipefail
+          commits=$(gh api "repos/$REPO/pulls/$PR/commits" --paginate --jq '.[].sha')
+          fail=0
+          for sha in $commits; do
+            msg=$(gh api "repos/$REPO/commits/$sha" --jq '.commit.message')
+            if ! printf '%s\n' "$msg" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::commit $sha is missing a DCO 'Signed-off-by' line"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Every commit must be signed off (git commit -s). See the DCO (ADR-0003)."
+            exit 1
+          fi
+          echo "OK: all commits carry a DCO sign-off"

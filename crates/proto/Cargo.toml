@@ -1,0 +1,18 @@
+[package]
+name = "wyrd-proto"
+description = "Minimal protobuf/prost wire-contract message shapes (commit, chunk put/get)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+prost.workspace = true
+
+[build-dependencies]
+# protox is a pure-Rust protobuf compiler, so the build needs no system `protoc`
+# (ADR-0016: contributors run the build on any OS without extra tooling).
+prost-build.workspace = true
+protox.workspace = true

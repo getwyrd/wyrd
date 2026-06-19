@@ -1,0 +1,13 @@
+[package]
+name = "wyrd-testkit"
+description = "Deterministic-simulation test seams: abstract time/disk, seed-driven RNG, single-threaded runner skeleton, and fault hooks (ADR-0009)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+rand.workspace = true
+rand_chacha.workspace = true
