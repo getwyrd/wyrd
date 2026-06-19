@@ -1,7 +1,7 @@
 ---
 created: 17.06.2026 00:56
 type: governance
-status: draft
+status: ratified
 tags:
   - governance
   - process
@@ -9,7 +9,7 @@ tags:
 ---
 # Governance
 
-> **Status: DRAFT — skeleton, not yet ratified.** This records the project's decision-making structure. Only the parts already anchored in an accepted ADR are firm; everything marked **[OPEN]** is a placeholder for a decision the maintainers have not yet made, and is not binding.
+> **Status: RATIFIED.** This records the project's decision-making structure — roles, the architecture board, and the decision and amendment processes. Ratified by the founding maintainer (the sole maintainer during bootstrap) per the amendment rule below; further changes follow that process.
 
 ## Purpose
 
@@ -19,38 +19,86 @@ It complements, and does not override, the per-class processes documented elsewh
 
 ## Roles
 
-### Contributors
+Participation is a ladder of four levels, each earned from the one below. Higher rungs carry more authority and more responsibility; all of them rest on the same contribution-under-DCO basis (ADR-0003). The architecture board (further below) is **not** a rung on this ladder — it is a body drawn from the maintainers.
 
-Anyone who opens an issue or a pull request. Contributions are accepted under the project's license and DCO sign-off (ADR-0003). No special status is required to contribute.
+| Level | In one line | GitHub mapping |
+|-------|-------------|----------------|
+| **Contributor** | anyone who opens an issue or PR | — (any account) |
+| **Associate** | a trusted contributor with triage rights, on the path to maintainer | repo **Triage** |
+| **Maintainer** | reviews and **merges**, triages, elects the architecture board | `maintainers` team, **Maintain** |
+| **Founding maintainer** | the genesis seed that bootstraps the project | org **Owner / Admin** |
 
-### Maintainers
+### Contributor
 
-Maintainers review and merge contributions, triage issues, and elect the architecture board (below).
+Anyone who opens an issue or a pull request. Contributions are accepted under the project's license and DCO sign-off (ADR-0003), and everyone who participates is held to the [Code of Conduct](CODE_OF_CONDUCT.md). No special status is required, and most participants never need more.
 
-- **How one becomes a maintainer** — criteria and the nomination / confirmation procedure: **[OPEN]**.
-- **Day-to-day decision rule** for routine changes (e.g. lazy consensus on pull requests): **[OPEN]**.
-- **Inactivity / removal policy:** **[OPEN]**.
+### Associate
+
+A contributor recognised for sustained, quality work, granted **triage** rights — labelling, assigning, and shepherding issues and pull requests, and reviewing — but **without merge authority**. It is the deliberate step between Contributor and Maintainer: trusted people help run the project before they hold the keys, and it is where a prospective maintainer is observed.
+
+- **How one becomes an Associate** — **nominated by a maintainer** for a track record of good contributions, and approved once a **second maintainer agrees** (two maintainers suffice).
+- **Inactivity:** an Associate is removed after **six months** of inactivity, and may later return as **emeritus** (below).
+
+### Maintainer
+
+Maintainers review and **merge** contributions, triage, set day-to-day direction, and **elect the architecture board** (below). **New maintainers are elected by the existing maintainers**, normally promoted from Associates.
+
+- **How one becomes a maintainer** — elected by the existing maintainers, from candidates with a **proven track record as a Contributor or Associate spanning at least a year**; confirmation is by a **two-thirds majority of the existing maintainers**.
+- **Day-to-day decision rule** — a maintainer decides **individually** on routine pull requests; only changes that touch a **spec, proposal, or ADR** go to the architecture board.
+- **Inactivity:** a Maintainer is removed after **one year** of inactivity, and may later return as **emeritus** (below).
+- **Cadence:** the maintainers hold at least one meeting a year — the *"state of the solution"* — to review the project's direction.
+
+### Founding maintainer
+
+A rule that maintainers are elected by maintainers needs a seed. **Eduard Ralph is the founding (first) maintainer**, by virtue of starting the project; the maintainer group grows from there by election. The founding maintainer is a full Maintainer who additionally holds **bootstrap authority** until the maintainer group and the board are established — sole maintainer, and sole elector and **chair** of the initial board. This authority is **transitional** and dissolves once the board is constituted (after which the board elects its own chair); the founding maintainer holds **no standing power** beyond it.
+
+The founding maintainer may be elected board chair like any member, but does not hold it automatically. The founding-maintainer role **voids after one year of inactivity** and is then **left empty** — not re-filled or inherited; the project then continues under the maintainers and the board.
+
+### Emeritus
+
+A former **Associate** or **Maintainer** — removed for inactivity, or having stepped down — holds **emeritus** standing. An emeritus may be **re-elected to their former level without re-proving the track record** it normally requires (the year as Contributor or Associate for a Maintainer; the contribution record for an Associate). The level's confirmation step still applies — a second maintainer's agreement for an Associate, a two-thirds maintainer vote for a Maintainer.
 
 ### Architecture board
 
-The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../design/adr/0001-record-architecture-decisions.md). Its members are **elected by the maintainers**.
+The body with authority to **accept** and **supersede** the project's binding decisions — **ADRs** (per [ADR-0001](../design/adr/0001-record-architecture-decisions.md)), **specifications**, and **enhancement proposals**. Its members are **elected by the maintainers** and **may be drawn from any participation level** — a board seat reflects judgement on the architecture, not rank on the ladder.
 
-- **Size:** **[OPEN]**.
-- **Term and re-election cadence:** **[OPEN]**.
-- **Election procedure** — how maintainers nominate and vote: **[OPEN]**.
-- **Decision rule for accepting an ADR** — quorum, majority, or full consensus of the board: **[OPEN]**.
-- **Chair / tie-breaking:** **[OPEN]**.
+- **Size:** **at least three** members.
+- **Chair:** **elected by the board, unanimously** (during bootstrap the founding maintainer chairs — see below).
+- **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle, and ratifies specifications and enhancement proposals through their own folder processes; ratification is by a **two-thirds majority** of the members, recorded as agreement on the pull request.
+- **Bootstrap — fewer than three members.** Until the board reaches three, the **chair (the founding maintainer) may make acceptance decisions**. To remain consistent with ADR-0001 — acceptance is never a single maintainer's act — these interim decisions are **provisional**: the board reviews and confirms them once it is constituted. *(If instead the chair's bootstrap acceptances are meant to be final, that is a true exception to ADR-0001 and must be enacted by a superseding ADR, not this document.)*
+- **Term:** elected members serve **two years** and may stand for re-election (the founding maintainer chairs *ex officio*, independent of these terms).
+- **Election procedure:** board members are elected by a **majority of the maintainers**.
+
+### Removal for cause
+
+Separately from the inactivity rules above, anyone may be removed for **cause** — a serious or sustained breach of the [Code of Conduct](CODE_OF_CONDUCT.md), or acting against the project's interests — whether or not they are active:
+
+- An **Associate** is removed by the agreement of **two maintainers**.
+- A **Maintainer** is removed by a **two-thirds vote of the other maintainers**.
+- A **board member** is removed by a **two-thirds vote of the maintainers**; the vacated seat is re-filled by the normal election.
+- The **founding maintainer**, being a Maintainer, is removed under the Maintainer rule once other maintainers exist; during bootstrap, with no other maintainer, the role can lapse only through inactivity.
+
+This is the enforcement backstop the Code of Conduct refers to: deliberate and documented, never summary.
 
 ## Decision-making
 
 | Decision type | Process | Authority |
 |---------------|---------|-----------|
 | Architecture decision (ADR) | [ADR-0001](../design/adr/0001-record-architecture-decisions.md) lifecycle (Proposed → Accepted → Superseded) | Architecture board |
-| Enhancement proposal | `../design/proposals/` (draft → accepted) | **[OPEN]** — board, maintainers, or both |
-| Specification version bump | `../design/specs/` (strict change process) | **[OPEN]** |
+| Enhancement proposal | `../design/proposals/` (draft → accepted) | Architecture board |
+| Specification version bump | `../design/specs/` (strict change process) | Architecture board |
 | Routine code change | Pull-request review | Maintainers |
-| Changes to *this* document | See below | **[OPEN]** |
+| Changes to *this* document | See below | Unanimous maintainers |
+| Removal for cause | *Removal for cause* (above) | Two maintainers (Associate); two-thirds (Maintainer, board) |
+
+A **new feature** is never a routine change: it enters through an enhancement proposal (`../design/proposals/`) and is therefore the **architecture board's** decision, not an individual maintainer's merge.
+
+An ADR — and likewise a specification or proposal — is moved to **Accepted** only when it carries **no unresolved `[OPEN]` items**: open questions must be resolved, or deferred to a named follow-up, before ratification.
 
 ## Amending this document
 
-**[OPEN]** — the process for changing governance itself (who approves, and by what majority) is not yet decided. Until it is, this document remains a DRAFT and is authoritative only for the parts that restate an accepted ADR.
+Changes are made by pull request and require the **approval of all maintainers** (unanimous). During bootstrap, with a single maintainer, that is the founding maintainer's approval alone.
+
+## Contact
+
+Questions or concerns about governance, conduct, or project policy: **policy@getwyrd.dev**.

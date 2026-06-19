@@ -181,6 +181,8 @@ def out_url(rel: str) -> str | None:
         return "/name.html"
     if rel == "governance/GOVERNANCE.md":
         return "/governance.html"
+    if rel == "governance/CODE_OF_CONDUCT.md":
+        return "/code-of-conduct.html"
     if rel == "design/README.md":
         return "/docs/"
     if not rel.startswith("design/"):
@@ -308,6 +310,7 @@ class Renderer:
         """Return (rel, path, url) for every published source; populate url_map."""
         sources: list[tuple[str, Path, str]] = []
         candidates = [DOCS_ROOT / "NAME.md", DOCS_ROOT / "governance" / "GOVERNANCE.md",
+                      DOCS_ROOT / "governance" / "CODE_OF_CONDUCT.md",
                       DOCS_ROOT / "design" / "README.md"]
         candidates += sorted((DOCS_ROOT / "design").rglob("*.md"))
         candidates += sorted((DOCS_ROOT / "design").rglob("*.mermaid"))
