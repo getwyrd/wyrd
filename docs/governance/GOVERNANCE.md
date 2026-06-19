@@ -65,8 +65,8 @@ The body with authority to **accept** and **supersede** ADRs, per [ADR-0001](../
 - **Chair:** the **founding maintainer**.
 - **Decision rule** — the board accepts (and supersedes) ADRs through the ADR-0001 lifecycle: its agreement on an ADR's pull request *is* the ratification. The numeric threshold among the members (simple majority vs. full consensus) is **[OPEN]**.
 - **Bootstrap — fewer than three members.** Until the board reaches three, the **chair (the founding maintainer) may make acceptance decisions**. To remain consistent with ADR-0001 — acceptance is never a single maintainer's act — these interim decisions are **provisional**: the board reviews and confirms them once it is constituted. *(If instead the chair's bootstrap acceptances are meant to be final, that is a true exception to ADR-0001 and must be enacted by a superseding ADR, not this document.)*
-- **Term and re-election cadence:** **[OPEN]**.
-- **Election procedure** — how maintainers nominate and vote: **[OPEN]**.
+- **Term:** elected members serve **two years** and may stand for re-election (the founding maintainer chairs *ex officio*, independent of these terms).
+- **Election procedure:** board members are elected by a **majority of the maintainers**.
 
 ## Decision-making
 
