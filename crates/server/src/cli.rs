@@ -16,11 +16,12 @@ use std::process::ExitCode;
 use pollster::block_on;
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_coordination_mem::MemCoordination;
+use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, WriteBatch};
 
-use crate::Gateway;
+use crate::{Gateway, DEFAULT_DURABILITY};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -65,9 +66,42 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 
 fn usage() {
     eprintln!("usage:");
-    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N]");
+    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR]");
     eprintln!("  wyrd demo");
+}
+
+/// Parse a `--durability` value: `rs(k,m)` (Reed-Solomon) or `none`/`replication(1)`.
+fn parse_durability(s: &str) -> Result<EcScheme, BoxError> {
+    if s == "none" || s == "replication(1)" {
+        return Ok(EcScheme::None);
+    }
+    if let Some(inner) = s.strip_prefix("rs(").and_then(|r| r.strip_suffix(')')) {
+        let (k, m) = inner
+            .split_once(',')
+            .ok_or_else(|| format!("invalid --durability `{s}` (expected `rs(k,m)`)"))?;
+        let k: u8 = k
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid k in --durability `{s}`"))?;
+        let m: u8 = m
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid m in --durability `{s}`"))?;
+        if k == 0 {
+            return Err("--durability k must be at least 1".into());
+        }
+        return Ok(EcScheme::ReedSolomon { k, m });
+    }
+    Err(format!("invalid --durability `{s}` (expected `rs(k,m)` or `none`)").into())
+}
+
+/// A short human label for a scheme, for the `put` summary.
+fn durability_label(scheme: EcScheme) -> String {
+    match scheme {
+        EcScheme::None => "none".to_string(),
+        EcScheme::ReedSolomon { k, m } => format!("rs({k},{m})"),
+    }
 }
 
 /// `wyrd put <file> --key <name>`: read the file and write it under `key`.
@@ -83,6 +117,10 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
             .parse()
             .map_err(|_| format!("put: invalid --chunk-size `{s}`"))?,
         None => DEFAULT_CHUNK_SIZE,
+    };
+    let durability = match parsed.flag("durability") {
+        Some(s) => parse_durability(s)?,
+        None => DEFAULT_DURABILITY,
     };
 
     let data =
@@ -100,6 +138,7 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
             inode_id,
             &data,
             chunk_size,
+            durability,
             NOW_MILLIS,
             LEASE_TTL_MILLIS,
             next_id,
@@ -110,8 +149,9 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
             CommitOutcome::Committed => {
                 let chunks = data.len().div_ceil(chunk_size.max(1));
                 println!(
-                    "put ok: key={key} inode={inode_id} chunks={chunks} bytes={} version=1",
-                    data.len()
+                    "put ok: key={key} inode={inode_id} chunks={chunks} bytes={} durability={} version=1",
+                    data.len(),
+                    durability_label(durability),
                 );
                 Ok(ExitCode::SUCCESS)
             }

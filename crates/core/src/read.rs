@@ -15,7 +15,8 @@
 use wyrd_chunk_format::decode;
 use wyrd_traits::{ChunkId, ChunkStore, FragmentId, MetadataStore, Result};
 
-use crate::metadata::{self, DirentRecord, InodeId, InodeRecord, InodeState};
+use crate::erasure;
+use crate::metadata::{self, ChunkRef, DirentRecord, EcScheme, InodeId, InodeRecord, InodeState};
 
 /// Resolve `name` under `parent` to its inode id, or `None` if the name is
 /// unbound.
@@ -50,19 +51,8 @@ pub async fn read_inode(
 /// an error, never a short or corrupt read.
 pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(inode.size as usize);
-    for &chunk_id in &inode.chunk_map {
-        // replication(1)/none: a chunk is a single fragment at index 0. Erasure
-        // coding will gather any k of n fragments and reconstruct here.
-        let id = FragmentId {
-            chunk: chunk_id,
-            index: 0,
-        };
-        let fragment = chunks
-            .get_fragment(id)
-            .await?
-            .ok_or(ReadError::MissingFragment { chunk_id })?;
-        // The chunk store already verified integrity; decode to take the payload.
-        bytes.extend_from_slice(&decode(&fragment)?.payload);
+    for chunk in &inode.chunk_map {
+        bytes.extend_from_slice(&read_chunk(chunks, chunk).await?);
     }
     if bytes.len() as u64 != inode.size {
         return Err(ReadError::SizeMismatch {
@@ -72,6 +62,47 @@ pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> 
         .into());
     }
     Ok(bytes)
+}
+
+/// Read and decode one chunk's bytes, dispatching on its durability scheme. A
+/// per-chunk scheme is what lets one read path serve mixed-era data (ADR-0008).
+///
+/// This is the happy-path read (all fragments present). Tolerating up to `m`
+/// missing/corrupt fragments and erroring cleanly below `k` is M1.4.
+async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8>> {
+    /// Fetch the fragment at `index`, returning its decoded payload (the shard).
+    async fn payload_at(
+        chunks: &impl ChunkStore,
+        chunk_id: ChunkId,
+        index: u16,
+    ) -> Result<Vec<u8>> {
+        let fragment = chunks
+            .get_fragment(FragmentId {
+                chunk: chunk_id,
+                index,
+            })
+            .await?
+            .ok_or(ReadError::MissingFragment { chunk_id })?;
+        // The chunk store already verified integrity; decode to take the payload.
+        Ok(decode(&fragment)?.payload)
+    }
+
+    match chunk.scheme {
+        EcScheme::None => payload_at(chunks, chunk.id, 0).await,
+        EcScheme::ReedSolomon { k, m } => {
+            // Gather the k data shards (indices 0..k) and reconstruct.
+            let mut shards = Vec::with_capacity(k as usize);
+            for index in 0..k as u16 {
+                shards.push((index as usize, payload_at(chunks, chunk.id, index).await?));
+            }
+            Ok(erasure::reconstruct(
+                k as usize,
+                m as usize,
+                chunk.len as usize,
+                &shards,
+            )?)
+        }
+    }
 }
 
 /// Read a committed object by inode id. `None` if the inode is absent or not yet

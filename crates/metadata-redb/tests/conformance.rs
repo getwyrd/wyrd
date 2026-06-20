@@ -211,8 +211,13 @@ fn version_cas_rejects_a_stale_writer() {
             // chunk map. redb serializes the commits; exactly one wins.
             let prior: InodeRecord =
                 metadata::decode(&s.get(&metadata::inode_key(id)).await.unwrap().unwrap()).unwrap();
-            let map_a: Vec<u128> = vec![sim.gen(), sim.gen()];
-            let map_b: Vec<u128> = vec![sim.gen()];
+            let chunk = |id: u128| metadata::ChunkRef {
+                id,
+                scheme: metadata::EcScheme::None,
+                len: 0,
+            };
+            let map_a: Vec<metadata::ChunkRef> = vec![chunk(sim.gen()), chunk(sim.gen())];
+            let map_b: Vec<metadata::ChunkRef> = vec![chunk(sim.gen())];
 
             let a = metadata::commit_chunk_map(&s, id, &prior, map_a.clone(), prior.size)
                 .await

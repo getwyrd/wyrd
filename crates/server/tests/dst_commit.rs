@@ -6,6 +6,7 @@
 
 use pollster::block_on;
 use wyrd_chunkstore_fs::FsChunkStore;
+use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_testkit::Sim;
@@ -47,7 +48,7 @@ async fn put_new(
     data: &[u8],
     base: u128,
 ) {
-    let plan = write::plan_write(data, CHUNK, ids_from(base));
+    let plan = write::plan_write(data, CHUNK, EcScheme::None, ids_from(base)).unwrap();
     write::intent(meta, &plan, NOW + TTL).await.unwrap();
     write::write_fragments(chunks, &plan).await.unwrap();
     assert_eq!(
@@ -71,8 +72,8 @@ fn exactly_one_wins(seed: u64) {
 
         let a = payload(&mut sim, 32);
         let b = payload(&mut sim, 32);
-        let plan_a = write::plan_write(&a, CHUNK, ids_from(0x1_0000));
-        let plan_b = write::plan_write(&b, CHUNK, ids_from(0x2_0000));
+        let plan_a = write::plan_write(&a, CHUNK, EcScheme::None, ids_from(0x1_0000)).unwrap();
+        let plan_b = write::plan_write(&b, CHUNK, EcScheme::None, ids_from(0x2_0000)).unwrap();
         for plan in [&plan_a, &plan_b] {
             write::intent(&meta, plan, NOW + TTL).await.unwrap();
             write::write_fragments(&chunks, plan).await.unwrap();
@@ -111,7 +112,7 @@ fn never_a_hybrid(seed: u64) {
         let snapshot = read::read_inode(&meta, 1).await.unwrap().unwrap();
 
         let v2 = payload(&mut sim, 48);
-        let plan = write::plan_write(&v2, CHUNK, ids_from(0x9_0000));
+        let plan = write::plan_write(&v2, CHUNK, EcScheme::None, ids_from(0x9_0000)).unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
         write::commit_overwrite(&meta, 1, &snapshot, &plan)
@@ -144,7 +145,7 @@ fn crash_is_atomic(seed: u64) {
         // Crash between commit (3) and release (4).
         let (meta, chunks, _dir) = backends();
         let data = payload(&mut sim, 48);
-        let plan = write::plan_write(&data, CHUNK, ids_from(0x10));
+        let plan = write::plan_write(&data, CHUNK, EcScheme::None, ids_from(0x10)).unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
         write::commit_create(&meta, 0, "obj", 1, &plan)
@@ -165,7 +166,13 @@ fn crash_is_atomic(seed: u64) {
 
         // Crash before commit: nothing is visible; the sweep clears the leases.
         let (meta, chunks, _dir) = backends();
-        let plan = write::plan_write(&payload(&mut sim, 48), CHUNK, ids_from(0x20));
+        let plan = write::plan_write(
+            &payload(&mut sim, 48),
+            CHUNK,
+            EcScheme::None,
+            ids_from(0x20),
+        )
+        .unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
         // --- crash: no commit ---

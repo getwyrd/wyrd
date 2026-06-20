@@ -48,13 +48,44 @@ pub enum InodeState {
     Committed,
 }
 
+/// The durability scheme a chunk is stored under (ADR-0008 mixed-era data: the
+/// scheme is recorded per chunk, so chunks written under different schemes read
+/// correctly through one path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EcScheme {
+    /// A single fragment per chunk at index 0 (the M0 `replication(1)`/`none`
+    /// behaviour).
+    None,
+    /// Reed-Solomon erasure coding: `k` data + `m` parity fragments per chunk
+    /// (`k`/`m` are `u8` to match the v1 header's `ec_k`/`ec_m`).
+    ReedSolomon {
+        /// Data-fragment count.
+        k: u8,
+        /// Parity-fragment count.
+        m: u8,
+    },
+}
+
+/// One chunk in an inode's chunk map: its id, durability scheme, and **logical
+/// length** (the reader truncates to this after reconstruction, stripping shard
+/// padding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkRef {
+    /// The chunk's id (shared by all its fragments).
+    pub id: ChunkId,
+    /// How the chunk is fragmented.
+    pub scheme: EcScheme,
+    /// The chunk's logical (pre-coding) length in bytes.
+    pub len: u64,
+}
+
 /// An inode: attributes, the ordered chunk map, state, and version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InodeRecord {
     /// Logical content length in bytes.
     pub size: u64,
-    /// The ordered chunk ids making up the content.
-    pub chunk_map: Vec<ChunkId>,
+    /// The ordered chunks making up the content.
+    pub chunk_map: Vec<ChunkRef>,
     /// Commit state.
     pub state: InodeState,
     /// Monotonic per-inode version; the commit point bumps it under CAS.
@@ -151,7 +182,7 @@ pub async fn commit_chunk_map(
     store: &impl MetadataStore,
     id: InodeId,
     prior: &InodeRecord,
-    chunk_map: Vec<ChunkId>,
+    chunk_map: Vec<ChunkRef>,
     size: u64,
 ) -> Result<CommitOutcome> {
     let next = InodeRecord {

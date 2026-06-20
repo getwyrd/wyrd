@@ -4,7 +4,7 @@
 
 use pollster::block_on;
 use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
-use wyrd_core::metadata::{self, InodeRecord};
+use wyrd_core::metadata::{self, EcScheme, InodeRecord};
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_traits::{CommitOutcome, FragmentId};
@@ -46,6 +46,7 @@ fn committed_file_reads_back_byte_identical() {
                 1,
                 data,
                 CHUNK,
+                EcScheme::None,
                 NOW,
                 TTL,
                 ids_from(base),
@@ -78,6 +79,7 @@ fn reader_sees_old_or_new_version_never_a_hybrid() {
             1,
             b"version one is here",
             CHUNK,
+            EcScheme::None,
             NOW,
             TTL,
             ids_from(0x100),
@@ -94,7 +96,8 @@ fn reader_sees_old_or_new_version_never_a_hybrid() {
         );
 
         // Overwrite to v2 (new chunk ids; v1's fragments stay in the store).
-        let plan2 = write::plan_write(b"VERSION 2!", CHUNK, ids_from(0x500));
+        let plan2 =
+            write::plan_write(b"VERSION 2!", CHUNK, EcScheme::None, ids_from(0x500)).unwrap();
         write::intent(&meta, &plan2, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan2).await.unwrap();
         assert_eq!(
@@ -132,6 +135,7 @@ fn checksum_mismatch_surfaces_as_an_error() {
             1,
             b"important data, do not corrupt",
             CHUNK,
+            EcScheme::None,
             NOW,
             TTL,
             ids_from(0x40),
@@ -144,7 +148,7 @@ fn checksum_mismatch_surfaces_as_an_error() {
         let path = fragment_path(
             dir.path(),
             FragmentId {
-                chunk: inode.chunk_map[0],
+                chunk: inode.chunk_map[0].id,
                 index: 0,
             },
         );
