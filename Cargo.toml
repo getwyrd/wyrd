@@ -55,6 +55,18 @@ crc32c = "0.6"
 # task spawning, no runtime tie-in (ADR-0009).
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 madsim = "0.2"
+# The `tonic` simulator on madsim (M2.6, proposal 0004 "DST and integration
+# tests"). Under `--cfg madsim` the gRPC `ChunkStore` stubs resolve here so the
+# *real* `GrpcChunkStore` wire code runs on madsim's deterministic simulated
+# network (ADR-0009), rather than a ChunkStore-level in-sim fake (the recorded
+# fallback). Version matrix: madsim-tonic 0.6.0+0.14 tracks tonic 0.14. Default
+# features off — the dev/DST profile runs plaintext, no TLS (ADR-0005). The
+# published version carries `+0.14` build metadata (the tracked tonic line);
+# the requirement drops it (semver ignores build metadata) to keep cargo quiet.
+madsim-tonic = { version = "0.6.0", default-features = false }
+# Codegen counterpart, used by `proto`'s build.rs only when `CARGO_CFG_MADSIM`
+# is set; it emits the simulated client/server stubs into `OUT_DIR/sim/`.
+madsim-tonic-build = "0.6.0"
 pollster = "0.4"
 prost = "0.14"
 protox = "0.9"

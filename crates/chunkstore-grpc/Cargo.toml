@@ -14,9 +14,21 @@ publish.workspace = true
 # whatever `S: ChunkStore` the binary injects.
 wyrd-traits.workspace = true
 wyrd-proto.workspace = true
-tonic.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
+
+# Cfg-aliased like `proto` (proposal 0004): a normal build links real `tonic`; a
+# `--cfg madsim` build links `madsim-tonic` *as* `tonic`, so the *same*
+# `GrpcChunkStore` client + service code runs on madsim's simulated network in
+# the Tier-1 DST (ADR-0009) with no source change.
+[target.'cfg(not(madsim))'.dependencies]
+tonic.workspace = true
+
+# Declared directly (not workspace-inherited): cargo cannot rename an inherited
+# dependency, and the alias must carry `package = "madsim-tonic"`. Version pinned
+# to match the workspace `madsim-tonic` entry.
+[target.'cfg(madsim)'.dependencies]
+tonic = { package = "madsim-tonic", version = "0.6.0", default-features = false }
 
 [dev-dependencies]
 # The round-trip test injects the real filesystem store behind the service and

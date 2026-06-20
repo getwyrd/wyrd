@@ -10,15 +10,30 @@ publish.workspace = true
 
 [dependencies]
 prost.workspace = true
+
 # gRPC client + server stubs for the ChunkStore service (M2.1). tonic-prost
 # carries the ProstCodec the generated stubs use (split out of tonic in 0.14).
+# Cfg-aliased (proposal 0004): a normal build links real `tonic`; a `--cfg
+# madsim` build links `madsim-tonic` *as* `tonic`, so `tonic::include_proto!`
+# pulls the simulated stubs and the same client code runs on madsim's network.
+[target.'cfg(not(madsim))'.dependencies]
 tonic.workspace = true
 tonic-prost.workspace = true
+
+# Declared directly, not via workspace inheritance: cargo forbids renaming an
+# inherited dependency (`package` is ignored alongside `workspace = true`), so the
+# madsim-tonic version is pinned once in the workspace comment above and matched
+# here. `default-features = false` keeps the DST profile plaintext (no TLS).
+[target.'cfg(madsim)'.dependencies]
+tonic = { package = "madsim-tonic", version = "0.6.0", default-features = false }
 
 [build-dependencies]
 # protox is a pure-Rust protobuf compiler, so the build needs no system `protoc`
 # (ADR-0016: contributors run the build on any OS without extra tooling). Its
-# FileDescriptorSet is handed to tonic-prost-build's `compile_fds`, which emits
-# the prost message types *and* the tonic client/server service stubs.
+# FileDescriptorSet is handed to tonic-prost-build's `compile_fds` (normal build)
+# or, under `--cfg madsim`, written to a file and fed to madsim-tonic-build with
+# `skip_protoc_run` so codegen still needs no system `protoc`.
+prost.workspace = true
 protox.workspace = true
 tonic-prost-build.workspace = true
+madsim-tonic-build.workspace = true
