@@ -1,5 +1,7 @@
-//! Compile the `.proto` wire contracts into Rust with prost, using protox as a
-//! pure-Rust frontend so the build needs no system `protoc`.
+//! Compile the `.proto` wire contracts into Rust with tonic, using protox as a
+//! pure-Rust frontend so the build needs no system `protoc`. `compile_fds` takes
+//! protox's descriptor set directly — `compile_protos` would shell out to
+//! `protoc`, which we deliberately avoid (ADR-0016).
 
 use std::error::Error;
 
@@ -13,6 +15,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let file_descriptors = protox::compile(protos, includes)?;
-    prost_build::Config::new().compile_fds(file_descriptors)?;
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_fds(file_descriptors)?;
     Ok(())
 }
