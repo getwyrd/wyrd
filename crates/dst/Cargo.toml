@@ -1,0 +1,17 @@
+[package]
+name = "wyrd-dst"
+description = "Deterministic-simulation tests on madsim: the commit protocol under a seed-reproducible task scheduler (ADR-0009). Test-only; run with `cargo xtask dst`."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+madsim.workspace = true
+wyrd-core.workspace = true
+wyrd-traits.workspace = true
+wyrd-metadata-redb.workspace = true
+wyrd-chunkstore-fs.workspace = true
+tempfile.workspace = true

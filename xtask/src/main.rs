@@ -2,11 +2,12 @@
 //! laptop and in CI (ADR-0016, ADR-0009).
 //!
 //! Subcommands:
-//! - `ci` — fmt, clippy (`-D warnings`), build, test, cargo-deny, and the
-//!   conformance check; the single gate CI calls.
+//! - `ci` — fmt, clippy (`-D warnings`), build, test, cargo-deny, conformance,
+//!   and the madsim DST tier; the single gate CI calls.
 //! - `conformance` — run the `chunk-format` reader against the committed
-//!   conformance vectors. A stub at M0.1 (no vectors yet); the real reader and
-//!   vectors land in M0.2 (issue #65).
+//!   conformance vectors.
+//! - `dst` — run the madsim commit-protocol tests (`wyrd-dst`) under
+//!   `--cfg madsim` across a sweep of seeds (ADR-0009).
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
         Some("ci") => run_ci(),
         Some("conformance") => run_conformance(),
         Some("gen-vectors") => run_gen_vectors(),
+        Some("dst") => run_dst(),
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
             print_usage();
@@ -43,27 +45,68 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors>");
+    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors|dst>");
 }
 
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
 /// failure stops the run.
 fn run_ci() -> Result<(), String> {
+    // `wyrd-dst` only compiles under `--cfg madsim`; it is excluded from the
+    // normal workspace commands and built solely by `run_dst` below.
     cargo(&["fmt", "--all", "--", "--check"])?;
     cargo(&[
         "clippy",
         "--workspace",
+        "--exclude",
+        "wyrd-dst",
         "--all-targets",
         "--",
         "-D",
         "warnings",
     ])?;
-    cargo(&["build", "--workspace", "--all-targets"])?;
-    cargo(&["test", "--workspace"])?;
+    cargo(&[
+        "build",
+        "--workspace",
+        "--exclude",
+        "wyrd-dst",
+        "--all-targets",
+    ])?;
+    cargo(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
     cargo_deny_check()?;
     run_conformance()?;
+    run_dst()?;
     println!("\nxtask ci: all checks passed");
     Ok(())
+}
+
+/// Number of seeds the madsim DST tier sweeps per run.
+const DST_SEEDS: &str = "50";
+
+/// Run the madsim commit-protocol tests under `--cfg madsim` (ADR-0009). The
+/// flag and seed count are set on this child process only, so the normal build
+/// is untouched; this recompiles `wyrd-dst` and its deps under the simulator.
+fn run_dst() -> Result<(), String> {
+    print_step(&["cargo", "test", "-p", "wyrd-dst", "(--cfg madsim)"]);
+
+    // Append `--cfg madsim` to any existing RUSTFLAGS rather than clobbering it.
+    let rustflags = match std::env::var("RUSTFLAGS") {
+        Ok(existing) if !existing.is_empty() => format!("{existing} --cfg madsim"),
+        _ => "--cfg madsim".to_string(),
+    };
+
+    let status = Command::new("cargo")
+        .args(["test", "-p", "wyrd-dst"])
+        .current_dir(workspace_root())
+        .env("RUSTFLAGS", rustflags)
+        .env("MADSIM_TEST_NUM", DST_SEEDS)
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("madsim DST tests failed with {status}"))
+    }
 }
 
 /// Run the committed conformance vectors against the reference reader.

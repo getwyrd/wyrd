@@ -16,6 +16,7 @@ members = [
     "crates/chunkstore-fs",
     "crates/coordination-mem",
     "crates/server",
+    "crates/dst",
     "xtask",
 ]
 
@@ -42,6 +43,7 @@ wyrd-coordination-mem = { path = "crates/coordination-mem" }
 async-trait = "0.1"
 bytes = "1"
 crc32c = "0.6"
+madsim = "0.2"
 pollster = "0.4"
 prost = "0.13"
 prost-build = "0.13"
