@@ -1,0 +1,43 @@
+name: dco
+
+# Provenance gate (ADR-0003 §1): every commit in a pull request must carry a DCO
+# 'Signed-off-by' line. Split out of ci.yml so it runs on EVERY pull request,
+# including docs-only ones that the Rust gate skips — DCO applies to all
+# contributions, so this workflow carries no paths filter. Same gh-api idiom as
+# require-issue.yml; re-runs on each push so adding the sign-off clears the check.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Require a DCO sign-off on every commit
+        run: |
+          set -uo pipefail
+          commits=$(gh api "repos/$REPO/pulls/$PR/commits" --paginate --jq '.[].sha')
+          fail=0
+          for sha in $commits; do
+            msg=$(gh api "repos/$REPO/commits/$sha" --jq '.commit.message')
+            if ! printf '%s\n' "$msg" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::commit $sha is missing a DCO 'Signed-off-by' line"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Every commit must be signed off (git commit -s). See the DCO (ADR-0003)."
+            exit 1
+          fi
+          echo "OK: all commits carry a DCO sign-off"
