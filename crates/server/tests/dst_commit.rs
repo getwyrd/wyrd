@@ -18,6 +18,11 @@ const TTL: u64 = 5_000;
 const AFTER_LEASE: u64 = NOW + TTL + 1;
 const SEEDS: u64 = 64;
 
+/// The commit protocol is durability-scheme agnostic; run every property under
+/// both the M0 single-fragment path and the rs(6,3) erasure-coded path (M1.6,
+/// ADR-0008 mixed-era). The reads reconstruct, so the assertions are identical.
+const SCHEMES: &[EcScheme] = &[EcScheme::None, EcScheme::ReedSolomon { k: 6, m: 3 }];
+
 fn backends() -> (RedbMetadataStore, FsChunkStore, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("temp dir");
     let meta = RedbMetadataStore::in_memory().expect("redb");
@@ -47,8 +52,9 @@ async fn put_new(
     id: u64,
     data: &[u8],
     base: u128,
+    scheme: EcScheme,
 ) {
-    let plan = write::plan_write(data, CHUNK, EcScheme::None, ids_from(base)).unwrap();
+    let plan = write::plan_write(data, CHUNK, scheme, ids_from(base)).unwrap();
     write::intent(meta, &plan, NOW + TTL).await.unwrap();
     write::write_fragments(chunks, &plan).await.unwrap();
     assert_eq!(
@@ -63,17 +69,26 @@ async fn put_new(
 /// Invariant: under a concurrent overwrite, exactly one commit wins and the
 /// loser sees the version conflict; the winner's content and a single version
 /// bump persist.
-fn exactly_one_wins(seed: u64) {
+fn exactly_one_wins(scheme: EcScheme, seed: u64) {
     block_on(async {
         let mut sim = Sim::new(seed);
         let (meta, chunks, _dir) = backends();
-        put_new(&meta, &chunks, "obj", 1, &payload(&mut sim, 32), 0x10).await;
+        put_new(
+            &meta,
+            &chunks,
+            "obj",
+            1,
+            &payload(&mut sim, 32),
+            0x10,
+            scheme,
+        )
+        .await;
         let prior = read::read_inode(&meta, 1).await.unwrap().unwrap();
 
         let a = payload(&mut sim, 32);
         let b = payload(&mut sim, 32);
-        let plan_a = write::plan_write(&a, CHUNK, EcScheme::None, ids_from(0x1_0000)).unwrap();
-        let plan_b = write::plan_write(&b, CHUNK, EcScheme::None, ids_from(0x2_0000)).unwrap();
+        let plan_a = write::plan_write(&a, CHUNK, scheme, ids_from(0x1_0000)).unwrap();
+        let plan_b = write::plan_write(&b, CHUNK, scheme, ids_from(0x2_0000)).unwrap();
         for plan in [&plan_a, &plan_b] {
             write::intent(&meta, plan, NOW + TTL).await.unwrap();
             write::write_fragments(&chunks, plan).await.unwrap();
@@ -103,16 +118,16 @@ fn exactly_one_wins(seed: u64) {
 /// Invariant: a reader sees the pre- or post-commit version whole, never a
 /// hybrid — the captured v1 snapshot reassembles all of v1 while the live path
 /// resolves all of v2.
-fn never_a_hybrid(seed: u64) {
+fn never_a_hybrid(scheme: EcScheme, seed: u64) {
     block_on(async {
         let mut sim = Sim::new(seed);
         let (meta, chunks, _dir) = backends();
         let v1 = payload(&mut sim, 48);
-        put_new(&meta, &chunks, "obj", 1, &v1, 0x10).await;
+        put_new(&meta, &chunks, "obj", 1, &v1, 0x10, scheme).await;
         let snapshot = read::read_inode(&meta, 1).await.unwrap().unwrap();
 
         let v2 = payload(&mut sim, 48);
-        let plan = write::plan_write(&v2, CHUNK, EcScheme::None, ids_from(0x9_0000)).unwrap();
+        let plan = write::plan_write(&v2, CHUNK, scheme, ids_from(0x9_0000)).unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
         write::commit_overwrite(&meta, 1, &snapshot, &plan)
@@ -138,14 +153,14 @@ fn never_a_hybrid(seed: u64) {
 /// Fault injection: a crash between phases 3 and 4 leaves the file fully visible
 /// and a crash before commit leaves it invisible; the sweep reclaims only
 /// ledger entries, never a committed object's fragments.
-fn crash_is_atomic(seed: u64) {
+fn crash_is_atomic(scheme: EcScheme, seed: u64) {
     block_on(async {
         let mut sim = Sim::new(seed);
 
         // Crash between commit (3) and release (4).
         let (meta, chunks, _dir) = backends();
         let data = payload(&mut sim, 48);
-        let plan = write::plan_write(&data, CHUNK, EcScheme::None, ids_from(0x10)).unwrap();
+        let plan = write::plan_write(&data, CHUNK, scheme, ids_from(0x10)).unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
         write::commit_create(&meta, 0, "obj", 1, &plan)
@@ -166,13 +181,8 @@ fn crash_is_atomic(seed: u64) {
 
         // Crash before commit: nothing is visible; the sweep clears the leases.
         let (meta, chunks, _dir) = backends();
-        let plan = write::plan_write(
-            &payload(&mut sim, 48),
-            CHUNK,
-            EcScheme::None,
-            ids_from(0x20),
-        )
-        .unwrap();
+        let plan =
+            write::plan_write(&payload(&mut sim, 48), CHUNK, scheme, ids_from(0x20)).unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
         // --- crash: no commit ---
@@ -196,22 +206,28 @@ fn crash_is_atomic(seed: u64) {
 
 #[test]
 fn exactly_one_commit_wins_across_seeds() {
-    for seed in 0..SEEDS {
-        exactly_one_wins(seed);
+    for &scheme in SCHEMES {
+        for seed in 0..SEEDS {
+            exactly_one_wins(scheme, seed);
+        }
     }
 }
 
 #[test]
 fn reader_never_sees_a_hybrid_across_seeds() {
-    for seed in 0..SEEDS {
-        never_a_hybrid(seed);
+    for &scheme in SCHEMES {
+        for seed in 0..SEEDS {
+            never_a_hybrid(scheme, seed);
+        }
     }
 }
 
 #[test]
 fn crash_between_commit_and_release_is_atomic_across_seeds() {
-    for seed in 0..SEEDS {
-        crash_is_atomic(seed);
+    for &scheme in SCHEMES {
+        for seed in 0..SEEDS {
+            crash_is_atomic(scheme, seed);
+        }
     }
 }
 
@@ -221,9 +237,11 @@ fn crash_between_commit_and_release_is_atomic_across_seeds() {
 #[test]
 fn commit_invariants_hold_at_pinned_regression_seed() {
     const REGRESSION_SEED: u64 = 0x00C0_FFEE;
-    exactly_one_wins(REGRESSION_SEED);
-    never_a_hybrid(REGRESSION_SEED);
-    crash_is_atomic(REGRESSION_SEED);
+    for &scheme in SCHEMES {
+        exactly_one_wins(scheme, REGRESSION_SEED);
+        never_a_hybrid(scheme, REGRESSION_SEED);
+        crash_is_atomic(scheme, REGRESSION_SEED);
+    }
 
     // Re-running the seed reproduces the run exactly (determinism).
     let once: Vec<u8> = {
