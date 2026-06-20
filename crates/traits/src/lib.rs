@@ -24,6 +24,18 @@ use bytes::Bytes;
 /// central coordination, which suits the direct-write data path.
 pub type ChunkId = u128;
 
+/// Addresses one fragment of a chunk: the chunk id plus the fragment's
+/// `ec_fragment_index` (ADR-0019). A chunk under `replication(1)`/`none` has a
+/// single fragment at index 0; an erasure-coded chunk has `k + m` fragments at
+/// indices `0..k+m`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FragmentId {
+    /// The chunk this fragment belongs to.
+    pub chunk: ChunkId,
+    /// The fragment's 0-based index within the chunk's stripe.
+    pub index: u16,
+}
+
 /// A monotonic fencing token handed out with a lock or leadership grant, so a
 /// stale holder's writes can be rejected after it has lost the lock.
 pub type FencingToken = u64;
@@ -47,21 +59,25 @@ pub enum Health {
     Unhealthy,
 }
 
-/// Stores and retrieves erasure-coded chunk fragments by chunk id.
+/// Stores and retrieves erasure-coded chunk fragments, addressed by
+/// [`FragmentId`] — chunk id plus fragment index.
 ///
 /// Deliberately dumb (building-block view, L4): no placement logic and no
 /// metadata. A fragment is the on-disk bytes specified by `chunk-format`
 /// (ADR-0019); this trait moves those bytes and verifies their integrity, but
-/// does not interpret them beyond the format's own checksums.
+/// does not interpret them beyond the format's own checksums. Fragment-addressed
+/// from M1 so erasure-coded chunks (many fragments per chunk) and M0's
+/// `replication(1)` (a single fragment at index 0) share one contract — the
+/// addressing M2's networked D servers inherit.
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
     /// Persist a fragment's bytes under `id`. Implementations verify the
     /// fragment's self-describing checksums before acknowledging.
-    async fn put_fragment(&self, id: ChunkId, fragment: Bytes) -> Result<()>;
+    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()>;
 
     /// Fetch a fragment's bytes, or `Ok(None)` if this store holds no fragment
     /// for `id`. Implementations verify integrity before returning bytes.
-    async fn get_fragment(&self, id: ChunkId) -> Result<Option<Bytes>>;
+    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>>;
 
     /// Report this store's current health.
     async fn health(&self) -> Result<Health>;
