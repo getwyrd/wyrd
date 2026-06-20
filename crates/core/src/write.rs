@@ -19,20 +19,26 @@
 //! seed (ADR-0009).
 
 use bytes::Bytes;
-use wyrd_chunk_format::{encode, FragmentHeader};
+use wyrd_chunk_format::{encode, EcSchemeType, FragmentHeader};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, FragmentId, MetadataStore, Result, WriteBatch,
 };
 
-use crate::metadata::{self, InodeId, InodeRecord, InodeState, PendingEntry};
+use crate::erasure;
+use crate::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry};
 
-/// One planned chunk: its minted id and the encoded v1 fragment bytes.
+/// One planned chunk: its id, durability scheme, logical length, and the encoded
+/// fragments to store — each `(ec_fragment_index, fragment bytes)`.
 #[derive(Debug, Clone)]
 pub struct PlannedChunk {
-    /// The chunk id minted for this chunk.
+    /// The chunk id minted for this chunk (shared by all its fragments).
     pub id: ChunkId,
-    /// The encoded fragment (header + payload + checksum) to store.
-    pub fragment: Bytes,
+    /// How the chunk is fragmented.
+    pub scheme: EcScheme,
+    /// The chunk's logical (pre-coding) length.
+    pub len: u64,
+    /// The fragments to write, by `ec_fragment_index`.
+    pub fragments: Vec<(u16, Bytes)>,
 }
 
 /// The pure result of chunking and encoding an object — no store access yet.
@@ -45,36 +51,77 @@ pub struct WritePlan {
 }
 
 impl WritePlan {
-    /// The chunk ids in object order — the inode's chunk map.
+    /// The chunk ids in object order — the keys of the pending ledger.
     pub fn chunk_ids(&self) -> Vec<ChunkId> {
         self.chunks.iter().map(|c| c.id).collect()
+    }
+
+    /// The chunk map for the inode record — id, scheme, and logical length per chunk.
+    pub fn chunk_refs(&self) -> Vec<ChunkRef> {
+        self.chunks
+            .iter()
+            .map(|c| ChunkRef {
+                id: c.id,
+                scheme: c.scheme,
+                len: c.len,
+            })
+            .collect()
+    }
+}
+
+/// Encode one chunk's `piece` into its fragments under `scheme`.
+fn encode_chunk(
+    scheme: EcScheme,
+    id: ChunkId,
+    piece: &[u8],
+) -> std::result::Result<Vec<(u16, Bytes)>, erasure::ErasureError> {
+    match scheme {
+        EcScheme::None => {
+            let header = FragmentHeader::new_v1(id, piece.len() as u64);
+            Ok(vec![(0, Bytes::from(encode(&header, piece)))])
+        }
+        EcScheme::ReedSolomon { k, m } => {
+            let shards = erasure::encode(k as usize, m as usize, piece)?;
+            Ok(shards
+                .into_iter()
+                .enumerate()
+                .map(|(i, shard)| {
+                    let mut header = FragmentHeader::new_v1(id, shard.len() as u64);
+                    header.ec_scheme_type = EcSchemeType::ReedSolomon;
+                    header.ec_k = k;
+                    header.ec_m = m;
+                    header.ec_fragment_index = i as u16;
+                    (i as u16, Bytes::from(encode(&header, &shard)))
+                })
+                .collect())
+        }
     }
 }
 
 /// Chunk `data` into `chunk_size`-byte pieces, mint a chunk id per piece via
-/// `next_id`, and encode each as a v1 fragment. Pure and deterministic given
-/// `next_id`. An empty object yields an empty plan.
+/// `next_id`, and erasure-code each into its fragments under `scheme`. Pure and
+/// deterministic given `next_id`. An empty object yields an empty plan.
 pub fn plan_write(
     data: &[u8],
     chunk_size: usize,
+    scheme: EcScheme,
     mut next_id: impl FnMut() -> ChunkId,
-) -> WritePlan {
+) -> std::result::Result<WritePlan, erasure::ErasureError> {
     let chunk_size = chunk_size.max(1);
-    let chunks = data
-        .chunks(chunk_size)
-        .map(|piece| {
-            let id = next_id();
-            let fragment = Bytes::from(encode(
-                &FragmentHeader::new_v1(id, piece.len() as u64),
-                piece,
-            ));
-            PlannedChunk { id, fragment }
-        })
-        .collect();
-    WritePlan {
+    let mut chunks = Vec::new();
+    for piece in data.chunks(chunk_size) {
+        let id = next_id();
+        chunks.push(PlannedChunk {
+            id,
+            scheme,
+            len: piece.len() as u64,
+            fragments: encode_chunk(scheme, id, piece)?,
+        });
+    }
+    Ok(WritePlan {
         chunks,
         size: data.len() as u64,
-    }
+    })
 }
 
 /// Phase 1 — Intent: register every chunk id in the pending ledger with a lease
@@ -101,13 +148,13 @@ pub async fn intent(
 /// checksums. Failures here are harmless leased garbage.
 pub async fn write_fragments(chunks: &impl ChunkStore, plan: &WritePlan) -> Result<()> {
     for chunk in &plan.chunks {
-        // replication(1)/none: one fragment per chunk at index 0. Erasure coding
-        // will vary the index across the chunk's n fragments here.
-        let id = FragmentId {
-            chunk: chunk.id,
-            index: 0,
-        };
-        chunks.put_fragment(id, chunk.fragment.clone()).await?;
+        for (index, fragment) in &chunk.fragments {
+            let id = FragmentId {
+                chunk: chunk.id,
+                index: *index,
+            };
+            chunks.put_fragment(id, fragment.clone()).await?;
+        }
     }
     Ok(())
 }
@@ -123,7 +170,7 @@ pub async fn commit_create(
 ) -> Result<CommitOutcome> {
     let record = InodeRecord {
         size: plan.size,
-        chunk_map: plan.chunk_ids(),
+        chunk_map: plan.chunk_refs(),
         state: InodeState::Committed,
         version: 1,
     };
@@ -138,7 +185,7 @@ pub async fn commit_overwrite(
     prior: &InodeRecord,
     plan: &WritePlan,
 ) -> Result<CommitOutcome> {
-    metadata::commit_chunk_map(meta, inode_id, prior, plan.chunk_ids(), plan.size).await
+    metadata::commit_chunk_map(meta, inode_id, prior, plan.chunk_refs(), plan.size).await
 }
 
 /// Phase 4 — Release: delete the pending-ledger entries for a committed write.
@@ -160,11 +207,12 @@ pub async fn write_new_object(
     inode_id: InodeId,
     data: &[u8],
     chunk_size: usize,
+    scheme: EcScheme,
     now_millis: u64,
     lease_ttl_millis: u64,
     next_id: impl FnMut() -> ChunkId,
 ) -> Result<CommitOutcome> {
-    let plan = plan_write(data, chunk_size, next_id);
+    let plan = plan_write(data, chunk_size, scheme, next_id)?;
     intent(meta, &plan, now_millis + lease_ttl_millis).await?;
     write_fragments(chunks, &plan).await?;
     let outcome = commit_create(meta, parent, name, inode_id, &plan).await?;

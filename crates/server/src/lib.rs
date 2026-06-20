@@ -17,12 +17,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use wyrd_core::metadata::InodeId;
+use wyrd_core::metadata::{EcScheme, InodeId};
 use wyrd_core::{read, write};
 use wyrd_traits::{ChunkId, ChunkStore, CommitOutcome, Coordination, MetadataStore, Result};
 
 /// The root inode every object key is bound under — a flat namespace at M0.
 const ROOT: InodeId = 0;
+/// Default durability: Reed-Solomon RS(6,3) — k=6 data, m=3 parity (proposal 0003).
+pub const DEFAULT_DURABILITY: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 };
 /// Default chunk size (1 MiB). Tests override it to exercise multi-chunk objects.
 const DEFAULT_CHUNK_SIZE: usize = 1 << 20;
 /// Default pending-ledger lease lifetime.
@@ -41,6 +43,7 @@ pub struct Gateway<M, C, Co> {
     chunks: C,
     coord: Co,
     chunk_size: usize,
+    durability: EcScheme,
     lease_ttl_millis: u64,
     // Id allocation is an in-process counter at M0 (one process, not deployable);
     // random/uncoordinated chunk ids (ADR-0019) and durable inode allocation are
@@ -62,6 +65,7 @@ where
             chunks,
             coord,
             chunk_size: DEFAULT_CHUNK_SIZE,
+            durability: DEFAULT_DURABILITY,
             lease_ttl_millis: DEFAULT_LEASE_TTL_MILLIS,
             next_inode: AtomicU64::new(1), // 0 is ROOT
             next_chunk: AtomicU64::new(1),
@@ -71,6 +75,12 @@ where
     /// Set the chunk size (mainly so tests can force multi-chunk objects).
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.chunk_size = chunk_size.max(1);
+        self
+    }
+
+    /// Set the durability scheme objects are stored under.
+    pub fn with_durability(mut self, durability: EcScheme) -> Self {
+        self.durability = durability;
         self
     }
 
@@ -97,7 +107,9 @@ where
     /// conditional, so a concurrent writer would lose with an error rather than
     /// corrupt the object.
     pub async fn put_object(&self, key: &str, data: &[u8]) -> Result<()> {
-        let plan = write::plan_write(data, self.chunk_size, || self.mint_chunk_id());
+        let plan = write::plan_write(data, self.chunk_size, self.durability, || {
+            self.mint_chunk_id()
+        })?;
         let lease_expiry = now_millis() + self.lease_ttl_millis;
         write::intent(&self.meta, &plan, lease_expiry).await?;
         write::write_fragments(&self.chunks, &plan).await?;

@@ -9,7 +9,7 @@
 use pollster::block_on;
 use wyrd_chunk_format::decode;
 use wyrd_chunkstore_fs::FsChunkStore;
-use wyrd_core::metadata::{self, DirentRecord, InodeRecord, InodeState};
+use wyrd_core::metadata::{self, DirentRecord, EcScheme, InodeRecord, InodeState};
 use wyrd_core::write;
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_testkit::Sim;
@@ -50,10 +50,10 @@ async fn pending_count(meta: &RedbMetadataStore) -> usize {
 async fn read_object(meta: &RedbMetadataStore, chunks: &FsChunkStore, inode_id: u64) -> Vec<u8> {
     let inode = read_inode(meta, inode_id).await.expect("inode");
     let mut out = Vec::new();
-    for id in &inode.chunk_map {
+    for chunk in &inode.chunk_map {
         let fragment = chunks
             .get_fragment(FragmentId {
-                chunk: *id,
+                chunk: chunk.id,
                 index: 0,
             })
             .await
@@ -78,6 +78,7 @@ fn write_produces_an_atomically_committed_readable_file() {
             1,
             data,
             CHUNK,
+            EcScheme::None,
             NOW,
             TTL,
             ids_from(0x10),
@@ -113,7 +114,13 @@ fn crash_before_commit_leaves_only_collectable_garbage() {
     block_on(async {
         let (meta, chunks, _dir) = backends();
         let mut next = ids_from(0x20);
-        let plan = write::plan_write(b"data that is staged but never committed", CHUNK, &mut next);
+        let plan = write::plan_write(
+            b"data that is staged but never committed",
+            CHUNK,
+            EcScheme::None,
+            &mut next,
+        )
+        .unwrap();
 
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
@@ -154,7 +161,13 @@ fn crash_between_commit_and_release_leaves_entries_the_sweep_reclaims() {
     block_on(async {
         let (meta, chunks, _dir) = backends();
         let mut next = ids_from(0x30);
-        let plan = write::plan_write(b"committed but not released", CHUNK, &mut next);
+        let plan = write::plan_write(
+            b"committed but not released",
+            CHUNK,
+            EcScheme::None,
+            &mut next,
+        )
+        .unwrap();
 
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
@@ -199,6 +212,7 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
                 1,
                 b"v1",
                 CHUNK,
+                EcScheme::None,
                 NOW,
                 TTL,
                 ids_from(sim.gen()),
@@ -208,8 +222,11 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
             let prior = read_inode(&meta, 1).await.unwrap();
 
             // Two writers read the same prior and each stage a new version.
-            let plan_a = write::plan_write(b"winner", CHUNK, ids_from(sim.gen()));
-            let plan_b = write::plan_write(b"loser too", CHUNK, ids_from(sim.gen()));
+            let plan_a =
+                write::plan_write(b"winner", CHUNK, EcScheme::None, ids_from(sim.gen())).unwrap();
+            let plan_b =
+                write::plan_write(b"loser too", CHUNK, EcScheme::None, ids_from(sim.gen()))
+                    .unwrap();
             write::intent(&meta, &plan_a, NOW + TTL).await.unwrap();
             write::write_fragments(&chunks, &plan_a).await.unwrap();
             write::intent(&meta, &plan_b, NOW + TTL).await.unwrap();
@@ -229,7 +246,7 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
             assert_eq!(committed.version, 2, "seed {seed}: bumped once");
             assert_eq!(
                 committed.chunk_map,
-                plan_a.chunk_ids(),
+                plan_a.chunk_refs(),
                 "seed {seed}: winner persisted"
             );
 
@@ -251,8 +268,8 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
 fn concurrent_create_of_the_same_name_has_one_winner() {
     block_on(async {
         let (meta, chunks, _dir) = backends();
-        let plan_a = write::plan_write(b"a", CHUNK, ids_from(0x100));
-        let plan_b = write::plan_write(b"b", CHUNK, ids_from(0x200));
+        let plan_a = write::plan_write(b"a", CHUNK, EcScheme::None, ids_from(0x100)).unwrap();
+        let plan_b = write::plan_write(b"b", CHUNK, EcScheme::None, ids_from(0x200)).unwrap();
         write::intent(&meta, &plan_a, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan_a).await.unwrap();
         write::intent(&meta, &plan_b, NOW + TTL).await.unwrap();
