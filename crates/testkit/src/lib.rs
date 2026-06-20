@@ -25,6 +25,55 @@ pub trait Clock {
     fn now_millis(&self) -> u64;
 }
 
+/// The production [`Clock`]: real wall-clock time, in milliseconds since the Unix
+/// epoch. Used by single-process backends outside a simulation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_millis(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+}
+
+/// A manually-advanced [`Clock`] for deterministic tests: cheap to clone and
+/// share (the handle and the code under test see the same time), and advanced
+/// explicitly so expiry and timeout logic is exercised without real waiting.
+#[derive(Debug, Clone, Default)]
+pub struct ManualClock {
+    millis: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ManualClock {
+    /// A clock started at `start_millis`.
+    pub fn new(start_millis: u64) -> Self {
+        Self {
+            millis: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(start_millis)),
+        }
+    }
+
+    /// Advance the clock by `millis`.
+    pub fn advance(&self, millis: u64) {
+        self.millis
+            .fetch_add(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the clock to an absolute `millis`.
+    pub fn set(&self, millis: u64) {
+        self.millis
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_millis(&self) -> u64 {
+        self.millis.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Abstract durable storage. Production code performs disk I/O through this seam
 /// so the simulator can model latency, reordering, and faults deterministically.
 pub trait Disk {

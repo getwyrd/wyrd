@@ -1,6 +1,6 @@
 [package]
 name = "wyrd-coordination-mem"
-description = "In-memory Coordination: trivial single-process service discovery, leader election, locks, and config behind the trait seam (ADR-0006). etcd is the production backend wired in by `server`."
+description = "In-memory Coordination: single-process service discovery (leased, expiring), leader election, try-acquire locks, and mutable config behind the trait seam (ADR-0006). etcd is the production backend wired in by `server`."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,10 @@ publish.workspace = true
 
 [dependencies]
 wyrd-traits.workspace = true
+# The Clock seam (ADR-0009): production code is written against testkit's
+# abstractions, so leased registrations can expire under both a real and a
+# simulated clock.
+wyrd-testkit.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 

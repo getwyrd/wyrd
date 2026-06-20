@@ -3,70 +3,90 @@
 //! same trait; openraft is reserved as a future embedded one — choosing between
 //! them is composition in `server` (ADR-0010), not a refactor here.
 //!
-//! In one process there is nothing to coordinate *between*, so the semantics are
-//! deliberately trivial (architecture §5, L5): discovery just remembers what was
-//! registered, leadership is always granted (a lone process is always the
-//! leader), and a lock is granted immediately. What is real from day one is the
-//! **trait shape** — leased registration, fencing tokens — so etcd drops in
-//! later without touching any caller.
+//! The semantics are real where a single process can exercise them: leased
+//! registrations **expire** against an injected [`Clock`] and can be renewed or
+//! revoked; locks provide genuine **mutual exclusion** (try-acquire — a held key
+//! refuses contenders) and are released through the trait; config is mutable and
+//! carries a monotonic **revision**. Leadership is always granted (a lone process
+//! is always the leader), with a rising fencing token. Time is the only input;
+//! drive it with a [`ManualClock`](wyrd_testkit::ManualClock) for a reproducible
+//! run under the DST harness (ADR-0009).
 //!
-//! Everything is a deterministic counter (no clock, no randomness), so a run
-//! under the DST harness (ADR-0009) is reproducible.
+//! ## Deferred until a second backend (etcd) pins the semantics
 //!
-//! ## Deferred until the trait grows (and two backends pin the semantics)
-//!
-//! - **Lease expiry / renewal.** A registration lives for the process lifetime;
-//!   there is no `renew`/`revoke` on the trait yet, and a single process has no
-//!   crashed peer whose lease should lapse.
-//! - **Lock contention.** [`LockGuard`] is `Copy` with no release hook, so a
-//!   lock cannot block or be held — it is granted with a rising fencing token.
-//!   Mutual exclusion arrives when the trait gains a releasable guard.
-//! - **Config mutation and watch.** Config is seeded at construction and read
-//!   back; change notification is a later refinement on this seam.
+//! - **Blocking lock acquisition.** [`lock`](Coordination::lock) is non-blocking
+//!   (returns `None` when held); awaiting until a lock frees needs an async
+//!   notification primitive and a networked backend to validate against.
+//! - **Push config watch.** Change notification here is the pollable
+//!   [`config_revision`](Coordination::config_revision); a real stream is an etcd
+//!   refinement (the trait already shapes it as revision-based).
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use wyrd_traits::{Coordination, Leadership, Lease, LockGuard, Result};
+use wyrd_testkit::{Clock, SystemClock};
+use wyrd_traits::{Coordination, FencingToken, Leadership, Lease, LockGuard, Result};
 
-/// A [`Coordination`] backed entirely by in-process state.
-pub struct MemCoordination {
+/// A [`Coordination`] backed entirely by in-process state, generic over the
+/// [`Clock`] that drives lease expiry (a real [`SystemClock`] by default; a
+/// manual clock in tests).
+pub struct MemCoordination<C: Clock = SystemClock> {
     inner: Mutex<Inner>,
+    clock: C,
 }
 
 #[derive(Default)]
 struct Inner {
     /// Leased registrations, keyed by discovery key, in registration order.
-    registrations: HashMap<String, Vec<(u64, Bytes)>>,
-    /// Zone-wide config, seeded at construction.
+    registrations: HashMap<String, Vec<Registration>>,
+    /// Reverse index from lease id to its registration, so a lease can be
+    /// renewed or revoked without knowing its key.
+    leases: HashMap<u64, LeaseInfo>,
+    /// Keys currently locked, to the fencing token of the holder.
+    held_locks: HashMap<String, FencingToken>,
+    /// Zone-wide config.
     config: HashMap<String, Bytes>,
+    /// Bumped on every config write so a watcher can detect changes.
+    config_revision: u64,
     /// Source of lease ids; monotonic, starts at 1 (0 is reserved as "none").
     next_lease: u64,
     /// Source of fencing tokens, shared by leadership and locks so every grant
     /// is strictly greater than every grant before it (the fencing property).
-    next_token: u64,
+    next_token: FencingToken,
 }
 
-impl MemCoordination {
-    /// Create an empty coordinator (no config).
+/// A single registration's mutable expiry, kept in `registrations`.
+struct Registration {
+    lease_id: u64,
+    value: Bytes,
+    expiry_millis: u64,
+}
+
+/// What `leases` remembers so a lease can be located and re-stamped.
+struct LeaseInfo {
+    key: String,
+    ttl_millis: u64,
+}
+
+impl MemCoordination<SystemClock> {
+    /// Create an empty coordinator driven by the real wall clock.
     pub fn new() -> Self {
+        Self::with_clock(SystemClock)
+    }
+}
+
+impl<C: Clock> MemCoordination<C> {
+    /// Create an empty coordinator driven by `clock` — inject a manual clock to
+    /// exercise lease expiry deterministically.
+    pub fn with_clock(clock: C) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
-        }
-    }
-
-    /// Create a coordinator with zone-wide config seeded from `config`. There is
-    /// no setter on the trait yet, so config is provided here.
-    pub fn with_config(config: impl IntoIterator<Item = (String, Bytes)>) -> Self {
-        Self {
-            inner: Mutex::new(Inner {
-                config: config.into_iter().collect(),
-                ..Inner::default()
-            }),
+            clock,
         }
     }
 
@@ -79,32 +99,85 @@ impl MemCoordination {
     }
 }
 
-impl Default for MemCoordination {
+impl Default for MemCoordination<SystemClock> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl Coordination for MemCoordination {
-    async fn register(&self, key: &str, value: Bytes) -> Result<Lease> {
+impl<C: Clock + Send + Sync> Coordination for MemCoordination<C> {
+    async fn register(&self, key: &str, value: Bytes, ttl: Duration) -> Result<Lease> {
+        let now = self.clock.now_millis();
+        let ttl_millis = ttl.as_millis() as u64;
         let mut inner = self.guard()?;
+
         inner.next_lease += 1;
-        let id = inner.next_lease;
+        let lease_id = inner.next_lease;
+        inner.leases.insert(
+            lease_id,
+            LeaseInfo {
+                key: key.to_owned(),
+                ttl_millis,
+            },
+        );
         inner
             .registrations
             .entry(key.to_owned())
             .or_default()
-            .push((id, value));
-        Ok(Lease { id })
+            .push(Registration {
+                lease_id,
+                value,
+                expiry_millis: now + ttl_millis,
+            });
+        Ok(Lease { id: lease_id })
+    }
+
+    async fn renew(&self, lease: Lease) -> Result<()> {
+        let now = self.clock.now_millis();
+        let mut inner = self.guard()?;
+
+        let Some(info) = inner.leases.get(&lease.id) else {
+            return Err("renew: unknown or expired lease".into());
+        };
+        let (key, ttl_millis) = (info.key.clone(), info.ttl_millis);
+        let registration = inner
+            .registrations
+            .get_mut(&key)
+            .and_then(|regs| regs.iter_mut().find(|r| r.lease_id == lease.id));
+        match registration {
+            Some(r) if r.expiry_millis > now => {
+                r.expiry_millis = now + ttl_millis;
+                Ok(())
+            }
+            // Expired (or already swept): treat as gone.
+            _ => Err("renew: unknown or expired lease".into()),
+        }
+    }
+
+    async fn revoke(&self, lease: Lease) -> Result<()> {
+        let mut inner = self.guard()?;
+        if let Some(info) = inner.leases.remove(&lease.id) {
+            if let Some(regs) = inner.registrations.get_mut(&info.key) {
+                regs.retain(|r| r.lease_id != lease.id);
+            }
+        }
+        Ok(())
     }
 
     async fn discover(&self, key: &str) -> Result<Vec<Bytes>> {
+        let now = self.clock.now_millis();
         let inner = self.guard()?;
         Ok(inner
             .registrations
             .get(key)
-            .map(|members| members.iter().map(|(_, value)| value.clone()).collect())
+            .map(|members| {
+                members
+                    .iter()
+                    .filter(|r| r.expiry_millis > now)
+                    .map(|r| r.value.clone())
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -118,17 +191,40 @@ impl Coordination for MemCoordination {
         })
     }
 
-    async fn lock(&self, _key: &str) -> Result<LockGuard> {
-        // No contention in one process: grant immediately with a rising token.
+    async fn lock(&self, key: &str) -> Result<Option<LockGuard>> {
+        // Genuine mutual exclusion: a held key refuses contenders (try-acquire).
         let mut inner = self.guard()?;
+        if inner.held_locks.contains_key(key) {
+            return Ok(None);
+        }
         inner.next_token += 1;
-        Ok(LockGuard {
-            token: inner.next_token,
-        })
+        let token = inner.next_token;
+        inner.held_locks.insert(key.to_owned(), token);
+        Ok(Some(LockGuard { token }))
+    }
+
+    async fn unlock(&self, guard: LockGuard) -> Result<()> {
+        // Release by fencing token; idempotent if already released.
+        let mut inner = self.guard()?;
+        inner
+            .held_locks
+            .retain(|_, &mut token| token != guard.token);
+        Ok(())
+    }
+
+    async fn set_config(&self, key: &str, value: Bytes) -> Result<()> {
+        let mut inner = self.guard()?;
+        inner.config.insert(key.to_owned(), value);
+        inner.config_revision += 1;
+        Ok(())
     }
 
     async fn get_config(&self, key: &str) -> Result<Option<Bytes>> {
         let inner = self.guard()?;
         Ok(inner.config.get(key).cloned())
+    }
+
+    async fn config_revision(&self) -> Result<u64> {
+        Ok(self.guard()?.config_revision)
     }
 }

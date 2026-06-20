@@ -12,7 +12,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use wyrd_core::metadata::InodeId;
@@ -27,6 +27,9 @@ const DEFAULT_CHUNK_SIZE: usize = 1 << 20;
 const DEFAULT_LEASE_TTL_MILLIS: u64 = 30_000;
 /// Coordination group under which gateway nodes register for discovery.
 const NODES_GROUP: &str = "nodes";
+/// Lease lifetime for a node registration. Generous because the single-process
+/// gateway does not run a renewal loop at M0; a networked node would renew.
+const NODE_LEASE_TTL: Duration = Duration::from_secs(3600);
 
 /// An S3 gateway over a metadata store, a chunk store, and a coordination
 /// backend. Generic over the three seams so the concretes are chosen by the
@@ -73,7 +76,11 @@ where
     /// M0 this mainly proves all three backends are genuinely composed.
     pub async fn announce(&self, node: &str) -> Result<()> {
         self.coord
-            .register(NODES_GROUP, Bytes::copy_from_slice(node.as_bytes()))
+            .register(
+                NODES_GROUP,
+                Bytes::copy_from_slice(node.as_bytes()),
+                NODE_LEASE_TTL,
+            )
             .await?;
         Ok(())
     }
