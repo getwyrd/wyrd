@@ -3,14 +3,31 @@ name: ci
 # The Rust gate (ADR-0009): a thin caller of `cargo xtask ci`, so the same
 # checks — fmt, clippy (-D warnings), build, test, cargo-deny, conformance —
 # run identically on a laptop and here. CI logic lives in Rust (xtask), not
-# YAML (ADR-0016). A second job enforces DCO sign-off on pull requests
-# (ADR-0003 §1).
+# YAML (ADR-0016).
+#
+# Docs-only changes skip this gate (paths-ignore below): nothing under docs/ or
+# any Markdown/legal file can affect the Rust build. This is safe because the
+# Rust gate is NOT a required status check, so a skipped run never leaves a
+# docs-only PR stuck "pending" — unlike the required checks (require-issue,
+# docs-check, adr-immutability), which deliberately carry no paths filter so
+# they always report. DCO sign-off must cover every commit (docs included), so
+# it lives in its own always-on workflow (dco.yml), unaffected by this filter.
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - 'NOTICE'
   pull_request:
     types: [opened, reopened, synchronize]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - 'NOTICE'
 
 permissions:
   contents: read
@@ -52,35 +69,3 @@ jobs:
       - name: cargo xtask bench (tracked, non-gating)
         run: cargo xtask bench
         continue-on-error: true
-
-  dco:
-    # Provenance check: every commit in a PR must carry a DCO sign-off
-    # (ADR-0003 §1). Same gh-api idiom as require-issue.yml; re-runs on edit so
-    # adding the sign-off clears the check.
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      PR: ${{ github.event.pull_request.number }}
-    steps:
-      - name: Require a DCO sign-off on every commit
-        run: |
-          set -uo pipefail
-          commits=$(gh api "repos/$REPO/pulls/$PR/commits" --paginate --jq '.[].sha')
-          fail=0
-          for sha in $commits; do
-            msg=$(gh api "repos/$REPO/commits/$sha" --jq '.commit.message')
-            if ! printf '%s\n' "$msg" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
-              echo "::error::commit $sha is missing a DCO 'Signed-off-by' line"
-              fail=1
-            fi
-          done
-          if [ "$fail" -ne 0 ]; then
-            echo "::error::Every commit must be signed off (git commit -s). See the DCO (ADR-0003)."
-            exit 1
-          fi
-          echo "OK: all commits carry a DCO sign-off"
