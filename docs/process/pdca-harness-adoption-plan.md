@@ -1,7 +1,8 @@
 ---
 created: 20.06.2026 13:40
+updated: 20.06.2026 14:40
 type: plan
-status: draft
+status: piloted
 author: Eduard Ralph
 tags:
   - process
@@ -18,6 +19,23 @@ tags:
 > highest-value, lowest-risk step ships first and nothing is adopted before it
 > earns its place. Early in the project the discipline matters more than the
 > ceremony; this plan is deliberately phased, not all-or-nothing.
+
+> [!note] Status update — 2026-06-20: **Phase 2 pilot shipped.**
+> When this plan was first drafted, Workstream A (neutralize the harness) was assumed
+> to be outstanding. Verifying against the harness repo showed it had **already
+> shipped** at template `v0.24.0`: it is **Apache-2.0** (no relicense needed), it
+> supports **wholesale gate delegation** (`[gates] runner` / `cmd = "cargo xtask ci"`),
+> and its model ships as **plain Markdown** (`PCDA/quality-cycle/`, no Obsidian). So
+> Phase 1 was a no-op, and the **Phase 2 out-of-tree pilot was executed**: a project
+> rendered from the harness now lives beside this repo at **`../wyrd-pdca`**. It
+> delegates every gate to `cargo xtask ci` through a thin `engine/xtask.sh` wrapper
+> (no gate is re-declared), fills `docs/INTEGRATION.md` with Wyrd's values, and was
+> verified end-to-end (`pdca gates --working-tree` drives `cargo xtask ci` to a green,
+> gating pass; a toy bundle runs Plan→Do→Check→sign-off; its own Act log is live).
+> **Act stays complementary, not either/or:** Phase 0's native Act beat (ADR-0023, the
+> cheap proven first step) and the harness's richer Act tooling coexist exactly as
+> ADR-0023 frames it — proving the highest-value beat natively *de-risks* the fuller
+> harness adoption. The annotations below mark what is done; this tree is untouched.
 
 ## Goal
 
@@ -39,7 +57,7 @@ Wyrd implements three of PDCA's four beats natively, often more rigorously than 
 | **Plan** | `specs/` (RFC-2119 + conformance vectors), ADRs (immutable), proposals (draft → accepted → implemented) |
 | **Do** | DST-constrained implementation against `testkit` abstractions (ADR-0009) |
 | **Check** | `cargo xtask ci` — fmt, clippy `-D warnings`, build, test, cargo-deny, conformance — run identically on laptop and CI; plus `require-issue`, `dco`, `adr-immutability` |
-| **Act** | — *no home today* (see the companion draft ADR) |
+| **Act** | native home proposed in `docs/process/act-log.md` (ADR-0023); the pilot adds richer tooling (`../wyrd-pdca/process/act-log.md` + `pdca act-index`/`act-log`) — complementary, per ADR-0023's own framing |
 
 The integration work is therefore **not** "install a process Wyrd lacks." It is "make PDCA neutral enough to wrap the process Wyrd already has, and fill the one gap (Act)."
 
@@ -80,24 +98,34 @@ What Wyrd supplies once the harness is neutral. These are the `docs/INTEGRATION.
 
 Ordered so unique value ships first and each phase gates the next.
 
-- **Phase 0 — adopt the Act beat natively (now, zero harness dependency).**
-  Land the companion ADR and `docs/process/act-log.md`. This is the one beat Wyrd lacks and the harness's most distinctive contribution; capturing it natively delivers the value immediately, with no license, toolchain, or vendoring cost, and de-risks every later phase.
+- **Phase 0 — adopt the Act beat natively (now, zero harness dependency).** — **PROPOSED (ADR-0023).**
+  The companion ADR-0023 (status: Proposed) decides to land Act natively as an append-only
+  `docs/process/act-log.md`, routing lessons into `xtask` gates / ADRs / proposals. It stands on its
+  own with no harness dependency, and — per its own Consequences — *de-risks* the fuller harness
+  adoption by proving the highest-value beat first. It is **complementary** to the pilot's Act tooling,
+  not superseded by it; the two can converge (the pilot's log pointing at the native one) if both stay.
 
-- **Phase 1 — neutralize the harness (pdca-harness side).**
-  Workstream A: relicense to Apache-2.0; add delegated-gate support; de-Obsidian the model; make Plan a pointer. None of this touches Wyrd's tree.
+- **Phase 1 — neutralize the harness (pdca-harness side).** — **DONE upstream (no work needed).**
+  Workstream A (relicense to Apache-2.0; delegated-gate support; de-Obsidian; Plan-as-pointer) had
+  all already shipped in pdca-harness by template `v0.24.0`. Verified against the repo, not assumed.
 
-- **Phase 2 — pilot the harness out-of-tree against Wyrd.**
-  Render the neutralized harness into a thin `pdca/` (or a sibling worktree) that **wraps** `cargo xtask`, never re-declares gates. Fill `INTEGRATION.md` (Workstream B). Run **one real issue** end to end — stubbed/offline leaves first, then `leaves_mode = "command"` — and confirm: no duplicated gate definitions, no new denied licenses, no second CI truth, no forced Obsidian. Keep or discard on the pilot's evidence.
+- **Phase 2 — pilot the harness out-of-tree against Wyrd.** — **DONE.**
+  Rendered into the sibling project `../wyrd-pdca`, which **wraps** `cargo xtask` via `engine/xtask.sh`
+  and never re-declares gates. `INTEGRATION.md` filled (Workstream B). Verified end to end with
+  stub/offline leaves: `pdca gates --working-tree` drives `cargo xtask ci` to a green gating pass, and a
+  toy bundle runs Plan→Do→Check→sign-off; no duplicated gate definitions, no new denied licenses, no
+  second CI truth, no forced Obsidian, this tree untouched. **Remaining:** flip `leaves_mode = "command"`
+  and run **one real Wyrd issue** with live model leaves before the keep/discard call.
 
-- **Phase 3 — evaluate scale features only when volume justifies them.**
+- **Phase 3 — evaluate scale features only when volume justifies them.** — *unchanged (not yet due).*
   PDCA's batch / lane-concurrency / sign-off-queue features earn their keep with many concurrent issues and agent fleets. Hold them until contributor and issue volume (and any move past founding-maintainer bootstrap) makes them pay; otherwise they are ceremony.
 
 ## Decision gates / open questions
 
-- **Does relicensing the harness happen, and to Apache-2.0 specifically?** Phase 1+ is blocked until it does.
-- **Can `pdca.toml` reference an external runner without re-declaring gates?** If the harness cannot delegate wholesale, Wyrd should *not* adopt it — single-sourced gates in `xtask` are non-negotiable (ADR-0016).
-- **Where does the rendered driver live** — `pdca/` in-tree (now permissible once Apache-2.0) or an out-of-tree sibling? Pilot out-of-tree first; promote in-tree only if it carries its weight.
-- **Does Phase 0 alone suffice?** It may. If the Act beat closes the only real gap and Phases 1–3 never clear their gates, that is a valid end state, not a failure.
+- **Does relicensing the harness happen, and to Apache-2.0 specifically?** — **RESOLVED:** the harness is already Apache-2.0 (`v0.24.0`); no relicense needed.
+- **Can `pdca.toml` reference an external runner without re-declaring gates?** — **RESOLVED: yes.** `[gates] runner` + a bare `subcmd` (or a full `cmd = "cargo xtask ci"`) delegates wholesale; the pilot proves it driving `cargo xtask ci` with zero gate re-declaration. The non-negotiable (ADR-0016) holds.
+- **Where does the rendered driver live** — in-tree or out-of-tree? — **RESOLVED: out-of-tree sibling** (`../wyrd-pdca`). Promote in-tree only if it later earns its weight.
+- **Does the native-Act path (Phase 0) alone suffice?** — **STILL OPEN, and now complementary:** ADR-0023's native act-log stands on its own (Proposed); the pilot adds richer tooling on top. The live question is whether the **pilot** earns its keep once a real issue runs with live leaves — and, if both stay, whether to converge the two Act logs (the pilot's pointing at the native one). Discard the pilot cleanly if it doesn't pay; the native beat is unaffected either way.
 
 ## Success criteria
 
