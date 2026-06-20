@@ -36,3 +36,6 @@ tonic.workspace = true
 wyrd-chunk-format.workspace = true
 wyrd-testkit.workspace = true
 tempfile.workspace = true
+# A fault-injecting ChunkStore fake (a hanging/down D server) for the any-k read
+# fan-out test (M2.5).
+async-trait.workspace = true

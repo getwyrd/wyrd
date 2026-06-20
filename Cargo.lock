@@ -1972,6 +1972,7 @@ dependencies = [
 name = "wyrd-server"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "pollster",
  "tempfile",
