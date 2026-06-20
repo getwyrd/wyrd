@@ -49,6 +49,11 @@ bytes = "1"
 # surface small (ADR-0003).
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 crc32c = "0.6"
+# Runtime-agnostic future combinators (try_join_all) for the parallel write
+# fan-out / any-k read (M2.4/M2.5). `alloc`-only: single-task concurrency that
+# polls the n fragment futures cooperatively — deterministic under madsim, no
+# task spawning, no runtime tie-in (ADR-0009).
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 madsim = "0.2"
 pollster = "0.4"
 prost = "0.14"

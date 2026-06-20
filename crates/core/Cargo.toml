@@ -13,6 +13,7 @@ wyrd-traits.workspace = true
 wyrd-proto.workspace = true
 wyrd-chunk-format.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 reed-solomon-simd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +21,10 @@ serde_json.workspace = true
 [dev-dependencies]
 # Seeded property tests reuse the deterministic simulator (ADR-0009).
 wyrd-testkit.workspace = true
+# Drives the async write/read path in tests without a runtime tie-in.
+pollster.workspace = true
+# Implement the ChunkStore trait for an in-test fault-injecting fake.
+async-trait.workspace = true
 # EC throughput micro-benchmarks (M1.7, `cargo xtask bench`).
 criterion.workspace = true
 

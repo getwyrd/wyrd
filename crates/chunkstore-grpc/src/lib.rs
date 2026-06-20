@@ -22,10 +22,12 @@
 mod client;
 mod conv;
 mod error;
+mod fanout;
 mod server;
 
 pub use client::GrpcChunkStore;
 pub use error::TransportError;
+pub use fanout::FanoutChunkStore;
 pub use server::ChunkStoreService;
 
 /// The generated tonic server wrapper, re-exported so a host (the `server`

@@ -145,17 +145,31 @@ pub async fn intent(
 }
 
 /// Phase 2 — Data: write every fragment to the chunk store, which verifies its
-/// checksums. Failures here are harmless leased garbage.
+/// checksums.
+///
+/// The puts are fired as a **concurrent fan-out** and joined on every one: with a
+/// fan-out store (M2.4) a chunk's `n` fragments stream to distinct D servers in
+/// parallel rather than one after another, so the data phase costs one round trip,
+/// not `n`. The join is single-task cooperative concurrency (it polls the futures,
+/// it does not spawn), so it stays deterministic under simulation (ADR-0009).
+///
+/// **Fail-closed:** if any put fails or times out the whole phase returns that
+/// error, so the four-phase protocol aborts *before* the commit — there is never a
+/// half-committed chunk. The fragments that did land are harmless **leased
+/// garbage** the pending-ledger sweep reclaims. Degraded-write tolerance
+/// (committing with fewer than `n` and letting custodians backfill) is deferred to
+/// M3; M2 commits only after **all `n`** ack.
 pub async fn write_fragments(chunks: &impl ChunkStore, plan: &WritePlan) -> Result<()> {
-    for chunk in &plan.chunks {
-        for (index, fragment) in &chunk.fragments {
+    let puts = plan.chunks.iter().flat_map(|chunk| {
+        chunk.fragments.iter().map(move |(index, fragment)| {
             let id = FragmentId {
                 chunk: chunk.id,
                 index: *index,
             };
-            chunks.put_fragment(id, fragment.clone()).await?;
-        }
-    }
+            chunks.put_fragment(id, fragment.clone())
+        })
+    });
+    futures_util::future::try_join_all(puts).await?;
     Ok(())
 }
 
