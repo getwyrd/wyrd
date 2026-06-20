@@ -45,6 +45,14 @@ jobs:
       - name: cargo xtask ci
         run: cargo xtask ci
 
+      # EC throughput numbers (issue #99), tracked for regression visibility in
+      # the run log — NOT a gate: CI wall-clock is noisy, so a slowdown never
+      # blocks a merge. Reuses the warm cache from the step above (the bench is
+      # already compiled by `cargo xtask ci`'s `build --all-targets`).
+      - name: cargo xtask bench (tracked, non-gating)
+        run: cargo xtask bench
+        continue-on-error: true
+
   dco:
     # Provenance check: every commit in a PR must carry a DCO sign-off
     # (ADR-0003 §1). Same gh-api idiom as require-issue.yml; re-runs on edit so
