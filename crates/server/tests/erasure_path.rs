@@ -1,8 +1,9 @@
-//! Integration tests for the erasure-coded write path (M1.3, architecture §5/§6.1,
-//! proposal 0003): a chunk is coded into n = k+m fragments stored under one chunk
-//! id, the chunk map records the scheme + logical length, and the object reads
-//! back byte-identical through the same read path. Wired against the real redb +
-//! filesystem backends; `pollster::block_on` drives the sync path deterministically.
+//! Integration tests for the erasure-coded write + read path (M1.3/M1.4,
+//! architecture §5/§6.1/§6.2/§6.6, proposal 0003): a chunk is coded into n = k+m
+//! fragments stored under one chunk id, the chunk map records the scheme + logical
+//! length, and the read reconstructs from any k — excluding missing or
+//! checksum-failing fragments and erroring cleanly below k. Wired against the real
+//! redb + filesystem backends; `pollster::block_on` drives the sync path.
 
 use pollster::block_on;
 use wyrd_chunk_format::{decode, EcSchemeType};
@@ -202,6 +203,143 @@ fn mixed_era_chunks_read_through_one_path() {
         assert_eq!(
             read::read_object_from(&chunks, &inode).await.unwrap(),
             expected
+        );
+    });
+}
+
+// --- M1.4: resilient read (reconstruct from any k) -------------------------------
+
+/// A deterministic, non-trivial single-chunk payload (spans several shards).
+fn sample() -> Vec<u8> {
+    (0..500u32)
+        .map(|i| i.wrapping_mul(31).wrapping_add(7) as u8)
+        .collect()
+}
+
+/// Write a single-chunk rs(6,3) object and return its committed inode snapshot.
+async fn put_rs(meta: &RedbMetadataStore, chunks: &FsChunkStore, data: &[u8]) -> InodeRecord {
+    write::write_new_object(
+        meta,
+        chunks,
+        ROOT,
+        "obj",
+        1,
+        data,
+        CHUNK,
+        RS,
+        NOW,
+        TTL,
+        ids_from(0x10),
+    )
+    .await
+    .unwrap();
+    let inode = read::read_inode(meta, 1).await.unwrap().unwrap();
+    assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
+    inode
+}
+
+fn frag_path(root: &std::path::Path, chunk: ChunkId, index: u16) -> std::path::PathBuf {
+    fragment_path(root, FragmentId { chunk, index })
+}
+
+/// Flip the last byte of a fragment on disk so its checksum fails verification.
+fn corrupt(root: &std::path::Path, chunk: ChunkId, index: u16) {
+    let path = frag_path(root, chunk, index);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+}
+
+#[test]
+fn reads_survive_any_m_fragment_losses() {
+    block_on(async {
+        let data = sample();
+        // Every way to delete m = 3 of the n = 9 fragments (C(9,3) = 84): each keeps
+        // exactly k = 6, so the chunk must still reconstruct byte-identical.
+        for mask in 0u16..(1 << 9) {
+            if mask.count_ones() != 3 {
+                continue;
+            }
+            let (meta, chunks, dir) = backends();
+            let inode = put_rs(&meta, &chunks, &data).await;
+            let cid = inode.chunk_map[0].id;
+            for index in 0..9u16 {
+                if mask & (1 << index) != 0 {
+                    std::fs::remove_file(frag_path(dir.path(), cid, index)).unwrap();
+                }
+            }
+            assert_eq!(
+                read::read_object_from(&chunks, &inode).await.unwrap(),
+                data,
+                "deleting fragments {mask:#011b} must still reconstruct"
+            );
+        }
+    });
+}
+
+#[test]
+fn fewer_than_k_fragments_is_a_clean_typed_error() {
+    block_on(async {
+        let data = sample();
+        let (meta, chunks, dir) = backends();
+        let inode = put_rs(&meta, &chunks, &data).await;
+        let cid = inode.chunk_map[0].id;
+
+        // Delete m + 1 = 4 fragments → only 5 < k = 6 remain.
+        for index in [0u16, 1, 2, 3] {
+            std::fs::remove_file(frag_path(dir.path(), cid, index)).unwrap();
+        }
+        let err = read::read_object_from(&chunks, &inode).await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<read::ReadError>(),
+                Some(read::ReadError::InsufficientFragments {
+                    have: 5,
+                    need: 6,
+                    ..
+                })
+            ),
+            "below k must surface InsufficientFragments, got: {err}"
+        );
+    });
+}
+
+#[test]
+fn checksum_failing_fragments_are_excluded_and_reconstructed_around() {
+    block_on(async {
+        let data = sample();
+
+        // Corrupting up to m = 3 fragments still reconstructs around them — a
+        // checksum-failing shard is never fed to the decoder.
+        for corrupt_count in 1..=3u16 {
+            let (meta, chunks, dir) = backends();
+            let inode = put_rs(&meta, &chunks, &data).await;
+            let cid = inode.chunk_map[0].id;
+            for index in 0..corrupt_count {
+                corrupt(dir.path(), cid, index);
+            }
+            assert_eq!(
+                read::read_object_from(&chunks, &inode).await.unwrap(),
+                data,
+                "corrupting {corrupt_count} fragment(s) must reconstruct around them"
+            );
+        }
+
+        // Corrupting m + 1 = 4 leaves < k valid fragments → typed error.
+        let (meta, chunks, dir) = backends();
+        let inode = put_rs(&meta, &chunks, &data).await;
+        let cid = inode.chunk_map[0].id;
+        for index in 0..4u16 {
+            corrupt(dir.path(), cid, index);
+        }
+        let err = read::read_object_from(&chunks, &inode).await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<read::ReadError>(),
+                Some(read::ReadError::InsufficientFragments { .. })
+            ),
+            "m+1 corruptions must surface InsufficientFragments, got: {err}"
         );
     });
 }

@@ -7,10 +7,11 @@
 //!   and chunks are immutable (a new version mints new chunk ids), so a
 //!   reassembled object is always one whole version — never a mix.
 //! - **Never bad data.** The chunk store verifies each fragment's checksum on
-//!   read ([`ChunkStore::get_fragment`]); a mismatch propagates as an error
-//!   rather than returning corrupt bytes. At M0 (`replication(1)`) there is a
-//!   single fragment, so a corrupt or missing one errors; multi-replica re-read
-//!   is a later milestone.
+//!   read ([`ChunkStore::get_fragment`]); a mismatch never returns corrupt bytes.
+//!   For an erasure-coded chunk a missing or checksum-failing fragment is
+//!   excluded and reconstructed around (up to `m` of them); below `k` survivors
+//!   the read fails with a typed error. A `replication(1)`/`none` chunk has a
+//!   single fragment, so a corrupt or missing one simply errors.
 
 use wyrd_chunk_format::decode;
 use wyrd_traits::{ChunkId, ChunkStore, FragmentId, MetadataStore, Result};
@@ -67,40 +68,55 @@ pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> 
 /// Read and decode one chunk's bytes, dispatching on its durability scheme. A
 /// per-chunk scheme is what lets one read path serve mixed-era data (ADR-0008).
 ///
-/// This is the happy-path read (all fragments present). Tolerating up to `m`
-/// missing/corrupt fragments and erroring cleanly below `k` is M1.4.
+/// For an erasure-coded chunk the read is resilient (§6.6): fragments that are
+/// missing or fail their checksum are excluded and reconstructed around, up to
+/// `m` of them; below `k` survivors it returns a clean typed error rather than a
+/// short or corrupt read.
 async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8>> {
-    /// Fetch the fragment at `index`, returning its decoded payload (the shard).
-    async fn payload_at(
-        chunks: &impl ChunkStore,
-        chunk_id: ChunkId,
-        index: u16,
-    ) -> Result<Vec<u8>> {
-        let fragment = chunks
-            .get_fragment(FragmentId {
-                chunk: chunk_id,
-                index,
-            })
-            .await?
-            .ok_or(ReadError::MissingFragment { chunk_id })?;
-        // The chunk store already verified integrity; decode to take the payload.
-        Ok(decode(&fragment)?.payload)
-    }
-
     match chunk.scheme {
-        EcScheme::None => payload_at(chunks, chunk.id, 0).await,
+        EcScheme::None => {
+            // A single fragment at index 0; there is nothing to reconstruct around.
+            let fragment = chunks
+                .get_fragment(FragmentId {
+                    chunk: chunk.id,
+                    index: 0,
+                })
+                .await?
+                .ok_or(ReadError::MissingFragment { chunk_id: chunk.id })?;
+            Ok(decode(&fragment)?.payload)
+        }
         EcScheme::ReedSolomon { k, m } => {
-            // Gather the k data shards (indices 0..k) and reconstruct.
-            let mut shards = Vec::with_capacity(k as usize);
-            for index in 0..k as u16 {
-                shards.push((index as usize, payload_at(chunks, chunk.id, index).await?));
+            let (k, m) = (k as usize, m as usize);
+            // Gather valid shards by index until we have the k the coder needs. A
+            // fragment that is missing (`Ok(None)`), fails its checksum (`Err`), or
+            // cannot be decoded is treated as absent and reconstructed around — a
+            // corrupt shard is never handed to the decoder.
+            let mut shards: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
+            for index in 0..(k + m) as u16 {
+                let fetched = chunks
+                    .get_fragment(FragmentId {
+                        chunk: chunk.id,
+                        index,
+                    })
+                    .await;
+                if let Ok(Some(fragment)) = fetched {
+                    if let Ok(decoded) = decode(&fragment) {
+                        shards.push((index as usize, decoded.payload));
+                    }
+                }
+                if shards.len() == k {
+                    break;
+                }
             }
-            Ok(erasure::reconstruct(
-                k as usize,
-                m as usize,
-                chunk.len as usize,
-                &shards,
-            )?)
+            if shards.len() < k {
+                return Err(ReadError::InsufficientFragments {
+                    chunk_id: chunk.id,
+                    have: shards.len(),
+                    need: k,
+                }
+                .into());
+            }
+            Ok(erasure::reconstruct(k, m, chunk.len as usize, &shards)?)
         }
     }
 }
@@ -150,6 +166,16 @@ pub enum ReadError {
         /// The size actually reassembled.
         found: u64,
     },
+    /// Fewer than `k` fragments of an erasure-coded chunk were readable, so it
+    /// cannot be reconstructed (more than `m` were missing or corrupt).
+    InsufficientFragments {
+        /// The chunk that could not be reconstructed.
+        chunk_id: ChunkId,
+        /// How many valid fragments were available.
+        have: usize,
+        /// How many (`k`) the scheme needs.
+        need: usize,
+    },
 }
 
 impl std::fmt::Display for ReadError {
@@ -165,6 +191,17 @@ impl std::fmt::Display for ReadError {
                 write!(
                     f,
                     "reassembled {found} bytes but the inode records {expected}"
+                )
+            }
+            ReadError::InsufficientFragments {
+                chunk_id,
+                have,
+                need,
+            } => {
+                write!(
+                    f,
+                    "chunk {chunk_id:032x}: only {have} of {need} fragments readable; \
+                     cannot reconstruct"
                 )
             }
         }
