@@ -19,6 +19,9 @@ use wyrd_traits::CommitOutcome;
 
 const CHUNK: usize = 4;
 const LEASE_EXPIRY: u64 = 6_000;
+// Exercise the concurrent commit over the default erasure-coded data path (n = 9
+// fragments per chunk), not just M0 single-fragment replication (M1.6).
+const RS: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 };
 
 /// A unique, deterministic chunk-id generator starting just above `base`.
 fn ids_from(base: u128) -> impl FnMut() -> u128 {
@@ -36,7 +39,7 @@ async fn exactly_one_concurrent_writer_wins() {
     let chunks = Arc::new(FsChunkStore::open(dir.path()).expect("fs store"));
 
     // An existing object at version 1.
-    let v0 = write::plan_write(b"v0", CHUNK, EcScheme::None, ids_from(1)).unwrap();
+    let v0 = write::plan_write(b"v0", CHUNK, RS, ids_from(1)).unwrap();
     write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
     write::write_fragments(&*chunks, &v0).await.unwrap();
     write::commit_create(&*meta, 0, "obj", 1, &v0)
@@ -53,13 +56,8 @@ async fn exactly_one_concurrent_writer_wins() {
         let chunks = Arc::clone(&chunks);
         let prior = prior.clone();
         handles.push(madsim::task::spawn(async move {
-            let plan = write::plan_write(
-                b"contended",
-                CHUNK,
-                EcScheme::None,
-                ids_from(0x1000 * (i + 1)),
-            )
-            .unwrap();
+            let plan =
+                write::plan_write(b"contended", CHUNK, RS, ids_from(0x1000 * (i + 1))).unwrap();
             write::intent(&*meta, &plan, LEASE_EXPIRY).await.unwrap();
             write::write_fragments(&*chunks, &plan).await.unwrap();
             let outcome = write::commit_overwrite(&*meta, 1, &prior, &plan)
