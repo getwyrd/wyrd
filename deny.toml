@@ -27,6 +27,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "MIT",
     "BSD-2-Clause",
+    # Permissive; reed-solomon-simd (the M1 erasure coder, ADR-0004) is
+    # "MIT AND BSD-3-Clause". A deliberate addition (ADR-0003 §2).
+    "BSD-3-Clause",
     "Unicode-3.0",
 ]
 confidence-threshold = 0.9
