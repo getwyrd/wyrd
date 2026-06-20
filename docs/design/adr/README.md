@@ -34,6 +34,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0020](0020-global-namespace-store.md) | Global namespace store (L2) and the NamespaceStore trait | Proposed |
 | [0021](0021-encryption-at-rest-and-key-management.md) | Encryption at rest and key management | Proposed |
 | [0022](0022-multi-tenancy-model.md) | Multi-tenancy model | Proposed |
+| [0023](0023-act-beat-process-improvement-loop.md) | Adopt the Act beat: a process-improvement loop | Proposed |
 
 ## Why not ... ?
 
