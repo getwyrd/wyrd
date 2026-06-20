@@ -20,9 +20,17 @@ wyrd-core.workspace = true
 wyrd-traits.workspace = true
 wyrd-metadata-redb.workspace = true
 wyrd-chunkstore-fs.workspace = true
+# The networked-storage profile: the gRPC ChunkStore client/server (M2.2) and the
+# tokio runtime that hosts the `d-server` role. tokio is a server-binary host
+# detail; Wyrd's core stays runtime-agnostic (ADR-0009).
+wyrd-chunkstore-grpc.workspace = true
 wyrd-coordination-mem.workspace = true
 bytes.workspace = true
 pollster.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+# The transport that hosts the gRPC ChunkStore service for the `d-server` role.
+tonic.workspace = true
 
 [dev-dependencies]
 wyrd-chunk-format.workspace = true

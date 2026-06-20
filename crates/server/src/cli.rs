@@ -10,8 +10,11 @@
 
 use std::collections::HashMap;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use pollster::block_on;
 use wyrd_chunkstore_fs::FsChunkStore;
@@ -21,7 +24,15 @@ use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, WriteBatch};
 
+use crate::dserver::{self, DServer};
 use crate::{Gateway, DEFAULT_DURABILITY};
+
+/// Default endpoint the `d-server` role binds and advertises.
+const DEFAULT_DSERVER_BIND: &str = "127.0.0.1:50051";
+/// Default D-server registration lease lifetime, and how often it is renewed —
+/// renew well within the TTL so a missed tick does not drop the registration.
+const DEFAULT_DSERVER_LEASE_TTL_SECS: u64 = 30;
+const DEFAULT_DSERVER_RENEW_SECS: u64 = 10;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -44,6 +55,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("put") => cmd_put(&args[1..]),
         Some("get") => cmd_get(&args[1..]),
+        Some("d-server") => cmd_d_server(&args[1..]),
         Some("demo") => cmd_demo(),
         Some(other) => {
             eprintln!("wyrd: unknown command `{other}`");
@@ -68,6 +80,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR]");
+    eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N]");
     eprintln!("  wyrd demo");
 }
 
@@ -190,6 +203,76 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
             }
         }
     })
+}
+
+/// `wyrd d-server`: host the local filesystem `ChunkStore` over the gRPC
+/// `ChunkStore` service, registering the endpoint for discovery through the
+/// `Coordination` seam, until Ctrl-C.
+///
+/// The coordination backend here is the process-local in-memory concrete, so a
+/// D server in a separate process is not yet discoverable by a separate gateway
+/// process — that awaits an etcd (or static-endpoint) backing behind the same
+/// trait (ADR-0006), a composition swap, not M2.3 work. The cross-process and
+/// multi-server discovery semantics are proven in-process by the role's tests.
+fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
+    let parsed = ParsedArgs::parse(args)?;
+    let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
+    let group = parsed.flag("group").unwrap_or(dserver::DSERVER_GROUP);
+    let bind: SocketAddr = parsed
+        .flag("bind")
+        .unwrap_or(DEFAULT_DSERVER_BIND)
+        .parse()
+        .map_err(|e| format!("d-server: invalid --bind address: {e}"))?;
+    let lease_ttl = Duration::from_secs(parse_u64_flag(
+        &parsed,
+        "lease-ttl-secs",
+        DEFAULT_DSERVER_LEASE_TTL_SECS,
+    )?);
+    let renew_interval = Duration::from_secs(parse_u64_flag(
+        &parsed,
+        "renew-secs",
+        DEFAULT_DSERVER_RENEW_SECS,
+    )?);
+
+    let chunk_dir = Path::new(data_dir).join("chunks");
+    let store = FsChunkStore::open(&chunk_dir)?;
+
+    // The d-server role is async (it hosts a tonic server); spin a tokio runtime
+    // for it. The CLI's other commands stay sync (pollster) — only this role
+    // needs a reactor.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let coord = Arc::new(MemCoordination::new());
+        let server = DServer::bind(store, bind).await?;
+        eprintln!(
+            "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {data_dir})",
+            server.endpoint()
+        );
+        let lease = server.register(&*coord, group, lease_ttl).await?;
+        eprintln!(
+            "wyrd d-server: registered under `{group}` (lease {}); Ctrl-C to stop",
+            lease.id
+        );
+        server
+            .serve(coord, lease, renew_interval, async {
+                let _ = tokio::signal::ctrl_c().await;
+                eprintln!("wyrd d-server: shutting down");
+            })
+            .await
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parse an optional `--<name> <u64>` flag, defaulting when absent.
+fn parse_u64_flag(parsed: &ParsedArgs, name: &str, default: u64) -> Result<u64, BoxError> {
+    match parsed.flag(name) {
+        Some(s) => s.parse().map_err(|_| {
+            format!("d-server: invalid --{name} `{s}` (expected a whole number)").into()
+        }),
+        None => Ok(default),
+    }
 }
 
 /// `wyrd demo`: the M0.8 round trip against in-memory backends — the zero-setup
