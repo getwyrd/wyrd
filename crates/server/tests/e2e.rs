@@ -67,7 +67,9 @@ fn gateway_composes_the_coordination_backend() {
 
 #[test]
 fn binary_runs_the_round_trip_in_one_process() {
+    // `wyrd demo` is the in-memory PUT/GET round trip in one process.
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_wyrd"))
+        .arg("demo")
         .output()
         .expect("run the wyrd binary");
     assert!(
