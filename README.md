@@ -9,9 +9,11 @@ write either happened in full or not at all. It scales from one static binary on
 a laptop to a multi-region fleet in production — the same system, configured
 differently. Written in Rust, licensed Apache-2.0.
 
-**Status:** exploring the idea — architecture and specifications are in work
-(Milestone 0). Wyrd is **not yet deployable** and carries no durability or
-stability promise at this stage.
+**Status:** early implementation. The single-process slice works end to end —
+Milestone 0 (atomic commit, proven under deterministic simulation) and
+Milestone 1 (real Reed-Solomon erasure coding in the data path) are complete;
+networked multi-process storage (Milestone 2) is next. Wyrd is **not yet
+deployable** and carries no durability or stability promise at this stage.
 
 ## Why it exists
 
