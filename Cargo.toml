@@ -42,6 +42,10 @@ wyrd-coordination-mem = { path = "crates/coordination-mem" }
 # Shared third-party dependencies, version-pinned once here.
 async-trait = "0.1"
 bytes = "1"
+# EC micro-benchmarks (M1.7). Lean: no plotters/rayon HTML stack — the console
+# numbers are what CI tracks, and fewer transitive deps keeps the license
+# surface small (ADR-0003).
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 crc32c = "0.6"
 madsim = "0.2"
 pollster = "0.4"

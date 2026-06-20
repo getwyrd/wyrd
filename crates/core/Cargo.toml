@@ -20,3 +20,9 @@ serde_json.workspace = true
 [dev-dependencies]
 # Seeded property tests reuse the deterministic simulator (ADR-0009).
 wyrd-testkit.workspace = true
+# EC throughput micro-benchmarks (M1.7, `cargo xtask bench`).
+criterion.workspace = true
+
+[[bench]]
+name = "erasure"
+harness = false

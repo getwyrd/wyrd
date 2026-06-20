@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         Some("conformance") => run_conformance(),
         Some("gen-vectors") => run_gen_vectors(),
         Some("dst") => run_dst(),
+        Some("bench") => run_bench(),
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
             print_usage();
@@ -45,7 +46,15 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors|dst>");
+    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors|dst|bench>");
+}
+
+/// Run the EC throughput micro-benchmarks (M1.7, issue #99). Deliberately **not**
+/// part of `run_ci`: the numbers are tracked for regression visibility, not
+/// gated, because CI-runner wall-clock is noisy. The bench target's *compilation*
+/// is still covered by `run_ci`'s `build --all-targets`.
+fn run_bench() -> Result<(), String> {
+    cargo(&["bench", "-p", "wyrd-core", "--bench", "erasure"])
 }
 
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
