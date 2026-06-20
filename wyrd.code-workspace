@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../getwyrd.dev"
+		},
+		{
+			"path": "../wyrd-pdca"
 		}
 	],
 	"settings": {}
