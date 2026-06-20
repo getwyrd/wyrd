@@ -13,5 +13,10 @@ wyrd-traits.workspace = true
 wyrd-proto.workspace = true
 wyrd-chunk-format.workspace = true
 bytes.workspace = true
+reed-solomon-simd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# Seeded property tests reuse the deterministic simulator (ADR-0009).
+wyrd-testkit.workspace = true

@@ -8,6 +8,7 @@
 //!
 #![forbid(unsafe_code)]
 
+pub mod erasure;
 pub mod metadata;
 pub mod read;
 pub mod write;
