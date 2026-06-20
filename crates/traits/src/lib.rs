@@ -15,6 +15,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 
@@ -161,33 +163,65 @@ impl WriteBatch {
 }
 
 /// Bootstrap and coordination (L5): service discovery, leader election, locks
-/// with fencing tokens, and zone-wide config with change notification.
+/// with fencing tokens, and zone-wide config.
 ///
 /// Losing coordination loses no data (established connections keep working from
 /// cached state); what is lost is the ability to *react* until it returns.
+///
+/// Some semantics are provisional until a second backend (etcd, ADR-0006) pins
+/// them against a networked implementation: **blocking** lock acquisition (this
+/// surface offers non-blocking try-acquire) and a **push** config watch (this
+/// surface offers a pollable [`config_revision`](Coordination::config_revision))
+/// are later refinements.
 #[async_trait]
 pub trait Coordination: Send + Sync {
-    /// Register this member under `key` with a lease that must be renewed, so a
-    /// crashed member's registration expires (leased service discovery).
-    async fn register(&self, key: &str, value: Bytes) -> Result<Lease>;
+    /// Register this member under `key` with a lease that expires after `ttl`
+    /// unless [`renew`](Coordination::renew)ed, so a crashed member's
+    /// registration lapses (leased service discovery).
+    async fn register(&self, key: &str, value: Bytes, ttl: Duration) -> Result<Lease>;
 
-    /// Discover the current members registered under `key`.
+    /// Extend `lease` by its original `ttl` from now. Errors if the lease is
+    /// unknown or already expired.
+    async fn renew(&self, lease: Lease) -> Result<()>;
+
+    /// Withdraw the registration backing `lease` immediately.
+    async fn revoke(&self, lease: Lease) -> Result<()>;
+
+    /// Discover the current (unexpired) members registered under `key`.
     async fn discover(&self, key: &str) -> Result<Vec<Bytes>>;
 
     /// Campaign to become the single active leader for `key`. Resolves when
     /// leadership is granted, carrying a fencing token for the term.
     async fn elect_leader(&self, key: &str) -> Result<Leadership>;
 
-    /// Acquire a distributed lock on `key`, returning a fenced grant.
-    async fn lock(&self, key: &str) -> Result<LockGuard>;
+    /// Try to acquire the distributed lock on `key`. Returns `Some` with a fenced
+    /// grant if the lock was free, or `None` if it is already held — genuine
+    /// mutual exclusion without blocking. (A blocking acquire is a later
+    /// refinement; see the trait note.)
+    async fn lock(&self, key: &str) -> Result<Option<LockGuard>>;
 
-    /// Read the current zone-wide config value for `key`. Change notification
-    /// (watch) is a later refinement on this seam.
+    /// Release a lock previously acquired via [`lock`](Coordination::lock).
+    /// Releasing goes through the trait (not `Drop`) because a real backend's
+    /// release is an async operation. Idempotent.
+    async fn unlock(&self, guard: LockGuard) -> Result<()>;
+
+    /// Set the zone-wide config value for `key`, bumping
+    /// [`config_revision`](Coordination::config_revision).
+    async fn set_config(&self, key: &str, value: Bytes) -> Result<()>;
+
+    /// Read the current zone-wide config value for `key`.
     async fn get_config(&self, key: &str) -> Result<Option<Bytes>>;
+
+    /// The monotonic config revision, bumped on every [`set_config`]. A watcher
+    /// polls it to detect changes and re-reads the keys it cares about — the
+    /// dep-free stand-in for a push watch until etcd backs a real stream.
+    ///
+    /// [`set_config`]: Coordination::set_config
+    async fn config_revision(&self) -> Result<u64>;
 }
 
-/// A renewable lease backing a registration; dropping or letting it expire
-/// withdraws the registration.
+/// A renewable lease backing a registration; letting it expire (or
+/// [`revoke`](Coordination::revoke)ing it) withdraws the registration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lease {
     /// Opaque lease identifier assigned by the coordination backend.

@@ -1234,6 +1234,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "pollster",
+ "wyrd-testkit",
  "wyrd-traits",
 ]
 
