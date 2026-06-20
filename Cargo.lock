@@ -1888,6 +1888,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-chunkstore-grpc"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "wyrd-chunk-format",
+ "wyrd-chunkstore-fs",
+ "wyrd-proto",
+ "wyrd-traits",
+]
+
+[[package]]
 name = "wyrd-coordination-mem"
 version = "0.0.0"
 dependencies = [

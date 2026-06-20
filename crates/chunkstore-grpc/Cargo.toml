@@ -1,0 +1,29 @@
+[package]
+name = "wyrd-chunkstore-grpc"
+description = "gRPC ChunkStore: the GrpcChunkStore client and the D-server-side service over an injected ChunkStore (ADR-0010, ADR-0016, proposal 0004). The networked 'D server'."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The dependency rule (ADR-0010): both sides of the seam depend on the trait and
+# the wire contract, NEVER on a concrete store (chunkstore-fs). The server hosts
+# whatever `S: ChunkStore` the binary injects.
+wyrd-traits.workspace = true
+wyrd-proto.workspace = true
+tonic.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+# The round-trip test injects the real filesystem store behind the service and
+# drives it over a real tonic loopback connection — a concrete only the test
+# (standing in for `server`'s composition) is allowed to name.
+wyrd-chunkstore-fs.workspace = true
+wyrd-chunk-format.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tempfile.workspace = true

@@ -14,6 +14,7 @@ members = [
     "crates/core",
     "crates/metadata-redb",
     "crates/chunkstore-fs",
+    "crates/chunkstore-grpc",
     "crates/coordination-mem",
     "crates/server",
     "crates/dst",
@@ -37,6 +38,7 @@ wyrd-testkit = { path = "crates/testkit" }
 wyrd-core = { path = "crates/core" }
 wyrd-metadata-redb = { path = "crates/metadata-redb" }
 wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
+wyrd-chunkstore-grpc = { path = "crates/chunkstore-grpc" }
 wyrd-coordination-mem = { path = "crates/coordination-mem" }
 
 # Shared third-party dependencies, version-pinned once here.
@@ -58,6 +60,13 @@ reed-solomon-simd = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+# Async runtime, used only to *host* a tonic server (the gRPC stack is built on
+# tokio/hyper, already in the tree via tonic). Wyrd's own async surface stays
+# runtime-agnostic (async-trait over abstract seams, ADR-0009); tokio is a
+# test/binary host detail — the `d-server` subcommand (M2.3) and the in-process
+# round-trip test (M2.2) need a real reactor. Pinned once here, kept minimal.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 # gRPC transport for the networked storage path (M2, proposal 0004). Default
 # features only — no `tls` (the dev/DST profiles run plaintext; mTLS is a later
 # composition seam, ADR-0005). Version matrix, settled against crates.io and kept
