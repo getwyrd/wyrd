@@ -10,9 +10,15 @@ publish.workspace = true
 
 [dependencies]
 prost.workspace = true
+# gRPC client + server stubs for the ChunkStore service (M2.1). tonic-prost
+# carries the ProstCodec the generated stubs use (split out of tonic in 0.14).
+tonic.workspace = true
+tonic-prost.workspace = true
 
 [build-dependencies]
 # protox is a pure-Rust protobuf compiler, so the build needs no system `protoc`
-# (ADR-0016: contributors run the build on any OS without extra tooling).
-prost-build.workspace = true
+# (ADR-0016: contributors run the build on any OS without extra tooling). Its
+# FileDescriptorSet is handed to tonic-prost-build's `compile_fds`, which emits
+# the prost message types *and* the tonic client/server service stubs.
 protox.workspace = true
+tonic-prost-build.workspace = true

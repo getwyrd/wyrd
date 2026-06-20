@@ -49,9 +49,8 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 crc32c = "0.6"
 madsim = "0.2"
 pollster = "0.4"
-prost = "0.13"
-prost-build = "0.13"
-protox = "0.7"
+prost = "0.14"
+protox = "0.9"
 rand = "0.8"
 rand_chacha = "0.3"
 redb = "2"
@@ -59,3 +58,14 @@ reed-solomon-simd = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+# gRPC transport for the networked storage path (M2, proposal 0004). Default
+# features only — no `tls` (the dev/DST profiles run plaintext; mTLS is a later
+# composition seam, ADR-0005). Version matrix, settled against crates.io and kept
+# current: tonic 0.14 <-> tonic-prost-build 0.14 <-> protox 0.9 <-> prost 0.14,
+# and madsim-tonic 0.6.0+0.14 (added in M2.6) tracks tonic 0.14 — so the
+# deterministic-simulation DST runs the *real* wire code, no in-sim fake (ADR-0009).
+tonic = "0.14"
+# tonic 0.14 split the prost codec into its own runtime crate; the generated
+# service stubs reference `tonic_prost::ProstCodec`.
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"

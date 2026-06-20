@@ -1,7 +1,10 @@
 syntax = "proto3";
 
-// Minimal chunk put/get wire shapes for Milestone 0. gRPC transport is deferred
-// (proposal 0001); only the message shapes are defined now.
+// The gRPC ChunkStore wire contract (Milestone 2, proposal 0004). The storage
+// data path is fragment-addressed (ADR-0019, M1): the client writes/reads each
+// of a chunk's n erasure-coded fragments independently. This is an inter-component
+// contract under versioned protobuf (ADR-0002) — evolved by addition, never a
+// repurposed field.
 package wyrd.v0;
 
 // A 128-bit chunk id (ADR-0019), carried as high/low 64-bit halves because
@@ -11,19 +14,51 @@ message ChunkId {
   fixed64 lo = 2;
 }
 
-message ChunkPutRequest {
-  ChunkId id = 1;
+// A fragment's address: its chunk plus the fragment index within that chunk.
+// Mirrors traits::FragmentId { chunk: ChunkId, index: u16 } — protobuf has no
+// u16, so uint32 is the carrier (values stay in 0..n).
+message FragmentId {
+  ChunkId chunk = 1;
+  uint32 index = 2;
+}
+
+message FragmentPutRequest {
+  FragmentId id = 1;
   // The stored fragment bytes, exactly as specified by chunk-format (ADR-0019).
   bytes fragment = 2;
 }
 
-message ChunkPutResponse {}
+message FragmentPutResponse {}
 
-message ChunkGetRequest {
-  ChunkId id = 1;
+message FragmentGetRequest {
+  FragmentId id = 1;
 }
 
-message ChunkGetResponse {
-  // Empty when no fragment is stored for the requested id.
-  bytes fragment = 1;
+message FragmentGetResponse {
+  // Absent when no fragment is stored for the requested id — maps to the trait's
+  // `Option<Bytes>` (explicit proto3 presence, not empty-means-absent).
+  optional bytes fragment = 1;
+}
+
+// Connection/discovery liveness, self-reported and trusted (ADR-0005). This is
+// NOT durability telemetry or under-replication signalling (those are M3,
+// ADR-0011). Mirrors traits::Health.
+enum Health {
+  HEALTH_HEALTHY = 0;
+  HEALTH_DEGRADED = 1;
+  HEALTH_UNHEALTHY = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  Health status = 1;
+}
+
+// The storage server's data-plane surface: deliberately dumb — fragment put/get
+// plus liveness, no placement, no metadata, no identity (architecture §5 / §8.5).
+service ChunkStore {
+  rpc PutFragment(FragmentPutRequest) returns (FragmentPutResponse);
+  rpc GetFragment(FragmentGetRequest) returns (FragmentGetResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
 }

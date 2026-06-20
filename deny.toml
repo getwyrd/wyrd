@@ -31,6 +31,10 @@ allow = [
     # "MIT AND BSD-3-Clause". A deliberate addition (ADR-0003 §2).
     "BSD-3-Clause",
     "Unicode-3.0",
+    # Permissive (OSI-approved, GPL-compatible). foldhash — hashbrown's default
+    # hasher — reaches us transitively through the tonic/hyper gRPC stack (M2.1).
+    # A deliberate addition (ADR-0003 §2).
+    "Zlib",
 ]
 confidence-threshold = 0.9
 
