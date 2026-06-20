@@ -8,6 +8,12 @@
 //!   conformance vectors.
 //! - `dst` — run the madsim commit-protocol tests (`wyrd-dst`) under
 //!   `--cfg madsim` across a sweep of seeds (ADR-0009).
+//! - `integration` — the Tier-2 container tier (M2, proposal 0004): stand up a
+//!   cluster of real, networked gRPC D servers under docker-compose and run the
+//!   end-to-end write/read integration test against them. Not part of `ci` (it
+//!   needs a container runtime); a heavier-runner / nightly job.
+//! - `bench` — the tracked throughput benchmarks (EC micro-bench + the M2
+//!   aggregate D-server throughput bench). Tracked, not gated.
 
 #![forbid(unsafe_code)]
 
@@ -24,6 +30,7 @@ fn main() -> ExitCode {
         Some("conformance") => run_conformance(),
         Some("gen-vectors") => run_gen_vectors(),
         Some("dst") => run_dst(),
+        Some("integration") => run_integration(),
         Some("bench") => run_bench(),
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
@@ -46,15 +53,196 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors|dst|bench>");
+    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors|dst|integration|bench>");
 }
 
-/// Run the EC throughput micro-benchmarks (M1.7, issue #99). Deliberately **not**
-/// part of `run_ci`: the numbers are tracked for regression visibility, not
-/// gated, because CI-runner wall-clock is noisy. The bench target's *compilation*
-/// is still covered by `run_ci`'s `build --all-targets`.
+/// Run the tracked throughput benchmarks. Deliberately **not** part of `run_ci`:
+/// the numbers are tracked for regression visibility, not gated, because
+/// CI-runner wall-clock is noisy. The bench targets' *compilation* is still
+/// covered by `run_ci`'s `build --all-targets`.
+///
+/// - `erasure` — the EC coding micro-bench (M1.7, issue #99).
+/// - `throughput` — the M2 aggregate write/read throughput across D-server counts
+///   over real (in-process) tonic gRPC D servers (proposal 0004 § Benchmarks,
+///   issue #117); makes the §10 Q6 throughput claim first measurable.
 fn run_bench() -> Result<(), String> {
-    cargo(&["bench", "-p", "wyrd-core", "--bench", "erasure"])
+    cargo(&["bench", "-p", "wyrd-core", "--bench", "erasure"])?;
+    cargo(&["bench", "-p", "wyrd-core", "--bench", "throughput"])
+}
+
+/// Default number of D-server containers the Tier-2 cluster stands up — 9, so an
+/// `rs(6,3)` chunk's 9 fragments each land on a distinct networked D server.
+const DSERVER_COUNT: usize = 9;
+/// The compose project name, so the cluster is isolated and torn down cleanly.
+const TIER2_PROJECT: &str = "wyrd-tier2";
+
+/// Run the Tier-2 integration tier (M2, proposal 0004 PR step 7): bring up a
+/// cluster of real, networked gRPC D servers under docker-compose, run the
+/// end-to-end write/read integration test against them, then tear the cluster
+/// down. This is the first container job in CI — a heavier-runner / nightly lane,
+/// **not** part of `run_ci` (which must stay container-free).
+///
+/// If Docker is unavailable: a hard failure in CI (where the job is meant to run),
+/// a warn-and-skip locally (so a laptop without Docker is not blocked) — mirroring
+/// `cargo_deny_check`.
+fn run_integration() -> Result<(), String> {
+    let compose = workspace_root().join("crates/chunkstore-grpc/tests/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    if !docker_available() {
+        if is_ci() {
+            return Err("docker is not available but is required for the integration tier".into());
+        }
+        eprintln!(
+            "warning: docker not available; skipping the Tier-2 container integration tier \
+             locally. Install Docker (and the compose plugin) to run it."
+        );
+        return Ok(());
+    }
+
+    let count = std::env::var("WYRD_DSERVER_COUNT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 2)
+        .unwrap_or(DSERVER_COUNT);
+
+    // Bring the cluster up (building the image if needed), run the test, and tear
+    // down unconditionally so a failed run never leaks containers.
+    compose_up(&compose, count)?;
+    let result = (|| {
+        let endpoints = resolve_endpoints(&compose, count)?;
+        println!("\nxtask integration: {count} D servers at {endpoints}");
+        run_integration_test(&endpoints)
+    })();
+    compose_down(&compose);
+    result?;
+    println!("\nxtask integration: Tier-2 container integration passed");
+    Ok(())
+}
+
+/// Is a working Docker daemon reachable?
+fn docker_available() -> bool {
+    Command::new("docker")
+        .args(["info"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `docker compose ... up -d --build --scale dserver=N`.
+fn compose_up(compose: &str, count: usize) -> Result<(), String> {
+    docker_compose(
+        compose,
+        &[
+            "up",
+            "-d",
+            "--build",
+            "--scale",
+            &format!("dserver={count}"),
+        ],
+    )
+}
+
+/// `docker compose ... down -v --remove-orphans` (best-effort teardown).
+fn compose_down(compose: &str) {
+    let _ = docker_compose(compose, &["down", "-v", "--remove-orphans"]);
+}
+
+/// Resolve each replica's published host port into a comma-separated endpoint
+/// list (`http://127.0.0.1:PORT,…`) for `WYRD_DSERVER_ENDPOINTS`.
+fn resolve_endpoints(compose: &str, count: usize) -> Result<String, String> {
+    let mut endpoints = Vec::with_capacity(count);
+    for index in 1..=count {
+        let out = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                TIER2_PROJECT,
+                "-f",
+                compose,
+                "port",
+                "--index",
+                &index.to_string(),
+                "dserver",
+                "50051",
+            ])
+            .current_dir(workspace_root())
+            .output()
+            .map_err(|e| format!("failed to spawn docker compose port: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "docker compose port (index {index}) failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let mapped = String::from_utf8_lossy(&out.stdout);
+        let port = mapped
+            .trim()
+            .rsplit(':')
+            .next()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| format!("could not parse host port from `{}`", mapped.trim()))?;
+        endpoints.push(format!("http://127.0.0.1:{port}"));
+    }
+    Ok(endpoints.join(","))
+}
+
+/// Run the (otherwise `#[ignore]`d) Tier-2 integration test with the resolved
+/// endpoints exported, so it dials the live container cluster.
+fn run_integration_test(endpoints: &str) -> Result<(), String> {
+    print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-chunkstore-grpc",
+        "--test",
+        "tier2_integration",
+        "--",
+        "--ignored",
+    ]);
+    let status = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "wyrd-chunkstore-grpc",
+            "--test",
+            "tier2_integration",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ])
+        .current_dir(workspace_root())
+        .env("WYRD_DSERVER_ENDPOINTS", endpoints)
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Tier-2 integration test failed with {status}"))
+    }
+}
+
+/// Run a `docker compose -p <project> -f <file> …` command from the workspace
+/// root, echoing it first.
+fn docker_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", TIER2_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
 }
 
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first

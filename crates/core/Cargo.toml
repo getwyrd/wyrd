@@ -27,7 +27,21 @@ pollster.workspace = true
 async-trait.workspace = true
 # EC throughput micro-benchmarks (M1.7, `cargo xtask bench`).
 criterion.workspace = true
+# The aggregate write/read throughput bench (M2.7, `benches/throughput.rs`) drives
+# the data path over real, in-process tonic gRPC D servers across D-server counts.
+# These are the same concretes `server` composes — named only here, in a
+# test/bench target (ADR-0010 lets the composition layer name concretes).
+wyrd-chunkstore-grpc.workspace = true
+wyrd-chunkstore-fs.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "erasure"
+harness = false
+
+[[bench]]
+name = "throughput"
 harness = false

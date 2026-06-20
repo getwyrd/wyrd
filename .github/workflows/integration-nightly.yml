@@ -1,0 +1,47 @@
+name: integration-nightly
+
+# Tier-2 integration tier (Milestone 2, proposal 0004): the first container job
+# in CI. It stands up a cluster of real, networked gRPC D servers under
+# docker-compose and runs the end-to-end write/read integration test against
+# them (`cargo xtask integration`). This is the heavier, non-deterministic tier
+# that validates the abstractions Tier-1 simulates match reality (ADR-0009); it
+# is deliberately **not** part of the docs-skippable `cargo xtask ci` gate.
+#
+# It runs nightly (and on demand), not on every PR: it needs a container runtime
+# and is slower and noisier than the Rust gate. It is not a required status
+# check — its value is post-merge regression visibility, not a merge gate. The
+# tracked throughput numbers are emitted by `cargo xtask bench` (see ci.yml).
+
+on:
+  schedule:
+    # 04:00 UTC daily.
+    - cron: "0 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tier2:
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest ships Docker with the compose plugin; this confirms it.
+      - name: Docker info
+        run: docker info
+
+      - name: cargo xtask integration
+        run: cargo xtask integration

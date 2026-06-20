@@ -36,6 +36,10 @@ tonic = { package = "madsim-tonic", version = "0.6.0", default-features = false 
 # (standing in for `server`'s composition) is allowed to name.
 wyrd-chunkstore-fs.workspace = true
 wyrd-chunk-format.workspace = true
+# The Tier-2 integration test (`tests/tier2_integration.rs`, M2.7) drives the
+# real client write/read paths (fan-out write, any-k read) over the fan-out store
+# against containerized D servers — the same composition `server` performs.
+wyrd-core.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tempfile.workspace = true
