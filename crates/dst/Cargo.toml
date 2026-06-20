@@ -15,3 +15,22 @@ wyrd-traits.workspace = true
 wyrd-metadata-redb.workspace = true
 wyrd-chunkstore-fs.workspace = true
 tempfile.workspace = true
+# M2.6 network DST (tests/network.rs): the real gRPC ChunkStore over madsim's
+# simulated network. `chunkstore-grpc` carries the client + D-server service;
+# `chunk-format` builds/inspects fragments; `testkit` is the network-fault seam.
+wyrd-chunkstore-grpc.workspace = true
+wyrd-chunk-format.workspace = true
+wyrd-testkit.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+# Seed-derived fault selection (which D-server links to drop/corrupt), reproduced
+# from the madsim run seed so a bug-finding seed replays the same faults.
+rand.workspace = true
+rand_chacha.workspace = true
+
+# `wyrd-dst` compiles *only* under `--cfg madsim`, so its gRPC transport is
+# always madsim-tonic (aliased as `tonic`) — the same alias `proto` and
+# `chunkstore-grpc` use, so `Server::builder().serve(addr)` runs on the
+# simulated network (proposal 0004 Tier-1; ADR-0009).
+[target.'cfg(madsim)'.dev-dependencies]
+tonic = { package = "madsim-tonic", version = "0.6.0", default-features = false }

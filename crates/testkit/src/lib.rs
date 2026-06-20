@@ -114,6 +114,10 @@ pub enum FaultPoint {
     DiskWrite,
     /// A durability sync.
     DiskSync,
+    /// A fragment `put` travelling to a D server (the write fan-out).
+    FragmentPut,
+    /// A fragment `get` travelling from a D server (the any-`k` read).
+    FragmentFetch,
 }
 
 /// Decides whether to inject a fault at a given point. The default
@@ -132,6 +136,93 @@ pub struct NoFaults;
 impl FaultInjector for NoFaults {
     fn should_fail(&mut self, _point: FaultPoint) -> bool {
         false
+    }
+}
+
+/// The **network seam** (proposal 0004, "DST and integration tests": a network
+/// abstraction alongside the [`Clock`]/[`Disk`] seams). A `NetFault` is a fault
+/// the simulator injects on the link between the client and one D server, so the
+/// *real* gRPC `ChunkStore` wire code can be exercised under seed-reproducible
+/// drops, delays, partitions, and corruption (ADR-0009, Tier-1 properties 2–4).
+///
+/// The fault *model* lives here, free of any transport dependency, so it is
+/// import-light; a campaign maps each variant onto madsim's network controls
+/// (clog the link for `Drop`/`Partition`/`Delay`) or a corrupting store wrapper
+/// (`Corrupt`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetFault {
+    /// Outbound traffic to the D server is dropped — the fragment put or fetch
+    /// never arrives. Modelled by clogging the client→server link.
+    Drop,
+    /// Traffic to the D server is delayed by this many milliseconds before
+    /// delivery — a slow fragment the any-`k` read should not wait on.
+    Delay(u64),
+    /// The link is cut in both directions — the D server is partitioned away for
+    /// the duration of the operation.
+    Partition,
+    /// The bytes the D server returns are corrupted, so the fragment fails its
+    /// client-side checksum and is treated as **absent** (re-read elsewhere).
+    Corrupt,
+}
+
+/// Decides whether — and how — to fault the network for the D server at a given
+/// index. Mirrors [`FaultInjector`] for the network seam; the default injects
+/// nothing.
+pub trait NetFaultInjector {
+    /// The fault to inject for the D server at `store_index` on `point`, or
+    /// `None` to let the operation through untouched.
+    fn fault_for(&mut self, store_index: usize, point: FaultPoint) -> Option<NetFault>;
+}
+
+/// A network-fault plan fixed once from the run seed: a chosen set of D-server
+/// links, each with the fault to apply. Drawing the selection from the
+/// simulation RNG is what makes the whole campaign reproduce from its seed
+/// (ADR-0009) — a bug-finding seed replays the *same* faulted links.
+#[derive(Debug, Clone, Default)]
+pub struct SeededNetFaults {
+    faults: std::collections::BTreeMap<usize, NetFault>,
+}
+
+impl SeededNetFaults {
+    /// A plan from an explicit map of `store_index → fault` — e.g. corrupt the
+    /// fragment on D server 2.
+    pub fn new(faults: std::collections::BTreeMap<usize, NetFault>) -> Self {
+        Self { faults }
+    }
+
+    /// Pick up to `max` **distinct** D-server indices in `0..n`, each to be hit
+    /// with `fault`, drawing the choice from `rng`. Picking fewer than or equal
+    /// to `max` (never more) keeps a `k`-of-`n` read above its `k` survivors.
+    pub fn pick<R: RngCore>(rng: &mut R, n: usize, max: usize, fault: NetFault) -> Self {
+        let mut indices: Vec<usize> = (0..n).collect();
+        // Fisher–Yates prefix shuffle: draw `max` distinct indices deterministically.
+        let take = max.min(n);
+        for i in 0..take {
+            let j = i + (rng.next_u32() as usize) % (n - i);
+            indices.swap(i, j);
+        }
+        let faults = indices
+            .into_iter()
+            .take(take)
+            .map(|index| (index, fault))
+            .collect();
+        Self { faults }
+    }
+
+    /// The chosen faults, by D-server index.
+    pub fn faults(&self) -> &std::collections::BTreeMap<usize, NetFault> {
+        &self.faults
+    }
+
+    /// Whether the D server at `index` carries a fault in this plan.
+    pub fn is_faulted(&self, index: usize) -> bool {
+        self.faults.contains_key(&index)
+    }
+}
+
+impl NetFaultInjector for SeededNetFaults {
+    fn fault_for(&mut self, store_index: usize, _point: FaultPoint) -> Option<NetFault> {
+        self.faults.get(&store_index).copied()
     }
 }
 
@@ -223,5 +314,34 @@ mod tests {
     fn no_faults_injects_nothing() {
         let mut faults = NoFaults;
         assert!(!faults.should_fail(FaultPoint::DiskWrite));
+    }
+
+    #[test]
+    fn seeded_net_faults_pick_is_reproducible_and_bounded() {
+        // The network-seam promise: the faulted-link selection is a pure
+        // function of the seed, and never exceeds `max` (so a k-of-n read keeps
+        // its k survivors).
+        let mut a = ChaCha8Rng::seed_from_u64(7);
+        let mut b = ChaCha8Rng::seed_from_u64(7);
+        let pa = SeededNetFaults::pick(&mut a, 9, 3, NetFault::Drop);
+        let pb = SeededNetFaults::pick(&mut b, 9, 3, NetFault::Drop);
+        assert_eq!(pa.faults(), pb.faults(), "same seed → same faulted links");
+        assert!(pa.faults().len() <= 3, "never more than `max` faults");
+        assert!(
+            pa.faults().keys().all(|&i| i < 9),
+            "faulted indices are valid D servers"
+        );
+    }
+
+    #[test]
+    fn seeded_net_faults_reports_per_store() {
+        let mut faults = SeededNetFaults::new([(2, NetFault::Corrupt)].into_iter().collect());
+        assert!(faults.is_faulted(2));
+        assert!(!faults.is_faulted(0));
+        assert_eq!(
+            faults.fault_for(2, FaultPoint::FragmentFetch),
+            Some(NetFault::Corrupt)
+        );
+        assert_eq!(faults.fault_for(0, FaultPoint::FragmentFetch), None);
     }
 }

@@ -8,6 +8,11 @@
 
 /// Version-0 wire contracts (package `wyrd.v0`): message types and the
 /// `chunk_store_client` / `chunk_store_server` gRPC stubs.
+///
+/// `tonic::include_proto!` resolves to the right generated file in each build:
+/// the real stubs under a normal build, and madsim's simulated stubs (emitted
+/// into `OUT_DIR/sim/` by `madsim-tonic-build`) under `--cfg madsim` — because
+/// `tonic` there *is* `madsim-tonic`, whose macro includes the `sim/` variant.
 pub mod v0 {
-    include!(concat!(env!("OUT_DIR"), "/wyrd.v0.rs"));
+    tonic::include_proto!("wyrd.v0");
 }
