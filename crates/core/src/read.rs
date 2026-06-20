@@ -1,6 +1,8 @@
 //! The client read path: resolve a name, read the inode's chunk map from the
-//! [`MetadataStore`], fetch each fragment from the [`ChunkStore`], and return the
-//! reassembled bytes (architecture §6.2).
+//! [`MetadataStore`], fetch the chunk's fragments from the [`ChunkStore`], and
+//! return the reassembled bytes (architecture §6.2). An erasure-coded chunk
+//! fetches all `n` fragments **in parallel** and reconstructs from whichever `k`
+//! verify their checksums first — it never waits on the slow `m` (§6.2, §6.6).
 //!
 //! Two integrity properties hold by construction:
 //! - **Never a hybrid.** A read takes one inode snapshot (a single atomic `get`),
@@ -13,6 +15,7 @@
 //!   the read fails with a typed error. A `replication(1)`/`none` chunk has a
 //!   single fragment, so a corrupt or missing one simply errors.
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use wyrd_chunk_format::decode;
 use wyrd_traits::{ChunkId, ChunkStore, FragmentId, MetadataStore, Result};
 
@@ -68,10 +71,12 @@ pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> 
 /// Read and decode one chunk's bytes, dispatching on its durability scheme. A
 /// per-chunk scheme is what lets one read path serve mixed-era data (ADR-0008).
 ///
-/// For an erasure-coded chunk the read is resilient (§6.6): fragments that are
-/// missing or fail their checksum are excluded and reconstructed around, up to
-/// `m` of them; below `k` survivors it returns a clean typed error rather than a
-/// short or corrupt read.
+/// For an erasure-coded chunk the read is resilient *and* parallel (§6.2, §6.6):
+/// all `n = k + m` fragments are fetched at once and the chunk is reconstructed
+/// from whichever `k` verify their checksums **first**, so a missing, corrupt,
+/// slow, or unreachable fragment is read *around* — the read waits only on the
+/// `k` fastest valid fragments, never on the slowest `m`. Below `k` valid
+/// fragments it returns a clean typed error rather than a short or corrupt read.
 async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8>> {
     match chunk.scheme {
         EcScheme::None => {
@@ -87,25 +92,38 @@ async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8
         }
         EcScheme::ReedSolomon { k, m } => {
             let (k, m) = (k as usize, m as usize);
-            // Gather valid shards by index until we have the k the coder needs. A
-            // fragment that is missing (`Ok(None)`), fails its checksum (`Err`), or
-            // cannot be decoded is treated as absent and reconstructed around — a
-            // corrupt shard is never handed to the decoder.
-            let mut shards: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
-            for index in 0..(k + m) as u16 {
-                let fetched = chunks
-                    .get_fragment(FragmentId {
+            let n = (k + m) as u16;
+            // Any-`k`-arrive-first (§6.2): fire `get_fragment` at all `n` indices
+            // at once and reconstruct from the first `k` that verify their
+            // checksums. A fragment that is missing (`Ok(None)`), fails its
+            // checksum or cannot be decoded (`Err`), or is slow/unreachable (its
+            // future has simply not resolved) is treated as **absent** and read
+            // around — a corrupt shard is never handed to the decoder, and the
+            // read never blocks on the slow `m`. The futures are polled
+            // cooperatively on this one task (no spawn), so their completion
+            // ordering is seed-driven and the read stays deterministic under
+            // simulation (ADR-0009).
+            let mut inflight: FuturesUnordered<_> = (0..n)
+                .map(|index| {
+                    let id = FragmentId {
                         chunk: chunk.id,
                         index,
-                    })
-                    .await;
+                    };
+                    async move { (index, chunks.get_fragment(id).await) }
+                })
+                .collect();
+
+            let mut shards: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
+            while let Some((index, fetched)) = inflight.next().await {
                 if let Ok(Some(fragment)) = fetched {
                     if let Ok(decoded) = decode(&fragment) {
                         shards.push((index as usize, decoded.payload));
+                        if shards.len() == k {
+                            // `k` verified: drop the outstanding fetches, which
+                            // abandons (cancels) them.
+                            break;
+                        }
                     }
-                }
-                if shards.len() == k {
-                    break;
                 }
             }
             if shards.len() < k {
