@@ -1,7 +1,7 @@
 ---
 created: 20.06.2026 02:14
 type: proposal
-status: draft
+status: accepted
 author: Eduard Ralph
 tracking-issue: "#100"
 tags:
