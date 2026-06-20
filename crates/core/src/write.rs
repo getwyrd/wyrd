@@ -20,7 +20,9 @@
 
 use bytes::Bytes;
 use wyrd_chunk_format::{encode, FragmentHeader};
-use wyrd_traits::{ChunkId, ChunkStore, CommitOutcome, MetadataStore, Result, WriteBatch};
+use wyrd_traits::{
+    ChunkId, ChunkStore, CommitOutcome, FragmentId, MetadataStore, Result, WriteBatch,
+};
 
 use crate::metadata::{self, InodeId, InodeRecord, InodeState, PendingEntry};
 
@@ -99,9 +101,13 @@ pub async fn intent(
 /// checksums. Failures here are harmless leased garbage.
 pub async fn write_fragments(chunks: &impl ChunkStore, plan: &WritePlan) -> Result<()> {
     for chunk in &plan.chunks {
-        chunks
-            .put_fragment(chunk.id, chunk.fragment.clone())
-            .await?;
+        // replication(1)/none: one fragment per chunk at index 0. Erasure coding
+        // will vary the index across the chunk's n fragments here.
+        let id = FragmentId {
+            chunk: chunk.id,
+            index: 0,
+        };
+        chunks.put_fragment(id, chunk.fragment.clone()).await?;
     }
     Ok(())
 }

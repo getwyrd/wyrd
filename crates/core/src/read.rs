@@ -13,7 +13,7 @@
 //!   is a later milestone.
 
 use wyrd_chunk_format::decode;
-use wyrd_traits::{ChunkId, ChunkStore, MetadataStore, Result};
+use wyrd_traits::{ChunkId, ChunkStore, FragmentId, MetadataStore, Result};
 
 use crate::metadata::{self, DirentRecord, InodeId, InodeRecord, InodeState};
 
@@ -51,8 +51,14 @@ pub async fn read_inode(
 pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(inode.size as usize);
     for &chunk_id in &inode.chunk_map {
+        // replication(1)/none: a chunk is a single fragment at index 0. Erasure
+        // coding will gather any k of n fragments and reconstruct here.
+        let id = FragmentId {
+            chunk: chunk_id,
+            index: 0,
+        };
         let fragment = chunks
-            .get_fragment(chunk_id)
+            .get_fragment(id)
             .await?
             .ok_or(ReadError::MissingFragment { chunk_id })?;
         // The chunk store already verified integrity; decode to take the payload.

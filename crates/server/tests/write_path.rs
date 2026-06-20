@@ -13,7 +13,7 @@ use wyrd_core::metadata::{self, DirentRecord, InodeRecord, InodeState};
 use wyrd_core::write;
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_testkit::Sim;
-use wyrd_traits::{ChunkStore, CommitOutcome, MetadataStore};
+use wyrd_traits::{ChunkStore, CommitOutcome, FragmentId, MetadataStore};
 
 const ROOT: u64 = 0;
 const NOW: u64 = 1_000;
@@ -52,7 +52,10 @@ async fn read_object(meta: &RedbMetadataStore, chunks: &FsChunkStore, inode_id: 
     let mut out = Vec::new();
     for id in &inode.chunk_map {
         let fragment = chunks
-            .get_fragment(*id)
+            .get_fragment(FragmentId {
+                chunk: *id,
+                index: 0,
+            })
             .await
             .unwrap()
             .expect("fragment present");
@@ -126,7 +129,11 @@ fn crash_before_commit_leaves_only_collectable_garbage() {
         // The ledger holds the intent; the fragments are on disk (collectable).
         assert_eq!(pending_count(&meta).await, plan.chunks.len());
         for chunk in &plan.chunks {
-            assert!(chunks.get_fragment(chunk.id).await.unwrap().is_some());
+            let id = FragmentId {
+                chunk: chunk.id,
+                index: 0,
+            };
+            assert!(chunks.get_fragment(id).await.unwrap().is_some());
         }
 
         // The sweep spares unexpired leases and reclaims expired ones.

@@ -7,7 +7,7 @@ use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
 use wyrd_core::metadata::{self, InodeRecord};
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
-use wyrd_traits::CommitOutcome;
+use wyrd_traits::{CommitOutcome, FragmentId};
 
 const ROOT: u64 = 0;
 const NOW: u64 = 1_000;
@@ -141,7 +141,13 @@ fn checksum_mismatch_surfaces_as_an_error() {
 
         // Corrupt the first fragment on disk, behind the store's back.
         let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
-        let path = fragment_path(dir.path(), inode.chunk_map[0]);
+        let path = fragment_path(
+            dir.path(),
+            FragmentId {
+                chunk: inode.chunk_map[0],
+                index: 0,
+            },
+        );
         let mut bytes = std::fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xff;
