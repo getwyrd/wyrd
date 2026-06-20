@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "flags": 0,
+  "checksum_algo": "crc32c",
+  "encryption_scheme": "none",
+  "ec_scheme_type": "reed-solomon",
+  "ec_k": 6,
+  "ec_m": 3,
+  "ec_fragment_index": 6,
+  "chunk_id": "295990755014133383690938178085345737406",
+  "payload_length": "39",
+  "payload_hex": "726565642d736f6c6f6d6f6e2070617269747920736861726420286b3d362c6d3d332c693d3629"
+}

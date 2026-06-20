@@ -122,6 +122,23 @@ pub fn valid_vectors() -> Vec<ValidVector> {
     let replication_payload = b"replica".to_vec();
     replication.payload_length = replication_payload.len() as u64;
 
+    // Reed-Solomon RS(6,3): a data shard (index < k) and a parity shard
+    // (index >= k). The payload is opaque shard bytes — this vector exercises the
+    // format's EC header fields + checksums, not the coder's math.
+    let rs_data_payload = b"reed-solomon data shard (k=6,m=3,i=0)".to_vec();
+    let mut rs_data = FragmentHeader::new_v1(ID_A, rs_data_payload.len() as u64);
+    rs_data.ec_scheme_type = EcSchemeType::ReedSolomon;
+    rs_data.ec_k = 6;
+    rs_data.ec_m = 3;
+    rs_data.ec_fragment_index = 0;
+
+    let rs_parity_payload = b"reed-solomon parity shard (k=6,m=3,i=6)".to_vec();
+    let mut rs_parity = FragmentHeader::new_v1(ID_B, rs_parity_payload.len() as u64);
+    rs_parity.ec_scheme_type = EcSchemeType::ReedSolomon;
+    rs_parity.ec_k = 6;
+    rs_parity.ec_m = 3;
+    rs_parity.ec_fragment_index = 6;
+
     vec![
         ValidVector {
             name: "empty-payload",
@@ -137,6 +154,16 @@ pub fn valid_vectors() -> Vec<ValidVector> {
             name: "replication-fragment",
             header: replication,
             payload: replication_payload,
+        },
+        ValidVector {
+            name: "reed-solomon-data-shard",
+            header: rs_data,
+            payload: rs_data_payload,
+        },
+        ValidVector {
+            name: "reed-solomon-parity-shard",
+            header: rs_parity,
+            payload: rs_parity_payload,
         },
     ]
 }
