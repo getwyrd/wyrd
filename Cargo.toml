@@ -65,7 +65,14 @@ tempfile = "3"
 # runtime-agnostic (async-trait over abstract seams, ADR-0009); tokio is a
 # test/binary host detail — the `d-server` subcommand (M2.3) and the in-process
 # round-trip test (M2.2) need a real reactor. Pinned once here, kept minimal.
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "net",
+    "time",
+    "signal",
+    "sync",
+] }
 tokio-stream = { version = "0.1", features = ["net"] }
 # gRPC transport for the networked storage path (M2, proposal 0004). Default
 # features only — no `tls` (the dev/DST profiles run plaintext; mTLS is a later
