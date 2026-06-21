@@ -56,7 +56,7 @@ jobs:
       # uploaded artifact for post-merge regression triage.
       - name: Upload container diagnostics
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tier2-container-logs
           path: target/tier2-logs/
