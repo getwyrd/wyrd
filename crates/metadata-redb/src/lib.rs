@@ -13,7 +13,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use redb::{backends::InMemoryBackend, Database, ReadableTable, TableDefinition};
+use redb::{backends::InMemoryBackend, Database, ReadableDatabase, ReadableTable, TableDefinition};
 use wyrd_traits::{CommitOutcome, MetadataStore, Result, WriteBatch};
 
 /// All metadata lives in one keyspace; the model namespaces keys by prefix
