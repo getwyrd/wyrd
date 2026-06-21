@@ -15,7 +15,7 @@
 
 #![forbid(unsafe_code)]
 
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 /// Abstract logical time. Production code reads time through this seam instead
@@ -193,7 +193,7 @@ impl SeededNetFaults {
     /// Pick up to `max` **distinct** D-server indices in `0..n`, each to be hit
     /// with `fault`, drawing the choice from `rng`. Picking fewer than or equal
     /// to `max` (never more) keeps a `k`-of-`n` read above its `k` survivors.
-    pub fn pick<R: RngCore>(rng: &mut R, n: usize, max: usize, fault: NetFault) -> Self {
+    pub fn pick<R: Rng>(rng: &mut R, n: usize, max: usize, fault: NetFault) -> Self {
         let mut indices: Vec<usize> = (0..n).collect();
         // Fisher–Yates prefix shuffle: draw `max` distinct indices deterministically.
         let take = max.min(n);
@@ -254,16 +254,16 @@ impl Sim {
     }
 
     /// The deterministic RNG. All randomness in a run must be drawn from here.
-    pub fn rng(&mut self) -> &mut impl RngCore {
+    pub fn rng(&mut self) -> &mut impl Rng {
         &mut self.rng
     }
 
     /// Draw a uniformly random value of type `T` from the deterministic RNG.
     pub fn gen<T>(&mut self) -> T
     where
-        rand::distributions::Standard: rand::distributions::Distribution<T>,
+        rand::distr::StandardUniform: rand::distr::Distribution<T>,
     {
-        self.rng.gen()
+        self.rng.random()
     }
 
     /// Advance logical time by `millis`.

@@ -506,6 +506,6 @@ fn rand_seed() -> rand_chacha::ChaCha8Rng {
 /// One `u64` from a `ChaCha8Rng`, without pulling the `rand::Rng` trait into
 /// scope at every call site.
 fn rng_u64(rng: &mut rand_chacha::ChaCha8Rng) -> u64 {
-    use rand::RngCore;
+    use rand::Rng;
     rng.next_u64()
 }
