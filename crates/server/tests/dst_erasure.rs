@@ -143,7 +143,7 @@ fn loss_beyond_m_is_clean_error(seed: u64) {
         let data = nonempty_payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0];
+        let chunk = inode.chunk_map[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             delete(dir.path(), chunk.id, index);
         }
@@ -190,7 +190,7 @@ fn corruption_beyond_m_is_clean_error(seed: u64) {
         let data = nonempty_payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0];
+        let chunk = inode.chunk_map[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             corrupt(dir.path(), chunk.id, index);
         }

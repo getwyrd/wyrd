@@ -17,7 +17,7 @@
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use wyrd_chunk_format::decode;
-use wyrd_traits::{ChunkId, ChunkStore, FragmentId, MetadataStore, Result};
+use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, PlacementChunkStore, Result};
 
 use crate::erasure;
 use crate::metadata::{self, ChunkRef, DirentRecord, EcScheme, InodeId, InodeRecord, InodeState};
@@ -53,7 +53,10 @@ pub async fn read_inode(
 /// explicit snapshot is what makes a read see one whole version. Each fragment's
 /// checksum is verified by the chunk store; a mismatch or a missing fragment is
 /// an error, never a short or corrupt read.
-pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> Result<Vec<u8>> {
+pub async fn read_object_from(
+    chunks: &impl PlacementChunkStore,
+    inode: &InodeRecord,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(inode.size as usize);
     for chunk in &inode.chunk_map {
         bytes.extend_from_slice(&read_chunk(chunks, chunk).await?);
@@ -68,6 +71,20 @@ pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> 
     Ok(bytes)
 }
 
+/// The D server holding fragment `index` of `chunk`, per the committed placement
+/// record (proposal 0005, M3.1). The read resolves each fragment **from the record**
+/// — retiring M2's stateless `index % n` — so a fragment a custodian has *moved* is
+/// still found. A pre-M3 record carries no placement (or a short one); the fragment
+/// then resolves to its own index, which the single-authority store routes exactly as
+/// M2 did, so mixed-era data reads through the same path.
+fn fragment_dserver(chunk: &ChunkRef, index: u16) -> DServerId {
+    chunk
+        .placement
+        .get(index as usize)
+        .copied()
+        .unwrap_or(u64::from(index))
+}
+
 /// Read and decode one chunk's bytes, dispatching on its durability scheme. A
 /// per-chunk scheme is what lets one read path serve mixed-era data (ADR-0008).
 ///
@@ -77,15 +94,22 @@ pub async fn read_object_from(chunks: &impl ChunkStore, inode: &InodeRecord) -> 
 /// slow, or unreachable fragment is read *around* — the read waits only on the
 /// `k` fastest valid fragments, never on the slowest `m`. Below `k` valid
 /// fragments it returns a clean typed error rather than a short or corrupt read.
-async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8>> {
+///
+/// Each fragment is fetched from the D server the **placement record** names
+/// ([`fragment_dserver`]), not from `index % n` — the location authority is the
+/// committed chunk map, not the fan-out.
+async fn read_chunk(chunks: &impl PlacementChunkStore, chunk: &ChunkRef) -> Result<Vec<u8>> {
     match chunk.scheme {
         EcScheme::None => {
             // A single fragment at index 0; there is nothing to reconstruct around.
             let fragment = chunks
-                .get_fragment(FragmentId {
-                    chunk: chunk.id,
-                    index: 0,
-                })
+                .get_fragment_at(
+                    fragment_dserver(chunk, 0),
+                    FragmentId {
+                        chunk: chunk.id,
+                        index: 0,
+                    },
+                )
                 .await?
                 .ok_or(ReadError::MissingFragment { chunk_id: chunk.id })?;
             Ok(decode(&fragment)?.payload)
@@ -93,14 +117,14 @@ async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8
         EcScheme::ReedSolomon { k, m } => {
             let (k, m) = (k as usize, m as usize);
             let n = (k + m) as u16;
-            // Any-`k`-arrive-first (§6.2): fire `get_fragment` at all `n` indices
-            // at once and reconstruct from the first `k` that verify their
-            // checksums. A fragment that is missing (`Ok(None)`), fails its
-            // checksum or cannot be decoded (`Err`), or is slow/unreachable (its
-            // future has simply not resolved) is treated as **absent** and read
-            // around — a corrupt shard is never handed to the decoder, and the
-            // read never blocks on the slow `m`. The futures are polled
-            // cooperatively on this one task (no spawn), so their completion
+            // Any-`k`-arrive-first (§6.2): fire `get_fragment_at` at all `n` indices
+            // at once — each resolved to its placed D server — and reconstruct from
+            // the first `k` that verify their checksums. A fragment that is missing
+            // (`Ok(None)`), fails its checksum or cannot be decoded (`Err`), or is
+            // slow/unreachable (its future has simply not resolved) is treated as
+            // **absent** and read around — a corrupt shard is never handed to the
+            // decoder, and the read never blocks on the slow `m`. The futures are
+            // polled cooperatively on this one task (no spawn), so their completion
             // ordering is seed-driven and the read stays deterministic under
             // simulation (ADR-0009).
             let mut inflight: FuturesUnordered<_> = (0..n)
@@ -109,7 +133,8 @@ async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8
                         chunk: chunk.id,
                         index,
                     };
-                    async move { (index, chunks.get_fragment(id).await) }
+                    let dserver = fragment_dserver(chunk, index);
+                    async move { (index, chunks.get_fragment_at(dserver, id).await) }
                 })
                 .collect();
 
@@ -143,7 +168,7 @@ async fn read_chunk(chunks: &impl ChunkStore, chunk: &ChunkRef) -> Result<Vec<u8
 /// `COMMITTED`.
 pub async fn read_object(
     meta: &impl MetadataStore,
-    chunks: &impl ChunkStore,
+    chunks: &impl PlacementChunkStore,
     inode_id: InodeId,
 ) -> Result<Option<Vec<u8>>> {
     let Some(inode) = read_inode(meta, inode_id).await? else {
@@ -159,7 +184,7 @@ pub async fn read_object(
 /// not committed.
 pub async fn read_path(
     meta: &impl MetadataStore,
-    chunks: &impl ChunkStore,
+    chunks: &impl PlacementChunkStore,
     parent: InodeId,
     name: &str,
 ) -> Result<Option<Vec<u8>>> {

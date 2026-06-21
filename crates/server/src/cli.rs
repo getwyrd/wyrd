@@ -23,7 +23,9 @@ use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
-use wyrd_traits::{ChunkId, ChunkStore, CommitOutcome, MetadataStore, WriteBatch};
+use wyrd_traits::{
+    ChunkId, ChunkStore, CommitOutcome, MetadataStore, PlacementChunkStore, WriteBatch,
+};
 
 use crate::dserver::{self, DServer};
 use crate::{Gateway, DEFAULT_DURABILITY};
@@ -475,7 +477,7 @@ pub async fn cluster_store_put<C: ChunkStore>(
 /// Read an object back through the gateway client mode, reconstructing it from
 /// fragments read over `chunks` — the same [`read::read_path`] the local-disk
 /// path uses, over the gRPC fan-out.
-pub async fn cluster_store_get<C: ChunkStore>(
+pub async fn cluster_store_get<C: PlacementChunkStore>(
     meta: &RedbMetadataStore,
     chunks: &C,
     key: &str,

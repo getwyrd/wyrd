@@ -15,7 +15,7 @@
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, Result, WriteBatch};
+use wyrd_traits::{ChunkId, CommitOutcome, DServerId, MetadataStore, Result, WriteBatch};
 
 /// An inode identifier.
 pub type InodeId = u64;
@@ -66,10 +66,21 @@ pub enum EcScheme {
     },
 }
 
-/// One chunk in an inode's chunk map: its id, durability scheme, and **logical
-/// length** (the reader truncates to this after reconstruction, stripping shard
-/// padding).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// One chunk in an inode's chunk map: its id, durability scheme, **logical length**
+/// (the reader truncates to this after reconstruction, stripping shard padding), and
+/// the **placement record** — the stable D-server holding each fragment.
+///
+/// `placement[i]` is the [`DServerId`] of the D server holding the fragment at index
+/// `i` (proposal 0005, "The placement record", M3.1): recorded at the write commit
+/// point and consumed by the read path **in place of** M2's stateless `index % n`, so
+/// a fragment a custodian has *moved* is still resolved. It is **additive** metadata
+/// on a never-yet-deployed schema (`#[serde(default)]`), so an inode written before
+/// the field decodes with an empty vector and the read falls back to the identity
+/// placement (M0–M2 read through the same path).
+///
+/// (Carrying a `Vec` makes `ChunkRef` no longer `Copy`; the chunk map is cloned
+/// where ownership is needed.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRef {
     /// The chunk's id (shared by all its fragments).
     pub id: ChunkId,
@@ -77,6 +88,10 @@ pub struct ChunkRef {
     pub scheme: EcScheme,
     /// The chunk's logical (pre-coding) length in bytes.
     pub len: u64,
+    /// The stable D-server id holding each fragment, by fragment index (length `n`).
+    /// Empty on a pre-M3 record; the read path then resolves by fragment index.
+    #[serde(default)]
+    pub placement: Vec<DServerId>,
 }
 
 /// An inode: attributes, the ordered chunk map, state, and version.

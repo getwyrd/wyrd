@@ -2224,6 +2224,7 @@ dependencies = [
  "wyrd-chunk-format",
  "wyrd-chunkstore-fs",
  "wyrd-chunkstore-grpc",
+ "wyrd-metadata-redb",
  "wyrd-proto",
  "wyrd-testkit",
  "wyrd-traits",

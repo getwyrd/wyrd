@@ -80,7 +80,7 @@ fn rs_put_stages_n_fragments_and_reads_back_byte_identical() {
         // chunk's logical length.
         let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
         assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
-        let chunk = inode.chunk_map[0];
+        let chunk = inode.chunk_map[0].clone();
         assert_eq!(chunk.scheme, RS, "scheme recorded in the chunk map");
         assert_eq!(chunk.len, data.len() as u64, "logical length recorded");
 

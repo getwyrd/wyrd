@@ -40,6 +40,18 @@ pub struct FragmentId {
 /// stale holder's writes can be rejected after it has lost the lock.
 pub type FencingToken = u64;
 
+/// A **stable D-server identifier** (proposal 0005, "The placement record"). A D
+/// server is referenced by this stable id — assigned at registration and resolved
+/// to a *current* endpoint by discovery — **not** by its endpoint URL, which
+/// rebinds under restart/NAT and would rot a placement record keyed on it. The
+/// committed chunk map records one `DServerId` per fragment index (the placement
+/// vector), so a fragment that a custodian has *moved* is still found.
+///
+/// A `u64` is the encoding for M3.1 (the wire/registration source firms up with the
+/// failure-domain selector, #141); it is deliberately opaque — consumers compare it,
+/// they do not interpret its bits.
+pub type DServerId = u64;
+
 /// The boxed error type used across the trait surface at Milestone 0. Concrete
 /// backends surface their own error detail through it; richer typed errors are
 /// a later refinement once the failure modes are pinned by an implementation.
@@ -81,6 +93,54 @@ pub trait ChunkStore: Send + Sync {
 
     /// Report this store's current health.
     async fn health(&self) -> Result<Health>;
+}
+
+/// **Placement-aware** addressing over a fleet of D servers (proposal 0005, M3.1).
+///
+/// M2 routed a fragment **statelessly** — `index % n` — so the read found it only
+/// because nothing had moved it. M3 records, per fragment index, the [`DServerId`]
+/// holding that fragment (the chunk map's placement vector) and resolves the read
+/// **from that record**, so a *moved* fragment is still found. This trait is the
+/// seam the read/write path uses to address a specific D server by its stable id;
+/// it is layered **beside** [`ChunkStore`] (its supertrait), which stays the dumb
+/// fragment-bytes primitive and gains **no** methods (the enumerate/delete additions
+/// are a separate slice).
+///
+/// Every backing store provides the methods through their defaults: a bare
+/// `ChunkStore` is a **single location authority** that already routes by
+/// `FragmentId` (M0's one store, M2's `index % n` fan-out), so the recorded id is
+/// advisory and the at-server calls delegate straight through — M0–M2 behaviour is
+/// preserved exactly. A genuinely **relocatable** fleet (a custodian-aware store,
+/// later M3 slices) overrides them to honour a moved id.
+#[async_trait]
+pub trait PlacementChunkStore: ChunkStore {
+    /// The stable D-server ids a fresh chunk's `0..n` fragments are placed on, in
+    /// fragment-index order — recorded into the chunk map at the write commit. The
+    /// default is the identity placement (`index` → D-server `index`): a single
+    /// store / `index % n` fan-out is its own location authority, so the record just
+    /// mirrors the fragment order.
+    fn placement(&self, n: u16) -> Vec<DServerId> {
+        (0..u64::from(n)).collect()
+    }
+
+    /// Fetch fragment `id` from the D server `dserver` the placement record names.
+    /// The default ignores `dserver` and delegates to
+    /// [`ChunkStore::get_fragment`] — a single-authority store already routes by
+    /// `FragmentId`.
+    async fn get_fragment_at(&self, _dserver: DServerId, id: FragmentId) -> Result<Option<Bytes>> {
+        self.get_fragment(id).await
+    }
+
+    /// Place fragment `id` on the D server `dserver`. The default ignores `dserver`
+    /// and delegates to [`ChunkStore::put_fragment`].
+    async fn put_fragment_at(
+        &self,
+        _dserver: DServerId,
+        id: FragmentId,
+        fragment: Bytes,
+    ) -> Result<()> {
+        self.put_fragment(id, fragment).await
+    }
 }
 
 /// The authoritative metadata store: inodes, dirents, chunk maps, the

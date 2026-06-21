@@ -56,7 +56,13 @@ impl WritePlan {
         self.chunks.iter().map(|c| c.id).collect()
     }
 
-    /// The chunk map for the inode record — id, scheme, and logical length per chunk.
+    /// The chunk map for the inode record — id, scheme, logical length, and the
+    /// **placement record** per chunk. Placement is the identity vector
+    /// (`index` → D-server `index`): the write fan-out routes each fragment by index
+    /// (`index % n`), so the committed record mirrors that placement and the read
+    /// path resolves each fragment **from the record** instead of recomputing the
+    /// route (proposal 0005, M3.1). A custodian that later *moves* a fragment rewrites
+    /// this entry, and the read follows the record rather than the stale `index % n`.
     pub fn chunk_refs(&self) -> Vec<ChunkRef> {
         self.chunks
             .iter()
@@ -64,6 +70,7 @@ impl WritePlan {
                 id: c.id,
                 scheme: c.scheme,
                 len: c.len,
+                placement: (0..c.fragments.len() as u64).collect(),
             })
             .collect()
     }

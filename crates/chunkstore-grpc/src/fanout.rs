@@ -7,9 +7,16 @@
 //! best-effort, **not** an enforced placement guarantee — with fewer stores than
 //! fragments some share a store, and failure-domain-aware placement is L2 /
 //! custodian work (M3+). Placement is **stateless** and deterministic: the same
-//! index always routes to the same store, so the read resolves a fragment back to
-//! where the write put it without a placement record (the recorded-placement
-//! question is settled at M3).
+//! index always routes to the same store.
+//!
+//! As of M3.1 (proposal 0005, "The placement record") the **chunk map** records, per
+//! fragment, the stable D server holding it, and the read path resolves each fragment
+//! from that record ([`wyrd_traits::PlacementChunkStore`]) — so the recorded-placement
+//! question M2 deferred is now settled in the affirmative. The fan-out is no longer the
+//! location *authority*: it stays a single-D-server-per-store [`PlacementChunkStore`]
+//! whose `index % n` is the identity placement the write records, so an **un-moved**
+//! fragment routes exactly as before. Honouring a *moved* id (a relocatable, custodian-
+//! aware fan-out) is a later M3 slice; this slice records and resolves placement.
 //!
 //! Generic over `C: ChunkStore`, so it composes whatever the binary injects —
 //! `GrpcChunkStore` clients to networked D servers in production, in-process
@@ -19,7 +26,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use wyrd_traits::{ChunkStore, FragmentId, Health, Result};
+use wyrd_traits::{ChunkStore, FragmentId, Health, PlacementChunkStore, Result};
 
 /// A [`ChunkStore`] over an ordered set of backing stores, routing each fragment
 /// by `index % n`.
@@ -86,3 +93,10 @@ impl<C: ChunkStore> ChunkStore for FanoutChunkStore<C> {
         })
     }
 }
+
+/// The fan-out is a single-D-server-per-store [`PlacementChunkStore`]: its `index % n`
+/// routing **is** the identity placement the write commit records, so an un-moved
+/// fragment resolves through [`ChunkStore::get_fragment`] exactly as in M2 (the trait's
+/// defaults). The chunk map — not the fan-out — is now the location authority; a
+/// custodian-aware fan-out that honours a *moved* id is a later M3 slice (0005, M3.1).
+impl<C: ChunkStore> PlacementChunkStore for FanoutChunkStore<C> {}

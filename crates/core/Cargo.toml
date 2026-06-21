@@ -32,6 +32,9 @@ criterion.workspace = true
 # test/bench target (ADR-0010 lets the composition layer name concretes).
 wyrd-chunkstore-grpc.workspace = true
 wyrd-chunkstore-fs.workspace = true
+# The placement-record regression (tests/placement_record.rs) reopens a persisted
+# redb metadata store to prove the record survives a process restart (M3.1, #139).
+wyrd-metadata-redb.workspace = true
 tonic.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
