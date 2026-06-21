@@ -28,6 +28,10 @@ concurrency:
 jobs:
   tier2:
     runs-on: ubuntu-latest
+    # Bound the job so a hung cold build fails fast instead of drifting toward
+    # the 6h GitHub default (#150). Cold image build + 9-server cluster + the
+    # integration test fit well under this.
+    timeout-minutes: 45
     env:
       CI: "true"
     steps:
@@ -45,3 +49,16 @@ jobs:
 
       - name: cargo xtask integration
         run: cargo xtask integration
+
+      # Surface what `cargo xtask integration` captured before teardown (#150):
+      # it writes container logs to target/tier2-logs/ on failure, BEFORE
+      # compose_down destroys the cluster, so the diagnostics survive as an
+      # uploaded artifact for post-merge regression triage.
+      - name: Upload container diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-container-logs
+          path: target/tier2-logs/
+          if-no-files-found: ignore
+          retention-days: 14
