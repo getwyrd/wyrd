@@ -2,7 +2,10 @@
 
 Thank you for your interest in contributing to Wyrd.
 
-Before contributing, please read the project's Code of Conduct, Governance, and Security Policy documents.
+Before contributing, please read the project's Governance documentation and Security Policy.
+
+- Governance: docs/governance/
+- Security Policy: SECURITY.md
 
 ## Development workflow
 
@@ -39,7 +42,21 @@ This automatically adds the required Signed-off-by line.
 
 ## Running checks
 
-Before opening a pull request, run the project's local checks and tests where applicable.
+Before opening a pull request, run:
+
+```bash
+cargo xtask ci
+```
+
+This is the same gate that runs in CI.
+
+Optional Tier-2 integration tests:
+
+```bash
+cargo xtask integration
+```
+
+Note: Tier-2 integration tests require Docker.
 
 ## Reporting bugs
 

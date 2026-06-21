@@ -10,5 +10,5 @@ Closes #
 
 - [ ] I have linked a real issue.
 - [ ] My commits include DCO sign-off.
-- [ ] I tested my changes locally.
+- [ ] I ran cargo xtask ci.
 - [ ] Documentation has been updated if needed.
