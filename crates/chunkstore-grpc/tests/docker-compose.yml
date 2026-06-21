@@ -1,0 +1,21 @@
+# Tier-2 D-server cluster (Milestone 2 PR step 7, issue #117).
+#
+# A single `dserver` service that `cargo xtask integration` scales to N replicas
+# (`docker compose up --scale dserver=N`), each a real, networked gRPC D server in
+# its own container. Each publishes its gRPC port on an ephemeral host port; xtask
+# resolves the mapped ports (`docker compose port --index i dserver 50051`) into
+# the `WYRD_DSERVER_ENDPOINTS` the integration test dials. The image is the
+# `d-server` role of the single `wyrd` binary (ADR-0014/ADR-0016).
+services:
+  dserver:
+    build:
+      # Build context is the workspace root (three levels up from this file) so
+      # the whole crate graph is available to the multi-stage compile.
+      context: ../../..
+      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
+    image: wyrd-dserver:test
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data"]
+    # Target-only port: Docker assigns a free host port per replica (no clashes
+    # under --scale), which xtask reads back with `docker compose port`.
+    ports:
+      - "50051"

@@ -1,0 +1,8 @@
+# Keep the Docker build context small and host-toolchain-free: the Tier-2
+# D-server image (crates/chunkstore-grpc/tests/dserver/Dockerfile) compiles the
+# workspace fresh inside the build stage, so host build artifacts must not leak in
+# (they carry the host's libc and would bloat the context by gigabytes).
+target/
+.git/
+results/
+**/*.swp
