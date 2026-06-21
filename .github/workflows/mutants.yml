@@ -1,0 +1,98 @@
+name: mutants
+
+# Mutation testing (cargo-mutants): inject bugs — flip `<` to `<=`, replace a
+# function body with `Ok(())` — and check the test suite catches them. A SURVIVING
+# mutant is a behavior the 50-seed DST + conformance suite does not actually pin
+# down: a hole in the project's core promise. This measures test *quality*, which
+# line coverage cannot.
+#
+# ⚠️ EXPERIMENTAL / NON-GATING. The `cargo mutants` steps carry `continue-on-error`
+# so this workflow never blocks a merge while it's being dialled in on this
+# codebase. Once a clean run is confirmed, drop `continue-on-error` from the PR
+# step and add `mutants` to branch protection to make per-PR mutation a real gate.
+#
+# Scope: the hand-written correctness crates are selected explicitly with
+# `--package`. This is deliberate — it keeps `wyrd-dst` (which only compiles under
+# `--cfg madsim`) and the generated `wyrd-proto` stubs out of the run WITHOUT
+# fighting the workspace build, because neither is a dependency of the crates
+# below, so cargo-mutants never builds them.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  schedule:
+    - cron: "0 4 * * *" # 04:00 UTC nightly full sweep
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mutants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so the PR `--in-diff` step can diff against the base.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      # PR mode: only test mutants that overlap the lines this PR changed — fast
+      # enough to run per-PR. `--in-diff` is applied on top of the `--package`
+      # filters, so it stays scoped to the correctness crates.
+      - name: cargo mutants (PR diff)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          git diff "origin/${{ github.base_ref }}" > pr.diff
+          cargo mutants --in-diff pr.diff --no-shuffle \
+            --package wyrd-chunk-format \
+            --package wyrd-core \
+            --package wyrd-traits \
+            --package wyrd-metadata-redb \
+            --package wyrd-chunkstore-fs \
+            --package wyrd-chunkstore-grpc \
+            --package wyrd-coordination-mem \
+            --package wyrd-server
+
+      # Nightly / manual: full sweep over the correctness crates. Tracked like the
+      # bench — surfaced for visibility, never a gate.
+      - name: cargo mutants (full sweep)
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        run: |
+          cargo mutants --no-shuffle \
+            --package wyrd-chunk-format \
+            --package wyrd-core \
+            --package wyrd-traits \
+            --package wyrd-metadata-redb \
+            --package wyrd-chunkstore-fs \
+            --package wyrd-chunkstore-grpc \
+            --package wyrd-coordination-mem \
+            --package wyrd-server
+
+      # The report (surviving mutants, timings) for inspection after the run.
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ github.event_name }}
+          path: mutants.out/
+          if-no-files-found: ignore
