@@ -210,6 +210,14 @@ impl ChunkStore for ArrivalStore {
         self.inner.get_fragment(id).await
     }
 
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        self.inner.list_fragments().await
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.inner.delete_fragment(id).await
+    }
+
     async fn health(&self) -> Result<Health> {
         self.inner.health().await
     }

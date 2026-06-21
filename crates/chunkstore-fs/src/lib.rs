@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_chunk_format::{decode, FragmentError};
-use wyrd_traits::{ChunkStore, FragmentId, Health, PlacementChunkStore, Result};
+use wyrd_traits::{ChunkId, ChunkStore, FragmentId, Health, PlacementChunkStore, Result};
 
 /// A [`ChunkStore`] that keeps each fragment as a file under a root directory.
 pub struct FsChunkStore {
@@ -96,6 +96,55 @@ impl ChunkStore for FsChunkStore {
         Ok(Some(Bytes::from(bytes)))
     }
 
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        // The on-disk layout is `root/<32-hex chunk>/<05-index>.frag`, so a walk
+        // of two directory levels recovers exactly the placed fragment ids — the
+        // inverse of `fragment_path`. Names that don't match (e.g. a `.tmp` from
+        // an interrupted put, or any foreign entry) are skipped, so a crash mid
+        // write never surfaces as a phantom fragment.
+        let mut ids = Vec::new();
+        let chunk_dirs = match fs::read_dir(&self.root) {
+            Ok(dirs) => dirs,
+            // A never-written store has no root contents yet — an empty walk.
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ids),
+            Err(e) => return Err(e.into()),
+        };
+        for chunk_entry in chunk_dirs {
+            let chunk_entry = chunk_entry?;
+            if !chunk_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(chunk) = chunk_entry
+                .file_name()
+                .to_str()
+                .and_then(parse_chunk_dir_name)
+            else {
+                continue;
+            };
+            for frag_entry in fs::read_dir(chunk_entry.path())? {
+                let frag_entry = frag_entry?;
+                if let Some(index) = frag_entry
+                    .file_name()
+                    .to_str()
+                    .and_then(parse_fragment_file_name)
+                {
+                    ids.push(FragmentId { chunk, index });
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        // Idempotent: a missing file is a successful no-op, so a retried GC
+        // reclaim never errors.
+        match fs::remove_file(self.fragment_path(id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     async fn health(&self) -> Result<Health> {
         Ok(match fs::metadata(&self.root) {
             Ok(meta) if meta.is_dir() => Health::Healthy,
@@ -154,4 +203,21 @@ impl std::error::Error for FsChunkStoreError {
 pub fn fragment_path(root: &Path, id: FragmentId) -> PathBuf {
     root.join(format!("{:032x}", id.chunk))
         .join(format!("{:05}.frag", id.index))
+}
+
+/// Recover a chunk id from a chunk directory name, inverting the `{:032x}` in
+/// [`fragment_path`]. `None` for any name that is not exactly 32 lowercase-hex
+/// digits, so a foreign directory is skipped by the walk rather than misread.
+fn parse_chunk_dir_name(name: &str) -> Option<ChunkId> {
+    if name.len() != 32 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    ChunkId::from_str_radix(name, 16).ok()
+}
+
+/// Recover a fragment index from a fragment file name, inverting the
+/// `{:05}.frag` in [`fragment_path`]. `None` for anything not ending `.frag`
+/// with a `u16` stem — notably the `.tmp` of an interrupted put.
+fn parse_fragment_file_name(name: &str) -> Option<u16> {
+    name.strip_suffix(".frag")?.parse().ok()
 }

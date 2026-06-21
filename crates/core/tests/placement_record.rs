@@ -90,6 +90,24 @@ impl ChunkStore for Fleet {
             .cloned())
     }
 
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        // Supertrait obligation: the union across the fleet. A fragment lives on
+        // exactly one server (placed via `*_at`), so the keys are disjoint.
+        Ok(self
+            .servers
+            .iter()
+            .flat_map(|s| s.lock().unwrap().keys().copied().collect::<Vec<_>>())
+            .collect())
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        // Supertrait obligation: remove wherever it physically lives.
+        for s in &self.servers {
+            s.lock().unwrap().remove(&id);
+        }
+        Ok(())
+    }
+
     async fn health(&self) -> Result<Health> {
         Ok(Health::Healthy)
     }

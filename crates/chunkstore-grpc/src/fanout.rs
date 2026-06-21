@@ -70,6 +70,24 @@ impl<C: ChunkStore> ChunkStore for FanoutChunkStore<C> {
         self.route(id.index).get_fragment(id).await
     }
 
+    /// The union of every backing store's fragments — the fan-out holds what its
+    /// backends hold. Order is unspecified (the trait makes no promise), and the
+    /// per-store sets are disjoint by construction (`route` places each index on
+    /// exactly one backend), so no de-duplication is needed.
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        let mut ids = Vec::new();
+        for store in &self.stores {
+            ids.extend(store.list_fragments().await?);
+        }
+        Ok(ids)
+    }
+
+    /// Delete from the one backend the fragment is placed on, matching how `put`
+    /// and `get` route by `index % n`.
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.route(id.index).delete_fragment(id).await
+    }
+
     /// Aggregate liveness: `Healthy` only if every backing store is, `Unhealthy`
     /// only if all are unreachable or unhealthy, else `Degraded` — a single dead D
     /// server degrades the fan-out without failing it (a read can still reconstruct

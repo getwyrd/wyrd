@@ -98,6 +98,67 @@ fn health_is_healthy_when_open() {
     });
 }
 
+// ---- Enumerate + delete (M3, proposal 0005) --------------------------------
+
+#[test]
+fn list_and_delete_walk_the_store() {
+    block_on(async {
+        let (s, _dir) = store();
+        // An empty store walks to nothing.
+        assert!(s.list_fragments().await.unwrap().is_empty());
+
+        let ids = [fid(0x11, 0), fid(0x11, 4), fid(0x22, 0)];
+        for &id in &ids {
+            s.put_fragment(id, fragment(id, b"walked")).await.unwrap();
+        }
+        let listed: std::collections::HashSet<_> =
+            s.list_fragments().await.unwrap().into_iter().collect();
+        assert_eq!(
+            listed,
+            ids.into_iter().collect::<std::collections::HashSet<_>>(),
+            "the directory walk recovers exactly the placed fragment ids"
+        );
+
+        // Delete one; it disappears from both get and the walk, siblings remain.
+        s.delete_fragment(fid(0x11, 4)).await.unwrap();
+        assert!(s.get_fragment(fid(0x11, 4)).await.unwrap().is_none());
+        let listed: std::collections::HashSet<_> =
+            s.list_fragments().await.unwrap().into_iter().collect();
+        assert_eq!(
+            listed,
+            [fid(0x11, 0), fid(0x22, 0)]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
+
+        // Deleting an absent fragment is an idempotent Ok(()).
+        s.delete_fragment(fid(0x11, 4)).await.unwrap();
+        s.delete_fragment(fid(0xdead, 9)).await.unwrap();
+    });
+}
+
+#[test]
+fn list_skips_foreign_and_temp_entries() {
+    block_on(async {
+        let (s, dir) = store();
+        let id = fid(0x33, 0);
+        s.put_fragment(id, fragment(id, b"real")).await.unwrap();
+
+        // A leftover `.tmp` (an interrupted put) and a foreign directory/file
+        // must not surface as phantom fragments — the walk parses names strictly.
+        let chunk_dir = dir.path().join(format!("{:032x}", id.chunk));
+        std::fs::write(chunk_dir.join("00001.tmp"), b"interrupted").unwrap();
+        std::fs::write(chunk_dir.join("notes.txt"), b"foreign").unwrap();
+        std::fs::create_dir_all(dir.path().join("not-a-chunk")).unwrap();
+
+        assert_eq!(
+            s.list_fragments().await.unwrap(),
+            vec![id],
+            "only the valid .frag under a 32-hex chunk dir is listed"
+        );
+    });
+}
+
 // ---- Integrity (filesystem-specific) ---------------------------------------
 
 #[test]

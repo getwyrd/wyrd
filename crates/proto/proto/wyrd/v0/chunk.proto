@@ -40,6 +40,25 @@ message FragmentGetResponse {
   optional bytes fragment = 1;
 }
 
+// Walk what a D server holds (M3, proposal 0005): scrub enumerates a store's
+// fragments to diff them against the chunk map. No request parameters — a store
+// reports the whole set it holds.
+message FragmentListRequest {}
+
+message FragmentListResponse {
+  // Every fragment id this store currently holds. Order is unspecified.
+  repeated FragmentId ids = 1;
+}
+
+// Reclaim a fragment's bytes (M3, proposal 0005): GC deletes orphaned fragments.
+message FragmentDeleteRequest {
+  FragmentId id = 1;
+}
+
+// Empty: delete is idempotent, so an absent fragment is a successful no-op, not a
+// distinct status.
+message FragmentDeleteResponse {}
+
 // Connection/discovery liveness, self-reported and trusted (ADR-0005). This is
 // NOT durability telemetry or under-replication signalling (those are M3,
 // ADR-0011). Mirrors traits::Health.
@@ -61,4 +80,9 @@ service ChunkStore {
   rpc PutFragment(FragmentPutRequest) returns (FragmentPutResponse);
   rpc GetFragment(FragmentGetRequest) returns (FragmentGetResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+  // Added by addition for M3 maintenance (proposal 0005, ADR-0002 wire rule:
+  // fields/rpcs never repurposed). The D server stays deliberately dumb (§8.5) —
+  // it enumerates the bytes it holds and removes bytes it is told to.
+  rpc ListFragments(FragmentListRequest) returns (FragmentListResponse);
+  rpc DeleteFragment(FragmentDeleteRequest) returns (FragmentDeleteResponse);
 }

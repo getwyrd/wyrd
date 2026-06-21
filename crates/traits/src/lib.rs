@@ -91,6 +91,22 @@ pub trait ChunkStore: Send + Sync {
     /// for `id`. Implementations verify integrity before returning bytes.
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>>;
 
+    /// Enumerate every fragment this store currently holds. Order is
+    /// unspecified. The maintenance plane's **scrub** loop (M3, proposal 0005)
+    /// walks this to diff a D server's actual contents against the committed
+    /// chunk map — orphans GC should reclaim, absences reconstruction should
+    /// rebuild. Added additively for M3; it neither moves bytes nor interprets
+    /// them beyond their addressing.
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>>;
+
+    /// Remove the bytes stored for `id`. **Idempotent**: deleting a fragment the
+    /// store does not hold succeeds with `Ok(())`, so a retried or duplicated GC
+    /// reclaim is not an error. The maintenance plane's **GC** loop (M3, proposal
+    /// 0005) reclaims orphaned bytes through this; the store stays deliberately
+    /// dumb (building-block view, §8.5) — it removes the bytes it is told to,
+    /// making no reference-safety judgement (that is the caller's invariant).
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()>;
+
     /// Report this store's current health.
     async fn health(&self) -> Result<Health>;
 }
@@ -103,8 +119,9 @@ pub trait ChunkStore: Send + Sync {
 /// **from that record**, so a *moved* fragment is still found. This trait is the
 /// seam the read/write path uses to address a specific D server by its stable id;
 /// it is layered **beside** [`ChunkStore`] (its supertrait), which stays the dumb
-/// fragment-bytes primitive and gains **no** methods (the enumerate/delete additions
-/// are a separate slice).
+/// fragment-bytes primitive — its only M3 growth is the bytes-level
+/// enumerate/delete affordances ([`ChunkStore::list_fragments`] /
+/// [`ChunkStore::delete_fragment`], a sibling slice), not any placement logic.
 ///
 /// Every backing store provides the methods through their defaults: a bare
 /// `ChunkStore` is a **single location authority** that already routes by
