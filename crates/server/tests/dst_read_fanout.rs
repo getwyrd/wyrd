@@ -215,6 +215,10 @@ impl ChunkStore for ArrivalStore {
     }
 }
 
+// A single fault-injecting store is its own location authority; it uses the
+// `PlacementChunkStore` identity defaults (0005, M3.1).
+impl wyrd_traits::PlacementChunkStore for ArrivalStore {}
+
 /// Write a new object end to end under `scheme` and return its committed inode
 /// (fragments land on disk with no delay — only the read is raced).
 async fn put(
@@ -299,7 +303,7 @@ fn below_k_is_a_clean_typed_error(seed: u64) {
         let data = nonempty_payload(&mut sim, MAX_PAYLOAD);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0];
+        let chunk = inode.chunk_map[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             delete(dir.path(), chunk.id, index);
         }

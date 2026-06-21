@@ -215,6 +215,7 @@ fn version_cas_rejects_a_stale_writer() {
                 id,
                 scheme: metadata::EcScheme::None,
                 len: 0,
+                placement: vec![0],
             };
             let map_a: Vec<metadata::ChunkRef> = vec![chunk(sim.gen()), chunk(sim.gen())];
             let map_b: Vec<metadata::ChunkRef> = vec![chunk(sim.gen())];

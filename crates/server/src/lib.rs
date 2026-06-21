@@ -20,7 +20,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use wyrd_core::metadata::{EcScheme, InodeId};
 use wyrd_core::{read, write};
-use wyrd_traits::{ChunkId, ChunkStore, CommitOutcome, Coordination, MetadataStore, Result};
+use wyrd_traits::{
+    ChunkId, CommitOutcome, Coordination, MetadataStore, PlacementChunkStore, Result,
+};
 
 /// The root inode every object key is bound under — a flat namespace at M0.
 const ROOT: InodeId = 0;
@@ -56,7 +58,9 @@ pub struct Gateway<M, C, Co> {
 impl<M, C, Co> Gateway<M, C, Co>
 where
     M: MetadataStore,
-    C: ChunkStore,
+    // `PlacementChunkStore` (its supertrait is `ChunkStore`) so the read path resolves
+    // each fragment from the committed placement record, not `index % n` (0005, M3.1).
+    C: PlacementChunkStore,
     Co: Coordination,
 {
     /// Compose a gateway over the given backends.

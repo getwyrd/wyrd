@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_chunk_format::{decode, FragmentError};
-use wyrd_traits::{ChunkStore, FragmentId, Health, Result};
+use wyrd_traits::{ChunkStore, FragmentId, Health, PlacementChunkStore, Result};
 
 /// A [`ChunkStore`] that keeps each fragment as a file under a root directory.
 pub struct FsChunkStore {
@@ -103,6 +103,12 @@ impl ChunkStore for FsChunkStore {
         })
     }
 }
+
+/// A single on-disk store is its own location authority: it holds every fragment
+/// addressed by `FragmentId`, so it is a single-D-server [`PlacementChunkStore`] and
+/// uses the trait's identity defaults (the placement record is advisory here — the
+/// store routes by `FragmentId`). Proposal 0005, M3.1.
+impl PlacementChunkStore for FsChunkStore {}
 
 /// Errors specific to the filesystem chunk store; surfaced through the trait's
 /// boxed error.
