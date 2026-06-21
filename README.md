@@ -81,6 +81,37 @@ cargo build
 cargo test
 ```
 
+## Development & testing
+
+The full development workflow lives in [`cargo xtask`](xtask) — automation
+written in Rust rather than YAML, so the same checks run on a laptop and in CI
+([ADR-0016]):
+
+| Command | What it runs |
+|---------|--------------|
+| `cargo xtask ci` | The local **merge gate**, and the single check CI calls: `fmt --check`, `clippy -D warnings`, build, test, `cargo deny check`, the conformance vectors, and the madsim DST sweep. Run it before pushing. |
+| `cargo xtask conformance` | The on-disk chunk-format reader against the committed conformance vectors (also run inside `ci`). |
+| `cargo xtask dst` | The madsim deterministic-simulation commit-protocol tests across a seed sweep (also run inside `ci`). |
+| `cargo xtask integration` | The **Tier-2** end-to-end test against a cluster of real, networked gRPC D servers. **Not** part of `ci` — it needs a container runtime (see below). |
+| `cargo xtask bench` | The tracked throughput benchmarks (tracked for regression visibility, not gated). |
+
+Plain `cargo test` silently **skips** the Tier-2 integration test — it is
+`#[ignore]`d and needs a live cluster; run it through `cargo xtask integration`.
+
+**`cargo xtask integration` prerequisites:** a running **Docker** daemon and the
+**Docker Compose plugin** (`docker compose`). The tier stands up a cluster of D
+servers under docker-compose; without Docker it is skipped locally and fails in
+CI. Set **`WYRD_DSERVER_COUNT`** (default 9, minimum 2) to change how many D
+servers the cluster runs.
+
+### Try it
+
+A self-contained S3 PUT/GET round-trip — no cluster, no setup:
+
+```sh
+cargo run -p wyrd-server --bin wyrd -- demo
+```
+
 ## Security
 
 Wyrd is pre-release software and carries no security promise yet, but we still
