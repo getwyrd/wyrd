@@ -14,7 +14,7 @@ use bytes::Bytes;
 use pollster::block_on;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::write;
-use wyrd_traits::{ChunkStore, FragmentId, Health, Result};
+use wyrd_traits::{ChunkStore, FragmentId, Health, PlacementChunkStore, Result};
 
 const CHUNK: usize = 1 << 16; // one chunk per test payload
 const RS: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 };
@@ -66,6 +66,11 @@ impl ChunkStore for FaultStore {
         Ok(Health::Healthy)
     }
 }
+
+// A single-location store: its `*_at` defaults delegate to the index-routed
+// `put_fragment` / `get_fragment`, so the identity-placement fan-out routes exactly
+// as in M2 (the write path now addresses fragments via `put_fragment_at`).
+impl PlacementChunkStore for FaultStore {}
 
 fn rs_plan(payload: &[u8]) -> write::WritePlan {
     let mut next = 0x42u128;

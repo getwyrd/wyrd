@@ -18,14 +18,54 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService};
-use wyrd_traits::{ChunkStore, Coordination, Lease, Result};
+use wyrd_core::placement::Topology;
+use wyrd_traits::{ChunkStore, Coordination, DServerId, Lease, Result};
 
 /// The discovery group under which D servers register their gRPC endpoints.
 pub const DSERVER_GROUP: &str = "chunkstore";
+
+/// The default opaque failure-domain label a D server reports when none is
+/// configured — a single-domain zone (the M2 best-effort posture). Real
+/// deployments set a per-server rack / power / switch label (architecture §7.3).
+pub const DEFAULT_FAILURE_DOMAIN: &str = "default";
+
+/// What a D server publishes through `Coordination::register` (proposal 0005, "The
+/// placement record", `0005:194-196`): its **stable id**, its current dialable
+/// **endpoint**, and its opaque **failure-domain label**. Keyed on the stable id
+/// (not the URL, which rebinds), this is what lets the write path build a topology
+/// and place a chunk's fragments across distinct failure domains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DServerRegistration {
+    /// The stable D-server id (the placement record keys on this).
+    pub id: DServerId,
+    /// The dialable gRPC endpoint (e.g. `http://127.0.0.1:50051`).
+    pub endpoint: String,
+    /// The opaque failure-domain label (rack / power / switch).
+    pub failure_domain: String,
+}
+
+impl DServerRegistration {
+    /// Decode a registration from its stored coordination bytes. Falls back to
+    /// treating the raw value as a bare endpoint (a pre-M3 registration that carried
+    /// only the endpoint string), keeping discovery one-version-gap compatible.
+    pub fn decode(raw: &[u8]) -> Result<Self> {
+        if let Ok(reg) = serde_json::from_slice::<DServerRegistration>(raw) {
+            return Ok(reg);
+        }
+        let endpoint = String::from_utf8(raw.to_vec())
+            .map_err(|e| format!("non-utf8 D-server registration: {e}"))?;
+        Ok(DServerRegistration {
+            id: 0,
+            endpoint,
+            failure_domain: DEFAULT_FAILURE_DOMAIN.to_string(),
+        })
+    }
+}
 
 /// A D server bound to a port but not yet serving. Binding first means the
 /// listener is already accepting into the OS backlog and the advertised endpoint
@@ -36,12 +76,16 @@ pub struct DServer<S> {
     store: S,
     listener: TcpListener,
     endpoint: String,
+    id: DServerId,
+    failure_domain: String,
 }
 
 impl<S: ChunkStore + 'static> DServer<S> {
     /// Bind the gRPC listener on `bind` (use port 0 for an ephemeral port) over
     /// `store`. The advertised endpoint is derived from the bound address; NAT /
-    /// split-horizon advertisement is a later deployment concern.
+    /// split-horizon advertisement is a later deployment concern. The server starts
+    /// with a default stable id and the default failure domain; set them with
+    /// [`with_identity`](DServer::with_identity) before registering.
     pub async fn bind(store: S, bind: SocketAddr) -> Result<Self> {
         let listener = TcpListener::bind(bind).await?;
         let addr = listener.local_addr()?;
@@ -49,7 +93,19 @@ impl<S: ChunkStore + 'static> DServer<S> {
             store,
             listener,
             endpoint: format!("http://{addr}"),
+            id: 0,
+            failure_domain: DEFAULT_FAILURE_DOMAIN.to_string(),
         })
+    }
+
+    /// Set this server's **stable id** and opaque **failure-domain label** — the
+    /// placement-relevant facts its registration carries (proposal 0005,
+    /// `0005:194-196`, §"Failure-domain-aware placement"). Distinct labels are what
+    /// let the write selector place a chunk's fragments across distinct domains.
+    pub fn with_identity(mut self, id: DServerId, failure_domain: impl Into<String>) -> Self {
+        self.id = id;
+        self.failure_domain = failure_domain.into();
+        self
     }
 
     /// The dialable endpoint this server advertises (e.g. `http://127.0.0.1:50051`).
@@ -57,18 +113,33 @@ impl<S: ChunkStore + 'static> DServer<S> {
         &self.endpoint
     }
 
-    /// Register this server's endpoint under `group` with a lease of `ttl`. The
-    /// returned [`Lease`] is renewed by [`serve`](DServer::serve); letting it
-    /// lapse drops the endpoint out of `discover`.
+    /// This server's stable D-server id.
+    pub fn id(&self) -> DServerId {
+        self.id
+    }
+
+    /// The registration record this server publishes (`{ id, endpoint, failure-domain
+    /// label }`).
+    pub fn registration(&self) -> DServerRegistration {
+        DServerRegistration {
+            id: self.id,
+            endpoint: self.endpoint.clone(),
+            failure_domain: self.failure_domain.clone(),
+        }
+    }
+
+    /// Register this server's `{ id, endpoint, failure-domain label }` record under
+    /// `group` with a lease of `ttl`. The returned [`Lease`] is renewed by
+    /// [`serve`](DServer::serve); letting it lapse drops the server out of `discover`.
     pub async fn register(
         &self,
         coord: &impl Coordination,
         group: &str,
         ttl: Duration,
     ) -> Result<Lease> {
-        coord
-            .register(group, Bytes::from(self.endpoint.clone().into_bytes()), ttl)
-            .await
+        let value = serde_json::to_vec(&self.registration())
+            .map_err(|e| format!("encoding D-server registration: {e}"))?;
+        coord.register(group, Bytes::from(value), ttl).await
     }
 
     /// Serve the gRPC `ChunkStore` until `shutdown` resolves, renewing `lease`
@@ -114,16 +185,30 @@ impl<S: ChunkStore + 'static> DServer<S> {
     }
 }
 
-/// Resolve the dialable endpoints currently registered under `group`. Endpoints
-/// are stored as UTF-8 strings; a non-UTF-8 value is a contract violation.
+/// Resolve the dialable endpoints currently registered under `group`, decoding the
+/// `{ id, endpoint, failure-domain label }` record (with a bare-endpoint fallback for
+/// a pre-M3 registration).
 pub async fn discover_endpoints(coord: &impl Coordination, group: &str) -> Result<Vec<String>> {
     let mut endpoints = Vec::new();
     for raw in coord.discover(group).await? {
-        let endpoint = String::from_utf8(raw.to_vec())
-            .map_err(|e| format!("non-utf8 endpoint in discovery group `{group}`: {e}"))?;
-        endpoints.push(endpoint);
+        endpoints.push(DServerRegistration::decode(&raw)?.endpoint);
     }
     Ok(endpoints)
+}
+
+/// Build the failure-domain [`Topology`] the write selector places against from the
+/// D servers currently registered under `group` (proposal 0005,
+/// §"Failure-domain-aware placement", `0005:235-245`). Each registration contributes
+/// its stable id and opaque failure-domain label; the selector then spreads a chunk's
+/// fragments across distinct domains. This is the **production input** that retires
+/// the domain-blind `index % n` route.
+pub async fn discover_topology(coord: &impl Coordination, group: &str) -> Result<Topology> {
+    let mut topology = Topology::default();
+    for raw in coord.discover(group).await? {
+        let reg = DServerRegistration::decode(&raw)?;
+        topology.register(reg.id, reg.failure_domain);
+    }
+    Ok(topology)
 }
 
 /// Select `n` endpoints to fan a chunk's `n` fragments out to, **preferring

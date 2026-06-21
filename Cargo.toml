@@ -16,6 +16,7 @@ members = [
     "crates/chunkstore-fs",
     "crates/chunkstore-grpc",
     "crates/coordination-mem",
+    "crates/custodian",
     "crates/server",
     "crates/dst",
     "xtask",
@@ -40,6 +41,7 @@ wyrd-metadata-redb = { path = "crates/metadata-redb" }
 wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
 wyrd-chunkstore-grpc = { path = "crates/chunkstore-grpc" }
 wyrd-coordination-mem = { path = "crates/coordination-mem" }
+wyrd-custodian = { path = "crates/custodian" }
 
 # Shared third-party dependencies, version-pinned once here.
 async-trait = "0.1"
@@ -102,6 +104,23 @@ tonic = "0.14"
 # service stubs reference `tonic_prost::ProstCodec`.
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+# --- Durability-plane telemetry (M3.3, proposal 0005 §"The durability plane";
+# ADR-0011 telemetry-from-first-commit, ADR-0012 backend-agnostic OpenTelemetry) ---
+# The custodian emits durability telemetry through `tracing` bridged to OpenTelemetry,
+# exporting over BOTH a Prometheus-scrapeable registry AND OTLP push — no backend is
+# hardcoded (ADR-0012). New dependencies: they require the ADR-0003 cargo-deny
+# three-test audit + `deny.toml` allowlist review at sign-off (a NEEDS-HUMAN).
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-prometheus = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "metrics",
+    "grpc-tonic",
+] }
+prometheus = "0.14"
 
 # Lint policy — the SINGLE SOURCE OF TRUTH for the lint gate (ADR-0016: the rule
 # lives in one place, not duplicated across CI YAML and a clippy CLI flag). Each

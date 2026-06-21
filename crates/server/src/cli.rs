@@ -23,9 +23,7 @@ use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
-use wyrd_traits::{
-    ChunkId, ChunkStore, CommitOutcome, MetadataStore, PlacementChunkStore, WriteBatch,
-};
+use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, PlacementChunkStore, WriteBatch};
 
 use crate::dserver::{self, DServer};
 use crate::{Gateway, DEFAULT_DURABILITY};
@@ -256,6 +254,14 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         "renew-secs",
         DEFAULT_DSERVER_RENEW_SECS,
     )?);
+    // The stable D-server id and opaque failure-domain label this server publishes
+    // through registration (proposal 0005, "The placement record"). The label is what
+    // lets the write selector place a chunk's fragments across distinct domains.
+    let dserver_id = parse_u64_flag(&parsed, "id", 0)?;
+    let failure_domain = parsed
+        .flag("failure-domain")
+        .unwrap_or(dserver::DEFAULT_FAILURE_DOMAIN)
+        .to_string();
 
     let chunk_dir = Path::new(data_dir).join("chunks");
     let store = FsChunkStore::open(&chunk_dir)?;
@@ -268,7 +274,9 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         .build()?;
     runtime.block_on(async move {
         let coord = Arc::new(MemCoordination::new());
-        let server = DServer::bind(store, bind).await?;
+        let server = DServer::bind(store, bind)
+            .await?
+            .with_identity(dserver_id, failure_domain);
         eprintln!(
             "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {data_dir})",
             server.endpoint()
@@ -447,7 +455,7 @@ pub fn open_cluster_meta(data_dir: &str) -> Result<RedbMetadataStore, BoxError> 
 /// with the on-disk chunk store swapped for the gRPC fan-out. Persisting the ids
 /// is what makes storing several distinct objects across separate invocations
 /// (fresh process / new composition over the same `data_dir`) work.
-pub async fn cluster_store_put<C: ChunkStore>(
+pub async fn cluster_store_put<C: PlacementChunkStore>(
     meta: &RedbMetadataStore,
     chunks: &C,
     key: &str,

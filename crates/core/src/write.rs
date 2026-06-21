@@ -21,14 +21,17 @@
 use bytes::Bytes;
 use wyrd_chunk_format::{encode, EcSchemeType, FragmentHeader};
 use wyrd_traits::{
-    ChunkId, ChunkStore, CommitOutcome, FragmentId, MetadataStore, Result, WriteBatch,
+    ChunkId, CommitOutcome, DServerId, FragmentId, MetadataStore, PlacementChunkStore, Result,
+    WriteBatch,
 };
 
 use crate::erasure;
 use crate::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry};
+use crate::placement::{select_distinct_domains, SelectorError, Topology};
 
-/// One planned chunk: its id, durability scheme, logical length, and the encoded
-/// fragments to store — each `(ec_fragment_index, fragment bytes)`.
+/// One planned chunk: its id, durability scheme, logical length, the encoded
+/// fragments to store — each `(ec_fragment_index, fragment bytes)` — and the
+/// **placement** the fragments land on.
 #[derive(Debug, Clone)]
 pub struct PlannedChunk {
     /// The chunk id minted for this chunk (shared by all its fragments).
@@ -39,6 +42,13 @@ pub struct PlannedChunk {
     pub len: u64,
     /// The fragments to write, by `ec_fragment_index`.
     pub fragments: Vec<(u16, Bytes)>,
+    /// The stable D-server id each fragment is placed on, in fragment-index order
+    /// (length `n`). Defaults to the **identity** placement (`index` → D-server
+    /// `index`) — M0–M2's `index % n` route — and is overwritten by
+    /// [`WritePlan::place`] with the failure-domain selector's distinct-domain
+    /// choice (Option B, proposal 0005, `0005:510-513`). The write fan-out places
+    /// each fragment at `placement[index]` and the commit records this vector.
+    pub placement: Vec<DServerId>,
 }
 
 /// The pure result of chunking and encoding an object — no store access yet.
@@ -57,12 +67,13 @@ impl WritePlan {
     }
 
     /// The chunk map for the inode record — id, scheme, logical length, and the
-    /// **placement record** per chunk. Placement is the identity vector
-    /// (`index` → D-server `index`): the write fan-out routes each fragment by index
-    /// (`index % n`), so the committed record mirrors that placement and the read
-    /// path resolves each fragment **from the record** instead of recomputing the
-    /// route (proposal 0005, M3.1). A custodian that later *moves* a fragment rewrites
-    /// this entry, and the read follows the record rather than the stale `index % n`.
+    /// **placement record** per chunk. Placement is each chunk's `placement` vector:
+    /// the identity vector (`index` → D-server `index`) for the M0–M2 `index % n`
+    /// route, or — once [`place`](WritePlan::place) has run the failure-domain
+    /// selector — the **distinct-domain** choice (Option B, proposal 0005,
+    /// `0005:510-513`, `0005:235-245`). The read path resolves each fragment **from
+    /// the record** instead of recomputing the route (`0005:489-490`), so a custodian
+    /// that later *moves* a fragment rewrites this entry and the read follows it.
     pub fn chunk_refs(&self) -> Vec<ChunkRef> {
         self.chunks
             .iter()
@@ -70,9 +81,28 @@ impl WritePlan {
                 id: c.id,
                 scheme: c.scheme,
                 len: c.len,
-                placement: (0..c.fragments.len() as u64).collect(),
+                placement: c.placement.clone(),
             })
             .collect()
+    }
+
+    /// Assign each chunk's placement with the **failure-domain-aware selector** so
+    /// the committed record spreads a chunk's `n` fragments across `n` **distinct**
+    /// failure domains, **retiring identity `index % n`** as the write's placement
+    /// choice (Option B, proposal 0005 §"Failure-domain-aware placement",
+    /// `0005:235-245`, `0005:510-513`). Errors with [`SelectorError`] when `topology`
+    /// offers fewer than `n` distinct domains — the selector refuses rather than
+    /// collide domains (durability is gate-zero, `0005:303`).
+    ///
+    /// This is the point at which the selector is **shared by the write fan-out**
+    /// (`0005:241-242`): the placement it records is the placement
+    /// [`write_fragments`] fans the bytes out to.
+    pub fn place(&mut self, topology: &Topology) -> std::result::Result<(), SelectorError> {
+        for chunk in &mut self.chunks {
+            let n = chunk.fragments.len() as u16;
+            chunk.placement = select_distinct_domains(topology, n)?;
+        }
+        Ok(())
     }
 }
 
@@ -118,11 +148,17 @@ pub fn plan_write(
     let mut chunks = Vec::new();
     for piece in data.chunks(chunk_size) {
         let id = next_id();
+        let fragments = encode_chunk(scheme, id, piece)?;
+        // Default to the identity placement (`index` → D-server `index`), the M0–M2
+        // `index % n` route; `WritePlan::place` overwrites it with the selector's
+        // distinct-domain choice when a topology is supplied (Option B).
+        let placement = (0..fragments.len() as u64).collect();
         chunks.push(PlannedChunk {
             id,
             scheme,
             len: piece.len() as u64,
-            fragments: encode_chunk(scheme, id, piece)?,
+            fragments,
+            placement,
         });
     }
     Ok(WritePlan {
@@ -166,14 +202,24 @@ pub async fn intent(
 /// garbage** the pending-ledger sweep reclaims. Degraded-write tolerance
 /// (committing with fewer than `n` and letting custodians backfill) is deferred to
 /// M3; M2 commits only after **all `n`** ack.
-pub async fn write_fragments(chunks: &impl ChunkStore, plan: &WritePlan) -> Result<()> {
+pub async fn write_fragments(chunks: &impl PlacementChunkStore, plan: &WritePlan) -> Result<()> {
     let puts = plan.chunks.iter().flat_map(|chunk| {
         chunk.fragments.iter().map(move |(index, fragment)| {
             let id = FragmentId {
                 chunk: chunk.id,
                 index: *index,
             };
-            chunks.put_fragment(id, fragment.clone())
+            // Place the fragment at the D server its placement record names — the
+            // selector's distinct-domain choice once `place` has run, or the identity
+            // route otherwise. The default `put_fragment_at` of a single-authority
+            // store delegates to `put_fragment` (index-routed), so M0–M2 behaviour is
+            // preserved; a placement-aware fleet honours the chosen id.
+            let dserver = chunk
+                .placement
+                .get(*index as usize)
+                .copied()
+                .unwrap_or_else(|| DServerId::from(*index));
+            chunks.put_fragment_at(dserver, id, fragment.clone())
         })
     });
     futures_util::future::try_join_all(puts).await?;
@@ -222,7 +268,7 @@ pub async fn release(meta: &impl MetadataStore, plan: &WritePlan) -> Result<()> 
 #[allow(clippy::too_many_arguments)]
 pub async fn write_new_object(
     meta: &impl MetadataStore,
-    chunks: &impl ChunkStore,
+    chunks: &impl PlacementChunkStore,
     parent: InodeId,
     name: &str,
     inode_id: InodeId,
@@ -234,6 +280,41 @@ pub async fn write_new_object(
     next_id: impl FnMut() -> ChunkId,
 ) -> Result<CommitOutcome> {
     let plan = plan_write(data, chunk_size, scheme, next_id)?;
+    intent(meta, &plan, now_millis + lease_ttl_millis).await?;
+    write_fragments(chunks, &plan).await?;
+    let outcome = commit_create(meta, parent, name, inode_id, &plan).await?;
+    if outcome == CommitOutcome::Committed {
+        release(meta, &plan).await?;
+    }
+    Ok(outcome)
+}
+
+/// Write a brand-new object **placing its fragments across distinct failure
+/// domains** (Option B, proposal 0005 §"Failure-domain-aware placement"). Identical
+/// to [`write_new_object`] except the plan is run through the failure-domain
+/// selector against `topology` before the data phase, so the committed placement
+/// record reflects the **distinct-domain** choice (NOT the identity `index % n`
+/// vector) and the fan-out streams each fragment to its selected D server
+/// (`0005:510-513`). Errors with the selector's [`SelectorError`] (surfaced through
+/// the boxed `Result`) when the topology offers fewer than `n` distinct domains —
+/// the write fails closed rather than collide domains.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_new_object_placed(
+    meta: &impl MetadataStore,
+    chunks: &impl PlacementChunkStore,
+    parent: InodeId,
+    name: &str,
+    inode_id: InodeId,
+    data: &[u8],
+    chunk_size: usize,
+    scheme: EcScheme,
+    topology: &Topology,
+    now_millis: u64,
+    lease_ttl_millis: u64,
+    next_id: impl FnMut() -> ChunkId,
+) -> Result<CommitOutcome> {
+    let mut plan = plan_write(data, chunk_size, scheme, next_id)?;
+    plan.place(topology)?;
     intent(meta, &plan, now_millis + lease_ttl_millis).await?;
     write_fragments(chunks, &plan).await?;
     let outcome = commit_create(meta, parent, name, inode_id, &plan).await?;
