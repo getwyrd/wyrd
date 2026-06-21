@@ -117,6 +117,25 @@ jobs:
         run: cargo xtask bench
         continue-on-error: true
 
+  # Spell-check (typos) as its OWN always-on status check. Unlike the Rust gate,
+  # it carries no docs-skip: prose lives in docs/ and specs, so a docs-only PR is
+  # exactly when it matters most. Installed via the same prebuilt-binary action as
+  # cargo-deny (no new third-party action). Config + allowlist live in typos.toml.
+  # Always reports a `typos` status, so it can be a required check without ever
+  # wedging a docs-only PR.
+  typos:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install typos
+        uses: taiki-e/install-action@v2
+        with:
+          tool: typos-cli
+      - name: Spell-check (source + docs)
+        run: typos
+
   # Always-runs aggregation: this is the job to mark as a required status check.
   # It needs both `changes` and `rust` and runs unconditionally (`if: always()`),
   # so it reports a status even when `rust` was skipped on a docs-only change.
