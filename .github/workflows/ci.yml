@@ -89,7 +89,7 @@ jobs:
     env:
       CI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Installs the toolchain pinned by rust-toolchain.toml (with rustfmt and
       # clippy) on first use.
