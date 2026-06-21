@@ -1,0 +1,20 @@
+# typos (crate-ci/typos) — spell-check across source, comments, and docs.
+# Runs as an ALWAYS-ON CI job (no docs-skip) so prose in docs/ and specs is
+# covered too. Keep this allowlist tight: each entry is a deliberate exception,
+# the same "encode the decision" discipline as deny.toml.
+
+[default.extend-words]
+# The project name is Old English "wyrd" (fate) — not a misspelling of "weird".
+wyrd = "wyrd"
+# "OT" is Operational Transformation (used in "OT / CRDT" in the glossary), a
+# real acronym — not a typo for "TO"/"OF"/etc.
+ot = "ot"
+
+[files]
+# Don't spell-check generated or non-prose files. (typos already honors
+# .gitignore, so target/ and build/ are skipped; these are belt-and-suspenders
+# for checked-in artifacts.)
+extend-exclude = [
+    "Cargo.lock",
+    "*.svg",
+]

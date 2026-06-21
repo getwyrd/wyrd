@@ -22,7 +22,7 @@ use crate::conv;
 /// it translates wire ⇆ trait types and delegates; **integrity verification is
 /// the store's job** (the `ChunkStore` contract: implementations verify a
 /// fragment's self-describing checksums on put and get), so a corrupt or
-/// mis-filed fragment is rejected by `S` and surfaced here as an error status.
+/// misfiled fragment is rejected by `S` and surfaced here as an error status.
 pub struct ChunkStoreService<S> {
     inner: Arc<S>,
 }
