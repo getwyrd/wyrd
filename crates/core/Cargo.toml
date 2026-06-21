@@ -10,7 +10,6 @@ publish.workspace = true
 
 [dependencies]
 wyrd-traits.workspace = true
-wyrd-proto.workspace = true
 wyrd-chunk-format.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
