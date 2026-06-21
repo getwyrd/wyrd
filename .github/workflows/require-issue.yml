@@ -3,7 +3,9 @@ name: require-issue
 # Workflow governance: every pull request must reference a real issue, for
 # traceability. The PR title or body must mention an issue (e.g. "Closes #12",
 # "Refs #12", "#12", or an issue URL), and that number must resolve to an actual
-# issue -- not a pull request -- in this repository.
+# issue -- not a pull request -- in this repository. Dependabot dependency-bump
+# PRs are exempt (they reference no tracker item but are traceable via the
+# changelog / cargo-deny advisory wall, ADR-0003 §2): the check passes for them.
 #
 # No paths filter: the check always runs and reports a status, so it can serve
 # as a required status check. It re-runs when the PR is edited, so adding the
@@ -25,10 +27,20 @@ jobs:
       REPO: ${{ github.repository }}
       PR_TITLE: ${{ github.event.pull_request.title }}
       PR_BODY: ${{ github.event.pull_request.body }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
     steps:
       - name: Require a real linked issue
         run: |
           set -uo pipefail
+          # Dependabot opens dependency-bump PRs that reference no issue; they are
+          # traceable through the changelog / cargo-deny advisory wall (ADR-0003 §2),
+          # not a tracker item. Exempt them by PASSING — not skipping the job: a
+          # skipped required check stays "pending" and would wedge the merge (the same
+          # reason ci.yml uses an always-runs `gate` job rather than a paths filter).
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
+            echo "OK: dependency PR by $PR_AUTHOR — exempt from require-issue."
+            exit 0
+          fi
           text="$PR_TITLE
           $PR_BODY"
           # Collect candidate numbers from "#N" and ".../issues/N" forms.
