@@ -7,7 +7,8 @@ use bytes::Bytes;
 use tonic::{Request, Response, Status};
 use wyrd_proto::v0::chunk_store_server::ChunkStore as ChunkStoreRpc;
 use wyrd_proto::v0::{
-    FragmentGetRequest, FragmentGetResponse, FragmentPutRequest, FragmentPutResponse,
+    FragmentDeleteRequest, FragmentDeleteResponse, FragmentGetRequest, FragmentGetResponse,
+    FragmentListRequest, FragmentListResponse, FragmentPutRequest, FragmentPutResponse,
     HealthRequest, HealthResponse,
 };
 use wyrd_traits::ChunkStore;
@@ -75,6 +76,34 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
         Ok(Response::new(FragmentGetResponse {
             fragment: fragment.map(|bytes| bytes.to_vec()),
         }))
+    }
+
+    async fn list_fragments(
+        &self,
+        _request: Request<FragmentListRequest>,
+    ) -> std::result::Result<Response<FragmentListResponse>, Status> {
+        let ids = self
+            .inner
+            .list_fragments()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(FragmentListResponse {
+            ids: ids.into_iter().map(conv::to_wire_fragment_id).collect(),
+        }))
+    }
+
+    async fn delete_fragment(
+        &self,
+        request: Request<FragmentDeleteRequest>,
+    ) -> std::result::Result<Response<FragmentDeleteResponse>, Status> {
+        let request = request.into_inner();
+        let id = conv::from_wire_fragment_id(request.id)?;
+        // Idempotent at the store; a true I/O failure becomes an error status.
+        self.inner
+            .delete_fragment(id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(FragmentDeleteResponse {}))
     }
 
     async fn health(

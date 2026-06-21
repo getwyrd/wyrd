@@ -6,7 +6,10 @@ use bytes::Bytes;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use wyrd_proto::v0::chunk_store_client::ChunkStoreClient;
-use wyrd_proto::v0::{FragmentGetRequest, FragmentPutRequest, HealthRequest};
+use wyrd_proto::v0::{
+    FragmentDeleteRequest, FragmentGetRequest, FragmentListRequest, FragmentPutRequest,
+    HealthRequest,
+};
 use wyrd_traits::{ChunkStore, FragmentId, Health, Result};
 
 use crate::conv;
@@ -70,6 +73,32 @@ impl ChunkStore for GrpcChunkStore {
         // Absent bytes preserve the trait's `Ok(None)` not-found contract — a
         // miss is not a transport error.
         Ok(response.into_inner().fragment.map(Bytes::from))
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        let mut client = self.client.clone();
+        let response = client
+            .list_fragments(Request::new(FragmentListRequest {}))
+            .await
+            .map_err(TransportError::from)?;
+        response
+            .into_inner()
+            .ids
+            .into_iter()
+            .map(|wire| conv::from_wire_fragment_id(Some(wire)).map_err(Into::into))
+            .collect()
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        let mut client = self.client.clone();
+        let request = FragmentDeleteRequest {
+            id: Some(conv::to_wire_fragment_id(id)),
+        };
+        client
+            .delete_fragment(Request::new(request))
+            .await
+            .map_err(TransportError::from)?;
+        Ok(())
     }
 
     async fn health(&self) -> Result<Health> {

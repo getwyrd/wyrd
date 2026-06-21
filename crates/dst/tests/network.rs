@@ -133,6 +133,21 @@ impl ChunkStore for DStore {
         })
     }
 
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        Ok(self
+            .fragments
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|&(chunk, index)| FragmentId { chunk, index })
+            .collect())
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.fragments.lock().unwrap().remove(&(id.chunk, id.index));
+        Ok(())
+    }
+
     async fn health(&self) -> Result<Health> {
         Ok(Health::Healthy)
     }

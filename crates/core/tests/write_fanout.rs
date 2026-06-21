@@ -53,6 +53,15 @@ impl ChunkStore for FaultStore {
         Ok(None)
     }
 
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        Ok(self.stored.lock().unwrap().iter().copied().collect())
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.stored.lock().unwrap().remove(&id);
+        Ok(())
+    }
+
     async fn health(&self) -> Result<Health> {
         Ok(Health::Healthy)
     }
