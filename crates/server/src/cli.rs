@@ -18,11 +18,12 @@ use std::time::Duration;
 
 use pollster::block_on;
 use wyrd_chunkstore_fs::FsChunkStore;
+use wyrd_chunkstore_grpc::{FanoutChunkStore, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
-use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, WriteBatch};
+use wyrd_traits::{ChunkId, ChunkStore, CommitOutcome, MetadataStore, WriteBatch};
 
 use crate::dserver::{self, DServer};
 use crate::{Gateway, DEFAULT_DURABILITY};
@@ -78,10 +79,15 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 
 fn usage() {
     eprintln!("usage:");
-    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none]");
-    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR]");
+    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…]");
+    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…]");
     eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N]");
     eprintln!("  wyrd demo");
+    eprintln!();
+    eprintln!("  --endpoints drives a local distributed cluster: fragments fan out over gRPC");
+    eprintln!(
+        "  to the listed D servers (metadata held locally). See README \"Run a local cluster\"."
+    );
 }
 
 /// Parse a `--durability` value: `rs(k,m)` (Reed-Solomon) or `none`/`replication(1)`.
@@ -138,6 +144,14 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
 
     let data =
         std::fs::read(file).map_err(|e| format!("put: cannot read input file `{file}`: {e}"))?;
+
+    // Cluster client mode: fan the object's fragments out over gRPC to the
+    // configured D servers, holding metadata locally under `data_dir`.
+    if let Some(raw) = parsed.flag("endpoints") {
+        let endpoints = parse_endpoints(raw)?;
+        return cluster_put(data_dir, &endpoints, key, &data, chunk_size, durability);
+    }
+
     let (meta, chunks) = open_backends(data_dir)?;
 
     block_on(async {
@@ -184,6 +198,13 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
         .ok_or("get: a <key> argument is required")?;
     let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
     let out = parsed.flag("out");
+
+    // Cluster client mode: reconstruct the object from fragments read back over
+    // gRPC from the configured D servers (any-k arrive-first).
+    if let Some(raw) = parsed.flag("endpoints") {
+        let endpoints = parse_endpoints(raw)?;
+        return cluster_get(data_dir, &endpoints, key, out);
+    }
 
     let (meta, chunks) = open_backends(data_dir)?;
 
@@ -345,6 +366,193 @@ fn chunk_id_minter(inode_id: u64) -> impl FnMut() -> ChunkId {
         seq += 1;
         id
     }
+}
+
+// --- Static-endpoints gateway client mode (M2.8, issue #155, proposal 0004) ---
+//
+// The user-facing way to drive a local distributed cluster: `wyrd put`/`get
+// --endpoints <list>` fans each object's erasure-coded fragments out over gRPC to
+// a *configured* list of networked D servers (no discovery backend — etcd /
+// dynamic discovery is M3, ADR-0006), holding the metadata and the persisted
+// inode allocator locally under `--data-dir`.
+//
+// It deliberately reuses the SAME id machinery as the local-disk path
+// (`alloc_inode` + `chunk_id_minter`, above): the inode comes from the persisted
+// `meta:next_inode` counter and the chunk ids are derived from it. That is what
+// lets several distinct objects PUT across *separate* invocations over one
+// `--data-dir` each get a distinct, persisted inode and non-colliding chunk ids —
+// an in-process counter (reset every process) would re-allocate inode 1 on the
+// second PUT (a bogus "concurrent writer won" conflict) and reuse chunk id 1,
+// clobbering the first object's fragments on the shared chunk store.
+
+/// The chunk plane of the static-endpoints gateway client mode: the M2 fan-out
+/// placement store ([`FanoutChunkStore`]) over one gRPC [`GrpcChunkStore`] client
+/// per configured D-server endpoint. Fragment index `i` lands on D server `i % n`
+/// (`fanout.rs`), so a chunk's fragments prefer distinct, real, networked D
+/// servers.
+pub type GrpcFanout = FanoutChunkStore<GrpcChunkStore>;
+
+/// Split a comma-separated `--endpoints` value (e.g.
+/// `http://127.0.0.1:50051,http://127.0.0.1:50052`) into dialable endpoint
+/// strings, rejecting an empty list — a fan-out with no backend can place no
+/// fragment.
+pub fn parse_endpoints(raw: &str) -> Result<Vec<String>, BoxError> {
+    let endpoints: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if endpoints.is_empty() {
+        return Err(
+            "--endpoints needs at least one D-server URL (e.g. http://127.0.0.1:50051)".into(),
+        );
+    }
+    Ok(endpoints)
+}
+
+/// Dial each endpoint as a gRPC `ChunkStore` client and compose them into the M2
+/// fan-out placement store. Connecting up front surfaces an unreachable D server
+/// as a clear startup error rather than a mid-write failure.
+pub async fn connect_fanout(endpoints: &[String]) -> Result<GrpcFanout, BoxError> {
+    if endpoints.is_empty() {
+        return Err("connect_fanout: at least one endpoint is required".into());
+    }
+    let mut clients = Vec::with_capacity(endpoints.len());
+    for endpoint in endpoints {
+        let client = GrpcChunkStore::connect(endpoint.clone())
+            .await
+            .map_err(|e| format!("gateway: cannot connect to D server `{endpoint}`: {e}"))?;
+        clients.push(client);
+    }
+    Ok(FanoutChunkStore::new(clients))
+}
+
+/// Open the local metadata store (redb) under `data_dir` for the gateway client
+/// mode, creating the dir if needed. Unlike [`open_backends`], the cluster path
+/// holds **no** local chunk store — every fragment crosses the wire to a
+/// configured D server — but it keeps the metadata store and its persisted inode
+/// allocator (`meta:next_inode`) locally, exactly as the local-disk path does.
+pub fn open_cluster_meta(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
+    let dir = Path::new(data_dir);
+    std::fs::create_dir_all(dir)?;
+    let meta = RedbMetadataStore::open(dir.join("meta.redb"))?;
+    Ok(meta)
+}
+
+/// Store an object through the gateway client mode over `chunks`, allocating the
+/// inode from the persisted `meta:next_inode` counter and deriving chunk ids from
+/// it — exactly the local-disk path's [`write::write_new_object`] composition,
+/// with the on-disk chunk store swapped for the gRPC fan-out. Persisting the ids
+/// is what makes storing several distinct objects across separate invocations
+/// (fresh process / new composition over the same `data_dir`) work.
+pub async fn cluster_store_put<C: ChunkStore>(
+    meta: &RedbMetadataStore,
+    chunks: &C,
+    key: &str,
+    data: &[u8],
+    chunk_size: usize,
+    durability: EcScheme,
+) -> Result<CommitOutcome, BoxError> {
+    let inode_id = alloc_inode(meta).await?;
+    let next_id = chunk_id_minter(inode_id);
+    let outcome = write::write_new_object(
+        meta,
+        chunks,
+        ROOT,
+        key,
+        inode_id,
+        data,
+        chunk_size,
+        durability,
+        NOW_MILLIS,
+        LEASE_TTL_MILLIS,
+        next_id,
+    )
+    .await?;
+    Ok(outcome)
+}
+
+/// Read an object back through the gateway client mode, reconstructing it from
+/// fragments read over `chunks` — the same [`read::read_path`] the local-disk
+/// path uses, over the gRPC fan-out.
+pub async fn cluster_store_get<C: ChunkStore>(
+    meta: &RedbMetadataStore,
+    chunks: &C,
+    key: &str,
+) -> Result<Option<Vec<u8>>, BoxError> {
+    read::read_path(meta, chunks, ROOT, key).await
+}
+
+/// Build the multi-threaded tokio runtime the cluster client mode needs: the gRPC
+/// clients are async (tonic), unlike the sync local-disk paths (pollster).
+fn cluster_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?)
+}
+
+/// `wyrd put … --endpoints <list>`: store the object through the static-endpoints
+/// gateway client mode — fragments fan out over gRPC to the configured D servers,
+/// metadata (and the persisted inode allocator) held locally under `data_dir`.
+fn cluster_put(
+    data_dir: &str,
+    endpoints: &[String],
+    key: &str,
+    data: &[u8],
+    chunk_size: usize,
+    durability: EcScheme,
+) -> Result<ExitCode, BoxError> {
+    let runtime = cluster_runtime()?;
+    runtime.block_on(async {
+        let meta = open_cluster_meta(data_dir)?;
+        let fanout = connect_fanout(endpoints).await?;
+        match cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await? {
+            CommitOutcome::Committed => {
+                let chunks = data.len().div_ceil(chunk_size.max(1));
+                println!(
+                    "put ok (cluster): key={key} servers={} chunks={chunks} bytes={} durability={}",
+                    endpoints.len(),
+                    data.len(),
+                    durability_label(durability),
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+            CommitOutcome::Conflict => {
+                eprintln!("wyrd: key `{key}` already exists");
+                Ok(ExitCode::FAILURE)
+            }
+        }
+    })
+}
+
+/// `wyrd get … --endpoints <list>`: read the object back through the
+/// static-endpoints gateway client mode, reconstructing it from fragments read
+/// over gRPC from the configured D servers.
+fn cluster_get(
+    data_dir: &str,
+    endpoints: &[String],
+    key: &str,
+    out: Option<&str>,
+) -> Result<ExitCode, BoxError> {
+    let runtime = cluster_runtime()?;
+    runtime.block_on(async {
+        let meta = open_cluster_meta(data_dir)?;
+        let fanout = connect_fanout(endpoints).await?;
+        match cluster_store_get(&meta, &fanout, key).await? {
+            Some(bytes) => {
+                match out {
+                    Some(path) => std::fs::write(path, &bytes)
+                        .map_err(|e| format!("get: cannot write output file `{path}`: {e}"))?,
+                    None => std::io::stdout().write_all(&bytes)?,
+                }
+                Ok(ExitCode::SUCCESS)
+            }
+            None => {
+                eprintln!("wyrd: key `{key}` not found");
+                Ok(ExitCode::FAILURE)
+            }
+        }
+    })
 }
 
 /// Positional arguments plus `--flag value` pairs.

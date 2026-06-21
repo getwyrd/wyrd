@@ -112,6 +112,71 @@ A self-contained S3 PUT/GET round-trip — no cluster, no setup:
 cargo run -p wyrd-server --bin wyrd -- demo
 ```
 
+## Run a local cluster
+
+You can stand up a small **distributed** Wyrd cluster on one machine and drive it
+with the `wyrd` gateway client mode — several networked D servers in containers,
+with the binary fanning each object's erasure-coded fragments across them over
+gRPC. This is the milestone-2 networked path exercised end to end by hand; it is
+not yet a production deployment (no durability or stability promise).
+
+Bring up four D servers on fixed ports, each with its own persistent volume:
+
+```sh
+docker compose up --build -d        # uses ./docker-compose.yml
+```
+
+Four, not three: the default durability is `rs(6,3)` — 9 fragments per chunk,
+any **k = 6** of which reconstruct the data. Three servers hold 3 fragments each,
+so losing one drops to exactly 6 (no headroom); a fourth server keeps a
+single-server loss above k. The loopback round-trip test uses the same four.
+
+Point the gateway at the cluster's published endpoints. `--endpoints` switches
+`put`/`get` from the local-disk path to the **static-endpoints gateway client
+mode**: fragments fan out over gRPC to the listed D servers, while the object
+metadata (and the persisted inode allocator) is held locally under `--data-dir`.
+
+```sh
+ENDPOINTS=http://127.0.0.1:50051,http://127.0.0.1:50052,http://127.0.0.1:50053,http://127.0.0.1:50054
+
+# PUT: erasure-code each object and fan its fragments across the D servers.
+cargo run --bin wyrd -- put ./somefile --key obj/one \
+  --endpoints "$ENDPOINTS" --data-dir ./cluster-meta
+cargo run --bin wyrd -- put ./otherfile --key obj/two \
+  --endpoints "$ENDPOINTS" --data-dir ./cluster-meta
+
+# GET: reconstruct them from fragments read back over gRPC, byte-identical.
+cargo run --bin wyrd -- get obj/one --out ./out-one.bin \
+  --endpoints "$ENDPOINTS" --data-dir ./cluster-meta
+cargo run --bin wyrd -- get obj/two --out ./out-two.bin \
+  --endpoints "$ENDPOINTS" --data-dir ./cluster-meta
+
+diff ./somefile ./out-one.bin && diff ./otherfile ./out-two.bin && echo "round-trip ok"
+```
+
+The two `put`s above share one `--data-dir`: each gets its own inode from the
+persisted allocator there, so storing several distinct objects across separate
+`wyrd` invocations works (the metadata, not the D servers, tracks which object
+owns which fragments).
+
+Tear the cluster down (and drop its volumes) when finished:
+
+```sh
+docker compose down -v
+```
+
+Notes and current limits:
+
+- The endpoint list is **static** — the gateway dials exactly the D servers you
+  name. Dynamic discovery (etcd or a non-static coordination backend), stable
+  placement records, and rebalance are milestone-3 work (ADR-0006).
+- Metadata is held locally under `--data-dir`, so the `put` and `get` above must
+  share it. This is a single-gateway shape; a shared-metadata gateway daemon is a
+  later topology choice.
+- The CI integration fixture (`crates/chunkstore-grpc/tests/docker-compose.yml`,
+  driven by `cargo xtask integration`) is separate — it uses ephemeral ports and
+  is not meant to be driven by hand.
+
 ## Security
 
 Wyrd is pre-release software and carries no security promise yet, but we still
