@@ -98,6 +98,8 @@ A real environment is therefore never used to test correctness the simulation al
 
 The tiers escalate in realism and cost. Each catches what the one below cannot; none replaces DST as the correctness authority. They attach to the implementation arc (proposal 0002) at the milestone where they first add value, so test investment stays matched to the milestone that needs it.
 
+> **Tier numbering — two distinct schemes.** These Tier 0–3 labels are this strategy's *realism-and-cost* ladder. They are **not** the same as the "Tier-1"/"Tier-2" labels in the code and CI (proposal 0004's test taxonomy, e.g. `cargo xtask integration`): proposal 0004's "Tier-1" is the in-process DST/wire suite and its "Tier-2" is the container integration test — both of which run *within* this strategy's Tier 0–1, not on the Tier 2 single real machine below. Read a bare "Tier 2" by its source: this section's silicon tier, or the code's container suite.
+
 #### Tier 0 — Deterministic simulation (from M0, always)
 
 `testkit` and the commit-protocol property tests (ADR-0009). The correctness authority. Runs in CI from the first milestone and grows with every subsequent one. Everything below is complementary to this, never a substitute.

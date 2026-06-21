@@ -4,5 +4,4 @@
 # (they carry the host's libc and would bloat the context by gigabytes).
 target/
 .git/
-results/
 **/*.swp
