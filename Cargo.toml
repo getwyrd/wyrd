@@ -47,7 +47,7 @@ bytes = "1"
 # EC micro-benchmarks (M1.7). Lean: no plotters/rayon HTML stack — the console
 # numbers are what CI tracks, and fewer transitive deps keeps the license
 # surface small (ADR-0003).
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 crc32c = "0.6"
 # Runtime-agnostic future combinators (try_join_all) for the parallel write
 # fan-out / any-k read (M2.4/M2.5). `alloc`-only: single-task concurrency that
