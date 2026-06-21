@@ -106,18 +106,41 @@ fn run_integration() -> Result<(), String> {
         .filter(|&n| n >= 2)
         .unwrap_or(DSERVER_COUNT);
 
-    // Bring the cluster up (building the image if needed), run the test, and tear
-    // down unconditionally so a failed run never leaks containers.
+    // Bring the cluster up (building the image if needed), run the test, then
+    // finalize: on failure capture container diagnostics BEFORE teardown, and
+    // tear down unconditionally so a run never leaks containers (#150).
     compose_up(&compose, count)?;
     let result = (|| {
         let endpoints = resolve_endpoints(&compose, count)?;
         println!("\nxtask integration: {count} D servers at {endpoints}");
         run_integration_test(&endpoints)
     })();
-    compose_down(&compose);
-    result?;
+    finish_integration(result, || compose_logs(&compose), || compose_down(&compose))?;
     println!("\nxtask integration: Tier-2 container integration passed");
     Ok(())
+}
+
+/// Finalize an integration run. On **failure**, capture container diagnostics
+/// (`capture_logs`) **before** `teardown` destroys the cluster — the operability
+/// invariant (#150): teardown must never precede log capture, or a failed
+/// nightly run preserves nothing to diagnose it. `teardown` always runs
+/// (best-effort) so a run never leaks containers, and `result` is propagated
+/// unchanged. Generic over the two actions so the ordering is unit-testable
+/// without a container runtime.
+fn finish_integration<C, D>(
+    result: Result<(), String>,
+    capture_logs: C,
+    teardown: D,
+) -> Result<(), String>
+where
+    C: FnOnce(),
+    D: FnOnce(),
+{
+    if result.is_err() {
+        capture_logs();
+    }
+    teardown();
+    result
 }
 
 /// Is a working Docker daemon reachable?
@@ -148,6 +171,56 @@ fn compose_up(compose: &str, count: usize) -> Result<(), String> {
 /// `docker compose ... down -v --remove-orphans` (best-effort teardown).
 fn compose_down(compose: &str) {
     let _ = docker_compose(compose, &["down", "-v", "--remove-orphans"]);
+}
+
+/// Capture `docker compose ... logs` before teardown (best-effort diagnostics,
+/// #150). Echoes the logs to the job log for at-a-glance triage and persists a
+/// copy under `target/tier2-logs/` for the workflow's `if: failure()` artifact
+/// upload — so a failed nightly run's container diagnostics survive
+/// `compose_down`. A capture failure only warns; it never masks the test result.
+fn compose_logs(compose: &str) {
+    let args = [
+        "compose",
+        "-p",
+        TIER2_PROJECT,
+        "-f",
+        compose,
+        "logs",
+        "--no-color",
+        "--timestamps",
+    ];
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&args);
+    print_step(&display);
+
+    let out = match Command::new("docker")
+        .args(args)
+        .current_dir(workspace_root())
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("warning: failed to capture container logs: {e}");
+            return;
+        }
+    };
+
+    // Echo to the job log...
+    print!("{}", String::from_utf8_lossy(&out.stdout));
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+
+    // ...and persist a copy for the workflow's `if: failure()` artifact upload.
+    let dir = workspace_root().join("target").join("tier2-logs");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("warning: could not create {}: {e}", dir.display());
+        return;
+    }
+    let path = dir.join("docker-compose.log");
+    let mut captured = out.stdout;
+    captured.extend_from_slice(&out.stderr);
+    if let Err(e) = std::fs::write(&path, &captured) {
+        eprintln!("warning: could not write {}: {e}", path.display());
+    }
 }
 
 /// Resolve each replica's published host port into a comma-separated endpoint
@@ -418,4 +491,50 @@ pub(crate) fn workspace_root() -> PathBuf {
         .parent()
         .expect("xtask crate is nested under the workspace root")
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    // The operability invariant (#150): on a FAILED integration run, container
+    // diagnostics must be captured BEFORE the cluster is torn down — teardown
+    // never precedes log capture, or a failed nightly run preserves nothing to
+    // diagnose it. Drives `finish_integration` with order-recording closures so
+    // the ordering is asserted without a container runtime.
+    #[test]
+    fn failure_captures_logs_before_teardown() {
+        let order: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let result = finish_integration(
+            Err("Tier-2 integration test failed".to_string()),
+            || order.borrow_mut().push("capture_logs"),
+            || order.borrow_mut().push("teardown"),
+        );
+        assert!(result.is_err(), "the failure must be propagated unchanged");
+        assert_eq!(
+            *order.borrow(),
+            vec!["capture_logs", "teardown"],
+            "diagnostics must be captured before teardown destroys them",
+        );
+    }
+
+    // A passing run needs no diagnostics: only teardown runs, and Ok is
+    // propagated. (Guards against a fix that always captures, which would noise
+    // up every green nightly run.)
+    #[test]
+    fn success_tears_down_without_capturing_logs() {
+        let order: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let result = finish_integration(
+            Ok(()),
+            || order.borrow_mut().push("capture_logs"),
+            || order.borrow_mut().push("teardown"),
+        );
+        assert!(result.is_ok(), "a passing run must stay Ok");
+        assert_eq!(
+            *order.borrow(),
+            vec!["teardown"],
+            "a passing run captures no logs; only teardown runs",
+        );
+    }
 }
