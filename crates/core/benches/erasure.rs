@@ -14,9 +14,10 @@
 //! Run via `cargo xtask bench`. CI tracks the numbers (regression visibility),
 //! it does not gate on them — wall-clock is noisy (issue #99).
 
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use wyrd_core::erasure;
 
 /// (k, m) schemes under test — the architecture's running example plus a narrower
