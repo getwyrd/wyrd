@@ -14,3 +14,8 @@ crc32c.workspace = true
 [dev-dependencies]
 # Seeded round-trip property tests reuse the deterministic simulator (ADR-0009).
 wyrd-testkit.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

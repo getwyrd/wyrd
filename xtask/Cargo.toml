@@ -12,3 +12,8 @@ publish.workspace = true
 wyrd-chunk-format.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

@@ -11,3 +11,8 @@ publish.workspace = true
 [dependencies]
 rand.workspace = true
 rand_chacha.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

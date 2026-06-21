@@ -102,3 +102,43 @@ tonic = "0.14"
 # service stubs reference `tonic_prost::ProstCodec`.
 tonic-prost = "0.14"
 tonic-prost-build = "0.14"
+
+# Lint policy — the SINGLE SOURCE OF TRUTH for the lint gate (ADR-0016: the rule
+# lives in one place, not duplicated across CI YAML and a clippy CLI flag). Each
+# crate opts in with `[lints]\nworkspace = true`; `cargo build`, `cargo clippy`,
+# and a contributor's editor (rust-analyzer) all read the same levels from here.
+# This replaces the old `cargo clippy -- -D warnings` flag in xtask.
+[workspace.lints.rust]
+# Warnings are errors — faithful migration of the old `-D warnings` behavior.
+# NOTE: this is stricter than the old clippy-only `-D warnings` flag: it now
+# applies to every compile, including the `--cfg madsim` DST build (ADR-0009).
+# `madsim` is set via RUSTFLAGS, not a Cargo feature, so it must be declared as a
+# known cfg below — otherwise `unexpected_cfgs` fires (now as an error) on the
+# `#[cfg(madsim)]` gates in the DST tier.
+warnings = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(madsim)'] }
+
+[workspace.lints.clippy]
+# The default clippy gate (correctness, suspicious, style, complexity, perf).
+# Equivalent to what `-D warnings` enforced for clippy lints — the codebase
+# already passes this, so it is a codification, not a tightening.
+all = "deny"
+
+# --- Correctness ratchet (intentionally NOT enabled yet) ---------------------
+# These restriction lints are high-value for infrastructure code — they flag
+# panics and silent integer overflow in shipping paths, where a wrong offset is
+# a data-corruption bug. They are left commented because they also fire in test
+# code (which `unwrap`s freely) and would turn the gate red until a cleanup pass.
+# Promote them to "deny" CRATE-BY-CRATE (move this block into a specific crate's
+# `[lints.clippy]`, with `#![cfg_attr(test, allow(...))]` for its test modules)
+# as each crate is hardened — that ratchet is itself a good DST-backed task.
+#
+# unwrap_used            = "deny"   # no silent `.unwrap()` in shipping code
+# expect_used            = "deny"
+# indexing_slicing       = "deny"   # `a[i]` can panic — prefer `.get(i)`
+# arithmetic_side_effects = "deny"  # catch integer overflow on the format/EC paths
+# panic                  = "deny"
+
+[workspace.lints.rustdoc]
+# Keep the API docs (and the architecture doc's code links) honest.
+broken_intra_doc_links = "deny"

@@ -43,3 +43,8 @@ wyrd-core.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tempfile.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true
