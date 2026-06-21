@@ -5,29 +5,26 @@ name: ci
 # run identically on a laptop and here. CI logic lives in Rust (xtask), not
 # YAML (ADR-0016).
 #
-# Docs-only changes skip this gate (paths-ignore below): nothing under docs/ or
-# any Markdown/legal file can affect the Rust build. This is safe because the
-# Rust gate is NOT a required status check, so a skipped run never leaves a
-# docs-only PR stuck "pending" — unlike the required checks (require-issue,
-# docs-check, adr-immutability), which deliberately carry no paths filter so
-# they always report. DCO sign-off must cover every commit (docs included), so
-# it lives in its own always-on workflow (dco.yml), unaffected by this filter.
+# Docs-only changes skip the heavy `rust` job (issue #125): nothing under docs/
+# or any Markdown/legal file can affect the Rust build. Previously that skip was
+# a workflow-level `paths-ignore`, which meant the WHOLE workflow was skipped on
+# docs-only PRs — and a skipped workflow's checks stay "pending", so the gate
+# could never be a required status check without wedging docs-only PRs.
+#
+# Instead the workflow now always runs; a cheap `changes` job decides whether any
+# non-docs (code) file changed, and `rust` is skipped (not the workflow) when it
+# did not. The always-runs `gate` job aggregates the result: it reports success
+# when `rust` passed OR was skipped (docs-only), failure otherwise. `gate` carries
+# no paths filter and therefore always reports, so it is the job to add to the
+# branch-protection required-checks set (the admin flip itself is done by a
+# maintainer). DCO sign-off must cover every commit (docs included), so it lives
+# in its own always-on workflow (dco.yml), unaffected by this skip.
 
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - 'NOTICE'
   pull_request:
     types: [opened, reopened, synchronize]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
-      - 'LICENSE'
-      - 'NOTICE'
 
 permissions:
   contents: read
@@ -37,7 +34,57 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Decide whether the change touches anything outside the docs/legal set. Mirrors
+  # the #125 docs paths (docs/**, **/*.md, LICENSE, NOTICE) but at the JOB level so
+  # the workflow itself always runs and the `gate` job can always report. Uses the
+  # same `gh api` idiom as dco.yml / require-issue.yml — no extra action dependency.
+  # Fails safe: if the changed-file list can't be determined, treat the change as
+  # code so the Rust gate runs rather than being silently skipped.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      BEFORE: ${{ github.event.before }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: Determine whether any non-docs (code) file changed
+        id: filter
+        run: |
+          set -uo pipefail
+          if [ -n "$PR" ]; then
+            files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
+          else
+            files=$(gh api "repos/$REPO/compare/$BEFORE...$SHA" --jq '.files[].filename' 2>/dev/null) || files=""
+          fi
+          if [ -z "$files" ]; then
+            echo "could not determine changed files; running the Rust gate (fail-safe)"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              docs/*)        continue ;;  # docs/**
+              *.md)          continue ;;  # **/*.md
+              LICENSE|NOTICE) continue ;;
+            esac
+            code=true
+            break
+          done <<< "$files"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "code-affecting change: $code"
+
   rust:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     env:
       CI: "true"
@@ -69,3 +116,30 @@ jobs:
       - name: cargo xtask bench (tracked, non-gating)
         run: cargo xtask bench
         continue-on-error: true
+
+  # Always-runs aggregation: this is the job to mark as a required status check.
+  # It needs both `changes` and `rust` and runs unconditionally (`if: always()`),
+  # so it reports a status even when `rust` was skipped on a docs-only change.
+  # Success iff the change was classified (changes succeeded) AND the Rust gate
+  # either passed or was skipped (docs-only); failure otherwise.
+  gate:
+    needs: [changes, rust]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify the Rust gate passed or was correctly skipped
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          RUST: ${{ needs.rust.result }}
+        run: |
+          set -u
+          if [ "$CHANGES" != "success" ]; then
+            echo "::error::change classification failed (changes result=$CHANGES)"
+            exit 1
+          fi
+          if [ "$RUST" = "success" ] || [ "$RUST" = "skipped" ]; then
+            echo "OK: Rust gate result=$RUST (success = passed or docs-only skip)"
+            exit 0
+          fi
+          echo "::error::the Rust gate did not pass (rust result=$RUST)"
+          exit 1

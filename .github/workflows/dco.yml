@@ -5,6 +5,13 @@ name: dco
 # including docs-only ones that the Rust gate skips — DCO applies to all
 # contributions, so this workflow carries no paths filter. Same gh-api idiom as
 # require-issue.yml; re-runs on each push so adding the sign-off clears the check.
+#
+# This is a designated REQUIRED status check: because it carries no paths filter
+# it always reports a `dco` status on every PR, so it can gate merges without ever
+# leaving a docs-only PR stuck "pending". ADR-0003 §1 says DCO must cover every
+# commit, so the `dco` context belongs in the branch-protection required-checks
+# set alongside the ci `gate` job; flipping that protection on is a maintainer
+# admin action, not an in-repo change.
 
 on:
   pull_request:
