@@ -400,6 +400,7 @@ fn run_ci() -> Result<(), String> {
         "--all-targets",
     ])?;
     cargo(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
+    cargo_machete_check()?;
     cargo_deny_check()?;
     run_conformance()?;
     run_dst()?;
@@ -512,6 +513,47 @@ fn cargo_deny_check() -> Result<(), String> {
             );
             Ok(())
         }
+    }
+}
+
+/// Run `cargo machete` — flag dependencies declared in a `Cargo.toml` but never
+/// referenced in source (ADR-0003 §2: keep the dependency/license surface small).
+/// Mirrors `cargo_deny_check`: skip with a warning if cargo-machete is not
+/// installed locally; in CI a missing binary is a hard failure so the check is
+/// always enforced. A false positive (a dep used only behind a `cfg`) is silenced
+/// per-crate with `[package.metadata.cargo-machete] ignored = ["crate-name"]`.
+fn cargo_machete_check() -> Result<(), String> {
+    // Probe the subcommand binary directly so "not installed" is cleanly
+    // distinguishable from "found unused deps" (a non-zero exit of the real run).
+    if Command::new("cargo-machete")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        if is_ci() {
+            return Err("cargo-machete is not installed but is required in CI".to_string());
+        }
+        eprintln!(
+            "warning: cargo-machete not installed; skipping the unused-dependency \
+             check locally. Install it with `cargo install cargo-machete --locked`."
+        );
+        return Ok(());
+    }
+    // Invoke the binary DIRECTLY (`cargo-machete`), not `cargo machete`: some
+    // cargo-machete builds don't strip the "machete" arg that the cargo
+    // subcommand shim forwards, and then treat it as a path to scan ("No such
+    // file or directory: machete"). With no args it scans the current dir.
+    print_step(&["cargo-machete"]);
+    let status = Command::new("cargo-machete")
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn cargo-machete: {e}"))?;
+    match status.success() {
+        true => Ok(()),
+        false => Err(format!(
+            "`cargo-machete` found unused dependencies (exit {status}). Remove them, \
+             or mark intentional ones with `[package.metadata.cargo-machete] ignored`."
+        )),
     }
 }
 

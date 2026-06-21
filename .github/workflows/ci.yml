@@ -99,12 +99,13 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # Prebuilt binary, so the license/advisory wall costs seconds, not a
-      # from-source compile.
-      - name: Install cargo-deny
+      # Prebuilt binaries, so the license/advisory wall and the unused-dependency
+      # check cost seconds, not a from-source compile. `cargo xtask ci` shells out
+      # to both (hard-failing in CI if either is missing — see xtask).
+      - name: Install cargo-deny + cargo-machete
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny
+          tool: cargo-deny,cargo-machete
 
       - name: cargo xtask ci
         run: cargo xtask ci
