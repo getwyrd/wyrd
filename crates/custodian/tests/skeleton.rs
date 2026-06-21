@@ -35,9 +35,10 @@ async fn elected_leader_is_fenced_and_deposed_leader_rejected() {
     let mut zone = FencedZone::new();
     zone.install(leader.leadership());
 
-    // The active leader's reconciliation step is admitted.
+    // The active leader's reconciliation step is admitted (the bare fence path: no
+    // maintenance inputs wired, so the control point reports a satisfied zone).
     assert_eq!(
-        reconcile_step(&zone, &leader).unwrap(),
+        reconcile_step(&zone, &leader, None, 0).await.unwrap(),
         Reconciled::Satisfied,
         "the active leader acts"
     );
@@ -52,10 +53,10 @@ async fn elected_leader_is_fenced_and_deposed_leader_rejected() {
 
     // The new leader acts; the DEPOSED leader is now fenced out.
     assert_eq!(
-        reconcile_step(&zone, &usurper).unwrap(),
+        reconcile_step(&zone, &usurper, None, 0).await.unwrap(),
         Reconciled::Satisfied
     );
-    let rejected = reconcile_step(&zone, &leader);
+    let rejected = reconcile_step(&zone, &leader, None, 0).await;
     assert!(
         rejected.is_err(),
         "a deposed leader's coordination action must be rejected by its stale fencing token"

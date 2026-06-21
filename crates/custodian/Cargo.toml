@@ -33,6 +33,10 @@ prometheus.workspace = true
 wyrd-coordination-mem.workspace = true
 wyrd-testkit.workspace = true
 tokio.workspace = true
+# In-memory trait stores for the GC loop's in-process test (the loop is proven over
+# the `MetadataStore`/`ChunkStore` seams, backend-agnostic).
+async-trait.workspace = true
+bytes.workspace = true
 
 # Inherit the workspace lint policy (single source of truth).
 [lints]
