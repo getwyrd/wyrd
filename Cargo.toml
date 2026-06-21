@@ -71,7 +71,7 @@ pollster = "0.4"
 prost = "0.14"
 protox = "0.9"
 rand = "0.8"
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 redb = "2"
 reed-solomon-simd = "3"
 serde = { version = "1", features = ["derive"] }
