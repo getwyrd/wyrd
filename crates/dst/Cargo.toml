@@ -34,3 +34,8 @@ rand_chacha.workspace = true
 # simulated network (proposal 0004 Tier-1; ADR-0009).
 [target.'cfg(madsim)'.dev-dependencies]
 tonic = { package = "madsim-tonic", version = "0.6.0", default-features = false }
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

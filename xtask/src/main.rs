@@ -2,8 +2,10 @@
 //! laptop and in CI (ADR-0016, ADR-0009).
 //!
 //! Subcommands:
-//! - `ci` — fmt, clippy (`-D warnings`), build, test, cargo-deny, conformance,
-//!   and the madsim DST tier; the single gate CI calls.
+//! - `ci` — fmt, clippy, build, test, cargo-machete, cargo-deny, conformance,
+//!   and the madsim DST tier; the single gate CI calls. The clippy/warnings
+//!   levels come from `[workspace.lints]` in the root Cargo.toml (single source
+//!   of truth), so no `-D warnings` flag is passed here.
 //! - `conformance` — run the `chunk-format` reader against the committed
 //!   conformance vectors.
 //! - `dst` — run the madsim commit-protocol tests (`wyrd-dst`) under
@@ -381,15 +383,14 @@ fn run_ci() -> Result<(), String> {
     // `wyrd-dst` only compiles under `--cfg madsim`; it is excluded from the
     // normal workspace commands and built solely by `run_dst` below.
     cargo(&["fmt", "--all", "--", "--check"])?;
+    // Lint levels (incl. warnings-as-errors) come from `[workspace.lints]` in
+    // the root Cargo.toml — the single source of truth — not a CLI flag here.
     cargo(&[
         "clippy",
         "--workspace",
         "--exclude",
         "wyrd-dst",
         "--all-targets",
-        "--",
-        "-D",
-        "warnings",
     ])?;
     cargo(&[
         "build",

@@ -21,3 +21,8 @@ bytes.workspace = true
 # The conformance suite is written against the trait surface and driven by
 # pollster (the in-memory methods never yield).
 pollster.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true
