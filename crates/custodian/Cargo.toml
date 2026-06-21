@@ -1,0 +1,39 @@
+[package]
+name = "wyrd-custodian"
+description = "The single-active, fenced maintenance plane (L4): leader-elected custodian, failure-domain-aware placement, and the backend-agnostic durability-telemetry seam (M3, proposal 0005)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The pluggability seams only — never a concrete backend (ADR-0010, 0005:421-422).
+# `proto` (the maintenance-RPC seam) is added by the loop slices (4–7) that walk
+# stores over `list_fragments`/`delete_fragment`; the M3.3 skeleton wires only the
+# leadership fence, the selector (in `core`), and the telemetry seam.
+wyrd-traits.workspace = true
+wyrd-core.workspace = true
+# Telemetry from the custodian's first commit (ADR-0011), backend-agnostic OTel
+# (ADR-0012): `tracing` emission bridged to OpenTelemetry, dual-exported over a
+# Prometheus registry AND OTLP push, no backend hardcoded.
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-prometheus.workspace = true
+opentelemetry-otlp.workspace = true
+prometheus.workspace = true
+
+[dev-dependencies]
+# In-memory coordination concrete to exercise leader election + fencing in-process
+# (a test/dev composition may name a concrete — ADR-0010).
+wyrd-coordination-mem.workspace = true
+wyrd-testkit.workspace = true
+tokio.workspace = true
+
+# Inherit the workspace lint policy (single source of truth).
+[lints]
+workspace = true

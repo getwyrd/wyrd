@@ -27,6 +27,10 @@ wyrd-chunkstore-grpc.workspace = true
 wyrd-coordination-mem.workspace = true
 bytes.workspace = true
 pollster.workspace = true
+# The D-server registration record (`{ id, endpoint, failure-domain label }`,
+# proposal 0005 "The placement record") is serialized into the coordination value.
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 # The transport that hosts the gRPC ChunkStore service for the `d-server` role.
