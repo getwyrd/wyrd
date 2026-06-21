@@ -100,24 +100,81 @@ fn run_integration() -> Result<(), String> {
         return Ok(());
     }
 
-    let count = std::env::var("WYRD_DSERVER_COUNT")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 2)
-        .unwrap_or(DSERVER_COUNT);
+    let (count, count_warning) = resolve_dserver_count(std::env::var("WYRD_DSERVER_COUNT").ok());
+    if let Some(warning) = count_warning {
+        eprintln!("warning: {warning}");
+    }
 
     // Bring the cluster up (building the image if needed), run the test, then
-    // finalize: on failure capture container diagnostics BEFORE teardown, and
-    // tear down unconditionally so a run never leaks containers (#150).
+    // finalize: on failure capture container diagnostics BEFORE teardown (#150),
+    // and tear down unconditionally so a run never leaks containers — even if the
+    // test *panics*. A `panic!` (vs an `Err` return) would otherwise unwind past
+    // the finalization call, leaking the cluster and capturing no diagnostics;
+    // running the body under `finalize_panic_safe` keeps capture+teardown on the
+    // unwind path too, then resumes the panic (#154).
     compose_up(&compose, count)?;
-    let result = (|| {
-        let endpoints = resolve_endpoints(&compose, count)?;
-        println!("\nxtask integration: {count} D servers at {endpoints}");
-        run_integration_test(&endpoints)
-    })();
-    finish_integration(result, || compose_logs(&compose), || compose_down(&compose))?;
+    finalize_panic_safe(
+        || {
+            let endpoints = resolve_endpoints(&compose, count)?;
+            println!("\nxtask integration: {count} D servers at {endpoints}");
+            run_integration_test(&endpoints)
+        },
+        |result| finish_integration(result, || compose_logs(&compose), || compose_down(&compose)),
+    )?;
     println!("\nxtask integration: Tier-2 container integration passed");
     Ok(())
+}
+
+/// Resolve the Tier-2 D-server count from a raw `WYRD_DSERVER_COUNT` value. An
+/// integer >= 2 is honored (an `rs(6,3)` chunk needs >= 2 distinct servers to be
+/// meaningfully spread); **any** other value — unset, unparsable, or `< 2` —
+/// falls back to [`DSERVER_COUNT`]. A *rejected explicit* value returns a warning
+/// string so the clamp is never silent (#154): a typo'd `WYRD_DSERVER_COUNT=1`
+/// previously became 9 with no signal. Pure (input -> output) so it is unit-tested
+/// without spawning a container.
+fn resolve_dserver_count(raw: Option<String>) -> (usize, Option<String>) {
+    match raw {
+        None => (DSERVER_COUNT, None),
+        Some(value) => match value.parse::<usize>() {
+            Ok(n) if n >= 2 => (n, None),
+            _ => (
+                DSERVER_COUNT,
+                Some(format!(
+                    "WYRD_DSERVER_COUNT={value:?} is not a usable D-server count \
+                     (need an integer >= 2); using the default {DSERVER_COUNT}"
+                )),
+            ),
+        },
+    }
+}
+
+/// Run `body`, then `finalize` it on **every** exit path — a normal return, an
+/// `Err`, or a `panic!` unwind (#154). #150's [`finish_integration`] already
+/// captures diagnostics before teardown, but it only runs if control *reaches*
+/// it: a `panic!` in the test body unwinds straight past the call, leaking the
+/// cluster and capturing nothing. `finalize_panic_safe` runs `body` under
+/// `catch_unwind`, finalizes a panic as a failure (so `finalize` captures logs
+/// **and** tears the cluster down), then resumes the unwind so the panic is not
+/// swallowed. Generic over both actions so the panic-safety composes with
+/// `finish_integration` and is unit-testable without a container runtime.
+fn finalize_panic_safe<B, F>(body: B, finalize: F) -> Result<(), String>
+where
+    B: FnOnce() -> Result<(), String>,
+    F: FnOnce(Result<(), String>) -> Result<(), String>,
+{
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    let (result, panic) = match outcome {
+        Ok(result) => (result, None),
+        Err(panic) => (
+            Err("Tier-2 integration test panicked".to_string()),
+            Some(panic),
+        ),
+    };
+    let finished = finalize(result);
+    if let Some(panic) = panic {
+        std::panic::resume_unwind(panic);
+    }
+    finished
 }
 
 /// Finalize an integration run. On **failure**, capture container diagnostics
@@ -497,6 +554,7 @@ pub(crate) fn workspace_root() -> PathBuf {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     // The operability invariant (#150): on a FAILED integration run, container
     // diagnostics must be captured BEFORE the cluster is torn down — teardown
@@ -535,6 +593,108 @@ mod tests {
             *order.borrow(),
             vec!["teardown"],
             "a passing run captures no logs; only teardown runs",
+        );
+    }
+
+    // #154 item 4 — `WYRD_DSERVER_COUNT` must not clamp a rejected value silently.
+
+    #[test]
+    fn dserver_count_unset_uses_default_silently() {
+        assert_eq!(resolve_dserver_count(None), (DSERVER_COUNT, None));
+    }
+
+    #[test]
+    fn dserver_count_accepts_a_valid_value_silently() {
+        assert_eq!(resolve_dserver_count(Some("4".to_string())), (4, None));
+        // The boundary (the smallest meaningful spread) is accepted.
+        assert_eq!(resolve_dserver_count(Some("2".to_string())), (2, None));
+    }
+
+    #[test]
+    fn dserver_count_rejects_unusable_values_with_a_warning() {
+        // `0`/`1` (too few to spread), unparsable garbage, and empty all fall
+        // back to the default — but each must surface a warning, not clamp silently.
+        for bad in ["0", "1", "garbage", ""] {
+            let (count, warning) = resolve_dserver_count(Some(bad.to_string()));
+            assert_eq!(count, DSERVER_COUNT, "{bad:?} should fall back to default");
+            let warning = warning.expect("a rejected value must warn, not clamp silently");
+            assert!(
+                warning.contains("WYRD_DSERVER_COUNT"),
+                "warning should name the variable: {warning:?}"
+            );
+        }
+    }
+
+    // #154 item 2 — finalization must run even when the test body PANICS, and the
+    // panic must still resume. Composed with #150's `finish_integration`, this
+    // proves the two invariants hold together: a panicking run still captures
+    // container diagnostics BEFORE teardown (#150) and never leaks the cluster
+    // (#154). A `panic!` unwinding past finalization is exactly what would leak it.
+
+    #[test]
+    fn panic_finalizes_capture_then_teardown_then_resumes() {
+        let order: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            finalize_panic_safe(
+                || panic!("integration test panicked"),
+                |result| {
+                    finish_integration(
+                        result,
+                        || order.borrow_mut().push("capture_logs"),
+                        || order.borrow_mut().push("teardown"),
+                    )
+                },
+            )
+        }));
+        assert!(outcome.is_err(), "the panic must resume, not be swallowed");
+        assert_eq!(
+            *order.borrow(),
+            vec!["capture_logs", "teardown"],
+            "a panicking run must still capture diagnostics before teardown (#150 + #154)",
+        );
+    }
+
+    #[test]
+    fn clean_run_finalizes_without_capturing_or_panicking() {
+        let order: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let result = finalize_panic_safe(
+            || Ok(()),
+            |result| {
+                finish_integration(
+                    result,
+                    || order.borrow_mut().push("capture_logs"),
+                    || order.borrow_mut().push("teardown"),
+                )
+            },
+        );
+        assert!(result.is_ok(), "a passing run stays Ok");
+        assert_eq!(
+            *order.borrow(),
+            vec!["teardown"],
+            "a passing run captures no logs; only teardown runs",
+        );
+    }
+
+    #[test]
+    fn err_return_finalizes_capture_then_teardown_and_propagates() {
+        // A non-panic failure (`Err`) is finalized exactly like #150: capture
+        // before teardown, error propagated unchanged.
+        let order: RefCell<Vec<&str>> = RefCell::new(Vec::new());
+        let result = finalize_panic_safe(
+            || Err("boom".to_string()),
+            |result| {
+                finish_integration(
+                    result,
+                    || order.borrow_mut().push("capture_logs"),
+                    || order.borrow_mut().push("teardown"),
+                )
+            },
+        );
+        assert_eq!(result, Err("boom".to_string()));
+        assert_eq!(
+            *order.borrow(),
+            vec!["capture_logs", "teardown"],
+            "an Err return captures before teardown, like #150",
         );
     }
 }

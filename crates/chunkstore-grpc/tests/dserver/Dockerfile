@@ -9,10 +9,14 @@
 # `tests/tier2_integration.rs`.
 
 # Build stage — compile the wyrd binary against the image's pinned glibc.
-FROM rust:1.96-bookworm AS build
+# Pin the exact patch (`1.96.0`) to match `rust-toolchain.toml`, so the base tag
+# floating to a newer patch can't trigger a build-time toolchain re-download.
+FROM rust:1.96.0-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --bin wyrd
+# `--locked` so the container build uses the committed `Cargo.lock` exactly,
+# matching the gated workspace rather than silently resolving newer deps.
+RUN cargo build --release --locked --bin wyrd
 
 # Runtime stage — a minimal image hosting just the d-server role.
 FROM debian:bookworm-slim

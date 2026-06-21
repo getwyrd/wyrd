@@ -1,0 +1,22 @@
+# Dependabot — keep the dependency surface current under the cargo-deny advisory
+# wall (ADR-0003 §2). A stale lockfile is how a `cargo deny check` RUSTSEC
+# advisory lands as a surprise CI failure; scheduled update PRs surface it as a
+# tracked change instead. Two ecosystems: the Cargo workspace and the GitHub
+# Actions pinned in `.github/workflows/`.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

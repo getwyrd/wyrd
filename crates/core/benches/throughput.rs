@@ -50,7 +50,9 @@ fn payload(len: usize) -> Vec<u8> {
 
 /// A running cluster of `n` real, in-process gRPC D servers over loopback, with a
 /// fan-out client store spread across them. Servers and temp dirs are held so they
-/// outlive the benchmark; dropping the cluster shuts them down.
+/// outlive the benchmark. Dropping the cluster *detaches* the server tasks (a
+/// dropped `JoinHandle` detaches, it does not abort) and removes the temp dirs;
+/// the detached servers are reclaimed when the bench process exits.
 struct Cluster {
     store: FanoutChunkStore<GrpcChunkStore>,
     _servers: Vec<JoinHandle<()>>,
