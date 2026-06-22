@@ -2488,6 +2488,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "wyrd-chunk-format",
  "wyrd-coordination-mem",
  "wyrd-core",
  "wyrd-testkit",

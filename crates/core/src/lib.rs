@@ -12,4 +12,5 @@ pub mod erasure;
 pub mod metadata;
 pub mod placement;
 pub mod read;
+pub mod repair;
 pub mod write;

@@ -37,6 +37,11 @@ tokio.workspace = true
 # the `MetadataStore`/`ChunkStore` seams, backend-agnostic).
 async-trait.workspace = true
 bytes.workspace = true
+# The scrub loop's test injects a bit-flip into a real v1 fragment to prove the
+# checksum verify is load-bearing; it builds the fragment with the on-disk-format
+# writer. Test-only — the scrub loop itself borrows `core`'s verify and gains no
+# chunk-format dependency (ADR-0010).
+wyrd-chunk-format.workspace = true
 
 # Inherit the workspace lint policy (single source of truth).
 [lints]
