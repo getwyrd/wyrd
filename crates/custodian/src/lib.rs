@@ -23,11 +23,13 @@
 pub mod gc;
 pub mod leadership;
 pub mod reconciliation;
+pub mod scrub;
 pub mod telemetry;
 
 pub use gc::{mark_orphaned, GcContext};
 pub use leadership::{Custodian, FenceError, FencedZone};
 pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
+pub use scrub::ScrubContext;
 pub use telemetry::{DurabilityTelemetry, ExporterConfig, TelemetryError};
 
 /// The failure-domain-aware **selector** the custodian places against — it lives in

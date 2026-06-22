@@ -21,6 +21,7 @@ use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, PlacementChunkS
 
 use crate::erasure;
 use crate::metadata::{self, ChunkRef, DirentRecord, EcScheme, InodeId, InodeRecord, InodeState};
+use crate::repair;
 
 /// Resolve `name` under `parent` to its inode id, or `None` if the name is
 /// unbound.
@@ -57,9 +58,27 @@ pub async fn read_object_from(
     chunks: &impl PlacementChunkStore,
     inode: &InodeRecord,
 ) -> Result<Vec<u8>> {
+    // No metadata store at this entry, so a corruption finding cannot be recorded
+    // on the repair queue; the placement-aware entries ([`read_object`] /
+    // [`read_path`]) thread the store and feed the queue. Findings are still
+    // computed (and dropped) here so this path's behaviour is otherwise unchanged.
+    let mut corrupt = Vec::new();
+    read_object_collecting(chunks, inode, &mut corrupt).await
+}
+
+/// Reassemble an object's bytes, **collecting** the ids of chunks whose read had to
+/// exclude a checksum-failing fragment, so the caller can enqueue them for repair on
+/// the shared queue (`0005:174-176`). `corrupt` is appended to as the read proceeds —
+/// it carries the findings even when the read ultimately fails (a chunk below `k`
+/// survivors is still a durable repair obligation).
+async fn read_object_collecting(
+    chunks: &impl PlacementChunkStore,
+    inode: &InodeRecord,
+    corrupt: &mut Vec<ChunkId>,
+) -> Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(inode.size as usize);
     for chunk in &inode.chunk_map {
-        bytes.extend_from_slice(&read_chunk(chunks, chunk).await?);
+        bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt).await?);
     }
     if bytes.len() as u64 != inode.size {
         return Err(ReadError::SizeMismatch {
@@ -98,7 +117,11 @@ fn fragment_dserver(chunk: &ChunkRef, index: u16) -> DServerId {
 /// Each fragment is fetched from the D server the **placement record** names
 /// ([`fragment_dserver`]), not from `index % n` — the location authority is the
 /// committed chunk map, not the fan-out.
-async fn read_chunk(chunks: &impl PlacementChunkStore, chunk: &ChunkRef) -> Result<Vec<u8>> {
+async fn read_chunk(
+    chunks: &impl PlacementChunkStore,
+    chunk: &ChunkRef,
+    corrupt: &mut Vec<ChunkId>,
+) -> Result<Vec<u8>> {
     match chunk.scheme {
         EcScheme::None => {
             // A single fragment at index 0; there is nothing to reconstruct around.
@@ -112,7 +135,16 @@ async fn read_chunk(chunks: &impl PlacementChunkStore, chunk: &ChunkRef) -> Resu
                 )
                 .await?
                 .ok_or(ReadError::MissingFragment { chunk_id: chunk.id })?;
-            Ok(decode(&fragment)?.payload)
+            match decode(&fragment) {
+                Ok(decoded) => Ok(decoded.payload),
+                Err(e) => {
+                    // A present-but-corrupt single fragment: never return its bytes,
+                    // and record the chunk as a durable repair obligation before
+                    // surfacing the error (there is nothing to reconstruct around).
+                    corrupt.push(chunk.id);
+                    Err(e.into())
+                }
+            }
         }
         EcScheme::ReedSolomon { k, m } => {
             let (k, m) = (k as usize, m as usize);
@@ -141,12 +173,21 @@ async fn read_chunk(chunks: &impl PlacementChunkStore, chunk: &ChunkRef) -> Resu
             let mut shards: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
             while let Some((index, fetched)) = inflight.next().await {
                 if let Ok(Some(fragment)) = fetched {
-                    if let Ok(decoded) = decode(&fragment) {
-                        shards.push((index as usize, decoded.payload));
-                        if shards.len() == k {
-                            // `k` verified: drop the outstanding fetches, which
-                            // abandons (cancels) them.
-                            break;
+                    match decode(&fragment) {
+                        Ok(decoded) => {
+                            shards.push((index as usize, decoded.payload));
+                            if shards.len() == k {
+                                // `k` verified: drop the outstanding fetches, which
+                                // abandons (cancels) them.
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            // A present fragment that fails its checksum is bit rot:
+                            // excluded from the decoder (read around) AND its chunk
+                            // recorded as a repair obligation, never silently absorbed
+                            // (`0005:174-176`, `0005:262-264`).
+                            corrupt.push(chunk.id);
                         }
                     }
                 }
@@ -177,7 +218,19 @@ pub async fn read_object(
     if inode.state != InodeState::Committed {
         return Ok(None);
     }
-    Ok(Some(read_object_from(chunks, &inode).await?))
+    // Read the object, collecting any chunk whose read excluded a checksum-failing
+    // fragment, then enqueue each onto the SAME repair queue scrub feeds
+    // (`0005:174-176`) — whether or not the read itself recovered. The enqueue runs
+    // before the read result is surfaced, so a read that fails below `k` survivors
+    // still leaves a durable repair obligation behind.
+    let mut corrupt = Vec::new();
+    let result = read_object_collecting(chunks, &inode, &mut corrupt).await;
+    corrupt.sort_unstable();
+    corrupt.dedup();
+    for chunk in corrupt {
+        repair::enqueue_repair(meta, chunk, "read").await?;
+    }
+    Ok(Some(result?))
 }
 
 /// Read a committed object by path. `None` if the name is unbound or its inode is

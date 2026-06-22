@@ -176,7 +176,7 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
 /// Every `(dserver, fragment)` a **committed** chunk map references through its
 /// placement record (`core::metadata::ChunkRef.placement`). A pending (uncommitted)
 /// inode's provisional map is excluded — only a committed reference protects bytes.
-async fn referenced_fragments(
+pub(crate) async fn referenced_fragments(
     meta: &dyn MetadataStore,
 ) -> Result<HashSet<(DServerId, FragmentId)>> {
     let mut set = HashSet::new();

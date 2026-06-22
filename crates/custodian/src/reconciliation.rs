@@ -10,6 +10,7 @@
 
 use crate::gc::{self, GcContext};
 use crate::leadership::{Custodian, FenceError, FencedZone};
+use crate::scrub::{self, ScrubContext};
 
 /// The observable outcome of a reconciliation step — "changed" vs "satisfied" are
 /// distinct, observable moments (`0005:351-352`).
@@ -50,22 +51,40 @@ impl std::error::Error for ReconcileError {}
 /// zone's current leadership term, so a superseded custodian's reconciliation is
 /// rejected (`0005:362-367`).
 ///
-/// When `gc` is supplied, the step dispatches to the **GC loop** ([`gc::reconcile`],
-/// `0005:288-295`) over the given stores; a bare `None` exercises the fence alone
-/// (no maintenance inputs wired). Scrub / reconstruction / rebalance (slices 5–7)
-/// are not yet dispatched.
+/// The supplied maintenance inputs select which loops the step dispatches: `gc`
+/// runs the **GC loop** ([`gc::reconcile`], `0005:288-295`), `scrub` runs the
+/// **scrub loop** ([`scrub::reconcile`], `0005:262-267`), and both `None` exercises
+/// the fence alone (no maintenance inputs wired). When both are supplied the step
+/// runs each independent loop and reports [`Reconciled::Changed`] if **either**
+/// converged. Reconstruction / rebalance (slices 6–7) are not yet dispatched.
 pub async fn reconcile_step(
     zone: &FencedZone,
     custodian: &Custodian,
     gc: Option<&GcContext<'_>>,
+    scrub: Option<&ScrubContext<'_>>,
     now_millis: u64,
 ) -> Result<Reconciled, ReconcileError> {
     zone.authorize(custodian.term())
         .map_err(ReconcileError::Fenced)?;
-    match gc {
-        Some(ctx) => gc::reconcile(ctx, now_millis)
+
+    let mut outcome = Reconciled::Satisfied;
+    if let Some(ctx) = gc {
+        if gc::reconcile(ctx, now_millis)
             .await
-            .map_err(ReconcileError::Store),
-        None => Ok(Reconciled::Satisfied),
+            .map_err(ReconcileError::Store)?
+            == Reconciled::Changed
+        {
+            outcome = Reconciled::Changed;
+        }
     }
+    if let Some(ctx) = scrub {
+        if scrub::reconcile(ctx, now_millis)
+            .await
+            .map_err(ReconcileError::Store)?
+            == Reconciled::Changed
+        {
+            outcome = Reconciled::Changed;
+        }
+    }
+    Ok(outcome)
 }
