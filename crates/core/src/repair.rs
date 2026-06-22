@@ -54,6 +54,22 @@ pub fn fragment_intact(bytes: &[u8], chunk: ChunkId) -> bool {
     matches!(wyrd_chunk_format::decode(bytes), Ok(decoded) if decoded.header.chunk_id == chunk)
 }
 
+/// Decode a survivor fragment to its **shard payload** iff it is intact and belongs to
+/// `chunk` — the gather step of the **reconstruction** custodian (`0005:275`). Returns
+/// `None` for a missing, checksum-failing, or misplaced fragment, which is then
+/// **excluded** from the decoder (never fed to it) and rebuilt around.
+///
+/// This is [`fragment_intact`]'s payload-returning sibling: it lives here (with the
+/// shared verify) so the reconstruction loop in `custodian` recovers a survivor's bytes
+/// **without** depending on the on-disk fragment format directly (ADR-0010,
+/// `0005:421-422`) — `core` owns the format reader.
+pub fn intact_shard(bytes: &[u8], chunk: ChunkId) -> Option<Vec<u8>> {
+    match wyrd_chunk_format::decode(bytes) {
+        Ok(decoded) if decoded.header.chunk_id == chunk => Some(decoded.payload),
+        _ => None,
+    }
+}
+
 /// Enqueue `chunk` for reconstruction onto the shared, durable repair queue.
 /// **Idempotent** — a chunk already queued stays a single obligation (the key
 /// dedups). `detected_by` records the producer (`"scrub"` | `"read"`) for the

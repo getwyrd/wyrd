@@ -23,12 +23,14 @@
 pub mod gc;
 pub mod leadership;
 pub mod reconciliation;
+pub mod reconstruction;
 pub mod scrub;
 pub mod telemetry;
 
 pub use gc::{mark_orphaned, GcContext};
 pub use leadership::{Custodian, FenceError, FencedZone};
 pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
+pub use reconstruction::{repair_priority, ReconstructionContext};
 pub use scrub::ScrubContext;
 pub use telemetry::{DurabilityTelemetry, ExporterConfig, TelemetryError};
 
@@ -37,5 +39,6 @@ pub use telemetry::{DurabilityTelemetry, ExporterConfig, TelemetryError};
 /// is re-exported here for custodian re-placement. The distinctness invariant is the
 /// custodian's to preserve on repair, exactly as the write preserves it on commit.
 pub use wyrd_core::placement::{
-    select_distinct_domains, DServerTopology, FailureDomain, SelectorError, Topology,
+    select_distinct_domains, select_distinct_domains_excluding, DServerTopology, FailureDomain,
+    SelectorError, Topology,
 };

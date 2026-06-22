@@ -106,6 +106,22 @@ impl WritePlan {
     }
 }
 
+/// Encode a single **rebuilt** Reed-Solomon shard into a self-describing v1 fragment,
+/// stamping the chunk id and EC header fields (`ec_k`/`ec_m`/`ec_fragment_index`)
+/// exactly as the write fan-out does ([`encode_chunk`]) so a reader decodes and
+/// verifies it identically. This is the re-place step's format primitive, exposed for
+/// the **reconstruction** custodian (`0005:276`) — which thus rebuilds a fragment
+/// without depending on the on-disk format directly (ADR-0010, `0005:421-422`);
+/// `core` owns the format writer.
+pub fn encode_ec_fragment(chunk: ChunkId, index: u16, k: u8, m: u8, shard: &[u8]) -> Bytes {
+    let mut header = FragmentHeader::new_v1(chunk, shard.len() as u64);
+    header.ec_scheme_type = EcSchemeType::ReedSolomon;
+    header.ec_k = k;
+    header.ec_m = m;
+    header.ec_fragment_index = index;
+    Bytes::from(encode(&header, shard))
+}
+
 /// Encode one chunk's `piece` into its fragments under `scheme`.
 fn encode_chunk(
     scheme: EcScheme,
