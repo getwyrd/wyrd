@@ -25,7 +25,7 @@
 //! later, custodian re-placement, so the invariant holds on both write and repair
 //! (`0005:241-242`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_traits::DServerId;
 
@@ -121,6 +121,44 @@ impl Topology {
 
     fn util(&self, id: DServerId) -> u64 {
         self.utilization.get(&id).copied().unwrap_or(0)
+    }
+
+    /// The **per-failure-domain utilization** — the capacity-plane signal the
+    /// custodian publishes (proposal 0005 §"The durability plane", `0005:341-343`;
+    /// architecture §8.3): each opaque failure domain mapped to the **sum** of its
+    /// member servers' recorded utilization (a server with no recorded utilization
+    /// contributes zero). It is the by-product of the thin domain model the durability
+    /// plane emits per domain; the selector keeps no policy of its own (`0005:251`).
+    pub fn domain_utilization(&self) -> BTreeMap<FailureDomain, u64> {
+        let mut by_domain: BTreeMap<FailureDomain, u64> = BTreeMap::new();
+        for server in &self.servers {
+            let entry = by_domain.entry(server.domain.clone()).or_insert(0);
+            *entry = entry.saturating_add(self.util(server.id));
+        }
+        by_domain
+    }
+
+    /// A view of this topology with the `exclude`d servers removed — the re-placement
+    /// pool a **drain / decommission** evacuation selects against, so an evacuated
+    /// fragment is never re-placed back onto a draining server (proposal 0005
+    /// §"Rebalance", `0005:297-303`: move fragments *off* draining servers). The
+    /// retained servers' utilization is carried over so least-loaded selection still
+    /// holds on the filtered view.
+    pub fn excluding(&self, exclude: &BTreeSet<DServerId>) -> Topology {
+        Topology {
+            servers: self
+                .servers
+                .iter()
+                .filter(|s| !exclude.contains(&s.id))
+                .cloned()
+                .collect(),
+            utilization: self
+                .utilization
+                .iter()
+                .filter(|(id, _)| !exclude.contains(id))
+                .map(|(id, used)| (*id, *used))
+                .collect(),
+        }
     }
 }
 
@@ -325,6 +363,42 @@ mod tests {
         assert!(
             domain != FailureDomain::new("A") && domain != FailureDomain::new("C"),
             "rebuilt fragment must not collide with a surviving fragment's domain"
+        );
+    }
+
+    #[test]
+    fn domain_utilization_sums_per_domain() {
+        // Two servers in domain A (10 + 5), one in B (7), one in C (no recorded util).
+        let mut t = Topology::default();
+        t.register(0, "A").register(1, "A").register(2, "B");
+        t.register(3, "C");
+        t.set_utilization(0, 10)
+            .set_utilization(1, 5)
+            .set_utilization(2, 7);
+        let util = t.domain_utilization();
+        assert_eq!(util.get(&FailureDomain::new("A")), Some(&15), "A sums 10+5");
+        assert_eq!(util.get(&FailureDomain::new("B")), Some(&7));
+        assert_eq!(
+            util.get(&FailureDomain::new("C")),
+            Some(&0),
+            "a domain with no recorded utilization maps to zero"
+        );
+    }
+
+    #[test]
+    fn excluding_drops_servers_and_their_utilization() {
+        let mut t = Topology::default();
+        t.register(0, "A").register(1, "B").register(2, "C");
+        t.set_utilization(1, 99);
+        // Exclude server 1 (the draining server): it must not be selectable.
+        let drained: std::collections::BTreeSet<DServerId> = [1].into_iter().collect();
+        let filtered = t.excluding(&drained);
+        assert_eq!(filtered.distinct_domains(), 2, "B is gone with server 1");
+        // A 2-wide distinct placement on the filtered view never lands on server 1.
+        let placement = select_distinct_domains(&filtered, 2).unwrap();
+        assert!(
+            !placement.contains(&1),
+            "an evacuation never re-places onto the draining server"
         );
     }
 
