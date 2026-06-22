@@ -2477,6 +2477,8 @@ dependencies = [
 name = "wyrd-custodian"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-prometheus",
