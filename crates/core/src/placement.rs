@@ -110,6 +110,15 @@ impl Topology {
         domains.len()
     }
 
+    /// The opaque failure domain `id` occupies, if the topology knows the server.
+    /// The custodian uses this on reconstruction to read off the **surviving**
+    /// fragments' domains, so the rebuilt fragment(s) can be re-placed in domains
+    /// **distinct** from them (`0005:276`, the distinct-domain leg of the repair
+    /// pipeline).
+    pub fn domain_of(&self, id: DServerId) -> Option<&FailureDomain> {
+        self.servers.iter().find(|s| s.id == id).map(|s| &s.domain)
+    }
+
     fn util(&self, id: DServerId) -> u64 {
         self.utilization.get(&id).copied().unwrap_or(0)
     }
@@ -197,6 +206,66 @@ pub fn select_distinct_domains(
     Ok(placement)
 }
 
+/// Select stable D-server ids for `count` **rebuilt** fragments so they occupy
+/// `count` failure domains that are distinct from each other **and** from every
+/// domain in `occupied` — the custodian re-placement step of reconstruction
+/// (`0005:276`, `0005:241-242`: the selector is shared by the write fan-out *and*
+/// custodian re-placement).
+///
+/// `occupied` is the set of domains the chunk's **surviving** fragments already
+/// hold; excluding them is what keeps the post-repair chunk on `n` distinct
+/// domains (the BINDING durability invariant, `0005:491`). Returns
+/// [`SelectorError::InsufficientDomains`] when fewer than `count` *free* distinct
+/// domains remain — the selector **refuses** rather than collide a rebuilt
+/// fragment into a domain a survivor already occupies (durability is gate-zero,
+/// `0005:303`).
+///
+/// The selection *algorithm* is ILLUSTRATIVE and identical to
+/// [`select_distinct_domains`] (least-utilized free domain first, least-utilized
+/// lowest-id server within it); only the distinct-and-disjoint guarantee is
+/// contractual.
+pub fn select_distinct_domains_excluding(
+    topo: &Topology,
+    count: u16,
+    occupied: &[FailureDomain],
+) -> std::result::Result<Vec<DServerId>, SelectorError> {
+    let need = count as usize;
+    let occupied: std::collections::BTreeSet<&FailureDomain> = occupied.iter().collect();
+
+    // Group only the servers whose domain is still free (not held by a survivor).
+    let mut by_domain: BTreeMap<&FailureDomain, Vec<&DServerTopology>> = BTreeMap::new();
+    for server in &topo.servers {
+        if occupied.contains(&server.domain) {
+            continue;
+        }
+        by_domain.entry(&server.domain).or_default().push(server);
+    }
+
+    if by_domain.len() < need {
+        return Err(SelectorError::InsufficientDomains {
+            have: by_domain.len(),
+            need: count,
+        });
+    }
+
+    let mut domains: Vec<(&FailureDomain, Vec<&DServerTopology>)> = by_domain.into_iter().collect();
+    domains.sort_by(|(la, a), (lb, b)| {
+        let min_a = a.iter().map(|s| topo.util(s.id)).min().unwrap_or(0);
+        let min_b = b.iter().map(|s| topo.util(s.id)).min().unwrap_or(0);
+        min_a.cmp(&min_b).then_with(|| la.cmp(lb))
+    });
+
+    let placement = domains
+        .into_iter()
+        .take(need)
+        .map(|(_, mut members)| {
+            members.sort_by_key(|s| (topo.util(s.id), s.id));
+            members[0].id
+        })
+        .collect();
+    Ok(placement)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +307,34 @@ mod tests {
         t.register(0, "A").register(1, "B").register(2, "C");
         let err = select_distinct_domains(&t, 9).unwrap_err();
         assert_eq!(err, SelectorError::InsufficientDomains { have: 3, need: 9 });
+    }
+
+    #[test]
+    fn replacement_avoids_occupied_domains() {
+        // Four domains A..D. Survivors hold A and C; a single rebuilt fragment must
+        // land in a domain distinct from both — B or D, never A/C.
+        let mut t = Topology::default();
+        t.register(0, "A")
+            .register(1, "B")
+            .register(2, "C")
+            .register(3, "D");
+        let occupied = [FailureDomain::new("A"), FailureDomain::new("C")];
+        let picked = select_distinct_domains_excluding(&t, 1, &occupied).unwrap();
+        assert_eq!(picked.len(), 1);
+        let domain = t.domain_of(picked[0]).unwrap().clone();
+        assert!(
+            domain != FailureDomain::new("A") && domain != FailureDomain::new("C"),
+            "rebuilt fragment must not collide with a surviving fragment's domain"
+        );
+    }
+
+    #[test]
+    fn replacement_refuses_when_no_free_domain_remains() {
+        // Two domains, both occupied by survivors: no free domain for a rebuild.
+        let mut t = Topology::default();
+        t.register(0, "A").register(1, "B");
+        let occupied = [FailureDomain::new("A"), FailureDomain::new("B")];
+        let err = select_distinct_domains_excluding(&t, 1, &occupied).unwrap_err();
+        assert_eq!(err, SelectorError::InsufficientDomains { have: 0, need: 1 });
     }
 }

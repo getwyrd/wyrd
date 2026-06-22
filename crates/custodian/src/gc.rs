@@ -42,7 +42,7 @@ use crate::reconciliation::Reconciled;
 /// instant.
 const ORPHAN_PREFIX: &[u8] = b"orphan:";
 
-fn orphan_key(dserver: DServerId, frag: FragmentId) -> Vec<u8> {
+pub(crate) fn orphan_key(dserver: DServerId, frag: FragmentId) -> Vec<u8> {
     format!("orphan:{dserver}:{}:{}", frag.chunk, frag.index).into_bytes()
 }
 

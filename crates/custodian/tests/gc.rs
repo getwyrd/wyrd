@@ -207,7 +207,7 @@ async fn reclaims_expired_lease_byte_and_orphan_through_reconcile_step() {
     };
 
     // now = 200: past the lease (100) and past the orphan window (0 + 50).
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, 200)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 200)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed, "GC reclaimed fragment bytes");
@@ -271,7 +271,7 @@ async fn never_reclaims_a_referenced_fragment() {
         grace_window_millis: 0,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, 1_000_000)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 1_000_000)
         .await
         .unwrap();
 
@@ -306,7 +306,7 @@ async fn honours_the_reader_safe_grace_window() {
 
     // WITHIN the window (now = 120 < 150): not reclaimed, and a reader holding the
     // prior version still resolves the fragment.
-    let early = reconcile_step(&zone, &custodian, Some(&ctx), None, 120)
+    let early = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 120)
         .await
         .unwrap();
     assert_eq!(
@@ -320,7 +320,7 @@ async fn honours_the_reader_safe_grace_window() {
     );
 
     // AFTER the window (now = 160 >= 150): reclaimed.
-    let late = reconcile_step(&zone, &custodian, Some(&ctx), None, 160)
+    let late = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 160)
         .await
         .unwrap();
     assert_eq!(
@@ -366,7 +366,7 @@ async fn emits_gc_actions_on_the_durability_seam() {
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, 100)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, 100)
         .with_subscriber(subscriber)
         .await
         .unwrap();
