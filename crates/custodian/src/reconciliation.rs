@@ -10,6 +10,7 @@
 
 use crate::gc::{self, GcContext};
 use crate::leadership::{Custodian, FenceError, FencedZone};
+use crate::rebalance::{self, RebalanceContext};
 use crate::reconstruction::{self, ReconstructionContext};
 use crate::scrub::{self, ScrubContext};
 
@@ -55,16 +56,19 @@ impl std::error::Error for ReconcileError {}
 /// The supplied maintenance inputs select which loops the step dispatches: `gc`
 /// runs the **GC loop** ([`gc::reconcile`], `0005:288-295`), `scrub` runs the
 /// **scrub loop** ([`scrub::reconcile`], `0005:262-267`), `reconstruction` runs the
-/// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`), and all
-/// `None` exercises the fence alone (no maintenance inputs wired). When several are
-/// supplied the step runs each independent loop and reports [`Reconciled::Changed`] if
-/// **any** converged. Rebalance (slice 7) is not yet dispatched.
+/// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`), `rebalance`
+/// runs the **rebalance loop** — drain/decommission evacuation ([`rebalance::reconcile`],
+/// `0005:297-303`) — and all `None` exercises the fence alone (no maintenance inputs
+/// wired). When several are supplied the step runs each independent loop and reports
+/// [`Reconciled::Changed`] if **any** converged.
+#[allow(clippy::too_many_arguments)]
 pub async fn reconcile_step(
     zone: &FencedZone,
     custodian: &Custodian,
     gc: Option<&GcContext<'_>>,
     scrub: Option<&ScrubContext<'_>>,
     reconstruction: Option<&ReconstructionContext<'_>>,
+    rebalance: Option<&RebalanceContext<'_>>,
     now_millis: u64,
 ) -> Result<Reconciled, ReconcileError> {
     zone.authorize(custodian.term())
@@ -91,6 +95,15 @@ pub async fn reconcile_step(
     }
     if let Some(ctx) = reconstruction {
         if reconstruction::reconcile(ctx, now_millis)
+            .await
+            .map_err(ReconcileError::Store)?
+            == Reconciled::Changed
+        {
+            outcome = Reconciled::Changed;
+        }
+    }
+    if let Some(ctx) = rebalance {
+        if rebalance::reconcile(ctx, now_millis)
             .await
             .map_err(ReconcileError::Store)?
             == Reconciled::Changed

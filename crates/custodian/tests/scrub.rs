@@ -204,7 +204,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -241,7 +241,7 @@ async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -309,7 +309,7 @@ async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstru
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -373,7 +373,7 @@ async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
         .with_subscriber(subscriber)
         .await
         .unwrap();

@@ -323,7 +323,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -416,7 +416,7 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed);
@@ -478,7 +478,7 @@ async fn emits_the_three_repair_metrics_on_the_durability_seam() {
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .with_subscriber(subscriber)
         .await
         .unwrap();

@@ -20,15 +20,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod desired_state;
 pub mod gc;
 pub mod leadership;
+pub mod rebalance;
 pub mod reconciliation;
 pub mod reconstruction;
 pub mod scrub;
 pub mod telemetry;
 
+pub use desired_state::{
+    clear_lifecycle, draining_servers, reconciliation_status, set_lifecycle, DServerLifecycle,
+    ReconciliationStatus,
+};
 pub use gc::{mark_orphaned, GcContext};
 pub use leadership::{Custodian, FenceError, FencedZone};
+pub use rebalance::RebalanceContext;
 pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
 pub use reconstruction::{repair_priority, ReconstructionContext};
 pub use scrub::ScrubContext;
