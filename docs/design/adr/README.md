@@ -35,6 +35,14 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0021](0021-encryption-at-rest-and-key-management.md) | Encryption at rest and key management | Proposed |
 | [0022](0022-multi-tenancy-model.md) | Multi-tenancy model | Proposed |
 | [0023](0023-act-beat-process-improvement-loop.md) | Adopt the Act beat: a process-improvement loop | Proposed |
+| [0024](0024-clock-and-time-source-trust.md) | Clock and time-source trust | Proposed |
+| [0025](0025-internal-service-to-service-trust.md) | Internal service-to-service trust | Proposed |
+| [0026](0026-key-service-and-kms-backend-selection.md) | Key management: the KeyService contract and KMS backend selection | Proposed |
+| [0027](0027-cross-zone-replication-transport.md) | Cross-zone replication transport: the ReplicationQueue trait and NATS JetStream default | Proposed |
+| [0028](0028-erasure-versus-retention-precedence.md) | Erasure-versus-retention precedence | Proposed |
+| [0029](0029-key-compromise-emergency-response.md) | Key-compromise emergency response | Proposed |
+| [0030](0030-build-and-release-integrity.md) | Build and release integrity | Proposed |
+| [0031](0031-watch-and-change-feed-contract.md) | Watch / change-feed contract | Proposed |
 
 ## Why not ... ?
 

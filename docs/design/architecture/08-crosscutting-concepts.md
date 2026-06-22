@@ -60,7 +60,7 @@ The operations that must be first-class, safe, resumable, and observable: adding
 
 ## 8.5 Security and trust
 
-The trust model follows from single-provider, closed federation (ADR-0005): one operator, an internal PKI, no cross-org or untrusted-operator trust to negotiate. That shrinks the security surface to four questions — who is calling, what they may touch, who can read the bytes at rest, and how tenants are kept apart.
+The trust model follows from single-provider, closed federation (ADR-0005): one operator, an internal PKI, no cross-org or untrusted-operator trust to negotiate. That shrinks the security surface to four questions — who is calling, what they may touch, who can read the bytes at rest, and how tenants are kept apart. The adversarial view — assets, trust boundaries, the D-server-compromise blast radius, and the storage attack catalog with each attack mapped to its mitigating decision — is the threat model (section 14).
 
 **Authentication — two planes.** *Users and applications* authenticate at the access layer (L1): OIDC / OAuth2 bearer tokens for the Drive / WebDAV / SDK surfaces, S3 Signature V4 (HMAC over per-tenant access keys) for the S3 surface, and OIDC + mTLS for the management API. The gateway is the authentication boundary; nothing below L1 re-authenticates the external principal. *Services* authenticate to each other with **mTLS under the provider CA** (ADR-0005) — zones, D servers, custodians, coordination; identity is the certificate, and there are no shared service secrets on the wire. etcd's own auth is defense-in-depth, never the primary boundary — coordination is network-isolated to the zone's control components and fronted by the mTLS fabric.
 

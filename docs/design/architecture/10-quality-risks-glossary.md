@@ -77,7 +77,7 @@ These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in 
 
 ## 13. Testing strategy
 
-> How Wyrd is verified, across tiers from reproducible simulation to real multi-region hardware. This subsection describes the *approach*; the DST decision itself is ADR-0009, the quality scenarios it must satisfy are above (section 10), and the milestone ordering that each tier attaches to is in section 9 and proposal 0002 (the implementation arc).
+> How Wyrd is verified, across tiers from reproducible simulation to real multi-region hardware. This subsection describes the *approach*; the DST decision itself is ADR-0009, the quality scenarios it must satisfy are above (section 10), the security properties and the threat→test map are the threat model (section 14.6–14.7), and the milestone ordering that each tier attaches to is in section 9 and proposal 0002 (the implementation arc).
 
 ### 13.1 The principle: simulation is primary, real environments are complementary
 
