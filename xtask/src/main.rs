@@ -14,12 +14,17 @@
 //!   cluster of real, networked gRPC D servers under docker-compose and run the
 //!   end-to-end write/read integration test against them. Not part of `ci` (it
 //!   needs a container runtime); a heavier-runner / nightly job.
+//! - `disk-faults` / `jepsen` / `kill-reconstruct` — the deferred (off-Check)
+//!   Tier-1 / Tier-2 custodian fault runners (M3, proposal 0005 `0005:405-411`,
+//!   `0005:437-438`). Privileged / real-environment tiers, never part of `ci`;
+//!   deferred by default, opted in by the dedicated off-Check job.
 //! - `bench` — the tracked throughput benchmarks (EC micro-bench + the M2
 //!   aggregate D-server throughput bench). Tracked, not gated.
 
 #![forbid(unsafe_code)]
 
 mod conformance;
+mod faults;
 mod vectors;
 
 use std::path::{Path, PathBuf};
@@ -33,6 +38,9 @@ fn main() -> ExitCode {
         Some("gen-vectors") => run_gen_vectors(),
         Some("dst") => run_dst(),
         Some("integration") => run_integration(),
+        Some("disk-faults") => faults::run_disk_faults(),
+        Some("jepsen") => faults::run_jepsen(),
+        Some("kill-reconstruct") => faults::run_kill_reconstruct(),
         Some("bench") => run_bench(),
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
@@ -55,7 +63,10 @@ fn main() -> ExitCode {
 }
 
 fn print_usage() {
-    eprintln!("usage: cargo xtask <ci|conformance|gen-vectors|dst|integration|bench>");
+    eprintln!(
+        "usage: cargo xtask \
+         <ci|conformance|gen-vectors|dst|integration|disk-faults|jepsen|kill-reconstruct|bench>"
+    );
 }
 
 /// Run the tracked throughput benchmarks. Deliberately **not** part of `run_ci`:

@@ -27,6 +27,15 @@ async-trait.workspace = true
 # from the madsim run seed so a bug-finding seed replays the same faults.
 rand.workspace = true
 rand_chacha.workspace = true
+# M3.8 custodian property campaign (tests/custodian.rs): the four custodian loops
+# driven through the real `reconcile_step` fenced control point over in-memory trait
+# stores, under the simulator. `custodian` carries the loops + the durability-plane
+# telemetry seam; `coordination-mem` provides leader election + the fencing token;
+# `tracing`/`tracing-subscriber` wire the durability metrics for in-process read-back.
+wyrd-custodian.workspace = true
+wyrd-coordination-mem.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 # `wyrd-dst` compiles *only* under `--cfg madsim`, so its gRPC transport is
 # always madsim-tonic (aliased as `tonic`) — the same alias `proto` and

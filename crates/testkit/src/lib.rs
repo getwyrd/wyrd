@@ -226,6 +226,101 @@ impl NetFaultInjector for SeededNetFaults {
     }
 }
 
+/// The **storage seam** fault model (proposal 0005 §"DST and tests": "a **bit-rot /
+/// fragment-loss fault seam** and a **D-server-kill seam** alongside the existing
+/// `Clock`/`Disk`/`Network` seams", `0005:434-435`). A `StorageFault` is a fault the
+/// custodian campaign injects on a D server's **stored fragment bytes**, so the four
+/// custodian loops (scrub, reconstruction, GC) can be driven against seed-reproducible
+/// bit rot and fragment loss — the storage-plane sibling of [`NetFault`] (which faults
+/// the *link*, not the stored byte).
+///
+/// The fault *model* lives here, free of any chunk-store or chunk-format dependency, so
+/// it stays import-light; a campaign maps each variant onto a concrete `ChunkStore`
+/// operation (drop the stored bytes for `Lost`; flip a payload byte for `BitRot`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFault {
+    /// The fragment's bytes are **gone** — the D server no longer holds them: a disk
+    /// failure, a deleted shard, or (the **D-server-kill** seam) every fragment a
+    /// killed D server held. A loss the custodian reads around and reconstructs
+    /// (Q1, `0005:381-384`).
+    Lost,
+    /// The fragment's bytes are **silently corrupted in place** (bit rot): still
+    /// present, but they fail their self-describing checksum, so scrub must exclude
+    /// the shard (never decode it) and enqueue the chunk for repair (Q2,
+    /// `0005:390-393`).
+    BitRot,
+}
+
+/// Decides whether — and how — to fault the **stored bytes** of the D server at a given
+/// index. Mirrors [`NetFaultInjector`] for the storage seam; the default injects
+/// nothing.
+pub trait StorageFaultInjector {
+    /// The fault to inject for the D server at `store_index`, or `None` to leave its
+    /// stored bytes untouched.
+    fn storage_fault_for(&mut self, store_index: usize) -> Option<StorageFault>;
+}
+
+/// A storage-fault plan fixed once from the run seed: a chosen set of D servers, each
+/// with the fault to apply to its stored fragment bytes. The storage-seam sibling of
+/// [`SeededNetFaults`]; drawing the selection from the simulation RNG is what makes the
+/// custodian campaign reproduce from its seed (ADR-0009) — a bug-finding seed replays
+/// the *same* killed / rotted servers as a permanent regression.
+#[derive(Debug, Clone, Default)]
+pub struct SeededStorageFaults {
+    faults: std::collections::BTreeMap<usize, StorageFault>,
+}
+
+impl SeededStorageFaults {
+    /// A plan from an explicit map of `store_index → fault` — e.g. rot the fragment on
+    /// D server 2.
+    pub fn new(faults: std::collections::BTreeMap<usize, StorageFault>) -> Self {
+        Self { faults }
+    }
+
+    /// Pick up to `max` **distinct** D-server indices in `0..n`, each to be hit with
+    /// `fault`, drawing the choice from `rng`. Picking no more than `max` keeps an
+    /// erasure-coded chunk above its `k` survivors so the loop can still reconstruct
+    /// (the same bound [`SeededNetFaults::pick`] keeps for the link seam).
+    pub fn pick<R: Rng>(rng: &mut R, n: usize, max: usize, fault: StorageFault) -> Self {
+        let mut indices: Vec<usize> = (0..n).collect();
+        // Fisher–Yates prefix shuffle: draw `max` distinct indices deterministically.
+        let take = max.min(n);
+        for i in 0..take {
+            let j = i + (rng.next_u32() as usize) % (n - i);
+            indices.swap(i, j);
+        }
+        let faults = indices
+            .into_iter()
+            .take(take)
+            .map(|index| (index, fault))
+            .collect();
+        Self { faults }
+    }
+
+    /// The **D-server-kill seam**: pick exactly **one** D server in `0..n` to kill,
+    /// drawing the victim from `rng`. A killed server's fragment is [`StorageFault::Lost`]
+    /// — the Q1 "kill a D server" injection (`0005:381-384`), reproduced from the seed.
+    pub fn kill<R: Rng>(rng: &mut R, n: usize) -> Self {
+        Self::pick(rng, n, 1, StorageFault::Lost)
+    }
+
+    /// The chosen faults, by D-server index.
+    pub fn faults(&self) -> &std::collections::BTreeMap<usize, StorageFault> {
+        &self.faults
+    }
+
+    /// Whether the D server at `index` carries a fault in this plan.
+    pub fn is_faulted(&self, index: usize) -> bool {
+        self.faults.contains_key(&index)
+    }
+}
+
+impl StorageFaultInjector for SeededStorageFaults {
+    fn storage_fault_for(&mut self, store_index: usize) -> Option<StorageFault> {
+        self.faults.get(&store_index).copied()
+    }
+}
+
 /// A seed-reproducible simulation context.
 ///
 /// Everything non-deterministic a component needs — randomness, time, fault
@@ -343,5 +438,51 @@ mod tests {
             Some(NetFault::Corrupt)
         );
         assert_eq!(faults.fault_for(0, FaultPoint::FragmentFetch), None);
+    }
+
+    #[test]
+    fn seeded_storage_faults_pick_is_reproducible_and_bounded() {
+        // The storage-seam promise: the rotted/lost-server selection is a pure function
+        // of the seed, and never exceeds `max` (so an erasure-coded chunk keeps its `k`
+        // survivors for the loop to reconstruct from).
+        let mut a = ChaCha8Rng::seed_from_u64(11);
+        let mut b = ChaCha8Rng::seed_from_u64(11);
+        let pa = SeededStorageFaults::pick(&mut a, 9, 3, StorageFault::BitRot);
+        let pb = SeededStorageFaults::pick(&mut b, 9, 3, StorageFault::BitRot);
+        assert_eq!(pa.faults(), pb.faults(), "same seed → same rotted shards");
+        assert!(pa.faults().len() <= 3, "never more than `max` faults");
+        assert!(
+            pa.faults().keys().all(|&i| i < 9),
+            "faulted indices are valid D servers"
+        );
+    }
+
+    #[test]
+    fn seeded_storage_faults_kill_picks_exactly_one_lost_server() {
+        // The D-server-kill seam: exactly one server is killed, and its fragment is Lost
+        // — reproducible from the seed.
+        let mut a = ChaCha8Rng::seed_from_u64(99);
+        let mut b = ChaCha8Rng::seed_from_u64(99);
+        let ka = SeededStorageFaults::kill(&mut a, 9);
+        let kb = SeededStorageFaults::kill(&mut b, 9);
+        assert_eq!(ka.faults(), kb.faults(), "same seed → same killed server");
+        assert_eq!(ka.faults().len(), 1, "kill drops exactly one D server");
+        let (&victim, &fault) = ka.faults().iter().next().unwrap();
+        assert!(victim < 9, "the killed server is a valid D server");
+        assert_eq!(
+            fault,
+            StorageFault::Lost,
+            "a killed server's fragment is lost"
+        );
+    }
+
+    #[test]
+    fn seeded_storage_faults_reports_per_store() {
+        let mut faults =
+            SeededStorageFaults::new([(2, StorageFault::BitRot)].into_iter().collect());
+        assert!(faults.is_faulted(2));
+        assert!(!faults.is_faulted(0));
+        assert_eq!(faults.storage_fault_for(2), Some(StorageFault::BitRot));
+        assert_eq!(faults.storage_fault_for(0), None);
     }
 }
