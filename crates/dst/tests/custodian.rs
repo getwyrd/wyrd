@@ -519,7 +519,7 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reconstruction").await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed, "the chunk was reconstructed");
@@ -571,7 +571,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
 
     // CRASH the custodian just before its version-conditional commit lands.
     meta.arm();
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -613,7 +613,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
 
     // RESTART: the custodian comes back and completes to full redundancy — fully new.
     meta.disarm();
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 600)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .await
         .unwrap();
     assert_eq!(
@@ -661,7 +661,7 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-scrub").await;
-    let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub_ctx), None, 100)
+    let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub_ctx), None, None, 100)
         .await
         .unwrap();
     assert_eq!(
@@ -683,7 +683,7 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
         fleet: &full,
         topology: &topo,
     };
-    let repaired = reconcile_step(&zone, &custodian, None, None, Some(&recon_ctx), 200)
+    let repaired = reconcile_step(&zone, &custodian, None, None, Some(&recon_ctx), None, 200)
         .await
         .unwrap();
     assert_eq!(repaired, Reconciled::Changed);
@@ -809,7 +809,7 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
         grace_window_millis: grace,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, now)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -886,7 +886,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
     zone.install(usurper.leadership());
 
     // The DEPOSED leader is fenced out — its reconciliation is rejected and NOTHING lands.
-    let rejected = reconcile_step(&zone, &deposed, None, None, Some(&ctx), 500).await;
+    let rejected = reconcile_step(&zone, &deposed, None, None, Some(&ctx), None, 500).await;
     assert!(
         rejected.is_err(),
         "a deposed leader's reconciliation is rejected by its stale fencing token"
@@ -902,7 +902,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
     );
 
     // The CURRENT leader acts and repairs.
-    let outcome = reconcile_step(&zone, &usurper, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &usurper, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed);
@@ -913,7 +913,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
     );
 
     // Even RACING after the new leader, the deposed leader still lands nothing.
-    let raced = reconcile_step(&zone, &deposed, None, None, Some(&ctx), 600).await;
+    let raced = reconcile_step(&zone, &deposed, None, None, Some(&ctx), None, 600).await;
     assert!(raced.is_err(), "the deposed leader stays fenced");
     assert_eq!(
         read_inode(&meta).await.version,
@@ -948,7 +948,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
 
     // PASS 1 — under-replicated: the count RISES, queue depth and time-to-repair emit.
     let rise = MetricCapture::default();
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .with_subscriber(tracing_subscriber::registry().with(rise.clone()))
         .await
         .unwrap();
@@ -971,7 +971,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
 
     // PASS 2 — repaired: the count RETURNS TO ZERO and the queue is drained.
     let settle = MetricCapture::default();
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), 600)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .with_subscriber(tracing_subscriber::registry().with(settle.clone()))
         .await
         .unwrap();
