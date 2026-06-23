@@ -220,6 +220,23 @@ mod tests {
         assert_eq!(decoded.header.payload_length, 0);
     }
 
+    /// `:72` (`< -> <=`) and `:89` (`> -> >=`) — a buffer of EXACTLY the header
+    /// length is a present, intact header with its payload truncated, NOT a
+    /// truncated header (`:72`) and NOT a header that overruns the buffer (`:89`).
+    /// Both boundary mutants misclassify it: `<=` at :72 returns `TruncatedHeader`
+    /// and `>=` at :89 returns `HeaderLengthExceedsBuffer`, so pinning the result
+    /// to `TruncatedPayload` kills both. (Prior decode tests only hit strictly
+    /// shorter / strictly longer buffers, never `len == header_length`.)
+    #[test]
+    fn header_length_exact_buffer_is_truncated_payload() {
+        // An empty-payload fragment is header + 0 payload + 4-byte checksum; drop
+        // the checksum so the buffer is exactly the header length.
+        let mut buf = valid_fragment(b"");
+        buf.truncate(CORE_HEADER_LEN as usize);
+        assert_eq!(buf.len(), CORE_HEADER_LEN as usize);
+        assert_eq!(decode(&buf), Err(FragmentError::TruncatedPayload));
+    }
+
     #[test]
     fn round_trips_a_replication_fragment() {
         let mut header = FragmentHeader::new_v1(CHUNK_ID, 3);
