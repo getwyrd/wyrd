@@ -666,7 +666,11 @@ mod tests {
     #[test]
     fn chunk_id_minter_packs_inode_in_the_high_bits() {
         let mut mint = chunk_id_minter(5);
-        assert_eq!(mint(), 5u128 << 64, "first id: inode in the high bits, seq 0");
+        assert_eq!(
+            mint(),
+            5u128 << 64,
+            "first id: inode in the high bits, seq 0"
+        );
         assert_eq!(mint(), (5u128 << 64) | 1, "seq increments in the low bits");
     }
 
