@@ -237,8 +237,12 @@ async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
 }
 
 async fn read_inode(meta: &MemMeta) -> InodeRecord {
+    read_inode_id(meta, 1).await
+}
+
+async fn read_inode_id(meta: &MemMeta, id: InodeId) -> InodeRecord {
     let bytes = meta
-        .get(&metadata::inode_key(1))
+        .get(&metadata::inode_key(id))
         .await
         .unwrap()
         .expect("inode present");
@@ -520,5 +524,207 @@ fn repair_priority_rises_as_redundancy_falls() {
     assert_eq!(
         keys[0], at_floor,
         "the near-floor chunk preempts comfortable ones in the drain order"
+    );
+}
+
+// ---- success identity: an Aborted plan must NOT be counted as a successful repair ----
+
+const INODE_COMMIT: InodeId = 11;
+const INODE_ABORT: InodeId = 12;
+const CHUNK_COMMIT: ChunkId = 0xC0FFEE;
+const CHUNK_ABORT: ChunkId = 0xA80872;
+
+/// Write one RS(2,1) object via the real write path, under `inode_id`/`name`/`chunk_id`.
+/// `four_domains()` places its 3 fragments on the first three domains A,B,C → servers
+/// 0,1,2 (the same placement [`write_rs_2_1`] asserts), so the two chunks this test
+/// builds share the same three servers and differ only in which fragment is lost.
+async fn write_rs_2_1_as(
+    meta: &MemMeta,
+    fleet: &Fleet<'_>,
+    inode_id: InodeId,
+    name: &str,
+    chunk_id: ChunkId,
+) -> Vec<u8> {
+    let data = format!("reconstruct erasure-coded chunk {chunk_id:#x}, every byte").into_bytes();
+    let topo = four_domains();
+    let outcome = write_new_object_placed(
+        meta,
+        fleet,
+        ROOT,
+        name,
+        inode_id,
+        &data,
+        data.len(),
+        EcScheme::ReedSolomon { k: 2, m: 1 },
+        &topo,
+        0,
+        1_000,
+        || chunk_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+    assert_eq!(
+        read_inode_id(meta, inode_id).await.chunk_map[0].placement,
+        vec![0, 1, 2],
+        "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
+    );
+    data
+}
+
+/// The value of a `monotonic_counter` metric read back off the Prometheus surface, summed
+/// over every exported sample (one per scope label-set). The OTel→Prometheus exporter
+/// suffixes a counter with `_total`; we accept either spelling so the read-back does not
+/// depend on that convention. A counter never emitted is absent from the surface → `0`.
+fn counter_total(exposed: &str, name: &str) -> u64 {
+    let with_suffix = format!("{name}_total");
+    exposed
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let key = fields.next()?;
+            let value = fields.next()?;
+            let metric = key.split('{').next().unwrap_or(key);
+            if metric == name || metric == with_suffix {
+                value.parse::<f64>().ok().map(|v| v as u64)
+            } else {
+                None
+            }
+        })
+        .sum()
+}
+
+/// BINDING success identity (proposal 0005 §326-332, ADR-0011; the in-code contract at
+/// `reconstruction.rs`): over a reconstruction pass, the quantity the durability-plane
+/// telemetry defines as "successful repairs" must equal **exactly** the count of plans
+/// whose outcome was `Committed`.
+///
+/// `reconstruction_repaired` is emitted once per plan UP FRONT — deliberately, before
+/// the heavy erasure-decode/commit section, because the `tracing`→OTel bridge can drop a
+/// metric emitted *after* that section under load. The outcome loop then offsets every
+/// NON-success on its own counter: a lost CAS race on `reconstruction_conflict`, an abort
+/// (the selector chose a server outside the fleet view, so nothing committed) on
+/// `reconstruction_aborted`. So derived successes = repaired − conflict − aborted.
+///
+/// This pass mixes a Committed plan with an Aborted one. Pre-fix the Aborted arm offset
+/// NOTHING, so derived successes = repaired − conflict over-counted by the one Aborted
+/// plan (2 instead of 1) — this assertion is RED. Post-fix the abort is offset and the
+/// identity holds.
+#[tokio::test]
+async fn an_aborted_repair_is_not_counted_as_a_successful_repair() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+
+    // Two RS(2,1) chunks, both placed on servers 0,1,2 (domains A,B,C).
+    write_rs_2_1_as(&meta, &fleet, INODE_COMMIT, "commit", CHUNK_COMMIT).await;
+    write_rs_2_1_as(&meta, &fleet, INODE_ABORT, "abort", CHUNK_ABORT).await;
+
+    // Differential loss, so the two plans take DIFFERENT outcomes in one pass:
+    //   * the COMMIT chunk loses domain C (server 2) → survivors on A,B → the rebuilt
+    //     fragment re-places on the free domain C (server 2, in the fleet) → Committed.
+    //   * the ABORT chunk loses domain B (server 1) → survivors on A,C → its only free
+    //     domain by the selector's util order is G (server 7), which is NOT in the fleet
+    //     view → the repair cannot place the rebuilt shard → Aborted (nothing committed).
+    d2.delete_fragment(FragmentId {
+        chunk: CHUNK_COMMIT,
+        index: 2,
+    })
+    .await
+    .unwrap();
+    d1.delete_fragment(FragmentId {
+        chunk: CHUNK_ABORT,
+        index: 1,
+    })
+    .await
+    .unwrap();
+    repair::enqueue_repair(&meta, CHUNK_COMMIT, "health")
+        .await
+        .unwrap();
+    repair::enqueue_repair(&meta, CHUNK_ABORT, "health")
+        .await
+        .unwrap();
+
+    // Reconstruction topology: A,B,C in the fleet, plus a GHOST domain G (server 7) the
+    // topology knows but the fleet does NOT hold. Loading domain B (server 1) makes the
+    // selector prefer the least-utilized free domain G for the abort chunk (whose free
+    // domains are {B, G}), while the commit chunk's free domains {C, G} tie on util and
+    // resolve to C by label — so one repair places in-fleet and one selects the ghost.
+    let mut topo = Topology::default();
+    topo.register(0, "A")
+        .register(1, "B")
+        .register(2, "C")
+        .register(7, "G")
+        .set_utilization(1, 100);
+    let recon_fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (1, &d1), (2, &d2)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &recon_fleet,
+        topology: &topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "at least one plan (the Committed one) repointed a placement record"
+    );
+
+    // Observe the committed count independently of the metric: exactly one obligation was
+    // drained by a real commit; the aborted one stays queued and its inode never bumped.
+    let remaining = repair::queued_repairs(&meta).await.unwrap();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "only the aborted plan's obligation stays queued; got {remaining:?}"
+    );
+    assert!(
+        remaining.contains(&CHUNK_ABORT),
+        "the queued obligation is the aborted chunk; got {remaining:?}"
+    );
+    assert_eq!(
+        read_inode_id(&meta, INODE_COMMIT).await.version,
+        2,
+        "the committed plan bumped its inode with one version-conditional commit"
+    );
+    assert_eq!(
+        read_inode_id(&meta, INODE_ABORT).await.version,
+        1,
+        "the aborted plan committed nothing (its inode is unchanged)"
+    );
+    let committed_count = 2 - remaining.len() as u64; // 2 obligations enqueued, 1 still queued
+    assert_eq!(committed_count, 1, "exactly one plan committed");
+
+    // BINDING: the telemetry's derived successes equal the committed count.
+    telemetry.flush().unwrap();
+    let exposed = telemetry
+        .gather_prometheus()
+        .expect("Prometheus surface configured");
+    let repaired = counter_total(&exposed, "reconstruction_repaired");
+    let conflict = counter_total(&exposed, "reconstruction_conflict");
+    let aborted = counter_total(&exposed, "reconstruction_aborted");
+    let derived_successes = repaired.saturating_sub(conflict).saturating_sub(aborted);
+    assert_eq!(
+        derived_successes, committed_count,
+        "successful repairs (reconstruction_repaired − conflict − aborted) must equal the \
+         committed count: got repaired={repaired} conflict={conflict} aborted={aborted} \
+         (derived {derived_successes}) vs committed {committed_count}\n{exposed}"
     );
 }
