@@ -18,23 +18,20 @@
 //!    the window gate and the within-grace orphan is reclaimed early.
 //! 4. **Durability-plane emission** (`0005:336-340`, ADR-0011/0012): GC actions are
 //!    emitted on the `DurabilityTelemetry` seam as metric + audit events and read
-//!    back in-process via `gather_prometheus`.
+//!    back in-process via `gather_prometheus`. This leg lives in its own test binary
+//!    (`gc_telemetry.rs`) — it must not share this process's `tracing` callsite cache
+//!    with the criteria above (issue #214).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tracing::instrument::WithSubscriber;
-use tracing_subscriber::prelude::*;
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
-use wyrd_custodian::{
-    mark_orphaned, reconcile_step, Custodian, DurabilityTelemetry, ExporterConfig, FencedZone,
-    GcContext, Reconciled,
-};
+use wyrd_custodian::{mark_orphaned, reconcile_step, Custodian, FencedZone, GcContext, Reconciled};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
     WriteBatch,
@@ -331,57 +328,5 @@ async fn honours_the_reader_safe_grace_window() {
     assert!(
         d0.get_fragment(frag(chunk, 0)).await.unwrap().is_none(),
         "the orphan is reclaimed only after the reader-safe grace window"
-    );
-}
-
-// ---- criterion 4: GC actions on the durability-plane seam, read back in-process ----
-
-#[tokio::test]
-async fn emits_gc_actions_on_the_durability_seam() {
-    let meta = MemMeta::default();
-    let d0 = MemDServer::default();
-
-    // One reclaim (an expired orphan) and one skip (a committed reference) so both
-    // the reclaim and skip metrics are emitted.
-    let orphan_chunk: ChunkId = 0xF6;
-    d0.put(frag(orphan_chunk, 0)).await;
-    mark_orphaned(&meta, 0, frag(orphan_chunk, 0), 0)
-        .await
-        .unwrap();
-
-    let live_chunk: ChunkId = 0x17;
-    d0.put(frag(live_chunk, 0)).await;
-    commit_reference(&meta, 1, "live", live_chunk, 0).await;
-
-    let coord = MemCoordination::new();
-    let (zone, custodian) = elect(&coord).await;
-    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
-    let ctx = GcContext {
-        meta: &meta,
-        fleet: &fleet,
-        grace_window_millis: 10,
-    };
-
-    // Wire the backend-agnostic durability seam (ADR-0012) and run GC under it.
-    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
-    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
-
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 100)
-        .with_subscriber(subscriber)
-        .await
-        .unwrap();
-    assert_eq!(outcome, Reconciled::Changed);
-
-    telemetry.flush().unwrap();
-    let exposed = telemetry
-        .gather_prometheus()
-        .expect("Prometheus surface configured");
-    assert!(
-        exposed.contains("gc_fragments_reclaimed"),
-        "the GC reclaim metric is exported on the durability seam; got:\n{exposed}"
-    );
-    assert!(
-        exposed.contains("gc_fragments_skipped"),
-        "the GC skip metric is exported on the durability seam; got:\n{exposed}"
     );
 }
