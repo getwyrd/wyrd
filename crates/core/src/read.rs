@@ -136,7 +136,21 @@ async fn read_chunk(
                 .await?
                 .ok_or(ReadError::MissingFragment { chunk_id: chunk.id })?;
             match decode(&fragment) {
-                Ok(decoded) => Ok(decoded.payload),
+                // Admit the fragment only if it decodes cleanly AND its header names
+                // the chunk being read — the same gate the shared verify enforces
+                // (`repair::fragment_intact`, `repair.rs`). This is the inline decode
+                // that verify is documented to mirror (`0005:262-267`, `0005:174-176`).
+                Ok(decoded) if decoded.header.chunk_id == chunk.id => Ok(decoded.payload),
+                Ok(_) => {
+                    // A misplaced-but-intact single fragment: it decodes cleanly but
+                    // its header names a DIFFERENT chunk (a misrouted / placement-
+                    // confused fragment). Never return its foreign bytes as this
+                    // chunk; record the chunk as a durable repair obligation and
+                    // surface a missing-fragment error — this chunk has no usable
+                    // fragment here, exactly as scrub/reconstruction exclude it.
+                    corrupt.push(chunk.id);
+                    Err(ReadError::MissingFragment { chunk_id: chunk.id }.into())
+                }
                 Err(e) => {
                     // A present-but-corrupt single fragment: never return its bytes,
                     // and record the chunk as a durable repair obligation before
@@ -174,7 +188,12 @@ async fn read_chunk(
             while let Some((index, fetched)) = inflight.next().await {
                 if let Ok(Some(fragment)) = fetched {
                     match decode(&fragment) {
-                        Ok(decoded) => {
+                        // Admit a survivor only if it decodes cleanly AND its header
+                        // names this chunk — the same gate `repair::intact_shard`
+                        // applies in reconstruction (`0005:262-267`). A misplaced-but-
+                        // intact fragment (valid checksum, foreign `chunk_id`) is
+                        // excluded from the decoder, never fed as a shard at `index`.
+                        Ok(decoded) if decoded.header.chunk_id == chunk.id => {
                             shards.push((index as usize, decoded.payload));
                             if shards.len() == k {
                                 // `k` verified: drop the outstanding fetches, which
@@ -182,11 +201,12 @@ async fn read_chunk(
                                 break;
                             }
                         }
-                        Err(_) => {
-                            // A present fragment that fails its checksum is bit rot:
-                            // excluded from the decoder (read around) AND its chunk
-                            // recorded as a repair obligation, never silently absorbed
-                            // (`0005:174-176`, `0005:262-264`).
+                        // A present fragment that fails its checksum (decode `Err`) or
+                        // names a different chunk (misplaced) is bit rot / a misrouted
+                        // fragment: excluded from the decoder (read around) AND its
+                        // chunk recorded as a repair obligation, never silently
+                        // absorbed (`0005:174-176`, `0005:262-264`).
+                        _ => {
                             corrupt.push(chunk.id);
                         }
                     }
