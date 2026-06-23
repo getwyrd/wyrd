@@ -25,10 +25,17 @@ name: mutants
 #     budget as the workspace grows: cargo-mutants partitions its mutant list
 #     deterministically across N shards, so each runner tests ~1/N of them in
 #     parallel. The expensive `wyrd-server` mutants (~5s build + ~13s test each) are
-#     spread across all shards, which is what buys the wall-clock win. A single
-#     unsharded sweep was ~18–22 min and sat right at the edge of being interrupted
-#     before the report finalized; sharding gives generous headroom under the
-#     per-job `timeout-minutes` backstop.
+#     spread across all shards, which is what buys the wall-clock win: an unsharded
+#     sweep was ~18–22 min, and sharding gives generous headroom under the per-job
+#     `timeout-minutes` backstop.
+#
+# NOTE: neither `timeout-minutes` nor the shard count is what keeps a runaway mutant
+# from killing a shard. A mutant that turns a loop counter into a no-op
+# (`i += 1` → `i *= 1`) makes an allocating loop run forever and OOM-kills the runner
+# in seconds — far inside any time budget, and on whatever shard the mutant lands.
+# It surfaces as a spurious "operation was canceled" (NOT a TIMEOUT), which is what
+# was originally misread as an "external runner shutdown" (issue #216). That class is
+# contained by running each sweep inside a memory-capped cgroup; see the steps below.
 
 on:
   pull_request:
@@ -73,10 +80,19 @@ jobs:
 
       - name: cargo mutants (PR diff)
         continue-on-error: true
+        # Memory-capped cgroup — see the full-sweep step below for why: a
+        # no-op-loop-counter mutant can OOM-kill the runner before the timeout
+        # fires. `OOMPolicy=continue` confines the kill to the runaway test.
         run: |
           git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
           git diff "origin/${{ github.base_ref }}" > pr.diff
-          cargo mutants --in-diff pr.diff --no-shuffle \
+          sudo systemd-run --scope --quiet --collect \
+            -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            --setenv=CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            --setenv=RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            "$(command -v cargo)" mutants --in-diff pr.diff --no-shuffle \
             --package wyrd-chunk-format \
             --package wyrd-core \
             --package wyrd-traits \
@@ -125,8 +141,25 @@ jobs:
 
       - name: cargo mutants (full sweep, shard ${{ matrix.shard }}/8)
         continue-on-error: true
+        # Run the sweep inside a memory-capped cgroup. A mutant that turns a
+        # loop counter into a no-op — e.g. `i += 1` → `i *= 1`, which cargo-mutants
+        # generates for every such counter — makes an allocating loop run forever
+        # (`positionals.push(args[0].clone())` with `i` stuck at 0). That fills RAM
+        # and OOM-kills the whole runner *before* the per-mutant timeout can fire,
+        # so the failure surfaces as a spurious "operation was canceled" rather than
+        # a TIMEOUT, and `continue-on-error` cannot catch it (a cancelled runner is
+        # not a non-zero step). The cap + `OOMPolicy=continue` makes the kernel
+        # OOM-kill only the runaway *test* subprocess; cargo-mutants survives,
+        # records the mutant as caught, and the sweep finishes. The runner agent
+        # lives outside the scope, so the cap can never take the runner down.
         run: |
-          cargo mutants --no-shuffle --shard ${{ matrix.shard }}/8 \
+          sudo systemd-run --scope --quiet --collect \
+            -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
+            --setenv=CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            --setenv=RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            "$(command -v cargo)" mutants --no-shuffle --shard ${{ matrix.shard }}/8 \
             --package wyrd-chunk-format \
             --package wyrd-core \
             --package wyrd-traits \
