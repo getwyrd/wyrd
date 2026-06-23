@@ -97,3 +97,36 @@ pub async fn queued_repairs(meta: &dyn MetadataStore) -> Result<Vec<ChunkId>> {
     }
     Ok(chunks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wyrd_chunk_format::{encode, FragmentHeader};
+
+    /// `:68` `== -> !=` — `intact_shard` decodes a survivor's payload ONLY when the
+    /// fragment's header names the requested chunk. A checksum-valid fragment naming
+    /// a DIFFERENT chunk is a misplaced shard and must be rejected (`None`), never fed
+    /// to the decoder (`0005:262-267`). The suite exercised only checksum failure, so
+    /// inverting the chunk-id match (`!=`) — accept the wrong chunk, reject the right
+    /// one — survived.
+    #[test]
+    fn intact_shard_accepts_matching_chunk_and_rejects_a_misplaced_one() {
+        let chunk: ChunkId = 0xABCD;
+        let payload = b"a survivor shard's bytes";
+        let bytes = encode(
+            &FragmentHeader::new_v1(chunk, payload.len() as u64),
+            payload,
+        );
+
+        assert_eq!(
+            intact_shard(&bytes, chunk).as_deref(),
+            Some(payload.as_slice()),
+            "a checksum-valid fragment whose header names `chunk` yields its payload"
+        );
+        assert_eq!(
+            intact_shard(&bytes, 0x9999),
+            None,
+            "the same bytes against a DIFFERENT chunk id are a misplaced fragment: rejected"
+        );
+    }
+}
