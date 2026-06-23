@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tower::limit::GlobalConcurrencyLimitLayer;
+use tower::load_shed::LoadShedLayer;
 use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService};
 use wyrd_core::placement::Topology;
 use wyrd_traits::{ChunkStore, Coordination, DServerId, Lease, Result};
@@ -33,6 +35,99 @@ pub const DSERVER_GROUP: &str = "chunkstore";
 /// configured — a single-domain zone (the M2 best-effort posture). Real
 /// deployments set a per-server rack / power / switch label (architecture §7.3).
 pub const DEFAULT_FAILURE_DOMAIN: &str = "default";
+
+/// Default **server-wide** admission limit: the maximum number of concurrent
+/// in-flight requests the whole d-server admits — across *all* connections —
+/// before it **sheds** the excess (architecture §8.9). 64 is a moderate,
+/// SSD-leaning middle ground; see [`AdmissionControl`] for tuning it to the
+/// backing device's useful queue depth (shallower for an HDD spindle).
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 64;
+
+/// Default per-connection admission limit: a secondary, transport-level cap on the
+/// concurrent in-flight requests a *single* connection may hold. This bounds the
+/// fan-in one client can impose, but it is **not** the server-wide bound — that is
+/// [`DEFAULT_MAX_CONCURRENT_REQUESTS`], the shared limit that actually fails the
+/// server closed under a many-connection overload.
+pub const DEFAULT_MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 64;
+
+/// Default request-handler timeout: the hard ceiling on the wall-clock time one
+/// request may run before it is cut with a deadline status, so a stuck handler
+/// never pins an admission slot forever.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default per-connection HTTP/2 inbound-stream cap — bounds the request fan-in a
+/// single connection can open at the transport layer (the implicit `h2` default
+/// leaves it effectively unbounded).
+pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 256;
+
+/// Default HTTP/2 server keepalive ping interval — reclaims admission slots
+/// stranded behind a silently dead peer.
+pub const DEFAULT_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Admission-control and backpressure configuration for the d-server's gRPC
+/// transport — the knobs that make the request-admission path **fail closed under
+/// pressure** (architecture §8.9,
+/// `docs/design/architecture/08-crosscutting-concepts.md:98-107`) instead of
+/// degrading into unbounded contention and thread-pool exhaustion.
+///
+/// **The binding bound is server-wide.** Beyond
+/// [`max_concurrent_requests`](Self::max_concurrent_requests) admitted *across all
+/// connections combined* the server sheds the excess with a retryable
+/// `RESOURCE_EXHAUSTED` "busy" signal, so an overloaded client is told to back off
+/// and retry rather than having its requests queue without bound and contend for
+/// runtime threads. This is enforced with one shared semaphore cloned across every
+/// connection (see [`DServer::serve`]) — a *per-connection* limit alone does not
+/// fail the server closed, because aggregate in-flight would still grow without
+/// bound in the number of connections.
+/// [`max_concurrent_requests_per_connection`](Self::max_concurrent_requests_per_connection)
+/// is a secondary, per-connection cap; [`request_timeout`](Self::request_timeout)
+/// bounds the work a single request can pin, so a hung handler is cut loose with a
+/// deadline status rather than holding an admission slot forever.
+///
+/// **Tuning to the device's useful queue depth.** The server-wide admission limit
+/// should track how many concurrent I/Os the backing store serves *usefully*: a
+/// single HDD spindle saturates at a shallow queue (tune it *down*, e.g. 8–16),
+/// while an SSD/NVMe device sustains a much deeper queue (tune it *up*, e.g. 256+).
+/// The [`Default`] is a moderate middle ground
+/// ([`DEFAULT_MAX_CONCURRENT_REQUESTS`]) — it is **not** a fixed constant;
+/// operators set it per deployment.
+#[derive(Debug, Clone)]
+pub struct AdmissionControl {
+    /// Maximum concurrent in-flight requests admitted **server-wide** (across all
+    /// connections); beyond it the excess is shed with a retryable
+    /// `RESOURCE_EXHAUSTED` status. This is the operator-tunable bound that fails
+    /// the server closed under pressure.
+    pub max_concurrent_requests: usize,
+    /// Maximum concurrent in-flight requests admitted **per connection** — a
+    /// secondary transport-level cap on a single client's fan-in. The server-wide
+    /// [`max_concurrent_requests`](Self::max_concurrent_requests) is the binding
+    /// bound; this only stops one connection from monopolising the budget.
+    pub max_concurrent_requests_per_connection: usize,
+    /// Hard per-request timeout: a handler that runs longer is cut with a deadline
+    /// status, freeing its admission slot.
+    pub request_timeout: Duration,
+    /// Maximum concurrent HTTP/2 inbound streams per connection — caps the
+    /// transport-level request fan-in.
+    pub max_concurrent_streams: u32,
+    /// Disable Nagle's algorithm: gRPC frames are small and latency-sensitive, so
+    /// coalescing them adds delay for no throughput gain.
+    pub tcp_nodelay: bool,
+    /// HTTP/2 server keepalive ping interval; `None` disables keepalive.
+    pub http2_keepalive_interval: Option<Duration>,
+}
+
+impl Default for AdmissionControl {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: DEFAULT_MAX_CONCURRENT_REQUESTS,
+            max_concurrent_requests_per_connection: DEFAULT_MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            max_concurrent_streams: DEFAULT_MAX_CONCURRENT_STREAMS,
+            tcp_nodelay: true,
+            http2_keepalive_interval: Some(DEFAULT_HTTP2_KEEPALIVE_INTERVAL),
+        }
+    }
+}
 
 /// What a D server publishes through `Coordination::register` (proposal 0005, "The
 /// placement record", `0005:194-196`): its **stable id**, its current dialable
@@ -78,6 +173,7 @@ pub struct DServer<S> {
     endpoint: String,
     id: DServerId,
     failure_domain: String,
+    admission: AdmissionControl,
 }
 
 impl<S: ChunkStore + 'static> DServer<S> {
@@ -95,6 +191,7 @@ impl<S: ChunkStore + 'static> DServer<S> {
             endpoint: format!("http://{addr}"),
             id: 0,
             failure_domain: DEFAULT_FAILURE_DOMAIN.to_string(),
+            admission: AdmissionControl::default(),
         })
     }
 
@@ -106,6 +203,21 @@ impl<S: ChunkStore + 'static> DServer<S> {
         self.id = id;
         self.failure_domain = failure_domain.into();
         self
+    }
+
+    /// Set the [`AdmissionControl`] posture this server's gRPC transport applies —
+    /// the **server-wide** admission limit, request timeout, and the HTTP/2 / TCP
+    /// tuning that make the request-admission path **fail closed under pressure**
+    /// (architecture §8.9). Defaults to [`AdmissionControl::default`]; operators
+    /// tune the limit to the backing device's useful queue depth.
+    pub fn with_admission_control(mut self, admission: AdmissionControl) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    /// The admission-control posture this server's gRPC transport applies.
+    pub fn admission_control(&self) -> &AdmissionControl {
+        &self.admission
     }
 
     /// The dialable endpoint this server advertises (e.g. `http://127.0.0.1:50051`).
@@ -157,7 +269,42 @@ impl<S: ChunkStore + 'static> DServer<S> {
         Co: Coordination + 'static,
     {
         let service = ChunkStoreService::new(self.store);
+        let admission = self.admission;
         let serve = Server::builder()
+            // Fail-closed admission, SERVER-WIDE (architecture §8.9). Applied via
+            // `.layer()`, the layer stack is built once and *cloned* per connection,
+            // so a `GlobalConcurrencyLimitLayer` (which holds one `Arc<Semaphore>`)
+            // bounds the concurrent in-flight requests across the WHOLE server, not
+            // per connection — aggregate in-flight can never exceed the limit no
+            // matter how many connections pile on. The outer `LoadShedLayer` turns
+            // the limit's backpressure into an immediate *shed*: an over-limit
+            // request is rejected with `tower`'s `Overloaded`, which tonic maps to a
+            // retryable `RESOURCE_EXHAUSTED` status (verified against tonic 0.14.6
+            // `status.rs`: `Overloaded` -> `Status::resource_exhausted`), instead of
+            // queuing without bound and contending for runtime threads.
+            //
+            // Order matters: the FIRST `.layer()` is the OUTERMOST, so load-shed
+            // wraps the concurrency limit and sheds when the shared semaphore is
+            // exhausted (verified against tower 0.5 `ServiceBuilder`/`Stack`).
+            .layer(LoadShedLayer::new())
+            .layer(GlobalConcurrencyLimitLayer::new(
+                admission.max_concurrent_requests,
+            ))
+            // Secondary, per-connection caps: a single connection cannot monopolise
+            // the budget, and `load_shed` makes its over-limit excess shed too. The
+            // server-wide layer above is the binding fail-closed bound; these only
+            // shape a single client's fan-in.
+            .concurrency_limit_per_connection(admission.max_concurrent_requests_per_connection)
+            .load_shed(true)
+            // Bound the work a single request can pin: a handler past this deadline
+            // is cut loose rather than holding its admission slot forever.
+            .timeout(admission.request_timeout)
+            // Cap per-connection HTTP/2 stream fan-in (the implicit h2 default is
+            // effectively unbounded) and tune the TCP/keepalive posture for small,
+            // latency-sensitive gRPC frames.
+            .max_concurrent_streams(Some(admission.max_concurrent_streams))
+            .tcp_nodelay(admission.tcp_nodelay)
+            .http2_keepalive_interval(admission.http2_keepalive_interval)
             .add_service(ChunkStoreServer::new(service))
             .serve_with_incoming_shutdown(TcpListenerStream::new(self.listener), shutdown);
 

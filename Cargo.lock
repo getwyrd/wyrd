@@ -2558,6 +2558,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "wyrd-chunk-format",
  "wyrd-chunkstore-fs",
  "wyrd-chunkstore-grpc",
