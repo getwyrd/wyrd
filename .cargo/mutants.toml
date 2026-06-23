@@ -1,0 +1,35 @@
+# cargo-mutants configuration.
+#
+# `exclude_re` lists EQUIVALENT mutants — cargo-mutants survivors that no test can
+# kill because they do not change observable behaviour on any input the system
+# produces. Excluding them keeps the nightly sweep's surviving-mutant list down to
+# *real* test gaps. Each entry is matched against the mutant name shown by
+# `cargo mutants --list` and pins the file:line:col, so the exclusion fails safe: if
+# the code shifts, the mutant reappears for re-review rather than staying hidden.
+#
+# Every entry below was verified equivalent by hand; see issue #225 for the audit.
+# A killable survivor gets a regression test instead — it never belongs here.
+exclude_re = [
+    # erasure.rs:72 `i * size < data.len()` -> `<=`: `start` only reaches
+    # `data.len()` for a shard wholly inside the zero-pad region, where the guarded
+    # body copies a zero-length slice. `<` vs `<=` is a no-op there.
+    'erasure\.rs:72:22: replace < with <= in encode',
+    # erasure.rs:113 `*idx < k + m` -> `<=`: `*idx` is a shard's global index,
+    # always in `0..k+m` for any real shard set. The two differ only at the
+    # out-of-range `idx == k+m`, which a correct caller never produces (and which
+    # both branches otherwise decline to treat as a data shard).
+    'erasure\.rs:113:24: replace < with <= in reconstruct',
+    # erasure.rs:118 `count() < k` -> `<=`: when exactly `k` data shards are present
+    # the decoder is skipped; `<=` runs `reed_solomon_simd::decode` with nothing
+    # missing, a no-op that returns the same bytes. (Proven: `round_trip_matrix`
+    # reconstructs from exactly the k data shards yet this mutant survives.)
+    'erasure\.rs:118:52: replace < with <= in reconstruct',
+    # conv.rs:24 `(hi << 64) | lo` -> `^`: `hi << 64` and `lo` (a u64 widened to
+    # u128) occupy disjoint bit ranges, so `|`, `^`, and `+` are identical for
+    # every input.
+    'conv\.rs:24:33: replace \| with \^ in from_wire_chunk_id',
+    # cli.rs:375 `(inode << 64) | seq` -> `^`: `inode << 64` and `seq` occupy
+    # disjoint bit ranges (seq never reaches 2^64 within a process), so `|` and `^`
+    # are identical for every minted id.
+    'cli\.rs:375:45: replace \| with \^ in chunk_id_minter',
+]
