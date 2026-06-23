@@ -237,4 +237,19 @@ mod tests {
             ErasureError::TooFewShards { have: 5, need: 6 }
         ));
     }
+
+    /// `:48` `source -> None` and `:49` delete the `Coder` arm — a `Coder` error
+    /// exposes the wrapped reed-solomon error as its `source`, so the error chain
+    /// stays walkable. Both mutants collapse `Coder(e)`'s source to `None`.
+    #[test]
+    fn coder_error_exposes_its_wrapped_source() {
+        let err =
+            ErasureError::Coder(reed_solomon_simd::Error::InvalidShardSize { shard_bytes: 64 });
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "a Coder error carries the reed-solomon error as its source"
+        );
+        // The non-wrapping variants legitimately have no source.
+        assert!(std::error::Error::source(&ErasureError::InconsistentShardSize).is_none());
+    }
 }
