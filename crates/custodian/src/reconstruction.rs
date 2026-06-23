@@ -156,9 +156,13 @@ pub(crate) async fn reconcile(
     // drop the late event), so the three M3 repair metrics (`0005:326-332`) are emitted
     // up front where the assessment is authoritative — the under-replicated chunk count
     // and, per chunk the pass is reconstructing, the dispatched-repair counter and the
-    // time-to-repair sample. A repair that subsequently loses the CAS race is recorded
-    // on the separate `reconstruction_conflict` counter (so successes = repaired −
-    // conflict), and re-assessed next pass.
+    // time-to-repair sample. Every non-success is offset on its own counter so the
+    // up-front count nets back to true successes: a repair that loses the CAS race is
+    // recorded on `reconstruction_conflict`, and one that cannot proceed (the selector
+    // chose a server outside the fleet view, so nothing is committed) on
+    // `reconstruction_aborted` — so successful repairs are
+    // `reconstruction_repaired − conflict − aborted`. Both offsets leave the obligation
+    // queued, to be re-assessed next pass.
     emit_under_replicated(plans.len());
     for plan in &plans {
         emit_repaired(plan.chunk_id, plan.missing.len(), now_millis);
@@ -169,7 +173,7 @@ pub(crate) async fn reconcile(
         match repair_chunk(ctx, &stores, plan, now_millis).await? {
             RepairOutcome::Committed => changed = true,
             RepairOutcome::Conflict => emit_conflict(plan.chunk_id),
-            RepairOutcome::Aborted => {}
+            RepairOutcome::Aborted => emit_aborted(plan.chunk_id),
         }
     }
 
@@ -292,7 +296,8 @@ enum RepairOutcome {
     /// The commit lost the CAS race (rebuilt fragments are now collectable garbage).
     Conflict,
     /// The repair could not proceed (e.g. the selector chose a server outside the
-    /// fleet view); nothing was committed.
+    /// fleet view); nothing was committed. Offset on `reconstruction_aborted` so an
+    /// aborted plan is not mistaken for a success (see [`emit_aborted`]).
     Aborted,
 }
 
@@ -430,7 +435,8 @@ fn emit_under_replicated(count: usize) {
 /// reconstructing. The sample is the logical instant of the repair pass; a per-obligation
 /// enqueue stamp (a precise elapsed window) is a later refinement of the shared queue's
 /// value encoding. A dispatched repair that loses its CAS is recorded separately on
-/// [`emit_conflict`], so successful repairs are `reconstruction_repaired − conflict`.
+/// [`emit_conflict`], and one that cannot proceed (no commit) on [`emit_aborted`], so
+/// successful repairs are `reconstruction_repaired − conflict − aborted`.
 fn emit_repaired(chunk: ChunkId, rebuilt: usize, now_millis: u64) {
     tracing::info!(monotonic_counter.reconstruction_repaired = 1_u64);
     tracing::info!(histogram.reconstruction_time_to_repair_millis = now_millis);
@@ -452,5 +458,21 @@ fn emit_conflict(chunk: ChunkId) {
         action = "conflict",
         chunk = %chunk,
         "reconstruction lost the version-conditional commit; rebuilt fragments are collectable garbage",
+    );
+}
+
+/// Emit an **aborted** repair on the same seam: the dispatched repair could not proceed
+/// (the selector chose a server outside the fleet view), so nothing was committed. Like
+/// [`emit_conflict`], this offsets the up-front [`emit_repaired`] increment — the
+/// obligation stays queued and the durability-plane success identity stays
+/// `reconstruction_repaired − conflict − aborted`, so an aborted plan never inflates the
+/// successful-repair count.
+fn emit_aborted(chunk: ChunkId) {
+    tracing::info!(monotonic_counter.reconstruction_aborted = 1_u64);
+    tracing::info!(
+        target: "wyrd.custodian.reconstruction.audit",
+        action = "aborted",
+        chunk = %chunk,
+        "reconstruction could not place the rebuilt shard(s); nothing was committed and the obligation stays queued",
     );
 }
