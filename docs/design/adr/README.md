@@ -45,6 +45,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0031](0031-watch-and-change-feed-contract.md) | Watch / change-feed contract | Proposed |
 | [0032](0032-d-server-on-disk-fragment-layout.md) | D-server on-disk fragment layout (FsChunkStore) | Proposed |
 | [0033](0033-fragment-durability-via-redundancy.md) | Fragment durability: redundancy + crash-atomic rename, not per-write fsync | Proposed |
+| [0034](0034-d-server-disk-model.md) | D server disk model: one-per-disk now, multi-disk reserved | Proposed |
 
 ## Why not ... ?
 
