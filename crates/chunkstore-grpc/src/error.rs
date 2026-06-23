@@ -58,3 +58,40 @@ impl std::error::Error for TransportError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `:33` / `:34` — `From<Status>` must route `Unavailable` to its own variant
+    /// and `DeadlineExceeded` to `Timeout` (a slow/dead fragment the read path reads
+    /// around), not collapse them into the generic `Rpc` arm. Deleting either match
+    /// arm sends that code to `_ => Rpc`.
+    #[test]
+    fn status_code_maps_to_the_specific_transport_variant() {
+        assert!(matches!(
+            TransportError::from(Status::unavailable("down")),
+            TransportError::Unavailable(_)
+        ));
+        assert!(matches!(
+            TransportError::from(Status::deadline_exceeded("slow")),
+            TransportError::Timeout(_)
+        ));
+        // An unclassified code still falls through to the generic arm.
+        assert!(matches!(
+            TransportError::from(Status::internal("boom")),
+            TransportError::Rpc(_)
+        ));
+    }
+
+    /// `:53` `source -> None` — `source` must expose the wrapped `Status` so the
+    /// error chain is walkable, not collapse to `None`.
+    #[test]
+    fn source_exposes_the_wrapped_status() {
+        let err = TransportError::from(Status::unavailable("down"));
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "the wrapped Status is the error source"
+        );
+    }
+}

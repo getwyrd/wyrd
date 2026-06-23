@@ -118,3 +118,149 @@ impl<C: ChunkStore> ChunkStore for FanoutChunkStore<C> {
 /// defaults). The chunk map — not the fan-out — is now the location authority; a
 /// custodian-aware fan-out that honours a *moved* id is a later M3 slice (0005, M3.1).
 impl<C: ChunkStore> PlacementChunkStore for FanoutChunkStore<C> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// An in-memory `ChunkStore` with a fixed reported health, cheap to clone so a
+    /// test can keep a handle after the store is moved into the fan-out and inspect
+    /// which backend a put landed on.
+    #[derive(Clone)]
+    struct MemStore {
+        frags: Arc<Mutex<HashMap<FragmentId, Bytes>>>,
+        health: Health,
+    }
+
+    impl MemStore {
+        fn with_health(health: Health) -> Self {
+            Self {
+                frags: Arc::new(Mutex::new(HashMap::new())),
+                health,
+            }
+        }
+        fn healthy() -> Self {
+            Self::with_health(Health::Healthy)
+        }
+        fn has(&self, id: FragmentId) -> bool {
+            self.frags.lock().unwrap().contains_key(&id)
+        }
+    }
+
+    #[async_trait]
+    impl ChunkStore for MemStore {
+        async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+            self.frags.lock().unwrap().insert(id, fragment);
+            Ok(())
+        }
+        async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+            Ok(self.frags.lock().unwrap().get(&id).cloned())
+        }
+        async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+            Ok(self.frags.lock().unwrap().keys().copied().collect())
+        }
+        async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+            self.frags.lock().unwrap().remove(&id);
+            Ok(())
+        }
+        async fn health(&self) -> Result<Health> {
+            Ok(self.health)
+        }
+    }
+
+    fn fid(index: u16) -> FragmentId {
+        FragmentId {
+            chunk: 0xC0FFEE,
+            index,
+        }
+    }
+
+    /// `:54` `width -> 0` / `1` — the reported width is the backing-store count.
+    #[tokio::test]
+    async fn width_reports_the_backing_store_count() {
+        let fanout = FanoutChunkStore::new(vec![
+            MemStore::healthy(),
+            MemStore::healthy(),
+            MemStore::healthy(),
+        ]);
+        assert_eq!(fanout.width(), 3, "width is the number of backing stores");
+    }
+
+    /// `:59` `% -> +` / `% -> /` — routing places index `i` on store `i % n`.
+    /// `+` overruns the slice (panic); `/` collapses low indices onto store 0. Pin
+    /// that index 1 lands on store[1] (not store[0]) and index 2 wraps to store[0].
+    #[tokio::test]
+    async fn route_places_each_index_on_index_mod_n() {
+        let a = MemStore::healthy();
+        let b = MemStore::healthy();
+        let fanout = FanoutChunkStore::new(vec![a.clone(), b.clone()]);
+
+        fanout
+            .put_fragment(fid(1), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        assert!(b.has(fid(1)), "index 1 routes to store[1] (1 % 2)");
+        assert!(!a.has(fid(1)), "index 1 is not on store[0]");
+
+        fanout
+            .put_fragment(fid(2), Bytes::from_static(b"y"))
+            .await
+            .unwrap();
+        assert!(a.has(fid(2)), "index 2 wraps to store[0] (2 % 2)");
+    }
+
+    /// `:78` `list_fragments -> Ok(vec![])` — the listing is the union of the
+    /// backends' fragments, not empty.
+    #[tokio::test]
+    async fn list_fragments_unions_every_backend() {
+        let fanout = FanoutChunkStore::new(vec![MemStore::healthy(), MemStore::healthy()]);
+        fanout
+            .put_fragment(fid(0), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        fanout
+            .put_fragment(fid(1), Bytes::from_static(b"y"))
+            .await
+            .unwrap();
+
+        let mut listed = fanout.list_fragments().await.unwrap();
+        listed.sort_by_key(|f| f.index);
+        assert_eq!(
+            listed,
+            vec![fid(0), fid(1)],
+            "the fan-out lists what its backends hold"
+        );
+    }
+
+    /// `:105` `== -> !=` and `:100` `+= -> -=` — `Healthy` requires every backend
+    /// healthy (`healthy == n`). `-=` underflows the `usize` counter (panic); `!=`
+    /// flips an all-healthy fan-out to `Degraded`.
+    #[tokio::test]
+    async fn health_is_healthy_only_when_all_backends_are() {
+        let fanout = FanoutChunkStore::new(vec![MemStore::healthy(), MemStore::healthy()]);
+        assert_eq!(fanout.health().await.unwrap(), Health::Healthy);
+    }
+
+    /// `:107` `== -> !=` and `:102` `+= -> -=` — `Unhealthy` requires every backend
+    /// unhealthy (`unhealthy == n`).
+    #[tokio::test]
+    async fn health_is_unhealthy_only_when_all_backends_are() {
+        let fanout = FanoutChunkStore::new(vec![
+            MemStore::with_health(Health::Unhealthy),
+            MemStore::with_health(Health::Unhealthy),
+        ]);
+        assert_eq!(fanout.health().await.unwrap(), Health::Unhealthy);
+    }
+
+    /// A single dead backend degrades the fan-out without failing it.
+    #[tokio::test]
+    async fn health_degrades_on_a_single_dead_backend() {
+        let fanout = FanoutChunkStore::new(vec![
+            MemStore::healthy(),
+            MemStore::with_health(Health::Unhealthy),
+        ]);
+        assert_eq!(fanout.health().await.unwrap(), Health::Degraded);
+    }
+}
