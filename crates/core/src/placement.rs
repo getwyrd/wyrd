@@ -411,4 +411,42 @@ mod tests {
         let err = select_distinct_domains_excluding(&t, 1, &occupied).unwrap_err();
         assert_eq!(err, SelectorError::InsufficientDomains { have: 0, need: 1 });
     }
+
+    /// `:158` `delete !` — `excluding` must carry the RETAINED servers'
+    /// utilization onto the filtered view and DROP the excluded servers'. The
+    /// existing `excluding_*` test only checked which servers survive, never whose
+    /// utilization is kept, so inverting the filter (keep only the excluded) survived.
+    #[test]
+    fn excluding_carries_retained_utilization_not_excluded() {
+        let mut t = Topology::default();
+        t.register(0, "A").register(1, "B");
+        t.set_utilization(0, 10).set_utilization(1, 99);
+        let drained: std::collections::BTreeSet<DServerId> = [1].into_iter().collect();
+        let filtered = t.excluding(&drained);
+        assert_eq!(
+            filtered.util(0),
+            10,
+            "the retained server's utilization is carried onto the filtered view"
+        );
+        assert_eq!(
+            filtered.util(1),
+            0,
+            "the excluded (draining) server's utilization is dropped, not kept"
+        );
+    }
+
+    /// `:282` `< -> <=` — a topology offering EXACTLY `need` free domains must
+    /// succeed. Prior tests exercised only strictly-more (success) and strictly-fewer
+    /// (refusal); the `len == need` boundary was untested, so refusing at it survived.
+    #[test]
+    fn places_when_free_domains_exactly_equal_need() {
+        let mut t = Topology::default();
+        t.register(0, "A").register(1, "B").register(2, "C");
+        let picked = select_distinct_domains_excluding(&t, 3, &[]).unwrap();
+        assert_eq!(
+            picked.len(),
+            3,
+            "exactly `need` distinct free domains is enough to place"
+        );
+    }
 }
