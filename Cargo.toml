@@ -100,6 +100,13 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # and madsim-tonic 0.6.0+0.14 (added in M2.6) tracks tonic 0.14 — so the
 # deterministic-simulation DST runs the *real* wire code, no in-sim fake (ADR-0009).
 tonic = "0.14"
+# Tower middleware for the d-server's admission control (issue #205, architecture
+# §8.9 fail-closed-under-pressure). `tonic` already pulls `tower` transitively; we
+# depend on it directly to apply a SERVER-WIDE (shared-semaphore) concurrency bound
+# plus load-shedding via `Server::layer`, so an overload sheds a retryable status
+# instead of exhausting runtime threads. Only the two middleware modules we use:
+# `limit` (GlobalConcurrencyLimitLayer) and `load-shed` (LoadShedLayer).
+tower = { version = "0.5", default-features = false, features = ["limit", "load-shed"] }
 # tonic 0.14 split the prost codec into its own runtime crate; the generated
 # service stubs reference `tonic_prost::ProstCodec`.
 tonic-prost = "0.14"

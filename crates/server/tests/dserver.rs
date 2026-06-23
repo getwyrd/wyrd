@@ -12,15 +12,19 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot, Semaphore};
+use tonic::Code;
 use wyrd_chunk_format::{encode, FragmentHeader};
 use wyrd_chunkstore_fs::FsChunkStore;
-use wyrd_chunkstore_grpc::GrpcChunkStore;
+use wyrd_chunkstore_grpc::{GrpcChunkStore, TransportError};
 use wyrd_coordination_mem::MemCoordination;
-use wyrd_server::dserver::{discover_endpoints, select_fanout, DServer, DSERVER_GROUP};
+use wyrd_server::dserver::{
+    discover_endpoints, select_fanout, AdmissionControl, DServer, DSERVER_GROUP,
+};
 use wyrd_testkit::ManualClock;
-use wyrd_traits::{ChunkId, ChunkStore, Coordination, FragmentId};
+use wyrd_traits::{ChunkId, ChunkStore, Coordination, FragmentId, Health, Result};
 
 fn fid(chunk: ChunkId, index: u16) -> FragmentId {
     FragmentId { chunk, index }
@@ -161,4 +165,224 @@ async fn d_servers_register_serve_and_are_discovered() {
             .is_empty(),
         "a cleanly stopped D server withdraws its registration",
     );
+}
+
+/// A `ChunkStore` whose `get_fragment` **gates**: it signals (via `entered`) that a
+/// request has been admitted into the handler, then blocks on a [`Semaphore`]
+/// (`gate`) until the test releases it. So an admitted request can be made to hold
+/// its admission slot for as long as the test needs, while *excess* concurrent
+/// requests pile up against the server's configured admission limit.
+/// `put`/`list`/`delete`/`health` delegate straight through.
+struct GateStore {
+    inner: FsChunkStore,
+    entered: mpsc::UnboundedSender<()>,
+    gate: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl ChunkStore for GateStore {
+    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+        self.inner.put_fragment(id, fragment).await
+    }
+
+    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+        // Announce that this request was admitted into the handler (it holds an
+        // admission slot from here), then park until the test opens the gate.
+        let _ = self.entered.send(());
+        let _permit = self.gate.acquire().await.expect("gate not closed");
+        self.inner.get_fragment(id).await
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        self.inner.list_fragments().await
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.inner.delete_fragment(id).await
+    }
+
+    async fn health(&self) -> Result<Health> {
+        self.inner.health().await
+    }
+}
+
+/// Bind, register, and serve one D server over `store` with the given admission
+/// posture; return its endpoint, a shutdown trigger, and the serve task.
+async fn serve_gated(
+    store: GateStore,
+    admission: AdmissionControl,
+) -> (
+    String,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
+    let coord = Arc::new(MemCoordination::new());
+    let server = DServer::bind(store, "127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind")
+        .with_admission_control(admission);
+    let endpoint = server.endpoint().to_string();
+    let lease = server
+        .register(&*coord, DSERVER_GROUP, Duration::from_secs(3600))
+        .await
+        .expect("register");
+    let (tx, rx) = oneshot::channel();
+    let handle = tokio::spawn(
+        server.serve(coord, lease, Duration::from_secs(3600), async move {
+            let _ = rx.await;
+        }),
+    );
+    (endpoint, tx, handle)
+}
+
+/// Pull the gRPC [`tonic::Code`] out of a `ChunkStore` boxed error — the
+/// `GrpcChunkStore` boxes a [`TransportError`] that carries the wire `Status`.
+fn status_code(err: &wyrd_traits::BoxError) -> Code {
+    let te = err
+        .downcast_ref::<TransportError>()
+        .expect("a transport failure carries a TransportError");
+    match te {
+        TransportError::Unavailable(s) | TransportError::Timeout(s) | TransportError::Rpc(s) => {
+            s.code()
+        }
+        TransportError::Connect(e) => panic!("expected a gRPC status, got a connect error: {e}"),
+    }
+}
+
+/// Success criterion (issue #205, architecture §8.9): offered more concurrent
+/// requests than its configured admission limit, the d-server **sheds** the excess
+/// with a retryable "busy" status instead of admitting it unboundedly.
+///
+/// The binding bound is **server-wide**, so this drives the overload across
+/// **separate connections**: with a global admission limit of 1, one request on
+/// connection A is admitted and made to hold the single slot (parked in the gate),
+/// then a request on a *different* connection B — which has its own fresh
+/// per-connection budget — must still come back promptly with a retryable
+/// `RESOURCE_EXHAUSTED` / `UNAVAILABLE` status. That is what a per-connection-only
+/// limit cannot do: B would get its own slot and be admitted. Only a shared,
+/// server-wide semaphore sheds B.
+///
+/// Red pre-fix: the bare `Server::builder()` set **no** admission limit, so B was
+/// admitted and queued behind A's held slot — it never gets a shed status, so the
+/// bounded wait below elapses and the assertion fails. Green post-fix: the shared
+/// server-wide limit + load-shed reject it immediately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overload_across_connections_sheds_excess_with_a_retryable_status() {
+    let (store, _dir) = fs_store();
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(Semaphore::new(0)); // closed: handlers park until released
+    let gate_store = GateStore {
+        inner: store,
+        entered: entered_tx,
+        gate: gate.clone(),
+    };
+
+    // Server-wide admission limit of 1; a long request timeout so the *timeout*
+    // never fires during this test — the only thing that can answer the excess
+    // request is the shed path. A roomy per-connection cap proves the shed comes
+    // from the SERVER-WIDE bound, not the per-connection one.
+    let admission = AdmissionControl {
+        max_concurrent_requests: 1,
+        max_concurrent_requests_per_connection: 64,
+        request_timeout: Duration::from_secs(60),
+        ..AdmissionControl::default()
+    };
+    let (endpoint, shutdown, handle) = serve_gated(gate_store, admission).await;
+
+    // Two SEPARATE clients = two separate connections, so a per-connection-only
+    // limit would give each its own slot. Only a server-wide bound sheds the second.
+    let client_a = GrpcChunkStore::connect(endpoint.clone())
+        .await
+        .expect("connect A");
+    let client_b = GrpcChunkStore::connect(endpoint).await.expect("connect B");
+    let id = fid(0x5_1ED, 0);
+
+    // Request on connection A: admitted, enters the handler, holds the one slot.
+    let admitted = tokio::spawn(async move { client_a.get_fragment(id).await });
+    entered_rx
+        .recv()
+        .await
+        .expect("the admitted request reaches the handler and holds the slot");
+
+    // Request on connection B: it is over the SERVER-WIDE limit. Bound the wait so a
+    // pre-fix server (no limit, so it just queues) fails the test instead of hanging.
+    let excess = tokio::time::timeout(Duration::from_secs(5), client_b.get_fragment(id)).await;
+
+    let answered = excess.expect(
+        "the excess request on a SECOND connection must be answered (shed) within the budget, \
+         not left to queue behind the slot held on the first connection — a server-wide \
+         admission bound sheds it; a per-connection-only or unbounded server does not",
+    );
+    let err = answered.expect_err("an over-limit request is shed, not served a value");
+    let code = status_code(&err);
+    assert!(
+        matches!(code, Code::ResourceExhausted | Code::Unavailable),
+        "the excess request is shed with a retryable busy signal \
+         (resource-exhausted / unavailable), got {code:?}",
+    );
+
+    // Release the held slot so the admitted request completes, then shut down.
+    gate.add_permits(8);
+    let _ = admitted.await;
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// Success criterion (issue #205): a handler that hangs past the configured request
+/// timeout is **cut** with a deadline status rather than pinning its admission slot
+/// forever.
+///
+/// A single request whose handler never returns (the gate is never opened) must,
+/// once the request timeout elapses, come back with a deadline status. tonic 0.14
+/// surfaces a server-side handler timeout as `CANCELLED` (verified against
+/// `tonic-0.14.6` `status.rs`); the client may also observe `DEADLINE_EXCEEDED`.
+///
+/// Red pre-fix: the bare `Server::builder()` set **no** request timeout, so the hung
+/// handler is never cut and the bounded wait below elapses. Green post-fix: the
+/// configured timeout cuts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hung_handler_is_cut_by_the_request_timeout() {
+    let (store, _dir) = fs_store();
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let gate = Arc::new(Semaphore::new(0)); // never opened: the handler hangs
+    let gate_store = GateStore {
+        inner: store,
+        entered: entered_tx,
+        gate: gate.clone(),
+    };
+
+    // A short request timeout; a wide admission limit so nothing is *shed* — the
+    // only thing that can answer is the deadline cut.
+    let admission = AdmissionControl {
+        max_concurrent_requests: 64,
+        request_timeout: Duration::from_millis(200),
+        ..AdmissionControl::default()
+    };
+    let (endpoint, shutdown, handle) = serve_gated(gate_store, admission).await;
+
+    let client = GrpcChunkStore::connect(endpoint).await.expect("connect");
+    let id = fid(0xDEAD, 0);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), client.get_fragment(id)).await;
+    // The handler did start (it parked in the gate) — proves the timeout cut a
+    // genuinely in-flight request, not one that never reached the handler.
+    entered_rx
+        .recv()
+        .await
+        .expect("the request reached the handler before being cut");
+
+    let answered = outcome.expect(
+        "a hung handler must be cut by the request timeout within the budget, not pin its slot \
+         forever — a server with no request timeout never cuts it",
+    );
+    let err = answered.expect_err("a timed-out request returns an error status, not a value");
+    let code = status_code(&err);
+    assert!(
+        matches!(code, Code::Cancelled | Code::DeadlineExceeded),
+        "a handler past the request timeout is cut with a deadline status, got {code:?}",
+    );
+
+    gate.add_permits(8);
+    let _ = shutdown.send(());
+    let _ = handle.await;
 }

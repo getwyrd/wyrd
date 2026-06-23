@@ -328,6 +328,36 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MetricCapture {
     }
 }
 
+/// Install a permissive, process-global default `tracing` subscriber exactly once.
+///
+/// The durability-plane metrics are emitted with `tracing::info!`
+/// (`crates/custodian/src/reconstruction.rs:417,425,435-436` — e.g.
+/// `reconstruction_under_replicated`) and read back per property through a *scoped*
+/// [`MetricCapture`] installed via `.with_subscriber(..)`. `tracing` caches a **global,
+/// process-wide** interest per callsite the first time that callsite is hit: when the
+/// thread that hits it first has only the process default (`NoSubscriber`, whose interest
+/// is `never`) — which is every property in this file that does **not** wrap its
+/// `reconcile_step` in a capture subscriber — the callsite is cached `never` and the
+/// event is short-circuited before it can ever reach a later `with_subscriber` capture
+/// layer. Under `cargo test`'s parallel threads (and the 50-seed sweep) that registration
+/// races the capture, so [`prop_durability_emission_rises_then_returns_to_zero`]
+/// non-deterministically records **nothing** (`left: []`) and the emission assertion
+/// flakes — even at a fixed seed (the flake is in process-global state, not the seed).
+///
+/// Installing a permissive global default makes every callsite register as *enabled* no
+/// matter which property hits it first, so the interest cache can never be poisoned to
+/// `never` and the per-property capture is deterministic. A *scoped* `with_subscriber`
+/// still overrides this global default for routing, so captured events are unaffected;
+/// non-capturing properties simply route their events to this no-op registry, which
+/// stores nothing for them. Idempotent via [`Once`]; calling it first in every
+/// `#[madsim::test]` makes the install a barrier that completes before any callsite is hit.
+fn install_metric_dispatch() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 // ---- helpers ----
 
 const ROOT: InodeId = 0;
@@ -1005,31 +1035,37 @@ fn rand_seed() -> ChaCha8Rng {
 
 #[madsim::test]
 async fn reconstruct_to_full_redundancy_q1() {
+    install_metric_dispatch();
     prop_reconstruct_to_full_redundancy(&mut rand_seed()).await;
 }
 
 #[madsim::test]
 async fn commit_point_atomic_repair_under_crash() {
+    install_metric_dispatch();
     prop_commit_point_atomic_under_crash(&mut rand_seed()).await;
 }
 
 #[madsim::test]
 async fn scrub_detects_bit_rot_then_reconstructs_q2() {
+    install_metric_dispatch();
     prop_scrub_detects_bit_rot_then_reconstructs(&mut rand_seed()).await;
 }
 
 #[madsim::test]
 async fn gc_reclaims_only_true_orphans_q3() {
+    install_metric_dispatch();
     prop_gc_reclaims_only_true_orphans(&mut rand_seed()).await;
 }
 
 #[madsim::test]
 async fn fenced_stale_leader_lands_nothing() {
+    install_metric_dispatch();
     prop_fenced_stale_leader_lands_nothing(&mut rand_seed()).await;
 }
 
 #[madsim::test]
 async fn durability_emission_rises_then_returns_to_zero() {
+    install_metric_dispatch();
     prop_durability_emission_rises_then_returns_to_zero(&mut rand_seed()).await;
 }
 
@@ -1053,6 +1089,7 @@ const REGRESSION_SEEDS: &[u64] = &[
 
 #[madsim::test]
 async fn committed_regression_seeds_stay_green() {
+    install_metric_dispatch();
     for &seed in REGRESSION_SEEDS {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         prop_reconstruct_to_full_redundancy(&mut rng).await;

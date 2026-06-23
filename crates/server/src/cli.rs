@@ -263,6 +263,24 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         .unwrap_or(dserver::DEFAULT_FAILURE_DOMAIN)
         .to_string();
 
+    // Admission control / backpressure (architecture §8.9): operator-tunable so the
+    // server-wide limit matches the backing device's useful queue depth (shallow for
+    // an HDD spindle, deep for SSD/NVMe) rather than a fixed constant. Unset flags
+    // fall back to `AdmissionControl::default()`.
+    let admission = dserver::AdmissionControl {
+        max_concurrent_requests: parse_u64_flag(
+            &parsed,
+            "max-concurrent-requests",
+            dserver::DEFAULT_MAX_CONCURRENT_REQUESTS as u64,
+        )? as usize,
+        request_timeout: Duration::from_secs(parse_u64_flag(
+            &parsed,
+            "request-timeout-secs",
+            dserver::DEFAULT_REQUEST_TIMEOUT.as_secs(),
+        )?),
+        ..dserver::AdmissionControl::default()
+    };
+
     let chunk_dir = Path::new(data_dir).join("chunks");
     let store = FsChunkStore::open(&chunk_dir)?;
 
@@ -276,7 +294,8 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         let coord = Arc::new(MemCoordination::new());
         let server = DServer::bind(store, bind)
             .await?
-            .with_identity(dserver_id, failure_domain);
+            .with_identity(dserver_id, failure_domain)
+            .with_admission_control(admission);
         eprintln!(
             "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {data_dir})",
             server.endpoint()
