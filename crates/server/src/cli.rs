@@ -599,3 +599,84 @@ impl ParsedArgs {
         self.flags.get(name).map(String::as_str)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse_durability` — `:95` `==`/`||` and `:110` `k == 0`. Pin every form:
+    /// the two `none` aliases, a real `rs(k,m)`, the `k == 0` refusal, and a
+    /// non-form. `!=`/`&&` on the alias test, or `!=` on the `k == 0` guard, each
+    /// flip one of these outcomes.
+    #[test]
+    fn parse_durability_maps_each_form() {
+        assert_eq!(parse_durability("none").unwrap(), EcScheme::None);
+        assert_eq!(parse_durability("replication(1)").unwrap(), EcScheme::None);
+        assert_eq!(
+            parse_durability("rs(2,1)").unwrap(),
+            EcScheme::ReedSolomon { k: 2, m: 1 }
+        );
+        assert!(parse_durability("rs(0,1)").is_err(), "k must be at least 1");
+        assert!(parse_durability("nonsense").is_err());
+    }
+
+    /// `parse_endpoints` — `:413` `delete !`. The `!s.is_empty()` filter drops
+    /// blank entries and KEEPS the rest; deleting the `!` keeps only the blanks, so
+    /// every real endpoint list collapses to empty and errors.
+    #[test]
+    fn parse_endpoints_splits_trims_and_rejects_empty() {
+        assert_eq!(
+            parse_endpoints("http://a, http://b").unwrap(),
+            vec!["http://a".to_string(), "http://b".to_string()]
+        );
+        assert_eq!(
+            parse_endpoints("http://only").unwrap(),
+            vec!["http://only".to_string()]
+        );
+        assert!(parse_endpoints("").is_err(), "no endpoints is an error");
+        assert!(
+            parse_endpoints("  ,  ").is_err(),
+            "only-blank entries is an error"
+        );
+    }
+
+    /// `ParsedArgs::parse` — `:585` `+= -> *=` on the flag branch's `i += 2`. A
+    /// `--flag value` consumes BOTH tokens; `*=` (or the positional branch's
+    /// `i *= 1`) leaves the value behind as a stray positional (or loops). Pin that
+    /// a flag's value is not a positional.
+    #[test]
+    fn parsed_args_consumes_flag_value_pairs() {
+        let args: Vec<String> = ["a", "--k", "v", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = ParsedArgs::parse(&args).unwrap();
+        assert_eq!(
+            parsed.positionals,
+            vec!["a".to_string(), "b".to_string()],
+            "a flag consumes its value; the value is not a positional"
+        );
+        assert_eq!(parsed.flag("k"), Some("v"));
+    }
+
+    /// `chunk_id_minter` — `:375` `<<`. The id packs the inode into the high 64
+    /// bits with the sequence in the low bits; `>>` drops the inode entirely.
+    /// (The sibling `| -> ^` is an equivalent mutant — non-overlapping bit ranges
+    /// — handled in the equivalent-mutant declaration.)
+    #[test]
+    fn chunk_id_minter_packs_inode_in_the_high_bits() {
+        let mut mint = chunk_id_minter(5);
+        assert_eq!(
+            mint(),
+            5u128 << 64,
+            "first id: inode in the high bits, seq 0"
+        );
+        assert_eq!(mint(), (5u128 << 64) | 1, "seq increments in the low bits");
+    }
+
+    /// `:46` `<<` — the default chunk size is 1 MiB; `>>` collapses it to 0.
+    #[test]
+    fn default_chunk_size_is_one_mib() {
+        assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
+    }
+}

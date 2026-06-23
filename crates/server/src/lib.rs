@@ -181,3 +181,14 @@ impl fmt::Display for GatewayError {
 }
 
 impl std::error::Error for GatewayError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `:32` `<<` — the gateway's default chunk size is 1 MiB; `>>` collapses it to 0.
+    #[test]
+    fn default_chunk_size_is_one_mib() {
+        assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
+    }
+}

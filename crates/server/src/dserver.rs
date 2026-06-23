@@ -227,3 +227,26 @@ pub fn select_fanout(endpoints: &[String], n: usize) -> Vec<String> {
         .map(|i| endpoints[i % endpoints.len()].clone())
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wyrd_chunkstore_fs::FsChunkStore;
+
+    /// `:117` `id -> Default::default()` — `id()` reports the configured stable id,
+    /// not the `0` default. Bind a server, set an identity, and read it back.
+    #[tokio::test]
+    async fn id_reports_the_configured_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsChunkStore::open(dir.path()).unwrap();
+        let server = DServer::bind(store, "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap()
+            .with_identity(42, "rack-a");
+        assert_eq!(
+            server.id(),
+            42,
+            "id() returns the identity set via with_identity, not the default 0"
+        );
+    }
+}
