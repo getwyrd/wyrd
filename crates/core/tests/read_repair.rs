@@ -253,3 +253,134 @@ async fn unrecoverable_read_still_enqueues_the_corrupt_chunk() {
         "even a failed read leaves the corrupt chunk enqueued for reconstruction"
     );
 }
+
+// ---- issue #198: the read path enforces the `chunk_id` recheck the shared verify ----
+// ---- enforces — a misplaced-but-intact fragment is rejected on BOTH schemes -----------
+//
+// A misrouted / placement-confused fragment has a VALID self-describing checksum but a
+// header naming a DIFFERENT chunk. Scrub (`repair::fragment_intact`) and reconstruction
+// (`repair::intact_shard`) admit a fragment only if it decodes cleanly AND its header's
+// `chunk_id` matches; the read path must apply the same gate (`0005:262-267`,
+// `0005:174-176`). Flippable: drop the `decoded.header.chunk_id == chunk.id` guard from
+// either read site in `read::read_chunk` and the matching assertion below fires.
+
+/// `EcScheme::None`: a single stored fragment that decodes cleanly but whose header
+/// names a DIFFERENT chunk must NOT be returned as the requested chunk's payload — the
+/// read fails rather than handing back the foreign bytes.
+#[tokio::test]
+async fn none_read_rejects_a_misplaced_but_intact_fragment() {
+    let meta = MemMeta::default();
+    let chunks = MemChunks::default();
+
+    let chunk_id: ChunkId = 0xC0FFEE;
+    // A perfectly intact fragment — valid header + payload checksums — whose header
+    // names a DIFFERENT chunk. Its payload is the SAME length as the chunk we read, so a
+    // pre-fix admit would clear the inode size check and silently return foreign bytes.
+    let foreign_chunk: ChunkId = 0xDEAD_BEEF;
+    let foreign_payload = b"another chunk's bytes!";
+    chunks
+        .put_fragment(
+            FragmentId {
+                chunk: chunk_id,
+                index: 0,
+            },
+            fragment(foreign_chunk, foreign_payload),
+        )
+        .await
+        .unwrap();
+
+    commit_inode(
+        &meta,
+        1,
+        ChunkRef {
+            id: chunk_id,
+            scheme: EcScheme::None,
+            len: foreign_payload.len() as u64,
+            placement: vec![0],
+        },
+        foreign_payload.len() as u64,
+    )
+    .await;
+
+    // The foreign fragment is never admitted as this chunk: the read fails rather than
+    // returning the misplaced fragment's bytes. (Pre-fix the bare `decode` accepts on
+    // `Ok` and this returns `Ok(Some(foreign_payload))`.)
+    let got = read::read_object(&meta, &chunks, 1).await;
+    assert!(
+        got.is_err(),
+        "a misplaced-but-intact fragment (foreign chunk_id) must not be returned as the chunk; \
+         got {got:?}"
+    );
+}
+
+/// `EcScheme::ReedSolomon`: a misplaced-but-intact fragment occupying a surviving index
+/// is treated as **absent** — read around, never fed to the decoder. With only one
+/// genuine survivor besides it (below `k`), the read fails on insufficient fragments
+/// rather than feeding the foreign shard into the decoder (silent corrupt
+/// reconstruction).
+#[tokio::test]
+async fn ec_read_treats_a_misplaced_but_intact_fragment_as_absent() {
+    let meta = MemMeta::default();
+    let chunks = MemChunks::default();
+
+    // RS(2,1): 3 fragments, k = 2 needed to reconstruct. The payload spans BOTH data
+    // shards (> one aligned shard), so a foreign shard at a data index corrupts the live
+    // output — not padding that truncation discards — making "silent corrupt
+    // reconstruction" the real pre-fix outcome.
+    let (k, m) = (2u8, 1u8);
+    let data: Vec<u8> = (0..200u32).map(|i| (i % 199) as u8).collect();
+    let chunk_id: ChunkId = 0xF00D;
+    let shards = erasure::encode(k as usize, m as usize, &data).unwrap();
+    assert_eq!(shards.len(), 3);
+    let shard_len = shards[0].len();
+
+    // Index 0: the genuine data shard. Index 2: missing. Index 1: a misplaced-but-intact
+    // fragment — a valid fragment of the SAME shard length whose header names a DIFFERENT
+    // chunk (filled with 0xFF, a byte the data never contains). Only k - 1 = 1 genuine
+    // survivor remains, so the misplaced fragment is the only thing that could lift the
+    // read to k = 2 — if it is (wrongly) admitted.
+    chunks
+        .put_fragment(
+            FragmentId {
+                chunk: chunk_id,
+                index: 0,
+            },
+            fragment(chunk_id, &shards[0]),
+        )
+        .await
+        .unwrap();
+    let foreign_chunk: ChunkId = 0x9999;
+    chunks
+        .put_fragment(
+            FragmentId {
+                chunk: chunk_id,
+                index: 1,
+            },
+            fragment(foreign_chunk, &vec![0xFF; shard_len]),
+        )
+        .await
+        .unwrap();
+
+    commit_inode(
+        &meta,
+        1,
+        ChunkRef {
+            id: chunk_id,
+            scheme: EcScheme::ReedSolomon { k, m },
+            len: data.len() as u64,
+            placement: vec![0, 1, 2],
+        },
+        data.len() as u64,
+    )
+    .await;
+
+    // The misplaced fragment is excluded (treated as absent), leaving only one genuine
+    // survivor (< k), so the read fails — it is never fed to the decoder. (Pre-fix the
+    // bare `decode` accepts it on `Ok`, the decoder runs on a foreign shard at index 1,
+    // and the read returns silently corrupt bytes.)
+    let got = read::read_object(&meta, &chunks, 1).await;
+    assert!(
+        got.is_err(),
+        "a misplaced-but-intact shard must be read around, not fed to the decoder; got {got:?}"
+    );
+}
