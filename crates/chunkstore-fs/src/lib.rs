@@ -221,3 +221,60 @@ fn parse_chunk_dir_name(name: &str) -> Option<ChunkId> {
 fn parse_fragment_file_name(name: &str) -> Option<u16> {
     name.strip_suffix(".frag")?.parse().ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pollster::block_on;
+
+    /// `:212` `|| -> &&` — a chunk directory name is a chunk only when it is BOTH
+    /// exactly 32 chars AND all hex. With `&&`, a name that fails only the length
+    /// test (a short all-hex name) is no longer rejected up front, and
+    /// `from_str_radix` happily parses it — so a 3-char hex directory would be
+    /// misread as a chunk. Pin the short-hex name to `None`.
+    #[test]
+    fn parse_chunk_dir_name_requires_full_width_and_hex() {
+        assert!(
+            parse_chunk_dir_name(&"a".repeat(32)).is_some(),
+            "exactly 32 hex digits is a valid chunk dir"
+        );
+        assert_eq!(
+            parse_chunk_dir_name("abc"),
+            None,
+            "a short all-hex name is not a chunk dir"
+        );
+        assert_eq!(
+            parse_chunk_dir_name(&"z".repeat(32)),
+            None,
+            "32 non-hex chars are not a chunk dir"
+        );
+    }
+
+    /// `:109` `== -> !=` — `list_fragments` treats a MISSING root as an empty walk
+    /// (a never-written or removed store lists nothing), and only `NotFound`.
+    /// Flipping `==` to `!=` turns an absent root into a propagated error.
+    #[test]
+    fn list_fragments_on_an_absent_root_is_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("store");
+        let store = FsChunkStore::open(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let listed = block_on(store.list_fragments()).unwrap();
+        assert!(
+            listed.is_empty(),
+            "a store whose root is absent lists nothing rather than erroring"
+        );
+    }
+
+    /// `:194` `source -> None` — the error source must expose the wrapped
+    /// `FragmentError` so the error chain stays walkable.
+    #[test]
+    fn not_a_fragment_error_exposes_its_source() {
+        let err = FsChunkStoreError::NotAFragment(FragmentError::BadMagic);
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "NotAFragment carries its FragmentError as the error source"
+        );
+    }
+}
