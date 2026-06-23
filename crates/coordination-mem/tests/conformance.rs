@@ -160,6 +160,34 @@ fn renewal_extends_a_lease_and_expired_leases_cannot_renew() {
     });
 }
 
+/// `lib.rs:177` (`> -> >=`) AND `lib.rs:149` (`> -> >=`) — a lease lapses **at**
+/// its expiry instant, not one millisecond later. The existing tests only step the
+/// clock strictly past expiry, so flipping `>` to `>=` (treat `now == expiry` as
+/// still live) survived. Pin the boundary `now == expiry`:
+///   * `discover` must report the member as gone, and
+///   * `renew` must refuse it as expired.
+#[test]
+fn a_lease_is_gone_at_its_exact_expiry_instant() {
+    block_on(async {
+        let clock = ManualClock::new(0);
+        let c = MemCoordination::with_clock(clock.clone());
+        let lease = c
+            .register("svc", b("n"), Duration::from_millis(1_000))
+            .await
+            .unwrap(); // expiry = 0 + 1000 = 1000
+
+        clock.set(1_000); // now == expiry exactly
+        assert!(
+            c.discover("svc").await.unwrap().is_empty(),
+            "a registration is gone AT its expiry instant (`> now`), not one ms after"
+        );
+        assert!(
+            c.renew(lease).await.is_err(),
+            "a lease cannot be renewed AT its expiry instant"
+        );
+    });
+}
+
 #[test]
 fn revoke_withdraws_a_registration_immediately() {
     block_on(async {
