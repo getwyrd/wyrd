@@ -9,6 +9,9 @@ wyrd = "wyrd"
 # "OT" is Operational Transformation (used in "OT / CRDT" in the glossary), a
 # real acronym — not a typo for "TO"/"OF"/etc.
 ot = "ot"
+# "HEL" is Hetzner's Helsinki location code (alongside FSN/NBG), used in the
+# deployment blueprint — not a typo for "HELP"/"HEAL".
+hel = "hel"
 
 [files]
 # Don't spell-check generated or non-prose files. (typos already honors

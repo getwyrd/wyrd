@@ -1,0 +1,44 @@
+%% Single-zone deployment — M4 "Small multi-node" production profile
+%% Diagrams as code. Render with any Mermaid renderer.
+%% See 07-deployment-view.md (§7.4) and m4-first-deployment-blueprint.md.
+%% Shape shown: full-strength RS(6,3) — 9 D servers, one fragment per server,
+%% spread across 3 failure domains. The minimum-honest profile (6 D servers,
+%% ~2 fragments/domain, single-fault tolerance) is the same shape with fewer
+%% D servers; see the blueprint's sizing cheat-sheet.
+graph TB
+    client(["S3 client / application"])
+
+    subgraph zone["Single zone — one site &nbsp;(no cross-zone replication — that is M5)"]
+        subgraph access["Stateless — restartable, horizontally scalable"]
+            gw["S3 gateway<br/>embeds client library<br/>(chunk · erasure-code · commit)"]
+            cust["Custodian (leader-elected)<br/>GC · scrub · reconstruct · durability telemetry"]
+        end
+
+        subgraph metaplane["Metadata + coordination — precious, separately replicated"]
+            tikv["TiKV + PD<br/>3-node quorum (Raft)<br/>inodes · dirents · chunk-maps"]
+            etcd["Coordination — etcd (L5)<br/>discovery · leader election · locks"]
+        end
+
+        subgraph storage["D servers — RS(6,3): 9 fragments/chunk, 1 per server, any 3 lost survive"]
+            fdA["Failure domain A<br/>rack / power / switch<br/>3 × D server"]
+            fdB["Failure domain B<br/>3 × D server"]
+            fdC["Failure domain C<br/>3 × D server"]
+        end
+    end
+
+    backup[("Out-of-band backup<br/>independent of this cluster (§8.2)<br/>the only DR story until M5")]
+
+    client -->|"S3 / HTTPS · SigV4"| gw
+    gw -->|"metadata commit · gRPC (PD :2379 / TiKV :20160) · mTLS"| tikv
+    gw -->|"bulk fragment I/O · gRPC :50051 · mTLS — spread 1 / domain"| fdA
+    gw --> fdB
+    gw --> fdC
+    gw -.->|"discover D servers · etcd gRPC :2379"| etcd
+    cust -->|"scrub · repair · reconstruct · gRPC :50051"| fdA
+    cust --> fdB
+    cust --> fdC
+    cust -->|"find under-replicated · gRPC"| tikv
+    cust -.->|"leader election · etcd gRPC :2379"| etcd
+    fdA -.->|"register (id · endpoint · fd label) · etcd gRPC"| etcd
+    tikv -.->|"metadata export"| backup
+    fdA -.->|"data export"| backup

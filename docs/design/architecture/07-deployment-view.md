@@ -36,3 +36,49 @@ What is shipped, in priority order: a single static binary (primary), an OCI ima
 ## 7.3 Failure domains
 
 Durability math depends on fragments landing in independent failure domains (rack, power, switch). The placement service (L2) and custodians (L4) enforce domain spread for the configured EC scheme. A leading-indicator capacity metric is per-failure-domain utilization: running out of room *in a specific domain* blocks new EC writes before total capacity is exhausted.
+
+**Independence is a topology property, not a process count.** The durability of an EC scheme is only real if the domains it spreads across *fail independently*. RS(6,3) writes 9 fragments per chunk and tolerates the loss of any 3; that promise holds only when no single physical failure can take more than 3 fragments. Nine fragments on nine processes that share one power supply, one disk, or one host is not 9× redundancy — one power cut destroys the chunk. So the load-bearing question for any deployment is **what is the unit of independent failure, and are there enough of them**:
+
+- **Full tolerance** wants **≥ 9 independent domains**, one fragment each — any 3 domains can be lost and the custodian rebuilds.
+- **Fewer domains** is honest only with **consciously-reduced tolerance**: e.g. 6 domains holding ~2 fragments each survives *any single domain* loss but not two arbitrary ones.
+
+A domain *label* must reflect actual shared-fate hardware. Labelling two processes that share a chassis as distinct domains does not create independence — it only makes the durability math lie. This is why day-one verification (§7.4) checks that a written chunk's fragments actually landed in distinct domains before the deployment is trusted.
+
+## 7.4 Worked example — first single-zone deployment (M4)
+
+The **Small multi-node** profile becomes concrete at the M4 release point ([single-zone deployment diagram](diagrams/single-zone-deployment.mermaid)). Two shapes illustrate the same topology reasoning — a **homelab** (own machines, one building/grid/ISP) and a **Hetzner single-zone** rental (genuine per-server hardware independence within one EU location). Both spend their failure-domain budget on the D servers first, give TiKV+PD their own quorum spread, and treat gateway/custodian as movable, stateless roles.
+
+| Shape | D-server domains | Fault tolerance | Disaster-recoverable? |
+|-------|------------------|-----------------|-----------------------|
+| Minimum honest | 6 (≈2 fragments/domain) | any single domain | No — one site |
+| Full RS(6,3) | 9 (1 fragment/domain) | any 3 domains | No — one site |
+
+Single-zone — homelab *or* one Hetzner location — survives disk/host/domain failure (the M3 repair story, on honest hardware) but **not loss of the whole site**; cross-zone replication (L3) is M5+. So M4 is a production-durable *single-site* store, governed by §8.2's rule: keep an out-of-band backup that does not depend on this cluster.
+
+Day-one verification gates trust, in order: (1) **label** each D server's failure domain so the selector spreads fragments; (2) **verify spread** — confirm a written chunk's 9 fragments landed in 9 distinct domains, or fix the labels; (3) **watch the durability plane** — under-replicated count must sit at zero in steady state; (4) **do the failure test** — kill one D server and watch reads keep serving from survivors, under-replicated count rise, the custodian rebuild, and the count return to zero. If that loop does not complete, the deployment is not yet production-durable.
+
+The full operational note — concrete machine counts, Hetzner `hcloud` provisioning, the `deploy/` TiKV+PD bring-up, failure-domain labelling, and the day-one runbook — is the [M4 first-deployment blueprint](m4-first-deployment-blueprint.md). It is operational guidance, not a normative spec.
+
+## 7.5 Communication paths, ports, and protocols
+
+The wiring of a production single-zone (Small multi-node) deployment — who dials whom, over what protocol, on which port, with what transport security. The dev single-binary profile collapses all of these to in-process calls (no sockets); §3.2 gives the external-interface view, this table the deployment-internal one.
+
+| Path | Protocol | Default port | Transport security | Reference |
+|------|----------|--------------|--------------------|-----------|
+| App → S3 gateway | HTTP / S3 | operator-set (e.g. `443`, `8080` in dev) | TLS; **S3 SigV4** | §3.2, §8.5 |
+| App → SDK gateway | gRPC | operator-set | TLS; **OIDC** | §3.2 |
+| Operator → Management API | gRPC / REST | operator-set | **mTLS + OIDC** | ADR-0013, §8.5 |
+| Gateway / client lib → D server | gRPC | **`50051`** (Wyrd default) | **mTLS, no plaintext fallback** | direct **bulk fragment** I/O; ADR-0025; `crates/server/src/cli.rs:32` |
+| Gateway / client lib → metadata (TiKV) | gRPC | PD `2379`, TiKV `20160` | mTLS | atomic multi-key commit; ADR-0008. *redb backend is embedded — in-process, no port* |
+| Custodian → D servers | gRPC | `50051` | mTLS | scrub / repair / reconstruct |
+| Custodian → metadata (TiKV) | gRPC | PD `2379`, TiKV `20160` | mTLS | under-replication scan, chunk-maps |
+| All components → Coordination (etcd) | etcd gRPC | client `2379`, peer `2380` | mTLS | discovery, leader election, locks; ADR-0006 |
+| D server → Coordination (etcd) | etcd gRPC | `2379` | mTLS | registration (id · endpoint · fd label), lease renewal |
+| Components → OTLP collector | OTLP/gRPC, OTLP/HTTP | `4317`, `4318` | TLS | outbound push; ADR-0012 |
+| Prometheus → components | HTTP | operator-set | TLS | metrics scrape; ADR-0012 |
+
+**Port honesty.** Only `50051` (the D-server gRPC bind) is fixed in Wyrd's own code today (`crates/server/src/cli.rs:32`). The metadata, coordination, and telemetry ports — PD `2379` / TiKV `20160`, etcd `2379`/`2380`, OTLP `4317`/`4318` — are the **upstream projects' conventional defaults**, not Wyrd's to assign. The S3, SDK, management, and Prometheus-scrape *listen* addresses are **operator-configured**; M4 fixes the exact flag names (see the blueprint's `[wyrd-config]` markers). All internal service-to-service dials are **mTLS under the provider CA with no plaintext fallback** (ADR-0005, ADR-0025); a plaintext internal dial is refused (M2).
+
+**Two planes.** Bulk **fragment** data flows directly client/gateway → D servers (the gRPC chunk path that scales with the fleet); the **metadata commit** is a separate, smaller gRPC path to TiKV. Keeping them distinct is the Colossus-class separation that lets throughput scale with D servers rather than through a metadata bottleneck. On a private-network deployment (e.g. Hetzner vSwitch) only the gateway's S3 port is exposed publicly; every other path stays on the internal network.
+
+**Out of single-zone scope.** Cross-zone replication (L3) uses **NATS JetStream** (client `4222`) and appears only at the **provider-fleet** profile (M5+); it is not part of a single-zone deployment (ADR-0027).
