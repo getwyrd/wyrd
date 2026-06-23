@@ -103,3 +103,25 @@ impl FragmentError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `:89` — `variant_name` backs the conformance `invalid/` vectors' "rejected
+    /// for the *documented* reason" assertion, so each variant must map to a stable,
+    /// DISTINCT, non-empty label. Replacing the whole body with a constant (`""` or
+    /// `"xyzzy"`) collapses every variant to one string; pinning two known-different
+    /// variants to distinct, non-empty names kills both mutants without hard-coding
+    /// the exact strings.
+    #[test]
+    fn variant_name_is_distinct_and_nonempty() {
+        let a = FragmentError::TruncatedHeader.variant_name();
+        let b = FragmentError::PayloadChecksumMismatch.variant_name();
+        assert!(
+            !a.is_empty() && !b.is_empty(),
+            "variant names are non-empty"
+        );
+        assert_ne!(a, b, "distinct variants carry distinct names");
+    }
+}
