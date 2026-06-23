@@ -43,6 +43,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0029](0029-key-compromise-emergency-response.md) | Key-compromise emergency response | Proposed |
 | [0030](0030-build-and-release-integrity.md) | Build and release integrity | Proposed |
 | [0031](0031-watch-and-change-feed-contract.md) | Watch / change-feed contract | Proposed |
+| [0032](0032-d-server-on-disk-fragment-layout.md) | D-server on-disk fragment layout (FsChunkStore) | Proposed |
 
 ## Why not ... ?
 
