@@ -16,6 +16,19 @@ name: mutants
 # `--cfg madsim`) and the generated `wyrd-proto` stubs out of the run WITHOUT
 # fighting the workspace build, because neither is a dependency of the crates
 # below, so cargo-mutants never builds them.
+#
+# Two jobs, by trigger:
+#   * mutants-pr   — per-PR, `--in-diff`, single runner. Fast (<90s); only tests
+#     mutants overlapping the PR's changed lines.
+#   * mutants-full — nightly / manual, full sweep over the correctness crates.
+#     SHARDED with `--shard i/N` across a job matrix so the run finishes well within
+#     budget as the workspace grows: cargo-mutants partitions its mutant list
+#     deterministically across N shards, so each runner tests ~1/N of them in
+#     parallel. The expensive `wyrd-server` mutants (~5s build + ~13s test each) are
+#     spread across all shards, which is what buys the wall-clock win. A single
+#     unsharded sweep was ~18–22 min and sat right at the edge of being interrupted
+#     before the report finalized; sharding gives generous headroom under the
+#     per-job `timeout-minutes` backstop.
 
 on:
   pull_request:
@@ -32,12 +45,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  mutants:
+  # PR mode: only test mutants that overlap the lines this PR changed — fast
+  # enough to run per-PR. `--in-diff` is applied on top of the `--package`
+  # filters, so it stays scoped to the correctness crates.
+  mutants-pr:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
-          # Full history so the PR `--in-diff` step can diff against the base.
+          # Full history so the `--in-diff` step can diff against the base.
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -53,11 +71,7 @@ jobs:
         with:
           tool: cargo-mutants
 
-      # PR mode: only test mutants that overlap the lines this PR changed — fast
-      # enough to run per-PR. `--in-diff` is applied on top of the `--package`
-      # filters, so it stays scoped to the correctness crates.
       - name: cargo mutants (PR diff)
-        if: github.event_name == 'pull_request'
         continue-on-error: true
         run: |
           git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
@@ -72,13 +86,44 @@ jobs:
             --package wyrd-coordination-mem \
             --package wyrd-server
 
-      # Nightly / manual: full sweep over the correctness crates. Tracked like the
-      # bench — surfaced for visibility, never a gate.
-      - name: cargo mutants (full sweep)
-        if: github.event_name != 'pull_request'
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-pr
+          path: mutants.out/
+          if-no-files-found: ignore
+
+  # Nightly / manual: full sweep over the correctness crates, sharded across a
+  # matrix. Tracked like the bench — surfaced for visibility, never a gate.
+  mutants-full:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # backstop: clear signal if a shard ever blows past budget
+    strategy:
+      fail-fast: false # one shard's miss/timeout must not cancel the others
+      matrix:
+        shard: [0, 1, 2, 3] # N=4; each ~4–5 min, generous headroom under 30 min
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: mutants
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: cargo mutants (full sweep, shard ${{ matrix.shard }}/4)
         continue-on-error: true
         run: |
-          cargo mutants --no-shuffle \
+          cargo mutants --no-shuffle --shard ${{ matrix.shard }}/4 \
             --package wyrd-chunk-format \
             --package wyrd-core \
             --package wyrd-traits \
@@ -88,11 +133,10 @@ jobs:
             --package wyrd-coordination-mem \
             --package wyrd-server
 
-      # The report (surviving mutants, timings) for inspection after the run.
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-${{ github.event_name }}
+          name: mutants-${{ github.event_name }}-shard${{ matrix.shard }}
           path: mutants.out/
           if-no-files-found: ignore
