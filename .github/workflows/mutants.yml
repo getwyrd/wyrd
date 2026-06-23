@@ -103,7 +103,10 @@ jobs:
     strategy:
       fail-fast: false # one shard's miss/timeout must not cancel the others
       matrix:
-        shard: [0, 1, 2, 3] # N=4; each ~4–5 min, generous headroom under 30 min
+        # N=8; ~60 mutants/shard, ~5 min each. Smaller shards shrink the window in
+        # which the heaviest shard (the wyrd-server mutants) can be reclaimed/cancelled
+        # by an external runner shutdown before it finishes (issue #216).
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v7
 
@@ -120,10 +123,10 @@ jobs:
         with:
           tool: cargo-mutants
 
-      - name: cargo mutants (full sweep, shard ${{ matrix.shard }}/4)
+      - name: cargo mutants (full sweep, shard ${{ matrix.shard }}/8)
         continue-on-error: true
         run: |
-          cargo mutants --no-shuffle --shard ${{ matrix.shard }}/4 \
+          cargo mutants --no-shuffle --shard ${{ matrix.shard }}/8 \
             --package wyrd-chunk-format \
             --package wyrd-core \
             --package wyrd-traits \
