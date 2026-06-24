@@ -443,6 +443,272 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
     );
 }
 
+// ---- issue #251: a placed-fragment READ FAULT must not abort the per-chunk drain ----
+
+/// A `ChunkStore` whose `get_fragment` always fails with a caller-supplied error — the
+/// in-process stand-in (issue #251 / the #195 disk-fault harness) for a D server whose
+/// disk faults the *read*: a permanent block-layer fault (a dead sector / `dm-error`
+/// `EIO`) or a transient unreachable/busy error. Every other operation delegates to a
+/// healthy inner store, so the loop can still *place* a rebuilt fragment here.
+struct FaultGetStore {
+    inner: MemDServer,
+    error: fn() -> wyrd_traits::BoxError,
+}
+
+#[async_trait]
+impl ChunkStore for FaultGetStore {
+    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+        self.inner.put_fragment(id, fragment).await
+    }
+
+    async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {
+        Err((self.error)())
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        self.inner.list_fragments().await
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.inner.delete_fragment(id).await
+    }
+
+    async fn health(&self) -> Result<Health> {
+        Ok(Health::Healthy)
+    }
+}
+
+/// A backend error that **wraps** its underlying `io::Error`, exposing it only through
+/// [`source`](std::error::Error::source) (and never re-surfacing the OS errno on its own
+/// `Display`). This is the shape a store that boxes the raw fault inside its *own* error
+/// type produces — so the permanent-vs-transient classifier must walk the source chain to
+/// find the `EIO` underneath, not merely inspect the top-level boxed error. It is the
+/// non-trivial-chain companion to the depth-0 fault `chunkstore-fs` surfaces directly.
+#[derive(Debug)]
+struct WrappedReadError(std::io::Error);
+
+impl std::fmt::Display for WrappedReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "backend read failed")
+    }
+}
+
+impl std::error::Error for WrappedReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// A **permanent** block-layer read fault surfaced at the **top of the box** — a raw `EIO`
+/// `io::Error`, exactly the shape `chunkstore-fs` propagates out of `fs::read` when the
+/// device cannot satisfy the read (`crates/chunkstore-fs/src/lib.rs:241`, `Err(e.into())`
+/// boxes the `io::Error` directly, depth 0). POSIX `EIO` is errno 5.
+fn permanent_eio_fault() -> wyrd_traits::BoxError {
+    Box::new(std::io::Error::from_raw_os_error(5))
+}
+
+/// The same **permanent** `EIO` fault, but **wrapped** inside a backend error so the
+/// `io::Error` is reachable only by walking [`source`](std::error::Error::source) (depth
+/// 1). Drives the classifier's source-chain walk at non-zero depth — closing the gap that
+/// a depth-0-only fixture would leave: a backend that wraps the raw fault must still be
+/// classified as a permanent read-around loss, never mistaken for a transient fault.
+fn wrapped_permanent_eio_fault() -> wyrd_traits::BoxError {
+    Box::new(WrappedReadError(std::io::Error::from_raw_os_error(5)))
+}
+
+/// A **transient** healthy-server fault: the D server is up but momentarily unreachable /
+/// busy. It carries no durability signal (not a corruption fault, not an `EIO`), so the
+/// loop must propagate it to the retry policy — never treat it as permanent fragment loss.
+fn transient_fault() -> wyrd_traits::BoxError {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "D server busy",
+    ))
+}
+
+/// BINDING (issue #251, the read-around leg): a placed fragment whose store returns a
+/// **permanent** read fault (an `EIO`-class `Err`, NOT `Ok(None)`/`NotFound`) is read
+/// AROUND — `assess` rebuilds from the >=k survivors and returns a repairable plan,
+/// instead of letting the `?` propagate the `Err` and abort the whole per-chunk drain.
+///
+/// Driven for BOTH fault shapes (`make_error`): the depth-0 `EIO` `chunkstore-fs` surfaces
+/// straight from `fs::read`, and a wrapped `EIO` reachable only via `source()` — so the
+/// classifier's source-chain walk is proven at non-zero depth, not just at depth 0.
+///
+/// Flippable: pre-fix `reconstruction::assess` does `store.get_fragment(frag).await?`, so
+/// the `EIO` propagates → `reconcile_step` returns `Err` and the chunk is never repaired
+/// (RED). Post-fix the permanent fault is classified and read around → `Reconciled::Changed`
+/// and the chunk is back to full redundancy (GREEN).
+async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::BoxError) {
+    let meta = MemMeta::default();
+    let (d0, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    // Server 1's disk faults every read (a dead sector / `dm-error` `EIO`), but it is
+    // still in the fleet — so `assess` actually calls `get_fragment` on it and must
+    // classify the fault, not route around it by absence.
+    let faulted1 = FaultGetStore {
+        inner: MemDServer::default(),
+        error: make_error,
+    };
+    {
+        // Place the chunk's three fragments on servers 0,1,2 via the real write path.
+        // `d1`'s real fragment bytes are irrelevant: the reconstruction fleet swaps in
+        // the faulting store at server 1, so the read fault — not absence — is exercised.
+        let d1 = MemDServer::default();
+        let fleet = Fleet {
+            servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+        };
+        write_rs_2_1(&meta, &fleet).await;
+    }
+
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    // Reconstruction sees server 1 as a faulting disk (EIO) and the healthy survivors on
+    // domains A,C; the rebuilt fragment must land on the one free domain, D (server 3).
+    let mut topo = Topology::default();
+    topo.register(0, "A").register(2, "C").register(3, "D");
+    let recon_fleet: [(DServerId, &dyn ChunkStore); 4] =
+        [(0, &d0), (1, &faulted1), (2, &d2), (3, &d3)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &recon_fleet,
+        topology: &topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let result = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500).await;
+    let outcome =
+        result.expect("a permanent read fault is read around, not propagated out of assess");
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the under-replicated chunk was reconstructed despite the EIO read fault"
+    );
+
+    // The obligation is drained and the placement flipped with ONE version-conditional
+    // commit — fragment 1 now lives on server 3 (domain D), read around the dead disk.
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "the obligation is drained once the chunk is rebuilt around the read fault"
+    );
+    let record = read_inode(&meta).await;
+    assert_eq!(record.version, 2, "exactly one version-conditional commit");
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![0, 3, 2],
+        "the rebuilt fragment was re-placed on a healthy D server in a distinct domain"
+    );
+    let rebuilt = d3
+        .get_fragment(frag(1))
+        .await
+        .unwrap()
+        .expect("the rebuilt fragment is present on its new server");
+    assert!(
+        repair::fragment_intact(&rebuilt, CHUNK),
+        "the rebuilt fragment verifies its checksum and belongs to the chunk"
+    );
+}
+
+/// The read-around leg with the **depth-0** `EIO` `chunkstore-fs` surfaces directly
+/// (`Err(e.into())`, `lib.rs:241`) — the exact production fault shape for the fs D server.
+#[tokio::test]
+async fn reads_around_a_depth0_permanent_read_fault_on_a_placed_fragment() {
+    reads_around_a_permanent_read_fault(permanent_eio_fault).await;
+}
+
+/// The read-around leg with a **wrapped** `EIO` reachable only via `source()` (depth 1) —
+/// exercising the classifier's source-chain walk at non-zero depth, so a backend that
+/// boxes the raw fault inside its own error type is still read around, not mistaken for a
+/// transient fault and propagated (the gap a depth-0-only fixture would leave open).
+#[tokio::test]
+async fn reads_around_a_wrapped_permanent_read_fault_on_a_placed_fragment() {
+    reads_around_a_permanent_read_fault(wrapped_permanent_eio_fault).await;
+}
+
+/// BINDING (issue #251, the no-spurious-re-placement leg): a placed fragment whose store
+/// returns a **transient** healthy-server error is NOT converted into permanent fragment
+/// loss / a re-placement. The transient fault carries no durability signal, so `assess`
+/// propagates it — the obligation stays queued for the retry policy and the fragment is
+/// neither dropped nor moved off its server.
+///
+/// Discriminating guard (not a red→green flip): it is green with the correct
+/// classify-and-propagate fix, and RED with the rejected over-broad `.ok().flatten()`
+/// candidate — which would swallow the transient error into `None`, rebuild, and re-place
+/// the fragment (a spurious permanent re-placement: `Changed`, drained queue, version
+/// bump), failing every assertion below.
+#[tokio::test]
+async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
+    let meta = MemMeta::default();
+    let (d0, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let faulted1 = FaultGetStore {
+        inner: MemDServer::default(),
+        error: transient_fault,
+    };
+    {
+        let d1 = MemDServer::default();
+        let fleet = Fleet {
+            servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+        };
+        let _data = write_rs_2_1(&meta, &fleet).await;
+    }
+
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    // The full four-domain topology and fleet: were the transient fault wrongly swallowed
+    // into a loss, the selector would re-place the "missing" fragment (free domain B,
+    // server 1) and commit — exactly the spurious re-placement this guard forbids.
+    let topo = four_domains();
+    let recon_fleet: [(DServerId, &dyn ChunkStore); 4] =
+        [(0, &d0), (1, &faulted1), (2, &d2), (3, &d3)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &recon_fleet,
+        topology: &topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let result = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500).await;
+
+    // The transient fault is propagated to the retry policy, not absorbed as a loss.
+    assert!(
+        result.is_err(),
+        "a transient healthy-server fault propagates out of the pass (the retry policy \
+         decides), rather than being silently converted into permanent fragment loss"
+    );
+    // Nothing was re-placed: the obligation stays queued and the inode is untouched, so
+    // the fragment is neither dropped nor moved off its server.
+    assert!(
+        repair::queued_repairs(&meta)
+            .await
+            .unwrap()
+            .contains(&CHUNK),
+        "the obligation stays queued for retry — no spurious drain"
+    );
+    assert_eq!(
+        read_inode(&meta).await.version,
+        1,
+        "no version-conditional commit ran — the fragment was not re-placed"
+    );
+    assert_eq!(
+        read_inode(&meta).await.chunk_map[0].placement,
+        vec![0, 1, 2],
+        "the placement record is unchanged — the transiently-faulting fragment stays put"
+    );
+}
+
 // ---- criterion 4: the three M3 repair metrics on the durability seam, read back ----
 
 #[tokio::test]
