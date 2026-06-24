@@ -64,24 +64,48 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
             if !referenced.contains(&(dserver, frag)) {
                 continue;
             }
-            // Fetch the bytes named by the chunk map. A fragment that vanished between
-            // the walk and the fetch is a loss for GC/reconstruction to notice, not a
-            // checksum finding — skip it rather than raise a false positive.
-            let Some(bytes) = store.get_fragment(frag).await? else {
-                continue;
-            };
+            // Fetch the bytes named by the chunk map, then decide what the fetch told
+            // us. A backend that does not verify on read (an in-memory fake) hands
+            // back the raw bytes for scrub's own `fragment_intact` to check; a
+            // verifying backend (the on-disk / networked D server) instead *rejects*
+            // a corrupt fragment with an `IntegrityFault` rather than returning bytes
+            // that already failed the very same check — so corruption must be handled
+            // on BOTH arms, and a single rotten fragment must never abort the pass.
+            match store.get_fragment(frag).await {
+                Ok(Some(bytes)) => {
+                    // COVERAGE: a referenced fragment scrub walked and verified.
+                    emit_scrubbed(dserver, frag);
 
-            // COVERAGE: a referenced fragment scrub walked and verified.
-            emit_scrubbed(dserver, frag);
-
-            // VERIFY the self-describing checksum against the committed chunk map.
-            // `frag.chunk` is the id the chunk map references it under.
-            if !repair::fragment_intact(&bytes, frag.chunk) {
-                // CORRUPTION: exclude the failing fragment (never decode it) and
-                // enqueue its chunk on the shared repair queue the read path feeds.
-                emit_corruption(dserver, frag);
-                repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
-                changed = true;
+                    // VERIFY the self-describing checksum against the committed chunk
+                    // map. `frag.chunk` is the id the chunk map references it under.
+                    if !repair::fragment_intact(&bytes, frag.chunk) {
+                        // CORRUPTION: exclude the failing fragment (never decode it)
+                        // and enqueue its chunk on the shared repair queue.
+                        emit_corruption(dserver, frag);
+                        repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
+                        changed = true;
+                    }
+                }
+                // A fragment that vanished between the walk and the fetch is a loss
+                // for GC/reconstruction to notice, not a checksum finding — skip it
+                // rather than raise a false positive.
+                Ok(None) => continue,
+                // The store REJECTED the fetch. Distinguish a **corruption** fault
+                // (the bytes failed their self-describing integrity check — a
+                // verifying backend's way of reporting bit rot / a misplaced
+                // fragment, locally or across the gRPC seam) from a **transient** one
+                // (unreachable / timed out / busy). Corruption is the same durable
+                // repair obligation as the mismatch above, and scrub must record it
+                // and CONTINUE past it — never abort the whole pass over one rotten
+                // fragment. A transient fault carries no such signal: propagate it so
+                // the retry policy, not scrub, decides.
+                Err(e) if wyrd_traits::is_integrity_fault(e.as_ref()) => {
+                    emit_scrubbed(dserver, frag);
+                    emit_corruption(dserver, frag);
+                    repair::enqueue_repair(ctx.meta, frag.chunk, "scrub").await?;
+                    changed = true;
+                }
+                Err(e) => return Err(e),
             }
         }
     }

@@ -4,16 +4,34 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use tonic::transport::{Channel, Endpoint};
-use tonic::Request;
+use tonic::{Code, Request, Status};
 use wyrd_proto::v0::chunk_store_client::ChunkStoreClient;
 use wyrd_proto::v0::{
     FragmentDeleteRequest, FragmentGetRequest, FragmentListRequest, FragmentPutRequest,
     HealthRequest,
 };
-use wyrd_traits::{ChunkStore, FragmentId, Health, Result};
+use wyrd_traits::{BoxError, ChunkStore, FragmentId, Health, IntegrityFault, Result};
 
 use crate::conv;
 use crate::error::TransportError;
+
+/// Classify a `get_fragment` error status. A `DATA_LOSS` status is the wire form of a
+/// stored-fragment **integrity** failure the D server detected on read (bit rot / a
+/// misplaced fragment): surface it as the seam-level [`IntegrityFault`] so a consumer
+/// (scrub, the read path) classifies it the *same* as a local store's corruption —
+/// repair-and-continue, not retry — without depending on this crate's
+/// [`TransportError`]. Every other status stays a [`TransportError`] (transient or
+/// generic rpc), preserving the retry policy's existing classification.
+fn classify_get_status(id: FragmentId, status: Status) -> BoxError {
+    if status.code() == Code::DataLoss {
+        Box::new(IntegrityFault {
+            id,
+            detail: status.message().to_string(),
+        })
+    } else {
+        Box::new(TransportError::from(status))
+    }
+}
 
 /// A [`ChunkStore`] implemented over a gRPC channel to one D server.
 ///
@@ -69,7 +87,7 @@ impl ChunkStore for GrpcChunkStore {
         let response = client
             .get_fragment(Request::new(request))
             .await
-            .map_err(TransportError::from)?;
+            .map_err(|status| classify_get_status(id, status))?;
         // Absent bytes preserve the trait's `Ok(None)` not-found contract — a
         // miss is not a transport error.
         Ok(response.into_inner().fragment.map(Bytes::from))

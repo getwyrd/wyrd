@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -59,6 +60,60 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// A convenience result alias for the trait surface.
 pub type Result<T> = std::result::Result<T, BoxError>;
+
+/// A fragment failed its **integrity** check: its self-describing checksum did not
+/// verify, or its header named a different chunk/index than the [`FragmentId`] it is
+/// filed under (bit rot / a tampered or misplaced fragment, `chunk-format` ADR-0019).
+///
+/// This is a **corruption** fault, categorically distinct from a **transient** one
+/// (unreachable / timed out / busy): the bytes are bad, so *retrying the same fetch
+/// cannot help*. A consumer that walks fragments — the custodian's scrub loop, the
+/// read path — must turn it into a **durable repair obligation** (enqueue the chunk
+/// for reconstruction) and carry on past it, never retry it; the two faults are
+/// handled differently (repair vs. retry), so they must stay distinguishable along
+/// the whole path from the store to the consumer's decision point.
+///
+/// It lives in the seam crate so **every** backend produces the *same* type and
+/// every consumer classifies it the *same* way ([`is_integrity_fault`]) without
+/// depending on a concrete store (ADR-0010). A networked backend that surfaces the
+/// fault over gRPC (a `DATA_LOSS` status, not a transient one) reconstructs *this*
+/// type on the client side, so the distinction survives the wire seam too.
+#[derive(Debug)]
+pub struct IntegrityFault {
+    /// The fragment whose stored (or offered) bytes failed integrity.
+    pub id: FragmentId,
+    /// Backend detail for the durability audit trail — the concrete
+    /// checksum/decode or id-mismatch reason.
+    pub detail: String,
+}
+
+impl fmt::Display for IntegrityFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "fragment integrity failure (chunk {:032x} index {}): {}",
+            self.id.chunk, self.id.index, self.detail
+        )
+    }
+}
+
+impl std::error::Error for IntegrityFault {}
+
+/// Whether `err` is an [`IntegrityFault`] (a corruption / integrity failure) anywhere
+/// in its source chain — the seam-level classifier that lets a consumer branch
+/// **repair-and-continue** (corruption) vs. **propagate/retry** (transient) without
+/// knowing the backend's concrete error type. Walks [`source`](std::error::Error::source)
+/// so a backend may wrap the fault in its own error and still be classified.
+pub fn is_integrity_fault(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if e.is::<IntegrityFault>() {
+            return true;
+        }
+        next = e.source();
+    }
+    false
+}
 
 /// A coarse health signal a backend reports about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

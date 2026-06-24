@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 use wyrd_proto::v0::chunk_store_server::ChunkStore as ChunkStoreRpc;
 use wyrd_proto::v0::{
     FragmentDeleteRequest, FragmentDeleteResponse, FragmentGetRequest, FragmentGetResponse,
@@ -52,11 +52,20 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
         let request = request.into_inner();
         let id = conv::from_wire_fragment_id(request.id)?;
         // The store verifies the fragment's checksums before acknowledging
-        // (write step 2); a verification or I/O failure becomes an error status.
+        // (write step 2). A malformed/failing-integrity fragment is the **client's**
+        // fault — surface it as `INVALID_ARGUMENT`, not `INTERNAL`, so the caller
+        // does not retry bytes that can never verify; a true I/O failure stays
+        // internal.
         self.inner
             .put_fragment(id, Bytes::from(request.fragment))
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                if wyrd_traits::is_integrity_fault(e.as_ref()) {
+                    Status::invalid_argument(e.to_string())
+                } else {
+                    Status::internal(e.to_string())
+                }
+            })?;
         Ok(Response::new(FragmentPutResponse {}))
     }
 
@@ -66,11 +75,18 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
     ) -> std::result::Result<Response<FragmentGetResponse>, Status> {
         let request = request.into_inner();
         let id = conv::from_wire_fragment_id(request.id)?;
-        let fragment = self
-            .inner
-            .get_fragment(id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // Stored-data corruption the store detected on read (bit rot / a misplaced
+        // fragment) travels as `DATA_LOSS` — categorically distinct from a transient
+        // (`UNAVAILABLE`/`DEADLINE_EXCEEDED`) status — so the client can reconstruct
+        // it as a corruption finding and the scrub/read consumer can repair rather
+        // than retry. Any other failure is internal.
+        let fragment = self.inner.get_fragment(id).await.map_err(|e| {
+            if wyrd_traits::is_integrity_fault(e.as_ref()) {
+                Status::new(Code::DataLoss, e.to_string())
+            } else {
+                Status::internal(e.to_string())
+            }
+        })?;
         // `None` travels as an absent field, not a NOT_FOUND status — the
         // client maps it back to the trait's `Ok(None)`.
         Ok(Response::new(FragmentGetResponse {

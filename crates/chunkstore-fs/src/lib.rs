@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_chunk_format::{decode, FragmentError};
-use wyrd_traits::{ChunkId, ChunkStore, FragmentId, Health, PlacementChunkStore, Result};
+use wyrd_traits::{
+    ChunkId, ChunkStore, FragmentId, Health, IntegrityFault, PlacementChunkStore, Result,
+};
 
 /// A [`ChunkStore`] that keeps each fragment as a file under a root directory.
 pub struct FsChunkStore {
@@ -132,8 +134,14 @@ impl FsChunkStore {
 impl ChunkStore for FsChunkStore {
     async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
         // Verify integrity and that the fragment belongs under this id before
-        // acknowledging the write.
-        Self::verify(id, fragment.as_ref())?;
+        // acknowledging the write. A verify failure here is a **malformed fragment
+        // the caller offered** — surfaced as a seam-level `IntegrityFault` so the
+        // networked seam can classify it as a client (invalid-argument) fault, not
+        // a server-internal one that invites futile retries.
+        Self::verify(id, fragment.as_ref()).map_err(|e| IntegrityFault {
+            id,
+            detail: e.to_string(),
+        })?;
 
         let final_path = self.fragment_path(id);
         // The chunk's directory may not exist yet (first fragment of the chunk).
@@ -166,8 +174,15 @@ impl ChunkStore for FsChunkStore {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        // Detect bit-rot / tampering before returning data.
-        Self::verify(id, &bytes)?;
+        // Detect bit-rot / tampering before returning data. A verify failure on the
+        // read path is **stored-data corruption** — surfaced as a seam-level
+        // `IntegrityFault` so a consumer (scrub, the read path) records a repair
+        // obligation and carries on, rather than retrying bytes that cannot heal.
+        // The corrupt bytes are never returned as a valid fragment.
+        Self::verify(id, &bytes).map_err(|e| IntegrityFault {
+            id,
+            detail: e.to_string(),
+        })?;
         Ok(Some(Bytes::from(bytes)))
     }
 
