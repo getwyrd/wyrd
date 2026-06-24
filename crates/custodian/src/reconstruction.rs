@@ -243,7 +243,22 @@ async fn assess(
             index: index as u16,
         };
         let bytes = match stores.get(&dserver) {
-            Some(store) => store.get_fragment(frag).await?,
+            // Fetch the placed fragment, classifying a fetch fault by the seam's
+            // permanent-loss-vs-transient distinction (ADR-0010, the `IntegrityFault`
+            // contract; the same split `scrub.rs:102` and the read path `read.rs:189`
+            // honour). A PERMANENT durability fault — a corruption / integrity fault, or
+            // a block-layer read fault (`EIO` / dead sector): the device cannot return
+            // the bytes — is read AROUND (treated as a missing shard below and rebuilt
+            // from the >=k survivors), so one faulted placed fragment never propagates
+            // out of the assessment and aborts the shared per-chunk drain. A TRANSIENT
+            // fault (unreachable / timed out / busy on a healthy server) carries no
+            // durability signal: propagate it to the retry policy rather than silently
+            // converting a reachable fragment into permanent loss / a re-placement.
+            Some(store) => match store.get_fragment(frag).await {
+                Ok(bytes) => bytes,
+                Err(e) if is_permanent_read_fault(e.as_ref()) => None,
+                Err(e) => return Err(e),
+            },
             None => None,
         };
         // VERIFY: a present fragment must decode cleanly AND name this chunk; a
@@ -286,6 +301,51 @@ async fn assess(
         placement,
         len: chunk_ref.len as usize,
     })))
+}
+
+/// POSIX `EIO` (errno 5) — the OS errno a block-layer read fault raises (a dead sector,
+/// a `dm-error` target): the device physically could not return the bytes. Standardised
+/// across the Unix platforms Wyrd targets; named here rather than pulled from `libc` to
+/// keep the loop's dependency surface unchanged (ADR-0010).
+const EIO: i32 = 5;
+
+/// Classify a `get_fragment` fault on a **placed** fragment as a *permanent durability
+/// fault* — one where the device cannot return the bytes, so the rebuild reads around it
+/// and reconstructs from the >=`k` survivors (the [`wyrd_traits::IntegrityFault`] seam
+/// contract, ADR-0010; the same permanent-vs-transient split `scrub.rs:102` and the read
+/// path `read.rs:189` honour). Two permanent shapes:
+///
+/// * a **corruption / integrity** fault ([`wyrd_traits::IntegrityFault`]): the stored
+///   bytes failed their self-describing checksum, so retrying the same fetch cannot heal
+///   them; and
+/// * a **block-layer read fault** (`EIO` — a dead sector / `dm-error`): the OS reported
+///   the read itself failed at the device.
+///
+/// A **transient** fault (unreachable / timed out / busy on a healthy server) matches
+/// NEITHER, so [`assess`] propagates it to the retry policy and never converts a reachable
+/// fragment into permanent loss / a re-placement.
+fn is_permanent_read_fault(err: &(dyn std::error::Error + 'static)) -> bool {
+    wyrd_traits::is_integrity_fault(err) || is_block_read_fault(err)
+}
+
+/// Whether `err`'s source chain carries a block-layer read fault (an `EIO` `io::Error`).
+/// Walks [`source`](std::error::Error::source) so the fault is found whether the backend
+/// surfaces the raw `io::Error` at the top of the box — the shape `chunkstore-fs` produces,
+/// `Err(e.into())` boxing the `fs::read` error directly
+/// (`crates/chunkstore-fs/src/lib.rs:241`) — or **wraps** it inside its own error type and
+/// exposes it via `source()`, mirroring how [`wyrd_traits::is_integrity_fault`] walks the
+/// chain for a corruption fault.
+fn is_block_read_fault(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if io.raw_os_error() == Some(EIO) {
+                return true;
+            }
+        }
+        next = e.source();
+    }
+    false
 }
 
 /// The outcome of repairing one chunk — reported back to [`reconcile`] so the metric /
