@@ -130,6 +130,51 @@ impl FsChunkStore {
     }
 }
 
+/// Run `f`'s blocking filesystem work **off the async reactor**.
+///
+/// The [`ChunkStore`] methods are `async` but their bodies are synchronous
+/// `std::fs` syscalls. On the d-server's multi-threaded tokio runtime
+/// (`crates/server/src/cli.rs`, `new_multi_thread().enable_all()`) those
+/// syscalls would otherwise execute on a **reactor worker thread**, pinning it
+/// for the whole syscall and starving every other task on that runtime —
+/// including the lease-renew heartbeat, whose missed tick past the lease TTL
+/// drops the server out of discovery (issue #204). Moving the work to tokio's
+/// blocking pool keeps the reactor — its accept loop, its timers, and every
+/// other in-flight task — schedulable independent of how many storage syscalls
+/// are in flight.
+///
+/// Runtime-agnostic by design (ADR-0009): the offload engages only when a tokio
+/// runtime is actually hosting the call. Driven off a tokio runtime (e.g. a
+/// `pollster::block_on` test) there is no reactor worker thread to starve, so the
+/// work runs inline — preserving the store's executor-independence rather than
+/// hard-wiring it to tokio.
+#[cfg(not(madsim))]
+async fn offload<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::spawn_blocking(f)
+            .await
+            .expect("storage blocking task panicked"),
+        Err(_) => f(),
+    }
+}
+
+/// Under madsim (ADR-0009) the simulator is single-threaded and deterministic and
+/// owns its own clock; offloading to a real OS thread would break seed
+/// reproducibility, so the blocking work runs inline on the simulated thread —
+/// exactly the pre-#204 behaviour, which is already non-starving there because the
+/// simulator has no separate reactor to block.
+#[cfg(madsim)]
+async fn offload<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    f()
+}
+
 #[async_trait]
 impl ChunkStore for FsChunkStore {
     async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
@@ -143,36 +188,63 @@ impl ChunkStore for FsChunkStore {
             detail: e.to_string(),
         })?;
 
+        // Compute the paths on the reactor (no I/O — a per-call atomic bump and
+        // path joins), then perform every blocking syscall off the reactor.
         let final_path = self.fragment_path(id);
-        // The chunk's directory may not exist yet (first fragment of the chunk).
-        if let Some(chunk_dir) = final_path.parent() {
-            fs::create_dir_all(chunk_dir)?;
-        }
-        // Write to a per-call private scratch file, then atomically rename it
-        // onto the final path: the rename is the only publish point, so a
-        // concurrent same-id write can neither observe nor clobber our partial
-        // bytes and last-writer-wins is a no-op (same id ⇒ identical bytes). On
-        // a failed write/rename we remove our *own* scratch (its name is unique,
-        // so this never touches a concurrent write's file); a hard crash before
-        // the rename leaves it for `reap_stale_temps` to clear at the next open.
         let temp = self.temp_path(id);
-        if let Err(e) = fs::write(&temp, &fragment) {
-            let _ = fs::remove_file(&temp);
-            return Err(e.into());
-        }
-        if let Err(e) = fs::rename(&temp, &final_path) {
-            let _ = fs::remove_file(&temp);
-            return Err(e.into());
-        }
-        Ok(())
+        offload(move || -> Result<()> {
+            // Write to a per-call private scratch file, then atomically rename it
+            // onto the final path: the rename is the only publish point, so a
+            // concurrent same-id write can neither observe nor clobber our partial
+            // bytes and last-writer-wins is a no-op (same id ⇒ identical bytes). On
+            // a failed write/rename we remove our *own* scratch (its name is
+            // unique, so this never touches a concurrent write's file); a hard
+            // crash before the rename leaves it for `reap_stale_temps` to clear at
+            // the next open.
+            //
+            // The chunk directory exists after the first fragment of the chunk, so
+            // attempt the scratch write straight away and create the directory only
+            // on the genuine first-fragment `NotFound` — sparing the steady-state
+            // write the per-call `create_dir_all` stat (issue #204).
+            match fs::write(&temp, &fragment) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    if let Some(chunk_dir) = final_path.parent() {
+                        fs::create_dir_all(chunk_dir)?;
+                    }
+                    if let Err(e) = fs::write(&temp, &fragment) {
+                        let _ = fs::remove_file(&temp);
+                        return Err(e.into());
+                    }
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&temp);
+                    return Err(e.into());
+                }
+            }
+            if let Err(e) = fs::rename(&temp, &final_path) {
+                let _ = fs::remove_file(&temp);
+                return Err(e.into());
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
-        let bytes = match fs::read(self.fragment_path(id)) {
-            Ok(bytes) => bytes,
-            // A missing chunk directory or a missing file both read as not-found.
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let path = self.fragment_path(id);
+        let bytes = match offload(move || -> Result<Option<Vec<u8>>> {
+            match fs::read(&path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                // A missing chunk directory or a missing file both read as not-found.
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await?
+        {
+            Some(bytes) => bytes,
+            None => return Ok(None),
         };
         // Detect bit-rot / tampering before returning data. A verify failure on the
         // read path is **stored-data corruption** — surfaced as a seam-level
@@ -192,54 +264,66 @@ impl ChunkStore for FsChunkStore {
         // inverse of `fragment_path`. Names that don't match (e.g. a `.tmp` from
         // an interrupted put, or any foreign entry) are skipped, so a crash mid
         // write never surfaces as a phantom fragment.
-        let mut ids = Vec::new();
-        let chunk_dirs = match fs::read_dir(&self.root) {
-            Ok(dirs) => dirs,
-            // A never-written store has no root contents yet — an empty walk.
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ids),
-            Err(e) => return Err(e.into()),
-        };
-        for chunk_entry in chunk_dirs {
-            let chunk_entry = chunk_entry?;
-            if !chunk_entry.file_type()?.is_dir() {
-                continue;
-            }
-            let Some(chunk) = chunk_entry
-                .file_name()
-                .to_str()
-                .and_then(parse_chunk_dir_name)
-            else {
-                continue;
+        // The O(N) walk is the worst worker-thread-starvation source (issue
+        // #204), so the whole two-level directory walk runs off the reactor.
+        let root = self.root.clone();
+        offload(move || -> Result<Vec<FragmentId>> {
+            let mut ids = Vec::new();
+            let chunk_dirs = match fs::read_dir(&root) {
+                Ok(dirs) => dirs,
+                // A never-written store has no root contents yet — an empty walk.
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(ids),
+                Err(e) => return Err(e.into()),
             };
-            for frag_entry in fs::read_dir(chunk_entry.path())? {
-                let frag_entry = frag_entry?;
-                if let Some(index) = frag_entry
+            for chunk_entry in chunk_dirs {
+                let chunk_entry = chunk_entry?;
+                if !chunk_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let Some(chunk) = chunk_entry
                     .file_name()
                     .to_str()
-                    .and_then(parse_fragment_file_name)
-                {
-                    ids.push(FragmentId { chunk, index });
+                    .and_then(parse_chunk_dir_name)
+                else {
+                    continue;
+                };
+                for frag_entry in fs::read_dir(chunk_entry.path())? {
+                    let frag_entry = frag_entry?;
+                    if let Some(index) = frag_entry
+                        .file_name()
+                        .to_str()
+                        .and_then(parse_fragment_file_name)
+                    {
+                        ids.push(FragmentId { chunk, index });
+                    }
                 }
             }
-        }
-        Ok(ids)
+            Ok(ids)
+        })
+        .await
     }
 
     async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
-        // Idempotent: a missing file is a successful no-op, so a retried GC
-        // reclaim never errors.
-        match fs::remove_file(self.fragment_path(id)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        let path = self.fragment_path(id);
+        offload(move || -> Result<()> {
+            // Idempotent: a missing file is a successful no-op, so a retried GC
+            // reclaim never errors.
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .await
     }
 
     async fn health(&self) -> Result<Health> {
-        Ok(match fs::metadata(&self.root) {
+        let root = self.root.clone();
+        Ok(offload(move || match fs::metadata(&root) {
             Ok(meta) if meta.is_dir() => Health::Healthy,
             _ => Health::Unhealthy,
         })
+        .await)
     }
 }
 

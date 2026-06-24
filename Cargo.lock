@@ -2416,6 +2416,7 @@ dependencies = [
  "bytes",
  "pollster",
  "tempfile",
+ "tokio",
  "wyrd-chunk-format",
  "wyrd-traits",
 ]

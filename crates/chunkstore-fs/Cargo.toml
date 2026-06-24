@@ -13,10 +13,23 @@ wyrd-traits.workspace = true
 wyrd-chunk-format.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+# Off-reactor offload of the blocking `std::fs` syscalls (issue #204): the async
+# `ChunkStore` methods hand their syscalls to tokio's blocking pool via
+# `spawn_blocking` so a reactor worker thread is never pinned for a disk syscall
+# (and the d-server's lease-renew heartbeat is not starved). Only the runtime
+# handle + blocking pool are needed, so just the `rt` feature — the store stays
+# runtime-agnostic (the offload no-ops off a tokio runtime, ADR-0009). tokio is
+# already in the workspace tree (the `server` binary host), so this adds no new
+# external dependency to the license/advisory surface.
+tokio = { version = "1", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 pollster.workspace = true
 tempfile.workspace = true
+# The #204 reactor-liveness regression drives the store on a real single-worker
+# tokio runtime and co-schedules a timer task, so it needs the multi-thread
+# runtime + timer driver (the workspace tokio feature set).
+tokio = { workspace = true }
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).
