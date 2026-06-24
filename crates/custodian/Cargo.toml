@@ -42,6 +42,13 @@ bytes.workspace = true
 # writer. Test-only — the scrub loop itself borrows `core`'s verify and gains no
 # chunk-format dependency (ADR-0010).
 wyrd-chunk-format.workspace = true
+# The verifying-backend scrub test drives the loop over the REAL on-disk D server
+# (`FsChunkStore`), whose `get_fragment` rejects a corrupt fragment with an
+# `IntegrityFault` instead of returning bytes — the backend whose silent-abort bug
+# this exercises end-to-end. A test/dev composition may name a concrete (ADR-0010);
+# the scrub loop itself still depends only on the trait seam.
+wyrd-chunkstore-fs.workspace = true
+tempfile.workspace = true
 
 # Inherit the workspace lint policy (single source of truth).
 [lints]

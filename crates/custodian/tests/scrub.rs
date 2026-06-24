@@ -27,6 +27,7 @@ use bytes::Bytes;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 use wyrd_chunk_format::{encode, FragmentHeader, CORE_HEADER_LEN};
+use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
 use wyrd_core::repair;
@@ -390,5 +391,180 @@ async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
     assert!(
         exposed.contains("scrub_corruption_detected"),
         "the scrub-detected corruption rate is exported on the durability seam; got:\n{exposed}"
+    );
+}
+
+// ---- issue #207: a VERIFYING backend (FsChunkStore) — corruption is enqueued AND the
+//      pass continues; it never aborts at the first rotten fragment ----
+//
+// The earlier criteria run over `MemDServer`, which returns the raw (corrupt) bytes for
+// scrub's own `fragment_intact` to check. A real on-disk / networked D server instead
+// **verifies on read** and *rejects* a corrupt fragment with a
+// `wyrd_traits::IntegrityFault` (over gRPC, a `DATA_LOSS` status) — it never hands back
+// bytes that already failed the same check. Before the fix scrub propagated that `Err`
+// with `?`, aborting the whole pass at the first rotten fragment: bit rot was never
+// enqueued, the fragments after it were never scrubbed, and the corruption/coverage
+// telemetry stayed all-green. These two tests pin the restored contract — corruption is
+// classified, enqueued, and the pass continues — against the real `FsChunkStore` and a
+// transient-fault fake, so the corrupt-vs-transient distinction is exercised both ways.
+
+/// A D server whose `get_fragment` always fails with a **non-integrity** (transient)
+/// error — the shape of an unreachable / timed-out backend (no `IntegrityFault` in the
+/// chain). It lists one referenced fragment so scrub reaches the fetch.
+struct TransientDServer {
+    id: FragmentId,
+}
+
+#[async_trait]
+impl ChunkStore for TransientDServer {
+    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
+        Ok(())
+    }
+
+    async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "d server unreachable",
+        )))
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        Ok(vec![self.id])
+    }
+
+    async fn delete_fragment(&self, _id: FragmentId) -> Result<()> {
+        Ok(())
+    }
+
+    async fn health(&self) -> Result<Health> {
+        Ok(Health::Unhealthy)
+    }
+}
+
+#[tokio::test]
+async fn fschunkstore_corruption_is_enqueued_and_the_pass_continues() {
+    let meta = MemMeta::default();
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsChunkStore::open(dir.path()).unwrap();
+
+    // Three referenced fragments on the on-disk D server: TWO bit-rotten, one intact.
+    let rotten_a: ChunkId = 0xF1;
+    let rotten_b: ChunkId = 0xF2;
+    let intact: ChunkId = 0xF3;
+    for chunk in [rotten_a, rotten_b, intact] {
+        store
+            .put_fragment(frag(chunk, 0), valid_fragment(chunk))
+            .await
+            .unwrap();
+    }
+    // Rot the two on disk *after* a valid write — flip a payload byte so the stored
+    // bytes no longer verify. (We cannot `put` corrupt bytes: put verifies too.) This
+    // is the bit-rot the repro describes; `get_fragment` will now reject each with an
+    // `IntegrityFault` rather than return bytes.
+    for chunk in [rotten_a, rotten_b] {
+        std::fs::write(
+            fragment_path(dir.path(), frag(chunk, 0)),
+            corrupt_fragment(chunk),
+        )
+        .unwrap();
+    }
+    commit_reference(&meta, 1, "rotten-a", rotten_a, 0).await;
+    commit_reference(&meta, 2, "rotten-b", rotten_b, 0).await;
+    commit_reference(&meta, 3, "intact", intact, 0).await;
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &store)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    // Run under the durability seam so the corruption metric (leg b) can be read back.
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+
+    // PRE-FIX: `get_fragment` on the first rotten fragment returns `Err`, scrub
+    // propagates it with `?` and ABORTS — `reconcile_step` returns `Err`, so this
+    // `unwrap` panics (red). POST-FIX scrub classifies it as corruption, enqueues, and
+    // continues over the rest of the D server.
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the pass detects corruption and produces repair obligations, not an aborting Err"
+    );
+
+    // (a) BOTH rotten chunks are enqueued for reconstruction — and only those. That
+    // BOTH are queued is the order-independent proof the pass CONTINUED past the first
+    // rotten fragment (leg c): had it aborted at the first, the second could never be
+    // enqueued.
+    let mut queued = repair::queued_repairs(&meta).await.unwrap();
+    queued.sort_unstable();
+    assert_eq!(
+        queued,
+        vec![rotten_a, rotten_b],
+        "both rotten chunks enqueued (the intact one is not) — the pass continued past the first"
+    );
+
+    // (b) the corruption + coverage metrics are emitted on the durability seam for the
+    // verifying-backend (Err) path, so the plane no longer reports all-green while data
+    // rots.
+    telemetry.flush().unwrap();
+    let exposed = telemetry
+        .gather_prometheus()
+        .expect("Prometheus surface configured");
+    assert!(
+        exposed.contains("scrub_corruption_detected"),
+        "corruption is emitted on the verifying-backend path; got:\n{exposed}"
+    );
+    assert!(
+        exposed.contains("scrub_coverage"),
+        "coverage is emitted across the pass; got:\n{exposed}"
+    );
+
+    // The intact fragment is still served as valid bytes; a corrupt fragment is never
+    // returned as a valid payload — its get is an `Err`, never `Ok(Some(bytes))`.
+    assert!(
+        store.get_fragment(frag(intact, 0)).await.unwrap().is_some(),
+        "the intact referenced fragment is untouched and still served"
+    );
+    assert!(
+        store.get_fragment(frag(rotten_a, 0)).await.is_err(),
+        "a corrupt fragment is rejected on read, never served as a valid payload"
+    );
+}
+
+#[tokio::test]
+async fn scrub_propagates_a_transient_get_fault_without_enqueuing() {
+    let meta = MemMeta::default();
+    let chunk: ChunkId = 0xAA;
+    let store = TransientDServer { id: frag(chunk, 0) };
+    commit_reference(&meta, 1, "transient", chunk, 0).await;
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &store)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    // A transient fault carries no integrity signal, so it is NOT corruption: scrub must
+    // not mint a false repair obligation for it. It propagates for the retry policy to
+    // decide — the other half of the corrupt-vs-transient distinction at scrub's
+    // decision point. (Were the two collapsed, this would either be swallowed as a
+    // false repair or abort the pass the way real corruption used to.)
+    let result = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0).await;
+    assert!(
+        result.is_err(),
+        "a transient get fault propagates for retry; it is not classified as corruption"
+    );
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "a transient fault never enqueues a repair obligation"
     );
 }
