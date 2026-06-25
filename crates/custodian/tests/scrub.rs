@@ -175,10 +175,33 @@ async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
     (zone, leader)
 }
 
+/// Install a permissive process-global default `tracing` subscriber once for this
+/// test binary.
+///
+/// The durability metrics are emitted as `tracing::info!(monotonic_counter.* )`
+/// callsites. `tracing` caches each callsite's *interest* in a process-global
+/// table the first time it is hit. Most scrub tests run the pass WITHOUT
+/// installing a subscriber, so that first hit would otherwise register the
+/// callsite against the no-op default — and two such first-registrations racing
+/// across test threads can latch the callsite as *disabled*, after which the one
+/// test that DOES read the metric back (`gather_prometheus`) silently sees it
+/// missing (flaky: corruption present, coverage absent). Registering against an
+/// always-enabling default makes every first-registration agree, so the callsite
+/// can never latch disabled. Per-test `.with_subscriber(...)` still overrides
+/// this default to capture metrics into that test's own provider.
+fn enable_metric_callsites() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 // ---- criterion 1: walk + verify referenced fragments through the control point ----
 
 #[tokio::test]
 async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
 
@@ -223,6 +246,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
 
 #[tokio::test]
 async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
 
@@ -289,6 +313,7 @@ async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
 // never happens and the two assertions below fire.
 #[tokio::test]
 async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstruction() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
 
@@ -345,6 +370,7 @@ async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstru
 
 #[tokio::test]
 async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
 
@@ -443,6 +469,7 @@ impl ChunkStore for TransientDServer {
 
 #[tokio::test]
 async fn fschunkstore_corruption_is_enqueued_and_the_pass_continues() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let dir = tempfile::tempdir().unwrap();
     let store = FsChunkStore::open(dir.path()).unwrap();
@@ -540,6 +567,7 @@ async fn fschunkstore_corruption_is_enqueued_and_the_pass_continues() {
 
 #[tokio::test]
 async fn scrub_propagates_a_transient_get_fault_without_enqueuing() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let chunk: ChunkId = 0xAA;
     let store = TransientDServer { id: frag(chunk, 0) };
