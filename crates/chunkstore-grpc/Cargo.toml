@@ -43,6 +43,13 @@ wyrd-core.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tempfile.workspace = true
+# The Tier-2 kill-and-reconstruct scenario test (`tests/tier2_kill_reconstruct.rs`,
+# M3.8) drives the production custodian reconstruction path (`reconcile_step` →
+# `reconstruction::reconcile`) over the live containerized D-server cluster.
+# `wyrd-custodian` is the production fenced control point; `wyrd-coordination-mem`
+# provides the in-process coordination backend for the test-local Custodian::elect.
+wyrd-custodian.workspace = true
+wyrd-coordination-mem.workspace = true
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

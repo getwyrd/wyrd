@@ -2434,7 +2434,9 @@ dependencies = [
  "tonic",
  "wyrd-chunk-format",
  "wyrd-chunkstore-fs",
+ "wyrd-coordination-mem",
  "wyrd-core",
+ "wyrd-custodian",
  "wyrd-proto",
  "wyrd-traits",
 ]
