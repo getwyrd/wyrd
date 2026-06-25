@@ -108,17 +108,60 @@ fn run_shell(tier: &str, cmd: &str) -> Result<(), String> {
 
 /// **Tier-1 disk-fault injection** (`0005:405-408`): drive scrub + the checksum-
 /// verification path against **real** block-layer misbehaviour via device-mapper
-/// `dm-flakey` / `dm-error` — the real-hardware complement to DST's modeled bit rot.
-/// Needs root + device-mapper (`dmsetup`). Opt in with `WYRD_TIER1=1` and configure
-/// `WYRD_TIER1_DISK_CMD`.
+/// `dm-error` — the real-hardware complement to DST's modelled bit rot.
+/// Needs root + device-mapper (`dmsetup`). Opt in with `WYRD_TIER1=1`.
+///
+/// When opted in and `dmsetup` is present, dispatches to the in-repo Tier-1
+/// scenario at `crates/custodian/tests/tier1_disk_faults.rs` via
+/// `cargo test --ignored` — **replacing** the old `WYRD_TIER1_DISK_CMD`
+/// external-command shell-out (pre-#195) with a real in-repo harness.
 pub fn run_disk_faults() -> Result<(), String> {
-    let plan = plan(
-        "Tier-1 disk-fault injection (dm-flakey/dm-error)",
+    let p = plan(
+        "Tier-1 disk-fault injection (dm-error)",
         "dmsetup",
         opted_in("WYRD_TIER1"),
         tool_available("dmsetup"),
     );
-    execute("Tier-1 disk-fault", plan, "WYRD_TIER1_DISK_CMD")
+    match p {
+        Plan::Deferred(reason) => {
+            eprintln!("xtask: {reason}");
+            Ok(())
+        }
+        Plan::MissingTool(msg) => Err(msg),
+        Plan::Run => run_tier1_scenario(),
+    }
+}
+
+/// Invoke the `#[ignore]`d Tier-1 disk-fault scenario at
+/// `crates/custodian/tests/tier1_disk_faults.rs` via `cargo test --ignored`.
+///
+/// This replaces the old `WYRD_TIER1_DISK_CMD` external-command shell-out with
+/// an in-repo `cargo test` invocation. The scenario drives the **production**
+/// `FsChunkStore` / `reconcile_step` / `ScrubContext` / `ReconstructionContext`
+/// APIs over a real `dm-error`-backed device (root required; opted in via
+/// `WYRD_TIER1=1` in the Tier-1 CI job).
+fn run_tier1_scenario() -> Result<(), String> {
+    let args = [
+        "test",
+        "-p",
+        "wyrd-custodian",
+        "--test",
+        "tier1_disk_faults",
+        "--",
+        "--ignored",
+        "--nocapture",
+    ];
+    println!("\n$ cargo {}", args.join(" "));
+    let status = Command::new("cargo")
+        .args(args)
+        .current_dir(crate::workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn cargo for Tier-1 scenario: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Tier-1 disk-fault scenario failed with {status}"))
+    }
 }
 
 /// **Tier-1 Jepsen consistency** (`0005:408`): a Jepsen harness asserting consistency
