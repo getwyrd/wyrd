@@ -1,0 +1,66 @@
+name: tier1-disk-faults
+
+# Tier-1 disk-fault injection harness (issue #195, proposal 0005 §13.2,
+# `0005:405-408`). Drives `scrub::reconcile` and `reconstruction::reconcile`
+# through the real `FsChunkStore` / `reconcile_step` fenced control point
+# against a **real** block-layer fault injected via device-mapper `dm-error`.
+#
+# This is the privileged, off-Check companion to the in-process Tier-0 DST
+# campaign (`crates/dst/tests/custodian.rs`). The scenario is compiled and
+# type-checked by the unprivileged `cargo xtask ci` gate (the test is
+# `#[ignore]`d there), and RUNS here, where root + device-mapper are available.
+#
+# Gating policy (ADR-0016): NOT a required merge-gate status check. Runs
+# nightly and on demand. The `cargo xtask ci` gate (the daily merge gate) stays
+# unprivileged and container-free; this job runs after merge to catch regressions
+# in the Tier-1 path (`is_permanent_read_fault`, `scrub::reconcile`'s
+# IntegrityFault handling) before the next release.
+#
+# Opt-in: `WYRD_TIER1=1` instructs `cargo xtask disk-faults` to invoke the
+# real scenario (`cargo test -p wyrd-custodian --test tier1_disk_faults
+# -- --ignored --nocapture`). Without it the xtask exits cleanly (deferred).
+
+on:
+  schedule:
+    # 03:00 UTC daily (an hour before integration-nightly, so both can share
+    # the results window without racing).
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier1-disk-faults-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tier1:
+    runs-on: ubuntu-latest
+    # Root is required for dmsetup and loop devices; GitHub-hosted runners
+    # provide root in the default user context on ubuntu-latest.
+    timeout-minutes: 30
+    env:
+      CI: "true"
+      # Opt in to the Tier-1 disk-fault scenario.
+      WYRD_TIER1: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Confirm the privileged tools are present before any Rust build.
+      - name: Verify privileged tools (dmsetup, losetup, mkfs.ext4)
+        run: |
+          dmsetup version
+          losetup --version
+          mkfs.ext4 -V
+
+      # cargo xtask disk-faults opts in when WYRD_TIER1=1, confirms dmsetup is
+      # present, then runs the #[ignore]d scenario via `cargo test --ignored`.
+      - name: cargo xtask disk-faults
+        run: cargo xtask disk-faults
