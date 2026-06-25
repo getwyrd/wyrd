@@ -37,8 +37,11 @@ concurrency:
 jobs:
   tier1:
     runs-on: ubuntu-latest
-    # Root is required for dmsetup and loop devices; GitHub-hosted runners
-    # provide root in the default user context on ubuntu-latest.
+    # Root is required for dmsetup and loop devices. GitHub-hosted ubuntu-latest
+    # runs steps as the unprivileged `runner` user (NOT root) but grants
+    # passwordless `sudo`; the Tier-1 harness self-escalates each privileged
+    # call via `sudo` (see crates/custodian/tests/tier1_disk_faults.rs), so the
+    # `cargo xtask disk-faults` step keeps its normal cargo/rustup environment.
     timeout-minutes: 30
     env:
       CI: "true"
@@ -54,9 +57,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # Confirm the privileged tools are present before any Rust build.
+      # `dmsetup version` queries the kernel driver via /dev/mapper/control,
+      # which is root-only — run it under `sudo` (this also confirms passwordless
+      # sudo works). `losetup`/`mkfs.ext4` version probes need no privilege.
       - name: Verify privileged tools (dmsetup, losetup, mkfs.ext4)
         run: |
-          dmsetup version
+          sudo dmsetup version
           losetup --version
           mkfs.ext4 -V
 

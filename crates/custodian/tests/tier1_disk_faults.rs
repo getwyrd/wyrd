@@ -50,7 +50,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -124,10 +124,49 @@ impl MetadataStore for MemMeta {
 
 // ─── Privileged infrastructure helpers ───────────────────────────────────────
 
-/// Run a command, panicking with the command's stderr on failure.
+/// Whether the harness must escalate privileged calls via `sudo`.
+///
+/// The Tier-1 scenario performs root-only I/O (`losetup`, `mount`, `mkfs.ext4`
+/// on a dm device, `dmsetup`, and writing `/proc/sys/vm/drop_caches`). On the
+/// GitHub-hosted `ubuntu-latest` runner the job runs as the unprivileged
+/// `runner` user with passwordless `sudo`, so every privileged call must be
+/// wrapped (issue: Codex PR #270). When already root (`sudo cargo …` or a
+/// privileged container) we skip `sudo` — that also avoids requiring `sudo` to
+/// be installed in a bare root image.
+///
+/// Cached: `id -u` is POSIX and always present, which avoids pulling a
+/// `libc`/`nix` dependency into the harness just for one euid check.
+fn needs_sudo() -> bool {
+    static NEEDS_SUDO: OnceLock<bool> = OnceLock::new();
+    *NEEDS_SUDO.get_or_init(|| {
+        Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Build a `Command` for a root-only `program`, escalating via `sudo` when the
+/// harness is not already running as root. Centralises the escalation so every
+/// privileged call site (and the teardown guard) goes through one place.
+fn privileged(program: &str, args: &[&str]) -> Command {
+    let mut cmd = if needs_sudo() {
+        let mut c = Command::new("sudo");
+        c.arg(program);
+        c
+    } else {
+        Command::new(program)
+    };
+    cmd.args(args);
+    cmd
+}
+
+/// Run a privileged command, panicking with the command's stderr on failure.
 fn must_run(program: &str, args: &[&str]) {
-    let out = Command::new(program)
-        .args(args)
+    let out = privileged(program, args)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"));
     assert!(
@@ -139,10 +178,9 @@ fn must_run(program: &str, args: &[&str]) {
     );
 }
 
-/// Run a command for its stdout (trimmed), panicking on failure.
+/// Run a privileged command for its stdout (trimmed), panicking on failure.
 fn must_run_stdout(program: &str, args: &[&str]) -> String {
-    let out = Command::new(program)
-        .args(args)
+    let out = privileged(program, args)
         .output()
         .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"));
     assert!(
@@ -167,13 +205,9 @@ impl Drop for DmGuard {
     fn drop(&mut self) {
         // Best-effort teardown: errors are printed but never panic here (we may
         // already be panicking). Each step is attempted unconditionally.
-        let _ = Command::new("umount").arg(&self.mount_point).output();
-        let _ = Command::new("dmsetup")
-            .args(["remove", "--force", &self.device_name])
-            .output();
-        let _ = Command::new("losetup")
-            .args(["-d", &self.loop_dev])
-            .output();
+        let _ = privileged("umount", &[&self.mount_point]).output();
+        let _ = privileged("dmsetup", &["remove", "--force", &self.device_name]).output();
+        let _ = privileged("losetup", &["-d", &self.loop_dev]).output();
     }
 }
 
@@ -359,8 +393,10 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
     // to detect the corruption. If the page cache still holds the pre-flip clean bytes
     // (from put_fragment), FsChunkStore returns Ok(clean_bytes) and scrub does NOT
     // detect the bit rot. Cache eviction is MANDATORY.
-    std::fs::write("/proc/sys/vm/drop_caches", b"3")
-        .expect("drop page caches: this test requires root");
+    // Privileged write — must go through `sudo` on the unprivileged CI runner, so
+    // the redirection runs in the root shell rather than `std::fs::write` (which
+    // would hit EACCES as the `runner` user).
+    must_run("sh", &["-c", "echo 3 > /proc/sys/vm/drop_caches"]);
     eprintln!("tier1: page caches dropped before scrub");
 
     // Pre-condition: d1's fragment must return IntegrityFault after the byte-flip.
@@ -434,8 +470,8 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
     // get_fragment on d1 would return IntegrityFault again — not the block-layer EIO
     // from dm-error. The scenario MUST exercise the EIO → is_permanent_read_fault
     // path (issue #251), not just the already-covered IntegrityFault path.
-    std::fs::write("/proc/sys/vm/drop_caches", b"3")
-        .expect("drop page caches before reconstruction: this test requires root");
+    // Privileged write (see the scrub-leg drop above) — escalated via `sudo`.
+    must_run("sh", &["-c", "echo 3 > /proc/sys/vm/drop_caches"]);
     eprintln!("tier1: page caches dropped before reconstruction");
 
     // Pre-condition: d1 must return block-layer EIO (NOT IntegrityFault) after
