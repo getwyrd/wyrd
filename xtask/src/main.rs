@@ -25,6 +25,7 @@
 
 mod conformance;
 mod faults;
+mod kill_reconstruct;
 mod vectors;
 
 use std::path::{Path, PathBuf};

@@ -134,18 +134,107 @@ pub fn run_jepsen() -> Result<(), String> {
     execute("Tier-1 Jepsen", plan, "WYRD_TIER1_JEPSEN_CMD")
 }
 
-/// **Tier-2 single-node kill-and-reconstruct** (`0005:409-411`): on a single real node,
-/// kill a real D server and watch real reconstruction over real NVMe/fsync. Needs a real
-/// node with the cluster tooling (`docker`). Opt in with `WYRD_TIER2=1` and configure
-/// `WYRD_TIER2_CMD`.
+/// **Tier-2 single-node kill-and-reconstruct** (`0005:409-411`): stand up a cluster of
+/// real, networked gRPC D servers under docker-compose, kill one of them, drive the
+/// **production** custodian reconstruction path (`custodian::reconcile_step` →
+/// `reconstruction::reconcile`) against the live cluster, and assert the durability
+/// outcome — the killed node's affected chunks return to full redundancy in **distinct
+/// failure domains**, and a crash mid-repair leaves **collectable garbage, never
+/// corruption** (`0005:277`, `0005:385-389`).
+///
+/// Reuses the Tier-2 container plumbing from `run_integration` (`compose_up` /
+/// `resolve_endpoints` / `finish_integration` / `finalize_panic_safe`) with a
+/// [`crate::kill_reconstruct::KR_DSERVER_COUNT`]-server RS(6,3) cluster (nine for the
+/// initial placement + one spare for the re-placed fragment). The live scenario test at
+/// `crates/chunkstore-grpc/tests/tier2_kill_reconstruct.rs` drives the production path
+/// and asserts the three-phase durability outcome.
+///
+/// Opt in with `WYRD_TIER2=1`. Requires `docker` (compose plugin) on the machine.
 pub fn run_kill_reconstruct() -> Result<(), String> {
-    let plan = plan(
+    let p = plan(
         "Tier-2 single-node kill-and-reconstruct",
         "docker",
         opted_in("WYRD_TIER2"),
         tool_available("docker"),
     );
-    execute("Tier-2 kill-reconstruct", plan, "WYRD_TIER2_CMD")
+    match p {
+        Plan::Deferred(reason) => {
+            eprintln!("xtask: {reason}");
+            return Ok(());
+        }
+        Plan::MissingTool(msg) => return Err(msg),
+        Plan::Run => {}
+    }
+
+    let compose = crate::workspace_root()
+        .join("crates/chunkstore-grpc/tests/docker-compose.yml")
+        .to_string_lossy()
+        .to_string();
+
+    let victim_index =
+        crate::kill_reconstruct::select_victim_index(crate::kill_reconstruct::KR_DSERVER_COUNT);
+    let victim_container = crate::kill_reconstruct::victim_container_name(victim_index);
+
+    crate::compose_up(&compose, crate::kill_reconstruct::KR_DSERVER_COUNT)?;
+    crate::finalize_panic_safe(
+        || {
+            let endpoints =
+                crate::resolve_endpoints(&compose, crate::kill_reconstruct::KR_DSERVER_COUNT)?;
+            println!(
+                "\nxtask kill-reconstruct: {} D servers at {endpoints}; victim container: {victim_container}",
+                crate::kill_reconstruct::KR_DSERVER_COUNT,
+            );
+            run_kill_reconstruct_test(&endpoints, &victim_container)
+        },
+        |result| {
+            crate::finish_integration(
+                result,
+                || crate::compose_logs(&compose),
+                || crate::compose_down(&compose),
+            )
+        },
+    )?;
+    println!("\nxtask kill-reconstruct: Tier-2 kill-and-reconstruct passed");
+    Ok(())
+}
+
+/// Run the (otherwise `#[ignore]`d) Tier-2 kill-and-reconstruct scenario test with the
+/// resolved endpoints and victim container exported, so it dials the live container
+/// cluster and kills the right D server.
+fn run_kill_reconstruct_test(endpoints: &str, victim_container: &str) -> Result<(), String> {
+    crate::print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-chunkstore-grpc",
+        "--test",
+        "tier2_kill_reconstruct",
+        "--",
+        "--ignored",
+    ]);
+    let status = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "wyrd-chunkstore-grpc",
+            "--test",
+            "tier2_kill_reconstruct",
+            "--",
+            "--ignored",
+            "--nocapture",
+        ])
+        .current_dir(crate::workspace_root())
+        .env("WYRD_DSERVER_ENDPOINTS", endpoints)
+        .env("WYRD_TIER2_VICTIM_CONTAINER", victim_container)
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Tier-2 kill-and-reconstruct test failed with {status}"
+        ))
+    }
 }
 
 #[cfg(test)]
