@@ -743,6 +743,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
     // ====================================================================
 
     let mut available: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut missing: Vec<(usize, DServerId)> = Vec::new();
     for (frag_index, &server_id) in new_placement.iter().enumerate() {
         let frag_id = FragmentId {
             chunk: CHUNK,
@@ -754,17 +755,33 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
             .unwrap_or_else(|e| {
                 panic!("get_fragment index {frag_index} from server {server_id}: {e}")
             });
-        if let Some(frag_bytes) = maybe_bytes {
-            if let Some(shard) = repair::intact_shard(&frag_bytes, CHUNK) {
-                available.push((frag_index, shard));
-            }
+        match maybe_bytes
+            .as_deref()
+            .and_then(|bytes| repair::intact_shard(bytes, CHUNK))
+        {
+            Some(shard) => available.push((frag_index, shard)),
+            // A placed fragment that is absent (`Ok(None)`) or fails its integrity
+            // check is a repair FAILURE, not something to skip over.
+            None => missing.push((frag_index, server_id)),
         }
     }
 
+    // Full redundancy means EVERY server named by the committed placement actually
+    // holds an intact fragment — including the freshly reconstructed one on the
+    // spare. A weaker `available.len() >= K` check would pass on the K=6 surviving
+    // old shards alone even if reconstruction never wrote the spare's fragment, so
+    // it cannot prove redundancy was restored (Codex review, #271). Require all N.
     assert!(
-        available.len() >= K,
-        "at least K={K} intact post-repair fragments must be available for reconstruction; \
-         got {} (server 0 is dead, servers 1–9 must all be reachable)",
+        missing.is_empty(),
+        "every fragment in the post-repair placement must be present and intact, \
+         including the rebuilt one on spare server {SPARE_INDEX}; missing/corrupt \
+         (frag_index, server_id): {missing:?}"
+    );
+    assert_eq!(
+        available.len(),
+        N,
+        "all N={N} placed fragments must be intact after reconstruction (full \
+         redundancy restored, not merely >= K survivors); got {}",
         available.len()
     );
 
