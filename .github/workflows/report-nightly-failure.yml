@@ -65,7 +65,12 @@ jobs:
     steps:
       - name: File or update the nightly-failure bug
         run: |
-          set -uo pipefail
+          # -e so any unhandled `gh`/`jq` failure (missing label, token/API
+          # error, a failed dedup list) fails the step instead of being masked
+          # by the trailing success `echo` — a nightly failure must never be left
+          # untracked while this reporter shows green. The one expected-to-fail
+          # command (`gh label create` when the label exists) guards with `|| true`.
+          set -euo pipefail
 
           # The marker label that scopes the dedup search. `bug` already exists;
           # create the scoping label once (idempotent — ignore "already exists").
