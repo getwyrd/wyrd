@@ -1,0 +1,125 @@
+name: report-nightly-failure
+
+# Nightly quality-verification failure reporter.
+#
+# The off-Check nightly quality jobs (tier1-disk-faults, tier2-kill-reconstruct,
+# integration-nightly, the mutants full sweep) run on a schedule and are NOT
+# required status checks, so a failure produces no merge signal — it can rot
+# unnoticed until the next release. This workflow turns each nightly failure into
+# a tracked bug.
+#
+# It listens via `workflow_run` (so the nightly workflows need no edits) and fires
+# only when a watched workflow's SCHEDULED run *fails*. Manual `workflow_dispatch`
+# runs and the per-PR mutants job are intentionally ignored — this reports the
+# once-a-night verification, not ad-hoc or PR runs.
+#
+# Idempotency (the "don't pile up duplicate bugs" rule): there is at most ONE open
+# issue per watched workflow. While that issue is open (the bug is unfixed) further
+# nightly failures append a comment with the new run link instead of opening a new
+# issue. Only once the issue is CLOSED (the bug is fixed) does a later failure open
+# a fresh one — a recurrence is a new bug. Dedup key = the issue title
+# `Nightly failure: <workflow>` carrying the `nightly-failure` label.
+#
+# Governance-class YAML (like dco.yml / require-issue.yml): uses the `gh` CLI with
+# the workflow token, not Rust/xtask — this is notification plumbing, not CI logic.
+
+on:
+  workflow_run:
+    workflows:
+      - tier1-disk-faults
+      - tier2-kill-reconstruct
+      - integration-nightly
+      - mutants
+    types:
+      - completed
+
+permissions:
+  contents: read
+  issues: write
+
+# Serialize per failing workflow so two near-simultaneous completions can't both
+# pass the "no open issue" check and each open one (mutants' matrix in particular
+# completes as a single workflow_run, but this is cheap insurance).
+concurrency:
+  group: report-nightly-failure-${{ github.event.workflow_run.name }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    # Only scheduled runs that actually failed. `workflow_dispatch` and the
+    # per-PR `mutants-pr` job (event == 'pull_request') are deliberately excluded.
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'schedule'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      # Pass event fields through the environment (never interpolate `${{ }}`
+      # straight into the script) so a crafted workflow name can't inject shell.
+      WF: ${{ github.event.workflow_run.name }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+    steps:
+      - name: File or update the nightly-failure bug
+        run: |
+          set -uo pipefail
+
+          # The marker label that scopes the dedup search. `bug` already exists;
+          # create the scoping label once (idempotent — ignore "already exists").
+          gh label create nightly-failure \
+            --repo "$REPO" \
+            --color B60205 \
+            --description "Auto-filed failure of a nightly quality-verification job" \
+            2>/dev/null || true
+
+          title="Nightly failure: $WF"
+
+          # Is there already an OPEN issue for this workflow? Filter by exact title
+          # in jq (gh's --jq has no --arg, and shell interpolation into a jq program
+          # is an injection risk) against the label-scoped open set.
+          existing=$(gh issue list \
+            --repo "$REPO" \
+            --state open \
+            --label nightly-failure \
+            --json number,title \
+            | jq -r --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            # Bug still unfixed → keep the single issue, just record this recurrence.
+            gh issue comment "$existing" --repo "$REPO" --body \
+              "Still failing — scheduled run #${RUN_NUMBER} on \`${BRANCH}\` (\`${SHA}\`): ${RUN_URL}"
+            echo "Open issue #${existing} already tracks '$title' — commented, no new issue."
+            exit 0
+          fi
+
+          # No open issue → this is a fresh (or recurred-after-fix) failure. Open one.
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          The nightly **\`${WF}\`** quality-verification workflow failed on its scheduled run.
+
+          - **Workflow:** \`${WF}\`
+          - **Run:** ${RUN_URL}
+          - **Branch:** \`${BRANCH}\`
+          - **Commit:** \`${SHA}\`
+
+          This is an off-Check, non-gating nightly job, so the failure produced no
+          merge-blocking signal — it is filed here so it is not lost.
+
+          This issue is auto-managed by the \`report-nightly-failure\` workflow:
+          while it stays **open**, subsequent nightly failures of \`${WF}\` add a
+          comment here rather than opening a duplicate. Closing it signals the bug is
+          fixed; a later failure then opens a new issue.
+
+          <!-- nightly-failure:${WF} -->
+          EOF
+
+          gh issue create \
+            --repo "$REPO" \
+            --title "$title" \
+            --label nightly-failure \
+            --label bug \
+            --body-file "$body_file"
+          echo "Opened a new issue for '$title'."
