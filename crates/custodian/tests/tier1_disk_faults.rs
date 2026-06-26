@@ -193,6 +193,27 @@ fn must_run_stdout(program: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Run a command **without** sudo escalation, returning its trimmed stdout.
+///
+/// Used to read the invoking user's real uid/gid: routing `id` through
+/// [`privileged`] would run `sudo id` and report root's `0:0`, defeating the
+/// post-mount `chown` that hands the mount point back to the unprivileged test
+/// user.
+fn unprivileged_stdout(program: &str, args: &[&str]) -> String {
+    let out = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn `{program}`: {e}"));
+    assert!(
+        out.status.success(),
+        "`{program} {}` failed (exit {}):\n{}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
 /// RAII guard that tears down the dm device, unmounts the filesystem, and
 /// detaches the loop device on `drop` — cleanup runs even if the test panics.
 struct DmGuard {
@@ -275,6 +296,18 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         &["-F", "-q", "-E", "lazy_itable_init=0", &dm_path],
     );
     must_run("mount", &[&dm_path, &mount_path]);
+    // `mount` ran as root (via `sudo` on the CI runner), so the freshly-created
+    // ext4 root is owned by `root:root`. The `FsChunkStore` for d1 below runs as
+    // the unprivileged test user and must create its `store/` subtree under this
+    // mount point — without handing ownership back it fails with EACCES
+    // (issue: the sudo-escalation in PR #270 left the mount root root-owned).
+    // When already root (`needs_sudo()` is false) the test process owns the
+    // mount and there is nothing to do.
+    if needs_sudo() {
+        let uid = unprivileged_stdout("id", &["-u"]);
+        let gid = unprivileged_stdout("id", &["-g"]);
+        must_run("chown", &[&format!("{uid}:{gid}"), &mount_path]);
+    }
     eprintln!("tier1: dm device {dm_path} mounted at {mount_path}");
 
     // ── 4. Open D servers ─────────────────────────────────────────────────────
