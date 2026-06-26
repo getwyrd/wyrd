@@ -53,11 +53,12 @@ The metric that matters: **time-to-repair vs. failure rate**. Durability ("the n
 
 After a real disaster, restore in dependency order:
 
-1. **L5 coordination** first — so components can find each other and elect leaders.
-2. **L2 / L4 metadata** next — so the map to the bytes exists. Restored from out-of-band backups that do **not** depend on the system being restored.
+0. **Trust plane (provider CA) first of all** — re-establish the CA (`step-ca` now, SPIRE reserved — ADR-0036) and distribute the trust bundle, because every step below dials over **fail-closed mTLS** (ADR-0005, ADR-0025) and cannot even complete a handshake without it. (In the single-binary profile the built-in dev-CA makes this a no-op; a real fleet must stand up the CA before anything else.)
+1. **L5 coordination** next — so components can find each other and elect leaders.
+2. **L2 / L4 metadata** — so the map to the bytes exists. Restored from out-of-band backups that do **not** depend on the system being restored.
 3. **L3 replica verification and re-replication** — so the bytes are protected again.
 
-Restoring bytes before the map is useless; restoring the map before coordination cannot even start. This ordering is a runbook section and must be written and drilled before it is needed.
+Restoring bytes before the map is useless; restoring the map before coordination cannot even start; and coordination itself cannot complete a single mutually-authenticated dial before the trust plane exists. This ordering is a runbook section and must be written and drilled before it is needed.
 
 ## 6.6 Consistency at runtime
 
