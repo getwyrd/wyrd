@@ -55,6 +55,32 @@ impl GrpcChunkStore {
         Ok(Self::new(channel))
     }
 
+    /// Like [`Self::connect`], but applies a per-request `timeout` (and an equal
+    /// connect timeout) to the channel.
+    ///
+    /// Tonic's default channel has **no** request deadline: an RPC to a server that has
+    /// stopped responding mid-call — a `docker pause`d node or an injected network
+    /// partition that leaves the connection established but the peer silent — would hang
+    /// the future indefinitely. With a timeout, such a request instead fails with a
+    /// transient `DEADLINE_EXCEEDED` [`Status`] (classified as a retryable
+    /// [`TransportError`], not an [`IntegrityFault`]), so a caller — e.g. the custodian
+    /// reconstruction path driven by the Tier-1 consistency scenario — observes an
+    /// *alive-but-unreachable* node and aborts the repair before commit rather than
+    /// stalling.
+    pub async fn connect_with_timeout(
+        endpoint: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let channel = Endpoint::try_from(endpoint.into())
+            .map_err(TransportError::Connect)?
+            .timeout(timeout)
+            .connect_timeout(timeout)
+            .connect()
+            .await
+            .map_err(TransportError::Connect)?;
+        Ok(Self::new(channel))
+    }
+
     /// Wrap an already-built channel — the seam a host uses to inject a
     /// pre-configured (load-balanced, lazily-connected, or simulated) channel.
     pub fn new(channel: Channel) -> Self {
