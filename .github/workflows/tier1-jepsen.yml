@@ -1,0 +1,86 @@
+name: tier1-jepsen
+
+# **Tier-1 Jepsen consistency campaign** (M3, proposal 0005 §13.2, `0005:408`):
+# assert the ADR-0015 consistency contract over the custodian repair path under
+# BOTH a crash (docker kill) and a network partition (docker pause/unpause).
+#
+# Drives the **production** `custodian::reconcile_step` → `reconstruction::reconcile`
+# path against a real containerized RS(6,3) D-server cluster and asserts:
+#   1. Commit-point-atomic repair under crash — a crash before the version-conditional
+#      commit leaves a fully-old inode (collectable garbage, never a torn/hybrid chunk).
+#   2. Commit-point-atomic repair under partition — a transient partition aborts the
+#      repair pass without committing any partial state.
+#   3. Read-after-commit — every committed server holds a readable fragment post-repair.
+#   4. Exactly-once convergence — repair commits exactly once across the partition heal.
+#   5. Data integrity — post-repair erasure reconstruction is byte-identical to original.
+#
+# This is the in-repo Option-B sibling to the literal Clojure/Jepsen/Elle credibility
+# artifact (re-filed as a follow-on once the substrate supports a non-vacuous run). It
+# mirrors the two merged sibling legs:
+#   - `tier1-disk-faults.yml` (cron 03:00, `WYRD_TIER1=1`)
+#   - `tier2-kill-reconstruct.yml` (cron 05:00, `WYRD_TIER2=1`)
+#
+# Gating policy (ADR-0016): NOT a required merge-gate status check. Runs nightly and
+# on demand. The `cargo xtask ci` gate (the daily merge gate) stays unprivileged and
+# container-free; this job runs after merge to catch regressions before the next
+# release. The scenario is compiled and type-checked by `cargo xtask ci` (the test is
+# `#[ignore]`d there); this job provides the live execution evidence.
+#
+# Opted in via `WYRD_TIER1=1`, which instructs `cargo xtask jepsen` to stand up the
+# real container cluster and drive the `#[ignore]`d scenario body.
+
+on:
+  schedule:
+    # 02:00 UTC daily — distinct from tier1-disk-faults.yml (03:00) and
+    # tier2-kill-reconstruct.yml (05:00) to avoid runner contention.
+    - cron: "0 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier1-jepsen-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  jepsen:
+    runs-on: ubuntu-latest
+    # Cold image build + 10-server cluster + six-phase consistency scenario fit under this.
+    # Matches tier2-kill-reconstruct.yml's bound.
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      # Opt in to the Tier-1 Jepsen consistency scenario.
+      WYRD_TIER1: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest ships Docker with the compose plugin; confirm the daemon is
+      # reachable (same check tier2-kill-reconstruct.yml and integration-nightly.yml use).
+      - name: Docker info
+        run: docker info
+
+      # cargo xtask jepsen opts in when WYRD_TIER1=1, confirms docker is present,
+      # stands up the 10-server cluster, runs the #[ignore]d consistency scenario via
+      # `cargo test --ignored`, then tears the cluster down.
+      - name: cargo xtask jepsen
+        run: cargo xtask jepsen
+
+      # Surface container diagnostics captured by jepsen_compose_logs before teardown
+      # (mirrors #150): logs are written to target/tier1-logs/ on failure so the
+      # diagnostics survive the compose down.
+      - name: Upload container diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tier1-jepsen-logs
+          path: target/tier1-logs/
+          if-no-files-found: ignore
+          retention-days: 14
