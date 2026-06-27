@@ -14,13 +14,15 @@ tags:
 
 The same codebase, composed differently. The composition lives in the `server` crate; switching profiles swaps backends behind the `ChunkStore`, `MetadataStore`, `NamespaceStore`, and `Coordination` traits.
 
-| Profile | Coordination | Metadata (L4) | Global plane (L2/L3) | Chunk store | Durability | Status |
-|---------|--------------|---------------|----------------------|-------------|------------|--------|
-| Single binary (dev) | in-memory | redb (embedded) | none — single-zone | filesystem | none / replication(1) | Dev & eval only (ADR-0014) |
-| Small multi-node | 3-node etcd | TiKV (small) / redb | none — single-zone | local-disk D servers | replication(n) or rs(k,m) | Production |
-| Provider fleet | dedicated etcd per zone | TiKV | TiDB + L3 replication (multi-region) | local-disk D servers | rs(k,m) | Production |
+| Profile | Coordination | Identity / PKI | Metadata (L4) | Global plane (L2/L3) | Chunk store | Durability | Status |
+|---------|--------------|----------------|---------------|----------------------|-------------|------------|--------|
+| Single binary (dev) | in-memory | dev-CA (in-process) | redb (embedded) | none — single-zone | filesystem | none / replication(1) | Dev & eval only (ADR-0014) |
+| Small multi-node | 3-node etcd | step-ca (SPIRE reserved) | TiKV (small) / redb | none — single-zone | local-disk D servers | replication(n) or rs(k,m) | Production |
+| Provider fleet | dedicated etcd per zone | step-ca, HA (SPIRE reserved) | TiKV | TiDB + L3 replication (multi-region) | local-disk D servers | rs(k,m) | Production |
 
-The single-binary profile collapses all components into one process: gateway, embedded metadata, one logical D server, custodians, in-memory coordination. It exists for development and evaluation and carries **no production durability promise** — a single chassis cannot deliver independent failure domains.
+The single-binary profile collapses all components into one process: gateway, embedded metadata, one logical D server, custodians, in-memory coordination, and a built-in **dev-CA** in place of the production CA (ADR-0025, ADR-0036) so a one-process system is not gated on a full PKI. It exists for development and evaluation and carries **no production durability promise** — a single chassis cannot deliver independent failure domains.
+
+The **Identity / PKI** column tracks the trust plane behind the mTLS fabric (§8.5, ADR-0005/0025): a built-in dev-CA in the single binary, and a **self-hosted provider CA — `step-ca` now, with SPIRE reserved** — for the production profiles (ADR-0036). It follows the same dev→fleet gradient as coordination, and — because internal mTLS is fail-closed (ADR-0025) — it is a first-class control-plane dependency, not an afterthought (see §7.3 and the §6.5 restore order). SPIRE (secret-less workload attestation) is the *reserved* upgrade, adopted at the fleet scale where its benefit outweighs its operational cost — a SPIRE Server plus a per-node Agent and attestation config; until then `step-ca` issues the short-lived, auto-rotated certs behind a `CertificateAuthority` seam, so the eventual switch is a composition change. The full rationale (why step-ca now, why SPIRE deferred, why not Vault) lives in ADR-0036.
 
 **There is no separate L2/L3 below the multi-zone tier.** The single-binary and small-multi-node profiles are *single-zone*: there is one home zone, so file→home-zone is trivial and the global namespace folds into the zonal store — `NamespaceStore` is backed by the same redb instance as `MetadataStore`, and cross-zone replication (L3) does not exist. A distinct, geo-distributed **L2** (TiDB behind `NamespaceStore`, ADR-0020) and the **L3** replication layer appear only at the **provider-fleet** profile — the first genuinely multi-region tier. This is why the build order (section 9) puts L2/L3 last.
 
@@ -43,6 +45,8 @@ Durability math depends on fragments landing in independent failure domains (rac
 - **Fewer domains** is honest only with **consciously-reduced tolerance**: e.g. 6 domains holding ~2 fragments each survives *any single domain* loss but not two arbitrary ones.
 
 A domain *label* must reflect actual shared-fate hardware. Labelling two processes that share a chassis as distinct domains does not create independence — it only makes the durability math lie. This is why day-one verification (§7.4) checks that a written chunk's fragments actually landed in distinct domains before the deployment is trusted.
+
+**The control and trust planes are failure domains too.** The math above concerns *D-server* domains, but two small control services carry their own availability requirement. The **coordination + metadata quorum** (etcd, PD/TiKV — 3 nodes, tolerate one loss not two) is the familiar one. Less obvious is the **provider CA trust plane** (`step-ca` now, SPIRE reserved — ADR-0036): because internal mTLS is **fail-closed** (ADR-0025), an unreachable CA halts *every new dial and certificate rotation* in the zone — so it is a hard availability dependency, not a background service. Run it **HA across independent domains** (as with the etcd quorum) and keep it **off the D-server hosts**, so a storage-node loss and a control-plane loss stay independent. A single-instance CA is a zone-wide single point of failure the moment a certificate needs to rotate.
 
 ## 7.4 Worked example — first single-zone deployment (M4)
 
