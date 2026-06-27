@@ -48,7 +48,7 @@ graph TB
     META["<b>METADATA STORE</b><br/>the commit point —<br/>the locus of atomicity"]
     CLIENT["<b>CLIENT</b> (thick)<br/>erasure-code, commit,<br/>reassemble on read"]
     CUST["<b>CUSTODIAN</b> (background)<br/>GC / scrub /<br/>reconstruct / rebalance"]
-    REPL["<b>REPLICATION WORKER</b><br/>(cross-zone, L3 — M5+)"]
+    REPL["<b>REPLICATION WORKER</b><br/>(cross-zone, L3 — M9+)"]
     DS["<b>D SERVERS</b> (dumb storage)<br/>store/return fragments by id,<br/>verify checksum · one per disk<br/>— a failure domain"]
     ZONES[("other zones")]
 
@@ -69,7 +69,7 @@ one mutation there**; the other four components collaborate around it.
 | **Client** *(the thick brain)* | Erasure-codes, writes fragments directly to D servers, issues the atomic commit, reconstructs on read. | Where the intelligence lives. It is the *only* component that understands what a *file* is: chunk → RS(k,m) encode → direct parallel fragment writes → atomic commit; on read, reconstruct from any *k* of *n*. Embedded in every L1 gateway. `client` crate, `reed-solomon-simd`. |
 | **D server** *(dumb storage)* | Stores and returns fragments by id, verifies checksums, reports health. | Deliberately stupid: no placement logic, no metadata, no erasure coding, no reconstruction. A disk with a gRPC interface and a checksum check. **One per disk** — each is an independent failure domain (ADR-0034). `dserver` crate, `ChunkStore` trait. |
 | **Custodian** *(background health)* | Keeps stored data healthy over time and emits durability telemetry. | Four jobs: **GC** (collect orphaned/failed-write garbage), **scrub** (re-verify checksums to catch bit-rot *before* it's needed), **reconstruct** (rebuild lost fragments when a D server dies), **rebalance** (drain hot/decommissioning servers). Reads and repairs against the metadata store and D servers. Emits the durability plane (ADR-0011). `custodian` crate. |
-| **Replication worker** *(cross-zone, L3 — M5+)* | Replicates committed chunks between zones, asynchronously, off the foreground write path. | Copies whole committed chunks to other zones per policy; a remote replica becomes readable only once its catalog record commits. Async by default; sync-N-zone is a per-tenant opt-in. Does not exist at single-zone scale. `proto`/NATS JetStream. |
+| **Replication worker** *(cross-zone, L3 — M9+)* | Replicates committed chunks between zones, asynchronously, off the foreground write path. | Copies whole committed chunks to other zones per policy; a remote replica becomes readable only once its catalog record commits. Async by default; sync-N-zone is a per-tenant opt-in. Does not exist at single-zone scale. `proto`/NATS JetStream. |
 
 Holding these together, off the data path: **coordination (L5)** — service
 discovery, leader election, locks — where D servers register and the custodian

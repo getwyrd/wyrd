@@ -15,9 +15,12 @@ tags:
   - multi-tenancy
   - security
 ---
-# Proposal: Management and administration — the operator surface
+# Proposal: Management and administration — the operator surface (Milestone 8 implementation plan)
 
-> Draft. The operator-facing **management and administration surface** for Wyrd:
+> Draft. The implementation plan for **Milestone 8 — Manageability (CLI + portal)**,
+> the ★ Step-2 release point of the [implementation arc][p2] at which the
+> single-zone system becomes *usable within a datacenter*. The operator-facing
+> **management and administration surface** for Wyrd:
 > the API-first management plane (ADR-0013), the observability planes and audit
 > log (ADR-0011, ADR-0012), the day-2 operations (§8.4), and multi-tenancy
 > administration (ADR-0022). M3 built the *engine* — the declarative
@@ -27,8 +30,10 @@ tags:
 > builds that surface. It is the **first real implementation** of the management
 > contract, so it **proposes to ratify ADR-0011, ADR-0012, and ADR-0013** (all
 > still Proposed) — Proposed → Accepted, subject to the architecture board. It is
-> scoped to **single-zone** management — the M0–M4 product; the cross-zone global
-> control plane (L2) is M6 and is explicitly out of scope.
+> scoped to **single-zone** management — the M0–M8 product; the cross-zone global
+> control plane (L2) is M10 and is explicitly out of scope. Its management-plane
+> auth (OIDC + mTLS) reuses the internal CA / identity fabric stood up in **M5**
+> (ADR-0036/0025).
 
 ## Motivation
 
@@ -200,7 +205,7 @@ emission to the full §8.3 plane model:
   the **five single-zone metrics** M3 already emits — under-replicated chunk
   count, repair-queue depth, time-to-repair distribution, scrub coverage,
   scrub-detected corruption rate. (The sixth ADR-0011 metric, replication lag per
-  zone pair, has no zone pair single-zone and is **deferred to M5**, per proposal
+  zone pair, has no zone pair single-zone and is **deferred to M9**, per proposal
   0005.) This plane answers the headline operability query directly.
 - **Capacity plane** — per-server / per-zone / **per-failure-domain** utilization
   and growth rate (§8.3, §8.9); the leading indicator for the add-capacity
@@ -264,7 +269,7 @@ the *changed* and *satisfied* moments observable.
   independent backup, (3) L3 verify + re-replicate the bytes from survivors —
   restoring bytes before the map is useless. The DR ordering is a **runbook that
   must be written and drilled** before it is needed. (Single-zone backup/restore
-  is in scope here; the multi-zone disaster-recovery *drill* is M7.)
+  is in scope here; the multi-zone disaster-recovery *drill* is M11.)
 
 ### Multi-tenancy administration (ADR-0022)
 
@@ -275,7 +280,7 @@ limits** (ADR-0022). The operator administers that bundle through the management
 API as **desired state**; tenant lifecycle, quota, and per-tenant replication
 factor are reconciled like any other policy. Per-tenant durability is the
 per-zone scheme — none / replication(n) / rs(k,m) (ADR-0008) — within a zone;
-synchronous N-zone replication is a per-tenant opt-in but is **cross-zone (M5+)**.
+synchronous N-zone replication is a per-tenant opt-in but is **cross-zone (M9+)**.
 
 Isolation is enforced **at L1 and L2, never below** (ADR-0022): the gateway (L1)
 authenticates the tenant and checks quota (bytes / object count; hard rejects,
@@ -291,12 +296,12 @@ A single-zone deployment **has** desired state and reconciliation; it is folded
 into the zonal store rather than a geo-distributed L2 (ADR-0020: "In a single-zone
 deployment the namespace IS the zonal store … becomes a distinct geo-distributed
 TiDB deployment only at the provider-fleet tier"). This proposal targets that
-single-zone product (the M0–M4 result). The **same desired-state / reconciliation
+single-zone product (the M0–M8 result). The **same desired-state / reconciliation
 API shape** extends across zones later: only the *backend* changes (zonal store →
 geo-distributed TiDB L2) and *cross-zone verbs* are added — the per-zone-pair
-replication-lag metric arrives with cross-zone replication at **M5**; placement
+replication-lag metric arrives with cross-zone replication at **M9**; placement
 across zones and residency redirect arrive with the global control plane at
-**M6**. The v1 API must be designed so the cross-zone surface is **additive, not a
+**M10**. The v1 API must be designed so the cross-zone surface is **additive, not a
 re-architecture** — consistent with ADR-0020 calling the global plane "a
 composition choice."
 
@@ -315,8 +320,8 @@ rest.)
 transport and auth prerequisites are recorded in Open questions); **polished
 dashboards and alerting** ("a gift, not a gate" — ADR-0012; "later and cheap"
 — ADR-0011); the **cross-zone global control plane** (L2 placement, geo namespace)
-→ **M6** (and the per-zone-pair replication-lag metric with cross-zone replication
-→ **M5**); **Zanzibar-class fine-grained authorization** (v1 is
+→ **M10** (and the per-zone-pair replication-lag metric with cross-zone replication
+→ **M9**); **Zanzibar-class fine-grained authorization** (v1 is
 POSIX-ish ACLs + bucket/prefix policy, §8.5); **tenant self-service admin
 delegation** (this proposal keeps administration operator-only in v1; ADR-0022
 keeps the policy tier centralized, so delegation is a deliberate later option).
@@ -456,12 +461,12 @@ keeps the policy tier centralized, so delegation is a deliberate later option).
 ## Out of scope — routed elsewhere
 
 - **The cross-zone global control plane** (L2 placement, the geo-distributed global
-  namespace / registry / replica catalog, cross-region/residency policy) → **M6**
+  namespace / registry / replica catalog, cross-region/residency policy) → **M10**
   (ADR-0020, status Proposed).
 - **Cross-zone data replication** (L3), the sync-N-zone per-tenant opt-in, and the
   per-zone-pair replication-lag metric (which has no zone pair to measure until
-  cross-zone replication exists) → **M5**.
-- **The multi-zone disaster-recovery drill** → **M7**. Single-zone backup/restore
+  cross-zone replication exists) → **M9**.
+- **The multi-zone disaster-recovery drill** → **M11**. Single-zone backup/restore
   is in scope; the cross-zone DR exercise is a distinct milestone.
 - **The web management UI**, **polished dashboards and alerting**, and
   **Zanzibar-class fine-grained authorization** — deferred consumers/features, not
@@ -479,7 +484,7 @@ keeps the policy tier centralized, so delegation is a deliberate later option).
 - **First implements the management/admin slice of** ADR-0022 (multi-tenancy) — the
   tenant policy bundle as a desired-state object. ADR-0022 is itself still
   **Proposed**, and its runtime isolation-enforcement points land with later
-  milestones (L1/L2 admission at M2+/M6), so this proposal implements only its
+  milestones (L1/L2 admission at M2+/M10), so this proposal implements only its
   administration slice and defers its ratification (carried in the Batch
   ratification open question).
 - **Builds on** ADR-0005 / ADR-0025 (provider CA, service mTLS), ADR-0008 (per-zone
@@ -488,6 +493,6 @@ keeps the policy tier centralized, so delegation is a deliberate later option).
   substrate / operator), ADR-0014 (single-binary dev-only), ADR-0016 (crate
   structure), ADR-0009 (DST as the correctness authority), and the M3 custodian
   work (proposal 0005: `desired_state.rs`, `telemetry.rs`, the rebalance loop).
-- **Scoped against** ADR-0020 (the global namespace / L2 control plane, M6) and the
-  implementation arc (proposal 0002: M5 cross-zone replication, M6 global control
-  plane, M7 disaster-recovery drill).
+- **Scoped against** ADR-0020 (the global namespace / L2 control plane, M10) and the
+  implementation arc (proposal 0013: M9 cross-zone replication, M10 global control
+  plane, M11 disaster-recovery drill).

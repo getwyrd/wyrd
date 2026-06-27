@@ -57,7 +57,7 @@ The **Small multi-node** profile becomes concrete at the M4 release point ([sing
 | Minimum honest | 6 (≈2 fragments/domain) | any single domain | No — one site |
 | Full RS(6,3) | 9 (1 fragment/domain) | any 3 domains | No — one site |
 
-Single-zone — homelab *or* one Hetzner location — survives disk/host/domain failure (the M3 repair story, on honest hardware) but **not loss of the whole site**; cross-zone replication (L3) is M5+. So M4 is a production-durable *single-site* store, governed by §8.2's rule: keep an out-of-band backup that does not depend on this cluster.
+Single-zone — homelab *or* one Hetzner location — survives disk/host/domain failure (the M3 repair story, on honest hardware) but **not loss of the whole site**; cross-zone replication (L3) is M9+. So M4 is a production-durable *single-site* store, governed by §8.2's rule: keep an out-of-band backup that does not depend on this cluster.
 
 Day-one verification gates trust, in order: (1) **label** each D server's failure domain so the selector spreads fragments; (2) **verify spread** — confirm a written chunk's 9 fragments landed in 9 distinct domains, or fix the labels; (3) **watch the durability plane** — under-replicated count must sit at zero in steady state; (4) **do the failure test** — kill one D server and watch reads keep serving from survivors, under-replicated count rise, the custodian rebuild, and the count return to zero. If that loop does not complete, the deployment is not yet production-durable.
 
@@ -85,4 +85,4 @@ The wiring of a production single-zone (Small multi-node) deployment — who dia
 
 **Two planes.** Bulk **fragment** data flows directly client/gateway → D servers (the gRPC chunk path that scales with the fleet); the **metadata commit** is a separate, smaller gRPC path to TiKV. Keeping them distinct is the Colossus-class separation that lets throughput scale with D servers rather than through a metadata bottleneck. On a private-network deployment (e.g. Hetzner vSwitch) only the gateway's S3 port is exposed publicly; every other path stays on the internal network.
 
-**Out of single-zone scope.** Cross-zone replication (L3) uses **NATS JetStream** (client `4222`) and appears only at the **provider-fleet** profile (M5+); it is not part of a single-zone deployment (ADR-0027).
+**Out of single-zone scope.** Cross-zone replication (L3) uses **NATS JetStream** (client `4222`) and appears only at the **provider-fleet** profile (M9+); it is not part of a single-zone deployment (ADR-0027).

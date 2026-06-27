@@ -77,7 +77,7 @@ These belong in CI as load/fault tests where feasible (Q1–Q3, Q5–Q7) and in 
 
 ## 13. Testing strategy
 
-> How Wyrd is verified, across tiers from reproducible simulation to real multi-region hardware. This subsection describes the *approach*; the DST decision itself is ADR-0009, the quality scenarios it must satisfy are above (section 10), the security properties and the threat→test map are the threat model (section 14.6–14.7), and the milestone ordering that each tier attaches to is in section 9 and proposal 0002 (the implementation arc).
+> How Wyrd is verified, across tiers from reproducible simulation to real multi-region hardware. This subsection describes the *approach*; the DST decision itself is ADR-0009, the quality scenarios it must satisfy are above (section 10), the security properties and the threat→test map are the threat model (section 14.6–14.7), and the milestone ordering that each tier attaches to is in section 9 and proposal 0013 (the implementation arc).
 
 ### 13.1 The principle: simulation is primary, real environments are complementary
 
@@ -96,7 +96,7 @@ A real environment is therefore never used to test correctness the simulation al
 
 ### 13.2 The tiers
 
-The tiers escalate in realism and cost. Each catches what the one below cannot; none replaces DST as the correctness authority. They attach to the implementation arc (proposal 0002) at the milestone where they first add value, so test investment stays matched to the milestone that needs it.
+The tiers escalate in realism and cost. Each catches what the one below cannot; none replaces DST as the correctness authority. They attach to the implementation arc (proposal 0013) at the milestone where they first add value, so test investment stays matched to the milestone that needs it.
 
 > **Tier numbering — two distinct schemes.** These Tier 0–3 labels are this strategy's *realism-and-cost* ladder. They are **not** the same as the "Tier-1"/"Tier-2" labels in the code and CI (proposal 0004's test taxonomy, e.g. `cargo xtask integration`): proposal 0004's "Tier-1" is the in-process DST/wire suite and its "Tier-2" is the container integration test — both of which run *within* this strategy's Tier 0–1, not on the Tier 2 single real machine below. Read a bare "Tier 2" by its source: this section's silicon tier, or the code's container suite.
 
@@ -120,7 +120,7 @@ The reference host for this tier is a single beefy workstation (see 13.3). Its E
 
 A single real, owned machine used as the primary local distributed-test host and the first "does this deploy and operate as claimed on real silicon" environment: real fsync, real NVMe latency, real SIMD-accelerated erasure coding, real OS behaviour. It validates honest single-node performance and real I/O semantics that the in-memory fakes abstract away, and it is the day-to-day host for the Tier-1 software-defined testing above. It is a *single failure domain*, so it proves real-silicon behaviour and single-node performance, not failure-domain independence (that is Tier 3).
 
-#### Tier 3 — Real multi-node, multi-region (from M5)
+#### Tier 3 — Real multi-node, multi-region (from M9)
 
 Rented, on-demand, separate machines in separate real failure domains and — for the cross-zone milestones — separate real regions, so the two things one machine structurally cannot provide become real rather than simulated:
 
@@ -148,15 +148,19 @@ Two notes on the reference choices:
 
 ### 13.4 Mapping to the arc
 
-| Milestone (proposal 0002) | Tiers active |
+| Milestone (proposal 0013) | Tiers active |
 |---------------------------|--------------|
 | M0 — walking skeleton | Tier 0 |
 | M1 — erasure coding | Tier 0; Tier 1/2 for first honest EC benchmarks |
 | M2 — networked D servers | Tier 0; Tier 1 (software faults), Tier 2 (real host); Jepsen begins |
 | M3 — custodians | Tier 0–2; Jepsen consistency; disk-fault injection for scrub/repair |
 | M4 — production metadata backend | Tier 0–2 against real TiKV |
-| M5 — cross-zone replication | + Tier 3 (real multi-region WAN) |
-| M6 — global control plane | Tier 0–3; cross-region consistency contract |
-| M7 — failover & DR, drilled | Tier 0–3; real zone-loss on independent hardware |
+| M5 — internal CA (step-ca) | Tier 0–2; mTLS handshake/identity fault injection — plaintext and wrong-identity dials refused; the `PeerIdentity` guard test |
+| M6 — encryption at rest (KMS) | Tier 0–2 against a real KMS (OpenBao); fail-closed on KMS unavailability; crypto-erase-vs-hold tests |
+| M7 — failover & DR (single-datacenter) | Tier 0–2; zone-internal node/disk/rack fault injection + local recovery drill |
+| M8 — manageability (CLI + portal) | Tier 0–2; management-plane auth (OIDC + mTLS) and day-2 op flows; upgrade/rotation drill |
+| M9 — cross-zone replication | + Tier 3 (real multi-region WAN) |
+| M10 — global control plane | Tier 0–3; cross-region consistency contract |
+| M11 — failover & DR, drilled | Tier 0–3; real zone-loss on independent hardware |
 
 The escalation is deliberate: the expensive Tier-3 rig is not stood up until the cross-zone milestones genuinely require real WAN and real failure-domain independence, and even then only on demand.
