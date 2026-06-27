@@ -1,0 +1,165 @@
+name: docs-immutability
+
+# Ratified design documents are append-only:
+#   - ADRs: Proposed -> Accepted -> Superseded (ADR-0001).
+#   - Proposals: draft -> accepted -> implemented/superseded/withdrawn
+#     (ADR-0037).
+#   - Specs: draft -> stable -> superseded/withdrawn (ADR-0037).
+#
+# The `status:` field in YAML frontmatter is the source of truth. This check
+# fails a pull request only when it modifies, deletes, or renames a document
+# that is *already* immutable in the PR's base — i.e. the version before the
+# change. Reading status from the base is what makes Proposed/draft -> Accepted
+# and draft -> stable transitions legal while freezing the record from that
+# point on. Adding new documents and editing indexes/READMEs stays allowed.
+#
+# Migration note: legacy records with no YAML frontmatter are outside this
+# regime until converted. Once converted, a non-editable base status freezes the
+# document.
+
+# Runs on every pull request (no path filter) so the check always reports a
+# status — required for it to be usable as a required status check. When a PR
+# touches no immutable design document, the job passes cheaply.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-immutability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Reject changes to immutable design documents
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          status_from_base() {
+            local path="$1"
+            local base_content status
+
+            base_content=$(git show "$BASE_SHA:$path" 2>/dev/null) || return 1
+
+            # Legacy records with no YAML frontmatter are not yet under the
+            # immutability regime.
+            [ "$(printf '%s\n' "$base_content" | head -n1)" = "---" ] || return 1
+
+            status=$(printf '%s\n' "$base_content" | awk '
+              NR==1 && $0=="---" { infm=1; next }
+              infm && /^---[[:space:]]*$/ { exit }
+              infm && tolower($0) ~ /^status:/ {
+                sub(/^[^:]*:[[:space:]]*/, ""); print; exit
+              }')
+            [ -n "$status" ] || status="unknown"
+            printf '%s' "$status"
+          }
+
+          normalized_status() {
+            printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
+          }
+
+          governing_spec_for() {
+            local path="$1"
+            local rel
+            rel="${path#docs/design/specs/}"
+
+            # Markdown spec files govern themselves.
+            if [[ "$path" == *.md ]]; then
+              printf '%s' "$path"
+              return 0
+            fi
+
+            # Non-Markdown conformance assets live below a version directory
+            # (for example conformance/vectors/v1/foo.fragment) and are
+            # governed by the matching spec (conformance/v1.md). Try the most
+            # specific prefix first, then walk back toward the spec domain.
+            IFS='/' read -r -a parts <<< "$rel"
+            for i in "${!parts[@]}"; do
+              if [[ "${parts[$i]}" =~ ^v[0-9]+$ ]]; then
+                local prefix_len prefix version spec_path
+                version="${parts[$i]}"
+                for ((prefix_len = i; prefix_len >= 1; prefix_len--)); do
+                  prefix=$(IFS='/'; printf '%s' "${parts[*]:0:prefix_len}")
+                  spec_path="docs/design/specs/${prefix}/${version}.md"
+                  if git cat-file -e "$BASE_SHA:$spec_path" 2>/dev/null; then
+                    printf '%s' "$spec_path"
+                    return 0
+                  fi
+                done
+              fi
+            done
+
+            return 1
+          }
+
+          document_status() {
+            local path="$1"
+            local governing_spec
+
+            case "$path" in
+              docs/design/adr/[0-9]*.md|docs/design/proposals/draft/[0-9]*.md|docs/design/proposals/accepted/[0-9]*.md)
+                status_from_base "$path"
+                ;;
+              docs/design/specs/*)
+                governing_spec=$(governing_spec_for "$path") || return 1
+                status_from_base "$governing_spec"
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          is_editable_status() {
+            local path="$1"
+            local status_lc="$2"
+
+            case "$path" in
+              docs/design/adr/[0-9]*.md)
+                [ "$status_lc" = "proposed" ]
+                ;;
+              docs/design/proposals/draft/[0-9]*.md|docs/design/proposals/accepted/[0-9]*.md|docs/design/specs/*)
+                [ "$status_lc" = "draft" ]
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          # Modified/Deleted/Renamed design records and spec-governed assets.
+          # The numbered globs exclude README/index pages by design.
+          # --name-status lines are tab-separated: "M\tpath", "D\tpath",
+          # "R<score>\told\tnew" — in every case the second field is the path
+          # as it exists in the base, whose status decides immutability.
+          violations=""
+          while IFS=$'\t' read -r change base_path _; do
+            [ -n "$base_path" ] || continue
+
+            status=$(document_status "$base_path") || continue
+            status_lc=$(normalized_status "$status")
+
+            if ! is_editable_status "$base_path" "$status_lc"; then
+              violations="${violations}  ${change}\t${base_path} (status: ${status:-unknown})"$'\n'
+            fi
+          done < <(git diff --name-status --diff-filter=MDR "$BASE_SHA" "$HEAD_SHA" -- \
+            'docs/design/adr/[0-9]*.md' \
+            'docs/design/proposals/draft/[0-9]*.md' \
+            'docs/design/proposals/accepted/[0-9]*.md' \
+            'docs/design/specs/**')
+
+          if [ -n "$violations" ]; then
+            echo "Immutable design documents were changed:"
+            printf '%b' "$violations"
+            echo
+            echo "Accepted ADRs/proposals and stable specs are append-only — supersede or version instead of editing."
+            exit 1
+          fi
+          echo "No immutable design documents were modified."

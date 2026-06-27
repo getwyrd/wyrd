@@ -48,6 +48,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0034](0034-d-server-disk-model.md) | D server disk model: one-per-disk now, multi-disk reserved | Proposed |
 | [0035](0035-no-dst-reachable-global-mutable-state.md) | No DST-reachable shared mutable global state (seed-determinism discipline) | Proposed |
 | [0036](0036-internal-ca-step-ca-spire.md) | Internal CA and identity fabric: step-ca now, SPIRE reserved | Proposed |
+| [0037](0037-proposal-and-spec-process.md) | Proposal and specification process, lifecycle, and immutability | Accepted |
 
 ## Why not ... ?
 

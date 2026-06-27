@@ -12,14 +12,14 @@ The design documentation is organized into four distinct classes, each with its 
 
 | Class | Location | Nature | Change process |
 |-------|----------|--------|----------------|
-| 1. Specifications | `specs/` | Normative, versioned | Strict; a version bump is an ecosystem event |
+| 1. Specifications | `specs/` | Normative, versioned | Strict; stable versions are immutable; a version bump is an ecosystem event |
 | 2. Architecture overview | `architecture/` | Descriptive, living | Edited continuously; always describes the current system |
 | 3. Decision records (ADRs) | `adr/` | Immutable history | Append-only; superseded, never edited |
-| 4. Enhancement proposals | `proposals/` | The change process | Draft → accepted → implemented |
+| 4. Enhancement proposals | `proposals/` | The change process | Draft → accepted → implemented; accepted records are immutable |
 
 ### 1. Specifications (`specs/`)
 
-The normative core. Currently this is the on-disk chunk/fragment format — the one artifact that must remain stable because **data outlives software**. A provider with petabytes written under format `v1` must be able to read it with software written years later. Specs use RFC 2119 language (MUST / SHOULD / MAY) and ship with conformance test vectors in `specs/conformance/`.
+The normative core. Currently this is the on-disk chunk/fragment format — the one artifact that must remain stable because **data outlives software**. A provider with petabytes written under format `v1` must be able to read it with software written years later. Specs use RFC 2119 language (MUST / SHOULD / MAY) and ship with conformance test vectors in `specs/conformance/`. See ADR-0037 for the spec lifecycle and immutability rule.
 
 Everything else (wire protocols, component interfaces) is implementation-first with versioned protobuf, not spec-first. See ADR-0002 for the reasoning.
 
@@ -33,9 +33,9 @@ Short, numbered, immutable records of *why* a decision was made. They exist so t
 
 ### 4. Enhancement proposals (`proposals/`)
 
-Once something is implemented, architectural change flows through proposals (modeled on Kubernetes KEPs and Rust RFCs). A proposal moves from `draft/` to `accepted/` and carries motivation, design, alternatives, and graduation criteria. Use `templates/proposal.md` to start one. Early in the project this is deliberately lightweight; the discipline matters more than the ceremony.
+Once something is implemented, architectural change flows through proposals (modeled on Kubernetes KEPs and Rust RFCs). A proposal moves from `draft/` to `accepted/` and carries motivation, design, alternatives, and graduation criteria. Use `templates/proposal.md` to start one. Early in the project this is deliberately lightweight; the discipline matters more than the ceremony. See ADR-0037 for the proposal lifecycle and immutability rule.
 
-Starting any of these documents? The fill-in templates for ADRs, proposals, and architecture sections live in `templates/`.
+Starting any of these documents? The fill-in templates for ADRs, proposals, specifications, and architecture sections live in `templates/`.
 
 ## Conventions
 
