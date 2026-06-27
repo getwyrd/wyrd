@@ -14,7 +14,7 @@ tags:
 # Proposal: Milestone 4 — production metadata backend (TiKV) (implementation plan)
 
 > The implementation plan for the fourth — and **release** — step of the
-> [implementation arc][p2] (proposal 0002). [Proposals 0001–0005][p5] built a
+> [implementation arc][p2] (proposal 0013, which supersedes 0002). [Proposals 0001–0005][p5] built a
 > single-zone object store that is erasure-coded ([0003][p3]), networked
 > ([0004][p4]), and self-maintaining ([0005][p5]) — but it runs entirely on the
 > **embedded redb** metadata backend, which by decision carries **no production
@@ -59,17 +59,23 @@ risk is exactly one proposition, and it is falsifiable:
   M4 is the empirical test of [ADR-0008][a8]'s own stated consequence: *"backend
   choice becomes a composition concern in `server`, not a refactor."*
 
-M4 is the **★ Step-2 release point** (arc): the result — a self-hostable,
-EC-efficient, atomically-consistent single-zone object store (and, after M3/M4,
-**self-maintaining** and **production-metadata-durable**) — is the **first
-genuinely useful product**, worth
-announcing and deploying even if Step 3 never follows ([p2][p2]). That status has
-two consequences the proposal honors throughout: (1) **production durability for
-metadata begins here** — redb stays the dev/eval backend, TiKV becomes the
-production backend ([ADR-0014][a14]); and (2) **backward-compatibility obligations
-begin here** — before M4 there was "no public API/deployments … nothing to stay
-compatible with" ([p2][p2]); at M4 the metadata trait, the deployment surface, and
-(on its own trigger) the on-disk format acquire stability duties.
+M4 is a **soft stopping point** that completes the single-zone **data plane**: the
+result — a self-hostable, EC-efficient, atomically-consistent single-zone object
+store, and after M3/M4 **self-maintaining** and **production-metadata-durable** —
+is feature-complete but **not yet the released product**. In the rescoped arc
+([p2][p2]) the **★ Step-2 release point moved to M8** (the secured, encrypted,
+operable single-zone product, "usable within a single datacenter"); M5–M8 add the
+trust fabric, encryption, single-DC failover, and the operator surface that make
+it deployable. That repositioning splits M4's old "release" consequences in two:
+(1) **production durability for metadata begins here** — redb stays the dev/eval
+backend, TiKV becomes the production backend ([ADR-0014][a14]) — and the
+**internal** `MetadataStore` contract hardens here, pinned by its two
+implementations; but (2) the **public release and backward-compatibility
+commitment moves to M8** — before the M8 release there is still "no public
+API/deployments … nothing to stay compatible with" ([p2][p2]). So M4 incurs the
+*internal* trait-stability duty (the trait is now a real contract with two
+backends to carry) without yet incurring the *public* API/deployment-compat duty
+that the release point M8 brings.
 
 A second, quieter motivation: M4 is the **second implementation** of the
 `MetadataStore` trait. Wyrd's discipline is that a trait's semantics are "pinned
@@ -131,7 +137,7 @@ seats kept open where retrofit is expensive:
 
 - **The global namespace store (L2) and cross-region linearizability** —
   [ADR-0020][a20] (NamespaceStore, default TiDB) is **status: Proposed** and is an
-  **M6** concern. M4 is **strictly the zonal L4 `MetadataStore`** ([ADR-0008][a8]),
+  **M10** concern. M4 is **strictly the zonal L4 `MetadataStore`** ([ADR-0008][a8]),
   linearizable **within one zone**. In a single-zone deployment the namespace
   shares the same metadata store as L4 — [ADR-0020][a20]:32 pins it to "the same
   embedded redb as L4 in the single-binary and small profiles," with TiDB
@@ -141,10 +147,10 @@ seats kept open where retrofit is expensive:
   to `MetadataStore` and flags NamespaceStore-on-the-production-backend separately
   (see Open questions).
 - **Cross-zone replication, replication-lag-bounded reads, sync-N-zone opt-in**
-  (consistency clauses 4–5) → **M5** (L3). There is **no second zone** at M4 to
+  (consistency clauses 4–5) → **M9** (L3). There is **no second zone** at M4 to
   measure lag against or replicate to; deferring is explicit, not silent.
 - **The version-high-water-mark *failover* behavior** ([§8][s8]; [ADR-0015][a15])
-  → **M7**. M4 **preserves the mechanism** (the per-file version is bumped in the
+  → **M11**. M4 **preserves the mechanism** (the per-file version is bumped in the
   atomic commit) but does not exercise it under zone loss.
 - **`RocksDB` as a third backend** — [ADR-0008][a8] keeps it "a fallback behind the
   trait," not a deliverable. M4 builds **only** the TiKV backend.
@@ -366,7 +372,7 @@ frozen five-clause consistency contract ([ADR-0015][a15], [§8.1][s8]): **clause
 demonstration; **clause 1** collapses into zonal linearizability (single zone, no
 distinct L2 — [ADR-0020][a20]:32); **clause 3** (read-your-writes / monotonic
 reads) is **trivially satisfied** at one zone and only becomes a testable
-cross-zone behavior at M5/M6; **clauses 4–5** (replication lag, sync-N-zone) are
+cross-zone behavior at M9/M10; **clauses 4–5** (replication lag, sync-N-zone) are
 cross-zone and deferred. M4 must also keep **bumping `meta:version` inside the
 atomic commit**, preserving the reserved Option-C fence as a non-breaking future
 strengthening — the regression risk here is *dropping the reservation*, not
@@ -449,7 +455,7 @@ NVMe latency, real OS behavior against real TiKV — honest single-node performa
 and I/O semantics the in-memory fakes abstract away (a single failure domain, so
 it proves real-silicon behavior, **not** failure-domain independence).
 
-**Tier-3 — multi-region — does *not* begin until M5** ([§13.4][s10]): single-zone
+**Tier-3 — multi-region — does *not* begin until M9** ([§13.4][s10]): single-zone
 M4 has no use for real WAN or cross-zone failure independence.
 
 > **Numbering note.** This proposal uses the architecture **realism ladder**
@@ -543,7 +549,7 @@ Building on the workspace as it stands after M3 (`chunk-format`, `chunkstore-fs`
   [ADR-0014][a14] keeps redb the dev/eval backend; M4 **adds** a production choice,
   it does not remove the dev one.
 - **Build the L2 NamespaceStore (TiDB) in the same milestone:** **rejected /
-  deferred to M6** — [ADR-0020][a20] is Proposed and is cross-region; M4 is
+  deferred to M10** — [ADR-0020][a20] is Proposed and is cross-region; M4 is
   strictly the zonal L4 store, and in single-zone deployments the namespace folds
   into the same store.
 - **Mint a new ADR for the TiKV backend:** **not minted** — [ADR-0008][a8] already
@@ -642,8 +648,10 @@ parallel with the tail of M3 once the trait is confirmed frozen.)
 
 ## Backward compatibility
 
-M4 is the **first release point**, so compatibility duties begin here — but
-narrowly and deliberately:
+M4 is **not** the release point (that is **M8** in the rescoped arc, [p2][p2]), so
+M4 incurs only the **internal** contract duties that landing the production
+backend creates; the **public** API / deployment-compatibility commitment begins
+at the M8 release. The M4 duties, narrowly and deliberately:
 
 - **The `MetadataStore` trait** — **unchanged**, and now **pinned by two
   implementations**. After M4 it is a real internal contract; a future change is a
@@ -661,9 +669,11 @@ narrowly and deliberately:
   fault-injection run" ([p2][p2]). M4's **Tier-2 sustained run on real TiKV** is a
   **candidate** `v1` trigger — recorded here, not decided (consistent with
   [0003][p3]/[0005][p5]).
-- **The deployment surface** — first stabilized here: the `deploy/` topology
-  (TiKV+PD+D-servers, L5 discovery) becomes the documented single-zone production
-  shape an operator can depend on.
+- **The deployment surface** — the `deploy/` topology (TiKV+PD+D-servers, L5
+  discovery) is **introduced** here as the production metadata tier, but it is
+  **not yet the stable operator-facing surface**: that is part of the M8 release
+  (the management plane and documented day-2 shape, proposal 0008). M4 fixes the
+  internal topology; M8 commits to it publicly.
 - **Reserved seats honored** — the `meta:version` fence ([ADR-0015][a15]) and the
   append/CAS/watch hooks ([ADR-0007][a7]) remain expressible on TiKV; M4 builds
   none of them but forecloses none.
@@ -707,7 +717,7 @@ narrowly and deliberately:
   ([ADR-0020][a20])? Out of M4 scope; flagged so the boundary stays deliberate.
 
 [p1]: ../accepted/0001-milestone-0-walking-skeleton.md
-[p2]: ../accepted/0002-implementation-arc.md
+[p2]: ../accepted/0013-implementation-arc-rescoped.md
 [p3]: ../accepted/0003-milestone-1-erasure-coding.md
 [p4]: ../accepted/0004-milestone-2-networked-d-servers.md
 [p5]: ../accepted/0005-milestone-3-custodians.md
