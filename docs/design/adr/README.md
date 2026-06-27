@@ -50,6 +50,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0036](0036-internal-ca-step-ca-spire.md) | Internal CA and identity fabric: step-ca now, SPIRE reserved | Proposed |
 | [0037](0037-proposal-and-spec-process.md) | Proposal and specification process, lifecycle, and immutability | Accepted (supersession-marker clause refined by 0038) |
 | [0038](0038-supersession-recorded-in-the-index.md) | Supersession is recorded in the index, not on the frozen file | Proposed |
+| [0039](0039-tier1-consistency-in-repo-scenario.md) | Tier-1 consistency-over-repair as an in-repo Rust scenario; literal Jepsen deferred (refines proposal 0005 §13.2) | Proposed |
 
 ## Why not ... ?
 
