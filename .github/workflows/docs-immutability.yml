@@ -134,27 +134,37 @@ jobs:
             esac
           }
 
+          check_path() {
+            local change="$1"
+            local path="$2"
+            local status status_lc
+
+            [ -n "$path" ] || return 0
+            status=$(document_status "$path") || return 0
+            status_lc=$(normalized_status "$status")
+
+            if ! is_editable_status "$path" "$status_lc"; then
+              violations="${violations}  ${change}\t${path} (status: ${status:-unknown})"$'\n'
+            fi
+          }
+
           # Added/Modified/Deleted/Renamed design records and spec-governed
           # assets. Additions are included so a stable spec's conformance
           # surface cannot grow by adding a new vector without superseding or
           # versioning the governing spec.
           # The numbered globs exclude README/index pages by design.
           # --name-status lines are tab-separated: "A\tpath", "M\tpath",
-          # "D\tpath", "R<score>\told\tnew" — in every case the second field
-          # is the relevant path. For additions, there is no base file at that
-          # path, but spec assets can still inherit immutable status from their
-          # governing base spec.
+          # "D\tpath", "R<score>\told\tnew". Rename records are checked as
+          # both a delete at the old path and an add at the new path, because a
+          # move from a draft-governed tree into a stable-governed tree grows
+          # the stable spec's conformance surface.
           violations=""
-          while IFS=$'\t' read -r change base_path _; do
-            [ -n "$base_path" ] || continue
-
-            status=$(document_status "$base_path") || continue
-            status_lc=$(normalized_status "$status")
-
-            if ! is_editable_status "$base_path" "$status_lc"; then
-              violations="${violations}  ${change}\t${base_path} (status: ${status:-unknown})"$'\n'
+          while IFS=$'\t' read -r change base_path target_path; do
+            check_path "$change" "$base_path"
+            if [[ "$change" == R* ]]; then
+              check_path "$change" "$target_path"
             fi
-          done < <(git diff --name-status --diff-filter=AMDR "$BASE_SHA" "$HEAD_SHA" -- \
+          done < <(git diff -M --name-status --diff-filter=AMDR "$BASE_SHA" "$HEAD_SHA" -- \
             'docs/design/adr/[0-9]*.md' \
             'docs/design/proposals/draft/[0-9]*.md' \
             'docs/design/proposals/accepted/[0-9]*.md' \
