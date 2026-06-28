@@ -125,16 +125,28 @@ async fn read_chunk(
     match chunk.scheme {
         EcScheme::None => {
             // A single fragment at index 0; there is nothing to reconstruct around.
-            let fragment = chunks
-                .get_fragment_at(
-                    fragment_dserver(chunk, 0),
-                    FragmentId {
-                        chunk: chunk.id,
-                        index: 0,
-                    },
-                )
-                .await?
-                .ok_or(ReadError::MissingFragment { chunk_id: chunk.id })?;
+            let frag_id = FragmentId {
+                chunk: chunk.id,
+                index: 0,
+            };
+            let fetch = chunks
+                .get_fragment_at(fragment_dserver(chunk, 0), frag_id)
+                .await;
+            let fragment = match fetch {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return Err(ReadError::MissingFragment { chunk_id: chunk.id }.into()),
+                // A verifying store (FsChunkStore, gRPC DATA_LOSS mapping) surfaced
+                // corruption as a typed fault instead of returning raw corrupt bytes.
+                // Mirror the raw-bytes corrupt arm: record as a durable repair
+                // obligation before surfacing the error (`0005:174-176`).
+                Err(e) if wyrd_traits::is_integrity_fault(e.as_ref()) => {
+                    corrupt.push(chunk.id);
+                    return Err(e);
+                }
+                // A transient / non-integrity error: propagate it so the caller's
+                // retry policy decides — do NOT record as a corruption finding.
+                Err(e) => return Err(e),
+            };
             match decode(&fragment) {
                 // Admit the fragment only if it decodes cleanly AND its header names
                 // the chunk being read — the same gate the shared verify enforces
@@ -186,30 +198,46 @@ async fn read_chunk(
 
             let mut shards: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
             while let Some((index, fetched)) = inflight.next().await {
-                if let Ok(Some(fragment)) = fetched {
-                    match decode(&fragment) {
-                        // Admit a survivor only if it decodes cleanly AND its header
-                        // names this chunk — the same gate `repair::intact_shard`
-                        // applies in reconstruction (`0005:262-267`). A misplaced-but-
-                        // intact fragment (valid checksum, foreign `chunk_id`) is
-                        // excluded from the decoder, never fed as a shard at `index`.
-                        Ok(decoded) if decoded.header.chunk_id == chunk.id => {
-                            shards.push((index as usize, decoded.payload));
-                            if shards.len() == k {
-                                // `k` verified: drop the outstanding fetches, which
-                                // abandons (cancels) them.
-                                break;
+                match fetched {
+                    Ok(Some(fragment)) => {
+                        match decode(&fragment) {
+                            // Admit a survivor only if it decodes cleanly AND its header
+                            // names this chunk — the same gate `repair::intact_shard`
+                            // applies in reconstruction (`0005:262-267`). A misplaced-but-
+                            // intact fragment (valid checksum, foreign `chunk_id`) is
+                            // excluded from the decoder, never fed as a shard at `index`.
+                            Ok(decoded) if decoded.header.chunk_id == chunk.id => {
+                                shards.push((index as usize, decoded.payload));
+                                if shards.len() == k {
+                                    // `k` verified: drop the outstanding fetches, which
+                                    // abandons (cancels) them.
+                                    break;
+                                }
+                            }
+                            // A present fragment that fails its checksum (decode `Err`) or
+                            // names a different chunk (misplaced) is bit rot / a misrouted
+                            // fragment: excluded from the decoder (read around) AND its
+                            // chunk recorded as a repair obligation, never silently
+                            // absorbed (`0005:174-176`, `0005:262-264`).
+                            _ => {
+                                corrupt.push(chunk.id);
                             }
                         }
-                        // A present fragment that fails its checksum (decode `Err`) or
-                        // names a different chunk (misplaced) is bit rot / a misrouted
-                        // fragment: excluded from the decoder (read around) AND its
-                        // chunk recorded as a repair obligation, never silently
-                        // absorbed (`0005:174-176`, `0005:262-264`).
-                        _ => {
-                            corrupt.push(chunk.id);
-                        }
                     }
+                    // Absent — read around.
+                    Ok(None) => {}
+                    // A verifying store (FsChunkStore, gRPC DATA_LOSS mapping) surfaced
+                    // corruption as a typed fault instead of raw bytes.  Mirror the
+                    // corrupt-bytes arm: record as a repair obligation and read around
+                    // (never absorbed silently, `0005:174-176`,
+                    // `crates/custodian/src/scrub.rs:102`).
+                    Err(e) if wyrd_traits::is_integrity_fault(e.as_ref()) => {
+                        corrupt.push(chunk.id);
+                    }
+                    // A transient / non-integrity error: silently drop (treat as absent,
+                    // existing behaviour) — do NOT record as a corruption finding
+                    // (reclassifying non-integrity errors is out of scope).
+                    Err(_) => {}
                 }
             }
             if shards.len() < k {
