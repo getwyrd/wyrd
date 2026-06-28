@@ -65,19 +65,23 @@ pub type Result<T> = std::result::Result<T, BoxError>;
 /// verify, or its header named a different chunk/index than the [`FragmentId`] it is
 /// filed under (bit rot / a tampered or misplaced fragment, `chunk-format` ADR-0019).
 ///
-/// This is a **corruption** fault, categorically distinct from a **transient** one
-/// (unreachable / timed out / busy): the bytes are bad, so *retrying the same fetch
-/// cannot help*. A consumer that walks fragments — the custodian's scrub loop, the
-/// read path — must turn it into a **durable repair obligation** (enqueue the chunk
-/// for reconstruction) and carry on past it, never retry it; the two faults are
-/// handled differently (repair vs. retry), so they must stay distinguishable along
-/// the whole path from the store to the consumer's decision point.
+/// This is a **corruption** fault, categorically distinct from a **transient** fault
+/// (unreachable / timed out / busy) AND from a **block-layer read fault**
+/// ([`BlockReadFault`] — `EIO` / dead sector): the bytes are bad (checksum failed),
+/// so *retrying the same fetch cannot help*. A consumer that walks fragments — the
+/// custodian's scrub loop, the read path — must turn it into a **durable repair
+/// obligation** (enqueue the chunk for reconstruction, emit a corruption finding) and
+/// carry on past it, never retry it; the **three** fault categories are handled
+/// differently (corruption-repair-and-continue, block-read-around-no-corruption-emit,
+/// and transient-retry), so they must stay mutually distinguishable along the whole
+/// path from the store to the consumer's decision point.
 ///
 /// It lives in the seam crate so **every** backend produces the *same* type and
 /// every consumer classifies it the *same* way ([`is_integrity_fault`]) without
 /// depending on a concrete store (ADR-0010). A networked backend that surfaces the
-/// fault over gRPC (a `DATA_LOSS` status, not a transient one) reconstructs *this*
-/// type on the client side, so the distinction survives the wire seam too.
+/// fault over gRPC (a `DATA_LOSS` status, distinct from both `FAILED_PRECONDITION`
+/// for block-read faults and the transient codes) reconstructs *this* type on the
+/// client side, so the distinction survives the wire seam too.
 #[derive(Debug)]
 pub struct IntegrityFault {
     /// The fragment whose stored (or offered) bytes failed integrity.
@@ -109,6 +113,106 @@ pub fn is_integrity_fault(err: &(dyn std::error::Error + 'static)) -> bool {
     while let Some(e) = next {
         if e.is::<IntegrityFault>() {
             return true;
+        }
+        next = e.source();
+    }
+    false
+}
+
+/// POSIX `EIO` (errno 5) — the OS errno a block-layer read fault raises (a dead
+/// sector, a `dm-error` target). This is the **single** definition of the closure
+/// "permanent block-layer fault" (errno-5 only; a wider class is deferred per
+/// #251 §6 item 2) so every site — the gRPC server, the gRPC client, and
+/// [`is_block_read_fault`] — agrees without re-deriving the predicate.
+const BLOCK_READ_FAULT_ERRNO: i32 = 5;
+
+/// A fragment could not be read because the **block device reported a read error**
+/// (POSIX `EIO`, errno 5 — a dead sector, a `dm-error` target, or equivalent
+/// block-layer I/O failure). This is a *permanent* durability fault — the device
+/// physically cannot return the bytes — but is categorically **distinct** from
+/// [`IntegrityFault`]:
+///
+/// * like [`IntegrityFault`], *retrying the same fetch cannot help* — read around
+///   it and rebuild from the ≥k survivors;
+/// * unlike [`IntegrityFault`], the stored content has **not** been shown to be
+///   corrupt — the fault is at the block layer, not in the bytes. A consumer
+///   **must not** record it as a corruption finding or schedule a checksum-repair.
+///
+/// It lives in the seam crate so a networked backend (the gRPC D server, which
+/// maps it to `FAILED_PRECONDITION` rather than `DATA_LOSS`) can reconstruct *this*
+/// type on the client side, preserving the block-read-fault ≠ corruption distinction
+/// across the wire seam (ADR-0010).
+///
+/// Its [`source`](std::error::Error::source) exposes a synthetic `EIO`
+/// [`std::io::Error`] so the source-chain walker `is_block_read_fault` in
+/// `reconstruction.rs` classifies remote and local dead sectors identically without
+/// a consumer-side code change — this type is transparent to the existing chain-
+/// walking classifier.
+#[derive(Debug)]
+pub struct BlockReadFault {
+    /// The fragment that could not be read.
+    pub id: FragmentId,
+    /// Backend detail for the durability audit trail.
+    pub detail: String,
+    // Synthetic EIO exposed via `source()` so the existing source-chain walker in
+    // `reconstruction.rs` (`is_block_read_fault`) finds it — remote and local dead
+    // sectors are classified identically without touching the consumer.
+    io_source: std::io::Error,
+}
+
+impl BlockReadFault {
+    /// Construct a block-read-fault for `id` with the given `detail` string.
+    pub fn new(id: FragmentId, detail: impl Into<String>) -> Self {
+        Self {
+            id,
+            detail: detail.into(),
+            io_source: std::io::Error::from_raw_os_error(BLOCK_READ_FAULT_ERRNO),
+        }
+    }
+}
+
+impl fmt::Display for BlockReadFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "block-layer read fault (chunk {:032x} index {}): {}",
+            self.id.chunk, self.id.index, self.detail
+        )
+    }
+}
+
+impl std::error::Error for BlockReadFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Expose the synthetic EIO so source-chain walkers (e.g. the private
+        // `is_block_read_fault` in `reconstruction.rs`) classify this seam type
+        // identically to a raw `io::Error(EIO)` raised by the fs backend.
+        Some(&self.io_source)
+    }
+}
+
+/// Whether `err` is a block-layer read fault anywhere in its source chain —
+/// checks for [`BlockReadFault`] (the seam type a remote gRPC backend
+/// reconstructs on the client) **or** a [`std::io::Error`] with
+/// `raw_os_error() == Some(5)` (a local `EIO` / dead sector raised by the fs
+/// backend directly).
+///
+/// This is the **single decision point** for the closure of "permanent block-layer
+/// fault" (EIO / errno-5 only; the wider class is deferred per #251 §6 item 2) —
+/// the gRPC server calls this to decide what to map to `FAILED_PRECONDITION`
+/// rather than re-deriving the check inline.
+///
+/// Walks [`source`](std::error::Error::source) so a backend may wrap the fault
+/// in its own type and still be classified.
+pub fn is_block_read_fault(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if e.is::<BlockReadFault>() {
+            return true;
+        }
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            if io.raw_os_error() == Some(BLOCK_READ_FAULT_ERRNO) {
+                return true;
+            }
         }
         next = e.source();
     }
