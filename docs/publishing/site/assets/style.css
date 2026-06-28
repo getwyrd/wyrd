@@ -52,7 +52,7 @@
     --paper-raised: #2a2620;
     --line: rgba(231, 224, 211, 0.14);
     --line-soft: rgba(231, 224, 211, 0.08);
-    --thread-deep: #b5564f;
+    --thread-deep: #d98a80;  /* link/label accent on Ink — a lighter seal for ≥4.5:1 */
     --weave: #5fa873;
   }
 }
@@ -148,8 +148,13 @@ h1 {
 }
 .btn:hover { text-decoration: none; border-color: var(--thread); transform: translateY(-1px); }
 .btn.primary { background: var(--thread); border-color: var(--thread); color: #fff; }
-@media (prefers-color-scheme: dark) { .btn.primary { color: #1a120c; } }
 .btn.primary:hover { background: var(--thread-deep); border-color: var(--thread-deep); }
+/* dark: the seal (sealOnDark #a2453f) carries white text in BOTH themes — dark text
+   on it is only ~3:1. The hover deepens the seal rather than reusing the lightened
+   --thread-deep link accent (which is tuned for legible link text, not a button fill). */
+@media (prefers-color-scheme: dark) {
+  .btn.primary:hover { background: #8f3a35; border-color: #8f3a35; }
+}
 .btn .arr { font-size: 16px; line-height: 1; }
 
 /* ---- landing page: sections ---- */
