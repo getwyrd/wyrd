@@ -9,36 +9,51 @@
      5. Prose          (generated Markdown: doc pages)
    ============================================================ */
 
-/* ---- 1. design tokens ---- */
+/* ---- 1. design tokens ----
+   The getwyrd "Statute" brand system (edition 2026.1) — source of truth in
+   docs/brand/ (getwyrd-tokens.css / .json). Brand-named tokens carry the palette;
+   the page's existing semantic names (--ink, --thread, --weave, …) are kept as
+   aliases so the whole stylesheet inherits the brand without restructuring. */
 :root {
-  --ink: #1a1916;
-  --ink-soft: #4a4843;
-  --ink-faint: #6f6d66;
-  --paper: #f6f4ee;
-  --paper-raised: #fbfaf6;
-  --line: #ddd9cd;
-  --line-soft: #e8e4da;
-  --thread: #9a5b3f;
-  --thread-deep: #7a4329;
-  --weave: #2f4a3f;
-  --radius: 6px;
+  /* brand palette */
+  --seal: #8a332d;       /* primary accent, the mark */
+  --brass: #9a7b3f;      /* secondary accent, rules */
+  --stone: #b7afa2;      /* muted borders */
+  --parchment: #e7e0d3;  /* sunk surfaces */
+
+  --ink: #211e1a;
+  --ink-soft: #5a554d;
+  --ink-faint: #8a8378;
+  --paper: #f7f4ee;
+  --paper-raised: #ffffff;
+  --line: rgba(33, 30, 26, 0.12);
+  --line-soft: rgba(33, 30, 26, 0.07);
+  --thread: var(--seal);        /* alias: primary accent */
+  --thread-deep: #6f2a24;       /* seal, deepened for links / hover */
+  --weave: #3f7a4f;             /* success: healthy / committed */
+  --radius: 4px;
   --maxw: 760px;
-  --font-display: "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
-  --font-body: "Charter", "Iowan Old Style", Georgia, "Times New Roman", serif;
-  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --font-display: "Spectral", Georgia, "Times New Roman", serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --ink: #e7e3d8;
+    /* on Ink: the brand's dark-panel variants (sealOnDark / brassOnDark) */
+    --seal: #a2453f;
+    --brass: #c2a05a;
+    --stone: #6f6a60;
+    --parchment: #2c2822;
+
+    --ink: #e7e0d3;
     --ink-soft: #b3afa3;
-    --ink-faint: #87847b;
-    --paper: #16150f;
-    --paper-raised: #1e1c15;
-    --line: #34322a;
-    --line-soft: #28261f;
-    --thread: #c98563;
-    --thread-deep: #d99877;
-    --weave: #7fa890;
+    --ink-faint: #8a8378;
+    --paper: #211e1a;
+    --paper-raised: #2a2620;
+    --line: rgba(231, 224, 211, 0.14);
+    --line-soft: rgba(231, 224, 211, 0.08);
+    --thread-deep: #d98a80;  /* link/label accent on Ink — a lighter seal for ≥4.5:1 */
+    --weave: #5fa873;
   }
 }
 
@@ -50,10 +65,11 @@ body {
   background: var(--paper);
   color: var(--ink);
   font-family: var(--font-body);
-  font-size: 19px;
+  font-size: 17px;
   line-height: 1.65;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  border-top: 4px solid var(--brass); /* the brand "cover rule" */
 }
 a { color: var(--thread-deep); text-decoration: none; }
 a:hover { text-decoration: underline; text-underline-offset: 3px; }
@@ -67,12 +83,18 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
   padding: 26px 0 0;
 }
 .brand {
+  display: inline-flex; align-items: center; gap: 9px;
   font-family: var(--font-display);
-  font-size: 21px; font-weight: 600; letter-spacing: 0.06em;
+  font-size: 22px; font-weight: 500; letter-spacing: -0.02em;
+  text-transform: lowercase;
   color: var(--ink);
 }
-.brand a { color: inherit; }
+.brand a { color: inherit; display: inline-flex; align-items: center; gap: 9px; }
 .brand a:hover { text-decoration: none; }
+/* the heraldic lozenge: outer diamond stroke + inner diamond (½) in the seal */
+.brand .mark { width: 22px; height: 22px; flex: none; display: block; }
+.brand .mark .lz-outer { fill: none; stroke: var(--ink); stroke-width: 2; }
+.brand .mark .lz-inner { fill: var(--seal); }
 .topnav { font-family: var(--font-mono); font-size: 13px; letter-spacing: 0.02em; }
 .topnav a { color: var(--ink-soft); margin-left: 22px; }
 .topnav a:hover { color: var(--thread-deep); }
@@ -126,8 +148,13 @@ h1 {
 }
 .btn:hover { text-decoration: none; border-color: var(--thread); transform: translateY(-1px); }
 .btn.primary { background: var(--thread); border-color: var(--thread); color: #fff; }
-@media (prefers-color-scheme: dark) { .btn.primary { color: #1a120c; } }
 .btn.primary:hover { background: var(--thread-deep); border-color: var(--thread-deep); }
+/* dark: the seal (sealOnDark #a2453f) carries white text in BOTH themes — dark text
+   on it is only ~3:1. The hover deepens the seal rather than reusing the lightened
+   --thread-deep link accent (which is tuned for legible link text, not a button fill). */
+@media (prefers-color-scheme: dark) {
+  .btn.primary:hover { background: #8f3a35; border-color: #8f3a35; }
+}
 .btn .arr { font-size: 16px; line-height: 1; }
 
 /* ---- landing page: sections ---- */
