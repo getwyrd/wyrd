@@ -3,7 +3,7 @@
 //! criteria `0005:500-502`; PR-sequence slice 8 `0005:541-545`; ADR-0009). M3's four
 //! custodian loops (GC #142, scrub #143, reconstruction #144, rebalance #145) shipped
 //! with *per-slice* tests; this suite is the **campaign** that sweeps seeds over the
-//! six §13/§10 properties continuously inside the deterministic simulator (`0005:371`).
+//! eight §13/§10 properties continuously inside the deterministic simulator (`0005:371`).
 //!
 //! Every property runs through the **real** [`reconcile_step`] fenced control point over
 //! the `MetadataStore` / `ChunkStore` trait seams (Option A — no deployed custodian
@@ -13,7 +13,9 @@
 //! function of its seed: a bug-finding seed replays the *same* killed/rotted servers and
 //! is committed as a permanent regression ([`REGRESSION_SEEDS`], ADR-0009).
 //!
-//! The six Tier-0 properties (`0005:378-403`):
+//! The eight Tier-0 properties (the six of `0005:378-403`, plus the two crash-window
+//! edges #199 adds — property 2 covers the commit-boundary crash, properties 7 and 8 the
+//! near edge of the write step and the reader's atomic flip across the repoint):
 //!   1. **Reconstruct-to-full-redundancy (Q1)** — kill a D server; reconstruction
 //!      rebuilds onto a healthy server in a **distinct failure domain**, and reads
 //!      **never error during repair** (`0005:381-384`).
@@ -32,6 +34,13 @@
 //!   6. **Durability-plane emission** — under-replicated count **rises then returns to
 //!      zero** as repair completes; queue depth + time-to-repair are emitted and correct
 //!      (`0005:400-403`).
+//!   7. **Crash mid-write commits nothing** (#199) — a crash *inside* the fragment-write
+//!      step (before the write is durable) places **nothing** and never reaches the commit:
+//!      the chunk map is fully old, the obligation stays queued, and the restart repairs.
+//!      The near edge of the window property 2 covers from the commit boundary.
+//!   8. **Reader flips atomically across the repoint** (#199) — a reader racing the single
+//!      version-conditional commit observes the placement **fully old XOR fully new, never a
+//!      mix**; both an old-placement and a new-placement reader read the correct object.
 //!
 //! Tier-1 (dm-flakey/dm-error + Jepsen) and Tier-2 (single-node kill-and-reconstruct)
 //! are the **deferred-posture** deliverables (`0005:405-411`): they need the block layer
@@ -57,7 +66,7 @@ use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
 use wyrd_core::placement::Topology;
-use wyrd_core::read::read_object;
+use wyrd_core::read::{read_object, read_object_from};
 use wyrd_core::repair;
 use wyrd_core::write::write_new_object_placed;
 use wyrd_custodian::{
@@ -163,6 +172,53 @@ impl MetadataStore for CrashMeta {
             return Ok(CommitOutcome::Conflict);
         }
         self.inner.commit(batch).await
+    }
+}
+
+/// A **crash-injecting** D server wrapping a [`MemDServer`]: while *armed*, every
+/// `put_fragment` **fails without storing**, modelling the custodian **dying mid-write** —
+/// the rebuilt fragment never reaching durable storage. This crashes the repair *strictly
+/// earlier* than [`CrashMeta`] (which drops the commit *after* the fragment is written):
+/// the two bracket the whole "fragment writes → commit" window of the heart-of-M3 loop
+/// (`reconstruction.rs:389-414` then `416-445`). The repair writes the fragment **before**
+/// the commit (`0005:325`), so a `put` that never completes leaves NOTHING placed — not
+/// even collectable garbage — and the version-conditional commit is never reached, so the
+/// chunk map is untouched (`0005:277`). The error propagates out of `repair_chunk`'s
+/// `put_fragment(..).await?` (`reconstruction.rs:407`) as a `ReconcileError::Store`, the
+/// trait-boundary shape of a custodian that died with the write in flight. Disarm to let
+/// the restarted custodian finish.
+struct CrashStore<'a> {
+    inner: &'a MemDServer,
+    armed: &'a AtomicBool,
+}
+
+#[async_trait]
+impl ChunkStore for CrashStore<'_> {
+    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+        if self.armed.load(Ordering::Relaxed) {
+            // The write dies in flight: nothing is stored, and the fault surfaces to the
+            // reconciler exactly as a real backend's interrupted write would.
+            return Err(Box::new(std::io::Error::other(
+                "simulated mid-write crash: the rebuilt fragment write never completed",
+            )));
+        }
+        self.inner.put_fragment(id, fragment).await
+    }
+
+    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+        self.inner.get_fragment(id).await
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        self.inner.list_fragments().await
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.inner.delete_fragment(id).await
+    }
+
+    async fn health(&self) -> Result<Health> {
+        self.inner.health().await
     }
 }
 
@@ -1024,6 +1080,208 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
     );
 }
 
+// ---- property 7: a crash DURING the fragment write commits nothing (the window's near edge) --
+
+/// **Crash mid-write — strictly earlier than [`prop_commit_point_atomic_under_crash`].**
+/// That property crashes at the commit boundary (the fragment already written, surviving as
+/// collectable garbage); this one crashes *inside* the fragment-write step, before the write
+/// is durable, so the two **bracket the whole "fragment writes → commit" window** the heart
+/// of M3 is structurally safe across (`reconstruction.rs:389-414` then `416-445`;
+/// `0005:277`, `0005:385-389`). RS(2,1) rebuilds exactly one fragment, so the finest crash
+/// point before the commit is the rebuilt write itself failing in flight ([`CrashStore`]).
+///
+/// The invariant: a write that never completes leaves the committed chunk map **fully old**
+/// (no version-conditional commit ran), places **nothing** — not even garbage — and the
+/// obligation **stays queued**, so the restarted custodian repairs cleanly. A crash here is
+/// never a torn/hybrid chunk and never silent data loss.
+async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
+    let meta = MemMeta::default();
+    let d = servers();
+    let fleet = fleet_of(&d);
+    let data = write_rs_2_1(&meta, &fleet).await;
+
+    let kill = SeededStorageFaults::kill(rng, N);
+    let victim = *kill.faults().keys().next().unwrap() as u16;
+    apply_storage_faults(&d, &kill).await;
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    // The rebuilt fragment always lands on the one free domain (D = server 3) for any victim
+    // in 0..N, so a crash store at server 3 intercepts the rebuild write whichever server the
+    // seed killed. The survivors (the non-victim servers in 0,1,2) stay plain D servers.
+    let armed = AtomicBool::new(false);
+    let crash3 = CrashStore {
+        inner: &d[3],
+        armed: &armed,
+    };
+    let mut topo = Topology::default();
+    let mut healthy: Vec<(DServerId, &dyn ChunkStore)> = Vec::new();
+    for id in 0u64..4 {
+        if id as u16 == victim {
+            continue;
+        }
+        topo.register(id, domain_letter(id));
+        if id == 3 {
+            healthy.push((3, &crash3 as &dyn ChunkStore));
+        } else {
+            healthy.push((id, &d[id as usize] as &dyn ChunkStore));
+        }
+    }
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-midwrite").await;
+
+    // CRASH the custodian inside the fragment-write step — the put never completes.
+    armed.store(true, Ordering::Relaxed);
+    let crashed = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500).await;
+    assert!(
+        crashed.is_err(),
+        "a write that dies in flight surfaces as a store error — the custodian died mid-repair"
+    );
+
+    // FULLY OLD: no version-conditional commit ran, so the inode is byte-for-byte its prior.
+    let after = read_inode(&meta).await;
+    assert_eq!(after.version, 1, "no commit landed");
+    assert_eq!(
+        after.chunk_map[0].placement,
+        vec![0, 1, 2],
+        "the committed placement is fully old — never a torn/hybrid chunk"
+    );
+    // NOTHING PLACED — not even collectable garbage: the interrupted write stored no bytes
+    // (the stricter sibling of the commit-boundary crash, where the fragment IS written).
+    assert!(
+        d[3].get_fragment(frag(victim)).await.unwrap().is_none(),
+        "the in-flight write left no rebuilt fragment on the target server"
+    );
+    assert!(
+        !repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "the obligation stays queued for the restarted custodian"
+    );
+    // Reads STILL succeed — degraded, read around the loss; the crash caused no corruption.
+    assert_eq!(
+        read_object(&meta, &fleet, INODE).await.unwrap(),
+        Some(data.clone()),
+        "the object reads correctly after the mid-write crash (no hybrid, no corruption)"
+    );
+
+    // RESTART: the custodian comes back, the write completes, and the repair commits once.
+    armed.store(false, Ordering::Relaxed);
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the restarted custodian repairs"
+    );
+    let record = read_inode(&meta).await;
+    assert_eq!(
+        record.version, 2,
+        "exactly one commit on the successful pass"
+    );
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "the obligation is drained once repair commits"
+    );
+    assert_full_redundancy(&record, &d).await;
+    assert_eq!(
+        read_object(&meta, &fleet, INODE).await.unwrap(),
+        Some(data),
+        "fully repaired after restart: the chunk reads correctly at full redundancy"
+    );
+}
+
+// ---- property 8: a reader racing the commit window flips atomically (old XOR new, never a mix) --
+
+/// **The reader's view flips atomically across the repoint.** The location update is ONE
+/// version-conditional commit (`reconstruction.rs:416-445`, `0005:277`), and a reader
+/// resolves placement from the single inode record it carries — so the *only* states a
+/// reader racing the commit can observe are the **fully-old** inode (v1) and the
+/// **fully-new** inode (v2); there is no third, hybrid inode, so {old, new} is the
+/// **exhaustive** race surface, not a sample of it. (The in-memory trait ops never yield
+/// mid-commit, so this boundary check is complete — a spawned reader could observe nothing
+/// the two snapshots here do not.)
+///
+/// The property models both racers against the **live** fleet *after* the flip has landed:
+/// - a reader that resolved the **old** placement before the commit ([`read_object_from`]
+///   with the v1 inode) still reads the correct, complete object — degraded, reconstructing
+///   around the killed fragment from its `k` survivors (which the repair never touched); and
+/// - a reader that resolves the **new** placement after the commit ([`read_object`]) reads
+///   the correct, complete object at full redundancy.
+///
+/// Both return byte-identical original data, and the placement repoints as a **whole vector**
+/// (the new differs from the old at exactly the rebuilt index) — never a per-index mix.
+async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
+    let meta = MemMeta::default();
+    let d = servers();
+    let fleet = fleet_of(&d);
+    let data = write_rs_2_1(&meta, &fleet).await;
+
+    let kill = SeededStorageFaults::kill(rng, N);
+    let victim = *kill.faults().keys().next().unwrap() as u16;
+    apply_storage_faults(&d, &kill).await;
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    // A reader that ENTERS the commit window resolves the OLD inode (v1, placement [0,1,2]).
+    let old = read_inode(&meta).await;
+    assert_eq!(old.version, 1);
+    assert_eq!(old.chunk_map[0].placement, vec![0, 1, 2]);
+
+    // The repoint lands as a single atomic commit.
+    let (topo, healthy) = healthy_view(victim, &d);
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-reader-race").await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .unwrap();
+    assert_eq!(outcome, Reconciled::Changed, "the chunk was reconstructed");
+
+    // A reader on the far side of the window resolves the NEW inode (v2).
+    let new = read_inode(&meta).await;
+
+    // ATOMIC, WHOLE-VECTOR FLIP: exactly one version transition (no hybrid inode between),
+    // and the placement changed only at the rebuilt index — never a per-index mix.
+    assert_eq!(new.version, 2, "exactly one atomic transition (v1 → v2)");
+    let differing: Vec<usize> = (0..N)
+        .filter(|&i| new.chunk_map[0].placement[i] != old.chunk_map[0].placement[i])
+        .collect();
+    assert_eq!(
+        differing,
+        vec![victim as usize],
+        "the repoint flips the whole placement vector, changing only the rebuilt index"
+    );
+    assert_eq!(
+        new.chunk_map[0].placement[victim as usize], 3,
+        "the rebuilt fragment moved to the free failure domain (D = server 3)"
+    );
+
+    // OLD reader, finishing AFTER the flip: still fully consistent — reads around the killed
+    // fragment from the `k` survivors the repair never disturbed. Never a torn/mixed read.
+    assert_eq!(
+        read_object_from(&fleet, &old).await.unwrap(),
+        data,
+        "a reader holding the old placement still reads the correct, complete object"
+    );
+    // NEW reader: fully consistent at full redundancy.
+    assert_eq!(
+        read_object(&meta, &fleet, INODE).await.unwrap(),
+        Some(data),
+        "a reader resolving the new placement reads the correct, complete object"
+    );
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -1064,6 +1322,18 @@ async fn fenced_stale_leader_lands_nothing() {
 }
 
 #[madsim::test]
+async fn crash_mid_fragment_write_commits_nothing() {
+    install_metric_dispatch();
+    prop_crash_mid_write_commits_nothing(&mut rand_seed()).await;
+}
+
+#[madsim::test]
+async fn reader_flips_atomically_across_commit() {
+    install_metric_dispatch();
+    prop_reader_flips_atomically_across_commit(&mut rand_seed()).await;
+}
+
+#[madsim::test]
 async fn durability_emission_rises_then_returns_to_zero() {
     install_metric_dispatch();
     prop_durability_emission_rises_then_returns_to_zero(&mut rand_seed()).await;
@@ -1098,5 +1368,7 @@ async fn committed_regression_seeds_stay_green() {
         prop_gc_reclaims_only_true_orphans(&mut rng).await;
         prop_fenced_stale_leader_lands_nothing(&mut rng).await;
         prop_durability_emission_rises_then_returns_to_zero(&mut rng).await;
+        prop_crash_mid_write_commits_nothing(&mut rng).await;
+        prop_reader_flips_atomically_across_commit(&mut rng).await;
     }
 }
