@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+# The DST determinism barrier (ADR-0035) lives in `src/lib.rs`, so `tracing` /
+# `tracing-subscriber` are normal deps of this (test-only, unpublished) crate, not
+# dev-deps: the barrier installs the permissive global default that the campaign's
+# per-callsite interest cache depends on, and the campaign tests reuse them.
+[dependencies]
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
 [dev-dependencies]
 madsim.workspace = true
 wyrd-core.workspace = true
@@ -30,12 +38,11 @@ rand_chacha.workspace = true
 # M3.8 custodian property campaign (tests/custodian.rs): the four custodian loops
 # driven through the real `reconcile_step` fenced control point over in-memory trait
 # stores, under the simulator. `custodian` carries the loops + the durability-plane
-# telemetry seam; `coordination-mem` provides leader election + the fencing token;
-# `tracing`/`tracing-subscriber` wire the durability metrics for in-process read-back.
+# telemetry seam; `coordination-mem` provides leader election + the fencing token.
+# (`tracing`/`tracing-subscriber` are normal deps above — the ADR-0035 barrier needs
+# them in the lib, and the campaign reuses them for in-process metric read-back.)
 wyrd-custodian.workspace = true
 wyrd-coordination-mem.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 # `wyrd-dst` compiles *only* under `--cfg madsim`, so its gRPC transport is
 # always madsim-tonic (aliased as `tonic`) — the same alias `proto` and
