@@ -96,12 +96,12 @@ async fn read_object_collecting(
 /// still found. A pre-M3 record carries no placement (or a short one); the fragment
 /// then resolves to its own index, which the single-authority store routes exactly as
 /// M2 did, so mixed-era data reads through the same path.
+///
+/// Delegates to [`ChunkRef::placed_dserver`] — the single authoritative
+/// placement-resolution definition shared by the read path, GC, scrub, and
+/// reconstruction, so placement semantics cannot drift across callers.
 fn fragment_dserver(chunk: &ChunkRef, index: u16) -> DServerId {
-    chunk
-        .placement
-        .get(index as usize)
-        .copied()
-        .unwrap_or(u64::from(index))
+    chunk.placed_dserver(index)
 }
 
 /// Read and decode one chunk's bytes, dispatching on its durability scheme. A
