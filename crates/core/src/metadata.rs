@@ -94,6 +94,36 @@ pub struct ChunkRef {
     pub placement: Vec<DServerId>,
 }
 
+impl ChunkRef {
+    /// The total number of fragments this chunk has, derived from its EC scheme:
+    /// `EcScheme::None` → 1; `EcScheme::ReedSolomon { k, m }` → `k + m`. This is
+    /// the authoritative fragment count shared by the read path, GC, scrub, and
+    /// reconstruction — the single source of truth for "how many fragments does this
+    /// chunk have?"
+    pub fn fragment_count(&self) -> u16 {
+        match self.scheme {
+            EcScheme::None => 1,
+            EcScheme::ReedSolomon { k, m } => u16::from(k) + u16::from(m),
+        }
+    }
+
+    /// The D server holding fragment `index` of this chunk, applying the
+    /// **identity-placement fallback** for pre-M3 / mixed-era records whose
+    /// `placement` vector is empty or shorter than `n` (decoded via
+    /// `#[serde(default)]`): if `placement[index]` is absent, the fragment resolves
+    /// to D-server `index`. This is the **single authoritative placement-resolution
+    /// definition** for the read path (`read.rs:fragment_dserver`), GC
+    /// (`gc.rs:referenced_fragments`), scrub, and reconstruction
+    /// (`reconstruction.rs:assess`), so placement semantics cannot drift across
+    /// callers.
+    pub fn placed_dserver(&self, index: u16) -> DServerId {
+        self.placement
+            .get(index as usize)
+            .copied()
+            .unwrap_or(u64::from(index))
+    }
+}
+
 /// An inode: attributes, the ordered chunk map, state, and version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InodeRecord {

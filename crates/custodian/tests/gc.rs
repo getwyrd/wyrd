@@ -279,6 +279,217 @@ async fn never_reclaims_a_referenced_fragment() {
     );
 }
 
+// ---- criterion 4: identity-fallback placement protects committed fragments (issue #287) ----
+//
+// Three sub-cases:
+//   4a: EcScheme::None  + placement: vec![]      — empty placement, index 0 falls back
+//   4b: EcScheme::RS    + placement: vec![]      — empty placement, orphan at index > 0
+//   4c: EcScheme::RS    + placement: vec![5]     — short vector, orphan at fallback index
+//
+// All three prove that GC's reference set equals the read path's resolved placement
+// closure (`read.rs:fragment_dserver`, `read.rs:99-105`; `ChunkRef::placed_dserver`,
+// `metadata.rs`), even for chunks whose `placement` vector is shorter than `n`.
+
+/// **Regression for issue #287 — sub-case 4a: `EcScheme::None` + empty placement.**
+///
+/// A committed inode whose `ChunkRef` carries `placement: vec![]` (pre-M3 / mixed-era,
+/// decoded with `#[serde(default)]`, `metadata.rs:93`) must have its identity-fallback
+/// fragment (index 0 → D-server 0) included in GC's reference set.
+///
+/// Pre-fix: `referenced_fragments` iterated `placement.iter()` (empty) → reference
+/// set was empty → stale orphan triggered `delete_fragment` → silent data loss.
+/// Post-fix: `ChunkRef::placed_dserver` expands to `(0, FragmentId{index:0})` → GC
+/// skips the fragment as referenced.
+///
+/// Flippable: revert `gc.rs:referenced_fragments` back to
+/// `chunk.placement.iter().enumerate()` and this goes red.
+#[tokio::test]
+async fn identity_fallback_none_empty_placement_protects_index0() {
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+
+    // A committed inode: EcScheme::None, placement: vec![] (pre-M3 / mixed-era).
+    // The read path resolves fragment 0 → D-server 0 via identity fallback
+    // (`ChunkRef::placed_dserver`: `placement.get(0)` = None → `unwrap_or(0)`).
+    let chunk: ChunkId = 0xF6_00;
+    d0.put(frag(chunk, 0)).await;
+    let record = InodeRecord {
+        size: 5,
+        chunk_map: vec![ChunkRef {
+            id: chunk,
+            scheme: EcScheme::None,
+            len: 5,
+            placement: vec![], // pre-M3: empty placement, identity fallback applies
+        }],
+        state: InodeState::Committed,
+        version: 1,
+    };
+    metadata::create(&meta, ROOT, "fallback-none-obj", 10, &record)
+        .await
+        .unwrap();
+
+    // A stale orphan for the same fragment (D-server 0, index 0), grace expired.
+    // Without the fix, the reference set is empty → orphan wins → delete_fragment.
+    mark_orphaned(&meta, 0, frag(chunk, 0), 0).await.unwrap();
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 0,
+    };
+
+    // now = 1_000_000: far past the orphan grace. Only protection is the identity-
+    // fallback reference implied by the committed chunk map.
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "4a: EcScheme::None + empty placement — committed fragment must not be reclaimed"
+    );
+    assert!(
+        d0.get_fragment(frag(chunk, 0)).await.unwrap().is_some(),
+        "4a: identity-fallback fragment of committed EcScheme::None chunk is NEVER deleted (issue #287)"
+    );
+}
+
+/// **Regression for issue #287 — sub-case 4b: `EcScheme::ReedSolomon` + empty placement,
+/// orphan at index > 0.**
+///
+/// An RS{k:2, m:1} chunk with `placement: vec![]` has 3 fragments (indices 0–2), all
+/// resolved by identity fallback: index `i` → D-server `i`. GC must protect the
+/// fragment at index 1 (D-server 1) even when a stale orphan record points at it.
+///
+/// This sub-case proves the scheme-aware fragment-count expansion (`fragment_count()`
+/// returning `k + m = 3`) AND the fallback at an index beyond 0.
+///
+/// Flippable: revert `gc.rs:referenced_fragments` to `placement.iter().enumerate()`;
+/// with `placement: vec![]` the loop yields nothing → (1, frag(chunk,1)) is not in the
+/// reference set → the orphan triggers `delete_fragment` → this goes red.
+#[tokio::test]
+async fn identity_fallback_rs_empty_placement_protects_index_above_zero() {
+    let meta = MemMeta::default();
+    let d1 = MemDServer::default();
+
+    // Committed inode: RS{k:2, m:1}, placement: vec![] (pre-M3).
+    // Fragment 1 → D-server 1 via identity fallback.
+    let chunk: ChunkId = 0xF6_01;
+    d1.put(frag(chunk, 1)).await;
+    let record = InodeRecord {
+        size: 5,
+        chunk_map: vec![ChunkRef {
+            id: chunk,
+            scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
+            len: 5,
+            placement: vec![], // pre-M3: empty, identity fallback for all 3 indices
+        }],
+        state: InodeState::Committed,
+        version: 1,
+    };
+    metadata::create(&meta, ROOT, "fallback-rs-obj", 20, &record)
+        .await
+        .unwrap();
+
+    // Stale orphan at (D-server 1, index 1), grace expired.
+    mark_orphaned(&meta, 1, frag(chunk, 1), 0).await.unwrap();
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    // Fleet only contains D-server 1 — the one with the orphaned fragment.
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(1, &d1)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 0,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "4b: RS + empty placement — committed fragment at index > 0 must not be reclaimed"
+    );
+    assert!(
+        d1.get_fragment(frag(chunk, 1)).await.unwrap().is_some(),
+        "4b: identity-fallback RS fragment at index 1 is NEVER deleted (issue #287)"
+    );
+}
+
+/// **Regression for issue #287 — sub-case 4c: `EcScheme::ReedSolomon` + short placement
+/// vector, orphan at a fallback index.**
+///
+/// An RS{k:2, m:1} chunk with `placement: vec![5]` has index 0 explicit (D-server 5)
+/// and indices 1–2 resolved by identity fallback (index 1 → D-server 1, index 2 →
+/// D-server 2). GC must protect the fragment at index 2 (D-server 2) even when a stale
+/// orphan record points at it and `placement[2]` does not exist.
+///
+/// This proves the mixed-explicit/fallback case: `.get(i).unwrap_or(i)` where some
+/// indices are present and others are not.
+///
+/// Flippable: revert `gc.rs:referenced_fragments` to `placement.iter().enumerate()`;
+/// with `placement: vec![5]` the loop yields only `(0, dserver=5)` → (2, frag(chunk,2))
+/// is absent → the orphan triggers `delete_fragment` → this goes red.
+#[tokio::test]
+async fn short_placement_vector_fallback_protects_fallback_index() {
+    let meta = MemMeta::default();
+    let d2 = MemDServer::default();
+
+    // Committed inode: RS{k:2, m:1}, placement: vec![5] (short — only index 0 explicit).
+    // Index 2 → D-server 2 via identity fallback.
+    let chunk: ChunkId = 0xF6_02;
+    d2.put(frag(chunk, 2)).await;
+    let record = InodeRecord {
+        size: 5,
+        chunk_map: vec![ChunkRef {
+            id: chunk,
+            scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
+            len: 5,
+            // Short vector: index 0 → D-server 5 (explicit), indices 1 and 2 fall back.
+            placement: vec![5],
+        }],
+        state: InodeState::Committed,
+        version: 1,
+    };
+    metadata::create(&meta, ROOT, "short-placement-obj", 30, &record)
+        .await
+        .unwrap();
+
+    // Stale orphan at (D-server 2, index 2), grace expired.
+    mark_orphaned(&meta, 2, frag(chunk, 2), 0).await.unwrap();
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    // Fleet only contains D-server 2 — the one with the orphaned fragment.
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(2, &d2)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 0,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "4c: RS + short placement — committed fragment at fallback index 2 must not be reclaimed"
+    );
+    assert!(
+        d2.get_fragment(frag(chunk, 2)).await.unwrap().is_some(),
+        "4c: short-placement RS fragment at index 2 is NEVER deleted (issue #287)"
+    );
+}
+
 // ---- criterion 3: grace window honoured (the flippable timing invariant) ----
 
 #[tokio::test]
