@@ -1,0 +1,43 @@
+{
+  "$meta": {
+    "brand": "getwyrd.dev",
+    "direction": "Statute",
+    "edition": "2026.1",
+    "license": "apache-2.0 + DCO"
+  },
+  "color": {
+    "ink":        { "value": "#211E1A", "use": "text, dark panels" },
+    "seal":       { "value": "#8A332D", "use": "primary accent, the mark" },
+    "sealOnDark": { "value": "#A2453F", "use": "seal lightened for use on Ink" },
+    "brass":      { "value": "#9A7B3F", "use": "secondary accent, rules" },
+    "brassOnDark":{ "value": "#C2A05A", "use": "brass on Ink" },
+    "stone":      { "value": "#B7AFA2", "use": "muted, borders" },
+    "parchment":  { "value": "#E7E0D3", "use": "surfaces" },
+    "paper":      { "value": "#F7F4EE", "use": "base ground" },
+    "success":    { "value": "#3F7A4F", "use": "healthy / committed" }
+  },
+  "font": {
+    "display": "Spectral",
+    "sans": "IBM Plex Sans",
+    "mono": "IBM Plex Mono"
+  },
+  "size": {
+    "display": 64, "h1": 40, "h2": 30, "h3": 22,
+    "body": 15, "small": 13, "mono": 13, "label": 11
+  },
+  "radius": { "base": 3, "lg": 4, "pill": 99 },
+  "logo": {
+    "mark": "heraldic lozenge — outer diamond stroke + inner diamond (½ size) in accent",
+    "wordmark": "lowercase Spectral 500, letter-spacing -0.02em",
+    "clearspace": "one inner-diamond height on every side",
+    "minMark": 16,
+    "minWordmark": 88
+  },
+  "family": {
+    "naming": "four-letter names in the wyrd lineage, share the ·rd ending and the lozenge",
+    "members": {
+      "wyrd": { "domain": "distributed storage", "accent": "seal" },
+      "vord": { "domain": "identity & access", "accent": "brass" }
+    }
+  }
+}

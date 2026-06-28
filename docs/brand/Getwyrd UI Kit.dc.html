@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Spectral:wght@300;400;500;600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>body{margin:0;background:#F7F4EE;}</style>
+</helmet>
+
+<div style="background:#F7F4EE; color:#211E1A; font-family:'IBM Plex Sans',sans-serif; -webkit-font-smoothing:antialiased;">
+
+  <!-- top bar -->
+  <div style="background:#211E1A; color:#F7F4EE; padding:18px 80px; display:flex; align-items:center; justify-content:space-between;">
+    <div style="display:flex; align-items:center; gap:13px;">
+      <svg width="24" height="24" viewBox="0 0 48 48" fill="none"><polygon points="24,3 45,24 24,45 3,24" stroke="#F7F4EE" stroke-width="2.2"/><polygon points="24,15 33,24 24,33 15,24" fill="#A2453F"/></svg>
+      <span style="font-family:'Spectral',serif; font-size:19px;">getwyrd</span>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:#9a8f84; margin-left:6px;">UI Kit</span>
+    </div>
+    <a href="Getwyrd%20Brand%20Kit.dc.html" style="font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:#cfc6ba; text-decoration:none;">← back to kit</a>
+  </div>
+
+  <div style="max-width:1180px; margin:0 auto; padding:64px 80px;">
+    <div style="font-family:'Spectral',serif; font-weight:400; font-size:40px; letter-spacing:-0.015em;">Component library</div>
+    <div style="margin-top:12px; font-size:14.5px; line-height:1.6; color:#5a554d; max-width:680px;">Production primitives for getwyrd consoles, docs and dashboards. Inline-styled, Statute palette, 3&nbsp;px radius, Plex for UI &amp; Spectral for headings.</div>
+
+    <!-- BUTTONS -->
+    <div style="margin-top:48px; border-top:2px solid #211E1A; padding-top:16px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:#8A332D;">Buttons</div>
+    <div style="margin-top:18px; display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:14px; background:#211E1A; color:#F7F4EE; padding:11px 22px; border-radius:3px;">Primary</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:14px; background:#8A332D; color:#F7F4EE; padding:11px 22px; border-radius:3px;">Seal action</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:14px; background:transparent; color:#211E1A; padding:10px 21px; border:1px solid #211E1A; border-radius:3px;">Secondary</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:14px; color:#8A332D; padding:11px 8px;">Ghost link →</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:14px; background:rgba(33,30,26,0.12); color:#9a948a; padding:11px 22px; border-radius:3px;">Disabled</span>
+    </div>
+    <div style="margin-top:12px; display:flex; flex-wrap:wrap; gap:12px; align-items:center;">
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:12px; background:#211E1A; color:#F7F4EE; padding:7px 15px; border-radius:3px;">Small</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:16px; background:#211E1A; color:#F7F4EE; padding:14px 28px; border-radius:3px;">Large</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:500; font-size:14px; background:#211E1A; color:#F7F4EE; padding:11px 20px; border-radius:3px; display:inline-flex; align-items:center; gap:9px;"><svg width="13" height="13" viewBox="0 0 48 48" fill="none"><polygon points="24,4 44,24 24,44 4,24" fill="#A2453F"/></svg>With mark</span>
+    </div>
+
+    <!-- FORMS -->
+    <div style="margin-top:42px; border-top:2px solid #211E1A; padding-top:16px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:#8A332D;">Forms</div>
+    <div style="margin-top:18px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:24px;">
+      <div>
+        <div style="font-size:12.5px; color:#5a554d; margin-bottom:7px;">Tenant name</div>
+        <div style="background:#fff; border:1px solid rgba(33,30,26,0.25); border-radius:3px; padding:11px 14px; font-family:'IBM Plex Mono',monospace; font-size:13px;">acme-eu</div>
+        <div style="margin-top:7px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#6a655c;">↳ lowercase, dns-safe</div>
+      </div>
+      <div>
+        <div style="font-size:12.5px; color:#5a554d; margin-bottom:7px;">Region</div>
+        <div style="display:flex; align-items:center; background:#fff; border:1px solid rgba(33,30,26,0.25); border-radius:3px; padding:11px 14px;"><span style="font-family:'IBM Plex Mono',monospace; font-size:13px;">eu-central</span><span style="margin-left:auto; color:#9a948a;">▾</span></div>
+      </div>
+      <div>
+        <div style="font-size:12.5px; color:#8A332D; margin-bottom:7px;">Quota (GiB)</div>
+        <div style="background:#fff; border:1px solid #8A332D; border-radius:3px; padding:11px 14px; font-family:'IBM Plex Mono',monospace; font-size:13px; color:#8A332D;">—</div>
+        <div style="margin-top:7px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8A332D;">⚠ required field</div>
+      </div>
+    </div>
+    <div style="margin-top:20px; display:flex; flex-wrap:wrap; gap:26px; align-items:center;">
+      <!-- toggle -->
+      <div style="display:flex; align-items:center; gap:10px;"><div style="width:38px; height:22px; border-radius:99px; background:#8A332D; position:relative;"><div style="position:absolute; top:2px; right:2px; width:18px; height:18px; border-radius:99px; background:#F7F4EE;"></div></div><span style="font-size:13px; color:#3a362f;">Atomic commits</span></div>
+      <div style="display:flex; align-items:center; gap:10px;"><div style="width:38px; height:22px; border-radius:99px; background:#B7AFA2; position:relative;"><div style="position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:99px; background:#F7F4EE;"></div></div><span style="font-size:13px; color:#3a362f;">Debug tracing</span></div>
+      <!-- checkbox -->
+      <div style="display:flex; align-items:center; gap:9px;"><div style="width:18px; height:18px; border-radius:3px; background:#211E1A; display:flex; align-items:center; justify-content:center;"><span style="color:#F7F4EE; font-size:12px;">✓</span></div><span style="font-size:13px; color:#3a362f;">GDPR residency</span></div>
+      <!-- radio -->
+      <div style="display:flex; align-items:center; gap:9px;"><div style="width:18px; height:18px; border-radius:99px; border:2px solid #8A332D; display:flex; align-items:center; justify-content:center;"><div style="width:8px; height:8px; border-radius:99px; background:#8A332D;"></div></div><span style="font-size:13px; color:#3a362f;">Single-region</span></div>
+    </div>
+
+    <!-- BADGES & TABS -->
+    <div style="margin-top:42px; border-top:2px solid #211E1A; padding-top:16px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:#8A332D;">Badges &amp; tabs</div>
+    <div style="margin-top:18px; display:flex; flex-wrap:wrap; gap:9px; align-items:center;">
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; background:#211E1A; color:#F7F4EE; padding:5px 11px; border-radius:99px;">stable</span>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; background:#8A332D; color:#F7F4EE; padding:5px 11px; border-radius:99px;">RFC</span>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; background:rgba(154,123,63,0.16); color:#7d6228; padding:5px 11px; border-radius:99px;">ADR-014</span>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; background:rgba(63,122,79,0.14); color:#3f7a4f; padding:5px 11px; border-radius:99px;">● healthy</span>
+      <span style="font-family:'IBM Plex Mono',monospace; font-size:11px; background:transparent; color:#5a554d; border:1px solid #B7AFA2; padding:4px 10px; border-radius:99px;">apache-2.0</span>
+    </div>
+    <div style="margin-top:18px; display:inline-flex; background:#E7E0D3; border-radius:4px; padding:4px;">
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-size:13px; font-weight:500; background:#F7F4EE; color:#211E1A; padding:7px 16px; border-radius:3px; box-shadow:0 1px 2px rgba(0,0,0,0.08);">Overview</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-size:13px; color:#6a655c; padding:7px 16px;">Replication</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-size:13px; color:#6a655c; padding:7px 16px;">Access</span>
+      <span style="font-family:'IBM Plex Sans',sans-serif; font-size:13px; color:#6a655c; padding:7px 16px;">Audit</span>
+    </div>
+
+    <!-- CARDS -->
+    <div style="margin-top:42px; border-top:2px solid #211E1A; padding-top:16px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:#8A332D;">Cards</div>
+    <div style="margin-top:18px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:18px; align-items:start;">
+      <!-- primitive status -->
+      <div style="background:#fff; border:1px solid rgba(33,30,26,0.12); border-radius:3px; padding:22px;">
+        <div style="display:flex; align-items:center; justify-content:space-between;"><div style="display:flex; align-items:center; gap:10px;"><svg width="24" height="24" viewBox="0 0 48 48" fill="none"><polygon points="24,3 45,24 24,45 3,24" stroke="#211E1A" stroke-width="2.4"/><polygon points="24,15 33,24 24,33 15,24" fill="#8A332D"/></svg><span style="font-family:'Spectral',serif; font-size:22px;">wyrd</span></div><span style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#3f7a4f;">● healthy</span></div>
+        <div style="margin-top:16px; display:grid; grid-template-columns:1fr 1fr; gap:12px; font-family:'IBM Plex Mono',monospace; font-size:12px;">
+          <div><div style="color:#9a948a; font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">Region</div><div style="margin-top:3px;">eu-central</div></div>
+          <div><div style="color:#9a948a; font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">Quorum</div><div style="margin-top:3px;">3 / 3</div></div>
+          <div><div style="color:#9a948a; font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">p99 commit</div><div style="margin-top:3px; color:#8A332D;">12 ms</div></div>
+          <div><div style="color:#9a948a; font-size:10px; text-transform:uppercase; letter-spacing:0.08em;">Stored</div><div style="margin-top:3px;">4.2 TiB</div></div>
+        </div>
+      </div>
+      <!-- ADR -->
+      <div style="background:#fff; border:1px solid rgba(33,30,26,0.12); border-left:3px solid #8A332D; border-radius:3px; padding:22px;">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; letter-spacing:0.08em; text-transform:uppercase; color:#8A332D;">ADR-014 · accepted</div>
+        <div style="margin-top:10px; font-family:'Spectral',serif; font-size:19px;">Provably-atomic commit</div>
+        <div style="margin-top:8px; font-size:13px; line-height:1.55; color:#5a554d;">Immutable, numbered record. Supersedes ADR-009.</div>
+        <div style="margin-top:14px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#9a948a;">2026-04-11 · architecture</div>
+      </div>
+      <!-- quota -->
+      <div style="background:#211E1A; color:#F7F4EE; border-radius:3px; padding:22px;">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; letter-spacing:0.08em; text-transform:uppercase; color:#9a8f84;">Quota · acme-eu</div>
+        <div style="margin-top:14px; font-family:'Spectral',serif; font-size:34px;">68<span style="font-size:18px; color:#9a8f84;"> / 100 GiB</span></div>
+        <div style="margin-top:14px; height:8px; border-radius:99px; background:rgba(255,255,255,0.14); overflow:hidden;"><div style="width:68%; height:100%; background:#A2453F;"></div></div>
+        <div style="margin-top:10px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#cfc6ba;">self-service · no subsidy</div>
+      </div>
+    </div>
+
+    <!-- ALERTS -->
+    <div style="margin-top:42px; border-top:2px solid #211E1A; padding-top:16px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:#8A332D;">Callouts</div>
+    <div style="margin-top:18px; display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px;">
+      <div style="background:rgba(154,123,63,0.10); border:1px solid rgba(154,123,63,0.4); border-radius:3px; padding:16px 18px;"><div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; letter-spacing:0.08em; text-transform:uppercase; color:#7d6228;">Note</div><div style="margin-top:7px; font-size:13px; line-height:1.55; color:#3a362f;">Spec-first only for contracts that must outlive the software.</div></div>
+      <div style="background:rgba(138,51,45,0.08); border:1px solid rgba(138,51,45,0.4); border-radius:3px; padding:16px 18px;"><div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; letter-spacing:0.08em; text-transform:uppercase; color:#8A332D;">Sovereignty</div><div style="margin-top:7px; font-size:13px; line-height:1.55; color:#3a362f;">This path introduces a US-controlled dependency. Flag explicitly.</div></div>
+      <div style="background:rgba(63,122,79,0.10); border:1px solid rgba(63,122,79,0.4); border-radius:3px; padding:16px 18px;"><div style="font-family:'IBM Plex Mono',monospace; font-size:10.5px; letter-spacing:0.08em; text-transform:uppercase; color:#3f7a4f;">Committed</div><div style="margin-top:7px; font-size:13px; line-height:1.55; color:#3a362f;">Quorum reached across 3 zones @ seq 0x1f3a.</div></div>
+    </div>
+
+    <!-- TABLE -->
+    <div style="margin-top:42px; border-top:2px solid #211E1A; padding-top:16px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:#8A332D;">Table</div>
+    <div style="margin-top:18px; background:#fff; border:1px solid rgba(33,30,26,0.12); border-radius:3px; overflow:hidden;">
+      <div style="display:grid; grid-template-columns:1.4fr 1fr 1fr 1fr; padding:12px 18px; background:#E7E0D3; font-family:'IBM Plex Mono',monospace; font-size:10.5px; letter-spacing:0.06em; text-transform:uppercase; color:#6a655c;"><div>Region</div><div>Replicas</div><div>p99</div><div>Status</div></div>
+      <div style="display:grid; grid-template-columns:1.4fr 1fr 1fr 1fr; padding:13px 18px; border-top:1px solid rgba(33,30,26,0.08); font-family:'IBM Plex Mono',monospace; font-size:12.5px; align-items:center;"><div>eu-central</div><div>3</div><div>12 ms</div><div style="color:#3f7a4f;">● healthy</div></div>
+      <div style="display:grid; grid-template-columns:1.4fr 1fr 1fr 1fr; padding:13px 18px; border-top:1px solid rgba(33,30,26,0.08); font-family:'IBM Plex Mono',monospace; font-size:12.5px; align-items:center;"><div>eu-west</div><div>3</div><div>18 ms</div><div style="color:#3f7a4f;">● healthy</div></div>
+      <div style="display:grid; grid-template-columns:1.4fr 1fr 1fr 1fr; padding:13px 18px; border-top:1px solid rgba(33,30,26,0.08); font-family:'IBM Plex Mono',monospace; font-size:12.5px; align-items:center;"><div>eu-north</div><div>2</div><div>31 ms</div><div style="color:#8A332D;">● rebalancing</div></div>
+    </div>
+
+    <!-- TERMINAL -->
+    <div style="margin-top:42px; border-top:2px solid #211E1A; padding-top:16px; font-family:'IBM Plex Mono',monospace; font-size:11px; letter-spacing:0.1em; text-transform:uppercase; color:#8A332D;">Terminal</div>
+    <div style="margin-top:18px; background:#211E1A; border-radius:3px; overflow:hidden;">
+      <div style="display:flex; align-items:center; gap:8px; padding:11px 16px; border-bottom:1px solid rgba(255,255,255,0.08);"><div style="width:9px; height:9px; border-radius:99px; background:#8A332D;"></div><div style="width:9px; height:9px; border-radius:99px; background:#9A7B3F;"></div><div style="width:9px; height:9px; border-radius:99px; background:#B7AFA2;"></div><span style="margin-left:8px; font-family:'IBM Plex Mono',monospace; font-size:11px; color:#9a8f84;">wyrd · eu-central</span></div>
+      <div style="padding:18px 20px; font-family:'IBM Plex Mono',monospace; font-size:12.5px; line-height:1.8; color:#cfc6ba;">
+        <div><span style="color:#A2453F;">$</span> <span style="color:#F7F4EE;">wyrd put obj://ledger/42 --atomic --quorum 3</span></div>
+        <div style="color:#9a8f84;"># resolving placement · eu-central</div>
+        <div style="color:#9A7B3F;">→ committed @ seq 0x1f3a · 12ms · 3/3 replicas</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

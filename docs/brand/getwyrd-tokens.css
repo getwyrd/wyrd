@@ -1,0 +1,47 @@
+/* getwyrd.dev — Statute design tokens
+   Edition 2026.1 · apache-2.0 + DCO */
+
+:root {
+  /* ---- Color ---- */
+  --gw-ink:        #211E1A; /* text, dark panels */
+  --gw-seal:       #8A332D; /* primary accent, the mark */
+  --gw-seal-on-dk: #A2453F; /* seal, lightened for use on Ink */
+  --gw-brass:      #9A7B3F; /* secondary accent, rules */
+  --gw-brass-on-dk:#C2A05A;
+  --gw-stone:      #B7AFA2; /* muted, borders */
+  --gw-parchment:  #E7E0D3; /* surfaces */
+  --gw-paper:      #F7F4EE; /* base ground */
+  --gw-success:    #3F7A4F; /* healthy / committed */
+
+  /* ---- Semantic ---- */
+  --gw-bg:            var(--gw-paper);
+  --gw-surface:       #ffffff;
+  --gw-surface-sunk:  var(--gw-parchment);
+  --gw-text:          var(--gw-ink);
+  --gw-text-muted:    #5a554d;
+  --gw-text-faint:    #8a8378;
+  --gw-border:        rgba(33, 30, 26, 0.12);
+  --gw-border-strong: rgba(33, 30, 26, 0.25);
+
+  /* ---- Type ---- */
+  --gw-font-display: 'Spectral', Georgia, serif;
+  --gw-font-sans:    'IBM Plex Sans', system-ui, sans-serif;
+  --gw-font-mono:    'IBM Plex Mono', ui-monospace, monospace;
+
+  /* type scale (px) */
+  --gw-size-display: 64px;
+  --gw-size-h1:      40px;
+  --gw-size-h2:      30px;
+  --gw-size-h3:      22px;
+  --gw-size-body:    15px;
+  --gw-size-small:   13px;
+  --gw-size-mono:    13px;
+  --gw-size-label:   11px; /* uppercase mono labels, +0.12em tracking */
+
+  /* ---- Form ---- */
+  --gw-radius:    3px;
+  --gw-radius-lg: 4px;
+  --gw-radius-pill: 99px;
+  --gw-space:     8px; /* base unit; sections use 78px / 80px */
+  --gw-rule:      5px; /* brass cover rule */
+}
