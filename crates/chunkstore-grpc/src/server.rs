@@ -75,14 +75,25 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
     ) -> std::result::Result<Response<FragmentGetResponse>, Status> {
         let request = request.into_inner();
         let id = conv::from_wire_fragment_id(request.id)?;
-        // Stored-data corruption the store detected on read (bit rot / a misplaced
-        // fragment) travels as `DATA_LOSS` — categorically distinct from a transient
-        // (`UNAVAILABLE`/`DEADLINE_EXCEEDED`) status — so the client can reconstruct
-        // it as a corruption finding and the scrub/read consumer can repair rather
-        // than retry. Any other failure is internal.
+        // Three fault categories must be kept mutually distinguishable across the
+        // wire seam (the seam contract, `wyrd_traits::IntegrityFault` / ADR-0010):
+        //
+        //  DATA_LOSS           — stored-data corruption (`IntegrityFault`): bit rot
+        //                        or a misplaced fragment detected on read; the client
+        //                        reconstructs an `IntegrityFault` → repair-and-continue,
+        //                        scrub emits a corruption finding.
+        //  FAILED_PRECONDITION — block-layer read fault (`BlockReadFault`): the block
+        //                        device physically could not return the bytes (POSIX
+        //                        `EIO` / dead sector); the client reconstructs a
+        //                        `BlockReadFault` → read-around, scrub does NOT emit
+        //                        corruption (the local/fs `EIO` path, `scrub.rs:108`).
+        //  INTERNAL            — any other server-side failure; stays `TransportError`
+        //                        (the retry-policy's transient classification).
         let fragment = self.inner.get_fragment(id).await.map_err(|e| {
             if wyrd_traits::is_integrity_fault(e.as_ref()) {
                 Status::new(Code::DataLoss, e.to_string())
+            } else if wyrd_traits::is_block_read_fault(e.as_ref()) {
+                Status::new(Code::FailedPrecondition, e.to_string())
             } else {
                 Status::internal(e.to_string())
             }
