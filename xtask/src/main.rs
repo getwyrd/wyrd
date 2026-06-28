@@ -38,6 +38,7 @@ fn main() -> ExitCode {
         Some("conformance") => run_conformance(),
         Some("gen-vectors") => run_gen_vectors(),
         Some("dst") => run_dst(),
+        Some("statics") => run_statics(),
         Some("integration") => run_integration(),
         Some("disk-faults") => faults::run_disk_faults(),
         Some("jepsen") => faults::run_jepsen(),
@@ -66,7 +67,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|integration|disk-faults|jepsen|kill-reconstruct|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|disk-faults|jepsen|kill-reconstruct|bench>"
     );
 }
 
@@ -389,6 +390,141 @@ fn docker_compose(compose: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+// ---- ADR-0035 DST-reachable global-mutable-state gate ----
+
+/// Production crates the DST campaigns compile against — the set ADR-0035's rule covers.
+/// `crates/dst` (the campaign substrate, incl. the sanctioned barrier) is scanned too.
+/// NOTE (ADR-0035 §4 latent hazard): `crates/server` is deliberately ABSENT — it is not yet
+/// DST-reachable. Its `Gateway` id allocators (`next_inode` / `next_chunk`, `AtomicU64`
+/// *fields*, not statics, so not flagged below even if scanned) MUST move behind a seam
+/// before any DST campaign exercises the server path; add `crates/server` here when it does.
+const STATICS_SCAN_CRATES: &[&str] = &[
+    "crates/core",
+    "crates/traits",
+    "crates/testkit",
+    "crates/custodian",
+    "crates/coordination-mem",
+    "crates/chunkstore-fs",
+    "crates/chunkstore-grpc",
+    "crates/chunk-format",
+    "crates/metadata-redb",
+    "crates/proto",
+    "crates/dst",
+];
+
+/// Substrings that name process-global mutable state (ADR-0035 §1): a `static mut`, the
+/// `lazy_static!` / `thread_local!` macros, or a `set_global_default` install. A bare
+/// `Atomic*` / `Mutex` as a struct *field* is local, not global, so it is matched only when
+/// it is the type of a `static` item (see [`statics_scan_line`]) — not flagged on its own.
+const FORBIDDEN_NEEDLES: &[&str] = &[
+    "static mut ",
+    "lazy_static!",
+    "thread_local!",
+    "set_global_default",
+];
+
+/// Interior-mutable container types that turn a `static` item into shared mutable global
+/// state (ADR-0035 §1). Matched only on a `static` declaration line.
+const INTERIOR_MUT_TYPES: &[&str] = &["Mutex", "RwLock", "OnceLock", "OnceCell", "Atomic"];
+
+/// Audited seed-safe occurrences permitted by ADR-0035 §4: `(path-fragment, label-fragment,
+/// reason)`. A scan hit whose file path contains the fragment and whose label contains the
+/// label-fragment is allowed. Keep this list short and every entry reasoned.
+const STATICS_ALLOWLIST: &[(&str, &str, &str)] = &[(
+    "crates/dst/src/lib.rs",
+    "set_global_default",
+    "the ADR-0035 determinism barrier itself — the one sanctioned global tracing default, \
+     installed fail-loud exactly once before any campaign runs",
+)];
+
+/// Scan one source line for ADR-0035 §1 global-mutable-state patterns, returning a label
+/// per hit. Comment lines are skipped so a doc/comment mention is not a false positive.
+/// Pure (no IO) so it is unit-tested directly.
+fn statics_scan_line(raw: &str) -> Vec<String> {
+    let line = raw.trim_start();
+    if line.starts_with("//") || line.starts_with('*') || line.starts_with("/*") {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for needle in FORBIDDEN_NEEDLES {
+        if raw.contains(needle) {
+            hits.push((*needle).to_string());
+        }
+    }
+    // A `static` ITEM (not a struct field) whose type is interior-mutable.
+    let is_static_item = line.starts_with("static ")
+        || line.starts_with("pub static ")
+        || line.starts_with("pub(crate) static ");
+    if is_static_item {
+        for ty in INTERIOR_MUT_TYPES {
+            if raw.contains(ty) {
+                hits.push(format!("static holding {ty}"));
+            }
+        }
+    }
+    hits
+}
+
+fn statics_collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            statics_collect_rs(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// ADR-0035: no DST-reachable shared mutable global state may influence a campaign outcome.
+/// A lightweight grep-style gate (the ADR-0016 single-source style, alongside `cargo-deny`)
+/// over the production crates the DST campaigns compile against — not a full reachability
+/// analysis, which "reachable from `#[madsim::test]`" cannot be computed as. Paired with the
+/// stated rule and review (ADR-0035 §4). Seed-safe exceptions live in [`STATICS_ALLOWLIST`].
+fn run_statics() -> Result<(), String> {
+    print_step(&["xtask", "statics", "(ADR-0035 DST global-state gate)"]);
+    let root = workspace_root();
+    let mut violations = Vec::new();
+    for crate_dir in STATICS_SCAN_CRATES {
+        let mut files = Vec::new();
+        statics_collect_rs(&root.join(crate_dir).join("src"), &mut files);
+        for file in files {
+            let content = std::fs::read_to_string(&file)
+                .map_err(|e| format!("statics: read {}: {e}", file.display()))?;
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            for (idx, raw) in content.lines().enumerate() {
+                for label in statics_scan_line(raw) {
+                    let allowed = STATICS_ALLOWLIST
+                        .iter()
+                        .any(|(p, n, _)| rel.contains(p) && label.contains(n));
+                    if !allowed {
+                        violations.push(format!("{rel}:{}: {label}", idx + 1));
+                    }
+                }
+            }
+        }
+    }
+    if violations.is_empty() {
+        println!("xtask statics: no DST-reachable shared mutable global state (ADR-0035)");
+        Ok(())
+    } else {
+        Err(format!(
+            "ADR-0035 violation — DST-reachable shared mutable global state can defeat \
+             seed-determinism:\n  {}\nInject the state through a testkit seam (Clock / \
+             seed-derived RNG / fault traits), or — if audited seed-safe — add it to \
+             STATICS_ALLOWLIST in xtask with a stated reason.",
+            violations.join("\n  ")
+        ))
+    }
+}
+
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
 /// failure stops the run.
 fn run_ci() -> Result<(), String> {
@@ -415,6 +551,7 @@ fn run_ci() -> Result<(), String> {
     cargo_machete_check()?;
     cargo_deny_check()?;
     run_conformance()?;
+    run_statics()?;
     run_dst()?;
     println!("\nxtask ci: all checks passed");
     Ok(())
@@ -629,6 +766,52 @@ mod tests {
             *order.borrow(),
             vec!["capture_logs", "teardown"],
             "diagnostics must be captured before teardown destroys them",
+        );
+    }
+
+    // ADR-0035 statics gate: it must catch process-global mutable state but NOT a bare
+    // atomic/mutex used as a struct field (local, seed-safe — e.g. the `Gateway` allocators
+    // or `ManualClock`), and it must ignore comments so a doc mention is not a false hit.
+    #[test]
+    fn statics_gate_flags_globals_not_fields() {
+        // Global mutable state — every forbidden shape is caught.
+        assert!(!statics_scan_line("static mut COUNTER: u64 = 0;").is_empty());
+        assert!(
+            !statics_scan_line("thread_local! { static X: Cell<u8> = Cell::new(0); }").is_empty()
+        );
+        assert!(!statics_scan_line("    let _ = set_global_default(reg);").is_empty());
+        assert!(
+            !statics_scan_line("static REG: Mutex<Vec<u8>> = Mutex::new(Vec::new());").is_empty()
+        );
+        assert!(!statics_scan_line("static N: AtomicU64 = AtomicU64::new(0);").is_empty());
+
+        // A struct FIELD atomic/mutex is local, not a global static — never flagged.
+        assert!(statics_scan_line("    next_inode: AtomicU64,").is_empty());
+        assert!(statics_scan_line("    kv: Mutex<HashMap<Vec<u8>, Bytes>>,").is_empty());
+        // A plain immutable static (no interior mutability) is fine.
+        assert!(statics_scan_line("static DST_SEEDS: &str = \"50\";").is_empty());
+        // Comments are skipped — a doc mention of a forbidden token is not a violation.
+        assert!(statics_scan_line("/// uses set_global_default in the barrier").is_empty());
+        assert!(statics_scan_line("// static mut FOO: u8 = 0;").is_empty());
+    }
+
+    // The one sanctioned exception (the barrier) is allowlisted, and the allowlist is keyed
+    // on path + label so it cannot accidentally permit the same token elsewhere.
+    #[test]
+    fn statics_allowlist_covers_only_the_barrier() {
+        let label = "set_global_default";
+        let allowed = |rel: &str| {
+            STATICS_ALLOWLIST
+                .iter()
+                .any(|(p, n, _)| rel.contains(p) && label.contains(n))
+        };
+        assert!(
+            allowed("crates/dst/src/lib.rs"),
+            "the barrier is allowlisted"
+        );
+        assert!(
+            !allowed("crates/custodian/src/telemetry.rs"),
+            "the same token elsewhere is NOT allowlisted"
         );
     }
 

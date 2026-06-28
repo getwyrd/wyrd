@@ -73,6 +73,9 @@ use wyrd_custodian::{
     mark_orphaned, reconcile_step, Custodian, FencedZone, GcContext, Reconciled,
     ReconstructionContext, ScrubContext,
 };
+// The DST determinism barrier preamble (ADR-0035): declaring every campaign property
+// through this macro installs the permissive global `tracing` default unbypassably.
+use wyrd_dst::dst_campaign_test;
 use wyrd_testkit::{SeededStorageFaults, StorageFault};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
@@ -384,35 +387,12 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for MetricCapture {
     }
 }
 
-/// Install a permissive, process-global default `tracing` subscriber exactly once.
-///
-/// The durability-plane metrics are emitted with `tracing::info!`
-/// (`crates/custodian/src/reconstruction.rs:417,425,435-436` — e.g.
-/// `reconstruction_under_replicated`) and read back per property through a *scoped*
-/// [`MetricCapture`] installed via `.with_subscriber(..)`. `tracing` caches a **global,
-/// process-wide** interest per callsite the first time that callsite is hit: when the
-/// thread that hits it first has only the process default (`NoSubscriber`, whose interest
-/// is `never`) — which is every property in this file that does **not** wrap its
-/// `reconcile_step` in a capture subscriber — the callsite is cached `never` and the
-/// event is short-circuited before it can ever reach a later `with_subscriber` capture
-/// layer. Under `cargo test`'s parallel threads (and the 50-seed sweep) that registration
-/// races the capture, so [`prop_durability_emission_rises_then_returns_to_zero`]
-/// non-deterministically records **nothing** (`left: []`) and the emission assertion
-/// flakes — even at a fixed seed (the flake is in process-global state, not the seed).
-///
-/// Installing a permissive global default makes every callsite register as *enabled* no
-/// matter which property hits it first, so the interest cache can never be poisoned to
-/// `never` and the per-property capture is deterministic. A *scoped* `with_subscriber`
-/// still overrides this global default for routing, so captured events are unaffected;
-/// non-capturing properties simply route their events to this no-op registry, which
-/// stores nothing for them. Idempotent via [`Once`]; calling it first in every
-/// `#[madsim::test]` makes the install a barrier that completes before any callsite is hit.
-fn install_metric_dispatch() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
-    });
-}
+// The `tracing` interest-cache determinism barrier this campaign depends on is no longer a
+// per-test convention here: it is a substrate property installed unconditionally by the
+// `dst_campaign_test!` preamble (`crates/dst/src/lib.rs`, ADR-0035). Every property below is
+// declared through that macro, so the permissive global default is installed (fail-loud,
+// once) before any callsite is hit — a property cannot be written without it. The superseded
+// per-test `install_metric_dispatch()` is gone (#242, #243).
 
 // ---- helpers ----
 
@@ -1291,52 +1271,52 @@ fn rand_seed() -> ChaCha8Rng {
     ChaCha8Rng::seed_from_u64(madsim::runtime::Handle::current().seed())
 }
 
-#[madsim::test]
-async fn reconstruct_to_full_redundancy_q1() {
-    install_metric_dispatch();
-    prop_reconstruct_to_full_redundancy(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn reconstruct_to_full_redundancy_q1() {
+        prop_reconstruct_to_full_redundancy(&mut rand_seed()).await;
+    }
 }
 
-#[madsim::test]
-async fn commit_point_atomic_repair_under_crash() {
-    install_metric_dispatch();
-    prop_commit_point_atomic_under_crash(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn commit_point_atomic_repair_under_crash() {
+        prop_commit_point_atomic_under_crash(&mut rand_seed()).await;
+    }
 }
 
-#[madsim::test]
-async fn scrub_detects_bit_rot_then_reconstructs_q2() {
-    install_metric_dispatch();
-    prop_scrub_detects_bit_rot_then_reconstructs(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn scrub_detects_bit_rot_then_reconstructs_q2() {
+        prop_scrub_detects_bit_rot_then_reconstructs(&mut rand_seed()).await;
+    }
 }
 
-#[madsim::test]
-async fn gc_reclaims_only_true_orphans_q3() {
-    install_metric_dispatch();
-    prop_gc_reclaims_only_true_orphans(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn gc_reclaims_only_true_orphans_q3() {
+        prop_gc_reclaims_only_true_orphans(&mut rand_seed()).await;
+    }
 }
 
-#[madsim::test]
-async fn fenced_stale_leader_lands_nothing() {
-    install_metric_dispatch();
-    prop_fenced_stale_leader_lands_nothing(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn fenced_stale_leader_lands_nothing() {
+        prop_fenced_stale_leader_lands_nothing(&mut rand_seed()).await;
+    }
 }
 
-#[madsim::test]
-async fn crash_mid_fragment_write_commits_nothing() {
-    install_metric_dispatch();
-    prop_crash_mid_write_commits_nothing(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn crash_mid_fragment_write_commits_nothing() {
+        prop_crash_mid_write_commits_nothing(&mut rand_seed()).await;
+    }
 }
 
-#[madsim::test]
-async fn reader_flips_atomically_across_commit() {
-    install_metric_dispatch();
-    prop_reader_flips_atomically_across_commit(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn reader_flips_atomically_across_commit() {
+        prop_reader_flips_atomically_across_commit(&mut rand_seed()).await;
+    }
 }
 
-#[madsim::test]
-async fn durability_emission_rises_then_returns_to_zero() {
-    install_metric_dispatch();
-    prop_durability_emission_rises_then_returns_to_zero(&mut rand_seed()).await;
+dst_campaign_test! {
+    async fn durability_emission_rises_then_returns_to_zero() {
+        prop_durability_emission_rises_then_returns_to_zero(&mut rand_seed()).await;
+    }
 }
 
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
@@ -1357,18 +1337,70 @@ const REGRESSION_SEEDS: &[u64] = &[
     0x5EED_0000_0000_0022,
 ];
 
-#[madsim::test]
-async fn committed_regression_seeds_stay_green() {
-    install_metric_dispatch();
-    for &seed in REGRESSION_SEEDS {
-        let mut rng = ChaCha8Rng::seed_from_u64(seed);
-        prop_reconstruct_to_full_redundancy(&mut rng).await;
-        prop_commit_point_atomic_under_crash(&mut rng).await;
-        prop_scrub_detects_bit_rot_then_reconstructs(&mut rng).await;
-        prop_gc_reclaims_only_true_orphans(&mut rng).await;
-        prop_fenced_stale_leader_lands_nothing(&mut rng).await;
-        prop_durability_emission_rises_then_returns_to_zero(&mut rng).await;
-        prop_crash_mid_write_commits_nothing(&mut rng).await;
-        prop_reader_flips_atomically_across_commit(&mut rng).await;
+dst_campaign_test! {
+    async fn committed_regression_seeds_stay_green() {
+        for &seed in REGRESSION_SEEDS {
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            prop_reconstruct_to_full_redundancy(&mut rng).await;
+            prop_commit_point_atomic_under_crash(&mut rng).await;
+            prop_scrub_detects_bit_rot_then_reconstructs(&mut rng).await;
+            prop_gc_reclaims_only_true_orphans(&mut rng).await;
+            prop_fenced_stale_leader_lands_nothing(&mut rng).await;
+            prop_durability_emission_rises_then_returns_to_zero(&mut rng).await;
+            prop_crash_mid_write_commits_nothing(&mut rng).await;
+            prop_reader_flips_atomically_across_commit(&mut rng).await;
+        }
+    }
+}
+
+// ---- the barrier's own regression test (ADR-0035 §5) ----
+
+/// A metric callsite **only this test** touches. The production callsites
+/// (`reconstruction_under_replicated`, …) are process-global and a sibling property may
+/// have cached their interest already, so they cannot test *first* touch deterministically;
+/// a private probe lets this test own the first touch and assert the barrier's effect on it.
+fn emit_poison_probe() {
+    tracing::info!(monotonic_counter.__dst_barrier_poison_probe = 1_u64);
+}
+
+dst_campaign_test! {
+    /// Pin the two things the barrier's containment rests on (ADR-0035 §5), each with teeth:
+    ///
+    /// 1. **The barrier was actually installed.** The `dst_campaign_test!` preamble must have
+    ///    set a global `tracing` default; a no-op or forgotten barrier leaves `NoSubscriber`
+    ///    and reds this assertion. (This is the half a removed barrier breaks.)
+    /// 2. **`registry()` keeps callsite interest non-`never`.** A scoped capture over a bare
+    ///    `tracing_subscriber::registry()` must observe an info metric callsite. The barrier
+    ///    relies on `registry()` reporting interest (so a callsite never latches `never`);
+    ///    nothing else pins that `tracing-subscriber` behaviour, so a dependency upgrade that
+    ///    changed `Registry`'s callsite interest would empty the capture and red this instead
+    ///    of silently re-breaking seed-determinism. The non-capturing first touch mirrors the
+    ///    poison race #242 describes.
+    ///
+    /// What this CANNOT do: deterministically reproduce the *cross-thread* poison itself.
+    /// `Dispatch::new` rebuilds the interest cache (`tracing-core` `dispatcher.rs`), so any
+    /// in-thread scoped capture re-evaluates the callsite; the genuine flake is a timing race
+    /// between parallel `cargo test` threads over the process-global cache, which is exactly
+    /// what the barrier (assertion 1) removes — it is not reproducible in one deterministic
+    /// test. Pinning the two invariants above is the achievable, teeth-bearing guard.
+    async fn barrier_installed_and_registry_keeps_callsites_capturable() {
+        // (1) The barrier installed a global default — teeth against a forgotten/no-op barrier.
+        assert!(
+            tracing::dispatcher::has_been_set(),
+            "the dst_campaign_test! barrier must have installed a global tracing default (ADR-0035 §2)"
+        );
+
+        // (2) A non-capturing first touch, then a scoped capture that must still observe it.
+        emit_poison_probe();
+        let cap = MetricCapture::default();
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(cap.clone()),
+            emit_poison_probe,
+        );
+        assert_eq!(
+            cap.values("monotonic_counter.__dst_barrier_poison_probe"),
+            vec![1],
+            "a scoped capture over registry() must observe the metric — registry() interest must stay non-`never`"
+        );
     }
 }
