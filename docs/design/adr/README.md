@@ -51,6 +51,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0037](0037-proposal-and-spec-process.md) | Proposal and specification process, lifecycle, and immutability | Accepted (supersession-marker clause refined by 0038) |
 | [0038](0038-supersession-recorded-in-the-index.md) | Supersession is recorded in the index, not on the frozen file | Proposed |
 | [0039](0039-tier1-consistency-in-repo-scenario.md) | Tier-1 consistency-over-repair as an in-repo Rust scenario; literal Jepsen deferred (refines proposal 0005 §13.2) | Proposed |
+| [0040](0040-mixed-era-placement-expansion.md) | Mixed-era placement expansion: one identity-fallback rule, liberal read / strict maintenance (refines proposal 0005 §placement) | Proposed |
 
 ## Why not ... ?
 
