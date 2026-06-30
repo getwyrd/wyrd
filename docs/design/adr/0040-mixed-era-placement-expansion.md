@@ -60,10 +60,17 @@ helper, with a deliberately asymmetric strictness posture.
 2. **One expansion helper.** A single helper —
    `ChunkRef::fragments() -> impl Iterator<Item = (u16, DServerId)>` over the full
    index space — is *the* "walk every fragment to its holding D-server" call;
-   `fragment_count()` and `placed_dserver()` remain its primitives. Every consumer
-   that interprets a committed chunk map MUST resolve placement through this helper
-   (or `placed_dserver`) and MUST NOT iterate the raw `placement` vector. Raw
-   iteration is the defect class this record exists to foreclose.
+   `fragment_count()` and `placed_dserver()` remain its primitives. No consumer may
+   iterate the raw `placement` vector — raw iteration is the defect class this record
+   exists to foreclose. This bare helper is **liberal**: it applies the identity
+   fallback unconditionally and does *not* validate length, so it is the read path's
+   resolution. Maintenance loops resolve through the same expansion but only behind
+   the validity gate of decision 4 — a malformed vector is rejected *before* it is
+   expanded, never silently identity-filled. The gate is therefore a separate,
+   fallible step, not a property of `fragments()` itself: expose it as a companion
+   (e.g. `checked_fragments() -> Result<…, MalformedPlacement>`, or a
+   `placement_is_valid()` predicate the loop checks first — #347/#348's call), while
+   `fragments()` stays infallible for read.
 
 3. **Validity of a placement vector.** A committed `placement` vector is valid
    **iff** it is empty (pre-M3 → identity) **or** `len == fragment_count()`
@@ -75,8 +82,11 @@ helper, with a deliberately asymmetric strictness posture.
 4. **Liberal read, strict maintenance.** The read path stays **liberal** — it keeps
    the per-index identity fallback so a still-readable record is never made
    unreadable over a length quirk (availability first). The maintenance loops are
-   **strict**: on a malformed (non-empty, wrong-length) vector they MUST NOT
-   fabricate identity entries. GC and scrub fail safe — treat the chunk as fully
+   **strict**: they MUST classify the committed placement *before* expanding — empty
+   or `len == fragment_count()` is valid and is walked via `fragments()`; a non-empty
+   wrong-length vector is **malformed** and takes the path below WITHOUT expansion, so
+   no identity entry is ever fabricated for it. GC and scrub fail safe — treat the
+   chunk as fully
    referenced, never reclaim, and emit an audit event (ADR-0011); reconstruction
    and rebalance skip the chunk and flag it NEEDS-HUMAN. This costs nothing on real
    data (only empty or full vectors occur) and turns a corrupt vector into a visible
@@ -105,12 +115,16 @@ leaving the compatibility fallback in place with no defined removal path.
 
 ## Consequences
 
-There is now one definition of placement expansion. The rebalance data-loss class
-(#346) is closed and structurally cannot recur, because the raw-iteration pattern
-is replaced by a helper that always walks the full index space; a reviewer can
-grep for `.placement.iter()` to find any future regression. Malformed placement
-vectors become an observable signal (audit event / NEEDS-HUMAN) rather than a
-silent identity resolution that masks corruption.
+This record changes no code: the rebalance data-loss path (#346) remains **live on
+`main`** — `plan_evacuations` still iterates `chunk.placement` raw and the
+`fragments()` helper does not yet exist. Once #347 lands the helper and #346 routes
+rebalance through it, there is a single definition of placement expansion and the
+data-loss class is closed — and, because the helper always walks the full index
+space, it then structurally cannot recur (a reviewer can grep for
+`.placement.iter()` to catch any future regression). Malformed placement vectors
+become an observable signal (audit event / NEEDS-HUMAN) once the strict-maintenance
+stance is implemented (#348), rather than a silent identity resolution that masks
+corruption.
 
 The cost is real follow-on work, tracked as the #292 follow-ups, all on M3 —
 Custodians: add the `fragments()` helper and migrate every consumer onto it
