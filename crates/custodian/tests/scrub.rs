@@ -168,6 +168,22 @@ async fn commit_reference(
     assert_eq!(outcome, CommitOutcome::Committed);
 }
 
+/// Commit an inode whose single chunk map entry is exactly `chunk_ref` — used by the
+/// empty/short/RS{6,3} placement cells below, which need schemes and placement shapes
+/// `commit_reference` (`EcScheme::None`, one explicit dserver) cannot express.
+async fn commit_chunk(meta: &MemMeta, inode: InodeId, name: &str, chunk_ref: ChunkRef) {
+    let record = InodeRecord {
+        size: 16,
+        chunk_map: vec![chunk_ref],
+        state: InodeState::Committed,
+        version: 1,
+    };
+    let outcome = metadata::create(meta, ROOT, name, inode, &record)
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+}
+
 async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
     let leader = Custodian::elect(coord, "zone-scrub").await.unwrap();
     let mut zone = FencedZone::new();
@@ -595,4 +611,263 @@ async fn scrub_propagates_a_transient_get_fault_without_enqueuing() {
         repair::queued_repairs(&meta).await.unwrap().is_empty(),
         "a transient fault never enqueues a repair obligation"
     );
+}
+
+// ---- issue #349 (mixed-era placement matrix): Scrub — empty/short placement, both
+//      schemes, + an RS{6,3} cell, mirroring the existing full(None) coverage above
+//      (`walks_and_verifies_referenced_fragments_through_reconcile_step`,
+//      `detects_a_bitflip_excludes_and_enqueues_for_reconstruction`). Scrub resolves
+//      its reference set through `crate::gc::referenced_fragments`
+//      (`crates/custodian/src/scrub.rs:30`), which expands every committed `ChunkRef`
+//      through the SAME `ChunkRef::placed_dserver` identity-placement fallback GC,
+//      read, and reconstruction share (`core/src/metadata.rs:119-124`,
+//      `crates/custodian/src/gc.rs:189-204`). Each case below commits a corrupt
+//      fragment at an identity-fallback (or mixed explicit/fallback) location and
+//      asserts scrub still finds it: a fragment scrub cannot resolve into its
+//      reference set is a fragment scrub silently never scrubs while bit rot
+//      accumulates underneath it (the silent-corruption invariant `0005:262-267`).
+//
+// Flippable (recorded in build-notes): revert `gc.rs:referenced_fragments`'s
+// `chunk.placed_dserver(index)` expansion (`gc.rs:197-204`) back to raw
+// `chunk.placement.iter().enumerate()` — an empty/short vector then yields too few
+// (or zero) referenced fragments, the corrupt fragment at the fallback index is
+// excluded from the reference set as "unreferenced", and the four assertions below
+// fire (`Reconciled::Satisfied` / an empty repair queue instead of the corruption
+// being caught).
+
+/// Sub-case mirroring gc.rs's 4a: `EcScheme::None` + `placement: vec![]` — the single
+/// fragment at index 0 resolves via identity fallback (D-server 0).
+#[tokio::test]
+async fn detects_corruption_on_an_empty_placement_none_chunk() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+
+    let chunk: ChunkId = 0xF9_00;
+    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk))
+        .await
+        .unwrap();
+    commit_chunk(
+        &meta,
+        1,
+        "empty-none",
+        ChunkRef {
+            id: chunk,
+            scheme: EcScheme::None,
+            len: 16,
+            placement: Vec::new(), // pre-M3: empty placement, identity fallback applies
+        },
+    )
+    .await;
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "empty-placement EcScheme::None: the identity-fallback fragment is referenced \
+         and its bit-flip is detected"
+    );
+    assert_eq!(
+        repair::queued_repairs(&meta).await.unwrap(),
+        vec![chunk],
+        "the identity-resolved chunk is enqueued for reconstruction"
+    );
+}
+
+/// Sub-case mirroring gc.rs's 4b: `EcScheme::ReedSolomon{2,1}` + `placement: vec![]` —
+/// the corrupt fragment sits at index 1 (D-server 1 via identity fallback), proving
+/// the fallback at an index ABOVE zero, not just the trivial index-0 case above.
+#[tokio::test]
+async fn detects_corruption_on_an_empty_placement_rs_chunk_above_index_zero() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let d1 = MemDServer::default();
+
+    let chunk: ChunkId = 0xF9_01;
+    d1.put_fragment(frag(chunk, 1), corrupt_fragment(chunk))
+        .await
+        .unwrap();
+    commit_chunk(
+        &meta,
+        1,
+        "empty-rs",
+        ChunkRef {
+            id: chunk,
+            scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
+            len: 16,
+            placement: Vec::new(), // pre-M3: empty, identity fallback for all 3 indices
+        },
+    )
+    .await;
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    // Fleet only contains D-server 1 — the one with the corrupt fragment.
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(1, &d1)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "empty-placement RS{{2,1}}: the identity-fallback fragment at index 1 is \
+         referenced and its bit-flip is detected"
+    );
+    assert_eq!(
+        repair::queued_repairs(&meta).await.unwrap(),
+        vec![chunk],
+        "the identity-resolved chunk is enqueued for reconstruction"
+    );
+}
+
+/// Sub-case mirroring gc.rs's 4c: `EcScheme::ReedSolomon{2,1}` + `placement: vec![5]`
+/// (short — only index 0 explicit, on D-server 5). The corrupt fragment sits at index
+/// 2 (D-server 2 via identity fallback), proving the mixed explicit/fallback
+/// resolution: `.get(2)` is absent, so `placed_dserver(2)` falls back to 2.
+#[tokio::test]
+async fn detects_corruption_at_a_short_placement_vectors_fallback_index() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let d2 = MemDServer::default();
+
+    let chunk: ChunkId = 0xF9_02;
+    d2.put_fragment(frag(chunk, 2), corrupt_fragment(chunk))
+        .await
+        .unwrap();
+    commit_chunk(
+        &meta,
+        1,
+        "short-rs",
+        ChunkRef {
+            id: chunk,
+            scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
+            len: 16,
+            // Short vector: index 0 -> D-server 5 (explicit), indices 1 and 2 fall back.
+            placement: vec![5],
+        },
+    )
+    .await;
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    // Fleet only contains D-server 2 — the one with the corrupt fallback-resolved
+    // fragment.
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(2, &d2)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "short placement: the fallback-resolved fragment at index 2 is referenced and \
+         its bit-flip is detected"
+    );
+    assert_eq!(
+        repair::queued_repairs(&meta).await.unwrap(),
+        vec![chunk],
+        "the identity-resolved chunk is enqueued for reconstruction"
+    );
+}
+
+/// The brief's required RS{6,3} cell: a FULL, explicit rs(6,3) placement (9 fragments
+/// across 9 distinct D servers) — the scheme size gap left open by every other scrub
+/// case above (RS{2,1}) and by the pre-existing full(None) coverage
+/// (`detects_a_bitflip_excludes_and_enqueues_for_reconstruction`). One of the 9
+/// referenced fragments is corrupt; scrub must walk, verify, and enqueue it.
+#[tokio::test]
+async fn detects_corruption_in_a_full_rs_6_3_placement() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let servers: Vec<MemDServer> = (0..9).map(|_| MemDServer::default()).collect();
+
+    let chunk: ChunkId = 0xF9_03;
+    // Full, explicit placement: fragment i -> D-server i (9 distinct servers).
+    let placement: Vec<DServerId> = (0..9).collect();
+    for (index, server) in servers.iter().enumerate() {
+        let bytes = if index == 4 {
+            corrupt_fragment(chunk) // one corrupt referenced fragment, mid-vector
+        } else {
+            valid_fragment(chunk)
+        };
+        server
+            .put_fragment(frag(chunk, index as u16), bytes)
+            .await
+            .unwrap();
+    }
+    commit_chunk(
+        &meta,
+        1,
+        "full-rs-6-3",
+        ChunkRef {
+            id: chunk,
+            scheme: EcScheme::ReedSolomon { k: 6, m: 3 },
+            len: 16,
+            placement: placement.clone(),
+        },
+    )
+    .await;
+    assert_eq!(
+        placement.len(),
+        9,
+        "rs(6,3) -> a full, length-9 placement vector"
+    );
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = servers
+        .iter()
+        .enumerate()
+        .map(|(id, s)| (id as DServerId, s as &dyn ChunkStore))
+        .collect();
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "rs(6,3): the one corrupt referenced fragment (index 4) is detected among the 9"
+    );
+    assert_eq!(
+        repair::queued_repairs(&meta).await.unwrap(),
+        vec![chunk],
+        "exactly the rs(6,3) chunk is queued for reconstruction"
+    );
+    // The other 8 fragments verified intact, never excluded as false positives.
+    for (index, server) in servers.iter().enumerate() {
+        if index != 4 {
+            assert!(
+                server
+                    .get_fragment(frag(chunk, index as u16))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "intact fragment {index} is untouched (scrub never deletes)"
+            );
+        }
+    }
 }

@@ -264,3 +264,197 @@ fn moved_fragment_resolved_from_record_after_reopen() {
         );
     });
 }
+
+// ---- issue #349 (mixed-era placement matrix): Read — empty/short placement, both
+//      schemes, identity-placement fallback (`ChunkRef::placed_dserver`,
+//      `metadata.rs:119-124`). Property 1+2 above already pin FULL rs(6,3) placement;
+//      these three close the empty/short gaps the #292 audit found unguarded. Each
+//      commits a record in the genuine pre-M3 / mixed-era shape directly (no live
+//      writer ever emits a short or empty vector, `write.rs:171`) and proves the read
+//      path resolves every fragment from `placed_dserver`, not a raw vector index.
+//
+// Flippable (recorded in build-notes): revert `read.rs:103-105` (`fragment_dserver`)
+// from `chunk.placed_dserver(index)` to raw `chunk.placement[index as usize]` — an
+// empty/short vector then panics (out of bounds) on these three cases instead of
+// resolving via the fallback, while Property 1/2's FULL-length cases above are
+// unaffected (their vectors are already length `n`).
+
+/// Gap: `EcScheme::None` + `placement: vec![]` (pre-M3). The single fragment at index 0
+/// must resolve via identity fallback (D-server 0) and read byte-identical.
+#[test]
+fn empty_placement_ec_none_resolves_via_identity_fallback() {
+    block_on(async {
+        let payload = b"a pre-M3 EcScheme::None chunk: empty placement, identity fallback".to_vec();
+        let mut next = 0x34900u128;
+        let plan = write::plan_write(&payload, CHUNK, EcScheme::None, || {
+            next += 1;
+            next
+        })
+        .unwrap();
+        assert_eq!(
+            plan.chunks.len(),
+            1,
+            "single chunk for this small an object"
+        );
+        let chunk = &plan.chunks[0];
+        assert_eq!(chunk.fragments.len(), 1, "EcScheme::None -> one fragment");
+
+        // Place the one fragment at its IDENTITY D server (0) — exactly where the
+        // empty-placement fallback (`placed_dserver(0) == 0`) resolves it.
+        let fleet = Fleet::new(1);
+        let (index, bytes) = &chunk.fragments[0];
+        fleet
+            .put_fragment_at(
+                u64::from(*index),
+                FragmentId {
+                    chunk: chunk.id,
+                    index: *index,
+                },
+                bytes.clone(),
+            )
+            .await
+            .unwrap();
+
+        let record = InodeRecord {
+            size: plan.size,
+            chunk_map: vec![ChunkRef {
+                id: chunk.id,
+                scheme: EcScheme::None,
+                len: chunk.len,
+                placement: Vec::new(), // pre-M3: the genuine empty shape
+            }],
+            state: InodeState::Committed,
+            version: 1,
+        };
+        assert!(
+            record.chunk_map[0].placement.is_empty(),
+            "pre-M3 record: an empty, not full-length, placement vector"
+        );
+
+        let got = read::read_object_from(&fleet, &record).await.unwrap();
+        assert_eq!(
+            got, payload,
+            "EcScheme::None chunk with empty placement reads via identity fallback"
+        );
+    });
+}
+
+/// Gap + the brief's required RS{6,3} cell: rs(6,3) + `placement: vec![]` (pre-M3).
+/// All 9 fragments resolve via identity fallback (index `i` -> D-server `i`).
+#[test]
+fn empty_placement_rs_6_3_resolves_via_identity_fallback() {
+    block_on(async {
+        let payload =
+            b"a pre-M3 rs(6,3) chunk: empty placement, identity-resolved fragments; ".repeat(4);
+        let plan = rs_plan(&payload);
+        let chunk = &plan.chunks[0];
+        assert_eq!(chunk.fragments.len(), N as usize, "rs(6,3) -> 9 fragments");
+
+        let fleet = Fleet::new(N as usize);
+        for (index, bytes) in &chunk.fragments {
+            fleet
+                .put_fragment_at(
+                    u64::from(*index), // identity fallback target
+                    FragmentId {
+                        chunk: chunk.id,
+                        index: *index,
+                    },
+                    bytes.clone(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let record = InodeRecord {
+            size: plan.size,
+            chunk_map: vec![ChunkRef {
+                id: chunk.id,
+                scheme: RS,
+                len: chunk.len,
+                placement: Vec::new(), // pre-M3: the genuine empty shape
+            }],
+            state: InodeState::Committed,
+            version: 1,
+        };
+        assert!(
+            record.chunk_map[0].placement.is_empty(),
+            "pre-M3 record: an empty, not full-length, placement vector"
+        );
+
+        let got = read::read_object_from(&fleet, &record).await.unwrap();
+        assert_eq!(
+            got, payload,
+            "rs(6,3) chunk with empty placement reads via identity fallback"
+        );
+    });
+}
+
+/// Gap: a SHORT rs(6,3) placement vector — the first 3 indices explicit (moved off
+/// their identity D server, onto servers OUTSIDE the identity range so a wrong
+/// resolution finds nothing there), the remaining 6 absent (identity fallback).
+/// Proves the mixed explicit/fallback `.get(i).unwrap_or(i)` resolution
+/// (`ChunkRef::placed_dserver`, `metadata.rs:119-124`) over a real rs(6,3) chunk.
+#[test]
+fn short_placement_rs_6_3_mixed_explicit_and_fallback() {
+    block_on(async {
+        let payload =
+            b"a short rs(6,3) placement vector: 3 explicit, 6 identity-fallback fragments; "
+                .repeat(4);
+        let plan = rs_plan(&payload);
+        let chunk = &plan.chunks[0];
+        assert_eq!(chunk.fragments.len(), N as usize, "rs(6,3) -> 9 fragments");
+
+        // Explicit indices 0,1,2 move to servers N..N+3 — strictly outside the
+        // identity range, so a wrong (raw / unresolved) read finds nothing there.
+        // Indices 3..9 stay unrecorded and resolve via identity fallback.
+        let explicit: Vec<DServerId> = (0..3).map(|i| u64::from(N) + i).collect();
+        let fleet = Fleet::new((N + 3) as usize);
+        for (index, bytes) in &chunk.fragments {
+            let dserver = if (*index as usize) < explicit.len() {
+                explicit[*index as usize]
+            } else {
+                u64::from(*index) // identity fallback target
+            };
+            fleet
+                .put_fragment_at(
+                    dserver,
+                    FragmentId {
+                        chunk: chunk.id,
+                        index: *index,
+                    },
+                    bytes.clone(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let record = InodeRecord {
+            size: plan.size,
+            chunk_map: vec![ChunkRef {
+                id: chunk.id,
+                scheme: RS,
+                len: chunk.len,
+                placement: explicit.clone(), // short: length 3, not 9
+            }],
+            state: InodeState::Committed,
+            version: 1,
+        };
+        assert_eq!(
+            record.chunk_map[0].placement.len(),
+            3,
+            "a genuinely SHORT vector: 3 explicit entries, not the full 9"
+        );
+        // Guard: every explicit entry diverges from identity, so a green read can only
+        // come from honouring the recorded override (not silently falling back to i).
+        assert!(
+            (0..3).all(|i| record.chunk_map[0].placement[i] != i as u64),
+            "every explicit index is moved off its identity D server"
+        );
+
+        let got = read::read_object_from(&fleet, &record).await.unwrap();
+        assert_eq!(
+            got, payload,
+            "short-placement rs(6,3) chunk reads via mixed explicit + identity fallback"
+        );
+    });
+}

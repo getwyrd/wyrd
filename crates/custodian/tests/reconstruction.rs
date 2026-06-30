@@ -443,6 +443,396 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
     );
 }
 
+// ---- issue #349 (mixed-era placement matrix): Reconstruction — empty/short placement
+//      and an RS{6,3} cell, closing the gaps the #292 audit found (this suite covered
+//      only full RS{2,1}; empty/short and the empty -> re-placement case were unpinned).
+//
+// `assess` (`crates/custodian/src/reconstruction.rs:226-232`) expands the chunk's
+// committed `placement` through the SAME `ChunkRef::placed_dserver` identity-fallback
+// resolution read/GC/scrub share, and `repair_chunk` (`reconstruction.rs:388-418`)
+// clones THAT expanded vector as the base it repoints — so a chunk reconstructed from
+// an empty or short committed `placement` must come back FULL-LENGTH
+// (`fragment_count()`), never the raw empty/short vector it started from.
+//
+// Flippable (recorded in build-notes): replace `assess`'s expansion (`reconstruction.rs
+// :230-232`, `let placement = (0..chunk_ref.fragment_count()).map(|i|
+// chunk_ref.placed_dserver(i)).collect();`) with raw `chunk_ref.placement.clone()`. For
+// an empty/short committed vector the iteration loop below then runs over 0 (or fewer
+// than `n`) entries, so `missing` stays empty -> `Assessment::Drain` -> the obligation
+// is drained with NOTHING rebuilt and the placement record never repointed — every
+// assertion in `reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_record`
+// and `reconstructs_a_short_placement_chunk_resolving_the_fallback_index` below fires.
+
+/// **The brief's required re-placement pin.** A chunk committed with an EMPTY
+/// `placement` (the genuine pre-M3 shape, `core/src/metadata.rs:93`) is kept under
+/// repair after a D-server loss; the rebuilt record must be FULL-LENGTH
+/// (`== fragment_count()`), with the rebuilt fragment in a domain distinct from the
+/// survivors — never a re-committed short/empty vector.
+#[tokio::test]
+async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_record() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+
+    let data = write_rs_2_1(&meta, &fleet).await;
+
+    // Downgrade the just-committed FULL placement to the pre-M3 EMPTY shape. The
+    // physical fragments are untouched (still on servers 0,1,2, exactly where the
+    // identity fallback resolves them), so this is a faithful pre-M3 fixture: a chunk
+    // committed before the `placement` field shipped decodes to precisely this shape.
+    let prior = read_inode(&meta).await;
+    let mut chunk_map = prior.chunk_map.clone();
+    chunk_map[0].placement = Vec::new();
+    assert_eq!(
+        metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    let downgraded = read_inode(&meta).await;
+    assert!(
+        downgraded.chunk_map[0].placement.is_empty(),
+        "pre-M3 record: an empty, not full-length, placement vector"
+    );
+
+    // KILL D server 1 (domain B): its fragment is lost, so the chunk is under-replicated.
+    d1.delete_fragment(frag(1)).await.unwrap();
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    // Reads succeed THROUGHOUT — degraded, read around the loss via the k=2 survivors,
+    // resolved entirely through the identity fallback (no explicit placement at all).
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data.clone()),
+        "the object reads correctly while under-replicated, via the empty-placement \
+         identity fallback"
+    );
+
+    // Reconstruction sees only the HEALTHY fleet/topology (server 1 is gone); the
+    // rebuilt fragment must land on the one free domain, D (server 3).
+    let mut healthy_topo = Topology::default();
+    healthy_topo
+        .register(0, "A")
+        .register(2, "C")
+        .register(3, "D");
+    let healthy_fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (2, &d2), (3, &d3)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy_fleet,
+        topology: &healthy_topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the empty-placement, under-replicated chunk was reconstructed"
+    );
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "the repair obligation is drained by the reconstruction commit"
+    );
+
+    let record = read_inode(&meta).await;
+    assert_eq!(
+        record.version, 3,
+        "exactly one version-conditional commit on top of the pre-M3 downgrade"
+    );
+    // THE re-placement pin: FULL-LENGTH (== fragment_count() == 3), never the raw
+    // empty vector the chunk was committed with going into this repair.
+    assert_eq!(
+        record.chunk_map[0].placement.len(),
+        usize::from(record.chunk_map[0].fragment_count()),
+        "the re-placed record is full-length, not the short/empty vector it started from"
+    );
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![0, 3, 2],
+        "survivors identity-resolved (0, 2); the lost fragment re-placed on the free \
+         distinct domain D (server 3)"
+    );
+    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+        .placement
+        .iter()
+        .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
+        .collect();
+    assert_eq!(
+        domains.len(),
+        3,
+        "n fragments on n distinct failure domains"
+    );
+
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data),
+        "the object reads correctly after repair (full redundancy, atomic flip)"
+    );
+}
+
+/// A SHORT committed placement (`vec![<explicit dserver>]`, length 1 < `fragment_count()
+/// == 3`) — index 0 explicit on an off-identity D server, indices 1-2 resolved by
+/// identity fallback. Reconstruction must resolve the mix correctly AND re-commit a
+/// FULL-LENGTH record, preserving the genuinely-explicit entry.
+#[tokio::test]
+async fn reconstructs_a_short_placement_chunk_resolving_the_fallback_index() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3, d9) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3), (9, &d9)],
+    };
+
+    let data = write_rs_2_1(&meta, &fleet).await; // commits [0, 1, 2] on domains A,B,C
+
+    // Move index 0's bytes to an out-of-band D server (9, domain "Z") and commit a
+    // SHORT placement: only index 0 explicit; indices 1,2 keep resolving via identity
+    // fallback to their real, untouched locations (servers 1, 2).
+    let bytes0 = d0.get_fragment(frag(0)).await.unwrap().unwrap();
+    d9.put_fragment(frag(0), bytes0).await.unwrap();
+    let prior = read_inode(&meta).await;
+    let mut chunk_map = prior.chunk_map.clone();
+    chunk_map[0].placement = vec![9];
+    assert_eq!(
+        metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    let downgraded = read_inode(&meta).await;
+    assert_eq!(
+        downgraded.chunk_map[0].placement,
+        vec![9],
+        "a genuinely SHORT vector: 1 explicit entry, not the full 3"
+    );
+
+    // KILL D server 2 (the fallback-resolved index 2's home, domain C).
+    d2.delete_fragment(frag(2)).await.unwrap();
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data.clone()),
+        "the object reads correctly while under-replicated, via the mixed \
+         explicit/fallback resolution"
+    );
+
+    // Reconstruction's healthy view excludes domain A (server 0 — stale, no longer
+    // referenced once index 0 moved to 9) and domain C (server 2 — dead): only the
+    // ACTUAL survivor domains (B, Z) plus the one free target domain (D) are visible.
+    let mut healthy_topo = Topology::default();
+    healthy_topo
+        .register(1, "B")
+        .register(3, "D")
+        .register(9, "Z");
+    let healthy_fleet: [(DServerId, &dyn ChunkStore); 3] = [(1, &d1), (3, &d3), (9, &d9)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy_fleet,
+        topology: &healthy_topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the short-placement, under-replicated chunk was reconstructed"
+    );
+
+    let record = read_inode(&meta).await;
+    assert_eq!(
+        record.version, 3,
+        "one commit on top of the short-placement downgrade"
+    );
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![9, 1, 3],
+        "explicit index 0 preserved (server 9); fallback index 1 untouched (server 1); \
+         lost index 2 re-placed on the free distinct domain D (server 3)"
+    );
+    assert_eq!(
+        record.chunk_map[0].placement.len(),
+        usize::from(record.chunk_map[0].fragment_count()),
+        "full-length record, not the short vector it started from"
+    );
+    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+        .placement
+        .iter()
+        .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
+        .collect();
+    assert_eq!(
+        domains.len(),
+        3,
+        "n fragments on n distinct failure domains"
+    );
+
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data),
+        "the object reads correctly after repair (full redundancy, atomic flip)"
+    );
+}
+
+/// A ten-domain topology A..J (servers 0..9). An rs(6,3) chunk (n=9) placed across the
+/// first nine domains A..I (servers 0..8); domain J (server 9) is the free spare.
+fn ten_domains() -> Topology {
+    let mut t = Topology::default();
+    for (id, label) in [
+        (0, "A"),
+        (1, "B"),
+        (2, "C"),
+        (3, "D"),
+        (4, "E"),
+        (5, "F"),
+        (6, "G"),
+        (7, "H"),
+        (8, "I"),
+        (9, "J"),
+    ] {
+        t.register(id, label);
+    }
+    t
+}
+
+/// Write one rs(6,3) chunk via the real write path, placed across nine distinct
+/// domains (servers 0..8). Returns the original object bytes.
+async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
+    let data = b"reconstruct this rs(6,3) chunk across all nine of its fragments".to_vec();
+    let topo = ten_domains();
+    let outcome = write_new_object_placed(
+        meta,
+        fleet,
+        ROOT,
+        "obj",
+        1,
+        &data,
+        data.len(),
+        EcScheme::ReedSolomon { k: 6, m: 3 },
+        &topo,
+        0,
+        1_000,
+        || CHUNK,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+    assert_eq!(
+        read_inode(meta).await.chunk_map[0].placement,
+        (0u64..9).collect::<Vec<_>>(),
+        "rs(6,3) placed across distinct domains A..I (servers 0..8)"
+    );
+    data
+}
+
+/// The brief's required RS{6,3} cell: kill one D server of a FULL rs(6,3) placement
+/// and reconstruct to full redundancy — the scheme-size gap every other reconstruction
+/// case above (RS{2,1}) leaves open.
+#[tokio::test]
+async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() {
+    let meta = MemMeta::default();
+    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
+    let fleet = Fleet {
+        servers: servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i as DServerId, s))
+            .collect(),
+    };
+
+    let data = write_rs_6_3(&meta, &fleet).await;
+
+    // KILL D server 4 (domain E): its fragment is lost, so the chunk is now
+    // under-replicated (8 of 9 survive, well within m=3).
+    servers[4].delete_fragment(frag(4)).await.unwrap();
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data.clone()),
+        "the object reads correctly while under-replicated (read around the lost fragment)"
+    );
+
+    // Healthy view excludes domain E (server 4); the rebuilt fragment must land on the
+    // one free domain, J (server 9).
+    let healthy_topo = ten_domains().excluding(&std::collections::BTreeSet::from([4]));
+    let healthy_fleet: Vec<(DServerId, &dyn ChunkStore)> = servers
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 4)
+        .map(|(i, s)| (i as DServerId, s as &dyn ChunkStore))
+        .collect();
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy_fleet,
+        topology: &healthy_topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the under-replicated rs(6,3) chunk was reconstructed"
+    );
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "the repair obligation is drained by the reconstruction commit"
+    );
+
+    let record = read_inode(&meta).await;
+    assert_eq!(record.version, 2, "exactly one version-conditional commit");
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![0, 1, 2, 3, 9, 5, 6, 7, 8],
+        "survivors identity-resolved; the lost fragment (index 4) re-placed on the free \
+         distinct domain J (server 9)"
+    );
+    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+        .placement
+        .iter()
+        .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
+        .collect();
+    assert_eq!(
+        domains.len(),
+        9,
+        "n=9 fragments on n=9 distinct failure domains"
+    );
+
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data),
+        "the object reads correctly after repair (full redundancy, atomic flip)"
+    );
+}
+
 // ---- issue #251: a placed-fragment READ FAULT must not abort the per-chunk drain ----
 
 /// A `ChunkStore` whose `get_fragment` always fails with a caller-supplied error — the
