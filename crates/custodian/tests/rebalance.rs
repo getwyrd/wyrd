@@ -45,10 +45,10 @@ use bytes::Bytes;
 use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 use wyrd_coordination_mem::MemCoordination;
-use wyrd_core::metadata::{self, EcScheme, InodeId, InodeRecord};
+use wyrd_core::metadata::{self, EcScheme, InodeId, InodeRecord, InodeState};
 use wyrd_core::placement::Topology;
 use wyrd_core::read::read_object;
-use wyrd_core::write::write_new_object_placed;
+use wyrd_core::write::{plan_write, write_fragments, write_new_object_placed};
 use wyrd_custodian::{
     reconcile_step, reconciliation_status, set_lifecycle, Custodian, DServerLifecycle,
     DurabilityTelemetry, ExporterConfig, FencedZone, RebalanceContext, Reconciled,
@@ -289,6 +289,234 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
     data
+}
+
+/// Write one chunk's fragments to the fleet at IDENTITY locations (fragment `i` lands
+/// on D-server `i`) and commit its `InodeRecord` with an **empty** `ChunkRef.placement`
+/// — the genuine pre-M3 / mixed-era shape (`#[serde(default)]`, `core/src/metadata.rs:93`),
+/// which every placement-consuming path resolves via the identity-placement fallback
+/// (`ChunkRef::placed_dserver`, `core/src/metadata.rs:119`).
+///
+/// Deliberately bypasses `write_new_object[_placed]`: every live writer always emits a
+/// full, explicit placement vector now (`core/src/write.rs:171`), so the only way to
+/// reproduce a pre-M3 record is to construct it directly — exactly the shape a chunk
+/// committed before the `placement` field shipped decodes to today.
+async fn write_pre_m3_chunk(meta: &MemMeta, fleet: &Fleet<'_>, scheme: EcScheme) -> Vec<u8> {
+    let data = b"a pre-M3 / mixed-era chunk: empty placement, identity-resolved fragments".to_vec();
+    let plan = plan_write(&data, data.len(), scheme, || CHUNK).unwrap();
+    write_fragments(fleet, &plan).await.unwrap();
+    let mut chunk_refs = plan.chunk_refs();
+    assert_eq!(chunk_refs.len(), 1, "one chunk for this small an object");
+    chunk_refs[0].placement = Vec::new(); // the pre-M3 shape: decoded via #[serde(default)]
+    let record = InodeRecord {
+        size: plan.size,
+        chunk_map: chunk_refs,
+        state: InodeState::Committed,
+        version: 1,
+    };
+    let outcome = metadata::create(meta, ROOT, "obj", 1, &record)
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+    data
+}
+
+// ---- #346: rebalance must apply the identity-placement fallback to a pre-M3 chunk ----
+//
+// BINDING success criterion (issue #346 / ADR-0040 decisions 1, 2, 4, 5): committing an
+// inode whose `ChunkRef.placement` is `vec![]` and whose identity-resolved D server is
+// draining MUST still produce and commit an `EvacPlan` that (a) moves the fragment off
+// the draining server to a healthy, non-draining, distinct-domain server, and (b) writes
+// back a placement record that is FULL-LENGTH (`== fragment_count()`), never the raw
+// empty/short vector. Pre-fix, `plan_evacuations` iterates the raw (empty) `placement`
+// vector: `evac` comes back empty, the chunk is silently skipped, and `Reconciled` stays
+// `Satisfied` with the chunk still wholly unprotected on the draining server — these
+// tests assert `Reconciled::Changed` and a full-length, repointed placement instead.
+
+/// `EcScheme::None` leg: the single fragment lives at index 0.
+#[tokio::test]
+async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+    let topo = four_domains();
+    let data = write_pre_m3_chunk(&meta, &fleet, EcScheme::None).await;
+
+    // Sanity: the committed record really is the pre-M3 shape — an EMPTY placement —
+    // yet the identity fallback resolves fragment 0 to server 0, which is where the
+    // bytes actually live.
+    let prior = read_inode(&meta).await;
+    assert!(
+        prior.chunk_map[0].placement.is_empty(),
+        "pre-M3 record: an empty, not full-length, placement vector"
+    );
+    assert_eq!(prior.chunk_map[0].placed_dserver(0), 0);
+
+    // The operator marks the IDENTITY-resolved server (0) draining.
+    set_lifecycle(&meta, 0, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciliation_status(&meta, 0).await.unwrap(),
+        ReconciliationStatus::Pending,
+        "server 0 still (identity-)resolves a referenced fragment"
+    );
+
+    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+    let ctx = RebalanceContext {
+        meta: &meta,
+        fleet: &dyn_fleet,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "BINDING (#346): a plan IS produced and committed for the pre-M3 chunk — pre-fix \
+         the raw-vector scan sees an empty `placement`, `evac` comes back empty, and the \
+         chunk is silently `continue`-skipped (Satisfied, nothing moved)"
+    );
+
+    // The committed placement is FULL-LENGTH (== fragment_count() == 1) and the moved
+    // index no longer names the draining server.
+    let record = read_inode(&meta).await;
+    assert_eq!(record.version, 2, "exactly one version-conditional commit");
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![1],
+        "full-length (fragment_count() == 1) placement, repointed off server 0 onto the \
+         one free distinct domain (B / server 1) — never an empty or short vector"
+    );
+    assert_eq!(
+        reconciliation_status(&meta, 0).await.unwrap(),
+        ReconciliationStatus::Satisfied,
+        "server 0 is no longer referenced by any committed placement"
+    );
+
+    // The fragment is intact at its new home, the old one is orphaned, and the object
+    // still reads correctly (full redundancy, atomic flip — no panic, no corruption).
+    assert!(
+        wyrd_core::repair::fragment_intact(
+            &d1.get_fragment(frag(0))
+                .await
+                .unwrap()
+                .expect("moved fragment present"),
+            CHUNK
+        ),
+        "the evacuated fragment verifies its checksum at its new home (server 1)"
+    );
+    assert!(
+        !meta.scan(b"orphan:").await.unwrap().is_empty(),
+        "the displaced fragment on the draining server is orphaned for GC"
+    );
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data),
+        "the object still reads correctly after the evacuation"
+    );
+}
+
+/// `ReedSolomon` leg: the draining fragment sits at index > 0 (index 1 of 3), exercising
+/// both the evacuation selection AND the `survivor_domains` resolution (ADR-0040 scope:
+/// "Apply the same resolution to the `survivor_domains` computation") over the FULL,
+/// identity-resolved fragment set rather than the (empty) raw vector.
+#[tokio::test]
+async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zero() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+    let topo = four_domains();
+    let data = write_pre_m3_chunk(&meta, &fleet, EcScheme::ReedSolomon { k: 2, m: 1 }).await;
+
+    let prior = read_inode(&meta).await;
+    assert!(
+        prior.chunk_map[0].placement.is_empty(),
+        "pre-M3 record: an empty, not full-length, placement vector"
+    );
+    // Identity fallback: fragment i -> server i. Drain server 1 (fragment index 1, NOT
+    // the first fragment — the brief's "index > 0" leg).
+    assert_eq!(prior.chunk_map[0].placed_dserver(1), 1);
+
+    set_lifecycle(&meta, 1, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciliation_status(&meta, 1).await.unwrap(),
+        ReconciliationStatus::Pending,
+        "server 1 still (identity-)resolves a referenced fragment"
+    );
+
+    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+    let ctx = RebalanceContext {
+        meta: &meta,
+        fleet: &dyn_fleet,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "BINDING (#346): a plan is produced and committed for the pre-M3 RS(2,1) chunk \
+         with the draining fragment at index > 0"
+    );
+
+    // FULL-LENGTH committed placement (== fragment_count() == k+m == 3): survivors 0 and
+    // 2 stay identity-resolved, the evacuated index 1 is repointed off server 1 onto the
+    // one free distinct domain (D / server 3) — never an empty or short vector.
+    let record = read_inode(&meta).await;
+    assert_eq!(record.version, 2, "exactly one version-conditional commit");
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![0, 3, 2],
+        "full-length placement: survivors identity-resolved, the draining index moved"
+    );
+
+    // Spread preserved: n = 3 fragments still span n = 3 DISTINCT failure domains — only
+    // possible because `survivor_domains` was resolved through the identity fallback too
+    // (over the raw empty vector it would see no survivor domains at all).
+    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+        .placement
+        .iter()
+        .map(|id| topo.domain_of(*id).unwrap().clone())
+        .collect();
+    assert_eq!(
+        domains.len(),
+        3,
+        "n fragments on n distinct failure domains"
+    );
+
+    assert_eq!(
+        reconciliation_status(&meta, 1).await.unwrap(),
+        ReconciliationStatus::Satisfied,
+        "server 1 is no longer referenced by any committed placement"
+    );
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data),
+        "the object still reads correctly after the evacuation (full redundancy)"
+    );
 }
 
 // ---- criterion 1+2: drain a D server, evacuate to a distinct domain, observe moments ----

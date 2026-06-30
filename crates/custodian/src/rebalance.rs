@@ -86,7 +86,12 @@ struct EvacPlan {
     prior: InodeRecord,
     chunk_index: usize,
     chunk_id: ChunkId,
-    /// The chunk's current placement vector (length `n`).
+    /// The chunk's FULL fragment placement (length `n` == `fragment_count()`),
+    /// resolved through the same authoritative identity-placement fallback the read
+    /// path, GC, scrub, and reconstruction use (`ChunkRef::placed_dserver`,
+    /// `core/src/metadata.rs:119`) — never the raw, possibly-empty or short
+    /// `ChunkRef::placement` field. This is what gets cloned, indexed, and committed
+    /// back by [`evacuate_chunk`], so it must already be full-length here.
     placement: Vec<DServerId>,
     /// Fragment indices on a draining server (to be evacuated).
     evac: Vec<usize>,
@@ -148,8 +153,19 @@ async fn plan_evacuations(
             continue;
         };
         for (chunk_index, chunk) in record.chunk_map.iter().enumerate() {
-            let evac: Vec<usize> = chunk
-                .placement
+            // Resolve the FULL `0..fragment_count()` index space through the same
+            // authoritative identity-placement-fallback resolution the read path, GC,
+            // scrub, and reconstruction use (`ChunkRef::placed_dserver`,
+            // `core/src/metadata.rs:119`) — NEVER the raw `placement` vector. A pre-M3
+            // / mixed-era chunk decodes with `placement: vec![]` (`#[serde(default)]`,
+            // `core/src/metadata.rs:93`); iterating it raw yields nothing, so a live
+            // fragment on a draining server was silently skipped here (#346). This is
+            // also what gets committed back below, so it must be full-length, never a
+            // raw empty/short vector (the half-fix this record forecloses).
+            let placement: Vec<DServerId> = (0..chunk.fragment_count())
+                .map(|i| chunk.placed_dserver(i))
+                .collect();
+            let evac: Vec<usize> = placement
                 .iter()
                 .enumerate()
                 .filter(|(_, server)| draining.contains(server))
@@ -158,10 +174,12 @@ async fn plan_evacuations(
             if evac.is_empty() {
                 continue;
             }
-            // The domains the fragments that STAY occupy — the move must avoid them so
-            // the chunk keeps `n` distinct domains (`0005:298`, the invariant).
-            let survivor_domains: Vec<FailureDomain> = chunk
-                .placement
+            // The domains the fragments that STAY occupy — resolved through the same
+            // fallback as `placement` above, so a mixed-era chunk's spread is computed
+            // over its FULL fragment set (not just whatever the raw vector happened to
+            // carry) — the move must avoid them so the chunk keeps `n` distinct domains
+            // (`0005:298`, the invariant).
+            let survivor_domains: Vec<FailureDomain> = placement
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| !evac.contains(index))
@@ -172,7 +190,7 @@ async fn plan_evacuations(
                 prior: record.clone(),
                 chunk_index,
                 chunk_id: chunk.id,
-                placement: chunk.placement.clone(),
+                placement,
                 evac,
                 survivor_domains,
             });
