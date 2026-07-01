@@ -154,16 +154,23 @@ async fn plan_evacuations(
         };
         for (chunk_index, chunk) in record.chunk_map.iter().enumerate() {
             // Resolve the FULL `0..fragment_count()` index space through the shared
-            // expansion helper (`ChunkRef::fragments`, `core/src/metadata.rs`,
-            // ADR-0040 decision 2) — the same authoritative identity-placement-
-            // fallback resolution the read path, GC, scrub, and reconstruction use —
-            // NEVER the raw `placement` vector. A pre-M3 / mixed-era chunk decodes
-            // with `placement: vec![]` (`#[serde(default)]`, `core/src/metadata.rs:93`);
-            // iterating it raw yields nothing, so a live fragment on a draining server
-            // was silently skipped here (#346). This is also what gets committed back
-            // below, so it must be full-length, never a raw empty/short vector (the
-            // half-fix this record forecloses).
-            let placement: Vec<DServerId> = chunk.fragments().map(|(_, dserver)| dserver).collect();
+            // STRICT companion (`ChunkRef::checked_fragments`, `core/src/metadata.rs`,
+            // ADR-0040 decision 4) — classify the committed placement BEFORE expanding it,
+            // NEVER the raw `placement` vector. A valid (empty / full-length) vector
+            // resolves through the same authoritative identity-placement fallback the read
+            // path, GC, scrub, and reconstruction use: a pre-M3 / mixed-era chunk decodes
+            // with `placement: vec![]` (`#[serde(default)]`, `core/src/metadata.rs:93`)
+            // and expands full-length, so a live fragment on a draining server is no longer
+            // silently skipped (#346). A MALFORMED vector (non-empty, wrong length) is
+            // rejected here — the chunk is skipped and flagged NEEDS-HUMAN rather than
+            // evacuated over (and committed back with) a fabricated identity tail.
+            let placement: Vec<DServerId> = match chunk.checked_fragments() {
+                Ok(frags) => frags.map(|(_, dserver)| dserver).collect(),
+                Err(_) => {
+                    emit_needs_human(chunk.id);
+                    continue;
+                }
+            };
             let evac: Vec<usize> = placement
                 .iter()
                 .enumerate()
@@ -328,6 +335,21 @@ fn emit_evacuated(chunk: ChunkId, moved: usize) {
         chunk = %chunk,
         moved,
         "rebalance evacuated fragment(s) off a draining server and repointed the placement record",
+    );
+}
+
+/// Emit a **NEEDS-HUMAN** signal on the durability-plane seam (ADR-0011 / ADR-0012,
+/// ADR-0040 decision 4): rebalance found a committed chunk whose `placement` vector is
+/// non-empty but of the wrong length — truncation / corruption. It is NOT evacuated
+/// (moving over a fabricated identity tail would then commit the malformed record back);
+/// the chunk is skipped and left for a human to resolve.
+fn emit_needs_human(chunk: ChunkId) {
+    tracing::warn!(monotonic_counter.rebalance_malformed_placement = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.rebalance.audit",
+        action = "needs-human",
+        chunk = %chunk,
+        "rebalance skipped a chunk with a malformed committed placement (wrong length); NEEDS-HUMAN, fragment left in place",
     );
 }
 

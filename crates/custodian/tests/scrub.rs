@@ -621,11 +621,14 @@ async fn scrub_propagates_a_transient_get_fault_without_enqueuing() {
 //      (`crates/custodian/src/scrub.rs:30`), which expands every committed `ChunkRef`
 //      through the SAME `ChunkRef::placed_dserver` identity-placement fallback GC,
 //      read, and reconstruction share (`core/src/metadata.rs:119-124`,
-//      `crates/custodian/src/gc.rs:189-204`). Each case below commits a corrupt
-//      fragment at an identity-fallback (or mixed explicit/fallback) location and
-//      asserts scrub still finds it: a fragment scrub cannot resolve into its
-//      reference set is a fragment scrub silently never scrubs while bit rot
-//      accumulates underneath it (the silent-corruption invariant `0005:262-267`).
+//      `crates/custodian/src/gc.rs:189-204`). The EMPTY-placement and full RS{6,3} cells
+//      commit a corrupt fragment at an identity-fallback / explicit location and assert
+//      scrub still finds it: a fragment scrub cannot resolve into its reference set is a
+//      fragment scrub silently never scrubs while bit rot accumulates underneath it (the
+//      silent-corruption invariant `0005:262-267`). The SHORT (non-empty, wrong-length)
+//      cell was RE-CLASSIFIED by #348 / ADR-0040 decisions 3–4: a short vector is
+//      malformed (truncation/corruption), so scrub fails safe over it rather than
+//      resolving a fabricated tail — see `short_placement_is_malformed_scrub_fails_safe`.
 //
 // Flippable (recorded in build-notes): revert `gc.rs:referenced_fragments`'s
 // `chunk.placed_dserver(index)` expansion (`gc.rs:197-204`) back to raw
@@ -735,12 +738,27 @@ async fn detects_corruption_on_an_empty_placement_rs_chunk_above_index_zero() {
     );
 }
 
-/// Sub-case mirroring gc.rs's 4c: `EcScheme::ReedSolomon{2,1}` + `placement: vec![5]`
-/// (short — only index 0 explicit, on D-server 5). The corrupt fragment sits at index
-/// 2 (D-server 2 via identity fallback), proving the mixed explicit/fallback
-/// resolution: `.get(2)` is absent, so `placed_dserver(2)` falls back to 2.
+/// **Issue #348 (supersedes the #349 short-placement cell): a SHORT vector is MALFORMED,
+/// scrub FAILS SAFE.** `EcScheme::ReedSolomon{2,1}` (`fragment_count() == 3`) with
+/// `placement: vec![5]` is non-empty but of the wrong length — malformed per ADR-0040
+/// decision 3 ("short non-empty vectors are NOT a supported steady state"), which can only
+/// mean truncation / corruption. The #349 matrix originally treated this as a resolvable
+/// mixed explicit/fallback record and asserted scrub verified the identity-fabricated
+/// index-2 fragment; ADR-0040 decision 4 reverses that for the maintenance loops: scrub
+/// MUST classify the committed placement *before* expanding it and MUST NOT fabricate the
+/// missing tail into a scrub finding. It treats the chunk as fully referenced (no finding),
+/// emits a malformed-placement signal, and leaves the corrupt placement for a human — the
+/// read path stays liberal and resolves it unchanged (proven in `metadata.rs` unit tests).
+///
+/// Pre-fix: `referenced_fragments` expanded via `fragments()`, fabricating index 2 →
+/// D-server 2; scrub fetched the corrupt fragment there and enqueued a repair (`Changed`).
+/// Post-fix: `checked_fragments()` classifies the vector malformed; the chunk is excluded
+/// from the valid reference set → `Satisfied`, empty repair queue.
+///
+/// Flippable: revert `gc.rs:referenced_fragments` to expand via `chunk.fragments()` and
+/// this goes red (the fabricated index-2 fragment is scrubbed and a repair enqueued).
 #[tokio::test]
-async fn detects_corruption_at_a_short_placement_vectors_fallback_index() {
+async fn short_placement_is_malformed_scrub_fails_safe() {
     enable_metric_callsites();
     let meta = MemMeta::default();
     let d2 = MemDServer::default();
@@ -755,9 +773,10 @@ async fn detects_corruption_at_a_short_placement_vectors_fallback_index() {
         "short-rs",
         ChunkRef {
             id: chunk,
-            scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
+            scheme: EcScheme::ReedSolomon { k: 2, m: 1 }, // fragment_count() == 3
             len: 16,
-            // Short vector: index 0 -> D-server 5 (explicit), indices 1 and 2 fall back.
+            // Non-empty, len 1 != 3 → malformed (truncation/corruption), NOT a resolvable
+            // "index 0 explicit, 1-2 fallback" record.
             placement: vec![5],
         },
     )
@@ -765,8 +784,7 @@ async fn detects_corruption_at_a_short_placement_vectors_fallback_index() {
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    // Fleet only contains D-server 2 — the one with the corrupt fallback-resolved
-    // fragment.
+    // Fleet only contains D-server 2 — the one holding the fabricated-index-2 fragment.
     let fleet: [(DServerId, &dyn ChunkStore); 1] = [(2, &d2)];
     let ctx = ScrubContext {
         meta: &meta,
@@ -778,14 +796,13 @@ async fn detects_corruption_at_a_short_placement_vectors_fallback_index() {
         .unwrap();
     assert_eq!(
         outcome,
-        Reconciled::Changed,
-        "short placement: the fallback-resolved fragment at index 2 is referenced and \
-         its bit-flip is detected"
+        Reconciled::Satisfied,
+        "malformed (short) placement: scrub fabricates no finding over the identity-filled \
+         tail — the chunk is fully referenced (#348)"
     );
-    assert_eq!(
-        repair::queued_repairs(&meta).await.unwrap(),
-        vec![chunk],
-        "the identity-resolved chunk is enqueued for reconstruction"
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "scrub must NOT enqueue a phantom repair against a fabricated placement index (#348)"
     );
 }
 

@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 
 use wyrd_core::repair;
-use wyrd_traits::{ChunkStore, DServerId, FragmentId, MetadataStore, Result};
+use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result};
 
 use crate::gc::referenced_fragments;
 use crate::reconciliation::Reconciled;
@@ -73,6 +73,15 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
     // placed D server is a loss, never a benign race.
     let referenced = referenced_fragments(ctx.meta).await?;
 
+    // Malformed committed placement (ADR-0040 decision 4, "strict maintenance"): a
+    // non-empty, wrong-length vector can only be truncation/corruption. Scrub FAILS SAFE
+    // — it does NOT fabricate the missing identity tail and enqueue phantom repair
+    // obligations for it (the valid reference set below excludes these chunks entirely) —
+    // and surfaces each one as an operator signal on the durability seam instead.
+    for (&chunk, m) in &referenced.malformed {
+        emit_malformed(chunk, m.expected, m.actual);
+    }
+
     // Group the reference set by placed D server so the pass is driven by WHAT IS
     // REFERENCED, not by what a store's own `list_fragments()` happens to enumerate
     // (issue #330). Walking `list_fragments()` alone can only ever find a
@@ -83,7 +92,7 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
     // chunk map says it holds closes that gap: a `get_fragment` that comes back
     // `Ok(None)` now means exactly what it says — no bytes for a fragment placed here.
     let mut by_dserver: HashMap<DServerId, Vec<FragmentId>> = HashMap::new();
-    for &(dserver, frag) in &referenced {
+    for &(dserver, frag) in &referenced.placed {
         by_dserver.entry(dserver).or_default().push(frag);
     }
 
@@ -188,6 +197,23 @@ fn emit_corruption(dserver: DServerId, frag: FragmentId) {
         chunk = %frag.chunk,
         index = frag.index,
         "scrub detected bit rot: fragment excluded, chunk enqueued for reconstruction",
+    );
+}
+
+/// Emit a **malformed committed placement** signal on the durability-plane seam
+/// (ADR-0011 / ADR-0012, ADR-0040 decision 4): a committed chunk whose `placement` vector
+/// is non-empty but of the wrong length — truncation / corruption. Scrub fails safe (it
+/// never fabricates the missing tail into phantom repair obligations); this is the
+/// operator signal that a corrupt placement is no longer masked as a silent resolution.
+fn emit_malformed(chunk: ChunkId, expected: u16, actual: usize) {
+    tracing::warn!(monotonic_counter.scrub_malformed_placement = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.scrub.audit",
+        action = "malformed-placement",
+        chunk = %chunk,
+        expected,
+        actual,
+        "scrub found a committed placement of the wrong length (truncation/corruption); chunk treated as fully referenced, no phantom repair enqueued — operator signal",
     );
 }
 
