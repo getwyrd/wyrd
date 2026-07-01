@@ -113,14 +113,34 @@ impl ChunkRef {
     /// `#[serde(default)]`): if `placement[index]` is absent, the fragment resolves
     /// to D-server `index`. This is the **single authoritative placement-resolution
     /// definition** for the read path (`read.rs:fragment_dserver`), GC
-    /// (`gc.rs:referenced_fragments`), scrub, and reconstruction
-    /// (`reconstruction.rs:assess`), so placement semantics cannot drift across
-    /// callers.
+    /// (`gc.rs:referenced_fragments`), scrub, reconstruction
+    /// (`reconstruction.rs:assess`), and rebalance (`rebalance.rs:plan_evacuations`),
+    /// so placement semantics cannot drift across callers.
     pub fn placed_dserver(&self, index: u16) -> DServerId {
         self.placement
             .get(index as usize)
             .copied()
             .unwrap_or(u64::from(index))
+    }
+
+    /// Every fragment of this chunk, resolved to its holding D server: the full
+    /// `0..fragment_count()` index space, each index resolved through
+    /// [`Self::placed_dserver`] (ADR-0040 decision 1, the normative expansion rule).
+    /// This is *the* "walk every fragment to its holding D-server" call (ADR-0040
+    /// decision 2) — the single definition every read-expansion consumer draws from
+    /// instead of open-coding `(0..fragment_count()).map(|i| placed_dserver(i))`
+    /// itself: GC's `referenced_fragments` (`gc.rs`), reconstruction's `assess`
+    /// (`reconstruction.rs`), and rebalance's `plan_evacuations` (`rebalance.rs`).
+    ///
+    /// Deliberately **liberal**, like `placed_dserver`: it applies the identity
+    /// fallback unconditionally and does not validate `placement`'s length, so it is
+    /// infallible and safe for the read path. A malformed (non-empty, wrong-length)
+    /// vector is a maintenance-loop concern (ADR-0040 decisions 3–4) — classifying and
+    /// rejecting one *before* expansion is a separate, fallible companion
+    /// (`checked_fragments()` / `placement_is_valid()`, #348), not a property of this
+    /// helper.
+    pub fn fragments(&self) -> impl Iterator<Item = (u16, DServerId)> + '_ {
+        (0..self.fragment_count()).map(move |i| (i, self.placed_dserver(i)))
     }
 }
 

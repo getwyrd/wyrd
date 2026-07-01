@@ -186,17 +186,17 @@ pub(crate) async fn referenced_fragments(
             continue;
         }
         for chunk in &record.chunk_map {
-            // Expand placement via the shared helper (`ChunkRef::placed_dserver`,
-            // `metadata.rs`): the single authoritative identity-fallback resolution
-            // that the read path and reconstruction also use. A pre-M3 / mixed-era
-            // `ChunkRef` with an empty or short `placement` vector (decoded via
-            // `#[serde(default)]`, `metadata.rs:93`) resolves fragment `i` to
-            // D-server `i`, so the GC reference set matches the read path's resolved
-            // placement closure exactly — closing the gap that caused silent data
-            // loss on committed pre-M3 objects (issue #287).
-            for index in 0..chunk.fragment_count() {
+            // Expand placement via the shared helper (`ChunkRef::fragments`,
+            // `metadata.rs`, ADR-0040 decision 2): the single authoritative
+            // identity-fallback resolution that the read path and reconstruction
+            // also use. A pre-M3 / mixed-era `ChunkRef` with an empty or short
+            // `placement` vector (decoded via `#[serde(default)]`, `metadata.rs:93`)
+            // resolves fragment `i` to D-server `i`, so the GC reference set matches
+            // the read path's resolved placement closure exactly — closing the gap
+            // that caused silent data loss on committed pre-M3 objects (issue #287).
+            for (index, dserver) in chunk.fragments() {
                 set.insert((
-                    chunk.placed_dserver(index),
+                    dserver,
                     FragmentId {
                         chunk: chunk.id,
                         index,

@@ -223,13 +223,11 @@ async fn assess(
         EcScheme::None => return Ok(Assessment::Unrepairable),
         EcScheme::ReedSolomon { k, m } => (k as usize, m as usize),
     };
-    // Expand placement via the shared helper (`ChunkRef::placed_dserver`,
-    // `metadata.rs`) — the single authoritative identity-fallback resolution that
-    // the read path and GC also use, so a pre-M3 / short-placement record resolves
-    // identically everywhere.
-    let placement: Vec<DServerId> = (0..chunk_ref.fragment_count())
-        .map(|i| chunk_ref.placed_dserver(i))
-        .collect();
+    // Expand placement via the shared helper (`ChunkRef::fragments`, `metadata.rs`,
+    // ADR-0040 decision 2) — the single authoritative identity-fallback resolution
+    // that the read path and GC also use, so a pre-M3 / short-placement record
+    // resolves identically everywhere.
+    let placement: Vec<DServerId> = chunk_ref.fragments().map(|(_, dserver)| dserver).collect();
 
     let mut survivors = Vec::new();
     let mut survivor_domains = Vec::new();
