@@ -251,11 +251,16 @@ pub trait ChunkStore: Send + Sync {
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>>;
 
     /// Enumerate every fragment this store currently holds. Order is
-    /// unspecified. The maintenance plane's **scrub** loop (M3, proposal 0005)
-    /// walks this to diff a D server's actual contents against the committed
-    /// chunk map — orphans GC should reclaim, absences reconstruction should
-    /// rebuild. Added additively for M3; it neither moves bytes nor interprets
-    /// them beyond their addressing.
+    /// unspecified. The maintenance plane's **GC** loop (M3, proposal 0005) walks
+    /// this to diff a D server's actual contents against the committed chunk map
+    /// and reclaim orphans (`crates/custodian/src/gc.rs`). The **scrub** loop
+    /// (M3, proposal 0005; missing-fragment detection issue #330) instead drives
+    /// off the committed reference set directly, fetching each placed fragment by
+    /// id via [`ChunkStore::get_fragment`] — a listing alone can only surface a
+    /// fragment's presence, never prove a specific one is genuinely absent,
+    /// since an absent fragment by definition never appears in it. Added
+    /// additively for M3; it neither moves bytes nor interprets them beyond
+    /// their addressing.
     async fn list_fragments(&self) -> Result<Vec<FragmentId>>;
 
     /// Remove the bytes stored for `id`. **Idempotent**: deleting a fragment the
