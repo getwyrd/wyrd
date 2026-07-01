@@ -10,11 +10,11 @@
 
 use pollster::block_on;
 use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
-use wyrd_core::metadata::{EcScheme, InodeRecord, InodeState};
+use wyrd_core::metadata::{ChunkRef, EcScheme, InodeRecord, InodeState};
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_testkit::Sim;
-use wyrd_traits::{ChunkId, CommitOutcome, FragmentId};
+use wyrd_traits::{ChunkId, CommitOutcome, DServerId, FragmentId};
 
 const ROOT: u64 = 0;
 const CHUNK: usize = 4;
@@ -241,6 +241,99 @@ fn mixed_era_read(seed: u64) {
     });
 }
 
+// ---- issue #349 (mixed-era placement matrix): an explicit empty-placement chunk —
+//      read AND maintenance resolve it IDENTICALLY across seeds ----
+//
+// `mixed_era_read` above mixes *schemes* but writes FULL placement from the real write
+// path (`write.rs:171`), so it never exercises an empty/short vector (the #292 audit's
+// gap). This property commits the genuine pre-M3 shape directly — `ChunkRef.placement:
+// vec![]` (`core/src/metadata.rs:93`) — and proves TWO independent consumers resolve
+// it identically: the READ path (`read::read_object_from`, which calls
+// `ChunkRef::placed_dserver` via `read.rs:103-105`) and a MAINTENANCE-style resolution
+// (`maintenance_resolved` below, mirroring how GC / scrub / reconstruction expand a
+// chunk map: `crates/custodian/src/gc.rs:197-204`, `reconstruction.rs:230-232`,
+// `rebalance.rs:165-167` — all `(0..chunk.fragment_count()).map(|i|
+// chunk.placed_dserver(i))`, never the raw vector).
+
+/// The maintenance-style resolution GC, scrub, and reconstruction apply over a
+/// committed chunk map: expand the FULL `0..fragment_count()` index space through
+/// [`ChunkRef::placed_dserver`] — the single authoritative identity-placement-fallback
+/// resolution (`core/src/metadata.rs:119-124`) — never the raw `placement` vector
+/// (which a pre-M3 / mixed-era record may carry empty or short).
+fn maintenance_resolved(chunk: &ChunkRef) -> Vec<(u16, DServerId)> {
+    (0..chunk.fragment_count())
+        .map(|i| (i, chunk.placed_dserver(i)))
+        .collect()
+}
+
+/// Property: an inode whose chunk(s) carry the genuine pre-M3 EMPTY `placement` resolve
+/// IDENTICALLY through the read path and the maintenance-style resolution above — every
+/// fragment covered (never the raw-vector's zero), at its identity D server.
+fn empty_placement_resolves_identically(seed: u64) {
+    block_on(async {
+        let mut sim = Sim::new(seed);
+        let (_meta, chunks, _dir) = backends();
+        let data = nonempty_payload(&mut sim, 48);
+
+        let mut plan = write::plan_write(&data, CHUNK, RS, ids_from(0x300)).unwrap();
+        write::write_fragments(&chunks, &plan).await.unwrap();
+
+        // The genuine pre-M3 shape: every chunk's committed `placement` is EMPTY. No
+        // live writer ever emits this (`write.rs:171`); it is exactly what a chunk
+        // committed before the `placement` field shipped decodes to
+        // (`#[serde(default)]`, `core/src/metadata.rs:93`).
+        for chunk in &mut plan.chunks {
+            chunk.placement = Vec::new();
+        }
+        let chunk_map = plan.chunk_refs();
+        assert!(
+            !chunk_map.is_empty(),
+            "seed {seed}: a nonempty payload always yields at least one chunk"
+        );
+        for chunk_ref in &chunk_map {
+            assert!(
+                chunk_ref.placement.is_empty(),
+                "seed {seed}: pre-M3 shape: empty, not full-length, placement"
+            );
+        }
+        let inode = InodeRecord {
+            size: plan.size,
+            chunk_map,
+            state: InodeState::Committed,
+            version: 1,
+        };
+
+        // READ resolves every fragment via the identity-placement fallback.
+        assert_eq!(
+            read::read_object_from(&chunks, &inode).await.unwrap(),
+            data,
+            "seed {seed}: empty-placement chunk map reads byte-identical via identity \
+             fallback"
+        );
+
+        // MAINTENANCE resolves the SAME closure: every one of the chunk's fragments,
+        // each at its identity D server — never the raw vector's zero entries.
+        for chunk_ref in &inode.chunk_map {
+            let resolved = maintenance_resolved(chunk_ref);
+            assert_eq!(
+                resolved.len(),
+                chunk_ref.fragment_count() as usize,
+                "seed {seed}: maintenance resolves every one of the chunk's fragments \
+                 (fragment_count() == {}), not the raw (empty) vector's zero",
+                chunk_ref.fragment_count()
+            );
+            for (index, dserver) in resolved {
+                assert_eq!(
+                    dserver,
+                    u64::from(index),
+                    "seed {seed}: read and maintenance agree: fragment {index} resolves \
+                     to its identity D server {index}"
+                );
+            }
+        }
+    });
+}
+
 #[test]
 fn rs_reads_survive_losses_across_seeds() {
     for seed in 0..SEEDS {
@@ -276,6 +369,13 @@ fn mixed_era_reads_across_seeds() {
     }
 }
 
+#[test]
+fn empty_placement_reads_and_maintenance_agree_across_seeds() {
+    for seed in 0..SEEDS {
+        empty_placement_resolves_identically(seed);
+    }
+}
+
 /// A pinned seed kept as a permanent regression guard (ADR-0009): any seed that
 /// ever surfaces a bug is added here so the exact scenario is replayed forever.
 #[test]
@@ -286,4 +386,5 @@ fn ec_properties_hold_at_pinned_regression_seed() {
     corruption_excluded(REGRESSION_SEED);
     corruption_beyond_m_is_clean_error(REGRESSION_SEED);
     mixed_era_read(REGRESSION_SEED);
+    empty_placement_resolves_identically(REGRESSION_SEED);
 }

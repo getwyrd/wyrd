@@ -519,6 +519,151 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
     );
 }
 
+// ---- issue #349 (mixed-era placement matrix): the brief's required RS{6,3} cell,
+//      alongside the full RS{2,1} criterion-1+2 case below and the pre-M3 empty-
+//      placement cases above — closing the scheme-size gap (this suite's evacuation
+//      coverage existed only at RS{2,1}).
+
+/// A ten-domain topology A..J (servers 0..9). An rs(6,3) chunk (n=9) placed across the
+/// first nine domains A..I (servers 0..8); domain J (server 9) is the free spare.
+fn ten_domains() -> Topology {
+    let mut t = Topology::default();
+    for (id, label) in [
+        (0, "A"),
+        (1, "B"),
+        (2, "C"),
+        (3, "D"),
+        (4, "E"),
+        (5, "F"),
+        (6, "G"),
+        (7, "H"),
+        (8, "I"),
+        (9, "J"),
+    ] {
+        t.register(id, label);
+    }
+    t
+}
+
+/// Write one rs(6,3) chunk via the real write path, placed across nine distinct
+/// domains (servers 0..8). Returns the original object bytes.
+async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec<u8> {
+    let data = b"evacuate this rs(6,3) chunk, every one of its nine fragments".to_vec();
+    let outcome = write_new_object_placed(
+        meta,
+        fleet,
+        ROOT,
+        "obj",
+        1,
+        &data,
+        data.len(),
+        EcScheme::ReedSolomon { k: 6, m: 3 },
+        topo,
+        0,
+        1_000,
+        || CHUNK,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+    assert_eq!(
+        read_inode(meta).await.chunk_map[0].placement,
+        (0u64..9).collect::<Vec<_>>(),
+        "rs(6,3) placed across distinct domains A..I (servers 0..8)"
+    );
+    data
+}
+
+/// Drain D server 4 (domain E) of a FULL rs(6,3) placement: the loop must evacuate
+/// fragment index 4 onto the one free distinct domain, J (server 9), keeping the
+/// chunk on n=9 distinct domains throughout.
+#[tokio::test]
+async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() {
+    let meta = MemMeta::default();
+    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
+    let fleet = Fleet {
+        servers: servers
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i as DServerId, s))
+            .collect(),
+    };
+    let topo = ten_domains();
+    let data = write_rs_6_3(&meta, &fleet, &topo).await;
+
+    // The operator marks D server 4 (domain E) DRAINING.
+    set_lifecycle(&meta, 4, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciliation_status(&meta, 4).await.unwrap(),
+        ReconciliationStatus::Pending,
+        "policy changed but not yet satisfied: server 4 still holds a referenced fragment"
+    );
+
+    let dyn_fleet: Vec<(DServerId, &dyn ChunkStore)> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as DServerId, s as &dyn ChunkStore))
+        .collect();
+    let ctx = RebalanceContext {
+        meta: &meta,
+        fleet: &dyn_fleet,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the draining server's rs(6,3) fragment was evacuated"
+    );
+
+    assert_eq!(
+        reconciliation_status(&meta, 4).await.unwrap(),
+        ReconciliationStatus::Satisfied,
+        "policy satisfied: server 4 is no longer referenced by any committed placement"
+    );
+
+    let record = read_inode(&meta).await;
+    assert_eq!(record.version, 2, "exactly one version-conditional commit");
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![0, 1, 2, 3, 9, 5, 6, 7, 8],
+        "fragment 4 evacuated off server 4 onto the one free distinct domain J (server 9)"
+    );
+    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+        .placement
+        .iter()
+        .map(|id| topo.domain_of(*id).unwrap().clone())
+        .collect();
+    assert_eq!(
+        domains.len(),
+        9,
+        "n=9 fragments on n=9 distinct failure domains"
+    );
+
+    assert!(
+        wyrd_core::repair::fragment_intact(
+            &servers[9]
+                .get_fragment(frag(4))
+                .await
+                .unwrap()
+                .expect("moved fragment present"),
+            CHUNK
+        ),
+        "the evacuated fragment verifies its checksum at its new home (server 9)"
+    );
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data),
+        "the object still reads correctly after the rs(6,3) evacuation"
+    );
+}
+
 // ---- criterion 1+2: drain a D server, evacuate to a distinct domain, observe moments ----
 
 #[tokio::test]
