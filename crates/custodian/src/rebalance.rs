@@ -153,18 +153,17 @@ async fn plan_evacuations(
             continue;
         };
         for (chunk_index, chunk) in record.chunk_map.iter().enumerate() {
-            // Resolve the FULL `0..fragment_count()` index space through the same
-            // authoritative identity-placement-fallback resolution the read path, GC,
-            // scrub, and reconstruction use (`ChunkRef::placed_dserver`,
-            // `core/src/metadata.rs:119`) — NEVER the raw `placement` vector. A pre-M3
-            // / mixed-era chunk decodes with `placement: vec![]` (`#[serde(default)]`,
-            // `core/src/metadata.rs:93`); iterating it raw yields nothing, so a live
-            // fragment on a draining server was silently skipped here (#346). This is
-            // also what gets committed back below, so it must be full-length, never a
-            // raw empty/short vector (the half-fix this record forecloses).
-            let placement: Vec<DServerId> = (0..chunk.fragment_count())
-                .map(|i| chunk.placed_dserver(i))
-                .collect();
+            // Resolve the FULL `0..fragment_count()` index space through the shared
+            // expansion helper (`ChunkRef::fragments`, `core/src/metadata.rs`,
+            // ADR-0040 decision 2) — the same authoritative identity-placement-
+            // fallback resolution the read path, GC, scrub, and reconstruction use —
+            // NEVER the raw `placement` vector. A pre-M3 / mixed-era chunk decodes
+            // with `placement: vec![]` (`#[serde(default)]`, `core/src/metadata.rs:93`);
+            // iterating it raw yields nothing, so a live fragment on a draining server
+            // was silently skipped here (#346). This is also what gets committed back
+            // below, so it must be full-length, never a raw empty/short vector (the
+            // half-fix this record forecloses).
+            let placement: Vec<DServerId> = chunk.fragments().map(|(_, dserver)| dserver).collect();
             let evac: Vec<usize> = placement
                 .iter()
                 .enumerate()

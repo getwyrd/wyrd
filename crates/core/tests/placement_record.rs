@@ -458,3 +458,114 @@ fn short_placement_rs_6_3_mixed_explicit_and_fallback() {
         );
     });
 }
+
+/// `ChunkRef::fragments()` (issue #347, ADR-0040 decision 2): the one placement-
+/// expansion helper GC, reconstruction, and rebalance must now route through instead
+/// of open-coding `(0..fragment_count()).map(|i| placed_dserver(i))` themselves. This
+/// matrix asserts `fragments()` yields *exactly* the per-index `placed_dserver`
+/// resolution — never more, never fewer, never a different value — across
+/// `EcScheme::None` and `ReedSolomon { k, m }`, for empty, full (`len ==
+/// fragment_count()`), and malformed (`len != fragment_count()`, non-empty) placement
+/// vectors. `fragments()` is deliberately liberal (ADR-0040 decision 2): it applies
+/// the identity fallback unconditionally and never validates `placement`'s length —
+/// that stays a synchronous, no-code, purely-mechanical proxy for the read path.
+mod fragments_matrix {
+    use wyrd_core::metadata::{ChunkRef, EcScheme};
+    use wyrd_traits::{ChunkId, DServerId};
+
+    const CHUNK_ID: ChunkId = 0x347;
+    const RS: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 }; // fragment_count() == 9
+
+    fn chunk(scheme: EcScheme, placement: Vec<DServerId>) -> ChunkRef {
+        ChunkRef {
+            id: CHUNK_ID,
+            scheme,
+            len: 4096,
+            placement,
+        }
+    }
+
+    /// The ADR-0040 decision-2 contract, checked structurally: `fragments()` covers
+    /// exactly `0..fragment_count()` and each entry is `(i, chunk.placed_dserver(i))`
+    /// — i.e. `fragments()` cannot drift from `placed_dserver`, by construction.
+    fn assert_matches_placed_dserver(chunk: &ChunkRef) {
+        let want: Vec<(u16, DServerId)> = (0..chunk.fragment_count())
+            .map(|i| (i, chunk.placed_dserver(i)))
+            .collect();
+        let got: Vec<(u16, DServerId)> = chunk.fragments().collect();
+        assert_eq!(
+            got, want,
+            "fragments() must equal the per-index placed_dserver walk"
+        );
+        assert_eq!(
+            got.len(),
+            chunk.fragment_count() as usize,
+            "fragments() must cover the full 0..fragment_count() index space"
+        );
+    }
+
+    #[test]
+    fn none_empty_placement_is_pure_identity() {
+        let c = chunk(EcScheme::None, vec![]);
+        assert_matches_placed_dserver(&c);
+        assert_eq!(c.fragments().collect::<Vec<_>>(), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn none_full_placement_resolves_from_record() {
+        let c = chunk(EcScheme::None, vec![7]);
+        assert_matches_placed_dserver(&c);
+        assert_eq!(c.fragments().collect::<Vec<_>>(), vec![(0, 7)]);
+    }
+
+    #[test]
+    fn none_malformed_length_placement_still_resolves_liberally() {
+        // `EcScheme::None` has `fragment_count() == 1`, so the only non-empty
+        // "wrong length" (ADR-0040 decision 3: malformed) shape reachable is a
+        // vector LONGER than the index space — a shorter-but-nonempty vector is
+        // impossible below length 1. `fragments()` does not validate length
+        // (decision 2): it walks only `0..fragment_count()` and ignores the extra
+        // trailing entry, exactly as `placed_dserver` would for the same index.
+        let c = chunk(EcScheme::None, vec![7, 8]);
+        assert_matches_placed_dserver(&c);
+        assert_eq!(c.fragments().collect::<Vec<_>>(), vec![(0, 7)]);
+    }
+
+    #[test]
+    fn rs_empty_placement_is_pure_identity() {
+        let c = chunk(RS, vec![]);
+        assert_matches_placed_dserver(&c);
+        let want: Vec<(u16, DServerId)> = (0..9u16).map(|i| (i, u64::from(i))).collect();
+        assert_eq!(c.fragments().collect::<Vec<_>>(), want);
+    }
+
+    #[test]
+    fn rs_full_placement_resolves_from_record() {
+        let placement: Vec<DServerId> = (0..9u16).map(|i| 100 + u64::from(i)).collect();
+        let c = chunk(RS, placement.clone());
+        assert_matches_placed_dserver(&c);
+        let want: Vec<(u16, DServerId)> = (0..9u16).map(|i| (i, placement[i as usize])).collect();
+        assert_eq!(c.fragments().collect::<Vec<_>>(), want);
+    }
+
+    #[test]
+    fn rs_short_placement_mixes_record_and_identity_fallback() {
+        // A short (non-empty, `len < fragment_count()`) vector: malformed per
+        // ADR-0040 decision 3. `fragments()` itself does not classify or reject it
+        // (that is the strict-maintenance companion's job, #348) — indices within
+        // `placement` resolve from the record, indices beyond it fall back to
+        // identity (decision 1), exactly like `placed_dserver`.
+        let placement: Vec<DServerId> = vec![50, 51, 52, 53]; // len 4 < fragment_count 9
+        let c = chunk(RS, placement.clone());
+        assert_matches_placed_dserver(&c);
+        let want: Vec<(u16, DServerId)> = (0..9u16)
+            .map(|i| {
+                (
+                    i,
+                    placement.get(i as usize).copied().unwrap_or(u64::from(i)),
+                )
+            })
+            .collect();
+        assert_eq!(c.fragments().collect::<Vec<_>>(), want);
+    }
+}
