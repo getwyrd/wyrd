@@ -175,16 +175,20 @@ The threat model records its own holes and tracks them to closure.
 
 - **Clock / time-source trust** — bounded skew + authenticated time + implausible-clock
   fail-closed (ADR-0024).
-- **Internal service-to-service trust** — the M2 enforcement contract for the mTLS fabric
+- **Internal service-to-service trust** — the enforcement contract for the mTLS fabric
   already chosen in ADR-0005: least authority per component, certificate-as-identity, no
-  plaintext fallback (ADR-0025).
+  plaintext fallback (ADR-0025). M2 refuses plaintext on the wire; the *enforcement* half —
+  authorization against a first-class identity, so a valid certificate cannot do
+  out-of-role operations — is retired at M5 (proposal 0013), which cites this gap as its
+  load-bearing risk.
+- **Build / release integrity** — signed releases (Sigstore/cosign keyless), SLSA build
+  provenance, and commit-SHA-pinned Actions (ADR-0030); binding from the first published
+  release artifact.
 
 **Still genuinely open**:
 
 - **Key-compromise emergency response** — a runbook for wholesale KEK revocation + forced
   re-encryption (distinct from planned re-wrap rotation, ADR-0021) is not yet written.
-- **Build / release integrity** — signed releases + SLSA provenance + pinned Actions are not
-  yet decided.
 - **The proto / network input-validation surface** — fuzzing and hardening of the gRPC decode
   path land with the networked tier (M2); only the on-disk reader is hardened today.
 - **CI security workflows** — a CodeQL (Rust) static-analysis workflow and a coverage-guided

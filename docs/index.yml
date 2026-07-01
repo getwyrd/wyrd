@@ -9,12 +9,12 @@
 
 meta:
   title: "Wyrd — distributed file storage with atomic writes"
-  description: "Wyrd is a globally scalable distributed file storage foundation with atomic writes. Written in Rust, Apache-2.0. Currently in the design phase."
+  description: "Wyrd is a globally scalable distributed file storage foundation with atomic writes. Written in Rust, Apache-2.0. Currently in early implementation (milestones M0–M3 built)."
   og_title: "Wyrd — distributed file storage with atomic writes"
   og_description: "A globally scalable distributed storage foundation. Atomic writes, erasure coding, single binary to global fleet. Rust, Apache-2.0."
 
 hero:
-  status: "Current Status: exploring the idea — architecture & specs in work"
+  status: "Current Status: building — the atomic core, erasure coding, networked storage servers, and custodians (M0–M3) are implemented and simulation-verified; the production metadata backend (M4) is next"
   title: "What is&nbsp;written, stays&nbsp;written."
   lede: "Wyrd should be a globally scalable distributed file storage foundation with atomic writes. Built in Rust, Apache-2.0."
   pron: "**wyrd** &nbsp;/wɪəd/&nbsp; — Old English for *fate*. Yes, it sounds like “weird.” Anyone who has run distributed storage at 3&nbsp;a.m. will agree that is the correct word."

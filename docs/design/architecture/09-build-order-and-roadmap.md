@@ -1,5 +1,6 @@
 ---
 created: 13.06.2026 11:57
+updated: 01.07.2026
 type: architecture
 status: living
 tags:
@@ -9,35 +10,52 @@ tags:
 ---
 # 9. Build order and roadmap
 
-> Living document. For an open-source project the build order *is* the contribution roadmap — it is how newcomers know where to start.
+> Living document. For an open-source project the build order *is* the contribution roadmap — it is how newcomers know where to start. The governing record of the ordering is [proposal 0013](../proposals/accepted/0013-implementation-arc-rescoped.md) (the implementation arc, rescoped — supersedes 0002); this section is its always-current summary and tracks build status.
 
-The strategy (ADR-0009, section 4.2): **not bottom-up**. A vertical slice through the layers that matter for one operation, then widen by risk. Trait boundaries exist from day one even where crate boundaries do not yet; traits are cheap to define and expensive to retrofit, crate splits are the reverse.
+The strategy (ADR-0009, section 4.2): **not bottom-up**. A vertical slice through the layers that matter for one operation, then widen by risk — **risk retired, not features delivered**. Trait boundaries exist from day one even where crate boundaries do not yet; traits are cheap to define and expensive to retrofit, crate splits are the reverse.
 
-## Milestone 0 — the walking skeleton
+## The three steps
 
-One atomic write and read, end to end, in a single process. Proves the commit protocol — the entire differentiator.
+| Step | Goal | Ends with |
+|------|------|-----------|
+| **1. Prove the differentiator** | One atomic write and read, end to end, in one process, shown atomic under fault injection in simulation. | The central claim is no longer a claim. |
+| **2. A real single-zone system** | Widen the proven slice, in risk order, into a self-hostable, erasure-coded, atomically-consistent — and then *secured, encrypted, and operable* — object store within one datacenter. | ★ the first genuinely useful product (M8). |
+| **3. A multi-region sovereign substrate** | The cross-zone layers that turn independent single-datacenter systems into one geographically distributed foundation. | ★ the mission artifact (M11). |
 
-- S3 PUT/GET (minimal L1) → client library (chunk + commit) → embedded metadata store (redb) → filesystem chunk store → in-memory coordination.
-- No EC yet (`replication(1)` or `none`), no custodians, no second zone, no global plane.
-- DST harness (`testkit`) and the commit-protocol property tests attach here and grow with the system. Jepsen-style fault injection begins as soon as there is a networked path.
-- Definition of done: a file written and read back, with the commit proven atomic under fault injection in simulation.
+## The milestones
 
-## Widening, in risk order
+| # | Milestone | Proves / retires | Status |
+|---|-----------|------------------|--------|
+| M0 | Walking skeleton | the commit protocol — the entire differentiator — end to end, atomic under DST fault injection | ✅ built |
+| M1 | Erasure coding | real RS(k,m) in the hottest loop; reconstruction from any *k* | ✅ built |
+| M2 | Networked D servers | the direct client→D-server data path; the `ChunkStore` seam is real | ✅ built |
+| M3 | Custodians | the system maintains its own durability (GC, scrub, reconstruction, rebalance) and reports it | ✅ built (closing) |
+| M4 | Production metadata backend | pluggability is real: redb→TiKV behind the unchanged trait is a composition change, not a refactor | next — proposal 0007 |
+| M5 | Internal CA (step-ca) | the fabric authenticates itself; least authority on a SPIFFE-shaped identity | planned — proposal 0011 |
+| M6 | Encryption at rest (KeyService/KMS) | envelope encryption behind the `KeyService` trait against a real KMS | planned — proposal 0012 |
+| M7 | Failover & DR, single-datacenter | node / disk / rack loss survived and recovered, drilled rather than asserted | planned — proposal owed |
+| M8 ★ | Manageability (CLI + portal) | the zone is *operable*: day-2 ops, tenant admin, the observability planes surfaced | planned — proposal 0008; **Step-2 release point** |
+| M9 | Cross-zone replication (L3) | committed chunks replicate between zones with no half-copied replica ever visible | Step 3 |
+| M10 | Global control plane (L2) | the global namespace and the home-zone consistency contract operate across zones | Step 3 |
+| M11 ★ | Cross-zone failover & DR, drilled | the guarantees survive real zone loss | Step 3 — **release point, the mission artifact** |
 
-1. **Erasure coding** — real Reed-Solomon in the client (the hottest, riskiest loop), validated against the working slice. Benchmarks in CI from here.
-2. **Networked D servers** — replace the in-process filesystem store with the gRPC `ChunkStore`, proving the direct-write data path.
-3. **Custodians** — GC, scrub, repair, rebalance (the second home of correctness risk), now with real data to maintain. Durability telemetry emitted from their first commit.
-4. **Production metadata backend** — swap redb for TiKV behind the `MetadataStore` trait, proving pluggability.
-5. **Cross-zone layers** — L3 replication and L2 global namespace, last, because multi-zone is meaningless until single-zone is solid and the requirements (single-provider, single useful zone) give the most slack here.
+M4 completes the single-zone **data plane** — feature-complete and pluggable, but a *soft stopping point*, not a deployable product: no internal trust fabric, no encryption at rest, no drilled local recovery, no operator surface. M5–M8 are what turn it into one; that is why the Step-2 ★ sits at **M8**, not M4. Step 3 is pursued in full only with a concrete operational owner committed to adopting it (proposal 0013, open question).
 
-Each step has a natural definition of done and a place to attach tests. A single zone of this design is already a useful product — a self-hostable, EC-efficient, atomically-consistent object store — which earns adoption and contributors long before the global federation exists.
+A single zone of this design is already the first genuinely useful product — a self-hostable, EC-efficient, atomically-consistent, **secured, encrypted, and operable** object store — which earns adoption and contributors long before the global federation exists.
+
+## Where to start contributing
+
+Every active milestone has a tracking issue and dependency-ordered per-slice issues on its GitHub milestone board; the per-milestone implementation plans are proposals 0001–0012. The DST harness (`testkit`) attaches at M0 and is extended at every milestone — it is not a one-time build but a growing dependency (ADR-0009), and extending it is always a welcome contribution. The most independent surface today: the M4 slices, the observability floor (proposal 0010), and the D-server performance program (proposal 0009).
 
 ## Deferred-with-reserved-seats
 
 These are not built early, but their *hooks* must exist from the relevant milestone because they are expensive to retrofit:
 
-- Append / CAS / watch storage primitives (ADR-0007) — the commit protocol and metadata schema must accommodate them from the start.
-- The version-fence for Option C consistency (ADR-0015) — the `meta:version` counter is reserved now.
-- Observability hooks (metric emission points, audit event stream, desired-state API) — emitted from when custodians exist; dashboards are cheap to add later (ADR-0011).
-- openraft embedded coordination backend (ADR-0006).
-- Web management UI — API-first now (ADR-0013), UI deferred.
+- Append / CAS / watch storage primitives (ADR-0007) — the commit protocol and metadata schema accommodate them from M0.
+- The version-fence for Option C consistency (ADR-0015) — the `meta:version` counter is reserved from M0.
+- Encryption format hooks (ADR-0019/0021) — `flags`, `encryption_scheme`, and key-version are reserved in the on-disk format from M0; the `KeyService` lands at M6.
+- Observability hooks (metric emission points, audit event stream, desired-state API) — emitted since the custodians' first commit (M3, ADR-0011); the floor that wires them into deployable binaries is proposal 0010; dashboards beyond M8's operable floor stay deferred (ADR-0013).
+- openraft embedded coordination backend (ADR-0006) — etcd is the production backend; openraft reserved behind the same trait.
+- SPIRE workload attestation (ADR-0036) — step-ca now; SPIRE reserved behind the `CertificateAuthority` seam for fleet scale.
+
+**Attached programs, not milestones.** Three standing bodies of work deliberately attach to milestones rather than being ordered as milestones (the arc's rule: if it does not retire a load-bearing risk, it attaches): object lifecycle & retention (proposal 0006 — enforcement spine near M6–M7, tenant-facing API after M8), the D-server performance program (proposal 0009 — tiers attach from M4's deployment onward), and the observability floor (proposal 0010 — gates the M4 real-world campaign).

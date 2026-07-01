@@ -48,16 +48,16 @@ A domain *label* must reflect actual shared-fate hardware. Labelling two process
 
 **The control and trust planes are failure domains too.** The math above concerns *D-server* domains, but two small control services carry their own availability requirement. The **coordination + metadata quorum** (etcd, PD/TiKV — 3 nodes, tolerate one loss not two) is the familiar one. Less obvious is the **provider CA trust plane** (`step-ca` now, SPIRE reserved — ADR-0036): because internal mTLS is **fail-closed** (ADR-0025), an unreachable CA halts *every new dial and certificate rotation* in the zone — so it is a hard availability dependency, not a background service. Run it **HA across independent domains** (as with the etcd quorum) and keep it **off the D-server hosts**, so a storage-node loss and a control-plane loss stay independent. A single-instance CA is a zone-wide single point of failure the moment a certificate needs to rotate.
 
-## 7.4 Worked example — first single-zone deployment (M4)
+## 7.4 Worked example — first single-zone deployment (M4–M5)
 
-The **Small multi-node** profile becomes concrete at the M4 release point ([single-zone deployment diagram](diagrams/single-zone-deployment.mermaid)). Two shapes illustrate the same topology reasoning — a **homelab** (own machines, one building/grid/ISP) and a **Hetzner single-zone** rental (genuine per-server hardware independence within one EU location). Both spend their failure-domain budget on the D servers first, give TiKV+PD their own quorum spread, and treat gateway/custodian as movable, stateless roles.
+The **Small multi-node** profile becomes concrete at the first real deployment ([single-zone deployment diagram](diagrams/single-zone-deployment.mermaid)): M4 completes the data plane it runs on and M5 supplies its trust fabric; the ★ Step-2 release point itself is **M8** (proposal 0013). Two shapes illustrate the same topology reasoning — a **homelab** (own machines, one building/grid/ISP) and a **Hetzner single-zone** rental (genuine per-server hardware independence within one EU location). Both spend their failure-domain budget on the D servers first, give TiKV+PD their own quorum spread, and treat gateway/custodian as movable, stateless roles.
 
 | Shape | D-server domains | Fault tolerance | Disaster-recoverable? |
 |-------|------------------|-----------------|-----------------------|
 | Minimum honest | 6 (≈2 fragments/domain) | any single domain | No — one site |
 | Full RS(6,3) | 9 (1 fragment/domain) | any 3 domains | No — one site |
 
-Single-zone — homelab *or* one Hetzner location — survives disk/host/domain failure (the M3 repair story, on honest hardware) but **not loss of the whole site**; cross-zone replication (L3) is M9+. So M4 is a production-durable *single-site* store, governed by §8.2's rule: keep an out-of-band backup that does not depend on this cluster.
+Single-zone — homelab *or* one Hetzner location — survives disk/host/domain failure (the M3 repair story, on honest hardware) but **not loss of the whole site**; cross-zone replication (L3) is M9+. So the first deployment is a production-durable *single-site* data plane — a soft stopping point on the way to the M8 release (proposal 0013), not yet the released product — governed by §8.2's rule: keep an out-of-band backup that does not depend on this cluster.
 
 Day-one verification gates trust, in order: (1) **label** each D server's failure domain so the selector spreads fragments; (2) **verify spread** — confirm a written chunk's 9 fragments landed in 9 distinct domains, or fix the labels; (3) **watch the durability plane** — under-replicated count must sit at zero in steady state; (4) **do the failure test** — kill one D server and watch reads keep serving from survivors, under-replicated count rise, the custodian rebuild, and the count return to zero. If that loop does not complete, the deployment is not yet production-durable.
 
