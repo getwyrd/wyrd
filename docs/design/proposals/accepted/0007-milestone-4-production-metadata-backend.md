@@ -1,7 +1,7 @@
 ---
 created: 23.06.2026 00:10
 type: proposal
-status: draft
+status: accepted
 author: Eduard Ralph
 tracking-issue: "#201"
 tags:
@@ -13,7 +13,7 @@ tags:
 ---
 # Proposal: Milestone 4 — production metadata backend (TiKV) (implementation plan)
 
-> The implementation plan for the fourth — and **release** — step of the
+> The implementation plan for the fourth step of the
 > [implementation arc][p2] (proposal 0013, which supersedes 0002). [Proposals 0001–0005][p5] built a
 > single-zone object store that is erasure-coded ([0003][p3]), networked
 > ([0004][p4]), and self-maintaining ([0005][p5]) — but it runs entirely on the

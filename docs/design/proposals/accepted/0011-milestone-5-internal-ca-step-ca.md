@@ -1,9 +1,9 @@
 ---
 created: 27.06.2026
 type: proposal
-status: draft
+status: accepted
 author: Eduard Ralph
-tracking-issue: TBD
+tracking-issue: "#374"
 tags:
   - proposal
   - milestone-5
@@ -709,7 +709,7 @@ deliberately narrow:
 [p4]: ../accepted/0004-milestone-2-networked-d-servers.md
 [p5]: ../accepted/0005-milestone-3-custodians.md
 [p7]: ./0007-milestone-4-production-metadata-backend.md
-[p8]: ./0008-management-and-administration.md
+[p8]: ../draft/0008-management-and-administration.md
 [s7]: ../../architecture/07-deployment-view.md
 [s8]: ../../architecture/08-crosscutting-concepts.md
 [s10]: ../../architecture/10-quality-risks-glossary.md
