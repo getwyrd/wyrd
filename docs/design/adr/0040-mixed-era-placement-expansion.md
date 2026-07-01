@@ -1,7 +1,7 @@
 ---
 created: 29.06.2026 14:00
 type: adr
-status: Proposed
+status: Accepted
 tags:
   - adr
   - custodian

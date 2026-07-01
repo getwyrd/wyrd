@@ -22,8 +22,8 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0008](0008-tikv-metadata-and-pluggable-backends.md) | TiKV metadata store and pluggable backends | Accepted |
 | [0009](0009-deterministic-simulation-testing.md) | Testing strategy | Accepted |
 | [0010](0010-pluggable-deployment-substrate.md) | Pluggable deployment substrate; Kubernetes optional | Accepted |
-| [0011](0011-durability-telemetry-and-declarative-management.md) | Durability telemetry and declarative management | Proposed |
-| [0012](0012-opentelemetry-instrumentation.md) | OpenTelemetry instrumentation; storage/viz agnostic | Proposed |
+| [0011](0011-durability-telemetry-and-declarative-management.md) | Durability telemetry and declarative management | Accepted |
+| [0012](0012-opentelemetry-instrumentation.md) | OpenTelemetry instrumentation; storage/viz agnostic | Accepted |
 | [0013](0013-api-first-management.md) | API-first management surface | Proposed |
 | [0014](0014-single-binary-dev-only.md) | Single-binary profile is dev/eval only | Accepted |
 | [0015](0015-consistency-contract.md) | Consistency contract: home-zone authority, version-fence reserved | Accepted |
@@ -50,8 +50,8 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0036](0036-internal-ca-step-ca-spire.md) | Internal CA and identity fabric: step-ca now, SPIRE reserved | Proposed |
 | [0037](0037-proposal-and-spec-process.md) | Proposal and specification process, lifecycle, and immutability | Accepted (supersession-marker clause refined by 0038) |
 | [0038](0038-supersession-recorded-in-the-index.md) | Supersession is recorded in the index, not on the frozen file | Proposed |
-| [0039](0039-tier1-consistency-in-repo-scenario.md) | Tier-1 consistency-over-repair as an in-repo Rust scenario; literal Jepsen deferred (refines proposal 0005 §13.2) | Proposed |
-| [0040](0040-mixed-era-placement-expansion.md) | Mixed-era placement expansion: one identity-fallback rule, liberal read / strict maintenance (refines proposal 0005 §placement) | Proposed |
+| [0039](0039-tier1-consistency-in-repo-scenario.md) | Tier-1 consistency-over-repair as an in-repo Rust scenario; literal Jepsen deferred (refines proposal 0005 §13.2) | Accepted |
+| [0040](0040-mixed-era-placement-expansion.md) | Mixed-era placement expansion: one identity-fallback rule, liberal read / strict maintenance (refines proposal 0005 §placement) | Accepted |
 
 ## Why not ... ?
 
