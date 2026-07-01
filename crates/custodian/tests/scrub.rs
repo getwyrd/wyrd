@@ -871,3 +871,103 @@ async fn detects_corruption_in_a_full_rs_6_3_placement() {
         }
     }
 }
+
+// ---- issue #330: a placed-but-ABSENT fragment is also a durable repair obligation ----
+//
+// Pre-fix, scrub only ever discovered a fragment by walking whatever a D server's
+// `list_fragments()` happened to return; a fragment that is simply MISSING from the
+// store never appears in that listing, so it was never visited at all — the `Ok(None)`
+// fetch arm of the old loop only fired for a fragment that vanished mid-pass, and even
+// then it just `continue`d with no obligation produced (`crates/custodian/src/scrub.rs`,
+// pre-fix ~`:89-92`). This is the central, flippable leg for #330: revert
+// `scrub::reconcile`'s missing-fragment arm (`crates/custodian/src/scrub.rs`, the
+// `Ok(None) => { emit_missing(...); repair::enqueue_repair(...); changed = true; }` arm)
+// back to `Ok(None) => continue` and this test's assertions fire (`Reconciled::Satisfied`
+// / an empty repair queue instead of the durable obligation).
+#[tokio::test]
+async fn detects_a_missing_placed_fragment_and_enqueues_for_reconstruction() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+
+    // A committed chunk map places (chunk, 0) on d0 — but d0 never received any bytes
+    // for it at all (simply absent, not corrupt: no `put_fragment` call for this id).
+    let chunk: ChunkId = 0x330A;
+    commit_reference(&meta, 1, "missing", chunk, 0).await;
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "a placed-but-absent referenced fragment is detected and a repair obligation is produced"
+    );
+    assert_eq!(
+        repair::queued_repairs(&meta).await.unwrap(),
+        vec![chunk],
+        "exactly the chunk with the missing fragment is queued for reconstruction — the \
+         same shared durable repair queue a corrupt fragment produces (0005:174-176)"
+    );
+}
+
+// ---- issue #330 (false-positive guardrail): an in-flight (uncommitted) write's
+//      referenced-but-not-yet-placed fragment must NEVER be flagged as a loss ----
+#[tokio::test]
+async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+
+    // A PENDING (not yet committed) inode whose chunk map places a fragment on d0 that
+    // d0 does not (yet) hold — the shape of an in-flight write mid-fan-out. Because the
+    // inode never reached `InodeState::Committed`, scrub's reference set
+    // (`crate::gc::referenced_fragments`) must exclude it entirely, so this can never
+    // be mistaken for a missing-fragment loss.
+    let chunk: ChunkId = 0x330C;
+    let record = InodeRecord {
+        size: 16,
+        chunk_map: vec![ChunkRef {
+            id: chunk,
+            scheme: EcScheme::None,
+            len: 16,
+            placement: vec![0],
+        }],
+        state: InodeState::Pending,
+        version: 1,
+    };
+    let outcome = metadata::create(&meta, ROOT, "in-flight", 1, &record)
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "a pending (uncommitted) write's provisional chunk map is never in scrub's \
+         reference set, so its not-yet-placed fragment is never a false-positive finding"
+    );
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "no repair obligation for an in-flight write's fragment"
+    );
+}
