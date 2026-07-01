@@ -382,7 +382,7 @@ surface and parallelize freely.
   elegant tier.
 
 [p5]: ../accepted/0005-milestone-3-custodians.md
-[p7]: 0007-milestone-4-production-metadata-backend.md
+[p7]: ../accepted/0007-milestone-4-production-metadata-backend.md
 [p8]: 0008-management-and-administration.md
 [p9]: 0009-d-server-performance.md
 [bp]: ../../architecture/m4-first-deployment-blueprint.md

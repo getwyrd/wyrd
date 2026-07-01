@@ -350,7 +350,7 @@ timestamp while the cluster keeps serving, no downtime. *Continuous near-realtim
 (low RPO)* — **only partially, and unverified for this deployment**: TiKV/TiDB
 log-backup PITR streams change logs with an RPO floor of ~5 minutes (never zero),
 **but that is a TiDB-*cluster* feature**, while Wyrd runs **standalone transactional
-TiKV** (`txnkv`, no TiDB — [proposal 0007](../proposals/draft/0007-milestone-4-production-metadata-backend.md))
+TiKV** (`txnkv`, no TiDB — [proposal 0007](../proposals/accepted/0007-milestone-4-production-metadata-backend.md))
 and the standalone TiKV-BR continuous path is documented for *RawKV*, not `txnkv`.
 So for M4 the safe assumption is **periodic online snapshots** (RPO = the snapshot
 interval); whether log-backup PITR works against bare `txnkv` must be **verified

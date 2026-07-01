@@ -1,9 +1,9 @@
 ---
 created: 27.06.2026
 type: proposal
-status: draft
+status: accepted
 author: Eduard Ralph
-tracking-issue: TBD
+tracking-issue: "#375"
 tags:
   - proposal
   - milestone-6

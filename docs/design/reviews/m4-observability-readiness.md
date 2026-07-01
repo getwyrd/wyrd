@@ -153,6 +153,6 @@ another home for assessment notes). Verified against the working tree at the tim
 writing; re-check the wiring claims if a custodian/telemetry integration PR has landed
 since.*
 
-[p7]: ../proposals/draft/0007-milestone-4-production-metadata-backend.md
+[p7]: ../proposals/accepted/0007-milestone-4-production-metadata-backend.md
 [p8]: ../proposals/draft/0008-management-and-administration.md
 [p9]: ../proposals/draft/0009-d-server-performance.md
