@@ -18,7 +18,7 @@ recognizable Jepsen/Elle credibility artifact to issue #329**, "blocked on subst
 that can yield a non-vacuous, checkable history against Wyrd's actual model." This ADR
 records that substrate decision, which is what unblocks #329.
 
-The block was real but mis-framed. Eight iterations under #250 pointed a literal
+The block was real but misframed. Eight iterations under #250 pointed a literal
 Clojure/Jepsen/Elle harness at Wyrd and produced only **vacuous histories**, and
 ADR-0039 drew the conclusion that Wyrd "is an immutable, single-write-per-key object
 store" for which "the 'list' or 'register' has to be invented client-side, so the
