@@ -27,6 +27,6 @@ This index is the authoritative record of each proposal's current status and any
 | [0011](accepted/0011-milestone-5-internal-ca-step-ca.md) | Milestone 5 — internal CA (step-ca) | accepted (tracker [#374](https://github.com/getwyrd/wyrd/issues/374)) |
 | [0012](accepted/0012-milestone-6-encryption-at-rest-kms.md) | Milestone 6 — encryption at rest (KeyService / KMS) | accepted (tracker [#375](https://github.com/getwyrd/wyrd/issues/375)) |
 | [0013](accepted/0013-implementation-arc-rescoped.md) | The implementation arc (rescoped) | accepted (supersedes 0002; tracker [#298](https://github.com/getwyrd/wyrd/issues/298)) |
-| [0014](draft/0014-milestone-7-failover-and-dr-single-dc.md) | Milestone 7 — failover and disaster recovery, single-DC | draft (tracker [#368](https://github.com/getwyrd/wyrd/issues/368)) |
+| [0014](draft/0014-milestone-7-failover-and-dr-single-dc.md) | Milestone 7 — failover and disaster recovery, single-DC | draft (authoring: [#368](https://github.com/getwyrd/wyrd/issues/368)) |
 
 ¹ Frozen pre-rescope: uses proposal 0002's original milestone numbering (old M5/M6/M7 = cross-zone replication / global control plane / cross-zone DR → **M9/M10/M11** today), and where these files call M4 the release point or the first deployable/usable product, that is superseded too — the **Step-2 ★ release point moved to M8** (M4 is a soft stopping point that completes the data plane). Reconcile through [0013's old→new mapping table](accepted/0013-implementation-arc-rescoped.md).

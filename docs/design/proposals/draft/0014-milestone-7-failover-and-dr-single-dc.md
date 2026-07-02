@@ -30,8 +30,12 @@ tags:
 > [§8.2][s8] out-of-band backup rule, the [blueprint][bp]'s per-tier backup model
 > — into **exercised fact**, plus the one production mechanism those decisions
 > presuppose but nothing yet implements: holistic failure *detection*. **No new
-> spec and no ADR ratification is required**; the deciding documents stand, and
-> M7 is where they stop being paper. The *cross-zone*, zone-loss DR drill —
+> spec, and no ratification of the milestone's technical contracts, is
+> required** — the trust, key, and consistency ADRs stand, and M7 is where they
+> stop being paper; the one *process* decision M7 introduces, the runbooks
+> document class, lands as a lightweight ADR with M7.5 (the [design README][rd]
+> ADR-first habit for a settled process choice). The *cross-zone*, zone-loss DR
+> drill —
 > home-zone failover via the version high-water mark ([ADR-0015][a15]) — is
 > **explicitly M11**, the Step-3 ★, not this milestone ([p2][p2]).
 
@@ -55,19 +59,25 @@ demonstrably does *not* yet establish:
   lapses," and `discover` returns "the current (unexpired) members"
   (`crates/traits/src/lib.rs`) — but **nothing consumes it**. A killed server
   today is discovered fragment-by-fragment at scrub cadence. And the half of
-  the durability equation detection owns is **unmeasured**: durability ≈ the
-  probability that more than *m* fragments are lost within one **detect +
-  repair** window ([§6.3][s6]; [bp][bp]), yet of ADR-0011's five
-  durability-plane metrics only *time-to-repair* exists — **time-to-detect is
-  not among them** ([ADR-0011][a11]).
+  the durability equation detection owns is **unmeasured**: §6.3 frames
+  durability as "the probability that more than *m* fragments fail within one
+  **repair** window" ([§6.3][s6]) — but repair cannot begin before loss is
+  *detected*, so the true at-risk interval is **detect + repair**, and M7 makes
+  that first half explicit (an extension of §6.3's framing, not a quote of it).
+  M3 already emits four of ADR-0011 §1's five durability metrics
+  (under-replicated count, repair-queue depth, time-to-repair, scrub
+  coverage/corruption; replication-lag-per-zone-pair is single-zone-moot) — but
+  **time-to-detect is not among them** ([ADR-0011][a11]), because no loop yet
+  owns detection to time it.
 - **The system of systems recovers, or only the data plane does.** Every fault
   M3 injected was a *data-plane* fault. The production single zone that M5/M6
   completed is five stateful or control tiers — the D fleet, TiKV+PD, the L5
   etcd ensemble, the step-ca trust plane, the OpenBao key plane — with
   per-tier loss semantics the architecture already fixes: coordination loss
   "loses no data … what is lost is the ability to *react*" (`Coordination`
-  doc-comment); an unreachable CA under **fail-closed mTLS** "halts *every* new
-  dial and cert rotation" ([§7.3][s7]; [ADR-0025][a25]); a KMS outage makes
+  doc-comment); an unreachable CA under **fail-closed mTLS** "halts *every new
+  dial and certificate rotation* in the zone" ([§7.3][s7], the fail-closed
+  consequence of [ADR-0025][a25]); a KMS outage makes
   encrypted data "temporarily *unreadable*, never *lost*" ([0012][p12];
   [ADR-0026][a26]); metadata loss "orphans all chunks" ([§8.2][s8]). Control-,
   trust-, and key-plane loss is a **failure class M3 never touched**, and the
@@ -79,12 +89,13 @@ demonstrably does *not* yet establish:
   before it is needed**, not improvised during an incident — and that runbook,
   plus backup cadence/format/retention, is still an open item in proposal 0008,
   not yet specified" ([bp][bp]). The backup model itself is asymmetric by design
-  ([§8.2][s8]: "replication is not backup" — Raft and EC faithfully replicate
-  logical disasters) and **fallible in exactly the place that matters**: TiKV
-  restore has real-world inconsistency history (TiKV issue #13281, cited by the
-  blueprint), and whether log-backup PITR works against Wyrd's standalone
-  `txnkv` (no TiDB) is an **open item of [0007][p7]** — so today the mandatory
-  metadata backup is configured on faith. The arc's definition-of-done verb is
+  ([bp][bp]: "replication is not backup"; Raft and EC "faithfully replicate
+  logical disasters" like a bad migration or errant delete, [§8.2][s8]) and
+  **fallible in exactly the place that matters**: TiKV restore has real-world
+  inconsistency history (TiKV issue #13281, cited by the blueprint), and
+  whether log-backup PITR works against Wyrd's standalone `txnkv` (no TiDB) is
+  an **open verification item the blueprint records** ([bp][bp]) — so today the
+  mandatory metadata backup is configured on faith. The arc's definition-of-done verb is
   *drilled*; nothing weaker retires this risk.
 
 A second, quieter motivation: M7 is the **dress rehearsal for the arc's final
@@ -134,8 +145,14 @@ reputation, is the cheap time to pay ([p2][p2]).
   *both* sides: within tolerance → reads keep serving and the rebuild lands in
   surviving distinct domains; **beyond tolerance → the loss is surfaced, never
   silent** (the reconstruction loop's `Unrepairable` assessment leaves the
-  obligation queued and the chunk visible as under-replicated,
-  `reconstruction.rs` — the honest-refusal half no current tier exercises).
+  obligation queued for re-assessment, `reconstruction.rs:145`). One honest gap
+  M7.2 must close first: today `emit_under_replicated` counts only *repairable*
+  plans (`reconstruction.rs:166`), so a beyond-tolerance chunk sits in the
+  repair-queue-depth metric but is **absent from the under-replicated count** —
+  the honest-refusal half is not yet surfaced there. M7.2 either extends the
+  emission to count unrepairable obligations or asserts the drill against queue
+  depth; either way the loss is made visible — the half no current tier
+  exercises.
 - **Quorum-loss recovery, per tier, per the blueprint's backup model** ([bp][bp];
   [§8.2][s8]): **etcd is rebuilt, not restored** (a stale snapshot rolls the
   mvcc revision backward and "can regress lock fencing tokens, re-admitting a
@@ -172,7 +189,14 @@ reputation, is the cheap time to pay ([p2][p2]).
   backup/restore, drain/decommission, and upgrades first-class, safe, resumable
   management-plane operations behind ADR-0013's API. M7 hands M8 a *drilled
   procedure*; M8 wraps it in the operator surface. The boundary is
-  mechanism-and-proof (M7) vs workflow-and-API (M8).
+  mechanism-and-proof (M7) vs workflow-and-API (M8). **0008, authored before
+  this proposal, today lists the DR runbook, the drill, and single-zone
+  backup/restore among its *own* graduation criteria and open items**;
+  reconciling that — narrowing 0008's criterion to "wrap the M7-drilled
+  procedure and backup config in the management API", so the runbook and the
+  backup cadence/format/retention are authored once, here — is a task of M7.5
+  and of 0008's slicing (#369), not a second independent plan for the same
+  artifacts.
 - **The Tier-1 `deploy/` performance bundle** — **[0009][p9]**. Kernel pins,
   udev/sysctl tuning, and the OS image are the performance program's; the drill
   runs on whatever bundle the substrate carries and neither depends on nor
@@ -248,16 +272,31 @@ struct of injected seams, one `reconcile` pass, dispatched only from the fenced
   queue), the L5 membership view (the decoded `DServerRegistration { id,
   endpoint, failure_domain }` records `discover` returns — the registration
   record M3.1 already defined, `crates/server/src/dserver.rs`), the desired-state
-  ledger, and the clock seam ([ADR-0024][a24]) so the suspicion window is
-  deterministic under DST.
+  ledger, and the clock seam ([ADR-0024][a24]): the suspicion window is
+  deterministic under DST **and sits inside ADR-0024's single shared skew
+  budget** — an implausible custodian clock (a forward jump that would make live
+  registrations look lapsed) **fails the pass closed** (no mass enqueue) rather
+  than fabricating loss, as ADR-0024 requires of every time-dependent check.
 - **The pass:** compute the set of D-server ids referenced by committed
-  placement records but **absent from the unexpired membership**; exclude
-  servers with a recorded drain/decommission lifecycle (the rebalance loop owns
-  evacuation); for a server absent longer than the suspicion window, enqueue a
-  repair obligation for every fragment the placement records put on it — with
-  its own source label on the shared queue (the ledger records the trigger, as
-  scrub's `"scrub"` label does), so the audit trail distinguishes
-  liveness-detected loss from scrub-detected loss.
+  placement records but **absent from the unexpired membership**; for a server
+  absent longer than the suspicion window, enqueue a repair obligation for every
+  fragment the placement records put on it — with its own source label on the
+  shared queue (the ledger records the trigger, as scrub's `"scrub"` label
+  does), so the audit trail distinguishes liveness-detected loss from
+  scrub-detected loss. A recorded drain/decommission lifecycle changes the
+  *audit disposition*, **not** whether the loss is repaired. A draining server
+  is excluded only once its evacuation is **satisfied** (`reconciliation_status`
+  = *satisfied*: no committed placement record still points at it — at which
+  point the pass has nothing to enqueue for it anyway, `desired_state.rs`). A
+  draining server whose evacuation is **unsatisfied** — fragments still placed
+  on it — that goes absent is a genuine loss the rest of the plane cannot
+  recover: rebalance clean-copies only an *intact fragment from the live source*
+  and a departed source is off-fleet (`rebalance.rs`), and scrub walks only the
+  present fleet (`scrub.rs`), so a fully-departed server's fragments fall to no
+  other loop. The reconciler therefore enqueues reconstruction for its
+  still-referenced fragments exactly as for any other departed server; excluding
+  by lifecycle *alone* would suppress the one holistic detector precisely when
+  nothing else can repair.
 - **Why a suspicion window:** a lease lapse can be a blip — an etcd restart, a
   GC pause, a network flap — and the false-positive cost is a **whole server's
   re-placement** (mass repair traffic that then contends with foreground reads,
@@ -315,7 +354,8 @@ each leg. The single-DC ordering the runbook writes:
    independent storage, restored onto a fresh TiKV+PD tier. M7 also executes
    the blueprint's named verification: whether log-backup **PITR works against
    standalone `txnkv`** (a TiDB-cluster-documented feature, unverified for
-   Wyrd's no-TiDB deployment — the [0007][p7] open item) is settled against the
+   Wyrd's no-TiDB deployment — the blueprint's open item, [bp][bp]) is settled
+   against the
    pinned TiKV-BR version, and the achievable **RPO floor is recorded either
    way** (the snapshot interval if PITR is out). Restore is treated as fallible
    and drilled, not configured (TiKV #13281).
@@ -388,8 +428,10 @@ operational home. So: `docs/design/runbooks/single-dc-failover-and-recovery.md`
 (frontmatter `type: runbook, status: living`), with **dated, append-only drill
 records** under `docs/design/runbooks/drills/` — the record immutable like an
 ADR (it is evidence), the procedure living like architecture. The README's
-class table gains the fifth row; whether the class needs its own ADR-0037-style
-change-process rule is flagged in Open questions.
+class table gains the fifth row, and the class plus its append-only-drill-record
+change process are minted in a **lightweight ADR landed with M7.5** — the
+ADR-first habit for a settled process decision ([design README][rd]), not a new
+document class smuggled in under a milestone plan.
 
 **What it contains:** the failure-detection matrix (signal, bound, responding
 loop, per class); per-failure-class response procedures (node / disk / rack /
@@ -570,9 +612,11 @@ additions 0007/0011/0012 make):
 ## Graduation criteria (definition of done)
 
 - **A dead D server is detected by a production path** — lease lapse →
-  suspicion window (drain/decommission excluded) → repair obligations for every
-  placed fragment on the departed server, on the shared queue, from the fenced
-  control point; proven at Tier 0 (seeded) and against a real cluster kill.
+  suspicion window (a *satisfied* drain excluded; a departed server whose drain
+  is unsatisfied is **not** excluded) → repair obligations for every placed
+  fragment on the departed server, on the shared queue, from the fenced control
+  point; proven at Tier 0 (seeded, incl. the implausible-clock leg) and against
+  a real cluster kill (the M7.2 leg asserts detection fires per killed member).
 - **Time-to-detect is on the durability plane** alongside ADR-0011's five, and
   the **failure-detection matrix** (class × signal × bound × responder) is
   written into the runbook.
@@ -618,15 +662,20 @@ Each step is one PR, tracked under the **M7** milestone (branch
    seam, drain/decommission exclusion, per-fragment obligations with a liveness
    source label; time-to-detect on the telemetry seam. *DoD:* Tier-0 detection
    property family green and seed-reproducible (exact enqueue set, window
-   honored, drain excluded, flap-stable); `traits` unchanged; the metric
-   observable on both export surfaces.
+   honored, **satisfied-drain excluded but an unsatisfied drain that departs
+   enqueues its remaining fragments**, flap-stable, and an **implausible-clock
+   leg that fails closed with no enqueue**, [ADR-0024][a24]); `traits`
+   unchanged; the metric observable on both export surfaces.
 2. **M7.2 — rack-scale and beyond-tolerance fault legs**
    (`feat/m7.2-rack-scale-faults`, `feat(xtask): …`). Whole-`fd`-group kill and
    whole-device `dm-error` legs extending the M3 runners (same compose
    plumbing, `Plan` gating, log-capture-before-teardown); Tier-0 rack-loss
    placement properties. *DoD:* within-tolerance group kill rebuilds into
-   surviving distinct domains with reads unbroken; past-tolerance kill surfaces
-   unrepairable, retains obligations, tears nothing; legs inert without opt-in.
+   surviving distinct domains with reads unbroken; **liveness detection fires
+   once per killed member** (the real-cluster-kill half of graduation criterion
+   1, against the M7.1 loop); past-tolerance kill surfaces unrepairable (the
+   `emit_under_replicated` gap above closed as part of this leg), retains
+   obligations, tears nothing; legs inert without opt-in.
 3. **M7.3 — quorum-loss recovery: etcd rebuild, TiKV restore-verify**
    (`feat/m7.3-quorum-recovery`, `feat(xtask): …` / `feat(deploy): …`). The
    etcd destroy → fresh-rebuild leg with re-registration / re-election / fence
@@ -646,10 +695,12 @@ Each step is one PR, tracked under the **M7** milestone (branch
 5. **M7.5 — the runbook + drill protocol** (`feat/m7.5-runbook`,
    `docs(runbooks): …`). `docs/design/runbooks/single-dc-failover-and-recovery.md`
    (matrix, procedures, restore ordering with gates, backup verification, drill
-   protocol + record template); `drills/` scaffold; README class-table row.
-   *DoD:* every procedure traces to an automated leg or a manual step with a
-   verification gate; the M8 boundary (workflow-and-API) and M11 boundary
-   (zone-scale) stated in the artifact itself.
+   protocol + record template); `drills/` scaffold; README class-table row; a
+   **lightweight ADR minting the runbooks document class** and its
+   append-only-drill-record change process. *DoD:* every procedure traces to an
+   automated leg or a manual step with a verification gate; the M8 boundary
+   (workflow-and-API, incl. narrowing 0008's backup/runbook criterion — #369)
+   and M11 boundary (zone-scale) stated in the artifact itself.
 6. **M7.6 — the graduation drill** (`feat/m7.6-graduation-drill`). Execute the
    runbook end to end on the #367 substrate (the blueprint topology): node,
    rack, etcd, TiKV, CA, KMS legs, timed against the stated bounds. *DoD:* the
@@ -707,20 +758,21 @@ the narrowest in Step 2:
   every custodian action — or does the rebuild need a persisted token-epoch
   floor (e.g. in L4 config) so L5-issued tokens never regress? M7.3's drill
   answers with evidence and pins the answer as a standing test.
-- **TiKV PITR against standalone `txnkv`.** The [0007][p7]/blueprint open item:
-  log-backup PITR is documented for TiDB clusters and RawKV, not Wyrd's bare
-  `txnkv`. Verify against the pinned TiKV-BR/`tikv-client`; if unsupported, the
-  RPO floor is the snapshot interval and the runbook says so plainly.
+- **TiKV PITR against standalone `txnkv`.** The blueprint's open verification
+  item ([bp][bp]): log-backup PITR is documented for TiDB clusters and RawKV,
+  not Wyrd's bare `txnkv`. Verify against the pinned TiKV-BR/`tikv-client`; if
+  unsupported, the RPO floor is the snapshot interval and the runbook says so
+  plainly.
 - **The CA outage fuse: cert lifetime and renewal margin.** Fail-closed mTLS
   makes minimum-remaining-cert-lifetime the zone's outage fuse under CA loss.
   What lifetime/renewal-margin policy balances that fuse against short-lived-
   cert security — and how it interacts with M5's provisioner choice — is
   measured by M7.4 and settled with the M5 pins, not assumed here.
-- **Drill cadence and the runbooks class's change process.** Per-release +
-  post-change is this proposal's floor; whether a calendar cadence is warranted
-  pre-M8, and whether the new document class (living procedure, append-only
-  drill records) needs an ADR-0037-style process rule of its own, are
-  documentation-governance questions to settle at acceptance.
+- **Drill cadence.** Per-release + post-change is this proposal's floor;
+  whether a standing calendar cadence is warranted pre-M8 is an operational
+  question to settle with the first drill's experience, not invented here. (The
+  runbooks document class and its change-process rule are *decided*, not
+  deferred — minted in the M7.5 ADR above.)
 - **Which durability-plane alerts the drill requires of the floor.** A drill is
   only operator-real if the outage is *alerting*, not merely log-visible:
   sustained under-replicated > 0, a time-to-detect bound breach, a stalled
