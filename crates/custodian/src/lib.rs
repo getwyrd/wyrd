@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backfill;
 pub mod desired_state;
 pub mod gc;
 pub mod leadership;
@@ -29,6 +30,7 @@ pub mod reconstruction;
 pub mod scrub;
 pub mod telemetry;
 
+pub use backfill::BackfillContext;
 pub use desired_state::{
     clear_lifecycle, draining_servers, reconciliation_status, set_lifecycle, DServerLifecycle,
     ReconciliationStatus,
