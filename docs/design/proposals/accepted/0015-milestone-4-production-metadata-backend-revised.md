@@ -1,7 +1,7 @@
 ---
 created: 02.07.2026
 type: proposal
-status: draft
+status: accepted
 supersedes: 0007-milestone-4-production-metadata-backend.md
 author: Eduard Ralph
 tracking-issue: "#201"
@@ -14,14 +14,14 @@ tags:
 ---
 # Proposal: Milestone 4 — production metadata backend (TiKV) (implementation plan, revised)
 
-> **Proposed revision of [proposal 0007](../accepted/0007-milestone-4-production-metadata-backend.md)**
-> (2026-07-02) — a **draft** that, *on acceptance*, will supersede the original M4 plan. **Until it is
-> accepted, 0007 remains the plan of record and governs; this document does *not* yet govern.**
-> Implementers should treat its scope changes as **proposed, not authoritative** until 0015 is
-> accepted and 0007 is marked superseded in the index (ADR-0037/0038). 0007 is retained unchanged as
-> a frozen record. The changes are **review-pass refinements** — a deployment-scope correction plus
-> risk/anchor hygiene — not a re-plan of the metadata work (the TiKV backend, its transactional
-> mapping, and the DST discipline carry over unchanged). See "Changes from proposal 0007" below.
+> **Supersedes [proposal 0007](./0007-milestone-4-production-metadata-backend.md)**
+> (accepted 2026-07-03), the original M4 plan, which is retained unchanged as a frozen
+> record. This document carries the **current** M4 plan; where the two differ, this one
+> governs (the supersession is recorded in the index, per ADR-0037/0038). The changes
+> are **review-pass refinements** — a deployment-scope correction plus risk/anchor
+> hygiene — not a re-plan of the metadata work (the TiKV backend, its transactional
+> mapping, and the DST discipline carry over unchanged). See "Changes from proposal
+> 0007" below.
 
 > The implementation plan for the fourth step of the
 > [implementation arc][p2] (proposal 0013, which supersedes 0002). [Proposals 0001–0005][p5] built a
