@@ -454,14 +454,17 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
 // an empty or short committed `placement` must come back FULL-LENGTH
 // (`fragment_count()`), never the raw empty/short vector it started from.
 //
-// Flippable (recorded in build-notes): replace `assess`'s expansion (`reconstruction.rs
-// :230-232`, `let placement = (0..chunk_ref.fragment_count()).map(|i|
-// chunk_ref.placed_dserver(i)).collect();`) with raw `chunk_ref.placement.clone()`. For
-// an empty/short committed vector the iteration loop below then runs over 0 (or fewer
-// than `n`) entries, so `missing` stays empty -> `Assessment::Drain` -> the obligation
-// is drained with NOTHING rebuilt and the placement record never repointed — every
-// assertion in `reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_record`
-// and `reconstructs_a_short_placement_chunk_resolving_the_fallback_index` below fires.
+// The EMPTY-placement cell (valid pre-M3) still resolves via the fallback and repoints to
+// a full-length record. The SHORT (non-empty, wrong-length) cell was RE-CLASSIFIED by
+// #348 / ADR-0040 decisions 3–4: a short vector is malformed (truncation/corruption), so
+// reconstruction now classifies it via `ChunkRef::checked_fragments` and SKIPS it (leaving
+// the obligation queued, flagging NEEDS-HUMAN) rather than rebuilding over a fabricated
+// tail — see `short_placement_is_malformed_reconstruction_skips_and_flags_needs_human`.
+//
+// Flippable (recorded in build-notes): for the empty cell, replace `assess`'s expansion
+// with raw `chunk_ref.placement.clone()`: the iteration runs over 0 entries, `missing`
+// stays empty -> `Assessment::Drain` -> the obligation drains with NOTHING rebuilt, so
+// `reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_record` fires.
 
 /// **The brief's required re-placement pin.** A chunk committed with an EMPTY
 /// `placement` (the genuine pre-M3 shape, `core/src/metadata.rs:93`) is kept under
@@ -582,12 +585,28 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
     );
 }
 
-/// A SHORT committed placement (`vec![<explicit dserver>]`, length 1 < `fragment_count()
-/// == 3`) — index 0 explicit on an off-identity D server, indices 1-2 resolved by
-/// identity fallback. Reconstruction must resolve the mix correctly AND re-commit a
-/// FULL-LENGTH record, preserving the genuinely-explicit entry.
+/// **Issue #348 (supersedes the #349 short-placement cell): a SHORT vector is MALFORMED,
+/// reconstruction SKIPS + flags NEEDS-HUMAN.** A committed `placement: vec![9]` (length 1
+/// < `fragment_count() == 3`) is non-empty but of the wrong length — malformed per ADR-0040
+/// decision 3 ("short non-empty vectors are NOT a supported steady state"), which can only
+/// mean truncation / corruption. The #349 matrix originally treated this as a resolvable
+/// mixed explicit/fallback record and asserted reconstruction rebuilt it into a full-length
+/// vector; ADR-0040 decision 4 reverses that for the maintenance loops: reconstruction MUST
+/// classify the committed placement *before* expanding it and MUST NOT rebuild over a
+/// fabricated identity tail. It **skips** the chunk (leaving the obligation queued, the
+/// record untouched) and flags it NEEDS-HUMAN — while the READ PATH stays liberal and still
+/// resolves the same chunk via the per-index fallback (availability first).
+///
+/// Pre-fix: `assess` expanded via `fragments()` → fabricated `[9, 1, 2]`; it gathered
+/// survivors, rebuilt the dead index 2, and repointed the committed record to a full-length
+/// vector (`Changed`, version bumped) — acting on an invented placement.
+/// Post-fix: `assess` classifies the vector malformed → `Assessment::Malformed`; the chunk
+/// is skipped, the obligation stays queued, and the committed `placement` stays `vec![9]`.
+///
+/// Flippable: revert `reconstruction.rs:assess` to expand via `chunk_ref.fragments()` and
+/// this goes red (the placement is repointed to `[9, 1, 3]` and the obligation is drained).
 #[tokio::test]
-async fn reconstructs_a_short_placement_chunk_resolving_the_fallback_index() {
+async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human() {
     let meta = MemMeta::default();
     let (d0, d1, d2, d3, d9) = (
         MemDServer::default(),
@@ -602,9 +621,9 @@ async fn reconstructs_a_short_placement_chunk_resolving_the_fallback_index() {
 
     let data = write_rs_2_1(&meta, &fleet).await; // commits [0, 1, 2] on domains A,B,C
 
-    // Move index 0's bytes to an out-of-band D server (9, domain "Z") and commit a
-    // SHORT placement: only index 0 explicit; indices 1,2 keep resolving via identity
-    // fallback to their real, untouched locations (servers 1, 2).
+    // Move index 0's bytes to an out-of-band D server (9) and commit a SHORT (malformed)
+    // placement `vec![9]` (len 1 != fragment_count 3): the fabricated tail would resolve
+    // indices 1,2 by identity to servers 1,2 — but a maintenance loop must never trust it.
     let bytes0 = d0.get_fragment(frag(0)).await.unwrap().unwrap();
     d9.put_fragment(frag(0), bytes0).await.unwrap();
     let prior = read_inode(&meta).await;
@@ -620,25 +639,24 @@ async fn reconstructs_a_short_placement_chunk_resolving_the_fallback_index() {
     assert_eq!(
         downgraded.chunk_map[0].placement,
         vec![9],
-        "a genuinely SHORT vector: 1 explicit entry, not the full 3"
+        "a genuinely SHORT (malformed) vector: 1 entry, not the full 3"
     );
 
-    // KILL D server 2 (the fallback-resolved index 2's home, domain C).
+    // KILL D server 2 (the fabricated index-2's identity home): under the OLD contract a
+    // rebuild would have re-placed it; under #348 the chunk is skipped instead.
     d2.delete_fragment(frag(2)).await.unwrap();
     repair::enqueue_repair(&meta, CHUNK, "health")
         .await
         .unwrap();
 
+    // The READ PATH is unchanged: it still resolves the object (degraded, k=2 survivors on
+    // servers 9 and 1) via the liberal per-index fallback — availability first.
     assert_eq!(
         read_object(&meta, &fleet, 1).await.unwrap(),
         Some(data.clone()),
-        "the object reads correctly while under-replicated, via the mixed \
-         explicit/fallback resolution"
+        "the read path still resolves a malformed-placement chunk via the identity fallback"
     );
 
-    // Reconstruction's healthy view excludes domain A (server 0 — stale, no longer
-    // referenced once index 0 moved to 9) and domain C (server 2 — dead): only the
-    // ACTUAL survivor domains (B, Z) plus the one free target domain (D) are visible.
     let mut healthy_topo = Topology::default();
     healthy_topo
         .register(1, "B")
@@ -658,41 +676,144 @@ async fn reconstructs_a_short_placement_chunk_resolving_the_fallback_index() {
         .unwrap();
     assert_eq!(
         outcome,
-        Reconciled::Changed,
-        "the short-placement, under-replicated chunk was reconstructed"
+        Reconciled::Satisfied,
+        "malformed (short) placement: reconstruction repoints nothing (#348)"
     );
 
+    // The committed record is UNTOUCHED — never rebuilt over a fabricated placement.
     let record = read_inode(&meta).await;
     assert_eq!(
-        record.version, 3,
-        "one commit on top of the short-placement downgrade"
+        record.version, downgraded.version,
+        "no version-conditional commit landed for a malformed-placement chunk"
     );
     assert_eq!(
         record.chunk_map[0].placement,
-        vec![9, 1, 3],
-        "explicit index 0 preserved (server 9); fallback index 1 untouched (server 1); \
-         lost index 2 re-placed on the free distinct domain D (server 3)"
-    );
-    assert_eq!(
-        record.chunk_map[0].placement.len(),
-        usize::from(record.chunk_map[0].fragment_count()),
-        "full-length record, not the short vector it started from"
-    );
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
-        .placement
-        .iter()
-        .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
-        .collect();
-    assert_eq!(
-        domains.len(),
-        3,
-        "n fragments on n distinct failure domains"
+        vec![9],
+        "the malformed placement is left exactly as committed, never repointed (#348)"
     );
 
+    // The obligation stays queued — surfaced for a human (NEEDS-HUMAN), not silently drained.
+    assert!(
+        repair::queued_repairs(&meta)
+            .await
+            .unwrap()
+            .contains(&CHUNK),
+        "the repair obligation for a malformed-placement chunk stays queued (NEEDS-HUMAN, #348)"
+    );
+
+    // The read path still resolves the object afterwards (it was never made unreadable).
     assert_eq!(
         read_object(&meta, &fleet, 1).await.unwrap(),
         Some(data),
-        "the object reads correctly after repair (full redundancy, atomic flip)"
+        "the read path is unchanged after the maintenance pass skipped the chunk"
+    );
+}
+
+/// #348 / ADR-0040 decisions 3–4, the **single-fragment (`EcScheme::None`) malformed
+/// case**: a malformed placement on a `None` chunk must be classified BEFORE the scheme
+/// match, so reconstruction flags it NEEDS-HUMAN like every other maintenance loop instead
+/// of letting it fall through the `None → Unrepairable` early return **silently**. A `None`
+/// chunk has `fragment_count() == 1`, so a committed `placement: vec![7, 8]` (length 2) is
+/// non-empty and of the wrong length — malformed, which for `None` can only mean truncation
+/// / corruption.
+///
+/// Pre-reorder: `assess` matched the scheme first, hit `EcScheme::None => Unrepairable`, and
+/// `reconcile` handled `Unrepairable => {}` — no NEEDS-HUMAN signal, so reconstruction was
+/// the lone loop that swallowed a malformed `None` placement. Post-reorder: `assess` runs
+/// `checked_fragments()` before the scheme match, classifies the vector `Malformed`, and
+/// `reconcile` emits the NEEDS-HUMAN durability signal (`reconstruction_malformed_placement`).
+///
+/// The signal is the only externally observable difference between the two paths (both leave
+/// the record untouched and the obligation queued), so this asserts the metric directly.
+/// Flippable: move the `checked_fragments()` gate back below the `scheme` match and this goes
+/// red (the malformed `None` placement returns `Unrepairable`, no metric is exported).
+#[tokio::test]
+async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+
+    // Start from a valid committed chunk, then corrupt it into a `None`-scheme record with a
+    // malformed (len 2, `fragment_count() == 1`) placement — the truncation/corruption case.
+    write_rs_2_1(&meta, &fleet).await;
+    let prior = read_inode(&meta).await;
+    let mut chunk_map = prior.chunk_map.clone();
+    chunk_map[0].scheme = EcScheme::None;
+    chunk_map[0].placement = vec![7, 8];
+    assert_eq!(
+        metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    let corrupted = read_inode(&meta).await;
+
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    let mut topo = Topology::default();
+    topo.register(0, "A").register(1, "B").register(2, "C");
+    let healthy_fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (1, &d1), (2, &d2)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy_fleet,
+        topology: &topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "malformed `None` placement: reconstruction repoints nothing"
+    );
+
+    // The committed record is untouched — never rebuilt over a fabricated placement.
+    let record = read_inode(&meta).await;
+    assert_eq!(
+        record.version, corrupted.version,
+        "no version-conditional commit landed for a malformed `None`-placement chunk"
+    );
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![7, 8],
+        "the malformed placement is left exactly as committed, never repointed (#348)"
+    );
+
+    // The obligation stays queued — surfaced for a human, not silently drained.
+    assert!(
+        repair::queued_repairs(&meta)
+            .await
+            .unwrap()
+            .contains(&CHUNK),
+        "the repair obligation for a malformed `None`-placement chunk stays queued (#348)"
+    );
+
+    // The NEEDS-HUMAN signal is emitted — the flippable distinguisher from the old silent
+    // `Unrepairable` path that the scheme-first ordering produced for `None` chunks.
+    telemetry.flush().unwrap();
+    let exposed = telemetry
+        .gather_prometheus()
+        .expect("Prometheus surface configured");
+    assert!(
+        exposed.contains("reconstruction_malformed_placement"),
+        "a malformed `None` placement is flagged NEEDS-HUMAN on the durability seam, not \
+         swallowed as `Unrepairable`; got:\n{exposed}"
     );
 }
 

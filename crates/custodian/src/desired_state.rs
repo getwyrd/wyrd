@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use wyrd_traits::{DServerId, MetadataStore, Result, WriteBatch};
+use wyrd_traits::{ChunkId, DServerId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::referenced_fragments;
 
@@ -78,13 +78,27 @@ impl DServerLifecycle {
 /// The reconciliation status of a D server's drain/decommission desired state — the
 /// observable surface that makes **"policy changed"** and **"policy satisfied"**
 /// distinct moments (`0005:351-352`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconciliationStatus {
     /// No drain/decommission desired state is recorded for this server.
     NotRequested,
     /// Desired state is recorded (**policy changed**) but reality has not yet
     /// converged — the server still holds at least one **referenced** fragment.
     Pending,
+    /// Desired state is recorded and the server holds no *valid* referenced fragment,
+    /// yet the drain **cannot** be certified satisfied: one or more committed chunk maps
+    /// carry a **malformed** placement (ADR-0040 decision 4) that rebalance refuses to
+    /// evacuate (skip + NEEDS-HUMAN), so a corrupt record — which cannot be trusted to
+    /// *not* name this server — might still reference it. The drain stays blocked
+    /// **cluster-wide** (fail safe: the block is deliberately *not* scoped to servers the
+    /// malformed vector happens to name, since trusting its contents is exactly what
+    /// ADR-0040 forbids), and the blocking chunk ids are surfaced **in the answer itself**
+    /// so an operator can attribute the stall to specific corruption and resolve it,
+    /// rather than see an unexplained `Pending`. Chunk ids are sorted (stable order).
+    PendingMalformed {
+        /// The committed chunk ids whose malformed placement is blocking every drain.
+        chunks: Vec<ChunkId>,
+    },
     /// Desired state is recorded **and** reality matches (**policy satisfied**) — the
     /// server holds no referenced fragment; its leftover bytes are GC-eligible orphans.
     Satisfied,
@@ -141,10 +155,26 @@ pub async fn reconciliation_status(
         return Ok(ReconciliationStatus::NotRequested);
     }
     let referenced = referenced_fragments(meta).await?;
-    let still_holds = referenced.iter().any(|(server, _)| *server == dserver);
-    Ok(if still_holds {
-        ReconciliationStatus::Pending
-    } else {
-        ReconciliationStatus::Satisfied
-    })
+    // A genuine, trustworthy reference: a *valid* committed placement that resolves a
+    // fragment onto `dserver`. While one exists the drain is honestly `Pending`.
+    let genuinely_holds = referenced
+        .placed
+        .iter()
+        .any(|(server, _)| *server == dserver);
+    if genuinely_holds {
+        return Ok(ReconciliationStatus::Pending);
+    }
+    // No valid reference names `dserver`. But a malformed committed placement (ADR-0040
+    // decision 4) cannot be trusted to *not* name it, and rebalance refuses to evacuate
+    // it (skip + NEEDS-HUMAN), so the drain genuinely cannot complete while one exists.
+    // Stay blocked **cluster-wide** (fail safe — deliberately not scoped to servers the
+    // corrupt vector names, since trusting its contents is what ADR-0040 forbids), but
+    // ATTRIBUTE the stall: surface the blocking chunk ids in the answer so `Pending` is
+    // never unexplained. Only once no malformed placement remains is the drain `Satisfied`.
+    if referenced.malformed.is_empty() {
+        return Ok(ReconciliationStatus::Satisfied);
+    }
+    let mut chunks: Vec<ChunkId> = referenced.malformed.keys().copied().collect();
+    chunks.sort_unstable();
+    Ok(ReconciliationStatus::PendingMalformed { chunks })
 }

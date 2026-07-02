@@ -143,6 +143,10 @@ pub(crate) async fn reconcile(
             // no redundancy (`EcScheme::None`): not reconstructable here. Leave the
             // obligation queued and surface it as under-replicated.
             Assessment::Unrepairable => {}
+            // Malformed committed placement (ADR-0040 decision 4): never rebuild over a
+            // fabricated identity vector. Skip the chunk, leave the obligation queued, and
+            // surface it for a human (NEEDS-HUMAN) on the durability seam.
+            Assessment::Malformed => emit_needs_human(chunk),
         }
     }
 
@@ -201,6 +205,10 @@ enum Assessment {
     Drain,
     /// Cannot be reconstructed in this slice (below `k`, or a no-redundancy scheme).
     Unrepairable,
+    /// The committed placement is **malformed** (non-empty, wrong length): rebuilding
+    /// over its fabricated identity tail is forbidden (ADR-0040 decision 4). Skip the
+    /// chunk and flag it NEEDS-HUMAN; the obligation stays queued.
+    Malformed,
 }
 
 /// Resolve `chunk` to its committed chunk map, then gather and **verify** its surviving
@@ -217,17 +225,28 @@ async fn assess(
     };
     let chunk_ref = prior.chunk_map[chunk_index].clone();
 
+    // Classify the committed placement BEFORE any scheme-specific handling
+    // (ADR-0040 decision 4, "strict maintenance"). A MALFORMED vector (non-empty,
+    // wrong length) is rejected here — for EVERY scheme, single-fragment `EcScheme::None`
+    // included — so the loop flags it NEEDS-HUMAN rather than letting it pass silently.
+    // This must run ahead of the scheme match: a malformed `None` placement (e.g. a
+    // len>=2 vector on a `fragment_count() == 1` chunk) can only mean truncation /
+    // corruption, and classifying scheme-first would return `Unrepairable` (silent) and
+    // leave reconstruction the lone maintenance loop that never surfaces it. A valid
+    // (empty / full-length) vector resolves through the shared strict companion
+    // (`ChunkRef::checked_fragments`, `metadata.rs`) exactly as the read path and GC
+    // resolve it, so a pre-M3 record resolves identically everywhere.
+    let placement: Vec<DServerId> = match chunk_ref.checked_fragments() {
+        Ok(frags) => frags.map(|(_, dserver)| dserver).collect(),
+        Err(_) => return Ok(Assessment::Malformed),
+    };
+
     let (k, m) = match chunk_ref.scheme {
         // A single-fragment chunk has no redundancy to reconstruct from; recovering it
         // is a replica-copy concern, not erasure reconstruction (out of scope here).
         EcScheme::None => return Ok(Assessment::Unrepairable),
         EcScheme::ReedSolomon { k, m } => (k as usize, m as usize),
     };
-    // Expand placement via the shared helper (`ChunkRef::fragments`, `metadata.rs`,
-    // ADR-0040 decision 2) — the single authoritative identity-fallback resolution
-    // that the read path and GC also use, so a pre-M3 / short-placement record
-    // resolves identically everywhere.
-    let placement: Vec<DServerId> = chunk_ref.fragments().map(|(_, dserver)| dserver).collect();
 
     let mut survivors = Vec::new();
     let mut survivor_domains = Vec::new();
@@ -501,6 +520,21 @@ fn emit_repaired(chunk: ChunkId, rebuilt: usize, now_millis: u64) {
         chunk = %chunk,
         rebuilt,
         "reconstruction is rebuilding the missing shard(s) and repointing the placement record",
+    );
+}
+
+/// Emit a **NEEDS-HUMAN** signal on the durability-plane seam (ADR-0011 / ADR-0012,
+/// ADR-0040 decision 4): reconstruction found a committed chunk whose `placement` vector
+/// is non-empty but of the wrong length — truncation / corruption it must NOT rebuild
+/// over. The chunk is skipped and its obligation left queued; a human resolves the corrupt
+/// placement.
+fn emit_needs_human(chunk: ChunkId) {
+    tracing::warn!(monotonic_counter.reconstruction_malformed_placement = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.reconstruction.audit",
+        action = "needs-human",
+        chunk = %chunk,
+        "reconstruction skipped a chunk with a malformed committed placement (wrong length); NEEDS-HUMAN, obligation left queued",
     );
 }
 

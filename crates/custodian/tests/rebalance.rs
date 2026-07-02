@@ -1220,3 +1220,112 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         "the lost-CAS conflict is emitted on the durability seam; got:\n{exposed}"
     );
 }
+
+// ---- malformed committed placement — rebalance skips + NEEDS-HUMAN (issue #348) ----
+
+/// **Issue #348 — rebalance skips a chunk with a malformed committed placement.**
+///
+/// ADR-0040 decisions 3–4: a committed `placement` that is non-empty but of the wrong
+/// length (`len != fragment_count()`) is malformed (truncation / corruption). The liberal
+/// `fragments()` expansion would identity-fill the missing tail, so a draining server that
+/// the fabricated tail happens to name would trigger an evacuation that **repoints the
+/// committed record over an invented placement**. The strict companion `checked_fragments()`
+/// rejects the vector first: rebalance **skips** the chunk (leaving the fragment in place)
+/// and flags it NEEDS-HUMAN, so the corrupt record is never rewritten.
+///
+/// Setup: a real RS(2,1) object (placement `[0,1,2]`, fragments on 0,1,2) is truncated to
+/// a malformed `placement: [0]`; server 0 (the index-0 fragment's home) is marked draining.
+///
+/// Pre-fix: `plan_evacuations` expands via `fragments()` → fabricated `[0,1,2]`; index 0
+/// names draining server 0 → the chunk is evacuated and the placement is repointed to a
+/// full-length vector (the committed record is rewritten over a fabricated placement).
+/// Post-fix: the vector classifies malformed → the chunk is skipped, the committed
+/// `placement` stays `[0]`, the fragment stays put (no orphan), and the drain stays
+/// unsatisfied.
+///
+/// Flippable: revert `rebalance.rs:plan_evacuations` to expand via `chunk.fragments()` and
+/// this goes red (the placement is repointed to length 3 and the fragment is moved).
+#[tokio::test]
+async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+    let topo = four_domains();
+
+    // A real, fully-placed RS(2,1) object: placement [0,1,2], fragments on servers 0,1,2.
+    write_rs_2_1(&meta, &fleet, &topo).await;
+
+    // Corrupt the committed record into a MALFORMED placement (len 1 != fragment_count 3).
+    let mut record = read_inode(&meta).await;
+    record.chunk_map[0].placement = vec![0];
+    meta.commit(WriteBatch::new().put(metadata::inode_key(1), metadata::encode(&record)))
+        .await
+        .unwrap();
+
+    // The operator marks server 0 draining — the index-0 fragment's home.
+    set_lifecycle(&meta, 0, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+
+    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+    let ctx = RebalanceContext {
+        meta: &meta,
+        fleet: &dyn_fleet,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "malformed placement: rebalance must move nothing and repoint nothing"
+    );
+
+    // The committed placement is UNCHANGED — never rewritten over a fabricated vector.
+    let after = read_inode(&meta).await;
+    assert_eq!(
+        after.chunk_map[0].placement,
+        vec![0],
+        "malformed placement is left exactly as committed (never repointed) (#348)"
+    );
+    assert_eq!(
+        after.version, record.version,
+        "no version-conditional commit landed for a malformed-placement chunk"
+    );
+
+    // The fragment is left on the draining server (not evacuated) and nothing is orphaned.
+    assert!(
+        d0.get_fragment(frag(0)).await.unwrap().is_some(),
+        "the index-0 fragment stays on the draining server — no fabricated evacuation (#348)"
+    );
+    assert!(
+        meta.scan(b"orphan:").await.unwrap().is_empty(),
+        "no fragment is displaced/orphaned for a malformed-placement chunk"
+    );
+
+    // The drain cannot be reported satisfied while a malformed placement is unresolved —
+    // AND the stall is ATTRIBUTED in the answer itself (issue #348 rework): the status
+    // names the blocking malformed chunk id, so `Pending` is never unexplained. The block
+    // is cluster-wide fail-safe (not scoped to servers the corrupt vector names); here no
+    // *valid* reference names server 0, so the ONLY reason it stays blocked is the
+    // malformed chunk — surfaced as `PendingMalformed { chunks: [CHUNK] }`.
+    assert_eq!(
+        reconciliation_status(&meta, 0).await.unwrap(),
+        ReconciliationStatus::PendingMalformed {
+            chunks: vec![CHUNK]
+        },
+        "a drain stays blocked while a malformed committed placement is unresolved, and \
+         the answer attributes the stall to the specific corrupt chunk id (#348)"
+    );
+}

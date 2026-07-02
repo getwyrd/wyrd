@@ -610,6 +610,89 @@ async fn short_placement_vector_rs_6_3_fallback_protects_fallback_index() {
     );
 }
 
+// ---- criterion 5: malformed committed placement — GC fails safe (issue #348) ----
+//
+// ADR-0040 decisions 3–4 ("liberal read, strict maintenance"): a committed `placement`
+// that is non-empty but of the WRONG length (`len != fragment_count()`) can only be
+// truncation / corruption — no writer emits one. The maintenance loops MUST classify the
+// committed placement BEFORE expanding it and MUST NEVER fabricate an identity entry for a
+// malformed vector. GC fails safe: the chunk is treated as FULLY REFERENCED, so none of
+// its fragments is ever reclaimed, and a malformed-placement signal is emitted.
+
+/// **Issue #348 — GC fail-safe on a malformed committed placement.**
+///
+/// A committed `ReedSolomon { k: 4, m: 2 }` chunk has `fragment_count() == 6` but a
+/// length-2 `placement` vector — malformed. The liberal `fragments()` expansion would
+/// identity-fill the missing tail (index 5 → D-server 5), so GC's reference set would
+/// protect `(D-server 5, index 5)` but NOT the chunk's real fragment sitting elsewhere —
+/// a stale orphan for that real fragment would then be reclaimed: silent loss of a
+/// fragment belonging to an already-corrupt chunk.
+///
+/// Pre-fix: `referenced_fragments` expands via `fragments()`, fabricating identity for the
+/// tail; the physical fragment `(D-server 0, index 5)` is absent from the reference set →
+/// the stale orphan wins → `delete_fragment` → the outcome is `Changed` and the byte is
+/// gone.
+/// Post-fix: `checked_fragments()` classifies the vector as malformed; the chunk is
+/// recorded as fully referenced, so `(D-server 0, index 5)` is protected → the outcome is
+/// `Satisfied` and the byte survives.
+///
+/// Flippable: revert `gc.rs:referenced_fragments` to expand via `chunk.fragments()` (the
+/// liberal helper) and this goes red.
+#[tokio::test]
+async fn malformed_placement_gc_treats_chunk_as_fully_referenced() {
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+
+    // A committed chunk: RS{4,2} (fragment_count == 6) with a length-2 placement — a
+    // malformed (truncated/corrupt) committed record.
+    let chunk: ChunkId = 0xF6_20;
+    d0.put(frag(chunk, 5)).await;
+    let record = InodeRecord {
+        size: 5,
+        chunk_map: vec![ChunkRef {
+            id: chunk,
+            scheme: EcScheme::ReedSolomon { k: 4, m: 2 },
+            len: 5,
+            // Non-empty, len 2 != fragment_count() 6 → malformed.
+            placement: vec![0, 1],
+        }],
+        state: InodeState::Committed,
+        version: 1,
+    };
+    metadata::create(&meta, ROOT, "malformed-rs-4-2-obj", 20, &record)
+        .await
+        .unwrap();
+
+    // A stale orphan for the chunk's real fragment on d0 at index 5, grace expired. The
+    // liberal expansion fabricates index 5 → D-server 5, so `(0, index 5)` is NOT in the
+    // fabricated reference set; only the strict fail-safe (fully referenced) protects it.
+    mark_orphaned(&meta, 0, frag(chunk, 5), 0).await.unwrap();
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 0,
+    };
+
+    // now = 1_000_000: far past the orphan grace.
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "malformed placement: GC must reclaim nothing — the chunk is fully referenced"
+    );
+    assert!(
+        d0.get_fragment(frag(chunk, 5)).await.unwrap().is_some(),
+        "a fragment of a malformed-placement chunk is NEVER reclaimed (fail safe, #348)"
+    );
+}
+
 // ---- criterion 3: grace window honoured (the flippable timing invariant) ----
 
 #[tokio::test]

@@ -29,7 +29,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use wyrd_core::metadata::{self, InodeRecord, InodeState, PendingEntry};
+use wyrd_core::metadata::{self, InodeRecord, InodeState, MalformedPlacement, PendingEntry};
 use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::reconciliation::Reconciled;
@@ -110,6 +110,14 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
     // placement record points at. A fragment in this set is NEVER reclaimed
     // (`0005:294-295`, Q3 `0005:394-397`) — its violation is silent corruption.
     let referenced = referenced_fragments(ctx.meta).await?;
+    // Malformed committed placement (ADR-0040 decision 4, "strict maintenance"): a
+    // non-empty, wrong-length vector can only be truncation/corruption. GC FAILS SAFE —
+    // the chunk is treated as fully referenced below (none of its fragments is ever
+    // reclaimed) — and surfaces each one as an operator signal on the durability seam,
+    // instead of silently identity-filling the missing tail into the reference set.
+    for (&chunk, m) in &referenced.malformed {
+        emit_malformed(chunk, m.expected, m.actual);
+    }
     // Input (1): chunks whose pending lease has expired — their fan-out garbage is
     // collectable (the lease TTL already encodes the crashed-write grace).
     let expired_pending = expired_pending_chunks(ctx.meta, now_millis).await?;
@@ -122,9 +130,16 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
 
     for &(dserver, store) in ctx.fleet {
         for frag in store.list_fragments().await? {
-            // SAFETY GATE — never reclaim a referenced fragment.
-            if referenced.contains(&(dserver, frag)) {
-                emit_skip(dserver, frag, "referenced");
+            // SAFETY GATE — never reclaim a referenced fragment. A fragment of a
+            // malformed-placement chunk is protected the same way (fail safe): its true
+            // placement cannot be trusted, so every fragment bearing its id is off-limits.
+            if referenced.protects(dserver, frag) {
+                let reason = if referenced.malformed.contains_key(&frag.chunk) {
+                    "malformed-placement"
+                } else {
+                    "referenced"
+                };
+                emit_skip(dserver, frag, reason);
                 continue;
             }
 
@@ -173,39 +188,71 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
     })
 }
 
-/// Every `(dserver, fragment)` a **committed** chunk map references through its
-/// placement record (`core::metadata::ChunkRef.placement`). A pending (uncommitted)
-/// inode's provisional map is excluded — only a committed reference protects bytes.
-pub(crate) async fn referenced_fragments(
-    meta: &dyn MetadataStore,
-) -> Result<HashSet<(DServerId, FragmentId)>> {
-    let mut set = HashSet::new();
+/// The **committed reference set** GC and scrub gate on: every fragment a *valid*
+/// committed chunk map places, keyed by its placed D server, **plus** the chunk ids
+/// whose committed placement is **malformed** (ADR-0040 decision 4). A pending
+/// (uncommitted) inode's provisional map is excluded — only a committed reference
+/// protects bytes.
+///
+/// A malformed committed placement (non-empty, `len != fragment_count()`) is deliberately
+/// **not** expanded into `placed`: its identity-filled tail would be fabricated, so the
+/// chunk is recorded in `malformed` and treated as **fully referenced** instead — every
+/// fragment bearing its id is protected (fail safe), because its true placement cannot be
+/// trusted (truncation / corruption).
+pub(crate) struct ReferenceSet {
+    /// `(dserver, fragment)` a valid committed chunk map references.
+    pub placed: HashSet<(DServerId, FragmentId)>,
+    /// Chunk ids whose committed placement is malformed, each with its classification.
+    pub malformed: HashMap<ChunkId, MalformedPlacement>,
+}
+
+impl ReferenceSet {
+    /// Whether `frag` on `dserver` is protected from reclamation — either a valid placed
+    /// reference, or *any* fragment of a malformed (fully-referenced) chunk.
+    pub fn protects(&self, dserver: DServerId, frag: FragmentId) -> bool {
+        self.placed.contains(&(dserver, frag)) || self.malformed.contains_key(&frag.chunk)
+    }
+}
+
+/// Build the [`ReferenceSet`] over every **committed** chunk map, classifying each
+/// chunk's committed placement **before** expanding it (ADR-0040 decision 4).
+pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<ReferenceSet> {
+    let mut placed = HashSet::new();
+    let mut malformed = HashMap::new();
     for (_key, value) in meta.scan(b"inode:").await? {
         let record: InodeRecord = metadata::decode(&value)?;
         if record.state != InodeState::Committed {
             continue;
         }
         for chunk in &record.chunk_map {
-            // Expand placement via the shared helper (`ChunkRef::fragments`,
-            // `metadata.rs`, ADR-0040 decision 2): the single authoritative
-            // identity-fallback resolution that the read path and reconstruction
-            // also use. A pre-M3 / mixed-era `ChunkRef` with an empty or short
-            // `placement` vector (decoded via `#[serde(default)]`, `metadata.rs:93`)
-            // resolves fragment `i` to D-server `i`, so the GC reference set matches
-            // the read path's resolved placement closure exactly — closing the gap
-            // that caused silent data loss on committed pre-M3 objects (issue #287).
-            for (index, dserver) in chunk.fragments() {
-                set.insert((
-                    dserver,
-                    FragmentId {
-                        chunk: chunk.id,
-                        index,
-                    },
-                ));
+            // Classify the committed placement BEFORE expanding it via the shared strict
+            // companion (`ChunkRef::checked_fragments`, `metadata.rs`, ADR-0040 decision
+            // 4). A valid (empty / full-length) vector resolves through the same
+            // authoritative identity-fallback the read path and reconstruction use — a
+            // pre-M3 / mixed-era chunk with an empty `placement` (decoded via
+            // `#[serde(default)]`, `metadata.rs:93`) resolves fragment `i` to D-server
+            // `i`, closing the pre-M3 silent-loss gap (issue #287). A MALFORMED vector is
+            // NOT identity-filled into `placed`; the chunk is recorded as fully referenced
+            // instead, so GC never reclaims any of its fragments.
+            match chunk.checked_fragments() {
+                Ok(frags) => {
+                    for (index, dserver) in frags {
+                        placed.insert((
+                            dserver,
+                            FragmentId {
+                                chunk: chunk.id,
+                                index,
+                            },
+                        ));
+                    }
+                }
+                Err(m) => {
+                    malformed.insert(chunk.id, m);
+                }
             }
         }
     }
-    Ok(set)
+    Ok(ReferenceSet { placed, malformed })
 }
 
 /// The chunk ids whose pending-ledger lease has expired as of `now_millis`.
@@ -255,6 +302,23 @@ fn emit_reclaim(dserver: DServerId, frag: FragmentId, reason: &str) {
         chunk = %frag.chunk,
         index = frag.index,
         "gc reclaimed collectable fragment bytes after the grace window",
+    );
+}
+
+/// Emit a **malformed committed placement** signal on the durability-plane seam
+/// (ADR-0011 / ADR-0012, ADR-0040 decision 4): a committed chunk whose `placement` vector
+/// is non-empty but of the wrong length — truncation / corruption. GC fails safe (the
+/// chunk is treated as fully referenced, never reclaimed); this is the operator signal
+/// that a corrupt placement was masked no longer.
+fn emit_malformed(chunk: ChunkId, expected: u16, actual: usize) {
+    tracing::warn!(monotonic_counter.gc_malformed_placement = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "malformed-placement",
+        chunk = %chunk,
+        expected,
+        actual,
+        "gc found a committed placement of the wrong length (truncation/corruption); chunk treated as fully referenced, NEVER reclaimed — operator signal",
     );
 }
 

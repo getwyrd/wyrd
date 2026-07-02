@@ -142,6 +142,59 @@ impl ChunkRef {
     pub fn fragments(&self) -> impl Iterator<Item = (u16, DServerId)> + '_ {
         (0..self.fragment_count()).map(move |i| (i, self.placed_dserver(i)))
     }
+
+    /// Whether the committed `placement` vector is **well-formed** — the single
+    /// classifier the maintenance loops share (ADR-0040 decision 3, the "liberal read,
+    /// strict maintenance" boundary). A committed `placement` is valid **iff** it is
+    /// **empty** (pre-M3 / mixed-era → identity fallback) **or** its length equals
+    /// [`Self::fragment_count`] (an explicit full-length record). Any other non-empty
+    /// length is **malformed**: no writer emits it (the write path always commits a
+    /// full-length vector; `#[serde(default)]` only ever yields empty), so in practice
+    /// it can only mean truncation or corruption.
+    ///
+    /// This is the strict counterpart to the deliberately liberal [`Self::fragments`]
+    /// expansion (#348): the read path stays liberal via `fragments()`, while a
+    /// maintenance loop consults this gate (or [`Self::checked_fragments`]) *before*
+    /// expanding, so a malformed vector is never silently identity-filled.
+    pub fn placement_is_valid(&self) -> bool {
+        self.placement.is_empty() || self.placement.len() == self.fragment_count() as usize
+    }
+
+    /// The **strict** companion to [`Self::fragments`]: the same full-index-space
+    /// expansion, but only **after** classifying the committed `placement` (ADR-0040
+    /// decision 4). A valid vector (empty or full-length) expands exactly as
+    /// `fragments()` does; a **malformed** one (non-empty, `len != fragment_count()`) is
+    /// rejected with [`MalformedPlacement`] *before* any expansion, so no identity entry
+    /// is ever fabricated for its missing tail.
+    ///
+    /// Every maintenance loop resolves committed placement through this gate — GC/scrub
+    /// treat a malformed chunk as fully referenced and audit it; reconstruction/rebalance
+    /// skip it and flag NEEDS-HUMAN — while the read path keeps using the infallible
+    /// `fragments()` (availability first).
+    pub fn checked_fragments(
+        &self,
+    ) -> std::result::Result<impl Iterator<Item = (u16, DServerId)> + '_, MalformedPlacement> {
+        if self.placement_is_valid() {
+            Ok(self.fragments())
+        } else {
+            Err(MalformedPlacement {
+                expected: self.fragment_count(),
+                actual: self.placement.len(),
+            })
+        }
+    }
+}
+
+/// A committed `placement` vector classified as **malformed** by
+/// [`ChunkRef::checked_fragments`] (ADR-0040 decision 3): non-empty but of a length
+/// other than the chunk's [`ChunkRef::fragment_count`]. It carries the mismatch so a
+/// maintenance loop can surface it as an operator signal (audit event / NEEDS-HUMAN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedPlacement {
+    /// The fragment count the chunk's [`EcScheme`] requires (`fragment_count()`).
+    pub expected: u16,
+    /// The actual length of the committed `placement` vector.
+    pub actual: usize,
 }
 
 /// An inode: attributes, the ordered chunk map, state, and version.
@@ -284,4 +337,68 @@ pub async fn sweep_pending(
         batch = batch.delete(pending_key(chunk));
     }
     store.commit(batch).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rs_chunk(placement: Vec<DServerId>) -> ChunkRef {
+        // ReedSolomon { k: 4, m: 2 } → fragment_count() == 6.
+        ChunkRef {
+            id: 0xC0,
+            scheme: EcScheme::ReedSolomon { k: 4, m: 2 },
+            len: 5,
+            placement,
+        }
+    }
+
+    #[test]
+    fn empty_placement_is_valid_pre_m3_identity() {
+        // A pre-M3 / mixed-era record decodes with an empty vector (`#[serde(default)]`):
+        // valid, resolved by the identity fallback (ADR-0040 decision 3).
+        let chunk = rs_chunk(vec![]);
+        assert!(chunk.placement_is_valid());
+        assert!(chunk.checked_fragments().is_ok());
+    }
+
+    #[test]
+    fn full_length_placement_is_valid() {
+        // len == fragment_count() (6): an explicit full-length record is valid.
+        let chunk = rs_chunk(vec![10, 11, 12, 13, 14, 15]);
+        assert!(chunk.placement_is_valid());
+        let resolved: Vec<_> = chunk.checked_fragments().unwrap().collect();
+        assert_eq!(
+            resolved,
+            vec![(0, 10), (1, 11), (2, 12), (3, 13), (4, 14), (5, 15)]
+        );
+    }
+
+    #[test]
+    fn non_empty_wrong_length_placement_is_malformed() {
+        // fragment_count() == 6 but a length-2 vector: malformed (truncation/corruption),
+        // rejected BEFORE expansion — never identity-filled (ADR-0040 decisions 3–4).
+        let chunk = rs_chunk(vec![10, 11]);
+        assert!(!chunk.placement_is_valid());
+        assert_eq!(
+            chunk.checked_fragments().err(),
+            Some(MalformedPlacement {
+                expected: 6,
+                actual: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn read_path_fragments_stays_liberal_for_malformed_placement() {
+        // The read path is UNCHANGED (ADR-0040 decision 4, availability first): the
+        // liberal `fragments()` still resolves the same malformed-placement chunk via the
+        // per-index identity fallback — indices 0..2 from the vector, 2..6 identity-filled.
+        let chunk = rs_chunk(vec![10, 11]);
+        let resolved: Vec<_> = chunk.fragments().collect();
+        assert_eq!(
+            resolved,
+            vec![(0, 10), (1, 11), (2, 2), (3, 3), (4, 4), (5, 5)]
+        );
+    }
 }
