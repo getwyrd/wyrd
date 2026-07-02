@@ -181,6 +181,29 @@ async fn read_chunk(
         }
         EcScheme::ReedSolomon { k, m } => {
             let (k, m) = (k as usize, m as usize);
+            // Validate the stored scheme itself before it drives any fan-out or
+            // shard indexing. A committed inode's chunk scheme is untrusted
+            // metadata (corruption/tampering, or a future decode of a record this
+            // build predates) — the CLI already rejects `rs(0,m)` at parse time
+            // (`crates/server/src/cli.rs:110`), but nothing re-checked it here, so
+            // `k == 0` reached `erasure::reconstruct` and panicked indexing an
+            // empty shard list (issue #285). Reject any scheme the erasure coder
+            // itself would refuse — not just `k == 0` — using the SAME predicate
+            // `erasure::reconstruct` applies (`erasure::supported`), so a stored
+            // `rs(k, 0)` (no recovery shards were ever a legal *encode* target for
+            // that scheme) is rejected before it can drive read fan-out, even
+            // though a full `k`-of-`k` `available` set would otherwise never reach
+            // the coder at all and could silently return bytes for a scheme no
+            // commit could ever have produced. Reject here, before firing a single
+            // fragment fetch.
+            if !erasure::supported(k, m) {
+                return Err(ReadError::InvalidEcScheme {
+                    chunk_id: chunk.id,
+                    k: k as u8,
+                    m: m as u8,
+                }
+                .into());
+            }
             let n = (k + m) as u16;
             // Any-`k`-arrive-first (§6.2): fire `get_fragment_at` at all `n` indices
             // at once — each resolved to its placed D server — and reconstruct from
@@ -327,6 +350,21 @@ pub enum ReadError {
         /// How many (`k`) the scheme needs.
         need: usize,
     },
+    /// A committed chunk's stored `EcScheme::ReedSolomon` is itself invalid —
+    /// `k == 0`, `m == 0`, or any other `k`/`m` pair the erasure coder does not
+    /// support (`erasure::supported`, the same predicate `erasure::reconstruct`
+    /// applies) — untrusted metadata (corruption/tampering) rather than anything
+    /// the CLI's own `rs(k,m)` parse would have accepted
+    /// (`crates/server/src/cli.rs:110`). Rejected before it can drive fragment
+    /// fan-out or shard indexing.
+    InvalidEcScheme {
+        /// The chunk whose stored scheme is invalid.
+        chunk_id: ChunkId,
+        /// The rejected data-fragment count.
+        k: u8,
+        /// The parity-fragment count that accompanied it.
+        m: u8,
+    },
 }
 
 impl std::fmt::Display for ReadError {
@@ -355,6 +393,13 @@ impl std::fmt::Display for ReadError {
                      cannot reconstruct"
                 )
             }
+            ReadError::InvalidEcScheme { chunk_id, k, m } => {
+                write!(
+                    f,
+                    "chunk {chunk_id:032x}: invalid stored EC scheme rs({k},{m}); \
+                     unsupported by the erasure coder"
+                )
+            }
         }
     }
 }
@@ -363,11 +408,10 @@ impl std::error::Error for ReadError {}
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use async_trait::async_trait;
     use bytes::Bytes;
     use wyrd_traits::{ChunkStore, FragmentId, Health};
-
-    use super::*;
 
     /// A chunk store that must never be called: the regression below feeds a
     /// `chunk_map` too short to ever reach a fragment fetch, so any call in here
@@ -398,6 +442,33 @@ mod tests {
     }
 
     impl PlacementChunkStore for UnreachableStore {}
+
+    /// A chunk store holding nothing — every fetch resolves `Ok(None)`. Sufficient
+    /// to prove an invalid stored scheme is rejected before any fragment is even
+    /// requested (issue #285's read-path boundary), since a real fetch is never
+    /// needed to trigger the (pre-fix) panic / silent pass-through.
+    struct EmptyChunks;
+
+    #[async_trait]
+    impl ChunkStore for EmptyChunks {
+        async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
+            Ok(())
+        }
+        async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+        async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+            Ok(Vec::new())
+        }
+        async fn delete_fragment(&self, _id: FragmentId) -> Result<()> {
+            Ok(())
+        }
+        async fn health(&self) -> Result<Health> {
+            Ok(Health::Healthy)
+        }
+    }
+
+    impl PlacementChunkStore for EmptyChunks {}
 
     /// `read.rs:79` (pre-fix) — `Vec::with_capacity(inode.size as usize)` trusted
     /// the inode's recorded `size` (an arbitrary `u64` from stored JSON) as an
@@ -434,5 +505,81 @@ mod tests {
                 bytes.len()
             ),
         }
+    }
+
+    /// Issue #285: a committed inode's stored `EcScheme::ReedSolomon { k: 0, .. }`
+    /// (corrupted/tampered metadata — untrusted input reaching the read path) must
+    /// fail as a typed `ReadError`, never panic. Pre-fix this reached
+    /// `erasure::reconstruct(0, m, ..)` and panicked indexing an empty shard list
+    /// (matches the brief's read-path repro).
+    #[test]
+    fn read_chunk_rejects_a_stored_k_zero_scheme() {
+        let chunk = ChunkRef {
+            id: 42,
+            scheme: EcScheme::ReedSolomon { k: 0, m: 1 },
+            len: 0,
+            placement: Vec::new(),
+        };
+        let mut corrupt = Vec::new();
+        let err = pollster::block_on(read_chunk(&EmptyChunks, &chunk, &mut corrupt))
+            .expect_err("a k == 0 stored scheme must be a typed error, not a panic");
+        let read_err = err
+            .downcast_ref::<ReadError>()
+            .expect("expected a wyrd_core::read::ReadError");
+        assert!(
+            matches!(
+                read_err,
+                ReadError::InvalidEcScheme {
+                    chunk_id: 42,
+                    k: 0,
+                    m: 1
+                }
+            ),
+            "expected InvalidEcScheme {{ chunk_id: 42, k: 0, m: 1 }}, got {read_err:?}"
+        );
+        assert!(
+            corrupt.is_empty(),
+            "an invalid stored scheme is a validation rejection, not a corruption finding"
+        );
+    }
+
+    /// Issue #285 (iteration 2 — carry-forward / codex finding): the read-boundary
+    /// guard must reject ALL unsupported stored schemes, not just `k == 0`. A
+    /// stored `rs(k, 0)` is exactly as untrusted — `reed_solomon_simd::encode`
+    /// itself refuses to produce a `rs(k, 0)` chunk, so no committed chunk could
+    /// ever legitimately carry that scheme. Pre- this iteration's fix (the
+    /// `k == 0`-only guard), a tampered `rs(k, 0)` inode whose `k` fragments all
+    /// happened to be present would fan out, fetch, and return bytes without ever
+    /// being rejected — this proves it is now rejected before a single fragment
+    /// fetch fires.
+    #[test]
+    fn read_chunk_rejects_a_stored_m_zero_scheme() {
+        let chunk = ChunkRef {
+            id: 7,
+            scheme: EcScheme::ReedSolomon { k: 3, m: 0 },
+            len: 0,
+            placement: Vec::new(),
+        };
+        let mut corrupt = Vec::new();
+        let err = pollster::block_on(read_chunk(&EmptyChunks, &chunk, &mut corrupt))
+            .expect_err("an m == 0 stored scheme must be a typed error, not silently accepted");
+        let read_err = err
+            .downcast_ref::<ReadError>()
+            .expect("expected a wyrd_core::read::ReadError");
+        assert!(
+            matches!(
+                read_err,
+                ReadError::InvalidEcScheme {
+                    chunk_id: 7,
+                    k: 3,
+                    m: 0
+                }
+            ),
+            "expected InvalidEcScheme {{ chunk_id: 7, k: 3, m: 0 }}, got {read_err:?}"
+        );
+        assert!(
+            corrupt.is_empty(),
+            "an invalid stored scheme is a validation rejection, not a corruption finding"
+        );
     }
 }

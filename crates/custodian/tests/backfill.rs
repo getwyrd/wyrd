@@ -32,11 +32,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tracing::instrument::WithSubscriber;
-use tracing_subscriber::prelude::*;
 use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
 use wyrd_custodian::backfill::{reconcile, BackfillContext};
-use wyrd_custodian::{DurabilityTelemetry, ExporterConfig, Reconciled};
+use wyrd_custodian::Reconciled;
 use wyrd_traits::{ChunkId, CommitOutcome, DServerId, MetadataStore, Result, WriteBatch};
 
 // ---- in-memory metadata store (backend-agnostic; the pass is proven over the seam) ----
@@ -170,16 +168,6 @@ fn rs_chunk(id: ChunkId, k: u8, m: u8, placement: Vec<DServerId>) -> ChunkRef {
     }
 }
 
-/// An `EcScheme::None` (single-fragment) chunk with the given placement.
-fn ec_none_chunk(id: ChunkId, placement: Vec<DServerId>) -> ChunkRef {
-    ChunkRef {
-        id,
-        scheme: EcScheme::None,
-        len: 5,
-        placement,
-    }
-}
-
 /// Commit `chunk_map` onto a freshly-seeded inode `id` via the real four-phase-write
 /// commit point (`metadata::commit_chunk_map`, `core/src/metadata.rs:299-317`) — the
 /// brief's repro instruction: an inode whose `ChunkRef` carries the given (possibly
@@ -214,24 +202,6 @@ async fn read_inode(meta: &impl MetadataStore, id: InodeId) -> InodeRecord {
         .unwrap()
         .expect("inode present");
     metadata::decode(&bytes).unwrap()
-}
-
-/// The value of a `gauge` metric read back off the Prometheus surface (the last
-/// non-comment sample matching `name`, ignoring any label set).
-fn gauge_value(exposed: &str, name: &str) -> Option<f64> {
-    exposed
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let key = fields.next()?;
-            let value = fields.next()?;
-            let metric = key.split('{').next().unwrap_or(key);
-            (metric == name)
-                .then(|| value.parse::<f64>().ok())
-                .flatten()
-        })
-        .next_back()
 }
 
 // ---- (a) identity backfill, version-conditional -------------------------------------
@@ -380,63 +350,7 @@ async fn already_explicit_full_length_placement_is_left_untouched() {
     assert_eq!(after.chunk_map[0].placement, vec![5, 6, 7]);
 }
 
-// ---- (c) drain-to-zero observability on the durability-plane seam -------------------
-
-/// **BINDING (c):** the empty-placement-remaining population is emitted on the
-/// durability-plane seam and reads ZERO once backfill has covered the store.
-#[tokio::test]
-async fn emitted_remaining_count_reaches_zero_once_backfill_covers_the_store() {
-    let meta = MemMeta::default();
-    // Three committed records, each with one empty-placement chunk — the pre-M3
-    // population this pass must drain.
-    seed_committed(&meta, 1, vec![rs_chunk(0xD0, 2, 1, vec![])], 5).await;
-    seed_committed(&meta, 2, vec![rs_chunk(0xD1, 4, 2, vec![])], 5).await;
-    seed_committed(&meta, 3, vec![ec_none_chunk(0xD2, vec![])], 5).await;
-
-    // Baseline: the raw store really carries three empty-placement committed chunks
-    // before any pass — the population the drain-to-zero signal must depart from.
-    let mut remaining_before = 0usize;
-    for id in 1..=3u64 {
-        let record = read_inode(&meta, id).await;
-        remaining_before += record
-            .chunk_map
-            .iter()
-            .filter(|c| c.placement.is_empty())
-            .count();
-    }
-    assert_eq!(
-        remaining_before, 3,
-        "baseline: three committed chunks still carry an empty placement pre-pass"
-    );
-
-    let ctx = BackfillContext { meta: &meta };
-    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
-    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
-    let outcome = reconcile(&ctx).with_subscriber(subscriber).await.unwrap();
-    assert_eq!(
-        outcome,
-        Reconciled::Changed,
-        "all three empty-placement chunks backfill uncontested in one pass"
-    );
-
-    telemetry.flush().unwrap();
-    let exposed = telemetry
-        .gather_prometheus()
-        .expect("Prometheus surface configured");
-    assert_eq!(
-        gauge_value(&exposed, "backfill_placement_remaining"),
-        Some(0.0),
-        "the empty-placement population reads ZERO once backfill has covered the \
-         store; got:\n{exposed}"
-    );
-
-    // And the store itself confirms it: every committed chunk now carries an
-    // explicit full-length identity placement.
-    for id in 1..=3u64 {
-        let record = read_inode(&meta, id).await;
-        assert!(
-            record.chunk_map.iter().all(|c| !c.placement.is_empty()),
-            "inode {id}: every committed chunk carries an explicit placement post-pass"
-        );
-    }
-}
+// The drain-to-zero observability leg (BINDING (c)) lives in its own test binary,
+// `backfill_telemetry.rs` — a `tracing` metric callsite caches interest in
+// process-global state, so a no-op-subscriber sibling test in the same process can
+// race and disable it (issue #214). Mirrors the `gc.rs` / `gc_telemetry.rs` split.
