@@ -225,21 +225,27 @@ async fn assess(
     };
     let chunk_ref = prior.chunk_map[chunk_index].clone();
 
+    // Classify the committed placement BEFORE any scheme-specific handling
+    // (ADR-0040 decision 4, "strict maintenance"). A MALFORMED vector (non-empty,
+    // wrong length) is rejected here — for EVERY scheme, single-fragment `EcScheme::None`
+    // included — so the loop flags it NEEDS-HUMAN rather than letting it pass silently.
+    // This must run ahead of the scheme match: a malformed `None` placement (e.g. a
+    // len>=2 vector on a `fragment_count() == 1` chunk) can only mean truncation /
+    // corruption, and classifying scheme-first would return `Unrepairable` (silent) and
+    // leave reconstruction the lone maintenance loop that never surfaces it. A valid
+    // (empty / full-length) vector resolves through the shared strict companion
+    // (`ChunkRef::checked_fragments`, `metadata.rs`) exactly as the read path and GC
+    // resolve it, so a pre-M3 record resolves identically everywhere.
+    let placement: Vec<DServerId> = match chunk_ref.checked_fragments() {
+        Ok(frags) => frags.map(|(_, dserver)| dserver).collect(),
+        Err(_) => return Ok(Assessment::Malformed),
+    };
+
     let (k, m) = match chunk_ref.scheme {
         // A single-fragment chunk has no redundancy to reconstruct from; recovering it
         // is a replica-copy concern, not erasure reconstruction (out of scope here).
         EcScheme::None => return Ok(Assessment::Unrepairable),
         EcScheme::ReedSolomon { k, m } => (k as usize, m as usize),
-    };
-    // Classify the committed placement BEFORE expanding it via the shared strict
-    // companion (`ChunkRef::checked_fragments`, `metadata.rs`, ADR-0040 decision 4). A
-    // valid (empty / full-length) vector resolves through the same authoritative
-    // identity-fallback the read path and GC use, so a pre-M3 record resolves identically
-    // everywhere. A MALFORMED vector (non-empty, wrong length) is rejected here — the loop
-    // skips the chunk and flags it NEEDS-HUMAN rather than rebuild over a fabricated tail.
-    let placement: Vec<DServerId> = match chunk_ref.checked_fragments() {
-        Ok(frags) => frags.map(|(_, dserver)| dserver).collect(),
-        Err(_) => return Ok(Assessment::Malformed),
     };
 
     let mut survivors = Vec::new();

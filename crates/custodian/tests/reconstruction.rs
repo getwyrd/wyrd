@@ -709,6 +709,114 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
     );
 }
 
+/// #348 / ADR-0040 decisions 3–4, the **single-fragment (`EcScheme::None`) malformed
+/// case**: a malformed placement on a `None` chunk must be classified BEFORE the scheme
+/// match, so reconstruction flags it NEEDS-HUMAN like every other maintenance loop instead
+/// of letting it fall through the `None → Unrepairable` early return **silently**. A `None`
+/// chunk has `fragment_count() == 1`, so a committed `placement: vec![7, 8]` (length 2) is
+/// non-empty and of the wrong length — malformed, which for `None` can only mean truncation
+/// / corruption.
+///
+/// Pre-reorder: `assess` matched the scheme first, hit `EcScheme::None => Unrepairable`, and
+/// `reconcile` handled `Unrepairable => {}` — no NEEDS-HUMAN signal, so reconstruction was
+/// the lone loop that swallowed a malformed `None` placement. Post-reorder: `assess` runs
+/// `checked_fragments()` before the scheme match, classifies the vector `Malformed`, and
+/// `reconcile` emits the NEEDS-HUMAN durability signal (`reconstruction_malformed_placement`).
+///
+/// The signal is the only externally observable difference between the two paths (both leave
+/// the record untouched and the obligation queued), so this asserts the metric directly.
+/// Flippable: move the `checked_fragments()` gate back below the `scheme` match and this goes
+/// red (the malformed `None` placement returns `Unrepairable`, no metric is exported).
+#[tokio::test]
+async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+
+    // Start from a valid committed chunk, then corrupt it into a `None`-scheme record with a
+    // malformed (len 2, `fragment_count() == 1`) placement — the truncation/corruption case.
+    write_rs_2_1(&meta, &fleet).await;
+    let prior = read_inode(&meta).await;
+    let mut chunk_map = prior.chunk_map.clone();
+    chunk_map[0].scheme = EcScheme::None;
+    chunk_map[0].placement = vec![7, 8];
+    assert_eq!(
+        metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    let corrupted = read_inode(&meta).await;
+
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    let mut topo = Topology::default();
+    topo.register(0, "A").register(1, "B").register(2, "C");
+    let healthy_fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (1, &d1), (2, &d2)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy_fleet,
+        topology: &topo,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "malformed `None` placement: reconstruction repoints nothing"
+    );
+
+    // The committed record is untouched — never rebuilt over a fabricated placement.
+    let record = read_inode(&meta).await;
+    assert_eq!(
+        record.version, corrupted.version,
+        "no version-conditional commit landed for a malformed `None`-placement chunk"
+    );
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![7, 8],
+        "the malformed placement is left exactly as committed, never repointed (#348)"
+    );
+
+    // The obligation stays queued — surfaced for a human, not silently drained.
+    assert!(
+        repair::queued_repairs(&meta)
+            .await
+            .unwrap()
+            .contains(&CHUNK),
+        "the repair obligation for a malformed `None`-placement chunk stays queued (#348)"
+    );
+
+    // The NEEDS-HUMAN signal is emitted — the flippable distinguisher from the old silent
+    // `Unrepairable` path that the scheme-first ordering produced for `None` chunks.
+    telemetry.flush().unwrap();
+    let exposed = telemetry
+        .gather_prometheus()
+        .expect("Prometheus surface configured");
+    assert!(
+        exposed.contains("reconstruction_malformed_placement"),
+        "a malformed `None` placement is flagged NEEDS-HUMAN on the durability seam, not \
+         swallowed as `Unrepairable`; got:\n{exposed}"
+    );
+}
+
 /// A ten-domain topology A..J (servers 0..9). An rs(6,3) chunk (n=9) placed across the
 /// first nine domains A..I (servers 0..8); domain J (server 9) is the free spare.
 fn ten_domains() -> Topology {
