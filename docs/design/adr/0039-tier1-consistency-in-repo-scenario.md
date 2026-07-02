@@ -1,7 +1,7 @@
 ---
 created: 28.06.2026 00:55
 type: adr
-status: Proposed
+status: Accepted
 tags:
   - adr
   - testing
@@ -55,10 +55,18 @@ We will realize proposal 0005 §13.2's Tier-1 "Jepsen consistency over the repai
 path" as an **in-repo Rust scenario** that drives the **production** custodian
 reconcile path (`custodian::reconcile_step` → `reconstruction::reconcile`)
 against a real containerized D-server cluster, injects **both** a crash (a killed
-node) and a **real network partition** (a node alive-but-unreachable, injected
-mid-repair and then healed), and asserts the ADR-0015 contract over the repair
-path directly: read-after-commit, no torn/stale reads, commit-point-atomic repair
-that converges **exactly once** across the heal. Its routing decision is a
+node, `docker kill`) and an **isolation fault** (a node made unreachable
+mid-repair via `docker pause`, then healed with `unpause`), and asserts the
+ADR-0015 contract over the repair path directly: read-after-commit, no torn/stale
+reads, commit-point-atomic repair that converges **exactly once** across the heal.
+The isolation fault is a **process-freeze nemesis** (`docker pause` suspends the
+container via the freezer cgroup), not a network-level packet-drop partition;
+because Wyrd's D-servers are *dumb* storage that initiate no commits of their own,
+a frozen node and a network-partitioned one are observably equivalent to the
+custodian repair path under test — the node is unreachable, repair proceeds around
+it, and the contract must hold across the heal. A stronger network-level partition
+that keeps the isolated node *live* is an additive upgrade to this leg (#399), not
+a change to the contract asserted. Its routing decision is a
 test-observable value, and it runs in a dedicated **privileged** CI job kept out
 of `cargo xtask ci` (ADR-0016). This is the leg shipped by #250, mirroring the
 two merged sibling legs (#195 disk-fault, #196 kill-reconstruct).
@@ -77,17 +85,19 @@ file — ADR-0038). Proposal 0005 otherwise stands.
 ## Consequences
 
 - The consistency contract over the repair path is now **actually exercised**
-  under crash and partition faults, replacing inert dispatch scaffolding. The
+  under crash and node-isolation faults, replacing inert dispatch scaffolding. The
   scenario binds the production reconcile API at compile time, so an API
   regression fails the merge gate even though the live run is off-Check.
 - The verification is **in-repo and maintainable** — Rust the team already owns,
   no Clojure/JVM toolchain, no client-invented observable. The trade-off: it is
   **not** the externally-recognizable public Jepsen artifact. That credibility
   claim is explicitly deferred (#329), not made by this leg.
-- The repair **trigger** is a sanctioned test stand-in (`repair::enqueue_repair`)
-  because no production path yet enqueues repair for a simply-missing fragment
-  (#330); the reconstruction path itself is genuinely traversed. When #330 lands,
-  the stand-in can be dropped.
+- The repair **trigger** was, when this record was authored, a sanctioned test
+  stand-in (`repair::enqueue_repair`) because no production path yet enqueued
+  repair for a simply-missing fragment; the reconstruction path itself is
+  genuinely traversed. #330 has **since landed** (scrub now enqueues repair for a
+  placed-but-missing fragment), so the stand-in can be dropped in favour of the
+  production trigger.
 - Reversing or extending this is cheap and additive: the literal-Jepsen artifact
   is a separate follow-on that supersedes nothing here; if it later becomes the
   preferred Tier-1 substrate, a further ADR records that.

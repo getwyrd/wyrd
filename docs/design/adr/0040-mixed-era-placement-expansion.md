@@ -1,7 +1,7 @@
 ---
 created: 29.06.2026 14:00
 type: adr
-status: Proposed
+status: Accepted
 tags:
   - adr
   - custodian
@@ -115,26 +115,30 @@ leaving the compatibility fallback in place with no defined removal path.
 
 ## Consequences
 
-This record changes no code: the rebalance data-loss path (#346) remains **live on
-`main`** — `plan_evacuations` still iterates `chunk.placement` raw and the
-`fragments()` helper does not yet exist. Once #347 lands the helper and #346 routes
-rebalance through it, there is a single definition of placement expansion and the
-data-loss class is closed — and, because the helper always walks the full index
-space, it then structurally cannot recur (a reviewer can grep for
-`.placement.iter()` to catch any future regression). Malformed placement vectors
-become an observable signal (audit event / NEEDS-HUMAN) once the strict-maintenance
-stance is implemented (#348), rather than a silent identity resolution that masks
-corruption.
+When this record was authored (29.06.2026) it changed no code: the rebalance
+data-loss path (#346) was still **live on `main`** — `plan_evacuations` iterated
+`chunk.placement` raw and no `fragments()` helper existed. **Those fixes have since
+landed, and this record is ratified with the M3 close alongside them:**
+`ChunkRef::fragments()` is now the single expansion helper
+(`crates/core/src/metadata.rs`, #347/#361) and rebalance's `plan_evacuations`
+resolves through it (`crates/custodian/src/rebalance.rs`, #346), so there is one
+definition of placement expansion and the data-loss class is closed — and, because
+the helper always walks the full index space, it structurally cannot recur (a
+reviewer can grep for `.placement.iter()` to catch any future regression).
+Malformed placement vectors become an observable signal (audit event /
+NEEDS-HUMAN) once the strict-maintenance stance is fully implemented (#348, still
+open), rather than a silent identity resolution that masks corruption.
 
-The cost is real follow-on work, tracked as the #292 follow-ups, all on M3 —
-Custodians: add the `fragments()` helper and migrate every consumer onto it
-(#347); fix rebalance to expand *and* materialize a full-length placement (#346,
-the priority); add the strict malformed-length handling with audit / NEEDS-HUMAN
-(#348); implement the mixed-era test matrix across read / scrub / reconstruction /
-rebalance, larger RS{6,3}, and a DST scenario seeded with an empty-placement chunk
-(#349); and the backfill migration plus the format-version-gated removal of the
-fallback (#350). The strict-maintenance stance adds fail-safe and NEEDS-HUMAN
-paths that did not exist before.
+The cost is real follow-on work, the #292 follow-ups on M3 — Custodians.
+**Landed with the M3 close:** the `fragments()` helper and the migration of every
+consumer onto it (#347/#361); the rebalance expand-*and*-materialize fix (#346);
+and the mixed-era test matrix across read / scrub / reconstruction / rebalance,
+larger RS{6,3}, and a DST scenario seeded with an empty-placement chunk (#349).
+**Still open**, re-homed to Foundations as hardening beyond the M3 definition of
+done: the strict malformed-length handling with audit / NEEDS-HUMAN (#348), and
+the backfill migration plus the format-version-gated removal of the fallback
+(#350, with its defensive-error step #363). The strict-maintenance stance adds
+fail-safe and NEEDS-HUMAN paths that did not exist before.
 
 This record refines proposal 0005's placement-record section without editing the
 frozen proposal (per ADR-0037 / ADR-0001 / ADR-0038: the relationship is recorded
