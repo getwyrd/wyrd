@@ -76,7 +76,14 @@ async fn read_object_collecting(
     inode: &InodeRecord,
     corrupt: &mut Vec<ChunkId>,
 ) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(inode.size as usize);
+    // `inode.size` is untrusted metadata (arbitrary `u64` from stored JSON, ADR-0002)
+    // and must not size an allocation before that many bytes are actually backed by
+    // the chunk map. Grow the buffer only from bytes a chunk read has *already*
+    // produced and checksum-verified (`read_chunk`) — never from the recorded size
+    // up front. A `size: u64::MAX` inode with an empty/short chunk map then falls
+    // through to the mismatch check below instead of attempting a
+    // size-proportional (or overflowing) allocation.
+    let mut bytes = Vec::new();
     for chunk in &inode.chunk_map {
         bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt).await?);
     }
@@ -404,7 +411,37 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use bytes::Bytes;
-    use wyrd_traits::{ChunkStore, Health};
+    use wyrd_traits::{ChunkStore, FragmentId, Health};
+
+    /// A chunk store that must never be called: the regression below feeds a
+    /// `chunk_map` too short to ever reach a fragment fetch, so any call in here
+    /// would itself indicate the fix regressed.
+    struct UnreachableStore;
+
+    #[async_trait]
+    impl ChunkStore for UnreachableStore {
+        async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
+            unreachable!("no write path is exercised by this read-only regression")
+        }
+
+        async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {
+            unreachable!("an empty chunk_map must fail on the size check, never fetch a fragment")
+        }
+
+        async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+            unreachable!("not exercised by this regression")
+        }
+
+        async fn delete_fragment(&self, _id: FragmentId) -> Result<()> {
+            unreachable!("not exercised by this regression")
+        }
+
+        async fn health(&self) -> Result<Health> {
+            Ok(Health::Healthy)
+        }
+    }
+
+    impl PlacementChunkStore for UnreachableStore {}
 
     /// A chunk store holding nothing — every fetch resolves `Ok(None)`. Sufficient
     /// to prove an invalid stored scheme is rejected before any fragment is even
@@ -432,6 +469,43 @@ mod tests {
     }
 
     impl PlacementChunkStore for EmptyChunks {}
+
+    /// `read.rs:79` (pre-fix) — `Vec::with_capacity(inode.size as usize)` trusted
+    /// the inode's recorded `size` (an arbitrary `u64` from stored JSON) as an
+    /// allocation hint *before* validating it against the chunk map. A committed
+    /// inode with `size: u64::MAX` and an empty chunk map turned an ordinary read
+    /// into a capacity-overflow panic (`with_capacity` panics past
+    /// `isize::MAX` bytes) instead of the typed `SizeMismatch` the size check at
+    /// `read.rs:83` was meant to produce. This must return a clean `Err` and must
+    /// not panic — proving the allocation no longer scales with the untrusted
+    /// `size` field.
+    #[tokio::test]
+    async fn oversized_inode_size_with_empty_chunk_map_errors_cleanly_not_panics() {
+        let inode = InodeRecord {
+            size: u64::MAX,
+            chunk_map: Vec::new(),
+            state: InodeState::Committed,
+            version: 1,
+        };
+
+        let result = read_object_from(&UnreachableStore, &inode).await;
+
+        match result {
+            Err(err) => {
+                // The variant is illustrative; what's binding is a typed error,
+                // not a panic and not a size-proportional allocation attempt.
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("18446744073709551615") || msg.contains("0"),
+                    "expected a size-mismatch-flavoured error, got: {msg}"
+                );
+            }
+            Ok(bytes) => panic!(
+                "an empty chunk_map cannot back a u64::MAX-sized object; got Ok({} bytes)",
+                bytes.len()
+            ),
+        }
+    }
 
     /// Issue #285: a committed inode's stored `EcScheme::ReedSolomon { k: 0, .. }`
     /// (corrupted/tampered metadata — untrusted input reaching the read path) must
