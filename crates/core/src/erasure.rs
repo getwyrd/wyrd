@@ -27,6 +27,24 @@ pub enum ErasureError {
     },
     /// The supplied shards are not all the same length.
     InconsistentShardSize,
+    /// The `k`/`m` pair itself is not a scheme the coder supports — `k == 0`
+    /// (no data shard to recover), `m == 0` (the coder cannot encode/decode
+    /// without at least one recovery shard), or any other `k`/`m` combination
+    /// [`supported`] rejects. Without this check `k == 0` lets
+    /// `available.len() < k` fall through (`0 < 0` is false) and reconstruction
+    /// reaches an out-of-bounds shard index; `m == 0` with a full `k`-of-`k`
+    /// `available` set would otherwise never even reach the coder, silently
+    /// returning bytes for a scheme that was never a legal *encode* target in
+    /// the first place. This guards the erasure API boundary against a `k`/`m`
+    /// pair that originated from stored (untrusted) metadata rather than the
+    /// CLI's own validated parse (`crates/server/src/cli.rs`, which already
+    /// rejects `rs(0,m)`).
+    InvalidScheme {
+        /// The rejected data-shard count.
+        k: usize,
+        /// The parity-shard count that accompanied it.
+        m: usize,
+    },
     /// The underlying coder rejected the operation.
     Coder(reed_solomon_simd::Error),
 }
@@ -38,6 +56,12 @@ impl fmt::Display for ErasureError {
                 write!(f, "too few shards to reconstruct: have {have}, need {need}")
             }
             ErasureError::InconsistentShardSize => write!(f, "shards are not all the same length"),
+            ErasureError::InvalidScheme { k, m } => {
+                write!(
+                    f,
+                    "invalid EC scheme rs({k},{m}): unsupported by the erasure coder"
+                )
+            }
             ErasureError::Coder(e) => write!(f, "reed-solomon coder error: {e}"),
         }
     }
@@ -82,6 +106,21 @@ pub fn encode(k: usize, m: usize, data: &[u8]) -> Result<Vec<Vec<u8>>, ErasureEr
     Ok(shards)
 }
 
+/// Whether `k` data shards + `m` parity shards is an EC scheme the underlying
+/// reed-solomon-simd coder can actually encode/decode — the same predicate
+/// [`encode`] and [`reconstruct`] rely on internally (`reed_solomon_simd`'s own
+/// `ReedSolomonEncoder`/`ReedSolomonDecoder::supports`, which agree: both
+/// delegate to the same `DefaultRate::supports`). `k == 0` and `m == 0` are
+/// always unsupported; other combinations are rejected per the coder's rate
+/// limits. Exposed so callers upstream of the coder — notably the read path
+/// (`crate::read::read_chunk`), which is handed a `k`/`m` pair straight from
+/// stored (untrusted) inode metadata — can reject an invalid scheme before it
+/// drives any fragment fan-out or shard indexing, not just after failing to
+/// reconstruct.
+pub fn supported(k: usize, m: usize) -> bool {
+    reed_solomon_simd::ReedSolomonDecoder::supports(k, m)
+}
+
 /// Reconstruct the original `logical_len` bytes from `available` — any `>= k` of
 /// the `n` shards, each as `(global_index, bytes)` (indices `0..k` data, `k..n`
 /// parity). Missing data shards are recovered, the `k` data shards concatenated,
@@ -92,6 +131,19 @@ pub fn reconstruct(
     logical_len: usize,
     available: &[(usize, Vec<u8>)],
 ) -> Result<Vec<u8>, ErasureError> {
+    // Validate the scheme itself before it drives any shard indexing. `k == 0`
+    // would otherwise sail past `available.len() < k` below (`0 < 0` is false)
+    // and reach `available[0]` further down with a possibly-empty `available`,
+    // panicking on a corrupted/untrusted `EcScheme::ReedSolomon { k: 0, .. }`
+    // read back from stored metadata instead of returning a typed error. An
+    // unsupported `m` (e.g. `m == 0`) is rejected the same way, even though a
+    // full `k`-of-`k` `available` set would otherwise never reach the coder at
+    // all and could silently return bytes for a scheme that was never a legal
+    // *encode* target — untrusted metadata must fail the same regardless of
+    // how much of `available` happens to be present.
+    if !supported(k, m) {
+        return Err(ErasureError::InvalidScheme { k, m });
+    }
     if available.len() < k {
         return Err(ErasureError::TooFewShards {
             have: available.len(),
@@ -236,6 +288,63 @@ mod tests {
             err,
             ErasureError::TooFewShards { have: 5, need: 6 }
         ));
+    }
+
+    /// Issue #285: a corrupted/untrusted `EcScheme::ReedSolomon { k: 0, .. }` read
+    /// back from stored metadata must fail as a typed error, never panic. Pre-fix,
+    /// `available.len() < k` is `0 < 0` (false) so the guard never trips, and
+    /// `reconstruct` falls through to `available[0]` on an empty slice, panicking
+    /// (matches the brief's repro: `erasure::reconstruct(0, 1, 0, &[])`).
+    #[test]
+    fn reconstruct_with_k_zero_is_a_typed_error_not_a_panic() {
+        let err = reconstruct(0, 1, 0, &[]).unwrap_err();
+        assert!(
+            matches!(err, ErasureError::InvalidScheme { k: 0, m: 1 }),
+            "expected InvalidScheme{{k: 0, m: 1}}, got {err:?}"
+        );
+    }
+
+    /// Same boundary, but with shards actually present (a `k == 0` scheme paired
+    /// with survivors that would otherwise be handed straight to `available[0]`).
+    #[test]
+    fn reconstruct_with_k_zero_and_nonempty_available_is_still_a_typed_error() {
+        let shards = encode(2, 1, &data_of(10)).unwrap();
+        let err = reconstruct(0, 1, 10, &pick(&shards, &[0, 1])).unwrap_err();
+        assert!(
+            matches!(err, ErasureError::InvalidScheme { k: 0, m: 1 }),
+            "expected InvalidScheme{{k: 0, m: 1}}, got {err:?}"
+        );
+    }
+
+    /// Issue #285 (iteration 2 — carry-forward): `m == 0` is unsupported by the
+    /// coder just as much as `k == 0` is (`reed_solomon_simd::encode` itself
+    /// refuses to produce a `rs(k, 0)` chunk — there are no recovery shards to
+    /// generate), so a stored `rs(k, 0)` scheme is definitionally tampered/
+    /// corrupt metadata: no committed chunk could ever have been written under
+    /// it. It must be rejected the same as `k == 0`, even though — unlike
+    /// `k == 0` — a full `k`-of-`k` `available` set would never reach the coder
+    /// at all and so would otherwise silently return bytes.
+    #[test]
+    fn reconstruct_with_m_zero_is_a_typed_error_even_with_all_k_shards_present() {
+        // Hand-build `k` same-size shards directly (never went through `encode`,
+        // since `encode(k, 0, ..)` itself is not a legal call) to isolate that the
+        // rejection happens on the scheme, not on shard availability.
+        let shards: Vec<(usize, Vec<u8>)> = (0..3).map(|i| (i, vec![0u8; 64])).collect();
+        let err = reconstruct(3, 0, 100, &shards).unwrap_err();
+        assert!(
+            matches!(err, ErasureError::InvalidScheme { k: 3, m: 0 }),
+            "expected InvalidScheme{{k: 3, m: 0}}, got {err:?}"
+        );
+    }
+
+    /// The broadened predicate ([`supported`]) must not reject any `k`/`m` pair
+    /// this module's own round-trip tests already rely on — otherwise the fix
+    /// for #285 would regress ordinary reconstruction.
+    #[test]
+    fn supported_accepts_the_schemes_this_module_round_trips() {
+        for (k, m) in [(2usize, 1usize), (3, 2), (6, 3), (4, 4), (4, 3)] {
+            assert!(supported(k, m), "rs({k},{m}) should be supported");
+        }
     }
 
     /// `:48` `source -> None` and `:49` delete the `Coder` arm — a `Coder` error
