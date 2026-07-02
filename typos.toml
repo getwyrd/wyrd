@@ -12,6 +12,10 @@ ot = "ot"
 # "HEL" is Hetzner's Helsinki location code (alongside FSN/NBG), used in the
 # deployment blueprint — not a typo for "HELP"/"HEAL".
 hel = "hel"
+# "RTO" is Recovery Time Objective (paired with RPO, Recovery Point Objective),
+# a standard disaster-recovery term used in the M7 failover/DR plan — not a typo
+# for "TO".
+rto = "rto"
 
 [files]
 # Don't spell-check generated or non-prose files. (typos already honors
