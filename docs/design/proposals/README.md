@@ -20,7 +20,7 @@ This index is the authoritative record of each proposal's current status and any
 | [0004](accepted/0004-milestone-2-networked-d-servers.md) | Milestone 2 — networked D servers | accepted¹ |
 | [0005](accepted/0005-milestone-3-custodians.md) | Milestone 3 — custodians | accepted¹ |
 | [0006](draft/0006-object-lifecycle-and-retention.md) | Object lifecycle and retention (versioning, trash, WORM) | draft (adoption: [#370](https://github.com/getwyrd/wyrd/issues/370)) |
-| [0007](accepted/0007-milestone-4-production-metadata-backend.md) | Milestone 4 — production metadata backend (TiKV) | accepted (tracker [#201](https://github.com/getwyrd/wyrd/issues/201)) |
+| [0007](accepted/0007-milestone-4-production-metadata-backend.md) | Milestone 4 — production metadata backend (TiKV) | accepted (tracker [#201](https://github.com/getwyrd/wyrd/issues/201)); **revision proposed in draft 0015** |
 | [0008](draft/0008-management-and-administration.md) | Management and administration (Milestone 8) | draft (slicing: [#369](https://github.com/getwyrd/wyrd/issues/369)) |
 | [0009](draft/0009-d-server-performance.md) | D-server performance | draft — standing program, attaches from M4 |
 | [0010](draft/0010-observability-floor-for-first-deployment.md) | The observability floor | draft — gates the M4 campaign ([#366](https://github.com/getwyrd/wyrd/issues/366)) |
@@ -28,5 +28,6 @@ This index is the authoritative record of each proposal's current status and any
 | [0012](accepted/0012-milestone-6-encryption-at-rest-kms.md) | Milestone 6 — encryption at rest (KeyService / KMS) | accepted (tracker [#375](https://github.com/getwyrd/wyrd/issues/375)) |
 | [0013](accepted/0013-implementation-arc-rescoped.md) | The implementation arc (rescoped) | accepted (supersedes 0002; tracker [#298](https://github.com/getwyrd/wyrd/issues/298)) |
 | [0014](draft/0014-milestone-7-failover-and-dr-single-dc.md) | Milestone 7 — failover and disaster recovery, single-DC | draft (authoring: [#368](https://github.com/getwyrd/wyrd/issues/368)) |
+| [0015](draft/0015-milestone-4-production-metadata-backend-revised.md) | Milestone 4 — production metadata backend (TiKV), revised | draft (supersedes 0007 on acceptance; tracker [#201](https://github.com/getwyrd/wyrd/issues/201)) |
 
 ¹ Frozen pre-rescope: uses proposal 0002's original milestone numbering (old M5/M6/M7 = cross-zone replication / global control plane / cross-zone DR → **M9/M10/M11** today), and where these files call M4 the release point or the first deployable/usable product, that is superseded too — the **Step-2 ★ release point moved to M8** (M4 is a soft stopping point that completes the data plane). Reconcile through [0013's old→new mapping table](accepted/0013-implementation-arc-rescoped.md).
