@@ -171,7 +171,7 @@ verbatim:
 
 - **The `MetadataStore` trait** — exactly three async methods, `get` / `scan` /
   `commit(WriteBatch)`, no associated types, object-safe, `Send + Sync`
-  (`crates/traits/src/lib.rs:173-187`). Its doc-comment already names the M4 swap
+  (`trait MetadataStore` in `crates/traits/src/lib.rs`). Its doc-comment already names the M4 swap
   as the motivating example: filesystem semantics live "*through* this primitive
   by the metadata model in `core`, never baked into the trait … makes a backend
   swap (redb → TiKV) a composition change" (`lib.rs:163-172`). M4 must keep this
@@ -200,14 +200,21 @@ verbatim:
   the custodians' atomic location updates hold on TiKV.
 - **Coordination (L5) and fencing** — `elect_leader` / `Leadership` /
   `FencingToken` are a **separate trait and seam** (`traits/src/lib.rs:258-337`).
-  M4 swaps the **metadata** backend only; Coordination is untouched.
+  The **metadata swap touches neither the Coordination trait nor its consumers** —
+  that is what "M4 swaps the metadata backend only" means. It is **not** a claim that
+  a distributed Coordination *backend* already exists: today only the process-local
+  `coordination-mem` is implemented, so cross-process L5 discovery does not yet work.
+  The multi-node deployment goal below therefore carries an **explicit prerequisite**
+  (an etcd-backed `Coordination` + runnable gateway/custodian roles) — see the
+  *Deployment prerequisite* note under Deployment. M4's *metadata* work is
+  independent of it.
 - **The EC engine, the gRPC `ChunkStore`, and the any-*k* read path** ([0003][p3],
   [0004][p4]) — none cross the `MetadataStore` seam; all unchanged.
 
 ### The `MetadataStore` contract M4 must honor verbatim
 
 The contract is small and the whole milestone rests on reproducing it exactly. In
-full (`crates/traits/src/lib.rs:173-219`):
+full (`trait MetadataStore` + `WriteBatch`/`Precondition`/`CommitOutcome` in `crates/traits/src/lib.rs`):
 
 ```rust
 async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;          // point read; None = absent
@@ -334,7 +341,7 @@ things, all addressable inside M4:
    async I/O, so the local paths must move onto the `tokio` runtime the cluster
    paths already use. Confined to `cli.rs`; the trait is **already async**, so no
    signatures ripple into `core`/`custodian`.
-3. **`alloc_inode`'s unbounded retry-on-`Conflict` loop** (`cli.rs:352-368`). Over
+3. **`alloc_inode`'s unbounded retry-on-`Conflict` loop** (`fn alloc_inode` in `cli.rs`). Over
    embedded redb a conflicting commit is a sub-microsecond local transaction, so a
    busy spin is harmless; over distributed TiKV **every iteration is a network
    round-trip**, so the backoff-free spin is a latency/load footgun. M4 gives it
@@ -398,6 +405,28 @@ live in **`deploy/`, outside the Cargo workspace** — the structural guard that
 **docker-compose** stack (TiKV + PD + the L5 etcd ensemble) for CI/eval; the Helm
 chart/operator are later.
 
+> **Deployment prerequisite (scope boundary — do not conflate with the metadata swap).**
+> The metadata-backend work above is self-contained and is the milestone's real risk.
+> The *multi-node, discovery-driven* stand-up it enables, however, has a hard
+> dependency that is **not** part of M4's metadata scope and does not exist yet:
+> **cross-process L5 discovery**. Today only the process-local `coordination-mem` is
+> implemented, so separate processes are not mutually discoverable — etcd discovery was
+> "deferred to a composition swap" back in M2 ([0004][p4]) — and there is **no runnable
+> gateway or custodian process role** (the custodian binary was explicitly deferred in
+> M3, [0005][p5]; the gateway exists only as `put`/`get` client mode). "Peers discovered
+> through L5" therefore requires, as a **named prerequisite**:
+> (1) an **etcd-backed `Coordination`** implementation (a `coordination-etcd` crate
+> behind the existing trait), and (2) **runnable gateway + custodian process roles**.
+> This is a genuine parallel to the metadata story: by the ADR-0006 "pin the trait with
+> two implementations" discipline, **etcd is Coordination's required second implementation**
+> exactly as TiKV is `MetadataStore`'s — so it is its own body of work, not carry-over.
+> M4's deployment slice (slice 5) and its deployment graduation criterion are **gated on
+> this prerequisite**; until it lands, M4's Tier-1/Tier-2 clusters are wired with **static
+> endpoints** (the current `--endpoints` path and the docker-compose fault harnesses),
+> which is sufficient to prove the metadata risk. Where this prerequisite is sequenced
+> (a dedicated slice, or a preceding coordination milestone) is an open scope decision;
+> it must be resolved before slice 5 can claim "peers discovered through L5."
+
 ### Backends, profiles, and what "production" means
 
 M4 **adds** a backend; it does **not** replace redb. [ADR-0014][a14] is explicit:
@@ -453,7 +482,11 @@ single-zone topology under `tc netem` / `iptables` partitions / cgroup throttlin
 **Tier-2 — first real-world hardware (single owned machine).** Real `fsync`, real
 NVMe latency, real OS behavior against real TiKV — honest single-node performance
 and I/O semantics the in-memory fakes abstract away (a single failure domain, so
-it proves real-silicon behavior, **not** failure-domain independence).
+it proves real-silicon behavior, **not** failure-domain independence). This is a
+**distinct environment** from slice 5's multi-node "Small multi-node Production"
+stand-up: Tier-2 is one machine for I/O honesty, slice 5 is the multi-node
+topology/discovery shape — the same code, two different runs, not one box standing
+in for the production topology.
 
 **Tier-3 — multi-region — does *not* begin until M9** ([§13.4][s10]): single-zone
 M4 has no use for real WAN or cross-zone failure independence.
@@ -517,7 +550,15 @@ Building on the workspace as it stands after M3 (`chunk-format`, `chunkstore-fs`
   + its PD cluster + a 3-node etcd ensemble (L5 Coordination) for CI/eval;
   Helm/operator deferred ([ADR-0010][a10]).
 - **deps** — `tikv-client` (+ its `tokio`/`grpcio` transitive tree); confirm under
-  the `cargo-deny` allowlist ([ADR-0003][a3]).
+  the `cargo-deny` allowlist ([ADR-0003][a3]). **Maturity risk to weigh explicitly:**
+  the Rust `tikv-client` (client-rust) is **pre-1.0 (0.4.x)** and has historically
+  trailed the Go client in maintenance cadence and feature parity (async-commit/1PC,
+  `get_for_update` ergonomics). M4 rests the *production-durability* tier on it, so the
+  first slice SHOULD include an **evaluation gate** — confirm the locking-read and
+  write-conflict paths against the pinned version (see Open questions), and record a
+  fallback stance (tolerate a vendored patch, or re-evaluate the backend) before the
+  dependency is committed. Its `grpcio` transitive tree is also the widest new surface
+  for the `cargo-deny` review.
 
 ## Alternatives considered
 
@@ -583,8 +624,11 @@ Building on the workspace as it stands after M3 (`chunk-format`, `chunkstore-fs`
   under fault injection; **Tier-2** single-node real-I/O run green. Any bug-finding
   discovery is promoted to a **seeded DST regression** where the trait exposes it.
 - **The production deployment stands up from `deploy/`** (TiKV-small + its PD
-  cluster + a 3-node etcd ensemble for L5 + local-disk D servers), peers discovered
-  through L5, with **no crate importing an orchestrator API**.
+  cluster + a 3-node etcd ensemble for L5 + local-disk D servers), with **no crate
+  importing an orchestrator API**. **"Peers discovered through L5" is gated on the
+  deployment prerequisite** (an etcd-backed `Coordination` + gateway/custodian process
+  roles — see the *Deployment prerequisite* note); until that ships, M4's clusters are
+  wired with static endpoints and this criterion is met at that reduced bar.
 - **redb remains the dev/single-binary backend** with no production-durability
   promise ([ADR-0014][a14]); TiKV carries the production promise.
 - `fmt`/`clippy` clean; `Cargo.lock` updated; `cargo-deny` passes with the
@@ -622,8 +666,13 @@ Each step is one PR, tracked under the **M4** milestone (branch
 5. **Production deployment — TiKV/PD as a stateful, disk-affine, orchestrator-agnostic
    tier** — `deploy/` docker-compose for TiKV-small + its PD cluster + a 3-node etcd
    ensemble (L5 Coordination) + local-disk D servers; discovery through
-   L5/Coordination; no orchestrator coupling in any crate. *DoD:* the single-zone
-   "Small multi-node Production" stack stands up from
+   L5/Coordination; no orchestrator coupling in any crate. **Gated on the deployment
+   prerequisite** (an etcd-backed `Coordination` + runnable gateway/custodian process
+   roles — see the *Deployment prerequisite* note): the `deploy/` artifacts and the
+   TiKV/PD tier land here, but the "peers discovered through L5" DoD cannot be met until
+   that prerequisite ships. Until then this slice delivers the stack **with static
+   endpoints**, and the L5-discovery DoD moves with the prerequisite. *DoD (with the
+   prerequisite):* the single-zone "Small multi-node Production" stack stands up from
    `deploy/`; peers discovered through Coordination; no crate imports a k8s/orchestrator
    API.
 6. **Tier-1 integration + Jepsen consistency; Tier-2 single-node** — end-to-end
@@ -700,9 +749,14 @@ at the M8 release. The M4 duties, narrowly and deliberately:
   but read staleness interacts with read-your-writes ([ADR-0015][a15] clause 3),
   which only becomes a cross-zone behavior later.
 - **Large-directory `scan` buffering.** `scan` returns a materialized `Vec`; a
-  directory with very many dirents buffers fully in memory. Whether M4 accepts this
-  or a later trait evolution adds a paginated/streaming scan is a **measurement**
-  question — a trait change is out of M4's "unchanged trait" scope.
+  directory with very many dirents buffers fully in memory. On redb that's a local
+  read, but on TiKV a single unbounded range scan pulls the whole prefix **over the
+  network** into the gateway's heap — a sharper cliff on the production backend.
+  Whether M4 accepts this or a later trait evolution adds a paginated/streaming scan
+  is a **measurement** question (a trait change is out of M4's "unchanged trait"
+  scope), but M4 SHOULD ship an **interim guard** rather than leave it unbounded — an
+  internal paging cap on the range read and/or a documented max-dirents-per-listing —
+  so a pathological directory cannot OOM the gateway before that decision is made.
 - **The `meta:version` fence as a `v1`-stamping trigger.** M4's sustained
   real-store fault-injection is a candidate trigger for stamping the on-disk format
   `v1`; recorded, not decided.
