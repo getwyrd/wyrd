@@ -14,6 +14,10 @@
 //!   cluster of real, networked gRPC D servers under docker-compose and run the
 //!   end-to-end write/read integration test against them. Not part of `ci` (it
 //!   needs a container runtime); a heavier-runner / nightly job.
+//! - `tikv-conformance` — the M4.1 backend-swap proof (proposal 0007): bring up the
+//!   throwaway single-node TiKV under `deploy/` and drive the shared `MetadataStore`
+//!   conformance suite against it. Not part of `ci` (it needs a container runtime);
+//!   the conformance test itself skips cleanly when no TiKV endpoint is configured.
 //! - `disk-faults` / `jepsen` / `kill-reconstruct` — the deferred (off-Check)
 //!   Tier-1 / Tier-2 custodian fault runners (M3, proposal 0005 `0005:405-411`,
 //!   `0005:437-438`). Privileged / real-environment tiers, never part of `ci`;
@@ -40,6 +44,7 @@ fn main() -> ExitCode {
         Some("dst") => run_dst(),
         Some("statics") => run_statics(),
         Some("integration") => run_integration(),
+        Some("tikv-conformance") => run_tikv_conformance(),
         Some("disk-faults") => faults::run_disk_faults(),
         Some("jepsen") => faults::run_jepsen(),
         Some("kill-reconstruct") => faults::run_kill_reconstruct(),
@@ -67,7 +72,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|disk-faults|jepsen|kill-reconstruct|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|disk-faults|jepsen|kill-reconstruct|bench>"
     );
 }
 
@@ -138,6 +143,134 @@ fn run_integration() -> Result<(), String> {
     )?;
     println!("\nxtask integration: Tier-2 container integration passed");
     Ok(())
+}
+
+/// The compose project name for the throwaway single-node TiKV, so it is isolated
+/// and torn down cleanly.
+const TIKV_PROJECT: &str = "wyrd-tikv-m41";
+/// PD's client endpoint the host reaches (host networking, `deploy/tikv-single-node`).
+const TIKV_PD_ENDPOINT: &str = "127.0.0.1:2379";
+
+/// Run the M4.1 TiKV conformance job (proposal 0007 §"Suggested PR sequence" item
+/// 1): bring up the throwaway single-node TiKV under `deploy/`, drive the **shared**
+/// `MetadataStore` conformance suite against it (`cargo test -p wyrd-metadata-tikv
+/// --features tikv`), then tear it down. **Not** part of `run_ci` — it needs a
+/// container runtime, exactly like `run_integration`; without one it is a hard
+/// failure in CI and a warn-and-skip locally (the conformance test ITSELF also skips
+/// cleanly when `WYRD_TIKV_PD_ENDPOINTS` is unset, so `ci` stays green regardless).
+fn run_tikv_conformance() -> Result<(), String> {
+    let compose = workspace_root().join("deploy/tikv-single-node/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    if !docker_available() {
+        if is_ci() {
+            return Err(
+                "docker is not available but is required for the TiKV conformance job".into(),
+            );
+        }
+        eprintln!(
+            "warning: docker not available; skipping the TiKV conformance job locally. \
+             Install Docker (and the compose plugin) to run it."
+        );
+        return Ok(());
+    }
+
+    tikv_compose(&compose, &["up", "-d"])?;
+    let result = wait_for_port(TIKV_PD_ENDPOINT).and_then(|()| run_tikv_conformance_test());
+    // Always tear the stack down, even on failure — a run never leaks containers.
+    let _ = tikv_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    result?;
+    println!("\nxtask tikv-conformance: TiKV passed the shared MetadataStore conformance suite");
+    Ok(())
+}
+
+/// Run the endpoint-gated conformance test with the `tikv` feature on and PD
+/// exported. TiKV's store bootstrap can lag PD's port opening, so the test — which
+/// dials the cluster — is retried a few times with backoff before giving up.
+fn run_tikv_conformance_test() -> Result<(), String> {
+    print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-metadata-tikv",
+        "--features",
+        "tikv",
+        "--test",
+        "conformance",
+    ]);
+    let mut last = String::new();
+    for attempt in 1..=5 {
+        let status = Command::new("cargo")
+            .args([
+                "test",
+                "-p",
+                "wyrd-metadata-tikv",
+                "--features",
+                "tikv",
+                "--test",
+                "conformance",
+                "--",
+                "--nocapture",
+            ])
+            .current_dir(workspace_root())
+            .env("WYRD_TIKV_PD_ENDPOINTS", TIKV_PD_ENDPOINT)
+            .status()
+            .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        last = format!("TiKV conformance test failed with {status}");
+        eprintln!(
+            "xtask tikv-conformance: attempt {attempt}/5 failed; TiKV may still be bootstrapping"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
+    }
+    Err(last)
+}
+
+/// Poll `host:port` until a TCP connection succeeds (PD is accepting clients), up to
+/// ~30s. A bounded readiness gate so the test does not race the container's start.
+fn wait_for_port(endpoint: &str) -> Result<(), String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let addr = endpoint
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve `{endpoint}`: {e}"))?
+        .next()
+        .ok_or_else(|| format!("`{endpoint}` resolved to no addresses"))?;
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "PD at `{endpoint}` did not accept connections within 30s"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Run a `docker compose -p <TIKV_PROJECT> -f <file> …` command from the workspace
+/// root, echoing it first.
+fn tikv_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", TIKV_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
 }
 
 /// Resolve the Tier-2 D-server count from a raw `WYRD_DSERVER_COUNT` value. An
