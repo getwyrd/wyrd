@@ -56,6 +56,24 @@ fn require_absent_race() {
     run_require_absent_race(endpoints);
 }
 
+/// N concurrent **blind** `commit(put(k, "w{i}"))` — **no precondition** on the
+/// contended key — so a loser can only be rejected by the pessimistic lock that
+/// `put` eagerly acquires, not by a `get_for_update` precondition. Regression for
+/// the mutator-lock gap (Codex P2 on #422): a lost race in the put/delete loop must
+/// be `Ok(Conflict)`, not `Err`. Exactly one `Committed`, the rest `Conflict`, zero
+/// `Err`, final value = the winner's.
+#[test]
+fn put_only_write_race() {
+    let Some(endpoints) = pd_endpoints() else {
+        eprintln!(
+            "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS not set — skipping the TiKV \
+             contention run (clean skip; the gate stays green without a TiKV)."
+        );
+        return;
+    };
+    run_put_only_write_race(endpoints);
+}
+
 /// How many writers race for the one key. >1 so there is always a set of losers to
 /// classify; small enough to stay fast against the single-node `deploy/` TiKV.
 #[cfg(feature = "tikv")]
@@ -113,6 +131,28 @@ fn run_require_absent_race(endpoints: Vec<String>) {
             WriteBatch::new()
                 .require_absent(key.clone())
                 .put(key.clone(), writer_value(i))
+        })
+        .await;
+
+        assert_final_value(&endpoints, &namespace, &key, writer_value(winner)).await;
+    });
+}
+
+#[cfg(feature = "tikv")]
+fn run_put_only_write_race(endpoints: Vec<String>) {
+    use wyrd_traits::WriteBatch;
+
+    let key = b"put-only:key".to_vec();
+
+    tikv_runtime().block_on(async move {
+        // Fresh namespace ⇒ the key is absent, and the batch carries NO precondition
+        // on it — so the ONLY place a loser can be rejected is the pessimistic lock
+        // `put` takes. Before the fix a loser fell through the put loop's `Err` path;
+        // it must now be `Ok(Conflict)`.
+        let namespace = fresh_namespace("put_only_race");
+
+        let winner = drive_race(&endpoints, &namespace, |i| {
+            WriteBatch::new().put(key.clone(), writer_value(i))
         })
         .await;
 
@@ -239,6 +279,15 @@ fn run_write_write_race(endpoints: Vec<String>) {
 
 #[cfg(not(feature = "tikv"))]
 fn run_require_absent_race(endpoints: Vec<String>) {
+    let _ = endpoints;
+    eprintln!(
+        "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS is set but the crate was built without \
+         `--features tikv` — skipping. Run it via `cargo xtask tikv-conformance`."
+    );
+}
+
+#[cfg(not(feature = "tikv"))]
+fn run_put_only_write_race(endpoints: Vec<String>) {
     let _ = endpoints;
     eprintln!(
         "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS is set but the crate was built without \

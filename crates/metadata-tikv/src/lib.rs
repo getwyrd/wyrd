@@ -288,14 +288,20 @@ mod store {
                 }
             }
 
+            // A pessimistic `put`/`delete` does NOT merely buffer: it eagerly acquires
+            // the pessimistic lock (an RPC) before buffering. So a mutated key that no
+            // precondition already locked can lose a write-write race right here — that
+            // is the trait's `Conflict`, not a fault, exactly as at `get_for_update`
+            // and `commit`. Classify it (proposal 0007's conflict-vs-fault partition);
+            // a genuine backend fault still falls through to `Err`.
             for (key, value) in &batch.puts {
                 if let Err(e) = txn.put(self.physical(key), value.to_vec()).await {
-                    return Err(rollback_then(&mut txn, e).await);
+                    return conflict_or_err(&mut txn, e).await;
                 }
             }
             for key in &batch.deletes {
                 if let Err(e) = txn.delete(self.physical(key)).await {
-                    return Err(rollback_then(&mut txn, e).await);
+                    return conflict_or_err(&mut txn, e).await;
                 }
             }
 
