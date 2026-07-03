@@ -110,10 +110,25 @@ pub mod keyspace {
 mod store {
     use async_trait::async_trait;
     use bytes::Bytes;
-    use tikv_client::{BoundRange, TransactionClient};
-    use wyrd_traits::{CommitOutcome, MetadataStore, Result, WriteBatch};
+    use tikv_client::{BoundRange, Transaction, TransactionClient};
+    use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
 
     use crate::keyspace;
+
+    /// Best-effort-roll back a still-active transaction before surfacing `err`.
+    ///
+    /// tikv-client 0.4.0 drops an unfinished `Transaction` with the default
+    /// `CheckLevel::Panic`, so returning a backend error with a bare `?` — while
+    /// the pessimistic txn is still open — would abort the process instead of
+    /// yielding `Err`. Finishing the txn with a best-effort rollback (a secondary
+    /// rollback error is deliberately ignored so it can't mask the original error)
+    /// both preserves the caller's error and leaves no active txn to panic on drop.
+    /// The terminal `commit()` needs no such guard: it finalizes the txn whether it
+    /// succeeds or fails, so its drop is already safe.
+    async fn rollback_then(txn: &mut Transaction, err: tikv_client::Error) -> BoxError {
+        let _ = txn.rollback().await;
+        err.into()
+    }
 
     /// A [`MetadataStore`] backed by a TiKV cluster, reached through its
     /// transactional API (Percolator 2PC coordinated by PD). Metadata keys/values
@@ -159,7 +174,10 @@ mod store {
     impl MetadataStore for TikvMetadataStore {
         async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
             let mut txn = self.client.begin_pessimistic().await?;
-            let value = txn.get(self.physical(key)).await?;
+            let value = match txn.get(self.physical(key)).await {
+                Ok(value) => value,
+                Err(e) => return Err(rollback_then(&mut txn, e).await),
+            };
             txn.rollback().await?;
             Ok(value.map(Bytes::from))
         }
@@ -174,7 +192,10 @@ mod store {
                 None => (start..).into(),
             };
             let mut txn = self.client.begin_pessimistic().await?;
-            let pairs = txn.scan(range, u32::MAX).await?;
+            let pairs = match txn.scan(range, u32::MAX).await {
+                Ok(pairs) => pairs,
+                Err(e) => return Err(rollback_then(&mut txn, e).await),
+            };
             let mut out = Vec::new();
             for pair in pairs {
                 let physical: Vec<u8> = pair.0.into();
@@ -196,7 +217,10 @@ mod store {
             // rule); the rigorous write-conflict CLASSIFICATION under contention is
             // hardened in M4.2 (#253).
             for pc in &batch.preconditions {
-                let current = txn.get_for_update(self.physical(&pc.key)).await?;
+                let current = match txn.get_for_update(self.physical(&pc.key)).await {
+                    Ok(current) => current,
+                    Err(e) => return Err(rollback_then(&mut txn, e).await),
+                };
                 let holds = match &pc.expected {
                     Some(expected) => current.as_deref() == Some(expected.as_ref()),
                     None => current.is_none(),
@@ -208,10 +232,14 @@ mod store {
             }
 
             for (key, value) in &batch.puts {
-                txn.put(self.physical(key), value.to_vec()).await?;
+                if let Err(e) = txn.put(self.physical(key), value.to_vec()).await {
+                    return Err(rollback_then(&mut txn, e).await);
+                }
             }
             for key in &batch.deletes {
-                txn.delete(self.physical(key)).await?;
+                if let Err(e) = txn.delete(self.physical(key)).await {
+                    return Err(rollback_then(&mut txn, e).await);
+                }
             }
 
             txn.commit().await?;
