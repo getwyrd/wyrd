@@ -14,6 +14,15 @@ publish.workspace = true
 # `metadata-tikv` can drive the identical assertions.
 wyrd-traits.workspace = true
 
+[dev-dependencies]
+# `tests/demonstrated_red.rs` (#419) implements deliberately-violating
+# `MetadataStore` stubs in-crate, dev-scope only (never shipped, never a real
+# backend — see the #419 brief's "Violating-store test double" NEEDS-HUMAN
+# note) to prove the three read-consistency properties are load-bearing.
+async-trait.workspace = true
+bytes.workspace = true
+pollster.workspace = true
+
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).
 [lints]
