@@ -56,6 +56,29 @@ fn require_absent_race() {
     run_require_absent_race(endpoints);
 }
 
+/// N concurrent **blind** `commit(put(k, "w{i}"))` — **no precondition** on the key.
+/// A blind write has no precondition to fail, so a lost pessimistic-lock race must
+/// **never** be reported as `Ok(Conflict)` (the many callers that use `?` and ignore
+/// `CommitOutcome` would silently drop the write). Regression for the P2 on #423: every
+/// outcome is `Committed` (a legitimate last-writer overwrite) or `Err` (a *surfaced*
+/// contention loss) — never a silent `Conflict` — and at least one commits.
+///
+/// This assertion is **timing-invariant**: unlike a `require`-guarded race it does NOT
+/// claim exactly-one-winner (a writer whose txn starts after another commits has nothing
+/// to reject and legitimately overwrites), so there is no start-timestamp barrier to
+/// race — it pins only the property the fix guarantees.
+#[test]
+fn blind_write_race_never_reports_conflict() {
+    let Some(endpoints) = pd_endpoints() else {
+        eprintln!(
+            "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS not set — skipping the TiKV \
+             contention run (clean skip; the gate stays green without a TiKV)."
+        );
+        return;
+    };
+    run_blind_write_race(endpoints);
+}
+
 /// How many writers race for the one key. >1 so there is always a set of losers to
 /// classify; small enough to stay fast against the single-node `deploy/` TiKV.
 #[cfg(feature = "tikv")]
@@ -117,6 +140,46 @@ fn run_require_absent_race(endpoints: Vec<String>) {
         .await;
 
         assert_final_value(&endpoints, &namespace, &key, writer_value(winner)).await;
+    });
+}
+
+#[cfg(feature = "tikv")]
+fn run_blind_write_race(endpoints: Vec<String>) {
+    use futures_util::future::join_all;
+    use wyrd_traits::{CommitOutcome, MetadataStore, WriteBatch};
+
+    let key = b"blind:key".to_vec();
+
+    tikv_runtime().block_on(async move {
+        // Fresh namespace ⇒ the key is absent; the batches carry NO precondition, so the
+        // ONLY place a loser meets contention is the pessimistic lock `put` eagerly takes.
+        let namespace = fresh_namespace("blind_write_race");
+
+        let mut stores = Vec::with_capacity(WRITERS);
+        for _ in 0..WRITERS {
+            stores.push(connect(&endpoints, &namespace).await);
+        }
+        let outcomes: Vec<_> = join_all(stores.iter().enumerate().map(|(i, store)| {
+            let batch = WriteBatch::new().put(key.clone(), writer_value(i));
+            async move { store.commit(batch).await }
+        }))
+        .await;
+
+        let mut committed = 0usize;
+        for (i, outcome) in outcomes.into_iter().enumerate() {
+            match outcome {
+                Ok(CommitOutcome::Committed) => committed += 1,
+                // The #423 invariant: a blind write is NEVER silently a `Conflict` — a
+                // `?`-only caller would mistake that for success and drop the write.
+                Ok(CommitOutcome::Conflict) => panic!(
+                    "blind writer {i} was reported Conflict — a precondition-free write \
+                     must not masquerade as Conflict (a `?`-only caller would drop it)"
+                ),
+                // A surfaced contention loss (Err) is fine: the caller *sees* it.
+                Err(_) => {}
+            }
+        }
+        assert!(committed >= 1, "at least one blind writer must commit");
     });
 }
 
@@ -239,6 +302,15 @@ fn run_write_write_race(endpoints: Vec<String>) {
 
 #[cfg(not(feature = "tikv"))]
 fn run_require_absent_race(endpoints: Vec<String>) {
+    let _ = endpoints;
+    eprintln!(
+        "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS is set but the crate was built without \
+         `--features tikv` — skipping. Run it via `cargo xtask tikv-conformance`."
+    );
+}
+
+#[cfg(not(feature = "tikv"))]
+fn run_blind_write_race(endpoints: Vec<String>) {
     let _ = endpoints;
     eprintln!(
         "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS is set but the crate was built without \
