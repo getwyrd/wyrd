@@ -1,0 +1,20 @@
+[package]
+name = "wyrd-metadata-conformance"
+description = "The shared MetadataStore trait-contract suite (ADR-0008): backend-agnostic get/scan/commit assertions, driven by every concrete backend's test target so the trait is pinned by both implementations, not forked (proposal 0007, M4.1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The suite is written against the trait surface ONLY (ADR-0016 dependency rule):
+# it never depends on a concrete backend, so both `metadata-redb` and
+# `metadata-tikv` can drive the identical assertions.
+wyrd-traits.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

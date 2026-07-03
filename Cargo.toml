@@ -12,7 +12,9 @@ members = [
     "crates/traits",
     "crates/testkit",
     "crates/core",
+    "crates/metadata-conformance",
     "crates/metadata-redb",
+    "crates/metadata-tikv",
     "crates/chunkstore-fs",
     "crates/chunkstore-grpc",
     "crates/coordination-mem",
@@ -37,7 +39,9 @@ wyrd-proto = { path = "crates/proto" }
 wyrd-traits = { path = "crates/traits" }
 wyrd-testkit = { path = "crates/testkit" }
 wyrd-core = { path = "crates/core" }
+wyrd-metadata-conformance = { path = "crates/metadata-conformance" }
 wyrd-metadata-redb = { path = "crates/metadata-redb" }
+wyrd-metadata-tikv = { path = "crates/metadata-tikv" }
 wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
 wyrd-chunkstore-grpc = { path = "crates/chunkstore-grpc" }
 wyrd-coordination-mem = { path = "crates/coordination-mem" }
@@ -71,6 +75,15 @@ madsim-tonic = { version = "0.6.0", default-features = false }
 madsim-tonic-build = "0.6.0"
 pollster = "0.4"
 prost = "0.14"
+# The distributed (production) metadata backend's client (ADR-0008, proposal 0007
+# M4.1). Pinned here; consumed ONLY by `wyrd-metadata-tikv` behind its OFF-by-default
+# `tikv` feature, so the default `cargo xtask ci` on a laptop/worktree with no TiKV
+# never compiles or audits this tree and stays green. `tikv-client` is **pre-1.0**
+# (draft 0015 names the maturity / supply-chain risk with an evaluation gate); the
+# `0.4` line is the current release. Introducing it into the shipped graph — the
+# ADR-0003 three-test audit + `deny.toml` allowlist call — is a **NEEDS-HUMAN** at
+# sign-off (INTEGRATION §4; research issue #260 tracks the pin + API-shape confirmation).
+tikv-client = "0.4"
 protox = "0.9"
 rand = "0.10"
 rand_chacha = "0.10"

@@ -1,0 +1,35 @@
+# Throwaway SINGLE-NODE TiKV for M4.1 CI/eval (proposal 0007 §"Crate touch-points",
+# §"Suggested PR sequence" item 1). This lives under `deploy/`, OUTSIDE the Cargo
+# workspace (ADR-0010): the structural guard that keeps orchestrator coupling out of
+# the crates. It is NOT the production tier — the full "Small multi-node Production"
+# stack (TiKV-small + its PD cluster + a 3-node etcd ensemble for L5) is M4.5 (#256).
+#
+# `pd` is TiKV's own coordinator (Placement Driver: region placement + the timestamp
+# oracle); `tikv` is the single storage node. Host networking is used so a
+# `tikv-client` running on the HOST reaches both PD (127.0.0.1:2379) and the store
+# address PD hands back (127.0.0.1:20160) — the usual TiKV-in-Docker-from-host snag.
+# Set WYRD_TIKV_PD_ENDPOINTS=127.0.0.1:2379 for the conformance run.
+name: wyrd-tikv-m41
+services:
+  pd:
+    image: pingcap/pd:v8.5.1
+    network_mode: host
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://127.0.0.1:2379
+      - --peer-urls=http://127.0.0.1:2380
+      - --initial-cluster=pd=http://127.0.0.1:2380
+    restart: on-failure
+
+  tikv:
+    image: pingcap/tikv:v8.5.1
+    network_mode: host
+    depends_on:
+      - pd
+    command:
+      - --addr=127.0.0.1:20160
+      - --status-addr=127.0.0.1:20180
+      - --data-dir=/data/tikv
+      - --pd-endpoints=127.0.0.1:2379
+    restart: on-failure
