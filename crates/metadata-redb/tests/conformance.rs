@@ -32,6 +32,11 @@ fn trait_contract() {
         conformance::contract_scan_by_prefix(&store()).await;
         conformance::contract_require_absent_gates(&store()).await;
         conformance::contract_require_value_gates(&store()).await;
+        // Read-consistency (#261 decision; #419): the snapshot/temporal
+        // dimension the four clauses above don't touch (ADR-0015 clause 3).
+        conformance::contract_read_after_commit(&store()).await;
+        conformance::contract_rename_race_yields_conflict(&store()).await;
+        conformance::contract_scan_is_consistent_cut(&store()).await;
     });
 }
 
