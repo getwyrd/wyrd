@@ -184,10 +184,22 @@ fn run_tikv_conformance() -> Result<(), String> {
     Ok(())
 }
 
-/// Run the endpoint-gated conformance test with the `tikv` feature on and PD
-/// exported. TiKV's store bootstrap can lag PD's port opening, so the test — which
+/// Run the endpoint-gated TiKV integration tests with the `tikv` feature on and PD
+/// exported. TiKV's store bootstrap can lag PD's port opening, so each test — which
 /// dials the cluster — is retried a few times with backoff before giving up.
+///
+/// Two test binaries run: `conformance` (the shared trait-contract suite, M4.1) and
+/// `contention` (the write-conflict property tests, M4.2/#253). Both must pass for
+/// the job to exercise the atomic-commit conflict semantics this slice hardens.
 fn run_tikv_conformance_test() -> Result<(), String> {
+    for test in ["conformance", "contention"] {
+        run_tikv_test(test)?;
+    }
+    Ok(())
+}
+
+/// Run one endpoint-gated TiKV test binary (`--test <name>`) with retry/backoff.
+fn run_tikv_test(test: &str) -> Result<(), String> {
     print_step(&[
         "cargo",
         "test",
@@ -196,7 +208,7 @@ fn run_tikv_conformance_test() -> Result<(), String> {
         "--features",
         "tikv",
         "--test",
-        "conformance",
+        test,
     ]);
     let mut last = String::new();
     for attempt in 1..=5 {
@@ -208,7 +220,7 @@ fn run_tikv_conformance_test() -> Result<(), String> {
                 "--features",
                 "tikv",
                 "--test",
-                "conformance",
+                test,
                 "--",
                 "--nocapture",
             ])
@@ -219,9 +231,10 @@ fn run_tikv_conformance_test() -> Result<(), String> {
         if status.success() {
             return Ok(());
         }
-        last = format!("TiKV conformance test failed with {status}");
+        last = format!("TiKV `{test}` test failed with {status}");
         eprintln!(
-            "xtask tikv-conformance: attempt {attempt}/5 failed; TiKV may still be bootstrapping"
+            "xtask tikv-conformance: `{test}` attempt {attempt}/5 failed; \
+             TiKV may still be bootstrapping"
         );
         std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
     }

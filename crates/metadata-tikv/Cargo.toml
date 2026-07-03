@@ -34,6 +34,10 @@ bytes = { workspace = true, optional = true }
 # M4.1) — the same one redb drives — and needs a tokio runtime to host the
 # networked store when the `tikv` feature is on.
 wyrd-metadata-conformance.workspace = true
+# The contention property tests (M4.2, #253) fan N concurrent `commit`s at one
+# shared namespace with `join_all` to force a server-side write-write race; used
+# only under `--features tikv` (endpoint-gated, like the conformance test).
+futures-util.workspace = true
 
 # `tikv-client` is used only under the `tikv` feature; keep cargo-machete quiet on
 # the default (feature-off) scan, where the optional deps look unreferenced.
