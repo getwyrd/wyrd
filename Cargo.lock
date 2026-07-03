@@ -3804,6 +3804,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "tikv-client",
  "tokio",
  "wyrd-metadata-conformance",

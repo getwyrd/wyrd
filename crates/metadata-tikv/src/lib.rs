@@ -130,6 +130,58 @@ mod store {
         err.into()
     }
 
+    /// Is `err` a TiKV **write-write conflict** — a lost race — rather than a
+    /// genuine fault?
+    ///
+    /// The load-bearing partition of the commit contract (`crates/traits/src/lib.rs`
+    /// `CommitOutcome`; proposal 0007 §"The semantic translation — two conflict
+    /// signals, one outcome, faults stay faults"): a losing writer is
+    /// `Ok(Conflict)`, everything else (network, region-unavailable, PD-timeout,
+    /// lock-resolution, deadlock, undetermined) stays `Err`. The single TiKV signal
+    /// for a write-write race is `Error::KeyError` carrying a `conflict:
+    /// Some(WriteConflict)` (kvrpcpb `KeyError.conflict`, tikv-client 0.4.0). Under
+    /// a pessimistic txn that key error can arrive wrapped: `commit()` prewrite
+    /// batches surface it as `ExtractedErrors`/`MultipleKeyErrors`, and a
+    /// `get_for_update` lock failure as `PessimisticLockError`. We recurse into the
+    /// wrappers — **any** wrapped write-conflict makes the whole error a conflict —
+    /// but we deliberately do **not** treat any other `KeyError` (`locked`,
+    /// `deadlock`, `abort`, …) as a conflict: only `conflict.is_some()`.
+    fn is_write_conflict(err: &tikv_client::Error) -> bool {
+        use tikv_client::Error;
+        match err {
+            Error::KeyError(ke) => ke.conflict.is_some(),
+            Error::MultipleKeyErrors(errs) | Error::ExtractedErrors(errs) => {
+                errs.iter().any(is_write_conflict)
+            }
+            Error::PessimisticLockError { inner, .. } => is_write_conflict(inner),
+            _ => false,
+        }
+    }
+
+    /// Finish `txn` and classify `err` as either a lost race (`Ok(Conflict)`) or a
+    /// fault (`Err`).
+    ///
+    /// This is the commit path's error policy: best-effort roll back so no active
+    /// txn is left to panic on drop and any prewrite locks release promptly (a
+    /// secondary rollback error is ignored so it can't mask the original), then map
+    /// through [`is_write_conflict`]. Drop-safety holds on both arms it guards
+    /// (proposal 0007 / verified backend facts): after a `get_for_update` error the
+    /// txn is still `Active`, so the rollback is what makes it drop-safe; after a
+    /// failed `commit()` the txn is already past `Active` (it moves to
+    /// `StartedCommit` before its RPC), so it is drop-safe regardless and `rollback`
+    /// accepts `StartedCommit`, releasing the prewrite locks a losing writer left.
+    async fn conflict_or_err(
+        txn: &mut Transaction,
+        err: tikv_client::Error,
+    ) -> Result<CommitOutcome> {
+        let _ = txn.rollback().await;
+        if is_write_conflict(&err) {
+            Ok(CommitOutcome::Conflict)
+        } else {
+            Err(err.into())
+        }
+    }
+
     /// A [`MetadataStore`] backed by a TiKV cluster, reached through its
     /// transactional API (Percolator 2PC coordinated by PD). Metadata keys/values
     /// are stored **byte-identically** — TiKV never interprets a key or value —
@@ -217,16 +269,21 @@ mod store {
             // rule); the rigorous write-conflict CLASSIFICATION under contention is
             // hardened in M4.2 (#253).
             for pc in &batch.preconditions {
+                // A `get_for_update` lock failure can itself be a write-write race
+                // (the concurrent winner already holds/moved the lock), so classify
+                // it — a losing writer here is a `Conflict`, not a fault.
                 let current = match txn.get_for_update(self.physical(&pc.key)).await {
                     Ok(current) => current,
-                    Err(e) => return Err(rollback_then(&mut txn, e).await),
+                    Err(e) => return conflict_or_err(&mut txn, e).await,
                 };
                 let holds = match &pc.expected {
                     Some(expected) => current.as_deref() == Some(expected.as_ref()),
                     None => current.is_none(),
                 };
                 if !holds {
-                    txn.rollback().await?;
+                    // Best-effort cleanup: a rollback fault here must not mask the
+                    // legitimate precondition-miss `Conflict` we are returning.
+                    let _ = txn.rollback().await;
                     return Ok(CommitOutcome::Conflict);
                 }
             }
@@ -242,7 +299,13 @@ mod store {
                 }
             }
 
-            txn.commit().await?;
+            // Prewrite can lose a write-write race to a concurrent committer; that
+            // is the trait's `Conflict`, not a fault. Any other commit error stays
+            // `Err` (faults, undetermined) — the delicate partition proposal 0007
+            // calls out.
+            if let Err(e) = txn.commit().await {
+                return conflict_or_err(&mut txn, e).await;
+            }
             Ok(CommitOutcome::Committed)
         }
     }
