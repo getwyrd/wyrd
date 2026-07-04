@@ -43,26 +43,21 @@ fn run(endpoints: Vec<String>) {
         .build()
         .expect("tokio runtime");
 
-    runtime.block_on(async {
-        // A fresh, isolated keyspace per contract clause — the same
-        // fresh-store-per-function isolation the redb target gets, but against one
-        // shared cluster. The pid keeps concurrent CI runs from colliding.
-        let connect = |tag: &str| {
-            let endpoints = endpoints.clone();
-            let namespace = format!("wyrd-conformance/{}/{tag}/", std::process::id()).into_bytes();
-            async move {
-                TikvMetadataStore::connect(endpoints)
-                    .await
-                    .expect("connect to TiKV")
-                    .with_namespace(namespace)
-            }
-        };
-
-        conformance::contract_commit_and_get(&connect("commit_and_get").await).await;
-        conformance::contract_scan_by_prefix(&connect("scan_by_prefix").await).await;
-        conformance::contract_require_absent_gates(&connect("require_absent").await).await;
-        conformance::contract_require_value_gates(&connect("require_value").await).await;
-    });
+    // The whole shared contract via the single `run_all` runner, so TiKV drives the
+    // identical clause set redb does with no per-driver list to drift — the
+    // read-consistency clauses (#419) now run here too. `make_store(tag)` hands each
+    // clause a connection scoped to a fresh, isolated per-`tag` keyspace against the one
+    // shared cluster (the pid keeps concurrent CI runs from colliding).
+    runtime.block_on(conformance::run_all(|tag| {
+        let endpoints = endpoints.clone();
+        let namespace = format!("wyrd-conformance/{}/{tag}/", std::process::id()).into_bytes();
+        async move {
+            TikvMetadataStore::connect(endpoints)
+                .await
+                .expect("connect to TiKV")
+                .with_namespace(namespace)
+        }
+    }));
 }
 
 #[cfg(not(feature = "tikv"))]

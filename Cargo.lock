@@ -3781,6 +3781,9 @@ dependencies = [
 name = "wyrd-metadata-conformance"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "pollster",
  "wyrd-traits",
 ]
 
