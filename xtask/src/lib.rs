@@ -13,4 +13,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod deploy_guard;
 pub mod disk_faults;
