@@ -53,10 +53,19 @@ const LEASE_TTL_MILLIS: u64 = 60_000;
 // not refactor" item 3). Over embedded redb a conflicting commit is a sub-µs
 // local retry, so the old unbounded spin was harmless; over distributed TiKV
 // every attempt is a network round-trip, so the spin is a latency/load footgun.
-// The retries are therefore capped and spaced with exponential backoff.
-const ALLOC_INODE_MAX_ATTEMPTS: u32 = 8;
+// The retries are therefore spaced with capped exponential backoff and bounded by
+// a WALL-CLOCK BUDGET rather than a fixed attempt count: the inode counter is a
+// single hot key, so a normal burst of N concurrent creates serialises one-per-round
+// against it, and a fixed count (say 8) would reject the (count+1)-th writer with a
+// spurious "persistent conflict" though the backend is healthy (Codex P2, #427). A
+// time budget instead retries a *contended* allocation until it succeeds and reserves
+// the error for a backend that genuinely cannot make progress within the budget.
+const ALLOC_INODE_BUDGET: Duration = Duration::from_secs(2);
 const ALLOC_INODE_BASE_BACKOFF: Duration = Duration::from_millis(2);
 const ALLOC_INODE_MAX_BACKOFF: Duration = Duration::from_millis(64);
+// Cap the backoff-exponent shift so `1u32 << attempt` can't overflow once the loop is
+// bounded by time (base 2ms << 5 == 64ms already saturates ALLOC_INODE_MAX_BACKOFF).
+const ALLOC_INODE_MAX_SHIFT: u32 = 5;
 
 /// The metadata backend `server` composes behind the unchanged `MetadataStore`
 /// seam, chosen by configuration (proposal 0015 §"Backend selection in `server`",
@@ -503,17 +512,23 @@ fn open_local_meta_redb(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
 
 /// Atomically allocate the next inode id from the persisted `meta:next_inode`
 /// counter (default 1). On a lost race the commit returns `Conflict`; this retries
-/// with **bounded** exponential backoff and gives up with an `Err` after
-/// [`ALLOC_INODE_MAX_ATTEMPTS`], rather than the old unbounded spin — over
-/// distributed TiKV every attempt is a network round-trip (proposal 0015
-/// §"Composition, not refactor" item 3). Generic over `M: MetadataStore` so the
-/// dev (redb) and prod (TiKV) backends share the identical allocator.
+/// with capped exponential backoff, bounded by a **wall-clock budget**
+/// ([`ALLOC_INODE_BUDGET`]) rather than a fixed attempt count, and gives up with an
+/// `Err` only once that budget is spent — over distributed TiKV every attempt is a
+/// network round-trip (proposal 0015 §"Composition, not refactor" item 3). A budget
+/// (not a count) means a *contended* allocation on the single hot counter key keeps
+/// retrying until it wins, so a normal burst of N concurrent creates is never rejected
+/// as a "persistent conflict" just for exceeding some fixed N (Codex P2, #427).
+/// Generic over `M: MetadataStore` so the dev (redb) and prod (TiKV) backends share
+/// the identical allocator.
 ///
 /// Public so the backend-selection regression can drive this exact production
 /// helper generically (the mock `MetadataStore` is only constructible because the
 /// helper is parameterized over `M` — the test load-bears the seam).
 pub async fn alloc_inode<M: MetadataStore>(meta: &M) -> Result<u64, BoxError> {
-    for attempt in 0..ALLOC_INODE_MAX_ATTEMPTS {
+    let deadline = tokio::time::Instant::now() + ALLOC_INODE_BUDGET;
+    let mut attempt: u32 = 0;
+    loop {
         let current = meta.get(NEXT_INODE_KEY).await?;
         let id: u64 = match &current {
             Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
@@ -527,17 +542,20 @@ pub async fn alloc_inode<M: MetadataStore>(meta: &M) -> Result<u64, BoxError> {
         if meta.commit(batch).await? == CommitOutcome::Committed {
             return Ok(id);
         }
-        // Lost the race — back off (capped) before retrying, but not after the
-        // final attempt (we are about to return the exhaustion error).
-        if attempt + 1 < ALLOC_INODE_MAX_ATTEMPTS {
-            let backoff = ALLOC_INODE_BASE_BACKOFF
-                .saturating_mul(1u32 << attempt)
-                .min(ALLOC_INODE_MAX_BACKOFF);
-            tokio::time::sleep(backoff).await;
+        // Lost the race — back off (capped), but give up once a backoff would run
+        // past the budget: that is a backend that genuinely cannot make progress,
+        // not ordinary contention.
+        let backoff = ALLOC_INODE_BASE_BACKOFF
+            .saturating_mul(1u32 << attempt.min(ALLOC_INODE_MAX_SHIFT))
+            .min(ALLOC_INODE_MAX_BACKOFF);
+        if tokio::time::Instant::now() + backoff >= deadline {
+            break;
         }
+        tokio::time::sleep(backoff).await;
+        attempt = attempt.saturating_add(1);
     }
     Err(format!(
-        "alloc_inode: could not allocate an inode after {ALLOC_INODE_MAX_ATTEMPTS} contended attempts (persistent metadata conflict)"
+        "alloc_inode: could not allocate an inode within {ALLOC_INODE_BUDGET:?} of contention (persistent metadata conflict)"
     )
     .into())
 }

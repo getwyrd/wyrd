@@ -58,6 +58,11 @@ tower.workspace = true
 wyrd-chunk-format.workspace = true
 wyrd-testkit.workspace = true
 tempfile.workspace = true
+# `test-util` adds the `start_paused` virtual clock so the alloc_inode budget test
+# auto-advances through its backoff sleeps instead of waiting the real budget.
+# Dev-only — dev-dependencies are not compiled into the production binary, so the
+# runtime tokio feature set is unchanged.
+tokio = { workspace = true, features = ["test-util"] }
 # A fault-injecting ChunkStore fake (a hanging/down D server) for the any-k read
 # fan-out test (M2.5).
 async-trait.workspace = true

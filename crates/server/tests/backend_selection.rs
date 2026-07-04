@@ -70,10 +70,12 @@ impl MetadataStore for AlwaysConflict {
 }
 
 /// (b) Against a perpetual-`Conflict` store the old `loop` spun forever; the
-/// bounded retry-with-backoff must instead return an `Err` well within the
-/// timeout. The `timeout` is a safety net: a regression to an *unbounded*
-/// backoff spin fails loudly here rather than hanging the whole suite.
-#[tokio::test]
+/// budget-bounded retry-with-backoff must instead return an `Err` once the
+/// wall-clock budget is spent. Runs on tokio's virtual clock (`start_paused`) so the
+/// backoff sleeps auto-advance instantly — fast even with a multi-second budget. The
+/// outer `timeout` is a safety net: a regression to an *unbounded* backoff spin trips
+/// the (virtual) 5s timeout and fails loudly rather than hanging the whole suite.
+#[tokio::test(start_paused = true)]
 async fn alloc_inode_is_bounded_against_a_perpetual_conflict_store() {
     let store = AlwaysConflict;
     let outcome = tokio::time::timeout(Duration::from_secs(5), alloc_inode(&store)).await;
