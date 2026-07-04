@@ -278,3 +278,27 @@ pub async fn contract_scan_is_consistent_cut(store: &impl MetadataStore) {
         "the surviving position is the rename's target"
     );
 }
+
+/// Drive **every** contract in this suite against a fresh store per clause.
+///
+/// A backend runs the whole contract by calling this ONE function, so there is no
+/// per-driver list to drift out of sync: a new `contract_*` added here is picked up by
+/// **both** backends automatically. (This is the seam that let the read-consistency
+/// clauses run against redb but skip TiKV — the very backend those snapshot properties
+/// exist to protect.) `make_store(tag)` yields a fresh, isolated store for each clause —
+/// redb hands back a new in-memory db, TiKV a connection scoped to a per-`tag` namespace —
+/// the fresh-store-per-clause isolation every clause assumes.
+pub async fn run_all<S, F, Fut>(mut make_store: F)
+where
+    S: MetadataStore,
+    F: FnMut(&'static str) -> Fut,
+    Fut: core::future::Future<Output = S>,
+{
+    contract_commit_and_get(&make_store("commit_and_get").await).await;
+    contract_scan_by_prefix(&make_store("scan_by_prefix").await).await;
+    contract_require_absent_gates(&make_store("require_absent").await).await;
+    contract_require_value_gates(&make_store("require_value").await).await;
+    contract_read_after_commit(&make_store("read_after_commit").await).await;
+    contract_rename_race_yields_conflict(&make_store("rename_race").await).await;
+    contract_scan_is_consistent_cut(&make_store("scan_consistent_cut").await).await;
+}
