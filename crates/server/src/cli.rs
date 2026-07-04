@@ -49,6 +49,75 @@ const DEFAULT_CHUNK_SIZE: usize = 1 << 20;
 const NOW_MILLIS: u64 = 0;
 const LEASE_TTL_MILLIS: u64 = 60_000;
 
+// Bounded retry-with-backoff for [`alloc_inode`] (proposal 0015 §"Composition,
+// not refactor" item 3). Over embedded redb a conflicting commit is a sub-µs
+// local retry, so the old unbounded spin was harmless; over distributed TiKV
+// every attempt is a network round-trip, so the spin is a latency/load footgun.
+// The retries are therefore capped and spaced with exponential backoff.
+const ALLOC_INODE_MAX_ATTEMPTS: u32 = 8;
+const ALLOC_INODE_BASE_BACKOFF: Duration = Duration::from_millis(2);
+const ALLOC_INODE_MAX_BACKOFF: Duration = Duration::from_millis(64);
+
+/// The metadata backend `server` composes behind the unchanged `MetadataStore`
+/// seam, chosen by configuration (proposal 0015 §"Backend selection in `server`",
+/// §"Suggested PR sequence" slice 4). This is the composition change M4 exists to
+/// demonstrate: selecting a backend is "pass a different concrete", not a refactor
+/// of any consumer (ADR-0008/0016).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataBackend {
+    /// Embedded redb — the dev / single-binary default, carrying no production
+    /// durability promise (ADR-0014). Always available.
+    Redb,
+    /// Distributed TiKV — the production backend (ADR-0008). Compiled only under
+    /// the OFF-by-default `tikv` feature, which forwards to `metadata-tikv`'s own
+    /// `tikv` feature, so the default build never pulls the `tikv-client` tree.
+    #[cfg(feature = "tikv")]
+    Tikv,
+}
+
+impl MetadataBackend {
+    /// Select the backend from a config value (the `--metadata-backend` flag or the
+    /// `WYRD_METADATA_BACKEND` env var). Absent ⇒ the redb dev default (ADR-0014).
+    /// `tikv` is only accepted when the binary was built `--features tikv`.
+    pub fn from_config(value: Option<&str>) -> Result<Self, BoxError> {
+        match value {
+            None | Some("redb") => Ok(Self::Redb),
+            #[cfg(feature = "tikv")]
+            Some("tikv") => Ok(Self::Tikv),
+            #[cfg(not(feature = "tikv"))]
+            Some("tikv") => Err(
+                "metadata backend `tikv` requires building `wyrd` with `--features tikv`".into(),
+            ),
+            Some(other) => Err(format!(
+                "unknown metadata backend `{other}` (expected `redb` or `tikv`)"
+            )
+            .into()),
+        }
+    }
+}
+
+/// Resolve the metadata backend from config: the `--metadata-backend` flag wins,
+/// else the `WYRD_METADATA_BACKEND` env var, else the redb dev default.
+fn resolve_backend(parsed: &ParsedArgs) -> Result<MetadataBackend, BoxError> {
+    let value = match parsed.flag("metadata-backend") {
+        Some(flag) => Some(flag.to_string()),
+        None => std::env::var("WYRD_METADATA_BACKEND").ok(),
+    };
+    MetadataBackend::from_config(value.as_deref())
+}
+
+/// Connect the production TiKV metadata store from its PD endpoints
+/// (`WYRD_TIKV_PD_ENDPOINTS`, comma-separated). Compiled only under the `tikv`
+/// feature — the tikv selection arm is `#[cfg]`-gated out of the default build.
+#[cfg(feature = "tikv")]
+async fn open_tikv_meta() -> Result<wyrd_metadata_tikv::TikvMetadataStore, BoxError> {
+    let raw = std::env::var("WYRD_TIKV_PD_ENDPOINTS").map_err(|_| {
+        "tikv backend: set WYRD_TIKV_PD_ENDPOINTS to the PD endpoints (comma-separated)"
+    })?;
+    let endpoints = parse_endpoints(&raw)?;
+    Ok(wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints).await?)
+}
+
 /// Parse `args` (including argv[0]) and run the requested command, returning the
 /// process exit code.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
@@ -79,8 +148,8 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 
 fn usage() {
     eprintln!("usage:");
-    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…]");
-    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…]");
+    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
+    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
     eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N]");
     eprintln!("  wyrd demo");
     eprintln!();
@@ -145,49 +214,82 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
     let data =
         std::fs::read(file).map_err(|e| format!("put: cannot read input file `{file}`: {e}"))?;
 
+    let backend = resolve_backend(&parsed)?;
+
     // Cluster client mode: fan the object's fragments out over gRPC to the
     // configured D servers, holding metadata locally under `data_dir`.
     if let Some(raw) = parsed.flag("endpoints") {
         let endpoints = parse_endpoints(raw)?;
-        return cluster_put(data_dir, &endpoints, key, &data, chunk_size, durability);
+        return cluster_put(
+            backend, data_dir, &endpoints, key, &data, chunk_size, durability,
+        );
     }
 
-    let (meta, chunks) = open_backends(data_dir)?;
-
-    block_on(async {
-        let inode_id = alloc_inode(&meta).await?;
-        let next_id = chunk_id_minter(inode_id);
-        let outcome = write::write_new_object(
-            &meta,
-            &chunks,
-            ROOT,
-            key,
-            inode_id,
-            &data,
-            chunk_size,
-            durability,
-            NOW_MILLIS,
-            LEASE_TTL_MILLIS,
-            next_id,
-        )
-        .await?;
-
-        match outcome {
-            CommitOutcome::Committed => {
-                let chunks = data.len().div_ceil(chunk_size.max(1));
-                println!(
-                    "put ok: key={key} inode={inode_id} chunks={chunks} bytes={} durability={} version=1",
-                    data.len(),
-                    durability_label(durability),
-                );
-                Ok(ExitCode::SUCCESS)
+    // Local-disk path. The metadata backend is selected by config, and the paths
+    // run on the tokio runtime the cluster paths already use — a `tokio`-bound
+    // TiKV client cannot run under `pollster::block_on` (proposal 0015
+    // §"Composition, not refactor" item 2).
+    let chunks = open_local_chunks(data_dir)?;
+    let runtime = tokio_runtime()?;
+    runtime.block_on(async {
+        match backend {
+            MetadataBackend::Redb => {
+                let meta = open_local_meta_redb(data_dir)?;
+                local_store_put(&meta, &chunks, key, &data, chunk_size, durability).await
             }
-            CommitOutcome::Conflict => {
-                eprintln!("wyrd: key `{key}` already exists");
-                Ok(ExitCode::FAILURE)
+            #[cfg(feature = "tikv")]
+            MetadataBackend::Tikv => {
+                let meta = open_tikv_meta().await?;
+                local_store_put(&meta, &chunks, key, &data, chunk_size, durability).await
             }
         }
     })
+}
+
+/// Store an object through the local-disk path, allocating the inode from the
+/// persisted `meta:next_inode` counter and driving [`write::write_new_object`].
+/// Generic over `M: MetadataStore` so the redb (dev) and TiKV (prod) backends run
+/// the **identical** composition — the swap is selection, not a refactor.
+async fn local_store_put<M: MetadataStore>(
+    meta: &M,
+    chunks: &FsChunkStore,
+    key: &str,
+    data: &[u8],
+    chunk_size: usize,
+    durability: EcScheme,
+) -> Result<ExitCode, BoxError> {
+    let inode_id = alloc_inode(meta).await?;
+    let next_id = chunk_id_minter(inode_id);
+    let outcome = write::write_new_object(
+        meta,
+        chunks,
+        ROOT,
+        key,
+        inode_id,
+        data,
+        chunk_size,
+        durability,
+        NOW_MILLIS,
+        LEASE_TTL_MILLIS,
+        next_id,
+    )
+    .await?;
+
+    match outcome {
+        CommitOutcome::Committed => {
+            let chunks = data.len().div_ceil(chunk_size.max(1));
+            println!(
+                "put ok: key={key} inode={inode_id} chunks={chunks} bytes={} durability={} version=1",
+                data.len(),
+                durability_label(durability),
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        CommitOutcome::Conflict => {
+            eprintln!("wyrd: key `{key}` already exists");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// `wyrd get <key> [--out <file>]`: read the object back, to a file or stdout.
@@ -199,31 +301,55 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
     let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
     let out = parsed.flag("out");
 
+    let backend = resolve_backend(&parsed)?;
+
     // Cluster client mode: reconstruct the object from fragments read back over
     // gRPC from the configured D servers (any-k arrive-first).
     if let Some(raw) = parsed.flag("endpoints") {
         let endpoints = parse_endpoints(raw)?;
-        return cluster_get(data_dir, &endpoints, key, out);
+        return cluster_get(backend, data_dir, &endpoints, key, out);
     }
 
-    let (meta, chunks) = open_backends(data_dir)?;
-
-    block_on(async {
-        match read::read_path(&meta, &chunks, ROOT, key).await? {
-            Some(bytes) => {
-                match out {
-                    Some(path) => std::fs::write(path, &bytes)
-                        .map_err(|e| format!("get: cannot write output file `{path}`: {e}"))?,
-                    None => std::io::stdout().write_all(&bytes)?,
-                }
-                Ok(ExitCode::SUCCESS)
+    let chunks = open_local_chunks(data_dir)?;
+    let runtime = tokio_runtime()?;
+    runtime.block_on(async {
+        match backend {
+            MetadataBackend::Redb => {
+                let meta = open_local_meta_redb(data_dir)?;
+                local_store_get(&meta, &chunks, key, out).await
             }
-            None => {
-                eprintln!("wyrd: key `{key}` not found");
-                Ok(ExitCode::FAILURE)
+            #[cfg(feature = "tikv")]
+            MetadataBackend::Tikv => {
+                let meta = open_tikv_meta().await?;
+                local_store_get(&meta, &chunks, key, out).await
             }
         }
     })
+}
+
+/// Read an object back through the local-disk path, reconstructing it from the
+/// on-disk chunk store via [`read::read_path`]. Generic over `M: MetadataStore` so
+/// the redb (dev) and TiKV (prod) backends run the identical read composition.
+async fn local_store_get<M: MetadataStore>(
+    meta: &M,
+    chunks: &FsChunkStore,
+    key: &str,
+    out: Option<&str>,
+) -> Result<ExitCode, BoxError> {
+    match read::read_path(meta, chunks, ROOT, key).await? {
+        Some(bytes) => {
+            match out {
+                Some(path) => std::fs::write(path, &bytes)
+                    .map_err(|e| format!("get: cannot write output file `{path}`: {e}"))?,
+                None => std::io::stdout().write_all(&bytes)?,
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        None => {
+            eprintln!("wyrd: key `{key}` not found");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }
 
 /// `wyrd d-server`: host the local filesystem `ChunkStore` over the gRPC
@@ -357,19 +483,37 @@ fn cmd_demo() -> Result<ExitCode, BoxError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Open the on-disk backends under `data_dir`, creating it if needed.
-fn open_backends(data_dir: &str) -> Result<(RedbMetadataStore, FsChunkStore), BoxError> {
+/// Open the on-disk chunk store under `data_dir`, creating the dir if needed. The
+/// metadata store is opened separately so the backend can be selected by config.
+fn open_local_chunks(data_dir: &str) -> Result<FsChunkStore, BoxError> {
+    let dir = Path::new(data_dir);
+    std::fs::create_dir_all(dir)?;
+    let chunks = FsChunkStore::open(dir.join("chunks"))?;
+    Ok(chunks)
+}
+
+/// Open the local redb metadata store under `data_dir`, creating the dir if
+/// needed — the dev-default backend for the local-disk path (ADR-0014).
+fn open_local_meta_redb(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
     let dir = Path::new(data_dir);
     std::fs::create_dir_all(dir)?;
     let meta = RedbMetadataStore::open(dir.join("meta.redb"))?;
-    let chunks = FsChunkStore::open(dir.join("chunks"))?;
-    Ok((meta, chunks))
+    Ok(meta)
 }
 
 /// Atomically allocate the next inode id from the persisted `meta:next_inode`
-/// counter (default 1). Retries if a concurrent writer bumped it first.
-async fn alloc_inode(meta: &RedbMetadataStore) -> Result<u64, BoxError> {
-    loop {
+/// counter (default 1). On a lost race the commit returns `Conflict`; this retries
+/// with **bounded** exponential backoff and gives up with an `Err` after
+/// [`ALLOC_INODE_MAX_ATTEMPTS`], rather than the old unbounded spin — over
+/// distributed TiKV every attempt is a network round-trip (proposal 0015
+/// §"Composition, not refactor" item 3). Generic over `M: MetadataStore` so the
+/// dev (redb) and prod (TiKV) backends share the identical allocator.
+///
+/// Public so the backend-selection regression can drive this exact production
+/// helper generically (the mock `MetadataStore` is only constructible because the
+/// helper is parameterized over `M` — the test load-bears the seam).
+pub async fn alloc_inode<M: MetadataStore>(meta: &M) -> Result<u64, BoxError> {
+    for attempt in 0..ALLOC_INODE_MAX_ATTEMPTS {
         let current = meta.get(NEXT_INODE_KEY).await?;
         let id: u64 = match &current {
             Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
@@ -383,7 +527,19 @@ async fn alloc_inode(meta: &RedbMetadataStore) -> Result<u64, BoxError> {
         if meta.commit(batch).await? == CommitOutcome::Committed {
             return Ok(id);
         }
+        // Lost the race — back off (capped) before retrying, but not after the
+        // final attempt (we are about to return the exhaustion error).
+        if attempt + 1 < ALLOC_INODE_MAX_ATTEMPTS {
+            let backoff = ALLOC_INODE_BASE_BACKOFF
+                .saturating_mul(1u32 << attempt)
+                .min(ALLOC_INODE_MAX_BACKOFF);
+            tokio::time::sleep(backoff).await;
+        }
     }
+    Err(format!(
+        "alloc_inode: could not allocate an inode after {ALLOC_INODE_MAX_ATTEMPTS} contended attempts (persistent metadata conflict)"
+    )
+    .into())
 }
 
 /// Mint chunk ids `inode_id << 64 | seq` — unique across objects and stable
@@ -457,8 +613,8 @@ pub async fn connect_fanout(endpoints: &[String]) -> Result<GrpcFanout, BoxError
 }
 
 /// Open the local metadata store (redb) under `data_dir` for the gateway client
-/// mode, creating the dir if needed. Unlike [`open_backends`], the cluster path
-/// holds **no** local chunk store — every fragment crosses the wire to a
+/// mode, creating the dir if needed. Unlike [`open_local_meta_redb`], the cluster
+/// path holds **no** local chunk store — every fragment crosses the wire to a
 /// configured D server — but it keeps the metadata store and its persisted inode
 /// allocator (`meta:next_inode`) locally, exactly as the local-disk path does.
 pub fn open_cluster_meta(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
@@ -474,8 +630,8 @@ pub fn open_cluster_meta(data_dir: &str) -> Result<RedbMetadataStore, BoxError> 
 /// with the on-disk chunk store swapped for the gRPC fan-out. Persisting the ids
 /// is what makes storing several distinct objects across separate invocations
 /// (fresh process / new composition over the same `data_dir`) work.
-pub async fn cluster_store_put<C: PlacementChunkStore>(
-    meta: &RedbMetadataStore,
+pub async fn cluster_store_put<M: MetadataStore, C: PlacementChunkStore>(
+    meta: &M,
     chunks: &C,
     key: &str,
     data: &[u8],
@@ -504,17 +660,20 @@ pub async fn cluster_store_put<C: PlacementChunkStore>(
 /// Read an object back through the gateway client mode, reconstructing it from
 /// fragments read over `chunks` — the same [`read::read_path`] the local-disk
 /// path uses, over the gRPC fan-out.
-pub async fn cluster_store_get<C: PlacementChunkStore>(
-    meta: &RedbMetadataStore,
+pub async fn cluster_store_get<M: MetadataStore, C: PlacementChunkStore>(
+    meta: &M,
     chunks: &C,
     key: &str,
 ) -> Result<Option<Vec<u8>>, BoxError> {
     read::read_path(meta, chunks, ROOT, key).await
 }
 
-/// Build the multi-threaded tokio runtime the cluster client mode needs: the gRPC
-/// clients are async (tonic), unlike the sync local-disk paths (pollster).
-fn cluster_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
+/// Build the multi-threaded tokio runtime the CLI's store paths need: the gRPC
+/// clients (tonic) and the production TiKV client are both async and `tokio`-bound
+/// — the local-disk redb path shares the same runtime rather than
+/// `pollster::block_on` so any backend runs identically (proposal 0015
+/// §"Composition, not refactor" item 2).
+fn tokio_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?)
@@ -524,6 +683,7 @@ fn cluster_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
 /// gateway client mode — fragments fan out over gRPC to the configured D servers,
 /// metadata (and the persisted inode allocator) held locally under `data_dir`.
 fn cluster_put(
+    backend: MetadataBackend,
     data_dir: &str,
     endpoints: &[String],
     key: &str,
@@ -531,11 +691,21 @@ fn cluster_put(
     chunk_size: usize,
     durability: EcScheme,
 ) -> Result<ExitCode, BoxError> {
-    let runtime = cluster_runtime()?;
+    let runtime = tokio_runtime()?;
     runtime.block_on(async {
-        let meta = open_cluster_meta(data_dir)?;
         let fanout = connect_fanout(endpoints).await?;
-        match cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await? {
+        let outcome = match backend {
+            MetadataBackend::Redb => {
+                let meta = open_cluster_meta(data_dir)?;
+                cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await?
+            }
+            #[cfg(feature = "tikv")]
+            MetadataBackend::Tikv => {
+                let meta = open_tikv_meta().await?;
+                cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await?
+            }
+        };
+        match outcome {
             CommitOutcome::Committed => {
                 let chunks = data.len().div_ceil(chunk_size.max(1));
                 println!(
@@ -558,16 +728,27 @@ fn cluster_put(
 /// static-endpoints gateway client mode, reconstructing it from fragments read
 /// over gRPC from the configured D servers.
 fn cluster_get(
+    backend: MetadataBackend,
     data_dir: &str,
     endpoints: &[String],
     key: &str,
     out: Option<&str>,
 ) -> Result<ExitCode, BoxError> {
-    let runtime = cluster_runtime()?;
+    let runtime = tokio_runtime()?;
     runtime.block_on(async {
-        let meta = open_cluster_meta(data_dir)?;
         let fanout = connect_fanout(endpoints).await?;
-        match cluster_store_get(&meta, &fanout, key).await? {
+        let found = match backend {
+            MetadataBackend::Redb => {
+                let meta = open_cluster_meta(data_dir)?;
+                cluster_store_get(&meta, &fanout, key).await?
+            }
+            #[cfg(feature = "tikv")]
+            MetadataBackend::Tikv => {
+                let meta = open_tikv_meta().await?;
+                cluster_store_get(&meta, &fanout, key).await?
+            }
+        };
+        match found {
             Some(bytes) => {
                 match out {
                     Some(path) => std::fs::write(path, &bytes)
