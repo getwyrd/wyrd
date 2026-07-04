@@ -1,0 +1,250 @@
+# The single-zone "Small multi-node Production" profile for CI/eval (M4.5, #256;
+# proposal 0015 §"Deployment: TiKV/PD as a stateful, disk-affine, orchestrator-agnostic
+# tier"; architecture §7.1's "Small multi-node" row). Composes the profile's FOUR
+# component roles:
+#   - a 3-node PD ensemble (TiKV's own placement driver / coordinator)
+#   - TiKV-small (one store node — the profile's "TiKV (small)")
+#   - a SEPARATE 3-node etcd ensemble for L5 Coordination (ADR-0006; distinct from
+#     PD's own embedded etcd — see the blueprint's "Component inventory")
+#   - local-disk D servers (the `wyrd d-server` role, reusing the `wyrd-dserver:local`
+#     image built for the root dev stack's `crates/chunkstore-grpc/tests/dserver/Dockerfile`)
+# No L2/L3/TiDB (single-zone, ADR-0020 is out of scope until M9+).
+#
+# Lives under `deploy/`, OUTSIDE the Cargo workspace (ADR-0010) — the structural guard
+# that keeps orchestrator coupling out of the crates; see `deploy/README.md` and
+# `xtask/tests/deploy_no_orchestrator_coupling.rs`. Unlike `deploy/tikv-single-node/`
+# (a throwaway SINGLE-node PD+TiKV pair on host networking, M4.1), this stack has
+# MULTIPLE replicas of the same role (3 PD, 3 etcd), so it uses the default compose
+# BRIDGE network with per-service DNS names and distinct published host ports instead
+# — host networking cannot give three same-port replicas distinct addresses.
+#
+# **Deployment prerequisite (out of scope here — proposal 0015 "Deployment
+# prerequisite" note, tracked as #365 + an untracked gateway/custodian item).** The
+# etcd ensemble is L5 Coordination's *backend*, but `wyrd d-server` does not yet dial
+# an external Coordination endpoint — it registers against its own in-process
+# `MemCoordination` (`crates/server/src/cli.rs`), and there is no runnable
+# gateway/custodian process role yet. So this stack stands up TiKV + PD + etcd +
+# D servers on STATIC endpoints; "peers discovered through L5" moves with that
+# prerequisite, per the proposal.
+name: wyrd-small-multi-node-m45
+
+services:
+  # ── L5 Coordination: a 3-node etcd ensemble (ADR-0006), separate from PD's own
+  #    embedded etcd. Ports mirror etcd's own canonical local static-bootstrap
+  #    example (client 2379/22379/32379) for anyone who knows that convention.
+  etcd0:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    command:
+      - etcd
+      - --name=etcd0
+      - --data-dir=/data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd0:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd0:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=wyrd-l5-coordination
+    ports:
+      - "12379:2379"
+    volumes:
+      - etcd0-data:/data
+    restart: on-failure
+
+  etcd1:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=wyrd-l5-coordination
+    ports:
+      - "22379:2379"
+    volumes:
+      - etcd1-data:/data
+    restart: on-failure
+
+  etcd2:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    command:
+      - etcd
+      - --name=etcd2
+      - --data-dir=/data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=wyrd-l5-coordination
+    ports:
+      - "32379:2379"
+    volumes:
+      - etcd2-data:/data
+    restart: on-failure
+
+  # ── TiKV's own PD (Placement Driver) ensemble — 3 nodes, DISTINCT from the etcd
+  #    ensemble above (blueprint "Component inventory": "Distinct from the L5
+  #    coordination etcd below"). Host-published on a separate port family
+  #    (2379x) so it never collides with the etcd ports above on the HOST even
+  #    though both default to container-internal 2379.
+  pd0:
+    image: pingcap/pd:v8.5.1
+    command:
+      - --name=pd0
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd0:2380
+      - --initial-cluster=pd0=http://pd0:2380,pd1=http://pd1:2380,pd2=http://pd2:2380
+    ports:
+      - "23791:2379"
+    volumes:
+      - pd0-data:/data
+    restart: on-failure
+
+  pd1:
+    image: pingcap/pd:v8.5.1
+    command:
+      - --name=pd1
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd1:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd1:2380
+      - --initial-cluster=pd0=http://pd0:2380,pd1=http://pd1:2380,pd2=http://pd2:2380
+    ports:
+      - "23792:2379"
+    volumes:
+      - pd1-data:/data
+    restart: on-failure
+
+  pd2:
+    image: pingcap/pd:v8.5.1
+    command:
+      - --name=pd2
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://pd2:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://pd2:2380
+      - --initial-cluster=pd0=http://pd0:2380,pd1=http://pd1:2380,pd2=http://pd2:2380
+    ports:
+      - "23793:2379"
+    volumes:
+      - pd2-data:/data
+    restart: on-failure
+
+  # ── TiKV-small: ONE store node (the profile's "TiKV (small)", §7.1). Registers
+  #    with the PD ensemble above, not the etcd ensemble.
+  tikv:
+    image: pingcap/tikv:v8.5.1
+    depends_on:
+      - pd0
+      - pd1
+      - pd2
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --status-addr=0.0.0.0:20180
+      - --advertise-status-addr=tikv:20180
+      - --data-dir=/data/tikv
+      - --pd-endpoints=pd0:2379,pd1:2379,pd2:2379
+    ports:
+      - "20160:20160"
+      - "20180:20180"
+    volumes:
+      - tikv-data:/data
+    restart: on-failure
+
+  # ── Local-disk D servers — the `wyrd d-server` role (ADR-0014/ADR-0016), reusing
+  #    the SAME `wyrd-dserver:local` image the root dev `docker-compose.yml` builds
+  #    (`crates/chunkstore-grpc/tests/dserver/Dockerfile`). No `--coordination` flag:
+  #    `wyrd d-server` does not yet dial an external Coordination endpoint (the
+  #    deployment prerequisite, see the header note) — each registers against its
+  #    own in-process `MemCoordination`, so these are static, independently-addressed
+  #    endpoints for now, not yet peers "discovered through L5."
+  dserver0:
+    build:
+      context: ../..
+      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
+    image: wyrd-dserver:local
+    command:
+      [
+        "d-server",
+        "--bind",
+        "0.0.0.0:50051",
+        "--data-dir",
+        "/data",
+        "--group",
+        "small-multi-node-m45",
+        "--failure-domain",
+        "fd0",
+      ]
+    ports:
+      - "50061:50051"
+    volumes:
+      - dserver0-data:/data
+
+  dserver1:
+    image: wyrd-dserver:local
+    build:
+      context: ../..
+      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
+    command:
+      [
+        "d-server",
+        "--bind",
+        "0.0.0.0:50051",
+        "--data-dir",
+        "/data",
+        "--group",
+        "small-multi-node-m45",
+        "--failure-domain",
+        "fd1",
+      ]
+    ports:
+      - "50062:50051"
+    volumes:
+      - dserver1-data:/data
+
+  dserver2:
+    image: wyrd-dserver:local
+    build:
+      context: ../..
+      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
+    command:
+      [
+        "d-server",
+        "--bind",
+        "0.0.0.0:50051",
+        "--data-dir",
+        "/data",
+        "--group",
+        "small-multi-node-m45",
+        "--failure-domain",
+        "fd2",
+      ]
+    ports:
+      - "50063:50051"
+    volumes:
+      - dserver2-data:/data
+
+volumes:
+  etcd0-data:
+  etcd1-data:
+  etcd2-data:
+  pd0-data:
+  pd1-data:
+  pd2-data:
+  tikv-data:
+  dserver0-data:
+  dserver1-data:
+  dserver2-data:
