@@ -289,7 +289,7 @@ pub mod paging {
                 "names the overflowing prefix: {msg}"
             );
             assert!(
-                msg.contains("truncat"),
+                msg.contains("truncated"),
                 "states it refused to truncate: {msg}"
             );
         }
