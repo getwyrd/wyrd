@@ -4,14 +4,18 @@
 //! `server` (ADR-0010), not a refactor here — the milestone's whole thesis
 //! (proposal 0007).
 //!
-//! This is the **M4.1 skeleton** (proposal 0007 §"Suggested PR sequence" item 1):
-//! the basic `get` / `scan` / `commit` shapes over TiKV's transactional API, so
+//! The basic `get` / `scan` / `commit` shapes over TiKV's transactional API, so
 //! the **shared** conformance suite that redb passes also passes against a real
-//! TiKV. The rigorous atomic-commit conflict semantics (`get_for_update` locking
-//! discipline hardening, write-conflict → `Conflict` classification,
-//! version-CAS-under-contention) are **M4.2** (#253); the native paged prefix
-//! scan + read-consistency doc are **M4.3** (#254) — a whole-range shortcut is
-//! acceptable in the skeleton.
+//! TiKV, landed in the **M4.1 skeleton** (proposal 0007 §"Suggested PR sequence"
+//! item 1). The rigorous atomic-commit conflict semantics (`get_for_update`
+//! locking discipline hardening, write-conflict → `Conflict` classification,
+//! version-CAS-under-contention) are **M4.2** (#253). The **native, internally
+//! paged** prefix scan — one consistent snapshot across all pages, fail-loud on an
+//! interim cap rather than truncate — plus the documented `get`/`scan`
+//! read-consistency contract are **M4.3** (#254; proposal 0015 §"Native prefix
+//! scan", #261/#262). The paging/cap **decision** logic is factored into the
+//! dependency-free [`paging`] module; the read-consistency contract is documented
+//! on the `store` module.
 //!
 //! The real backend is compiled only under the `tikv` feature. It is **off by
 //! default** so a machine with no TiKV (a laptop or a PDCA worktree) builds this
@@ -106,14 +110,231 @@ pub mod keyspace {
     }
 }
 
+/// Internal paging + fail-loud completeness for the native prefix `scan` (proposal
+/// 0015 §"Native prefix scan", §"Suggested PR sequence" item 3, Open questions
+/// "Large-directory `scan` buffering"). Kept free of any `tikv-client` dependency —
+/// exactly like [`keyspace`] — so the paging/cap **decisions** (cursor advance,
+/// short-page termination, cap-breach → error) compile and are unit-tested on every
+/// machine, TiKV or not (the load-light production unit the store's `scan` drives).
+///
+/// The store's `scan` holds **one** transaction — a single consistent read
+/// timestamp, the #261 consistent cut — across **every** internal page and drives
+/// the loop with [`after_page`]. The invariant is **completeness-or-fail-loud**
+/// (#262 / ADR-0011): a `scan(prefix)` returns the *complete* matching set observed
+/// at one snapshot, or `Err` — it **never** returns a silently truncated `Vec` (a
+/// truncated `inode:` scan corrupts GC's never-reclaim safety set — data loss).
+pub mod paging {
+    use std::fmt;
+
+    /// Maximum keys pulled per internal range read — a bounded network round-trip's
+    /// worth of dirents. The whole prefix is assembled by *looping* these pages
+    /// under one snapshot, not by one unbounded read (proposal 0015 Open questions
+    /// "Large-directory `scan` buffering"). Interim (#262): the paging mechanism and
+    /// value are Do's call *within* the completeness-or-fail-loud invariant.
+    pub const PAGE_SIZE: u32 = 1024;
+
+    /// Interim ceiling on the **total** materialized results of a single `scan`. On
+    /// breach the call fails loud (`Err`, via [`ScanCapExceeded`]) and returns **no**
+    /// partial `Vec`: a silently truncated `inode:` scan corrupts GC's never-reclaim
+    /// safety set (data loss), so this is a **correctness constraint, not a tuning
+    /// knob** (#262). 2^20 dirents is far past any legitimate single directory yet
+    /// bounds the gateway heap against a pathological prefix; it is revisited if a
+    /// paginated/streaming trait method is measured in (out of M4's unchanged-trait
+    /// scope). A product-facing "max dirents per listing" is the human's to confirm
+    /// (INTEGRATION §4 / #262).
+    pub const SCAN_CAP: usize = 1 << 20;
+
+    /// The interim per-`scan` cap was exceeded. Returned as the store's `Err` so the
+    /// scan **fails loud instead of truncating** (#262); the operator-visible
+    /// ADR-0011 audit signal is surfaced by the caller (GC/custodian), which already
+    /// owns the telemetry path — `metadata-tikv` carries no tracing dependency today,
+    /// so pushing the emit into the store would be a new-dependency ADR-0003 review.
+    /// A descriptive typed error keeps the audit signal caller-side and lets a caller
+    /// downcast to distinguish "too big, fail loud" from a genuine backend fault.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ScanCapExceeded {
+        /// The interim cap that was breached.
+        pub cap: usize,
+        /// The logical prefix whose scan overflowed (lossy-rendered for operators).
+        pub prefix: Vec<u8>,
+    }
+
+    impl fmt::Display for ScanCapExceeded {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "metadata scan exceeded the interim per-listing cap of {} keys for \
+                 prefix {:?}: failing loud rather than returning a truncated result set \
+                 (a silently truncated scan is data loss — #262, ADR-0011)",
+                self.cap,
+                String::from_utf8_lossy(&self.prefix),
+            )
+        }
+    }
+
+    impl std::error::Error for ScanCapExceeded {}
+
+    /// The next page's **inclusive** start key: the last key of the page just read
+    /// with a `0x00` byte appended — the smallest key strictly greater than
+    /// `last_key`. So the next page never re-yields `last_key` and never skips a key
+    /// between them, because no key sorts strictly between `k` and `k || 0x00`.
+    #[must_use]
+    pub fn next_page_start(last_key: &[u8]) -> Vec<u8> {
+        let mut next = Vec::with_capacity(last_key.len() + 1);
+        next.extend_from_slice(last_key);
+        next.push(0x00);
+        next
+    }
+
+    /// What the paged `scan` loop does after reading one page.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PageStep {
+        /// The cap was breached — fail loud, return **no** partial `Vec` (#262).
+        CapExceeded,
+        /// The bounded range is exhausted — the accumulated set is complete.
+        Done,
+        /// Continue the scan from this next (inclusive) start key.
+        Continue(Vec<u8>),
+    }
+
+    /// Decide whether a paged `scan` continues, is complete, or must fail loud, given
+    /// the running `total` materialized so far, the just-read page's length
+    /// `page_len`, and its physical `last_key`.
+    ///
+    /// Order matters: the cap is checked **first**, so an over-cap scan fails loud
+    /// even on what would otherwise be its final (short) page — an over-cap result
+    /// set can never slip through as a "complete" short page. A **short** page (fewer
+    /// than `page_size`, including empty) means the range is exhausted → `Done`; a
+    /// **full** page means there may be more → `Continue` past its last key.
+    #[must_use]
+    pub fn after_page(
+        total: usize,
+        page_len: usize,
+        last_key: Option<&[u8]>,
+        page_size: u32,
+        cap: usize,
+    ) -> PageStep {
+        if total > cap {
+            return PageStep::CapExceeded;
+        }
+        match last_key {
+            Some(k) if page_len >= page_size as usize => PageStep::Continue(next_page_start(k)),
+            _ => PageStep::Done,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn next_page_start_is_the_smallest_key_strictly_after_the_last() {
+            let last = b"inode:42";
+            let next = next_page_start(last);
+            // Strictly greater than the key already returned (never re-yielded)...
+            assert!(next.as_slice() > last.as_slice());
+            // ...and nothing sorts between them, so the paging skips no key.
+            assert_eq!(next, b"inode:42\x00");
+        }
+
+        #[test]
+        fn a_full_page_continues_past_its_last_key() {
+            assert_eq!(
+                after_page(1024, 1024, Some(b"p:last"), 1024, SCAN_CAP),
+                PageStep::Continue(b"p:last\x00".to_vec())
+            );
+        }
+
+        #[test]
+        fn a_short_page_ends_the_scan_complete() {
+            // Fewer than a full page => the bounded range is exhausted.
+            assert_eq!(
+                after_page(10, 10, Some(b"p:z"), 1024, SCAN_CAP),
+                PageStep::Done
+            );
+            // An empty page (no last key) likewise terminates cleanly.
+            assert_eq!(after_page(0, 0, None, 1024, SCAN_CAP), PageStep::Done);
+        }
+
+        #[test]
+        fn a_breach_of_the_cap_fails_loud_never_truncates() {
+            // total past the cap => CapExceeded regardless of page fullness — the
+            // caller must turn this into `Err`, never a partial Vec (#262).
+            assert_eq!(after_page(6, 5, Some(b"k"), 5, 5), PageStep::CapExceeded);
+            // Exactly at the cap is allowed — a full page there still continues, so a
+            // set of size == cap that ends on a page boundary is NOT a false breach.
+            assert_eq!(
+                after_page(5, 5, Some(b"k"), 5, 5),
+                PageStep::Continue(b"k\x00".to_vec())
+            );
+        }
+
+        #[test]
+        fn cap_is_checked_before_termination() {
+            // Even a short (would-be-final) page fails loud once it pushes total over
+            // the cap: an over-cap scan can never slip through as a "complete" short
+            // page and silently truncate.
+            assert_eq!(after_page(7, 2, Some(b"k"), 1024, 5), PageStep::CapExceeded);
+        }
+
+        #[test]
+        fn scan_cap_exceeded_error_is_operator_visible() {
+            let err = ScanCapExceeded {
+                cap: SCAN_CAP,
+                prefix: b"inode:".to_vec(),
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("inode:"),
+                "names the overflowing prefix: {msg}"
+            );
+            assert!(
+                msg.contains("truncated"),
+                "states it refused to truncate: {msg}"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "tikv")]
 mod store {
+    //! # Read-consistency contract (#261, ADR-0015 — the M4.3 decision)
+    //!
+    //! The `MetadataStore` trait promises nothing about `get`/`scan` snapshot
+    //! semantics (proposal 0015 Open questions "Read consistency to document"); this
+    //! backend pins it explicitly:
+    //!
+    //! - **Fresh-TSO snapshot per call.** Each `get` and each `scan` opens **one**
+    //!   `begin_pessimistic` transaction, which reads at a single PD-assigned start
+    //!   timestamp (TiKV snapshot isolation, ADR-0015). Reads are always current as
+    //!   of the call — **no** stale / follower / cached-timestamp reads. That
+    //!   relaxation is a *future* cross-zone behaviour behind the `meta:version`
+    //!   fence (ADR-0015 Option C); read-your-writes (ADR-0015 clause 3) likewise
+    //!   only becomes cross-zone behaviour later. M4 rejects them.
+    //! - **One consistent cut across all pages of a `scan`.** Because `scan` pages
+    //!   the range internally, all pages are read inside that *one* transaction, at
+    //!   the *one* start timestamp — so a `scan` observes a single consistent cut,
+    //!   never a torn read stitched across timestamps (#261). This is *required*
+    //!   precisely because the read is now paged.
+    //! - **Completeness or fail-loud, never truncation.** A `scan` returns the
+    //!   complete matching set or `Err` (see [`crate::paging`]); it never returns a
+    //!   silently truncated `Vec` (#262, ADR-0011).
+    //! - **`rename`'s read-then-commit is safe by re-check, not by read freshness.**
+    //!   `rename` reads *outside* the commit txn; its correctness rests on the
+    //!   commit's precondition re-check under the **locking rule** — every
+    //!   precondition key is re-read with `get_for_update` inside the one commit txn
+    //!   (see [`TikvMetadataStore::commit`]; proposal 0015 §"the mandatory rule",
+    //!   ADR-0015) — not on the freshness of the earlier read. So this read-snapshot
+    //!   contract does **not** alter `commit`; it documents why the split read/commit
+    //!   pattern is already sound.
+
     use async_trait::async_trait;
     use bytes::Bytes;
     use tikv_client::{BoundRange, Transaction, TransactionClient};
     use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
 
     use crate::keyspace;
+    use crate::paging::{self, PageStep, ScanCapExceeded};
 
     /// Best-effort-roll back a still-active transaction before surfacing `err`.
     ///
@@ -234,6 +455,10 @@ mod store {
 
     #[async_trait]
     impl MetadataStore for TikvMetadataStore {
+        /// Read `key` at a **fresh TSO snapshot** — one `begin_pessimistic` txn per
+        /// call reads at a single PD-assigned timestamp, so the value is current as
+        /// of the call (no stale/follower/cached-ts read). See the module-level
+        /// read-consistency contract (#261, ADR-0015).
         async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
             let mut txn = self.client.begin_pessimistic().await?;
             let value = match txn.get(self.physical(key)).await {
@@ -244,25 +469,68 @@ mod store {
             Ok(value.map(Bytes::from))
         }
 
+        /// Native, **internally paged** prefix scan (proposal 0015 §"Native prefix
+        /// scan", §"Suggested PR sequence" item 3).
+        ///
+        /// The bounded range `[prefix, prefix_upper)` is read in `PAGE_SIZE`-key
+        /// pages **inside one `begin_pessimistic` transaction** — one fixed read
+        /// timestamp across every page, so the whole materialized set is a single
+        /// consistent cut (#261, ADR-0015; see the module-level contract). The loop
+        /// advances the cursor strictly past the last key of each full page until a
+        /// short page ends the range.
+        ///
+        /// **Completeness or fail-loud (#262, ADR-0011):** the full matching set is
+        /// returned, or — if the interim [`paging::SCAN_CAP`] is breached — `Err`
+        /// ([`ScanCapExceeded`]). It **never** returns a silently truncated `Vec`; a
+        /// truncated `inode:` scan would corrupt GC's never-reclaim safety set (data
+        /// loss). Order stays unspecified (callers collect into a set/map).
         async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
-            // M4.1 skeleton: one bounded range scan `[prefix, upper)` materialized
-            // into the trait's owned Vec (order stays unspecified). Native PAGED
-            // scan + the read-consistency doc are M4.3 (#254).
             let start = self.physical(prefix);
-            let range: BoundRange = match keyspace::prefix_upper_bound(&start) {
-                Some(end) => (start..end).into(),
-                None => (start..).into(),
-            };
+            let upper = keyspace::prefix_upper_bound(&start);
+            // ONE transaction (one start timestamp) held across every page — the
+            // #261 consistent cut. `begin_pessimistic` reads at a single TSO, so
+            // keeping this one txn across all pages IS the snapshot guarantee.
             let mut txn = self.client.begin_pessimistic().await?;
-            let pairs = match txn.scan(range, u32::MAX).await {
-                Ok(pairs) => pairs,
-                Err(e) => return Err(rollback_then(&mut txn, e).await),
-            };
-            let mut out = Vec::new();
-            for pair in pairs {
-                let physical: Vec<u8> = pair.0.into();
-                if let Some(logical) = keyspace::logical(&self.namespace, &physical) {
-                    out.push((logical, Bytes::from(pair.1)));
+            let mut out: Vec<(Vec<u8>, Bytes)> = Vec::new();
+            let mut cursor = start;
+            loop {
+                let range: BoundRange = match &upper {
+                    Some(end) => (cursor.clone()..end.clone()).into(),
+                    None => (cursor.clone()..).into(),
+                };
+                let page: Vec<_> = match txn.scan(range, paging::PAGE_SIZE).await {
+                    Ok(page) => page.collect(),
+                    Err(e) => return Err(rollback_then(&mut txn, e).await),
+                };
+                let page_len = page.len();
+                let mut last_physical: Option<Vec<u8>> = None;
+                for pair in page {
+                    let physical: Vec<u8> = pair.0.into();
+                    if let Some(logical) = keyspace::logical(&self.namespace, &physical) {
+                        out.push((logical, Bytes::from(pair.1)));
+                    }
+                    last_physical = Some(physical);
+                }
+                match paging::after_page(
+                    out.len(),
+                    page_len,
+                    last_physical.as_deref(),
+                    paging::PAGE_SIZE,
+                    paging::SCAN_CAP,
+                ) {
+                    PageStep::CapExceeded => {
+                        // Fail loud — return NO partial Vec (#262). Roll back first
+                        // so no active txn is left to panic on drop (see
+                        // `rollback_then`); a secondary rollback error is ignored so
+                        // it cannot mask the cap-breach error the caller must see.
+                        let _ = txn.rollback().await;
+                        return Err(BoxError::from(ScanCapExceeded {
+                            cap: paging::SCAN_CAP,
+                            prefix: prefix.to_vec(),
+                        }));
+                    }
+                    PageStep::Continue(next) => cursor = next,
+                    PageStep::Done => break,
                 }
             }
             txn.rollback().await?;
