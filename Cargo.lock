@@ -3847,6 +3847,7 @@ dependencies = [
  "wyrd-coordination-mem",
  "wyrd-core",
  "wyrd-metadata-redb",
+ "wyrd-metadata-tikv",
  "wyrd-testkit",
  "wyrd-traits",
 ]
