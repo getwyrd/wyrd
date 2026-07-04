@@ -25,14 +25,11 @@ fn store() -> RedbMetadataStore {
 
 #[test]
 fn trait_contract() {
-    // Each clause gets a fresh, empty store so the shared functions never
-    // collide on keys — the same isolation the TiKV target provides per clause.
-    block_on(async {
-        conformance::contract_commit_and_get(&store()).await;
-        conformance::contract_scan_by_prefix(&store()).await;
-        conformance::contract_require_absent_gates(&store()).await;
-        conformance::contract_require_value_gates(&store()).await;
-    });
+    // The whole shared contract via the single `run_all` runner, so redb and TiKV drive
+    // the identical clause set with no per-driver list to drift (#419 read-consistency
+    // clauses previously ran here but not on TiKV). Each clause gets a fresh, empty
+    // in-memory store — the same isolation the TiKV target provides per clause.
+    block_on(conformance::run_all(|_tag| async { store() }));
 }
 
 // ---- DoD via the metadata model -------------------------------------------
