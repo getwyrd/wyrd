@@ -22,6 +22,15 @@
 //!   Tier-1 / Tier-2 custodian fault runners (M3, proposal 0005 `0005:405-411`,
 //!   `0005:437-438`). Privileged / real-environment tiers, never part of `ci`;
 //!   deferred by default, opted in by the dedicated off-Check job.
+//! - `deploy-small-multi-node` — the M4.5 production-topology bring-up smoke check
+//!   (proposal 0015 §"Deployment", PR sequence item 5, #256): bring up the
+//!   `deploy/small-multi-node/` stack (TiKV-small + its PD ensemble + a 3-node etcd
+//!   ensemble for L5 Coordination + local-disk D servers) and wait for every
+//!   component to accept connections. Not part of `ci` (it needs a container
+//!   runtime), exactly like `tikv-conformance` / `integration`. This is the
+//!   pre-prerequisite bring-up (proposal 0015's "Deployment prerequisite" note): it
+//!   proves the topology stands up on static endpoints, not yet "peers discovered
+//!   through L5" (gated on #365 + the runnable gateway/custodian roles).
 //! - `bench` — the tracked throughput benchmarks (EC micro-bench + the M2
 //!   aggregate D-server throughput bench). Tracked, not gated.
 
@@ -45,6 +54,7 @@ fn main() -> ExitCode {
         Some("statics") => run_statics(),
         Some("integration") => run_integration(),
         Some("tikv-conformance") => run_tikv_conformance(),
+        Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("disk-faults") => faults::run_disk_faults(),
         Some("jepsen") => faults::run_jepsen(),
         Some("kill-reconstruct") => faults::run_kill_reconstruct(),
@@ -72,7 +82,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|disk-faults|jepsen|kill-reconstruct|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|bench>"
     );
 }
 
@@ -240,6 +250,88 @@ fn run_tikv_test(test: &str) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
     }
     Err(last)
+}
+
+/// The compose project name for the M4.5 "Small multi-node Production" stack, so it
+/// is isolated and torn down cleanly (never collides with `TIKV_PROJECT`'s throwaway
+/// single-node stack — the two are never meant to run at once).
+const SMALL_MULTI_NODE_PROJECT: &str = "wyrd-small-multi-node-m45";
+/// Every component endpoint the smoke check waits on (host-published ports; see
+/// `deploy/small-multi-node/docker-compose.yml`): the 3-node etcd ensemble (L5
+/// Coordination), the 3-node PD ensemble, and TiKV-small itself.
+const SMALL_MULTI_NODE_ENDPOINTS: &[&str] = &[
+    "127.0.0.1:12379",
+    "127.0.0.1:22379",
+    "127.0.0.1:32379",
+    "127.0.0.1:23791",
+    "127.0.0.1:23792",
+    "127.0.0.1:23793",
+    "127.0.0.1:20160",
+];
+
+/// Run the M4.5 production-topology bring-up smoke check (proposal 0015
+/// §"Deployment", PR sequence item 5, #256): bring up `deploy/small-multi-node/`
+/// (TiKV-small + its PD ensemble + a 3-node etcd ensemble for L5 Coordination +
+/// local-disk D servers) and wait for every component to accept connections, then
+/// tear the stack down. **Not** part of `run_ci` — it needs a container runtime,
+/// exactly like `run_tikv_conformance`.
+///
+/// This is the pre-prerequisite bring-up only (proposal 0015's "Deployment
+/// prerequisite" note): it proves the topology stands up on STATIC endpoints. It
+/// does not (and cannot yet) prove "peers discovered through L5" — `wyrd d-server`
+/// does not dial an external Coordination endpoint yet, and there is no runnable
+/// gateway/custodian process role to exercise discovery with. That DoD is gated on
+/// #365 plus the (likely untracked) gateway/custodian process-role work.
+fn run_deploy_small_multi_node() -> Result<(), String> {
+    let compose = workspace_root().join("deploy/small-multi-node/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    if !docker_available() {
+        if is_ci() {
+            return Err(
+                "docker is not available but is required for the small-multi-node bring-up".into(),
+            );
+        }
+        eprintln!(
+            "warning: docker not available; skipping the small-multi-node bring-up locally. \
+             Install Docker (and the compose plugin) to run it."
+        );
+        return Ok(());
+    }
+
+    small_multi_node_compose(&compose, &["up", "-d"])?;
+    let result = SMALL_MULTI_NODE_ENDPOINTS
+        .iter()
+        .try_for_each(|endpoint| wait_for_port(endpoint));
+    // Always tear the stack down, even on failure — a run never leaks containers.
+    let _ = small_multi_node_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    result?;
+    println!(
+        "\nxtask deploy-small-multi-node: TiKV-small + its PD ensemble + the 3-node etcd \
+         ensemble + local-disk D servers are all accepting connections"
+    );
+    Ok(())
+}
+
+/// Run a `docker compose -p <SMALL_MULTI_NODE_PROJECT> -f <file> …` command from the
+/// workspace root, echoing it first. Mirrors `tikv_compose`.
+fn small_multi_node_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", SMALL_MULTI_NODE_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
 }
 
 /// Poll `host:port` until a TCP connection succeeds (PD is accepting clients), up to
@@ -672,6 +764,34 @@ fn run_statics() -> Result<(), String> {
     }
 }
 
+/// ADR-0010: no workspace crate may import an orchestrator/k8s API — the structural
+/// guard the `deploy/` bring-up (M4.5, #256) depends on ("makes it hard for
+/// orchestrator coupling to sneak into a component"). Scans every `.rs` file under
+/// `crates/` via the shared `xtask::deploy_guard::scan_dir` (the SAME function
+/// `xtask/tests/deploy_no_orchestrator_coupling.rs` drives over a planted fixture,
+/// proving it load-bearing rather than resting red on non-existence).
+fn run_orchestrator_guard() -> Result<(), String> {
+    print_step(&[
+        "xtask",
+        "deploy-guard",
+        "(ADR-0010 no-orchestrator-coupling gate)",
+    ]);
+    let violations = xtask::deploy_guard::scan_dir(&workspace_root().join("crates"));
+    if violations.is_empty() {
+        println!("xtask deploy-guard: no workspace crate imports an orchestrator API (ADR-0010)");
+        Ok(())
+    } else {
+        Err(format!(
+            "ADR-0010 violation — a crate imports an orchestrator/k8s API, breaking the \
+             deployment-substrate pluggability invariant (\"Kubernetes is available, never \
+             required\"):\n  {}\nMove the coupling behind a seam (peers are discovered \
+             through L5, never an orchestrator API), or if the dependency is genuinely \
+             needed, revisit ADR-0010 rather than working around it silently.",
+            violations.join("\n  ")
+        ))
+    }
+}
+
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
 /// failure stops the run.
 fn run_ci() -> Result<(), String> {
@@ -699,6 +819,7 @@ fn run_ci() -> Result<(), String> {
     cargo_deny_check()?;
     run_conformance()?;
     run_statics()?;
+    run_orchestrator_guard()?;
     run_dst()?;
     println!("\nxtask ci: all checks passed");
     Ok(())
