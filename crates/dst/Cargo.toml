@@ -21,6 +21,10 @@ madsim.workspace = true
 wyrd-core.workspace = true
 wyrd-traits.workspace = true
 wyrd-metadata-redb.workspace = true
+# The shared MetadataStore trait-contract suite (M4.1), driven under the simulator
+# over BOTH backends — redb and the simulated-TiKV model in `tests/support/mod.rs`
+# — so the trait is pinned by two implementations (ADR-0006; proposal 0015 M4.7).
+wyrd-metadata-conformance.workspace = true
 wyrd-chunkstore-fs.workspace = true
 tempfile.workspace = true
 # M2.6 network DST (tests/network.rs): the real gRPC ChunkStore over madsim's
