@@ -1,7 +1,14 @@
-//! The **durability plane**: a backend-agnostic OpenTelemetry seam emitting the
-//! custodian's telemetry from its first commit (proposal 0005 §"The durability
-//! plane", `0005:319-344`; ADR-0011 telemetry-from-first-commit; ADR-0012
-//! backend-agnostic OpenTelemetry).
+//! The **shared telemetry seam** (observability floor, proposal 0010 §"Scope
+//! boundary" item 1; ADR-0011 telemetry-from-first-commit, ADR-0012 backend-agnostic
+//! OpenTelemetry).
+//!
+//! This crate is the *extraction* of the custodian's M3 durability-plane seam
+//! (proposal 0005 §"The durability plane") into a **backend-agnostic** crate that any
+//! role can own — the custodian's durability plane today, and the server's
+//! request-plane RED / capacity-plane admission signals (0010 items 4–5) next, without
+//! forking a second export path (0010 invariant: *reuse, don't rebuild* the seam;
+//! *no concrete telemetry backend leaks into a leaf crate*). It lives outside
+//! `custodian` precisely so it is not anchored to one consumer.
 //!
 //! Telemetry is emitted through `tracing` bridged to OpenTelemetry
 //! ([`tracing_opentelemetry::MetricsLayer`]) and **dual-exported** — over BOTH a
@@ -15,16 +22,19 @@
 //! Prometheus registry in-process ([`DurabilityTelemetry::gather_prometheus`]); a
 //! live Prometheus scrape / OTLP collector run is supplementary evidence off-Check.
 
+#![forbid(unsafe_code)]
+
 use opentelemetry::metrics::{Meter, MeterProvider};
 use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use prometheus::Encoder;
 use tracing_opentelemetry::MetricsLayer;
 
-/// The instrumentation scope name the custodian's meters live under.
+/// The instrumentation scope name the durability-plane meters live under. Other
+/// planes (request / capacity) attach their own scope through the same provider.
 pub const SCOPE: &str = "wyrd.custodian";
 
-/// Which export surface(s) the durability plane is wired to. **No backend is
+/// Which export surface(s) the telemetry seam is wired to. **No backend is
 /// hardcoded** (ADR-0012): the caller selects, and a deployment can run Prometheus
 /// for dev, OTLP for production, or both.
 #[derive(Debug, Clone)]
@@ -60,9 +70,10 @@ impl ExporterConfig {
     }
 }
 
-/// The custodian's telemetry handle: an OpenTelemetry [`SdkMeterProvider`] wired to
-/// the configured export surface(s), plus the Prometheus registry (when a Prometheus
-/// surface is configured) for in-process read-back.
+/// The telemetry handle: an OpenTelemetry [`SdkMeterProvider`] wired to the configured
+/// export surface(s), plus the Prometheus registry (when a Prometheus surface is
+/// configured) for in-process read-back. Named `DurabilityTelemetry` for the M3
+/// consumer it was extracted from; the request/capacity planes share the same handle.
 #[derive(Clone)]
 pub struct DurabilityTelemetry {
     provider: SdkMeterProvider,
@@ -70,9 +81,9 @@ pub struct DurabilityTelemetry {
 }
 
 impl DurabilityTelemetry {
-    /// Build the durability-plane telemetry against `config`, wiring the selected
-    /// export surfaces. Constructing the OTLP exporter must run inside a Tokio
-    /// runtime (the tonic transport is built there).
+    /// Build the telemetry seam against `config`, wiring the selected export surfaces.
+    /// Constructing the OTLP exporter must run inside a Tokio runtime (the tonic
+    /// transport is built there).
     pub fn new(config: ExporterConfig) -> Result<Self, TelemetryError> {
         let mut builder = SdkMeterProvider::builder();
         let mut registry = None;
@@ -103,8 +114,7 @@ impl DurabilityTelemetry {
         })
     }
 
-    /// The custodian's OpenTelemetry meter — the instrument factory for the
-    /// durability metrics.
+    /// The OpenTelemetry meter — the instrument factory for the durability metrics.
     pub fn meter(&self) -> Meter {
         self.provider.meter(SCOPE)
     }
@@ -142,7 +152,7 @@ impl DurabilityTelemetry {
     }
 }
 
-/// Errors raised while wiring or flushing the durability-plane telemetry.
+/// Errors raised while wiring or flushing the telemetry seam.
 #[derive(Debug, Clone)]
 pub enum TelemetryError {
     /// The Prometheus exporter could not be built.

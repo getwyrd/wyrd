@@ -39,6 +39,20 @@ wyrd-chunkstore-fs.workspace = true
 # detail; Wyrd's core stays runtime-agnostic (ADR-0009).
 wyrd-chunkstore-grpc.workspace = true
 wyrd-coordination-mem.workspace = true
+# The deployable `wyrd custodian` role (observability floor, proposal 0010 item 2):
+# `server` is the one crate that wires concretes (ADR-0010), so it owns the runnable
+# custodian process — it depends on the `custodian` maintenance plane and installs the
+# shared `telemetry` handle it runs the leader-elected loop through.
+wyrd-custodian.workspace = true
+wyrd-telemetry.workspace = true
+# The custodian role's D-server connector seam (`DServerConnector`) is an object-safe
+# async trait (the gRPC dial abstracted so the fleet assembly is testable), so `server`
+# needs `async-trait` at build time, not just for tests.
+async-trait.workspace = true
+# The custodian role installs the telemetry metrics bridge on a `tracing` subscriber
+# and runs the fenced reconciliation loop through it (ADR-0011/0012).
+tracing.workspace = true
+tracing-subscriber.workspace = true
 bytes.workspace = true
 pollster.workspace = true
 # The D-server registration record (`{ id, endpoint, failure-domain label }`,
@@ -63,9 +77,6 @@ tempfile.workspace = true
 # Dev-only — dev-dependencies are not compiled into the production binary, so the
 # runtime tokio feature set is unchanged.
 tokio = { workspace = true, features = ["test-util"] }
-# A fault-injecting ChunkStore fake (a hanging/down D server) for the any-k read
-# fan-out test (M2.5).
-async-trait.workspace = true
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

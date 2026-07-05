@@ -1,0 +1,356 @@
+//! The **deployable `wyrd custodian` role** — the runnable process that turns the M3
+//! library maintenance plane into a running durability signal (observability floor,
+//! proposal 0010 §"Scope boundary" item 2; the keystone the day-one signal rides on).
+//!
+//! M3 shipped the custodian's loops (`wyrd_custodian::reconcile_step`,
+//! `reconstruction`, …) and, extracted at M4, the backend-agnostic telemetry seam
+//! ([`wyrd_telemetry::DurabilityTelemetry`]) as **libraries**. Nothing bound them into a
+//! deployable process: the custodian was a `dst`-only dependency, the server ran no
+//! custodian loop (`cli.rs` "The CLI runs no custodian sweep"), and the durability
+//! metrics a pass emits reached no export surface unless a caller wired one by hand. That
+//! is the sim-only gap 0010 names — the day-one signal ("kill a D server → the
+//! under-replicated count rises, then returns to zero") was only ever observed through a
+//! bespoke test capture, never the real Prometheus/OTLP surface a deployment scrapes.
+//!
+//! [`CustodianService`] is the wiring that closes it, in the one crate that may know
+//! concretes (ADR-0010): it **owns** the shared telemetry handle (proposal 0010 item 1,
+//! installed at role entry) and runs the fenced [`reconcile_step`] control point with
+//! that handle's `tracing`→OpenTelemetry metrics bridge installed as the dispatch for the
+//! pass (item 2), so every durability-plane metric the loops emit lands in *this role's*
+//! provider and is observable through its export surface
+//! ([`DurabilityTelemetry::gather_prometheus`] / OTLP). The `wyrd custodian` subcommand
+//! (`cli.rs`) constructs one from operator flags, chooses the export backend by
+//! [`ExporterConfig`](wyrd_telemetry::ExporterConfig) (no backend hardcoded, ADR-0012),
+//! and drives [`Self::run_reconstruction_until`] until Ctrl-C.
+//!
+//! It installs the bridge **scoped** (per pass, via [`WithSubscriber`]) rather than as a
+//! global default, and building the dispatch once at construction and cloning it per pass
+//! (`Dispatch` is `Arc`-backed) means every pass records into the same instruments, so one
+//! callsite-interest registration covers the role's lifetime. This scoped dispatch is a
+//! **metrics-only** bridge ([`DurabilityTelemetry::metrics_layer`]): it routes the loops'
+//! metric events into the export surface, but it is *not* a process-global
+//! `fmt`/`EnvFilter` log subscriber. The `--log-level`/`RUST_LOG` structured-log subscriber
+//! (proposal 0010 item 3) is a follow-on floor slice; until it lands, the loops'
+//! non-metric events (the reconstruction audit lines, the malformed-placement NEEDS-HUMAN
+//! warning) are emitted but captured by no log sink — a documented gap, not a claim that
+//! this keystone wires it.
+//!
+//! ## Surviving a killed D-server (the day-one fault) — the honest scope
+//!
+//! The reconstruction plane classifies an *unreachable / timed-out* fetch as **transient**
+//! and propagates it (it must not silently convert a reachable-but-flaky fragment into a
+//! re-placement, `reconstruction.rs`). Two mechanisms keep the deployable role alive on
+//! the day-one kill without depending on that classification changing:
+//!
+//! 1. the role derives its **live fleet by probing reachability every pass**
+//!    ([`live_reconstruction_view`]): a server that fails its health probe is dropped, so
+//!    the reconstruction plane reads *around* it (its fragments resolve as missing and are
+//!    rebuilt from the ≥ k survivors); and
+//! 2. the continuous loop ([`Self::run_reconstruction_until`]) **logs-and-continues** on a
+//!    per-pass [`ReconcileError::Store`] fault (a server that dies *after* the probe, a
+//!    transient metadata blip), so a mid-pass death degrades the pass, not the process.
+//!    Only a [`ReconcileError::Fenced`] (this custodian was superseded) stops the loop.
+//!
+//! The reachability probe is a **stand-in** for registration/lease-driven fleet membership:
+//! the durable answer to "which D-servers are live" is the etcd-backed `Coordination`
+//! discovery seam (ADR-0006) — the *other half* of 0015's deployment prerequisite, explicitly
+//! out of scope for this slice (brief §"Out of scope"). Whether the probe stand-in is
+//! acceptable for the first-deployment gate, or the classification seam should instead treat
+//! unreachable-during-reconstruction as missing, is a recorded human/proposal decision
+//! carried forward (iteration-3 §C5a) — flagged, not silently resolved here.
+
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use tracing::instrument::WithSubscriber;
+use tracing::Dispatch;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::Registry;
+use wyrd_core::placement::Topology;
+use wyrd_custodian::{
+    reconcile_step, Custodian, FencedZone, GcContext, RebalanceContext, ReconcileError, Reconciled,
+    ReconstructionContext, ScrubContext,
+};
+use wyrd_telemetry::DurabilityTelemetry;
+use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
+
+/// A configured D-server the role was told to maintain over: its stable [`DServerId`],
+/// its opaque failure-domain label, and the connected [`ChunkStore`] client. The role
+/// probes each one's reachability every pass ([`live_reconstruction_view`]) and hands the
+/// reconstruction plane only the live subset.
+///
+/// The `id` and `failure_domain` are what the reconstruction placement selector keys on.
+/// They are the D-server's **own registered identity** — supplied by the operator to match
+/// each D-server's `--id` / `--failure-domain` (the day-one runbook pins them), NOT
+/// fabricated positionally from the `--endpoints` order. Deriving them automatically from
+/// each D-server's registration record awaits the cross-process discovery seam (the
+/// out-of-scope etcd `Coordination`); until then the operator supplies the real topology
+/// rather than the role inventing one (iteration-3 rejection: "don't invent topology").
+///
+/// The store is held by **owned** [`Arc`], not a borrow, so the fleet is a self-contained
+/// owned value a [`DServerConnector`] can *return* (production wires a real gRPC client; a
+/// test injects an in-memory fake) — [`connect_fleet`] assembles it, and it can be moved
+/// into and driven by the run loop without the whole assembly having to live inside
+/// `cmd_custodian` (iteration-5 BLOCKING #2b: introduce an owned fleet type).
+pub struct ConfiguredDServer {
+    /// The D-server's stable id (the placement vector keys fragments by this).
+    pub id: DServerId,
+    /// The D-server's failure-domain label (distinct domains keep a chunk survivable).
+    pub failure_domain: String,
+    /// The connected store client the role reads/re-places fragments through.
+    pub store: Arc<dyn ChunkStore>,
+}
+
+/// The seam that turns a D-server **endpoint** into a connected [`ChunkStore`] client — the
+/// one concrete-transport call `connect_fleet` makes, abstracted behind a trait so the fleet
+/// assembly is coverable headlessly (iteration-5 BLOCKING #2a). Production wires a real gRPC
+/// dial ([`crate::cli`]'s `GrpcDServerConnector`, `GrpcChunkStore::connect_with_timeout`); a
+/// test injects a fake that returns in-memory stores and can return `Err` for one endpoint to
+/// exercise the start-degraded path (BLOCKING #3) without a network.
+#[async_trait]
+pub trait DServerConnector {
+    /// Dial `endpoint`, returning the connected store or a transport error. A returned `Err`
+    /// is a *startup-unreachable* peer, which [`connect_fleet`] reads around (it does not
+    /// abort fleet assembly).
+    async fn connect(
+        &self,
+        endpoint: &str,
+        timeout: Duration,
+    ) -> Result<Arc<dyn ChunkStore>, BoxError>;
+}
+
+/// Assemble the configured D-server fleet from the operator's `endpoints` / `ids` /
+/// `domains`, dialing each through the injected `connector` — the single testable place the
+/// custodian's fleet is built (iteration-5 BLOCKING #2c: `require_aligned_topology` + the
+/// dial loop + the `id`/`failure_domain` mapping in one function, not inlined in
+/// `cmd_custodian`).
+///
+/// **Topology is never fabricated:** `require` rejects any missing / mismatched `ids` /
+/// `domains` (the caller passes [`crate::cli`]'s `require_aligned_topology`), so a rebuilt
+/// fragment can never be re-placed onto a survivor's real failure domain (iteration-4
+/// rejection).
+///
+/// **Start-degraded (iteration-5 BLOCKING #3):** a peer that is *unreachable at startup* — a
+/// D-server killed before or during the very day-one incident the custodian exists to repair
+/// (architecture §7.4 step 4) — must NOT abort the whole role. Its `connect` `Err` is logged
+/// and the endpoint is **skipped**, so the role starts on the reachable subset and repairs
+/// *around* the down peer, exactly as `live_reconstruction_view` reads around a peer that
+/// dies mid-run. Returning the reachable subset (rather than propagating the first `Err`) is
+/// what makes a custodian *started or restarted during* the incident come up and repair,
+/// instead of exiting on the fault it is meant to fix.
+pub async fn connect_fleet<C, R>(
+    connector: &C,
+    endpoints: &[String],
+    ids: &[u64],
+    domains: &[String],
+    timeout: Duration,
+    require: R,
+) -> Result<Vec<ConfiguredDServer>, BoxError>
+where
+    C: DServerConnector + ?Sized,
+    R: FnOnce(usize, &[u64], &[String]) -> Result<(), BoxError>,
+{
+    require(endpoints.len(), ids, domains)?;
+    let mut fleet = Vec::with_capacity(endpoints.len());
+    for (i, endpoint) in endpoints.iter().enumerate() {
+        match connector.connect(endpoint, timeout).await {
+            Ok(store) => fleet.push(ConfiguredDServer {
+                id: ids[i] as DServerId,
+                failure_domain: domains[i].clone(),
+                store,
+            }),
+            // Start-degraded: a startup-unreachable peer is read around, not fatal.
+            Err(e) => eprintln!(
+                "wyrd custodian: D server `{endpoint}` unreachable at startup ({e}); \
+                 starting degraded and repairing around it"
+            ),
+        }
+    }
+    Ok(fleet)
+}
+
+/// Probe every configured D-server and return the **reachable** subset as the reconstruction
+/// view — the `(fleet, topology, unreachable)` a [`ReconstructionContext`] reads over. The
+/// third element is the set of configured servers that FAILED the probe this pass: their
+/// placed fragments are *transiently* unavailable, so [`ReconstructionContext::unreachable`]
+/// lets `assess` distinguish "unreachable right now" from "fragments confirmed gone" and NOT
+/// raise a false data-loss alarm on a below-`k` shortfall a transient outage alone explains
+/// (iteration-7 MUST-FIX).
+///
+/// This is the wiring that makes the deployable role SURVIVE the architecture §7.4 day-one
+/// step-4 fault (kill a D-server), driving the *same* production path the binary runs (the
+/// fleet is built from every configured endpoint, **including** the one that dies — the
+/// kill is handled here, at the role boundary, not by curating it out of the input). A
+/// killed / unreachable gRPC D-server answers its health probe with a transport error;
+/// were it left in the fleet, the first `get_fragment` the reconstruction assessment issues
+/// against it would raise a transient fault that `reconstruction::assess` propagates,
+/// unwinding the whole pass. Dropping unreachable servers here lets the reconstruction plane
+/// read *around* the loss (the dropped server's fragments resolve as missing and are rebuilt
+/// from the ≥ k survivors) so the role keeps running.
+///
+/// A server that answers its probe at all — `Healthy`, `Degraded`, or even `Unhealthy` —
+/// stays in the fleet: it is reachable, so its per-fragment faults are the
+/// permanent-vs-transient concern `assess` already handles. Only an *unreachable* server is
+/// the fatal case, and only it is dropped. The topology is built from the same live subset,
+/// so a rebuilt fragment is never re-placed onto a domain that just went dark. The
+/// topology also uses each server's operator-supplied `failure_domain`, so a rebuilt
+/// fragment respects the real cross-domain distinctness, not a fabricated one.
+pub async fn live_reconstruction_view(
+    configured: &[ConfiguredDServer],
+) -> (Vec<(DServerId, &dyn ChunkStore)>, Topology, Vec<DServerId>) {
+    let mut fleet = Vec::with_capacity(configured.len());
+    let mut topology = Topology::default();
+    let mut unreachable = Vec::new();
+    for d in configured {
+        // Reachable at all (any `Ok(Health)`) → keep; unreachable (`Err`) → drop and read
+        // around. `health()` is the same readiness signal proposal 0010 item 7's probe
+        // reflects, reused here so "is this server serving?" has one answer.
+        if d.store.health().await.is_ok() {
+            fleet.push((d.id, d.store.as_ref()));
+            topology.register(d.id, d.failure_domain.clone());
+        } else {
+            // Dropped as unreachable THIS pass. Its placed fragments are transiently
+            // unavailable — NOT confirmed lost — so the reconstruction plane must not raise
+            // the high-severity data-loss alarm on a below-`k` shortfall this server alone
+            // explains (iteration-7 MUST-FIX). The set is handed to the pass so `assess` can
+            // tell "unreachable right now" apart from "fragments confirmed gone".
+            unreachable.push(d.id);
+        }
+    }
+    (fleet, topology, unreachable)
+}
+
+/// A running custodian role: it owns the durability-plane [`DurabilityTelemetry`] handle
+/// and drives the fenced reconciliation loop with that handle's metrics bridge installed,
+/// so the durability metrics a pass emits are captured by this role's provider and
+/// observable through its export surface. This is the wiring proposal 0010 items 1–2
+/// deliver — the library maintenance plane made a *runnable process* that installs the
+/// telemetry seam at entry and runs the leader-elected loop through it.
+pub struct CustodianService {
+    telemetry: DurabilityTelemetry,
+    /// The role's `tracing` dispatch, built **once** over this role's telemetry provider,
+    /// so every pass records into the same instruments (and one callsite-interest
+    /// registration covers the whole role's lifetime). Cheap to clone (an `Arc`);
+    /// installed scoped per pass, never as a global default.
+    dispatch: Dispatch,
+}
+
+impl CustodianService {
+    /// Wire a role over `telemetry` — the shared telemetry handle installed at role entry
+    /// (proposal 0010 item 1). The handle's export surface(s) were chosen by the caller's
+    /// [`ExporterConfig`](wyrd_telemetry::ExporterConfig) (no backend hardcoded here,
+    /// ADR-0012); this role only routes the loops' emission into it.
+    pub fn new(telemetry: DurabilityTelemetry) -> Self {
+        let dispatch = Dispatch::new(Registry::default().with(telemetry.metrics_layer()));
+        Self {
+            telemetry,
+            dispatch,
+        }
+    }
+
+    /// This role's durability-plane telemetry handle — the read-back / export surface a
+    /// scrape endpoint exposes, and the in-process
+    /// [`DurabilityTelemetry::gather_prometheus`] the day-one signal is asserted through.
+    pub fn telemetry(&self) -> &DurabilityTelemetry {
+        &self.telemetry
+    }
+
+    /// Run **one** fenced reconciliation pass with this role's telemetry bridge installed
+    /// as the `tracing` dispatch for the pass (proposal 0010 item 2). It delegates to the
+    /// real [`reconcile_step`] fenced control point — the *same* code path the M3 property
+    /// campaign drives, never a parallel entry (the anti-#141 guard) — and adds only the
+    /// telemetry wiring, so the durability metrics the loops emit
+    /// (`reconstruction_under_replicated`, queue depth, …) are captured by
+    /// [`Self::telemetry`] and observable through its export surface.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reconcile_pass(
+        &self,
+        zone: &FencedZone,
+        custodian: &Custodian,
+        gc: Option<&GcContext<'_>>,
+        scrub: Option<&ScrubContext<'_>>,
+        reconstruction: Option<&ReconstructionContext<'_>>,
+        rebalance: Option<&RebalanceContext<'_>>,
+        now_millis: u64,
+    ) -> Result<Reconciled, ReconcileError> {
+        reconcile_step(
+            zone,
+            custodian,
+            gc,
+            scrub,
+            reconstruction,
+            rebalance,
+            now_millis,
+        )
+        .with_subscriber(self.dispatch.clone())
+        .await
+    }
+
+    /// The deployable **reconstruction run loop** — the spine the `wyrd custodian` binary
+    /// drives over a configured D-server fleet. Each pass:
+    ///
+    /// 1. derives the LIVE reconstruction view ([`live_reconstruction_view`]) — dropping
+    ///    any D-server that fails its reachability probe, so a killed server is read
+    ///    *around* rather than crashing the pass;
+    /// 2. runs one fenced [`Self::reconcile_pass`] over that view (the durability metrics
+    ///    land on this role's export surface);
+    /// 3. **survives** a per-pass store fault — a [`ReconcileError::Store`] (a server that
+    ///    died *after* the probe, a transient metadata blip) is logged to stderr and the
+    ///    loop continues to the next pass; only a [`ReconcileError::Fenced`] (this
+    ///    custodian was superseded — a newer term holds the zone) stops the loop, since
+    ///    continuing would be an unfenced actor.
+    ///
+    /// This is the production wiring the day-one runbook exercises: kill a D-server, watch
+    /// the under-replicated gauge rise then return to zero, through a role that does not
+    /// exit on the kill. `now_millis` is advanced by the caller's wall `clock`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_reconstruction_until<Fut, Clock>(
+        &self,
+        zone: &FencedZone,
+        custodian: &Custodian,
+        meta: &dyn MetadataStore,
+        configured: &[ConfiguredDServer],
+        interval: Duration,
+        mut clock: Clock,
+        shutdown: Fut,
+    ) -> Result<(), ReconcileError>
+    where
+        Fut: Future<Output = ()>,
+        Clock: FnMut() -> u64,
+    {
+        tokio::pin!(shutdown);
+        loop {
+            let (fleet, topology, unreachable) = live_reconstruction_view(configured).await;
+            let ctx = ReconstructionContext {
+                meta,
+                fleet: &fleet,
+                topology: &topology,
+                // The servers dropped as unreachable this pass: `assess` treats their placed
+                // fragments as transiently unavailable, not confirmed lost (no false data-loss).
+                unreachable: &unreachable,
+            };
+            match self
+                .reconcile_pass(zone, custodian, None, None, Some(&ctx), None, clock())
+                .await
+            {
+                Ok(_) => {}
+                // A superseded term must stop reconciling — it is fenced from committing
+                // anyway, but it should not keep burning passes as a zombie.
+                Err(e @ ReconcileError::Fenced(_)) => return Err(e),
+                // A transient store fault (a server that died after the probe, a metadata
+                // blip) degrades the pass, not the process: log and try again next tick.
+                Err(ReconcileError::Store(e)) => {
+                    eprintln!(
+                        "wyrd custodian: reconstruction pass failed (retrying next interval): {e}"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = &mut shutdown => return Ok(()),
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    }
+}

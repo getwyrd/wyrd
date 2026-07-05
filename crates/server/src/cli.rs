@@ -9,12 +9,13 @@
 //! observability is deferred past M0 (ADR-0012).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pollster::block_on;
 use wyrd_chunkstore_fs::FsChunkStore;
@@ -22,9 +23,14 @@ use wyrd_chunkstore_grpc::{FanoutChunkStore, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
+use wyrd_custodian::{Custodian, FencedZone};
 use wyrd_metadata_redb::RedbMetadataStore;
-use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, PlacementChunkStore, WriteBatch};
+use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig};
+use wyrd_traits::{
+    ChunkId, ChunkStore, CommitOutcome, MetadataStore, PlacementChunkStore, WriteBatch,
+};
 
+use crate::custodian::{connect_fleet, ConfiguredDServer, CustodianService, DServerConnector};
 use crate::dserver::{self, DServer};
 use crate::{Gateway, DEFAULT_DURABILITY};
 
@@ -135,6 +141,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         Some("put") => cmd_put(&args[1..]),
         Some("get") => cmd_get(&args[1..]),
         Some("d-server") => cmd_d_server(&args[1..]),
+        Some("custodian") => cmd_custodian(&args[1..]),
         Some("demo") => cmd_demo(),
         Some(other) => {
             eprintln!("wyrd: unknown command `{other}`");
@@ -160,11 +167,20 @@ fn usage() {
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
     eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N]");
+    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  --endpoints drives a local distributed cluster: fragments fan out over gRPC");
     eprintln!(
         "  to the listed D servers (metadata held locally). See README \"Run a local cluster\"."
+    );
+    eprintln!();
+    eprintln!("  custodian: --endpoints wires the reconstruction plane over the D-server fleet.");
+    eprintln!("  When --endpoints is given, --ids and --failure-domains are REQUIRED and must");
+    eprintln!("  each list one entry per endpoint (matching each D-server's own --id /");
+    eprintln!("  --failure-domain); the role never fabricates identity or topology from endpoint");
+    eprintln!(
+        "  order. Omit all three to run the leader-elected role with no reconstruction plane."
     );
 }
 
@@ -448,6 +464,352 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
             .await
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Default zone the custodian campaigns for leadership under.
+const DEFAULT_CUSTODIAN_ZONE: &str = "zone-0";
+/// Default reconciliation interval for the custodian run loop.
+const DEFAULT_CUSTODIAN_INTERVAL_SECS: u64 = 30;
+/// Default per-request / connect timeout for the custodian's D-server clients — a
+/// paused / partitioned peer must fail a fetch (transient `DEADLINE_EXCEEDED`) rather
+/// than hang the reconcile loop forever.
+const DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// `wyrd custodian`: the **deployable custodian role** (observability floor, proposal
+/// 0010 §"Scope boundary" item 2; the `wyrd custodian --otlp-endpoint …` bring-up command
+/// the M4 day-one blueprint makes true). It installs the shared telemetry handle at role
+/// entry (item 1), campaigns for single-active leadership over the zone, and runs the
+/// fenced reconstruction loop through that handle — so the durability metrics the loop
+/// emits (the under-replicated count that rises on a loss and returns to zero on repair —
+/// architecture §7.4 day-one step 4) land on the export surface a deployment scrapes,
+/// rather than staying reachable only from a library caller.
+///
+/// **Routes through the same metadata backend `put`/`get` do** ([`resolve_backend`] +
+/// `--metadata-backend`): M4 production runs the TiKV backend (redb is dev/eval only,
+/// ADR-0014), so the custodian MUST open the *same* store the cluster wrote to — else it
+/// would open an empty local redb, see zero chunks / zero repair obligations, and the
+/// day-one under-replicated gauge would never rise on the very deployment (#367) it gates.
+/// The `tikv` arm is `#[cfg]`-gated out of the default build, exactly as `cmd_put`/`cmd_get`.
+///
+/// The export backend is chosen by [`ExporterConfig`] with **no backend hardcoded**
+/// (ADR-0012): `--otlp-endpoint` pushes to a collector (the production day-one path); the
+/// zero-dependency Prometheus registry is always wired for in-process read-back. The
+/// D-server clients dial with a **connect/request timeout** ([`GrpcChunkStore::connect_with_timeout`])
+/// so a paused / partitioned peer fails its fetch transiently rather than hanging the loop.
+///
+/// Each D-server's **stable id and failure-domain label** are operator-supplied (`--ids`,
+/// `--failure-domains`, aligned to `--endpoints`) to match each D-server's own registered
+/// `--id` / `--failure-domain` — the role does NOT invent topology from the endpoint order
+/// (deriving them from the registration record awaits the out-of-scope etcd discovery seam).
+///
+/// Coordination scope is stated **honestly, per backend** (the process-local
+/// [`MemCoordination`] always grants the lone process leadership, so "single-active" is only
+/// as real as the *store* makes it):
+/// - **redb** — the store's exclusive file lock keeps a second custodian off the same
+///   `--data-dir`, so host-local single-active is genuine;
+/// - **tikv** — a shared networked store has **no** such lock, so two `wyrd custodian
+///   --metadata-backend tikv` on one host BOTH self-grant and reconstruct concurrently. The
+///   role logs a WARNING to say so plainly rather than advertise a safety property it does
+///   not hold. Real cross-process/cross-host fencing becomes real only when the etcd-backed
+///   `Coordination` replaces [`MemCoordination`] behind the same seam (ADR-0006, #365) — the
+///   out-of-scope *other half* of 0015's deployment prerequisite.
+///
+/// Even absent fencing no corruption is possible: the reconstruction repoint is a
+/// version-conditional (CAS) commit, so two racing custodians never both win.
+///
+/// `pub` so the deployable role's own binary entry — arg parse → [`resolve_backend`] →
+/// backend open → [`connect_fleet`] (with [`require_aligned_topology`] and the concrete
+/// [`GrpcDServerConnector`] dial) → run loop — is driven **end to end** by a test, not only
+/// its factored halves (iteration-5/6 T5c: the glue iterations 3/4 were rejected on must be
+/// exercised through the real entry point, so a regression there cannot slip past green gates).
+pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
+    let parsed = ParsedArgs::parse(args)?;
+    let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
+    let zone_name = parsed.flag("zone").unwrap_or(DEFAULT_CUSTODIAN_ZONE);
+    let interval = Duration::from_secs(parse_u64_flag(
+        &parsed,
+        "interval-secs",
+        DEFAULT_CUSTODIAN_INTERVAL_SECS,
+    )?);
+    let connect_timeout = Duration::from_secs(parse_u64_flag(
+        &parsed,
+        "connect-timeout-secs",
+        DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS,
+    )?);
+    let backend = resolve_backend(&parsed)?;
+    // The export surface: a Prometheus registry is always wired (in-process read-back);
+    // `--otlp-endpoint` additionally pushes to a collector (the production path).
+    let exporter = match parsed.flag("otlp-endpoint") {
+        Some(endpoint) => ExporterConfig::Both {
+            otlp_endpoint: endpoint.to_string(),
+        },
+        None => ExporterConfig::Prometheus,
+    };
+    let endpoints = match parsed.flag("endpoints") {
+        Some(raw) => Some(parse_endpoints(raw)?),
+        None => None,
+    };
+    // Operator-supplied stable identity, aligned to `--endpoints` order — NOT fabricated.
+    // Missing / mismatched topology is REJECTED below (no positional fallback), so a
+    // rebuilt fragment can never be re-placed onto a survivor's real failure domain.
+    let ids = parse_u64_list(parsed.flag("ids"))?;
+    let domains = parse_str_list(parsed.flag("failure-domains"));
+
+    let runtime = tokio_runtime()?;
+    runtime.block_on(async move {
+        // Item 1: install the shared telemetry handle at role entry (the OTLP exporter is
+        // built on this runtime). Item 2: run the leader-elected loop through it.
+        let telemetry = DurabilityTelemetry::new(exporter)?;
+        let service = CustodianService::new(telemetry);
+
+        let coord = MemCoordination::new();
+        let custodian = Custodian::elect(&coord, zone_name).await?;
+        let mut zone = FencedZone::new();
+        zone.install(custodian.leadership());
+        // Be HONEST about the fencing actually in force (iteration-5 REQUIRED #4). The
+        // process-local `MemCoordination` always grants leadership to the lone process, so
+        // "single-active" is only real to the extent the *store* keeps a second custodian out:
+        //  - Redb: the redb file holds an exclusive OS lock, so a second custodian on the same
+        //    `--data-dir` cannot even open the store — host-local single-active is genuine.
+        //  - TiKV: a shared networked store has NO such lock, so two `wyrd custodian
+        //    --metadata-backend tikv` on one host BOTH self-grant and reconstruct concurrently.
+        //    Real fencing awaits the etcd `Coordination` backend (#365, the out-of-scope other
+        //    half of 0015's prerequisite). Do NOT claim a safety property the tikv arm lacks; no
+        //    corruption results regardless (the repoint is a version-conditional CAS commit).
+        let fencing = match backend {
+            MetadataBackend::Redb => {
+                "host-local single-active via the redb store's exclusive file lock; cross-host \
+                 fencing pending the etcd Coordination backend (#365)"
+            }
+            #[cfg(feature = "tikv")]
+            MetadataBackend::Tikv => {
+                "WARNING: single-active is NOT enforced on the tikv backend (no store lock); do \
+                 not run a second custodian against the same tikv store until the etcd \
+                 Coordination backend lands (#365) — CAS commits keep it corruption-free meanwhile"
+            }
+        };
+        eprintln!(
+            "wyrd custodian: leader for zone `{zone_name}` (term {}); {fencing}; \
+             reconciling every {}s; Ctrl-C to stop",
+            custodian.term(),
+            interval.as_secs(),
+        );
+
+        let shutdown = async {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("wyrd custodian: shutting down");
+        };
+        let clock = wall_clock_millis;
+
+        let Some(endpoints) = endpoints else {
+            eprintln!(
+                "wyrd custodian: no --endpoints; nothing to reconstruct. Wire --endpoints to \
+                 the D-server fleet to run the reconstruction plane."
+            );
+            return Ok::<(), BoxError>(());
+        };
+
+        // Assemble the fleet through the injectable connector seam ([`connect_fleet`]): it
+        // REJECTS missing / mismatched topology (never fabricated), dials each endpoint WITH
+        // A TIMEOUT (so a paused / partitioned peer fails transiently instead of hanging the
+        // loop), and STARTS DEGRADED around any peer that is unreachable at startup — a
+        // D-server killed before/during the day-one incident does not abort the role, it is
+        // repaired around (architecture §7.4 day-one step 4). id/failure-domain come from the
+        // operator (matching each D-server's registered identity), never a fabricated index.
+        let configured = connect_fleet(
+            &GrpcDServerConnector,
+            &endpoints,
+            &ids,
+            &domains,
+            connect_timeout,
+            require_aligned_topology,
+        )
+        .await?;
+        if configured.is_empty() {
+            // FAIL LOUD (iteration-7 MUST-FIX §6.5). Per-peer start-degraded (skip ONE down
+            // server, repair around it) is handled inside `connect_fleet`; but if EVERY
+            // configured D-server is unreachable at startup, a long-running deployable
+            // custodian that returned `Ok(())` would exit 0 — the supervisor would not restart
+            // it and the operator would see a clean vanish on a total fleet outage / a bad
+            // `--endpoints`. Panic instead: a non-zero exit + diagnostic is a loud, restartable
+            // failure the supervisor and operator both act on.
+            panic!(
+                "wyrd custodian: NO configured D server was reachable at startup ({} endpoint(s) \
+                 all unreachable) — refusing to run a reconstruction plane over an empty fleet. \
+                 Check the D-server fleet / --endpoints and restart.",
+                endpoints.len()
+            );
+        }
+        eprintln!(
+            "wyrd custodian: reconstruction plane over {} reachable D server(s) of {} configured",
+            configured.len(),
+            endpoints.len()
+        );
+
+        // Open the SAME metadata store the cluster wrote to (redb dev / TiKV prod) and run
+        // the leader-elected reconstruction loop through the telemetry handle.
+        run_reconstruction_over_backend(
+            backend,
+            data_dir,
+            &service,
+            &zone,
+            &custodian,
+            &configured,
+            interval,
+            clock,
+            shutdown,
+        )
+        .await?;
+        Ok::<(), BoxError>(())
+    })?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Open the metadata store the cluster wrote to for the configured `backend` and run the
+/// custodian's leader-elected reconstruction loop over it — the **exact production
+/// backend-open path** `wyrd custodian` drives (redb dev / TiKV prod, ADR-0014), factored
+/// out so a backend-driven regression can exercise it: routing the deployable role through
+/// the wrong metadata plane (an empty local redb where the cluster ran TiKV) would leave
+/// the day-one under-replicated gauge reading a permanent healthy zero (iteration-3
+/// rejection). The `tikv` arm is `#[cfg]`-gated out of the default build exactly as
+/// `cmd_put` / `cmd_get`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_reconstruction_over_backend<Fut, Clock>(
+    backend: MetadataBackend,
+    data_dir: &str,
+    service: &CustodianService,
+    zone: &FencedZone,
+    custodian: &Custodian,
+    configured: &[ConfiguredDServer],
+    interval: Duration,
+    clock: Clock,
+    shutdown: Fut,
+) -> Result<(), BoxError>
+where
+    Fut: Future<Output = ()>,
+    Clock: FnMut() -> u64,
+{
+    match backend {
+        MetadataBackend::Redb => {
+            let meta = open_local_meta_redb(data_dir)?;
+            service
+                .run_reconstruction_until(
+                    zone, custodian, &meta, configured, interval, clock, shutdown,
+                )
+                .await?;
+        }
+        #[cfg(feature = "tikv")]
+        MetadataBackend::Tikv => {
+            let meta = open_tikv_meta().await?;
+            service
+                .run_reconstruction_until(
+                    zone, custodian, &meta, configured, interval, clock, shutdown,
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Require the operator-supplied topology (`--ids`, `--failure-domains`) to be present and
+/// aligned one-per-endpoint, REJECTING any missing / short / mismatched list — the role
+/// never fabricates identity or topology from endpoint order.
+///
+/// The prior positional fallback (`id = endpoint index`, `failure_domain = endpoint URL`)
+/// *invents* topology: two D-servers in one physical failure domain reached at different
+/// URLs would be handed distinct fabricated domains, so the reconstruction selector could
+/// re-place a rebuilt fragment into the same real domain as a survivor — defeating the
+/// cross-domain durability invariant the custodian exists to uphold. Each D-server's OWN
+/// registered `--id` / `--failure-domain` is supplied instead; deriving it automatically
+/// awaits the out-of-scope etcd `Coordination` discovery seam (0015's other prerequisite
+/// half). `n_endpoints` is always ≥ 1 here (an empty `--endpoints` short-circuits earlier).
+pub fn require_aligned_topology(
+    n_endpoints: usize,
+    ids: &[u64],
+    domains: &[String],
+) -> Result<(), BoxError> {
+    if ids.len() != n_endpoints {
+        return Err(format!(
+            "custodian: --ids has {} entr(y|ies) but --endpoints has {n_endpoints}; supply one \
+             stable D-server id per endpoint (matching each D-server's own --id) — the role does \
+             not fabricate identity from endpoint order",
+            ids.len()
+        )
+        .into());
+    }
+    if domains.len() != n_endpoints {
+        return Err(format!(
+            "custodian: --failure-domains has {} entr(y|ies) but --endpoints has {n_endpoints}; \
+             supply one failure-domain label per endpoint (matching each D-server's own \
+             --failure-domain) — the role does not fabricate topology from endpoint order",
+            domains.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The production [`DServerConnector`]: dials each D-server over gRPC with a connect/request
+/// timeout ([`GrpcChunkStore::connect_with_timeout`]) so a paused / partitioned peer fails
+/// transiently rather than hanging the reconcile loop. This is the one concrete-transport
+/// call [`connect_fleet`] makes; a test injects a fake in its place (no network), which is
+/// how the fleet-assembly + start-degraded behaviour is covered headlessly.
+struct GrpcDServerConnector;
+
+#[async_trait::async_trait]
+impl DServerConnector for GrpcDServerConnector {
+    async fn connect(
+        &self,
+        endpoint: &str,
+        timeout: Duration,
+    ) -> Result<Arc<dyn ChunkStore>, BoxError> {
+        let client = GrpcChunkStore::connect_with_timeout(endpoint.to_string(), timeout)
+            .await
+            .map_err(|e| format!("custodian: cannot connect to D server `{endpoint}`: {e}"))?;
+        Ok(Arc::new(client) as Arc<dyn ChunkStore>)
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch — the real instant the custodian's loop
+/// stamps its time-to-repair samples with. Monotonic enough for telemetry; a clock skew
+/// never corrupts state (the loop is fenced by leadership, not time).
+fn wall_clock_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Parse an optional comma-separated list of `u64`s (the `--ids` flag), aligned to the
+/// `--endpoints` order; absent ⇒ empty. An empty (or short) list is REJECTED by the
+/// custodian caller when `--endpoints` is present — the role never fabricates identity.
+fn parse_u64_list(raw: Option<&str>) -> Result<Vec<u64>, BoxError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<u64>().map_err(|_| {
+                format!("custodian: invalid --ids entry `{s}` (expected a whole number)").into()
+            })
+        })
+        .collect()
+}
+
+/// Parse an optional comma-separated list of failure-domain labels (`--failure-domains`),
+/// aligned to the `--endpoints` order; absent ⇒ empty. An empty (or short) list is REJECTED
+/// by the custodian caller when `--endpoints` is present — the role never fabricates topology.
+fn parse_str_list(raw: Option<&str>) -> Vec<String> {
+    match raw {
+        Some(raw) => raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Parse an optional `--<name> <u64>` flag, defaulting when absent.
@@ -836,6 +1198,29 @@ mod tests {
         );
         assert!(parse_durability("rs(0,1)").is_err(), "k must be at least 1");
         assert!(parse_durability("nonsense").is_err());
+    }
+
+    /// `require_aligned_topology` — the custodian rejects fabricated topology. With
+    /// `--endpoints` present, BOTH `--ids` and `--failure-domains` must be supplied
+    /// one-per-endpoint; a missing / short / long list is an error (never a positional
+    /// `id = index` / `domain = URL` fallback, which could collapse two real failure
+    /// domains into one and defeat cross-domain durability). Only exact alignment passes.
+    #[test]
+    fn require_aligned_topology_rejects_missing_or_mismatched_lists() {
+        let d = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Exact one-per-endpoint alignment is the ONLY accepted shape.
+        assert!(require_aligned_topology(2, &[7, 9], &d(&["rack-a", "rack-b"])).is_ok());
+
+        // Missing --ids entirely (the brief's canonical `wyrd custodian --otlp-endpoint …`
+        // command, which omits topology): rejected, not fabricated positionally.
+        assert!(require_aligned_topology(2, &[], &d(&["rack-a", "rack-b"])).is_err());
+        // Missing --failure-domains entirely: rejected.
+        assert!(require_aligned_topology(2, &[7, 9], &d(&[])).is_err());
+        // Short / long lists (a typo dropping or adding an entry): rejected.
+        assert!(require_aligned_topology(3, &[7, 9], &d(&["a", "b", "c"])).is_err());
+        assert!(require_aligned_topology(2, &[7, 9, 11], &d(&["a", "b"])).is_err());
+        assert!(require_aligned_topology(2, &[7, 9], &d(&["a", "b", "c"])).is_err());
     }
 
     /// `parse_endpoints` — `:413` `delete !`. The `!s.is_empty()` filter drops

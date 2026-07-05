@@ -3735,20 +3735,15 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-prometheus",
- "opentelemetry_sdk",
- "prometheus 0.14.0",
  "tempfile",
  "tokio",
  "tracing",
- "tracing-opentelemetry",
  "tracing-subscriber",
  "wyrd-chunk-format",
  "wyrd-chunkstore-fs",
  "wyrd-coordination-mem",
  "wyrd-core",
+ "wyrd-telemetry",
  "wyrd-testkit",
  "wyrd-traits",
 ]
@@ -3841,15 +3836,33 @@ dependencies = [
  "tokio-stream",
  "tonic 0.14.6",
  "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
  "wyrd-chunk-format",
  "wyrd-chunkstore-fs",
  "wyrd-chunkstore-grpc",
  "wyrd-coordination-mem",
  "wyrd-core",
+ "wyrd-custodian",
  "wyrd-metadata-redb",
  "wyrd-metadata-tikv",
+ "wyrd-telemetry",
  "wyrd-testkit",
  "wyrd-traits",
+]
+
+[[package]]
+name = "wyrd-telemetry"
+version = "0.0.0"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry-prometheus",
+ "opentelemetry_sdk",
+ "prometheus 0.14.0",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]

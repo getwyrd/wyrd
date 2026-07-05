@@ -18,6 +18,7 @@ members = [
     "crates/chunkstore-fs",
     "crates/chunkstore-grpc",
     "crates/coordination-mem",
+    "crates/telemetry",
     "crates/custodian",
     "crates/server",
     "crates/dst",
@@ -45,6 +46,9 @@ wyrd-metadata-tikv = { path = "crates/metadata-tikv" }
 wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
 wyrd-chunkstore-grpc = { path = "crates/chunkstore-grpc" }
 wyrd-coordination-mem = { path = "crates/coordination-mem" }
+# The shared backend-agnostic telemetry seam (observability floor, proposal 0010
+# item 1) — extracted from custodian so no leaf crate anchors the export path.
+wyrd-telemetry = { path = "crates/telemetry" }
 wyrd-custodian = { path = "crates/custodian" }
 
 # Shared third-party dependencies, version-pinned once here.
