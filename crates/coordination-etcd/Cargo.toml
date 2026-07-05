@@ -1,0 +1,66 @@
+[package]
+name = "wyrd-coordination-etcd"
+description = "etcd-backed Coordination (ADR-0006): the networked SECOND implementation of the L5 `Coordination` trait — leased service discovery, single-leader election with fencing tokens, mutually-exclusive fenced locks, and revisioned config — behind the byte-for-byte-unchanged trait, selected by `server` composition (ADR-0008/0016). The mirror of `metadata-tikv` for `MetadataStore` (proposal 0015 §\"Deployment prerequisite\", #365)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# OFF by default. The real `etcd-client` tree REGENERATES its etcd protobufs at
+# build time (it needs a system `protoc`) and dials a live etcd, so the default
+# `cargo xtask ci` on a laptop/worktree never compiles it and stays green — the
+# `metadata-tikv` posture (the ADR-0003 three-test audit + `deny.toml` allowlist
+# review for the etcd client is a NEEDS-HUMAN; INTEGRATION §4). The store itself is
+# ALSO compiled under `--cfg madsim`, where `etcd-client` ALIASES to
+# `madsim-etcd-client` (no protoc, no live etcd), so its distributed correctness is
+# proven DETERMINISTICALLY by the `dst` tier (`crates/dst/tests/coordination.rs`),
+# not resting on a manual real-etcd invocation. `cargo xtask etcd-conformance`
+# turns this feature on and drives the shared suite against a throwaway `deploy/` etcd.
+default = []
+etcd = ["dep:etcd-client", "dep:tokio"]
+
+[dependencies]
+wyrd-traits.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+# The real etcd client + a real reactor to host its keep-alive — optional, pulled
+# in ONLY by the `etcd` feature (ADR-0016: a concrete backend depends on `traits` +
+# its own backend client + runtime, never on `core` or a sibling concrete).
+etcd-client = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+# Under `--cfg madsim` the store compiles against the etcd SIMULATOR, aliased to
+# the same `etcd_client` path so ONE code path serves real etcd and the simulator.
+# `madsim-tokio` provides the spawn/time/sync surface the keep-alive uses, on the
+# deterministic simulated runtime (ADR-0009) — the same aliasing `dst`/`proto` use
+# for `tonic` -> `madsim-tonic`.
+# The rename-alias is specified inline (a member can't rename an inherited
+# workspace dep), exactly as `dst`/`proto` specify `madsim-tonic` inline.
+[target.'cfg(madsim)'.dependencies]
+etcd-client = { package = "madsim-etcd-client", version = "0.6.0" }
+tokio = { package = "madsim-tokio", version = "0.2.30", features = [
+    "rt",
+    "time",
+    "sync",
+    "macros",
+] }
+
+[dev-dependencies]
+# The shared trait-contract suite (the same one `coordination-mem` drives). Under
+# `--cfg madsim` it is driven against real store code over the simulator; with
+# `--features etcd` against a real etcd (endpoint-gated).
+wyrd-coordination-conformance.workspace = true
+
+# `etcd-client` / `tokio` are used only under the `etcd` feature (and the madsim
+# alias); keep cargo-machete quiet on the default (feature-off, non-madsim) scan,
+# where the optional deps look unreferenced.
+[package.metadata.cargo-machete]
+ignored = ["etcd-client", "tokio"]
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

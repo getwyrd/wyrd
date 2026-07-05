@@ -18,6 +18,9 @@ async-trait.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+# The SHARED `Coordination` trait-contract suite (the same one `coordination-etcd`
+# drives), so the L5 trait is pinned by both implementations, not forked (ADR-0006).
+wyrd-coordination-conformance.workspace = true
 # The conformance suite is written against the trait surface and driven by
 # pollster (the in-memory methods never yield).
 pollster.workspace = true

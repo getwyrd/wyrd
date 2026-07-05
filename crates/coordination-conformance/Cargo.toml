@@ -1,0 +1,31 @@
+[package]
+name = "wyrd-coordination-conformance"
+description = "The shared Coordination trait-contract suite (ADR-0006): backend-agnostic register/discover, election-with-fencing, mutually-exclusive locks, renew/revoke, and revisioned-config assertions, driven by every concrete backend's test target so the L5 trait is pinned by both implementations (coordination-mem AND coordination-etcd), not forked (proposal 0015 §\"Deployment prerequisite\", #365)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The suite is written against the trait surface ONLY (ADR-0016 dependency rule):
+# it never depends on a concrete backend, so both `coordination-mem` and
+# `coordination-etcd` can drive the identical assertions — the "one contract, two
+# implementations" pin (ADR-0006), the mirror of `metadata-conformance` for
+# `MetadataStore`.
+wyrd-traits.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+# `tests/demonstrated_red.rs` implements deliberately-violating `Coordination`
+# stubs in-crate, dev-scope only (never shipped, never a real backend) to prove
+# every clause is load-bearing (non-vacuous) — the mirror of
+# `metadata-conformance`'s demonstrated-red.
+async-trait.workspace = true
+pollster.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true
