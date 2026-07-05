@@ -18,6 +18,13 @@
 //!   throwaway single-node TiKV under `deploy/` and drive the shared `MetadataStore`
 //!   conformance suite against it. Not part of `ci` (it needs a container runtime);
 //!   the conformance test itself skips cleanly when no TiKV endpoint is configured.
+//! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
+//!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
+//!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
+//!   properties against it (`cargo test -p wyrd-coordination-etcd --features etcd`).
+//!   Not part of `ci` (it needs a container runtime AND a system `protoc`); the test
+//!   itself skips cleanly when no etcd endpoint is configured. The DETERMINISTIC proof
+//!   of the same store is in the `dst` tier (madsim etcd simulator), which is IN `ci`.
 //! - `disk-faults` / `jepsen` / `kill-reconstruct` — the deferred (off-Check)
 //!   Tier-1 / Tier-2 custodian fault runners (M3, proposal 0005 `0005:405-411`,
 //!   `0005:437-438`). Privileged / real-environment tiers, never part of `ci`;
@@ -54,6 +61,7 @@ fn main() -> ExitCode {
         Some("statics") => run_statics(),
         Some("integration") => run_integration(),
         Some("tikv-conformance") => run_tikv_conformance(),
+        Some("etcd-conformance") => run_etcd_conformance(),
         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("disk-faults") => faults::run_disk_faults(),
         Some("jepsen") => faults::run_jepsen(),
@@ -82,7 +90,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|bench>"
     );
 }
 
@@ -250,6 +258,185 @@ fn run_tikv_test(test: &str) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
     }
     Err(last)
+}
+
+/// The compose project name for the throwaway single-node etcd, isolated and torn
+/// down cleanly.
+const ETCD_PROJECT: &str = "wyrd-etcd-l5";
+/// etcd's client endpoint the host reaches (`deploy/etcd-single-node`).
+const ETCD_ENDPOINT: &str = "127.0.0.1:2379";
+
+/// Run the L5 Coordination conformance job (#365, proposal 0015 §"Deployment
+/// prerequisite"): bring up the throwaway single-node etcd under `deploy/`, drive
+/// the **shared** `Coordination` conformance suite + the cross-instance properties
+/// against it (`cargo test -p wyrd-coordination-etcd --features etcd`), then tear it
+/// down. **Not** part of `run_ci` — it needs a container runtime AND a system
+/// `protoc` to compile the real `etcd-client`, exactly like `run_tikv_conformance`
+/// needs a container; without either it is a hard failure in CI and a warn-and-skip
+/// locally (the conformance test ITSELF also skips cleanly when `WYRD_ETCD_ENDPOINTS`
+/// is unset, so `ci` stays green regardless).
+///
+/// The DETERMINISTIC proof of the same store lives in the `dst` tier
+/// (`crates/dst/tests/coordination.rs`, madsim etcd simulator), which needs neither a
+/// container nor `protoc`; this job is the real-etcd home that pins fidelity.
+fn run_etcd_conformance() -> Result<(), String> {
+    let compose = workspace_root().join("deploy/etcd-single-node/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    // This job's ONLY purpose is to prove the real etcd store passes the shared
+    // suite, so it must NEVER report success without actually having run it. If the
+    // required tooling is missing we FAIL LOUD — locally as well as in CI — rather
+    // than warn-and-return-`Ok` (a "false green": exit 0 having proved nothing).
+    // The DETERMINISTIC, always-runnable proof of the same store lives in the `dst`
+    // tier (madsim etcd simulator, in `ci`); this job is the real-etcd fidelity
+    // backstop and is invoked deliberately, not from `ci`.
+    if !docker_available() {
+        return Err(
+            "docker is not available but is required for the etcd conformance job; without it \
+             this job proves nothing and must not report success. Install Docker (and the \
+             compose plugin) to run it, or rely on the deterministic `cargo xtask dst` proof."
+                .into(),
+        );
+    }
+    // The real `etcd-client` regenerates its protobufs at build time; without a
+    // system `protoc` the `--features etcd` build cannot even compile, so a run
+    // would prove nothing.
+    if !protoc_available() {
+        return Err(
+            "protoc is not available but is required to build `--features etcd` for the etcd \
+             conformance job; without it this job proves nothing and must not report success. \
+             Install the Protocol Buffers compiler (`protoc`), or rely on the deterministic \
+             `cargo xtask dst` proof."
+                .into(),
+        );
+    }
+
+    etcd_compose(&compose, &["up", "-d"])?;
+    let result = wait_for_port(ETCD_ENDPOINT).and_then(|()| run_etcd_conformance_test());
+    // Always tear the stack down, even on failure — a run never leaks containers.
+    let _ = etcd_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    result?;
+    println!("\nxtask etcd-conformance: etcd passed the shared Coordination conformance suite");
+    Ok(())
+}
+
+/// Run the endpoint-gated etcd conformance test with `--features etcd` and the
+/// endpoint exported, with retry/backoff (etcd can lag its port opening).
+///
+/// COMPILE and RUN are separated deliberately. A build failure (e.g. the iter-5
+/// E0599 missing-import in a file no `ci` gate compiles) is NOT a bootstrap flake:
+/// retrying it 5× wastes minutes and — worse — reports it as "etcd may still be
+/// bootstrapping", masquerading a hard defect as transient. So `--no-run` builds
+/// first; a build failure fails LOUD and immediately, and only the actual test RUN
+/// (which genuinely can race etcd's port coming up) is retried with backoff.
+fn run_etcd_conformance_test() -> Result<(), String> {
+    // 1. Build the test binary. A non-zero exit here is a compile error, never a
+    //    bootstrap flake — surface it as such and do NOT retry.
+    print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-coordination-etcd",
+        "--features",
+        "etcd",
+        "--test",
+        "conformance",
+        "--no-run",
+    ]);
+    let build = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "wyrd-coordination-etcd",
+            "--features",
+            "etcd",
+            "--test",
+            "conformance",
+            "--no-run",
+        ])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if !build.success() {
+        return Err(format!(
+            "the `--features etcd` conformance test failed to COMPILE ({build}); this is a build \
+             error, not an etcd bootstrap flake — fix the code (it is not retried)."
+        ));
+    }
+
+    // 2. Run the (already-built) test, retrying only the RUN — etcd can lag its
+    //    port opening, which IS transient.
+    print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-coordination-etcd",
+        "--features",
+        "etcd",
+        "--test",
+        "conformance",
+    ]);
+    let mut last = String::new();
+    for attempt in 1..=5 {
+        let status = Command::new("cargo")
+            .args([
+                "test",
+                "-p",
+                "wyrd-coordination-etcd",
+                "--features",
+                "etcd",
+                "--test",
+                "conformance",
+                "--",
+                "--nocapture",
+            ])
+            .current_dir(workspace_root())
+            .env("WYRD_ETCD_ENDPOINTS", format!("http://{ETCD_ENDPOINT}"))
+            .status()
+            .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        last = format!("etcd conformance test failed with {status}");
+        eprintln!(
+            "xtask etcd-conformance: run attempt {attempt}/5 failed; etcd may still be \
+             bootstrapping (the test binary already built, so this is a run-time retry)"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
+    }
+    Err(last)
+}
+
+/// Run a `docker compose -p <ETCD_PROJECT> -f <file> …` command from the workspace
+/// root, echoing it first. Mirrors `tikv_compose`.
+fn etcd_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", ETCD_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
+}
+
+/// Is a `protoc` binary reachable? (The real `etcd-client` build script needs it.)
+fn protoc_available() -> bool {
+    Command::new("protoc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// The compose project name for the M4.5 "Small multi-node Production" stack, so it
@@ -643,6 +830,11 @@ const STATICS_SCAN_CRATES: &[&str] = &[
     "crates/testkit",
     "crates/custodian",
     "crates/coordination-mem",
+    // Now DST-reachable via `crates/dst/tests/coordination.rs`, which drives the
+    // etcd store over the madsim etcd simulator (#365) — so it falls under the
+    // ADR-0035 rule. It holds no process-global mutable state (only a `Mutex`
+    // FIELD), so the scan passes.
+    "crates/coordination-etcd",
     "crates/chunkstore-fs",
     "crates/chunkstore-grpc",
     "crates/chunk-format",
