@@ -297,7 +297,7 @@ where
     /// The dirent and its inode are removed under a compare-and-set on both records
     /// ([`metadata::unlink`]). If a concurrent writer wins that CAS, we re-resolve:
     /// a racing DELETE that already removed the key is success (the *observable*
-    /// outcome is idempotent — two concurrent DELETEs of the same key both succeed),
+    /// outcome is idempotent — two concurrent DELETE operations on the same key both succeed),
     /// while a racing overwrite is retried against the new record.
     ///
     /// The removed object's chunk fragments are **not** reclaimed eagerly on the delete

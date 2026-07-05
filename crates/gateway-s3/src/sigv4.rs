@@ -463,7 +463,7 @@ pub fn verify(
     // set (issue #364 carry-forward, iter-6 item 3 — "no half-accept"): the earlier open
     // `starts_with("STREAMING-")` accepted *any* streaming-looking sentinel, including
     // framings the `aws-chunked` decoder ([`super::streaming`]) cannot de-frame — a
-    // half-accept that would mis-parse a body it claimed to understand. Now every branch is
+    // half-accept that would misread a body it claimed to understand. Now every branch is
     // a form the pipeline actually handles; anything else is refused cleanly here. An
     // `aws-chunked` streaming upload carries the seed signature (head of the per-chunk chain)
     // and scope the decoder verifies each chunk with, so a stock SDK PUT round-trips instead
