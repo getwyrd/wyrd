@@ -165,23 +165,22 @@ jobs:
             esac
           }
 
-          # Strip the `status:` and any `superseded-by:`/`superseded_by:` lines
-          # from *within the frontmatter only*, leaving the frontmatter delimiters
-          # and the entire body verbatim. Two files that are identical after this
-          # differ only in those permitted fields.
-          canonicalize_for_stamp() {
+          # 1-based line number of the frontmatter's closing `---` on stdin, or
+          # empty if there is no closing delimiter. The body is everything after.
+          frontmatter_close_line() {
             awk '
-              BEGIN { fm = 0; done = 0 }
-              NR == 1 && $0 == "---" { fm = 1; print; next }
-              fm == 1 && done == 0 && /^---[[:space:]]*$/ { done = 1; print; next }
-              fm == 1 && done == 0 {
-                line = tolower($0)
-                if (line ~ /^status:/) next
-                if (line ~ /^superseded[-_]by:/) next
-                print; next
-              }
-              { print }
+              NR == 1 && $0 == "---" { fm = 1; next }
+              fm == 1 && /^---[[:space:]]*$/ { print NR; exit }
             '
+          }
+
+          # The frontmatter (lines 1..close) with the `status:` and any
+          # `superseded-by:`/`superseded_by:` lines removed — the only fields a
+          # stamp may touch.
+          frontmatter_canon() {
+            local ref="$1" path="$2" close="$3"
+            git show "$ref:$path" | sed -n "1,${close}p" \
+              | grep -viE '^(status:|superseded[-_]by:)' || true
           }
 
           # True iff the change to `path` is a pure supersession stamp: base is the
@@ -190,7 +189,7 @@ jobs:
           # removed. Deletions and renames (head absent) never qualify.
           is_supersession_stamp() {
             local path="$1"
-            local want_base base_status head_status
+            local want_base base_status head_status base_close head_close
 
             want_base=$(frozen_source_status "$path") || return 1
 
@@ -199,10 +198,21 @@ jobs:
             [ "$(normalized_status "$base_status")" = "$want_base" ] || return 1
             [ "$(normalized_status "$head_status")" = "superseded" ] || return 1
 
-            local base_canon head_canon
-            base_canon=$(git show "$BASE_SHA:$path" | canonicalize_for_stamp)
-            head_canon=$(git show "$HEAD_SHA:$path" | canonicalize_for_stamp)
-            [ "$base_canon" = "$head_canon" ]
+            base_close=$(git show "$BASE_SHA:$path" | frontmatter_close_line)
+            head_close=$(git show "$HEAD_SHA:$path" | frontmatter_close_line)
+            [ -n "$base_close" ] && [ -n "$head_close" ] || return 1
+
+            # Frontmatter (minus the status / superseded-by fields a stamp may
+            # touch) must match, and the body after the frontmatter must be
+            # byte-for-byte identical. cmp on the raw body stream — not a "$(...)"
+            # capture, which strips trailing newlines — so an added/removed blank
+            # line or terminal newline at EOF cannot slip a body change through.
+            cmp -s \
+              <(frontmatter_canon "$BASE_SHA" "$path" "$base_close") \
+              <(frontmatter_canon "$HEAD_SHA" "$path" "$head_close") || return 1
+            cmp -s \
+              <(git show "$BASE_SHA:$path" | tail -n +"$((base_close + 1))") \
+              <(git show "$HEAD_SHA:$path" | tail -n +"$((head_close + 1))")
           }
 
           check_path() {
