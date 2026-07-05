@@ -3772,6 +3772,7 @@ dependencies = [
  "wyrd-coordination-mem",
  "wyrd-core",
  "wyrd-custodian",
+ "wyrd-metadata-conformance",
  "wyrd-metadata-redb",
  "wyrd-testkit",
  "wyrd-traits",
