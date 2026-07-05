@@ -499,16 +499,17 @@ pub fn verify(
 /// [`verify`] must refuse rather than half-accept (issue #364 carry-forward, iter-6 item 3).
 ///
 /// The `-TRAILER` variants append trailer headers (and, for the signed variant, a trailer
-/// signature) *after* the terminating zero-length chunk; the data-chunk signature chain is
-/// identical to the non-trailer form, so the decoder verifies the object bytes the same way
-/// and the trailer — which carries only a checksum, not object data — is consumed and not
-/// re-validated (a documented residual; the chunk signatures already authenticate the body).
+/// signature) *after* the terminating zero-length chunk. The `aws-chunked` decoder
+/// ([`super::streaming::Decoder::next_chunk`]) requires an immediate CRLF after that zero
+/// chunk and cannot consume those trailer bytes, so admitting a `-TRAILER` sentinel is a
+/// half-accept: a real checksum-trailer upload would authenticate and then fail mid-body as
+/// malformed (issue #364 carry-forward, iter-6 item 3 — "no half-accept"). So they return
+/// `None` here and are refused up front, before any body is read. The only fully-consumable
+/// framing is the signed, no-trailer `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`. Trailer
+/// consumption/verification stays deferred with the rest of the streaming-checksum surface.
 fn streaming_variant(sentinel: &str) -> Option<bool> {
     match sentinel {
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => {
-            Some(true)
-        }
-        "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Some(false),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Some(true),
         _ => None,
     }
 }
@@ -1009,19 +1010,16 @@ mod tests {
                 ..
             }))
         ));
+        // The `-TRAILER` variants are refused up front: the decoder cannot consume the
+        // trailer bytes after the terminating zero chunk, so admitting them would be the
+        // iter-6 half-accept (authenticate, then fail mid-body). Rejected cleanly here.
         assert!(matches!(
             verify_with_claim("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"),
-            Ok(PayloadHash::Streaming(StreamingContext {
-                signed: true,
-                ..
-            }))
+            Err(AuthError::Malformed(_))
         ));
         assert!(matches!(
             verify_with_claim("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
-            Ok(PayloadHash::Streaming(StreamingContext {
-                signed: false,
-                ..
-            }))
+            Err(AuthError::Malformed(_))
         ));
         // A literal 64-char hex digest is a signed single-shot payload.
         let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";

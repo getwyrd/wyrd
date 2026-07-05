@@ -242,9 +242,10 @@ where
         }
 
         if size == 0 {
-            // The terminating chunk: nothing more is object data (any trailer headers that
-            // follow are consumed-and-ignored — the seed/chunk signatures already
-            // authenticated the body).
+            // The terminating chunk: nothing more is object data. Only the signed,
+            // no-trailer `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` framing reaches this decoder —
+            // `sigv4::streaming_variant` refuses the `-TRAILER` sentinels up front — so the
+            // zero chunk is followed by the closing CRLF (checked above), not trailer bytes.
             self.done = true;
             return Ok(None);
         }

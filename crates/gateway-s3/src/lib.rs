@@ -159,6 +159,53 @@ where
     }
 }
 
+/// The S3 subresource / multipart query keys this object-only floor does not implement.
+/// A request carrying any of them is refused (501) rather than falling through to a plain
+/// object PUT/GET/DELETE, which would mis-handle it — destructively for `PUT ?partNumber`
+/// (UploadPart) and `DELETE ?tagging`. Returns the first offending key found. Benign
+/// params a normal SDK adds to ordinary object requests (e.g. `x-id=PutObject`) are not
+/// listed, so they still pass; this is a denylist of unsupported operations, not a ban on
+/// all query strings.
+fn unsupported_subresource(query: &str) -> Option<&str> {
+    const SUBRESOURCES: &[&str] = &[
+        "uploads",
+        "uploadId",
+        "partNumber",
+        "tagging",
+        "acl",
+        "versions",
+        "versionId",
+        "cors",
+        "lifecycle",
+        "policy",
+        "website",
+        "location",
+        "delete",
+        "restore",
+        "select",
+        "retention",
+        "legal-hold",
+        "torrent",
+        "accelerate",
+        "logging",
+        "notification",
+        "replication",
+        "encryption",
+        "requestPayment",
+        "analytics",
+        "inventory",
+        "metrics",
+        "object-lock",
+        "publicAccessBlock",
+        "attributes",
+    ];
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
+        .find(|k| SUBRESOURCES.contains(k))
+}
+
 /// Split a request path `/{bucket}/{key}` into `(bucket, key)`. `key` may itself contain
 /// `/` (a nested key on the flat namespace). Returns `None` for a bucket-only or empty
 /// path — bucket-level operations are out of scope.
@@ -212,6 +259,20 @@ where
         percent_decode_utf8(bucket),
         percent_decode_utf8(key)
     );
+
+    // Subresource / multipart query forms (?uploadId, ?partNumber, ?tagging, ?acl, …) are
+    // out of scope (brief §Out-of-scope: multipart upload, ACLs, the full S3 surface).
+    // Dispatch below is by method only — the query is used solely for SigV4 — so without
+    // this guard a `PUT /b/k?partNumber=1&uploadId=…` (UploadPart) would silently OVERWRITE
+    // the whole object and a `DELETE /b/k?tagging` would DELETE the object itself, both
+    // returning 2xx. Refuse a form we do not implement rather than mis-handle it.
+    if let Some(sub) = unsupported_subresource(&query) {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            &format!("the `{sub}` S3 subresource/operation is not supported"),
+        );
+    }
 
     match method {
         Method::PUT => {
@@ -406,6 +467,24 @@ mod tests {
         assert_eq!(split_bucket_key("/bucket/"), None);
         assert_eq!(split_bucket_key("/bucket"), None);
         assert_eq!(split_bucket_key("/"), None);
+    }
+
+    #[test]
+    fn unsupported_subresource_flags_multipart_and_subresource_forms() {
+        // Destructive if mis-handled: UploadPart would overwrite the whole object,
+        // ?tagging DELETE would delete the object. These must be refused (501).
+        assert_eq!(
+            unsupported_subresource("partNumber=1&uploadId=abc"),
+            Some("partNumber")
+        );
+        assert_eq!(unsupported_subresource("uploads"), Some("uploads"));
+        assert_eq!(unsupported_subresource("tagging"), Some("tagging"));
+        assert_eq!(unsupported_subresource("acl"), Some("acl"));
+        assert_eq!(unsupported_subresource("versionId=3"), Some("versionId"));
+        // Ordinary object requests pass: empty query, and the benign x-id a real SDK adds.
+        assert_eq!(unsupported_subresource(""), None);
+        assert_eq!(unsupported_subresource("x-id=PutObject"), None);
+        assert_eq!(unsupported_subresource("x-id=GetObject"), None);
     }
 
     #[test]
