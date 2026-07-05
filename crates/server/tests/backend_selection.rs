@@ -42,7 +42,7 @@ fn coordination_backend_selects_by_config() {
         "an unknown coordination backend name is a config error"
     );
     // `etcd` is accepted only under `--features etcd`; without it, it is rejected
-    // with a build hint rather than silently falling back (a mis-selection must
+    // with a build hint rather than silently falling back (an invalid selection must
     // fail loud). Under the feature the same value selects the etcd concrete.
     #[cfg(not(feature = "etcd"))]
     assert!(

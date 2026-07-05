@@ -11,7 +11,7 @@
 //!   it **skips cleanly** so `cargo xtask ci` stays green.
 //! - With the endpoint set but built WITHOUT `--features etcd` it **panics** —
 //!   asking for a real-etcd run on a build that cannot serve one is an operator
-//!   error (a mis-wired Tier-2 job), never a silent pass.
+//!   error (a misconfigured Tier-2 job), never a silent pass.
 //!
 //! `cargo xtask etcd-conformance` brings up the throwaway `deploy/etcd-single-node`
 //! etcd, exports the endpoint, rebuilds with `--features etcd`, and runs it. The
