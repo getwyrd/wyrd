@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use wyrd_traits::{CommitOutcome, MetadataStore, Precondition, Result, WriteBatch};
+use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Precondition, Result, WriteBatch};
 
 /// How faithfully the model renders a commit's async shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,8 +168,16 @@ impl SimTikvMetadataStore {
     /// pessimistic locks and checks preconditions, the **mid-commit** await, then an
     /// atomic apply that releases the locks. The winner is decided at prewrite, so
     /// exactly one writer wins even though a commit spans two await boundaries.
-    async fn commit_await_inside(&self, batch: &WriteBatch) -> CommitOutcome {
+    async fn commit_await_inside(&self, batch: &WriteBatch) -> Result<CommitOutcome> {
         let keys = write_set(batch);
+        // A batch WITH preconditions is a CAS: losing a lock race is the trait's
+        // `Conflict` that the caller re-reads and retries. A precondition-FREE (blind)
+        // batch has no precondition to have failed, so a lost race must NOT surface as
+        // `Conflict` — the blind writers that use `?` and ignore the `CommitOutcome`
+        // (core::write::intent -> metadata::put_pending / sweep_pending) would read it
+        // as success and silently drop the write. It stays `Err`, mirroring the real
+        // adapter's `conflict_or_err` (crates/metadata-tikv/src/lib.rs:382-414).
+        let conditional = !batch.preconditions.is_empty();
 
         // Phase 1 — begin / TSO: a network hop. Every concurrent writer yields here.
         network_hop().await;
@@ -184,10 +192,18 @@ impl SimTikvMetadataStore {
             // commit can never produce.
             if keys.iter().any(|k| inner.locks.contains(k)) {
                 inner.obs.mid_commit_lock_conflicts += 1;
-                return CommitOutcome::Conflict;
+                return if conditional {
+                    Ok(CommitOutcome::Conflict)
+                } else {
+                    Err(BoxError::from(
+                        "simulated-TiKV: blind (precondition-free) batch lost a \
+                         write-write lock race — surfaced as Err, never a silent Conflict",
+                    ))
+                };
             }
             if !preconditions_hold(&inner.truth, &batch.preconditions) {
-                return CommitOutcome::Conflict;
+                // Only reachable with preconditions present, so this is a true CAS miss.
+                return Ok(CommitOutcome::Conflict);
             }
             for key in &keys {
                 inner.locks.insert(key.clone());
@@ -209,7 +225,7 @@ impl SimTikvMetadataStore {
             }
             inner.inflight -= 1;
         }
-        CommitOutcome::Committed
+        Ok(CommitOutcome::Committed)
     }
 }
 
@@ -236,9 +252,9 @@ impl MetadataStore for SimTikvMetadataStore {
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
-        Ok(match self.fidelity {
-            Fidelity::SynchronousRedbShaped => self.commit_synchronous(&batch),
+        match self.fidelity {
+            Fidelity::SynchronousRedbShaped => Ok(self.commit_synchronous(&batch)),
             Fidelity::AwaitInsideCommit => self.commit_await_inside(&batch).await,
-        })
+        }
     }
 }

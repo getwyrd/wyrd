@@ -39,7 +39,7 @@ use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
 use wyrd_metadata_redb::RedbMetadataStore;
-use wyrd_traits::{CommitOutcome, MetadataStore};
+use wyrd_traits::{CommitOutcome, MetadataStore, WriteBatch};
 
 #[path = "support/mod.rs"]
 mod support;
@@ -203,5 +203,76 @@ fn synchronous_redb_shaped_commit_never_reaches_the_interleaving() {
          prewrite observes another writer mid-commit (else the exactly-one-winner \
          coverage is vacuous); saw {} mid-commit observations",
         obs.mid_commit_lock_conflicts,
+    );
+}
+
+/// Regression (Codex P2 on #447): a **blind** (precondition-free) batch that loses a
+/// mid-commit lock race must surface as `Err`, never `Ok(Conflict)`. The real adapter
+/// keeps blind write-write races as `Err` (`crates/metadata-tikv/src/lib.rs:382-414`)
+/// precisely so the many blind writers that `await?` and ignore the `CommitOutcome`
+/// (`core::write::intent` -> `metadata::put_pending` / `sweep_pending`) cannot read a
+/// masked `Conflict` as success and silently drop the write. Two concurrent blind puts
+/// to the same key are swept across seeds so the mid-commit interleaving is genuinely
+/// reached; whenever it is, the loser is `Err` and exactly one writer commits — and no
+/// seed ever yields `Ok(Conflict)` from a blind batch. `Conflict` stays reserved for a
+/// failed precondition, matching the trait contract.
+#[test]
+fn blind_batch_lost_lock_race_is_err_never_conflict() {
+    let mut reached_interleaving = false;
+    for seed in 0..256u64 {
+        let rt = madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
+        let (outcomes, obs) = rt.block_on(async {
+            let meta = Arc::new(SimTikvMetadataStore::with_fidelity(
+                Fidelity::AwaitInsideCommit,
+            ));
+            let mut handles = Vec::new();
+            for i in 0..2u8 {
+                let meta = Arc::clone(&meta);
+                handles.push(madsim::task::spawn(async move {
+                    meta.commit(WriteBatch::new().put(b"blind-key".to_vec(), vec![i]))
+                        .await
+                }));
+            }
+            let mut outcomes = Vec::new();
+            for handle in handles {
+                outcomes.push(handle.await.unwrap());
+            }
+            (outcomes, meta.observations())
+        });
+
+        // Invariant under EVERY schedule: a blind batch never reports Ok(Conflict) — that
+        // would be a lost write masquerading as a benign "someone else won" outcome.
+        for outcome in &outcomes {
+            assert!(
+                !matches!(outcome, Ok(CommitOutcome::Conflict)),
+                "blind batch returned Ok(Conflict) (a masked lost write) at seed {seed}: \
+                 {outcomes:?}",
+            );
+        }
+
+        // When the interleaving is actually reached, the loser is Err and exactly one
+        // writer commits — the second implementation now surfaces the production error.
+        if obs.mid_commit_lock_conflicts >= 1 {
+            reached_interleaving = true;
+            let errs = outcomes.iter().filter(|o| o.is_err()).count();
+            let committed = outcomes
+                .iter()
+                .filter(|o| matches!(o, Ok(CommitOutcome::Committed)))
+                .count();
+            assert_eq!(
+                errs, 1,
+                "interleaved blind race must yield exactly one Err (seed {seed}): {outcomes:?}",
+            );
+            assert_eq!(
+                committed, 1,
+                "interleaved blind race must yield exactly one Committed (seed {seed}): \
+                 {outcomes:?}",
+            );
+        }
+    }
+    assert!(
+        reached_interleaving,
+        "no seed in 0..256 reached the mid-commit interleaving for two blind writers; \
+         the regression assertion would be vacuous",
     );
 }
