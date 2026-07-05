@@ -93,10 +93,10 @@ fn exactly_one_wins(scheme: EcScheme, seed: u64) {
             write::intent(&meta, plan, NOW + TTL).await.unwrap();
             write::write_fragments(&chunks, plan).await.unwrap();
         }
-        let out_a = write::commit_overwrite(&meta, 1, &prior, &plan_a)
+        let out_a = write::commit_overwrite(&meta, 1, &prior, &plan_a, 0)
             .await
             .unwrap();
-        let out_b = write::commit_overwrite(&meta, 1, &prior, &plan_b)
+        let out_b = write::commit_overwrite(&meta, 1, &prior, &plan_b, 0)
             .await
             .unwrap();
         assert_eq!(out_a, CommitOutcome::Committed, "seed {seed}");
@@ -130,7 +130,7 @@ fn never_a_hybrid(scheme: EcScheme, seed: u64) {
         let plan = write::plan_write(&v2, CHUNK, scheme, ids_from(0x9_0000)).unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
-        write::commit_overwrite(&meta, 1, &snapshot, &plan)
+        write::commit_overwrite(&meta, 1, &snapshot, &plan, 0)
             .await
             .unwrap();
 

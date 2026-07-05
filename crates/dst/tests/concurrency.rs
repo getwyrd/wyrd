@@ -60,7 +60,7 @@ async fn exactly_one_concurrent_writer_wins() {
                 write::plan_write(b"contended", CHUNK, RS, ids_from(0x1000 * (i + 1))).unwrap();
             write::intent(&*meta, &plan, LEASE_EXPIRY).await.unwrap();
             write::write_fragments(&*chunks, &plan).await.unwrap();
-            let outcome = write::commit_overwrite(&*meta, 1, &prior, &plan)
+            let outcome = write::commit_overwrite(&*meta, 1, &prior, &plan, 0)
                 .await
                 .unwrap();
             if outcome == CommitOutcome::Committed {
