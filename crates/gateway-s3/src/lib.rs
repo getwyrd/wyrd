@@ -161,7 +161,7 @@ where
 
 /// The S3 subresource / multipart query keys this object-only floor does not implement.
 /// A request carrying any of them is refused (501) rather than falling through to a plain
-/// object PUT/GET/DELETE, which would mis-handle it — destructively for `PUT ?partNumber`
+/// object PUT/GET/DELETE, which would mishandle it — destructively for `PUT ?partNumber`
 /// (UploadPart) and `DELETE ?tagging`. Returns the first offending key found. Benign
 /// params a normal SDK adds to ordinary object requests (e.g. `x-id=PutObject`) are not
 /// listed, so they still pass; this is a denylist of unsupported operations, not a ban on
@@ -265,7 +265,7 @@ where
     // Dispatch below is by method only — the query is used solely for SigV4 — so without
     // this guard a `PUT /b/k?partNumber=1&uploadId=…` (UploadPart) would silently OVERWRITE
     // the whole object and a `DELETE /b/k?tagging` would DELETE the object itself, both
-    // returning 2xx. Refuse a form we do not implement rather than mis-handle it.
+    // returning 2xx. Refuse a form we do not implement rather than mishandle it.
     if let Some(sub) = unsupported_subresource(&query) {
         return error_response(
             StatusCode::NOT_IMPLEMENTED,
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn unsupported_subresource_flags_multipart_and_subresource_forms() {
-        // Destructive if mis-handled: UploadPart would overwrite the whole object,
+        // Destructive if mishandled: UploadPart would overwrite the whole object,
         // ?tagging DELETE would delete the object. These must be refused (501).
         assert_eq!(
             unsupported_subresource("partNumber=1&uploadId=abc"),
