@@ -50,6 +50,23 @@ wyrd-coordination-mem.workspace = true
 # simulated network (proposal 0004 Tier-1; ADR-0009).
 [target.'cfg(madsim)'.dev-dependencies]
 tonic = { package = "madsim-tonic", version = "0.6.0", default-features = false }
+# The etcd-backed Coordination (#365) + the shared contract suite, driven on the
+# madsim etcd simulator (`tests/coordination.rs`). `coordination-etcd`'s store
+# compiles here because `--cfg madsim` aliases its `etcd-client` to
+# `madsim-etcd-client`; this is the deterministic, protoc-free proof of the etcd
+# backend's distributed correctness (ADR-0009; the #264/#258 DST-fidelity mirror).
+wyrd-coordination-etcd.workspace = true
+wyrd-coordination-conformance.workspace = true
+# The in-simulator etcd server the coordination campaign stands up; aliased so
+# `SimServer` resolves under the same `etcd_client` path the store uses.
+etcd-client = { package = "madsim-etcd-client", version = "0.6.0" }
+# madsim-tokio hosts the store's keep-alive spawn/time on the simulated runtime.
+tokio = { package = "madsim-tokio", version = "0.2.30", features = [
+    "rt",
+    "time",
+    "sync",
+    "macros",
+] }
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).
