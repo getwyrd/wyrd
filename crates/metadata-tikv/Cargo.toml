@@ -38,6 +38,12 @@ wyrd-metadata-conformance.workspace = true
 # shared namespace with `join_all` to force a server-side write-write race; used
 # only under `--features tikv` (endpoint-gated, like the conformance test).
 futures-util.workspace = true
+# The M4.6 (#257) Tier-1 consistency-over-the-swap scenario uses the metadata fault
+# seam (quorum/reachability arithmetic + the peer-side partition fault-effect oracle
+# `partition_took_effect`/`heal_is_complete`, wired into the live scenario) and Tier-2
+# uses `converged_exactly_once`. Test-only; no `src` dependency (proposal 0015 §"DST
+# and tests", PR-sequence item 6).
+wyrd-testkit.workspace = true
 
 # `tikv-client` is used only under the `tikv` feature; keep cargo-machete quiet on
 # the default (feature-off) scan, where the optional deps look unreferenced.

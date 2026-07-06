@@ -321,6 +321,309 @@ impl StorageFaultInjector for SeededStorageFaults {
     }
 }
 
+/// The **metadata-backend fault seam** (M4.6, #257; proposal 0015 §"DST and tests",
+/// PR-sequence item 6; ADR-0015 single-zone consistency contract). Where [`NetFault`]
+/// faults a client→D-server *link* and [`StorageFault`] faults a *stored fragment byte*,
+/// the metadata swap (redb → a real ≥3-replica TiKV Raft group behind the unchanged
+/// [`wyrd_traits::MetadataStore`] trait) is faulted by **partitioning voters of the Raft
+/// group**. TiKV/PD run their own Raft consensus, so the load-bearing question the Tier-1
+/// consistency leg rests on is *quorum*: which side of a **symmetric** partition retains a
+/// strict majority and therefore stays writable.
+///
+/// This is **pure arithmetic** (no cluster, no container, no transport dependency), so the
+/// ≥3-replica reachability reasoning is unit-testable inside the unprivileged `cargo xtask
+/// ci` gate — the same "born-at-tier flippable coverage" bar the sibling seams meet. It
+/// makes concrete the invariant that a *minority* partition against a linearizable Raft
+/// store **cannot** cause split-brain or a lost update (proposal 0015; ADR-0015): the
+/// majority side keeps quorum, the isolated minority goes read-only, and there is no second
+/// writer to diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionOutcome {
+    /// The unisolated (majority) side keeps a strict quorum and stays writable; the
+    /// isolated minority is read-only until the heal.
+    MajorityWritable,
+    /// The **isolated** side holds a strict majority (more than half were isolated), so it
+    /// is the writable side instead — the mirror image of [`Self::MajorityWritable`].
+    IsolatedWritable,
+    /// An **even split**: neither side holds a strict majority, so no side can commit
+    /// (Raft stalls rather than diverge). Only reachable for an even `total`.
+    NoQuorum,
+    /// The "partition" isolates **nobody or everybody** — a no-op that never materialized
+    /// (the Invariant-B fault-effect precondition: a partition is evidence only if it
+    /// actually splits the group).
+    NotMaterialized,
+}
+
+/// The strict-majority (quorum) size for a Raft group of `total` voters: `⌊total/2⌋ + 1`.
+/// A side can commit only if it holds at least this many voters.
+#[must_use]
+pub fn quorum(total: usize) -> usize {
+    total / 2 + 1
+}
+
+/// Decide the [`PartitionOutcome`] for a **symmetric** partition of a `total`-voter Raft
+/// group that isolates `isolated` voters. Pure — the whole point is that the ≥3-replica
+/// quorum reasoning is checkable without standing up a cluster.
+///
+/// A partition that isolates nobody (`isolated == 0`) or everybody (`isolated == total`)
+/// is [`PartitionOutcome::NotMaterialized`]. Otherwise exactly one of three things holds:
+/// the majority side is writable, the isolated side is writable (if it holds the majority),
+/// or neither is (an even split).
+#[must_use]
+pub fn partition_outcome(total: usize, isolated: usize) -> PartitionOutcome {
+    if total == 0 || isolated == 0 || isolated >= total {
+        return PartitionOutcome::NotMaterialized;
+    }
+    let remaining = total - isolated;
+    let q = quorum(total);
+    if remaining >= q {
+        PartitionOutcome::MajorityWritable
+    } else if isolated >= q {
+        PartitionOutcome::IsolatedWritable
+    } else {
+        PartitionOutcome::NoQuorum
+    }
+}
+
+/// Whether a symmetric partition of `isolated`/`total` voters **materialized** — i.e. it
+/// actually split the group (isolated at least one voter but not all). The Invariant-B
+/// precondition for treating a partition leg as evidence: a partition that isolates nobody
+/// or everybody is a no-op and proves nothing (the v6 asymmetric inbound-only-DROP defect,
+/// which left the target reachable, is exactly a non-materialized partition).
+#[must_use]
+pub fn partition_materialized(total: usize, isolated: usize) -> bool {
+    total > 0 && isolated > 0 && isolated < total
+}
+
+/// **Exactly-once convergence** (ADR-0015 commit-point atomicity): the metadata inode's
+/// version advanced by **exactly one** across a commit-and-heal — not zero (no commit
+/// slipped through) and not two-or-more (a double-commit). An independent arithmetic
+/// oracle over the observed before/after versions, kept SEPARATE from the read-after-commit
+/// signal so a diagnostic shows precisely which ADR-0015 clause failed (the v6 defect
+/// collapsed both into one `scenario.is_ok()` bit).
+#[must_use]
+pub fn converged_exactly_once(version_before: u64, version_after: u64) -> bool {
+    version_after == version_before.wrapping_add(1)
+}
+
+/// The **two INDEPENDENT ADR-0015 single-zone signals** the Tier-1 metadata
+/// consistency-over-the-swap leg carries, plus the Invariant-B fault-effect gate. Kept as
+/// separate fields (not one collapsed boolean — the v6 defect) so the verdict names the
+/// exact clause that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsistencySignals {
+    /// **Read-after-commit** (ADR-0015): the value committed before the fault is still
+    /// readable — byte-for-byte — after the partition heals. A committed value that
+    /// becomes unreadable is a violation, not a valid state.
+    pub read_after_commit: bool,
+    /// **Exactly-once convergence** (ADR-0015 commit-point atomicity): the inode version
+    /// advanced by exactly one across the heal (see [`converged_exactly_once`]).
+    pub converged_once: bool,
+    /// **Fault materialized** (Invariant B): the injected partition provably took effect —
+    /// observed from the PEER/PD side as a **lost heartbeat** (not by probing the dropped port,
+    /// and not via PD's slow-to-flip administrative `state_name`), AND healed completely (see
+    /// [`partition_materialized`], [`partition_took_effect`], [`heartbeat_is_fresh`], and
+    /// [`heal_is_complete`]). A leg whose fault was a no-op is NOT evidence.
+    pub fault_materialized: bool,
+    /// **No lost update under write-write contention** (ADR-0015 commit-point re-check; the
+    /// iteration-12 teeth). The `get_for_update` commit-point re-check only produces a
+    /// `Conflict` under CONCURRENT contention on the same key, so a strictly sequential
+    /// single-writer leg can never observe its regression (the iteration-12 adversary
+    /// refutation: deleting the re-check left every assertion green). This signal is computed
+    /// by [`no_lost_update`] over the contended-CAS outcome and the stale-CAS probe.
+    pub no_lost_update: bool,
+}
+
+/// The Tier-1 consistency leg passes only when **all four** signals hold: read-after-commit
+/// AND exactly-once convergence AND the fault materialized AND no lost update under
+/// contention. Each is an independent input, so a regression flips exactly the failing clause.
+#[must_use]
+pub fn consistency_passes(s: &ConsistencySignals) -> bool {
+    s.read_after_commit && s.converged_once && s.fault_materialized && s.no_lost_update
+}
+
+/// **No-lost-update verdict for the contended commit point** (ADR-0015; M4.6 #257, the
+/// iteration-12 teeth). With ≥2 concurrent writers racing the SAME compare-and-swap on the
+/// version key across the fault window, exactly **one** may report `Committed`
+/// (`committed_contenders == 1`: zero means a commit was lost outright, two-or-more means a
+/// stale precondition was admitted — a lost update), and a deliberately **stale** CAS probe
+/// (`require` on a version the cell has already left) must be **rejected**
+/// (`stale_probe_committed == false`). A missing/mis-ordered `get_for_update` commit-point
+/// re-check (`crates/metadata-tikv/src/lib.rs:555-573`) flips one or both inputs, so this
+/// oracle — pure arithmetic, unit-checked at Check, consumed by the live leg — is the signal a
+/// real commit-point regression turns red.
+#[must_use]
+pub fn no_lost_update(committed_contenders: usize, stale_probe_committed: bool) -> bool {
+    committed_contenders == 1 && !stale_probe_committed
+}
+
+/// Did the injected **symmetric** partition actually isolate the target metadata node,
+/// **observed from the peer/PD side**? (M4.6, #257; Invariant B.)
+///
+/// `connected_before` / `connected_during` are what **PD** (the Raft peers' coordinator)
+/// reports about the target store — `true` when PD still counts the store's **heartbeat
+/// fresh** (see [`heartbeat_is_fresh`]), `false` once PD has stopped receiving heartbeats from
+/// it. This is deliberately **not** a probe of the dropped port from the test host (the v6/v7
+/// defect: that only proves the rule blocks *the probe*, not that the node is isolated from its
+/// peers), and deliberately **not** PD's administrative `state_name` (the iter-11 defect:
+/// `state_name` stays `"Up"` through a short partition and only flips after
+/// `max-store-down-time`, ~30min, so a seconds-long scenario window can never observe it
+/// change). A partition is evidence only if the peer's own transient-liveness view flipped:
+/// heartbeat fresh before, stale during. A one-way or probe-only cut leaves the heartbeat fresh
+/// (`connected_during == true`) and fails this oracle — exactly the no-op shape Invariant B
+/// forbids.
+#[must_use]
+pub fn partition_took_effect(connected_before: bool, connected_during: bool) -> bool {
+    connected_before && !connected_during
+}
+
+/// Parse the target store's `last_heartbeat_ts` (PD's RFC3339 timestamp of its last heartbeat)
+/// from the raw `/pd/api/v1/stores` JSON body, as **nanoseconds since the Unix epoch**, for the
+/// store whose `address` contains `target_ip`. `None` when that store or the field is absent or
+/// unparsable. (M4.6, #257; the iter-11 fault-effect fix.)
+///
+/// This is the **transient-liveness** field the metadata partition oracle keys off — **not**
+/// PD's `state_name`, which is the ADMINISTRATIVE state and stays `"Up"` through a short
+/// partition (it only flips to `Down` after `max-store-down-time`, default ~30min), so a
+/// seconds-long scenario window could never observe it change (the iter-11 defect that made the
+/// live leg unpassable). A partitioned voter stops heartbeating PD, so `last_heartbeat_ts` stops
+/// advancing and its age grows past a few store-heartbeat intervals (default 10s) within the
+/// window. The **field selection** is unit-checkable inside the unprivileged `cargo xtask ci`
+/// gate (the live scenario calls this very function, so a regression here flips both the unit
+/// test and the live leg).
+///
+/// PD emits the heartbeat as `"last_heartbeat_ts":"<rfc3339>"` — an RFC3339 timestamp **string**
+/// in the `status` object (e.g. `"2019-03-21T14:14:22.961171958+08:00"`), **not** a bare
+/// `last_heartbeat` integer (the field that shape assumed does not exist in a real PD response;
+/// Codex #453). Within a store entry `"address":"<ip>:<port>"` (in the `store` object) precedes
+/// it, so the first `last_heartbeat_ts` after the target's address is that store's own. It is
+/// converted to epoch nanoseconds via `chrono` so the downstream age threshold
+/// ([`heartbeat_is_fresh`]) is unchanged.
+#[must_use]
+pub fn parse_store_last_heartbeat(stores_json: &str, target_ip: &str) -> Option<i128> {
+    let compact: String = stores_json.chars().filter(|c| !c.is_whitespace()).collect();
+    let needle = format!("\"address\":\"{target_ip}:");
+    let at = compact.find(&needle)?;
+    let rest = &compact[at..];
+    let key = "\"last_heartbeat_ts\":\"";
+    let ks = rest.find(key)? + key.len();
+    let after = &rest[ks..];
+    // `last_heartbeat_ts` is a quoted RFC3339 string; take up to the closing quote and
+    // convert to nanoseconds since the Unix epoch (parse-only — no clock read).
+    let end = after.find('"')?;
+    chrono::DateTime::parse_from_rfc3339(&after[..end])
+        .ok()?
+        .timestamp_nanos_opt()
+        .map(i128::from)
+}
+
+/// Parse the **leader's `store_id`** for the first region in a raw PD `/pd/api/v1/regions`
+/// JSON body, or `None` when no leader is recorded. (M4.6, #257; the iteration-12
+/// leader-isolation fix.)
+///
+/// Why the LEADER: the iteration-12 adversary showed that symmetrically cutting a **minority
+/// follower** of a linearizable Raft group can never change a commit outcome — the majority
+/// side keeps quorum and the leader keeps serving — so that cut is exactly the "hollow flip"
+/// the brief forbids. Isolating the **region leader** forces a leader election and perturbs
+/// the in-flight commit path for real. Scope note: a fresh ≥3-replica test cluster
+/// (`deploy/tikv-multi-replica`) starts with a handful of system regions whose leaders all
+/// sit on ONE store (PD's balancer hasn't spread them within the scenario window — verified
+/// empirically on pd v8.5.1: five regions, one leader store), so "first region's leader" IS
+/// the leader of the region under test; a long-lived multi-region cluster would need
+/// region-by-key resolution (documented limitation, not this leg's shape).
+///
+/// Pure string parse — no HTTP, no dependency — so the live leg's leader **selection** is
+/// unit-checkable inside the unprivileged gate; the live scenario calls this very function.
+#[must_use]
+pub fn parse_first_region_leader_store_id(regions_json: &str) -> Option<u64> {
+    let compact: String = regions_json
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let at = compact.find("\"leader\":")?;
+    let rest = &compact[at..];
+    let key = "\"store_id\":";
+    let ks = rest.find(key)? + key.len();
+    let after = &rest[ks..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    after[..end].parse::<u64>().ok()
+}
+
+/// Parse the **IP** (address minus the `:port`) of the store with id `store_id` from a raw PD
+/// `/pd/api/v1/stores` JSON body, or `None` when that store is absent. (M4.6, #257; the
+/// iteration-12 leader-isolation fix — maps [`parse_first_region_leader_store_id`]'s answer to
+/// the loopback IP the symmetric partition drops.) Pure string parse, unit-checked at Check,
+/// consumed by the live leg.
+#[must_use]
+pub fn parse_store_ip(stores_json: &str, store_id: u64) -> Option<String> {
+    let compact: String = stores_json.chars().filter(|c| !c.is_whitespace()).collect();
+    let needle = format!("\"id\":{store_id},");
+    let at = compact.find(&needle)?;
+    let rest = &compact[at..];
+    let key = "\"address\":\"";
+    let ks = rest.find(key)? + key.len();
+    let after = &rest[ks..];
+    let end = after.find('"')?;
+    after[..end].rsplit_once(':').map(|(ip, _)| ip.to_string())
+}
+
+/// Resolve which container owns `target_ip` from a `ip=container,ip=container` map (the
+/// runner-exported `WYRD_TIER1_NETNS_MAP`), or `None` when the IP is unmapped. (M4.6, #257;
+/// the iteration-13 netns-cut fix.)
+///
+/// Why a netns map: the symmetric partition is applied **inside the target node's own
+/// network namespace** (`docker run --network container:<name> … iptables …`) — under the
+/// old host-networking topology every node's outbound traffic was sourced from
+/// `127.0.0.1`, so a host-side per-IP cut was a provable no-op (the fault-effect oracle
+/// caught it live). The scenario resolves the leader's IP first, then this map names the
+/// netns to cut. Pure string parse, unit-checked at Check, consumed by the live leg — a
+/// mapping regression flips both.
+#[must_use]
+pub fn parse_netns_map(map: &str, target_ip: &str) -> Option<String> {
+    map.split(',').find_map(|pair| {
+        let (ip, container) = pair.trim().split_once('=')?;
+        (ip.trim() == target_ip && !container.trim().is_empty())
+            .then(|| container.trim().to_string())
+    })
+}
+
+/// Whether PD still counts the target store **live** — its last heartbeat is fresher than
+/// `max_staleness`. `age = now_nanos - last_heartbeat_nanos` (clamped at zero for clock skew),
+/// both nanoseconds since the Unix epoch. This is the boolean fed to [`partition_took_effect`]:
+/// fresh before the cut, **stale** during it. (M4.6, #257; the iter-11 fault-effect fix.)
+///
+/// A store that never heartbeated (`last_heartbeat <= 0`) or one long-silent is stale → not
+/// live. Deciding liveness on **heartbeat age** rather than PD's `state_name` is what lets the
+/// fault-effect oracle observe a real partition within a seconds-long window. Pure arithmetic,
+/// so it is unit-checkable at Check; the live scenario calls it, so a threshold regression
+/// flips both.
+#[must_use]
+pub fn heartbeat_is_fresh(
+    last_heartbeat_nanos: i128,
+    now_nanos: i128,
+    max_staleness: std::time::Duration,
+) -> bool {
+    if last_heartbeat_nanos <= 0 {
+        return false;
+    }
+    let age_nanos = (now_nanos - last_heartbeat_nanos).max(0);
+    (age_nanos as u128) < max_staleness.as_nanos()
+}
+
+/// Did the partition also **heal** completely? (M4.6, #257; Invariant B / the v6 review.)
+///
+/// The live partition must heal **every** isolation rule it applied (the v6 leg dropped two
+/// ports but healed only one), and PD must report the target store `Up` again
+/// (`connected_after_heal`) or host firewall state leaked. `applied` and `healed` are the
+/// isolation-rule identifiers the runner recorded; the heal is complete only when every
+/// applied rule was removed AND the peer view recovered.
+#[must_use]
+pub fn heal_is_complete(applied: &[String], healed: &[String], connected_after_heal: bool) -> bool {
+    connected_after_heal && applied.iter().all(|r| healed.contains(r))
+}
+
 /// A seed-reproducible simulation context.
 ///
 /// Everything non-deterministic a component needs — randomness, time, fault
@@ -484,5 +787,276 @@ mod tests {
         assert!(!faults.is_faulted(0));
         assert_eq!(faults.storage_fault_for(2), Some(StorageFault::BitRot));
         assert_eq!(faults.storage_fault_for(0), None);
+    }
+
+    // ── Metadata-backend fault seam (M4.6, #257) ──────────────────────────────────
+    //
+    // Independent oracles: each assertion uses a HAND-COMPUTED expectation (a quorum
+    // table), NOT the literal the function returns, so a mutation of the arithmetic
+    // (e.g. an off-by-one `total/2` instead of `total/2 + 1`) flips these RED — the
+    // non-tautological bar (the iter-1 defect the Success criterion forbids).
+
+    #[test]
+    fn quorum_is_strict_majority() {
+        // ⌊total/2⌋ + 1, computed independently of the function under test.
+        assert_eq!(quorum(1), 1);
+        assert_eq!(quorum(3), 2);
+        assert_eq!(quorum(4), 3);
+        assert_eq!(quorum(5), 3);
+        assert_eq!(quorum(9), 5);
+    }
+
+    #[test]
+    fn minority_partition_leaves_the_majority_writable() {
+        // The load-bearing ≥3-replica case (ADR-0015 single-zone): isolate ONE voter of
+        // three — the majority side (2) keeps quorum and stays writable; the isolated
+        // minority (1 < 2) goes read-only. There is no second writer, so no divergence:
+        // this is exactly why "exactly-one-winner goes red" can NEVER be the binding flip
+        // against a linearizable store (the Invariant the Success criterion pins).
+        assert_eq!(partition_outcome(3, 1), PartitionOutcome::MajorityWritable);
+        assert_eq!(partition_outcome(5, 2), PartitionOutcome::MajorityWritable);
+    }
+
+    #[test]
+    fn majority_partition_makes_the_isolated_side_writable() {
+        // The mirror image: isolate MORE than half. The isolated side holds the quorum,
+        // so it is the writable side (the unisolated remnant goes read-only).
+        assert_eq!(partition_outcome(3, 2), PartitionOutcome::IsolatedWritable);
+        assert_eq!(partition_outcome(5, 3), PartitionOutcome::IsolatedWritable);
+    }
+
+    #[test]
+    fn even_split_stalls_rather_than_diverges() {
+        // An even split hands neither side a strict majority — Raft stalls, it never lets
+        // two sides both commit (the property that makes split-brain unreachable).
+        assert_eq!(partition_outcome(4, 2), PartitionOutcome::NoQuorum);
+        assert_eq!(partition_outcome(6, 3), PartitionOutcome::NoQuorum);
+    }
+
+    #[test]
+    fn a_no_op_partition_is_not_materialized() {
+        // Isolating nobody or everybody is a no-op: the Invariant-B fault-effect
+        // precondition is FALSE, so such a leg is not evidence (the v6 asymmetric
+        // inbound-only DROP left the target reachable — a non-materialized partition).
+        assert_eq!(partition_outcome(3, 0), PartitionOutcome::NotMaterialized);
+        assert_eq!(partition_outcome(3, 3), PartitionOutcome::NotMaterialized);
+        assert!(!partition_materialized(3, 0));
+        assert!(!partition_materialized(3, 3));
+        assert!(!partition_materialized(0, 0));
+        // A real split of at least one voter (but not all) DID materialize.
+        assert!(partition_materialized(3, 1));
+        assert!(partition_materialized(3, 2));
+    }
+
+    #[test]
+    fn convergence_is_exactly_one_version_step() {
+        // Independent oracle: version must advance by EXACTLY one across the heal.
+        assert!(converged_exactly_once(7, 8), "advanced by one → converged");
+        assert!(!converged_exactly_once(7, 7), "no commit → NOT converged");
+        assert!(
+            !converged_exactly_once(7, 9),
+            "double-commit → NOT converged"
+        );
+        assert!(
+            !converged_exactly_once(7, 6),
+            "went backwards → NOT converged"
+        );
+    }
+
+    #[test]
+    fn consistency_needs_all_four_independent_signals() {
+        let ok = ConsistencySignals {
+            read_after_commit: true,
+            converged_once: true,
+            fault_materialized: true,
+            no_lost_update: true,
+        };
+        assert!(consistency_passes(&ok), "all four signals hold → PASS");
+        // Each clause is INDEPENDENTLY load-bearing: negating any one fails the verdict,
+        // proving the four are not collapsed into one bit (the v6 defect).
+        assert!(!consistency_passes(&ConsistencySignals {
+            read_after_commit: false,
+            ..ok
+        }));
+        assert!(!consistency_passes(&ConsistencySignals {
+            converged_once: false,
+            ..ok
+        }));
+        assert!(
+            !consistency_passes(&ConsistencySignals {
+                fault_materialized: false,
+                ..ok
+            }),
+            "a leg whose fault did NOT materialize is not evidence, even if the data \
+             assertions passed (Invariant B)"
+        );
+        assert!(
+            !consistency_passes(&ConsistencySignals {
+                no_lost_update: false,
+                ..ok
+            }),
+            "a leg that admitted a lost update under contention fails, even if the \
+             single-writer data assertions passed (the iteration-12 teeth)"
+        );
+    }
+
+    #[test]
+    fn lost_updates_are_caught_by_the_contention_arithmetic() {
+        // Exactly one CAS winner and a rejected stale probe — the only healthy outcome.
+        assert!(no_lost_update(1, false));
+        // Two contenders both reported Committed on the SAME compare-and-swap: a stale
+        // precondition was admitted — the lost update the get_for_update re-check exists to
+        // prevent. This is the input a deleted re-check produces (iteration-12 adversary).
+        assert!(!no_lost_update(2, false), "double-commit = lost update");
+        // Nobody committed: the update was lost outright (or the leg never contended).
+        assert!(!no_lost_update(0, false), "zero winners = lost commit");
+        // The stale probe (require on a version the cell already left) was admitted: a
+        // blind write slipped the commit point, independent of the contender count.
+        assert!(!no_lost_update(1, true), "admitted stale CAS = lost update");
+    }
+
+    #[test]
+    fn region_leader_and_store_ip_resolve_from_pd_bodies() {
+        // Hand-computed expectations over canned PD payload shapes (not the literal a
+        // function returns). The leader lives in the region's `leader` object; peers also
+        // carry store_ids the parse must NOT confuse with the leader's.
+        let regions = r#"{"count":1,"regions":[
+            {"id":4,"start_key":"","end_key":"",
+             "peers":[{"id":5,"store_id":1},{"id":6,"store_id":2},{"id":7,"store_id":3}],
+             "leader":{"id":6,"store_id":2},
+             "written_bytes":0}
+        ]}"#;
+        assert_eq!(parse_first_region_leader_store_id(regions), Some(2));
+        // No leader recorded (election in flight) → honest None, not a spurious store.
+        let leaderless = r#"{"count":1,"regions":[{"id":4,"peers":[{"id":5,"store_id":1}]}]}"#;
+        assert_eq!(parse_first_region_leader_store_id(leaderless), None);
+
+        // Store-id → IP over the same /stores shape the heartbeat oracle parses.
+        let stores = r#"{"count":2,"stores":[
+            {"store":{"id":1,"address":"127.0.0.1:20160","state_name":"Up"},
+             "status":{"last_heartbeat_ts":"1970-01-01T00:00:00.000000111Z"}},
+            {"store":{"id":2,"address":"127.0.0.2:20161","state_name":"Up"},
+             "status":{"last_heartbeat_ts":"1970-01-01T00:00:00.000000222Z"}}
+        ]}"#;
+        assert_eq!(parse_store_ip(stores, 2).as_deref(), Some("127.0.0.2"));
+        assert_eq!(parse_store_ip(stores, 1).as_deref(), Some("127.0.0.1"));
+        // A store PD never listed → None (the leg must then refuse to cut anything).
+        assert_eq!(parse_store_ip(stores, 9), None);
+    }
+
+    #[test]
+    fn netns_map_resolves_the_target_container_only() {
+        let map = "172.30.57.11=wyrd-tier1-metadata-tikv-0-1, \
+                   172.30.57.12=wyrd-tier1-metadata-tikv-1-1,\
+                   172.30.57.13=wyrd-tier1-metadata-tikv-2-1";
+        assert_eq!(
+            parse_netns_map(map, "172.30.57.12").as_deref(),
+            Some("wyrd-tier1-metadata-tikv-1-1")
+        );
+        assert_eq!(
+            parse_netns_map(map, "172.30.57.11").as_deref(),
+            Some("wyrd-tier1-metadata-tikv-0-1")
+        );
+        // An unmapped IP (e.g. PD's own) must resolve to nothing — the leg then refuses to
+        // cut anything rather than cutting a guess.
+        assert_eq!(parse_netns_map(map, "172.30.57.10"), None);
+        // Malformed entries are skipped, not misread.
+        assert_eq!(parse_netns_map("no-equals-here,=x,a=", "a"), None);
+    }
+
+    #[test]
+    fn partition_is_evidence_only_when_peers_lose_the_target() {
+        // The ONLY combination that materialized, observed from PD's side: the peers saw
+        // the store Up before, and lost it (Disconnected) during. This is a peer-side view,
+        // not a probe of the dropped port from the test host.
+        assert!(
+            partition_took_effect(true, false),
+            "PD saw the store before, lost it during → the partition materialized"
+        );
+        // The v6/v7 one-way / probe-only shape: PD still sees the store connected during the
+        // "partition" → it was a no-op, NOT evidence (red when the fault is a no-op).
+        assert!(
+            !partition_took_effect(true, true),
+            "PD still sees the store during → the partition was a no-op (Invariant B)"
+        );
+        // A store PD never saw up before proves nothing either.
+        assert!(!partition_took_effect(false, false));
+        assert!(!partition_took_effect(false, true));
+    }
+
+    #[test]
+    fn last_heartbeat_is_parsed_for_the_addressed_store() {
+        // Two stores; the oracle must pick the TARGET's own `last_heartbeat_ts` (the RFC3339
+        // heartbeat string in its `status` object), not a neighbour's — independent
+        // hand-computed expectation (the timestamps below are 111 / 222 ns past the epoch), not
+        // the literal the function returns. A regression that read `state_name` (the iter-11
+        // defect), the wrong store's field, or the non-existent bare `last_heartbeat` integer
+        // (Codex #453) flips this red.
+        let body = r#"{"count":2,"stores":[
+            {"store":{"id":1,"address":"127.0.0.1:20160","state_name":"Up"},
+             "status":{"capacity":"1GiB","last_heartbeat_ts":"1970-01-01T00:00:00.000000111Z"}},
+            {"store":{"id":2,"address":"127.0.0.2:20160","state_name":"Up"},
+             "status":{"capacity":"1GiB","last_heartbeat_ts":"1970-01-01T00:00:00.000000222Z"}}
+        ]}"#;
+        assert_eq!(parse_store_last_heartbeat(body, "127.0.0.2"), Some(222));
+        assert_eq!(parse_store_last_heartbeat(body, "127.0.0.1"), Some(111));
+        // A store PD never listed → no heartbeat to read (honest None, not a spurious value).
+        assert_eq!(parse_store_last_heartbeat(body, "127.0.0.9"), None);
+
+        // A real PD timestamp — non-UTC offset, full-nanosecond precision (the exact shape from
+        // the PD API docs). It must parse to a positive epoch-nanos value, not None.
+        let real = r#"{"count":1,"stores":[
+            {"store":{"id":1,"address":"10.0.0.5:20160","state_name":"Up"},
+             "status":{"last_heartbeat_ts":"2019-03-21T14:14:22.961171958+08:00"}}
+        ]}"#;
+        assert!(matches!(parse_store_last_heartbeat(real, "10.0.0.5"), Some(n) if n > 0));
+
+        // The shape this oracle used to assume — a bare `last_heartbeat` integer — is NOT what
+        // PD emits, and must now read as absent rather than silently succeeding (Codex #453).
+        let stale_shape = r#"{"count":1,"stores":[
+            {"store":{"id":1,"address":"10.0.0.6:20160","state_name":"Up"},
+             "status":{"last_heartbeat":123456789}}
+        ]}"#;
+        assert_eq!(parse_store_last_heartbeat(stale_shape, "10.0.0.6"), None);
+    }
+
+    #[test]
+    fn heartbeat_freshness_is_an_age_threshold_not_state_name() {
+        // Independent oracle: liveness is `now - last_heartbeat < max_staleness`, computed by
+        // hand here. This is the transient signal that flips within seconds — the iter-11 fix
+        // (state_name would stay "Up" and never flip in-window).
+        let sec = 1_000_000_000_i128; // one second in nanoseconds
+        let now = 100 * sec;
+        let window = std::time::Duration::from_secs(20);
+        // Fresh: 5s old, threshold 20s → PD still sees it live.
+        assert!(heartbeat_is_fresh(now - 5 * sec, now, window));
+        // Stale: 30s old, threshold 20s → PD lost it (a real partition the oracle must catch).
+        assert!(!heartbeat_is_fresh(now - 30 * sec, now, window));
+        // Exactly at the threshold is NOT fresh (strict `<`).
+        assert!(!heartbeat_is_fresh(now - 20 * sec, now, window));
+        // Never heartbeated (0) → not live.
+        assert!(!heartbeat_is_fresh(0, now, window));
+        // Clock skew (heartbeat "in the future") clamps to age 0 → fresh, never spuriously stale.
+        assert!(heartbeat_is_fresh(now + 5 * sec, now, window));
+    }
+
+    #[test]
+    fn heal_must_undo_every_isolation_rule_and_restore_the_peer_view() {
+        let both = vec!["in-127.0.0.2".to_string(), "out-127.0.0.2".to_string()];
+        // The complete heal: every applied rule removed AND PD sees the store Up again.
+        assert!(
+            heal_is_complete(&both, &both, true),
+            "every applied rule healed + peer view restored → complete heal"
+        );
+        // The v6 leak: applied two rules but healed only one — leaks host firewall state.
+        assert!(
+            !heal_is_complete(&both, &both[..1], true),
+            "an un-removed isolation rule leaks host state — NOT a complete heal"
+        );
+        // Every rule removed but PD still doesn't see the store → the heal did not take.
+        assert!(
+            !heal_is_complete(&both[..1], &both[..1], false),
+            "peer still down after heal → the heal did not restore the target"
+        );
     }
 }

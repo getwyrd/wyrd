@@ -11,6 +11,10 @@ publish.workspace = true
 [dependencies]
 rand.workspace = true
 rand_chacha.workspace = true
+# Parse PD's `last_heartbeat_ts` (the RFC3339 heartbeat timestamp in /pd/api/v1/stores)
+# into epoch nanoseconds for the metadata partition liveness oracle. Parse-only — the
+# `clock` feature is OFF, so no wall-clock source enters this DST seam crate (ADR-0009).
+chrono = { version = "0.4", default-features = false, features = ["alloc"] }
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).
