@@ -1,7 +1,8 @@
 ---
 created: 23.06.2026 00:10
 type: proposal
-status: accepted
+status: superseded
+superseded-by: 0015-milestone-4-production-metadata-backend-revised.md
 author: Eduard Ralph
 tracking-issue: "#201"
 tags:
