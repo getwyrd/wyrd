@@ -167,9 +167,10 @@ docker compose -f deploy/small-multi-node/docker-compose.yml down -v
 Notes and current limits:
 
 - This client-mode endpoint list is **static** — the gateway client dials exactly
-  the D servers you name. The stack's D servers *do* register through the etcd L5
-  Coordination backend (ADR-0006), but `wyrd put/get --endpoints` bypasses that and
-  talks to the listed endpoints directly; discovery-driven placement is later work.
+  the D servers you name. The stack's D servers *do* connect to and register through
+  the etcd L5 Coordination backend (ADR-0006), but `wyrd put/get --endpoints` bypasses
+  that and talks to the listed endpoints directly; discovery-driven placement is later
+  work (and the registered address is not yet routable across containers, #458).
 - Metadata is held locally under `--data-dir`, so the `put` and `get` above must
   share it. Wiring the S3 gateway role itself over the cluster's shared backends
   (TiKV metadata + D-server fanout) is tracked as #454 → #455.

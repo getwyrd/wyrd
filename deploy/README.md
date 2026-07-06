@@ -73,9 +73,13 @@ failure in CI, warn-and-skip locally with no Docker). Like `integration` /
 
 **Genuinely wired backends.** Built with `--features tikv,etcd`, so the D servers dial
 the etcd ensemble for L5 Coordination (`--coordination-backend etcd` +
-`WYRD_ETCD_ENDPOINTS`, #449) — real cross-process registration, not the in-process
-`MemCoordination` default — and the custodians open the TiKV metadata backend
-(`--metadata-backend tikv` + `WYRD_TIKV_PD_ENDPOINTS`).
+`WYRD_ETCD_ENDPOINTS`, #449) — a real cross-process connect + register, not the
+in-process `MemCoordination` default — and the custodians open the TiKV metadata
+backend (`--metadata-backend tikv` + `WYRD_TIKV_PD_ENDPOINTS`). Caveat: each D-server
+registration advertises the server's *bound* address (`http://0.0.0.0:50051`), which
+is not routable for cross-container discovery until d-server gains `--advertise-addr`
+(#458); it is unused here, since the custodians dial static `--endpoints` rather than
+discovering through etcd.
 
 **Two honest limits — this is a topology bring-up / smoke target, not an end-to-end
 object pipeline (tracked, #454 → #455):**

@@ -219,8 +219,14 @@ services:
   #    and tagged `wyrd-single-zone:local` — a DISTINCT tag from the integration
   #    fixture's default-feature `wyrd-dserver:test`, so the two never clobber each
   #    other (ADR-0043). Every other wyrd role below reuses this image (same `wyrd`
-  #    binary, different subcommand). Genuinely wired to L5: `--coordination-backend etcd` +
-  #    `WYRD_ETCD_ENDPOINTS` (#449), so registration is real cross-process discovery.
+  #    binary, different subcommand). Wired to L5: `--coordination-backend etcd` +
+  #    `WYRD_ETCD_ENDPOINTS` (#449) — each D server really connects to the etcd
+  #    ensemble and publishes a registration record. CAVEAT: the record advertises the
+  #    server's *bound* address (`http://0.0.0.0:50051`), not a routable one — d-server
+  #    has no `--advertise-addr` yet (#458) — so the record is not usable for
+  #    cross-container discovery. Harmless here: nothing in this stack discovers D
+  #    servers through etcd (the custodian below dials static `--endpoints`), so this
+  #    proves the connect/register path, not discovery-driven placement.
   dserver0:
     build:
       context: ../..
@@ -350,7 +356,7 @@ services:
   custodian0:
     image: wyrd-single-zone:local
     depends_on: [tikv0, tikv1, tikv2, dserver0, dserver8]
-    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "dserver0:50051,dserver1:50051,dserver2:50051,dserver3:50051,dserver4:50051,dserver5:50051,dserver6:50051,dserver7:50051,dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
     environment:
       WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
     restart: on-failure
@@ -358,7 +364,7 @@ services:
   custodian1:
     image: wyrd-single-zone:local
     depends_on: [tikv0, tikv1, tikv2, dserver0, dserver8]
-    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "dserver0:50051,dserver1:50051,dserver2:50051,dserver3:50051,dserver4:50051,dserver5:50051,dserver6:50051,dserver7:50051,dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
     environment:
       WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
     restart: on-failure
@@ -366,7 +372,7 @@ services:
   custodian2:
     image: wyrd-single-zone:local
     depends_on: [tikv0, tikv1, tikv2, dserver0, dserver8]
-    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "dserver0:50051,dserver1:50051,dserver2:50051,dserver3:50051,dserver4:50051,dserver5:50051,dserver6:50051,dserver7:50051,dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
     environment:
       WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
     restart: on-failure
