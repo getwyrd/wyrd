@@ -237,7 +237,7 @@ fn usage() {
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
     eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  --endpoints drives a local distributed cluster: fragments fan out over gRPC");
@@ -1215,37 +1215,195 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
         .or_else(|| std::env::var("WYRD_S3_SECRET_KEY").ok())
         .ok_or("s3: --secret-key (or WYRD_S3_SECRET_KEY) is required")?;
 
-    let dir = Path::new(data_dir);
-    std::fs::create_dir_all(dir)?;
-    let meta = RedbMetadataStore::open(dir.join("meta.redb"))?;
-    let chunks = FsChunkStore::open(dir.join("chunks"))?;
-    let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+    // Select the gateway's backends BY CONFIGURATION, exactly as every other
+    // cluster-facing role does — `resolve_backend` for put/get/custodian (#255) and
+    // `resolve_coordination_backend` for d-server (#449). The gateway must compose over
+    // the SAME resolved backends the rest of the cluster uses so a FLEET of gateways
+    // shares one logical store (proposal 0015 §"Composition, not refactor"), not a
+    // private redb + local disk per node (the parity/composition invariant #454 restores).
+    let backend = resolve_backend(&parsed)?;
+    let coordination = resolve_coordination_backend(&parsed)?;
+    // `--endpoints` fans each object's fragments out over gRPC to the configured D
+    // servers — the same static-endpoints fan-out that backs `cluster_put`/`cluster_get`
+    // (`connect_fanout`) — instead of a local `FsChunkStore`. Absent, keep the
+    // single-node local-FS front door so the #367 first-deployment loopback path is not
+    // broken.
+    let endpoints = match parsed.flag("endpoints") {
+        Some(raw) => Some(parse_endpoints(raw)?),
+        None => None,
+    };
 
-    let mut config = s3::S3Config::new(vec![s3::sigv4::Credentials {
+    let credentials = vec![s3::sigv4::Credentials {
         access_key_id: access_key,
         secret_access_key: secret_key,
-    }]);
-    config.region = region.clone();
-    let server = s3::S3Gateway::new(Arc::clone(&gateway), config);
+    }];
 
     let runtime = tokio_runtime()?;
     runtime.block_on(async move {
-        // Resume the in-process id allocators above everything already persisted under
-        // `data_dir`, so a RESTART over an existing store never reuses a committed inode or
-        // chunk id and corrupts an existing object (issue #364 durability finding 1).
-        gateway.recover().await?;
         let listener = tokio::net::TcpListener::bind(listen).await?;
         eprintln!(
             "wyrd s3: serving S3-compatible HTTP on {} (data-dir {data_dir})",
             listener.local_addr()?
         );
+        match endpoints.as_deref() {
+            Some(endpoints) => eprintln!(
+                "wyrd s3: cluster front door — fanning chunks to {} D server(s) over gRPC",
+                endpoints.len()
+            ),
+            None => eprintln!(
+                "wyrd s3: single-node front door — chunks on local disk under {data_dir}/chunks"
+            ),
+        }
         eprintln!(
             "wyrd s3: SigV4 required (region {region}, service s3); no anonymous access. Ctrl-C to stop"
         );
-        server.serve(listener).await?;
-        Ok::<(), BoxError>(())
+        serve_s3_role(
+            backend,
+            coordination,
+            data_dir,
+            endpoints.as_deref(),
+            credentials,
+            region,
+            listener,
+        )
+        .await
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Compose the `wyrd s3` gateway's backends BY CONFIGURATION and serve the S3 HTTP wire
+/// surface over `listener` until it stops. This is `cmd_s3`'s composition core, factored
+/// out — exactly as `cluster_put` factors out [`cluster_store_put`] — so the
+/// static-endpoints cluster arm is driven by an in-process loopback round-trip test
+/// (`tests/s3_gateway_cluster.rs`) against the SAME code the CLI runs, not a stand-in.
+///
+/// `endpoints`:
+///   * `Some(list)` — the CLUSTER front door: fan each object's fragments out over gRPC
+///     to the configured D servers ([`connect_fanout`]), holding metadata locally and
+///     writing NO local `FsChunkStore` — so a fleet of gateways is one pool over the
+///     shared cluster state, the invariant #454 restores.
+///   * `None` — the single-node local-FS front door (today's #367 behaviour preserved).
+///
+/// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
+/// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
+pub async fn serve_s3_role(
+    backend: MetadataBackend,
+    coordination: CoordinationBackend,
+    data_dir: &str,
+    endpoints: Option<&[String]>,
+    credentials: Vec<s3::sigv4::Credentials>,
+    region: String,
+    listener: tokio::net::TcpListener,
+) -> Result<(), BoxError> {
+    match endpoints {
+        // Cluster front door: the chunk plane is the gRPC fan-out over the configured
+        // D servers, so a chunk's fragments cross the wire to real D servers rather than
+        // a local disk — mirrors `cluster_put`'s `connect_fanout` (`cli.rs:1265`).
+        Some(endpoints) => {
+            let chunks = connect_fanout(endpoints).await?;
+            serve_s3_dispatch(
+                backend,
+                coordination,
+                data_dir,
+                chunks,
+                credentials,
+                region,
+                listener,
+            )
+            .await
+        }
+        // Single-node front door: the chunk plane is the local on-disk store under
+        // `data_dir/chunks`, exactly as before this slice (#367 loopback path).
+        None => {
+            let chunks = open_local_chunks(data_dir)?;
+            serve_s3_dispatch(
+                backend,
+                coordination,
+                data_dir,
+                chunks,
+                credentials,
+                region,
+                listener,
+            )
+            .await
+        }
+    }
+}
+
+/// The two-axis metadata × coordination dispatch shared by both chunk planes: open the
+/// selected metadata store and coordination concrete, compose the gateway over `chunks`,
+/// and serve. Each `(metadata, coordination)` arm monomorphizes its own
+/// `Gateway<M, C, Co>` — the `tikv` / `etcd` arms are `#[cfg]`-gated exactly as the peer
+/// roles' single-axis matches are (`cluster_put` `cli.rs:1266`, `cmd_d_server`
+/// `cli.rs:530`), so the default build compiles only the redb + mem arm and the
+/// production `tikv` + `etcd` arms build under their respective cargo features.
+async fn serve_s3_dispatch<C>(
+    backend: MetadataBackend,
+    coordination: CoordinationBackend,
+    data_dir: &str,
+    chunks: C,
+    credentials: Vec<s3::sigv4::Credentials>,
+    region: String,
+    listener: tokio::net::TcpListener,
+) -> Result<(), BoxError>
+where
+    C: PlacementChunkStore + Send + Sync + 'static,
+{
+    match (backend, coordination) {
+        (MetadataBackend::Redb, CoordinationBackend::Mem) => {
+            let meta = open_local_meta_redb(data_dir)?;
+            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            serve_s3(gateway, credentials, region, listener).await
+        }
+        #[cfg(feature = "tikv")]
+        (MetadataBackend::Tikv, CoordinationBackend::Mem) => {
+            let meta = open_tikv_meta().await?;
+            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            serve_s3(gateway, credentials, region, listener).await
+        }
+        #[cfg(feature = "etcd")]
+        (MetadataBackend::Redb, CoordinationBackend::Etcd) => {
+            let meta = open_local_meta_redb(data_dir)?;
+            let coord = open_etcd_coordination().await?;
+            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            serve_s3(gateway, credentials, region, listener).await
+        }
+        #[cfg(all(feature = "tikv", feature = "etcd"))]
+        (MetadataBackend::Tikv, CoordinationBackend::Etcd) => {
+            let meta = open_tikv_meta().await?;
+            let coord = open_etcd_coordination().await?;
+            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            serve_s3(gateway, credentials, region, listener).await
+        }
+    }
+}
+
+/// Recover the gateway's id allocators from persisted state (#364 durability finding 1)
+/// and serve the S3 HTTP wire surface over `listener` until it stops. Generic over the
+/// three backend seams (`M` metadata × `C` chunk plane × `Co` coordination) so every
+/// composition `cmd_s3` selects — the redb+mem+FS single-node front door, the
+/// redb+mem+gRPC-fanout cluster front door, and the tikv+etcd production composition —
+/// runs this identical serve path, differing only in the concrete backends handed in.
+pub async fn serve_s3<M, C, Co>(
+    gateway: Arc<Gateway<M, C, Co>>,
+    credentials: Vec<s3::sigv4::Credentials>,
+    region: String,
+    listener: tokio::net::TcpListener,
+) -> Result<(), BoxError>
+where
+    M: MetadataStore + Send + Sync + 'static,
+    C: PlacementChunkStore + Send + Sync + 'static,
+    Co: wyrd_traits::Coordination + Send + Sync + 'static,
+{
+    // Resume the in-process id allocators above everything already persisted under the
+    // data dir, so a RESTART over an existing store never reuses a committed inode or
+    // chunk id and corrupts an existing object (issue #364 durability finding 1).
+    gateway.recover().await?;
+    let mut config = s3::S3Config::new(credentials);
+    config.region = region;
+    let server = s3::S3Gateway::new(gateway, config);
+    server.serve(listener).await?;
+    Ok(())
 }
 
 /// `wyrd put … --endpoints <list>`: store the object through the static-endpoints
