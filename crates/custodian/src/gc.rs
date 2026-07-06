@@ -29,31 +29,19 @@
 
 use std::collections::{HashMap, HashSet};
 
-use wyrd_core::metadata::{self, InodeRecord, InodeState, MalformedPlacement, PendingEntry};
+// The orphan-ledger key protocol lives in `core::metadata` (beside `pending_key`) so the
+// delete path that WRITES a grace record and this GC loop that READS it share one
+// definition and can never key-format-drift (issue #364). Re-exported `pub(crate)` here so
+// the other orphaning loops (`reconstruction.rs`, `rebalance.rs`) keep calling
+// `crate::gc::orphan_key` unchanged.
+pub(crate) use wyrd_core::metadata::orphan_key;
+use wyrd_core::metadata::{
+    self, parse_orphan_key, InodeRecord, InodeState, MalformedPlacement, PendingEntry,
+    ORPHAN_PREFIX,
+};
 use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::reconciliation::Reconciled;
-
-/// Key prefix for the **orphan ledger** — the reader-safe grace record an orphaning
-/// operation (a delete or a completed reconstruction) writes when it strands a
-/// fragment, mirroring the pending-ledger sweep pattern (architecture §5; the grace
-/// window of `0005:291-294`). The value is the logical-millis instant the fragment
-/// became orphaned; GC reclaims it only once the grace window has elapsed past that
-/// instant.
-const ORPHAN_PREFIX: &[u8] = b"orphan:";
-
-pub(crate) fn orphan_key(dserver: DServerId, frag: FragmentId) -> Vec<u8> {
-    format!("orphan:{dserver}:{}:{}", frag.chunk, frag.index).into_bytes()
-}
-
-fn parse_orphan_key(key: &[u8]) -> Option<(DServerId, FragmentId)> {
-    let rest = std::str::from_utf8(key).ok()?.strip_prefix("orphan:")?;
-    let mut parts = rest.splitn(3, ':');
-    let dserver = parts.next()?.parse().ok()?;
-    let chunk = parts.next()?.parse().ok()?;
-    let index = parts.next()?.parse().ok()?;
-    Some((dserver, FragmentId { chunk, index }))
-}
 
 fn parse_pending_chunk(key: &[u8]) -> Option<ChunkId> {
     std::str::from_utf8(key)

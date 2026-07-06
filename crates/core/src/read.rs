@@ -15,6 +15,7 @@
 //!   the read fails with a typed error. A `replication(1)`/`none` chunk has a
 //!   single fragment, so a corrupt or missing one simply errors.
 
+use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use wyrd_chunk_format::decode;
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, PlacementChunkStore, Result};
@@ -309,6 +310,51 @@ pub async fn read_object(
         repair::enqueue_repair(meta, chunk, "read").await?;
     }
     Ok(Some(result?))
+}
+
+/// Resolve `name` under `parent` to its **committed** inode snapshot, or `None` if
+/// the name is unbound or its inode is not yet `COMMITTED`. The returned record
+/// carries only the chunk *map* (ids/scheme/len/placement) — small metadata, not the
+/// object bytes — so a caller can then stream the object one chunk at a time via
+/// [`read_chunk_verified`] without ever materialising the whole object (the
+/// "stream, don't buffer" invariant, issue #364 / `0015:789`).
+pub async fn committed_inode(
+    meta: &impl MetadataStore,
+    parent: InodeId,
+    name: &str,
+) -> Result<Option<InodeRecord>> {
+    let Some(inode_id) = resolve(meta, parent, name).await? else {
+        return Ok(None);
+    };
+    let Some(inode) = read_inode(meta, inode_id).await? else {
+        return Ok(None);
+    };
+    if inode.state != InodeState::Committed {
+        return Ok(None);
+    }
+    Ok(Some(inode))
+}
+
+/// Read and verify a **single** chunk of a committed object, enqueuing any chunk
+/// whose read had to exclude a checksum-failing fragment onto the shared repair
+/// queue (`0005:174-176`) — exactly as the whole-object [`read_object`] does, but for
+/// one chunk. This is the per-chunk primitive a streaming GET walks over
+/// [`InodeRecord::chunk_map`] with, so only one chunk (never the whole object) is
+/// resident at a time (issue #364). Fragment checksums are verified on the way out,
+/// so a streamed read still never yields corrupt bytes.
+pub async fn read_chunk_verified(
+    meta: &impl MetadataStore,
+    chunks: &impl PlacementChunkStore,
+    chunk: &ChunkRef,
+) -> Result<Bytes> {
+    let mut corrupt = Vec::new();
+    let result = read_chunk(chunks, chunk, &mut corrupt).await;
+    corrupt.sort_unstable();
+    corrupt.dedup();
+    for chunk_id in corrupt {
+        repair::enqueue_repair(meta, chunk_id, "read").await?;
+    }
+    Ok(Bytes::from(result?))
 }
 
 /// Read a committed object by path. `None` if the name is unbound or its inode is

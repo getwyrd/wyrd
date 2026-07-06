@@ -59,10 +59,23 @@ async-trait.workspace = true
 # and runs the fenced reconciliation loop through it (ADR-0011/0012).
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The client-facing gateway seam and its S3 wire surface (issue #364, T5-a). The wire
+# layer is its OWN crate, generic over `ObjectGateway` (which `Gateway` implements) — so
+# the S3 protocol never calcifies in this composition root. `cli::cmd_s3` binds the
+# listener; the axum/hmac/SigV4 machinery lives in `gateway-s3`, not here.
+wyrd-gateway-core.workspace = true
+wyrd-gateway-s3.workspace = true
 # The production L5 Coordination backend, wired only under the OFF-by-default
 # `etcd` feature above — optional so the default build never compiles the etcd tree.
 wyrd-coordination-etcd = { workspace = true, optional = true }
 bytes.workspace = true
+# Stream combinators for the streaming PUT body adapter (map/StreamExt) and the
+# `HashingSource` wrapper — `alloc`-only, the same runtime-agnostic dep core uses.
+futures-util.workspace = true
+# Vetted RustCrypto SHA-256 for the streaming PUT body hash (issue #364, carry-forward
+# T5-a): the running digest checked against the wire layer's authenticated content hash
+# before commit. MIT OR Apache-2.0, already deny.toml-allowed.
+sha2.workspace = true
 pollster.workspace = true
 # The D-server registration record (`{ id, endpoint, failure-domain label }`,
 # proposal 0005 "The placement record") is serialized into the coordination value.
@@ -86,6 +99,14 @@ tempfile.workspace = true
 # Dev-only — dev-dependencies are not compiled into the production binary, so the
 # runtime tokio feature set is unchanged.
 tokio = { workspace = true, features = ["test-util"] }
+# The aws-sdk-s3 client + smithy runtime drive the S3 wire surface's real-SDK interop
+# test (issue #364). `async-trait` (used by the M2.5 fault-fake) is a normal dependency
+# above now — the custodian role needs it at build time — so it is not repeated here.
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["rt-tokio", "http-1x"] }
+aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client"] }
+aws-smithy-runtime-api = { version = "1.12.3", features = ["client", "http-1x"] }
+aws-smithy-types = "1.5.0"
+aws-credential-types = "1.2.14"
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

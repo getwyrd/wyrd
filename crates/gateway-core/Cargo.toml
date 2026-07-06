@@ -1,0 +1,23 @@
+[package]
+name = "wyrd-gateway-core"
+description = "The shared gateway seam (ObjectGateway) every client-facing gateway front-door is generic over, plus the neutral content-hash / gateway-error vocabulary. Seam only — no wire protocol, no concretes (ADR-0010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The seam names the storage `Result`/`BoxError` vocabulary (a gateway's methods are
+# fallible in the same currency as the backends it composes).
+wyrd-traits.workspace = true
+bytes.workspace = true
+# `Stream` is the object-body currency both a PUT source and a GET response speak.
+# `alloc`-only, runtime-agnostic — the same lean dep the core write/read paths use.
+futures-util.workspace = true
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

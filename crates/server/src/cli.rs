@@ -33,9 +33,15 @@ use wyrd_traits::{
 use crate::custodian::{connect_fleet, ConfiguredDServer, CustodianService, DServerConnector};
 use crate::dserver::{self, DServer};
 use crate::{Gateway, DEFAULT_DURABILITY};
+use wyrd_gateway_s3 as s3;
 
 /// Default endpoint the `d-server` role binds and advertises.
 const DEFAULT_DSERVER_BIND: &str = "127.0.0.1:50051";
+/// Default listen address for the `s3` gateway role. `0.0.0.0:8080` mirrors the
+/// blueprint's `--s3-listen 0.0.0.0:8080` (m4-first-deployment-blueprint:620-623).
+const DEFAULT_S3_LISTEN: &str = "0.0.0.0:8080";
+/// Default SigV4 region the `s3` role expects in a credential scope.
+const DEFAULT_S3_REGION: &str = "us-east-1";
 /// Default D-server registration lease lifetime, and how often it is renewed —
 /// renew well within the TTL so a missed tick does not drop the registration.
 const DEFAULT_DSERVER_LEASE_TTL_SECS: u64 = 30;
@@ -204,6 +210,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         Some("get") => cmd_get(&args[1..]),
         Some("d-server") => cmd_d_server(&args[1..]),
         Some("custodian") => cmd_custodian(&args[1..]),
+        Some("s3") => cmd_s3(&args[1..]),
         Some("demo") => cmd_demo(),
         Some(other) => {
             eprintln!("wyrd: unknown command `{other}`");
@@ -230,6 +237,7 @@ fn usage() {
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
     eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  --endpoints drives a local distributed cluster: fragments fan out over gRPC");
@@ -1172,6 +1180,72 @@ fn tokio_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
     Ok(tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?)
+}
+
+/// `wyrd s3`: the **runnable gateway server role** — serve the S3-compatible HTTP wire
+/// surface (bucket-scoped object PUT/GET/DELETE with mandatory SigV4, streaming bodies)
+/// over the composed redb + filesystem + in-memory-coordination backends (issue #364,
+/// m4-first-deployment-blueprint:59). This is the "Stateless S3 front door" the
+/// first-deployment gate (#367) runs; the public-TLS terminator and the multi-node,
+/// discovery-driven stand-up are gated on the separate coordination prerequisite
+/// (proposal 0015 §"Deployment prerequisite", 443-463), so at M4 this binds plaintext
+/// loopback/host and an operator fronts it with the public S3 cert.
+fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
+    let parsed = ParsedArgs::parse(args)?;
+    let listen: SocketAddr = parsed
+        .flag("s3-listen")
+        .unwrap_or(DEFAULT_S3_LISTEN)
+        .parse()
+        .map_err(|e| format!("s3: invalid --s3-listen address: {e}"))?;
+    let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
+    let region = parsed
+        .flag("region")
+        .unwrap_or(DEFAULT_S3_REGION)
+        .to_string();
+    let access_key = parsed
+        .flag("access-key")
+        .map(str::to_string)
+        .or_else(|| std::env::var("WYRD_S3_ACCESS_KEY").ok())
+        .ok_or(
+            "s3: --access-key (or WYRD_S3_ACCESS_KEY) is required; there is no anonymous access",
+        )?;
+    let secret_key = parsed
+        .flag("secret-key")
+        .map(str::to_string)
+        .or_else(|| std::env::var("WYRD_S3_SECRET_KEY").ok())
+        .ok_or("s3: --secret-key (or WYRD_S3_SECRET_KEY) is required")?;
+
+    let dir = Path::new(data_dir);
+    std::fs::create_dir_all(dir)?;
+    let meta = RedbMetadataStore::open(dir.join("meta.redb"))?;
+    let chunks = FsChunkStore::open(dir.join("chunks"))?;
+    let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+
+    let mut config = s3::S3Config::new(vec![s3::sigv4::Credentials {
+        access_key_id: access_key,
+        secret_access_key: secret_key,
+    }]);
+    config.region = region.clone();
+    let server = s3::S3Gateway::new(Arc::clone(&gateway), config);
+
+    let runtime = tokio_runtime()?;
+    runtime.block_on(async move {
+        // Resume the in-process id allocators above everything already persisted under
+        // `data_dir`, so a RESTART over an existing store never reuses a committed inode or
+        // chunk id and corrupts an existing object (issue #364 durability finding 1).
+        gateway.recover().await?;
+        let listener = tokio::net::TcpListener::bind(listen).await?;
+        eprintln!(
+            "wyrd s3: serving S3-compatible HTTP on {} (data-dir {data_dir})",
+            listener.local_addr()?
+        );
+        eprintln!(
+            "wyrd s3: SigV4 required (region {region}, service s3); no anonymous access. Ctrl-C to stop"
+        );
+        server.serve(listener).await?;
+        Ok::<(), BoxError>(())
+    })?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `wyrd put … --endpoints <list>`: store the object through the static-endpoints

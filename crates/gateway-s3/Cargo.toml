@@ -1,0 +1,35 @@
+[package]
+name = "wyrd-gateway-s3"
+description = "The S3-compatible HTTP wire surface (bucket-scoped object PUT/GET/DELETE, SigV4 auth, aws-chunked streaming). Generic over the ObjectGateway seam — names no concrete backend (ADR-0010, issue #364)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The shared gateway seam this wire layer is generic over (issue #364, T5-a): the
+# listener drives objects through `ObjectGateway`, never a concrete `Gateway<M,C,Co>`.
+wyrd-gateway-core.workspace = true
+wyrd-traits.workspace = true
+# axum hosts the client-facing HTTP listener; already `cargo deny`-vetted via tonic.
+axum.workspace = true
+bytes.workspace = true
+# Stream combinators for the request-body adapter and the aws-chunked decoder.
+futures-util.workspace = true
+# Vetted RustCrypto primitives on the SigV4 auth boundary (issue #364, T5-a):
+# SHA-256 (payload + canonical-request digest) and HMAC-SHA256 (the signing MAC).
+hmac.workspace = true
+sha2.workspace = true
+# The runtime that hosts the listener and the bounded-channel decode/read tasks.
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true
