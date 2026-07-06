@@ -15,11 +15,12 @@
 //! `scan_dir_is_green_over_the_real_workspace_crates` proves the invariant holds
 //! today (GREEN on the real tree).
 //!
-//! **(2) A `docker compose config` structural-validity check** over the new
-//! `deploy/small-multi-node/docker-compose.yml` (the single-zone "Small multi-node
-//! Production" stack, architecture §7.1): it must parse and declare the profile's
-//! FOUR component roles — PD, TiKV, the 3-node etcd ensemble (L5 Coordination), and
-//! D servers. This only *parses* the compose file (`docker compose config`), never
+//! **(2) A `docker compose config` structural-validity check** over the
+//! `deploy/small-multi-node/docker-compose.yml` (the consolidated single-zone stack,
+//! architecture §7.1): it must parse and declare every component role — the 3-node PD
+//! ensemble, the 3-node TiKV, the 3-node etcd ensemble (L5 Coordination), the 9 D
+//! servers, the custodian role, and the S3 gateway role. This only *parses* the
+//! compose file (`docker compose config`), never
 //! brings up a container, so it stays fast; it mirrors the project's existing
 //! docker-availability convention (`docker_available` in `xtask/src/main.rs`): a
 //! hard failure in CI (the `.github/workflows/ci.yml` `ubuntu-latest` runner always
@@ -175,26 +176,41 @@ fn small_multi_node_compose_config_is_structurally_valid() {
     );
 
     let merged = String::from_utf8_lossy(&output.stdout);
-    // The profile's four component roles (proposal 0015 §"Deployment"; architecture
-    // §7.1 "Small multi-node" row): the 3-node PD ensemble, TiKV-small, the 3-node
-    // etcd ensemble (L5 Coordination), and the local-disk D servers.
+    // The consolidated single-zone stack's component roles (proposal 0015 §"Deployment";
+    // architecture §7.1 "Small multi-node" row): the 3-node PD ensemble, the 3-node
+    // TiKV, the 3-node etcd ensemble (L5 Coordination), the 9 local-disk D servers
+    // (fd0..fd8 — `dserver8` proves the 9th is declared), the custodian role, and the
+    // S3 gateway role.
     for service in [
-        "pd0", "pd1", "pd2", "tikv:", "etcd0", "etcd1", "etcd2", "dserver0", "dserver1", "dserver2",
+        "pd0",
+        "pd1",
+        "pd2",
+        "tikv0",
+        "tikv1",
+        "tikv2",
+        "etcd0",
+        "etcd1",
+        "etcd2",
+        "dserver0",
+        "dserver8",
+        "custodian0",
+        "gateway0",
     ] {
         assert!(
             merged.contains(service),
-            "merged compose config is missing the `{service}` service — all four \
-             component roles (PD / TiKV / etcd / D server) must be declared:\n{merged}"
+            "merged compose config is missing the `{service}` service — every role \
+             (PD / TiKV / etcd / D server / custodian / S3 gateway) must be declared:\n{merged}"
         );
     }
-    // The images pinned for the three external components, and the D-server image
-    // reused from the root dev stack (Scope: "reusing the wyrd-dserver:local image
-    // and the wyrd d-server role").
+    // The images pinned for the three external components, and the feature-built
+    // (`--features tikv,etcd`) wyrd image the single-zone stack tags distinctly from
+    // the integration fixture's default-feature `wyrd-dserver:test` so the two never
+    // clobber (ADR-0043).
     for image in [
         "pingcap/pd:",
         "pingcap/tikv:",
         "etcd:",
-        "wyrd-dserver:local",
+        "wyrd-single-zone:local",
     ] {
         assert!(
             merged.contains(image),
