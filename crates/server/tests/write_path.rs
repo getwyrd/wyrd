@@ -233,10 +233,10 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
             write::write_fragments(&chunks, &plan_b).await.unwrap();
 
             // They race to commit on the same prior; exactly one wins.
-            let a = write::commit_overwrite(&meta, 1, &prior, &plan_a)
+            let a = write::commit_overwrite(&meta, 1, &prior, &plan_a, 0)
                 .await
                 .unwrap();
-            let b = write::commit_overwrite(&meta, 1, &prior, &plan_b)
+            let b = write::commit_overwrite(&meta, 1, &prior, &plan_b, 0)
                 .await
                 .unwrap();
             assert_eq!(a, CommitOutcome::Committed, "seed {seed}");

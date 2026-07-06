@@ -21,6 +21,8 @@ members = [
     "crates/coordination-mem",
     "crates/coordination-etcd",
     "crates/custodian",
+    "crates/gateway-core",
+    "crates/gateway-s3",
     "crates/server",
     "crates/dst",
     "xtask",
@@ -50,9 +52,21 @@ wyrd-coordination-conformance = { path = "crates/coordination-conformance" }
 wyrd-coordination-mem = { path = "crates/coordination-mem" }
 wyrd-coordination-etcd = { path = "crates/coordination-etcd" }
 wyrd-custodian = { path = "crates/custodian" }
+# The shared gateway seam (ObjectGateway) and the S3 wire-surface crate it drives
+# (issue #364, T5-a): the wire layer is its own crate, generic over the neutral seam,
+# so it never calcifies inside the `server` composition root (ADR-0010).
+wyrd-gateway-core = { path = "crates/gateway-core" }
+wyrd-gateway-s3 = { path = "crates/gateway-s3" }
 
 # Shared third-party dependencies, version-pinned once here.
 async-trait = "0.1"
+# The HTTP framework hosting the gateway's S3 wire surface (issue #364,
+# m4-first-deployment-blueprint §5 "Primary integration surface"). Already in the
+# graph transitively via `tonic` (built on axum/hyper), so this promotes an existing,
+# `cargo deny`-vetted crate to a direct dependency rather than adding a new one to the
+# licence surface. Minimal features: a router + `axum::serve` + streaming bodies over
+# HTTP/1 (no default multipart/ws/etc.).
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytes = "1"
 # EC micro-benchmarks (M1.7). Lean: no plotters/rayon HTML stack — the console
 # numbers are what CI tracks, and fewer transitive deps keeps the license
@@ -64,16 +78,13 @@ crc32c = "0.6"
 # polls the n fragment futures cooperatively — deterministic under madsim, no
 # task spawning, no runtime tie-in (ADR-0009).
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+# RustCrypto HMAC-SHA256 — the SigV4 signing/verification MAC on the gateway's
+# fail-closed auth boundary (issue #364). A vetted, maintained implementation replacing
+# the earlier hand-rolled one (carry-forward T5-a); `MIT OR Apache-2.0` (already on the
+# deny.toml allowlist), pure-Rust, no build script. Paired with `sha2` (same digest 0.10
+# core). Adopted through the ADR-0003 §2 three-test dependency audit (see build-notes).
+hmac = "0.12"
 madsim = "0.2"
-# The `tonic` simulator on madsim (M2.6, proposal 0004 "DST and integration
-# tests"). Under `--cfg madsim` the gRPC `ChunkStore` stubs resolve here so the
-# *real* `GrpcChunkStore` wire code runs on madsim's deterministic simulated
-# network (ADR-0009), rather than a ChunkStore-level in-sim fake (the recorded
-# fallback). Version matrix: madsim-tonic 0.6.0+0.14 tracks tonic 0.14. Default
-# features off — the dev/DST profile runs plaintext, no TLS (ADR-0005). The
-# published version carries `+0.14` build metadata (the tracked tonic line);
-# the requirement drops it (semver ignores build metadata) to keep cargo quiet.
-madsim-tonic = { version = "0.6.0", default-features = false }
 # Codegen counterpart, used by `proto`'s build.rs only when `CARGO_CFG_MADSIM`
 # is set; it emits the simulated client/server stubs into `OUT_DIR/sim/`.
 madsim-tonic-build = "0.6.0"
@@ -106,6 +117,11 @@ redb = "4"
 reed-solomon-simd = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# RustCrypto SHA-256 — the SigV4 payload hash + canonical-request digest, and the
+# streaming PUT body hash (issue #364). Vetted maintained crate replacing the earlier
+# hand-rolled SHA-256 on the auth boundary (carry-forward T5-a); `MIT OR Apache-2.0`
+# (already allowed), pure-Rust, no build script. Paired with `hmac` above.
+sha2 = "0.10"
 tempfile = "3"
 # Async runtime, used only to *host* a tonic server (the gRPC stack is built on
 # tokio/hyper, already in the tree via tonic). Wyrd's own async surface stays

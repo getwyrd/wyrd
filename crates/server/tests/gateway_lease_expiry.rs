@@ -119,6 +119,7 @@ async fn losing_put_leaves_a_future_dated_lease() {
         "the pre-occupied inode makes the PUT lose: {err}"
     );
 
+    let finished = now_millis();
     let pending: Vec<Bytes> = probe
         .kv
         .lock()
@@ -131,16 +132,28 @@ async fn losing_put_leaves_a_future_dated_lease() {
     for value in pending {
         let entry: PendingEntry = metadata::decode(value.as_ref()).unwrap();
         let expiry = entry.lease_expiry_millis;
-        // `now + ttl` lands just ahead of `started` (ttl is tens of seconds). `now - ttl`
-        // lands in the past (fails the lower bound); `now * ttl` overshoots by millennia
-        // (fails the upper bound). A 10-minute window comfortably brackets the real `+`.
+        // The lease is stamped `internal_now + ttl` where the gateway's `ttl` is tens of
+        // seconds. The two mutants this kills: `+ -> -` gives `internal_now - ttl` (the
+        // PAST, ~30s BELOW `started`); `+ -> *` gives `internal_now * ttl` (millennia in
+        // the future). The bounds bracket the real `+` while excluding both.
+        //
+        // DURABILITY (issue #364 carry-forward, iter-6 item 4 — quarantine the wall-clock
+        // flake): `started`/`finished` are sampled from a DIFFERENT wall-clock read than the
+        // gateway's internal one, so an NTP backward step between them could push a correct
+        // `+ ttl` lease just under a tight `>= started` lower bound and flake the gate. The
+        // lower bound is slackened by `SKEW_ALLOWANCE_MILLIS` (20s) to absorb a clock step of
+        // up to ~50s while STILL rejecting the `- ttl` mutant: that mutant lands at least
+        // `2*ttl` (~60s) below the correct lease, well beneath `started - 20s`. The upper
+        // bound stays generous for the `* ttl` mutant.
+        const SKEW_ALLOWANCE_MILLIS: u64 = 20_000;
         assert!(
-            expiry >= started,
-            "lease must expire in the future (now + ttl), not the past (now - ttl): {expiry} < {started}"
+            expiry + SKEW_ALLOWANCE_MILLIS >= started,
+            "lease must expire in the future (now + ttl), not the past (now - ttl): \
+             {expiry} < {started} - {SKEW_ALLOWANCE_MILLIS}"
         );
         assert!(
-            expiry <= started + 600_000,
-            "lease must be ~now + ttl, not now * ttl: {expiry} >> {started}"
+            expiry <= finished + 600_000,
+            "lease must be ~now + ttl, not now * ttl: {expiry} >> {finished}"
         );
     }
 }

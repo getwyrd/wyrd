@@ -262,13 +262,28 @@ pub async fn commit_create(
 
 /// Phase 3 — Commit (overwrite): CAS the inode's chunk map + size onto `prior`,
 /// bumping the version. `Conflict` rejects a stale writer; exactly one wins.
+///
+/// The prior object's fragments are **superseded** by this overwrite, so they are orphaned
+/// in the *same atomic commit* (`orphaned_at` stamps the grace record) — the custodian GC
+/// reclaims them after the reader-safe grace window, so an overwrite neither leaks the old
+/// bytes (issue #364, PUT-overwrite reclaim) nor tears a concurrent reader of the prior
+/// version. See [`metadata::commit_chunk_map_superseding`].
 pub async fn commit_overwrite(
     meta: &impl MetadataStore,
     inode_id: InodeId,
     prior: &InodeRecord,
     plan: &WritePlan,
+    orphaned_at_millis: u64,
 ) -> Result<CommitOutcome> {
-    metadata::commit_chunk_map(meta, inode_id, prior, plan.chunk_refs(), plan.size).await
+    metadata::commit_chunk_map_superseding(
+        meta,
+        inode_id,
+        prior,
+        plan.chunk_refs(),
+        plan.size,
+        orphaned_at_millis,
+    )
+    .await
 }
 
 /// Phase 4 — Release: delete the pending-ledger entries for a committed write.
@@ -338,6 +353,206 @@ pub async fn write_new_object_placed(
         release(meta, &plan).await?;
     }
     Ok(outcome)
+}
+
+/// Intent + Data for **one** chunk, streaming: lease the chunk id then fan its
+/// fragments out (the same per-chunk `intent`→`write_fragments` the whole-object path
+/// runs, `write.rs`). Returns the chunk's metadata with its fragment **bytes dropped**
+/// — they are already written, so only the id/scheme/len/placement is retained for the
+/// commit, keeping the streaming write's resident footprint at one chunk (issue #364,
+/// `0015:789`).
+async fn intent_and_write_chunk(
+    meta: &impl MetadataStore,
+    chunks: &impl PlacementChunkStore,
+    scheme: EcScheme,
+    id: ChunkId,
+    piece: &[u8],
+    lease_expiry_millis: u64,
+) -> Result<PlannedChunk> {
+    let fragments = encode_chunk(scheme, id, piece)?;
+    // Identity placement (`index` → D-server `index`), the M0–M2 `index % n` route —
+    // the streaming path does not run the failure-domain selector (a later refinement).
+    let placement: Vec<DServerId> = (0..fragments.len() as u64).collect();
+    metadata::put_pending(
+        meta,
+        id,
+        &PendingEntry {
+            lease_expiry_millis,
+        },
+    )
+    .await?;
+    let puts = fragments.iter().map(|(index, fragment)| {
+        let frag_id = FragmentId {
+            chunk: id,
+            index: *index,
+        };
+        let dserver = placement
+            .get(*index as usize)
+            .copied()
+            .unwrap_or_else(|| DServerId::from(*index));
+        chunks.put_fragment_at(dserver, frag_id, fragment.clone())
+    });
+    futures_util::future::try_join_all(puts).await?;
+    Ok(PlannedChunk {
+        id,
+        scheme,
+        len: piece.len() as u64,
+        // Bytes already written and dropped — the commit needs only `chunk_refs()`.
+        fragments: Vec::new(),
+        placement,
+    })
+}
+
+/// Lease + write one streaming chunk, first **renewing the in-flight leases** written so
+/// far if the clock has advanced past `renew_at`.
+///
+/// Because a streaming PUT commits only after its *last* chunk arrives, an early chunk's
+/// fragments are protected from the custodian **GC** solely by its pending lease — they are
+/// in no committed chunk map yet, so GC's committed reference set does not cover them
+/// (`custodian::gc::reconcile`). A single start-of-upload deadline stamped on every chunk
+/// (the prior behaviour) let a slow authenticated upload run past it, so the GC would reclaim
+/// the early chunks as *expired* garbage before the commit and publish an object with missing
+/// fragments (issue #364 durability finding 2). Renewing keeps every in-flight lease a fresh
+/// TTL ahead of the most recent write, and the new chunk is stamped from its own write time.
+/// A stall longer than the TTL *between* two chunks still lapses — a genuinely dead upload the
+/// sweep should reap.
+#[allow(clippy::too_many_arguments)]
+async fn lease_write_chunk(
+    meta: &impl MetadataStore,
+    chunks: &impl PlacementChunkStore,
+    scheme: EcScheme,
+    id: ChunkId,
+    piece: &[u8],
+    now_millis: u64,
+    lease_ttl_millis: u64,
+    leased: &mut Vec<ChunkId>,
+    renew_at: &mut u64,
+) -> Result<PlannedChunk> {
+    if !leased.is_empty() && now_millis >= *renew_at {
+        metadata::renew_pending(
+            meta,
+            leased,
+            &PendingEntry {
+                lease_expiry_millis: now_millis + lease_ttl_millis,
+            },
+        )
+        .await?;
+        *renew_at = now_millis + lease_ttl_millis / 2;
+    }
+    let planned = intent_and_write_chunk(
+        meta,
+        chunks,
+        scheme,
+        id,
+        piece,
+        now_millis + lease_ttl_millis,
+    )
+    .await?;
+    if leased.is_empty() {
+        // First chunk of the upload: arm the renewal clock half a TTL out.
+        *renew_at = now_millis + lease_ttl_millis / 2;
+    }
+    leased.push(id);
+    Ok(planned)
+}
+
+/// Phases 1–2 (Intent + Data) driven from a **byte stream** rather than a full
+/// `&[u8]`: re-chunk the incoming buffers into `chunk_size` pieces and lease + write
+/// each chunk **as it arrives**, so the object is never held whole in memory — the
+/// "stream, don't buffer" invariant that closes the `0015:789` OOM cliff for the S3
+/// wire surface (issue #364). Peak resident bytes are one `chunk_size` piece plus its
+/// fragments, independent of object size.
+///
+/// The returned [`WritePlan`] carries the committed chunk **map** (no fragment bytes)
+/// and total size, so the caller drives phase 3 (commit) with the existing
+/// [`commit_create`] / [`commit_overwrite`] and phase 4 ([`release`]) exactly as the
+/// buffered path does — the data written here is **leased garbage** until that commit,
+/// so a caller that aborts (e.g. a payload-hash mismatch) never publishes it; the
+/// sweep reclaims it. `next_id` mints the chunk ids and `source` yields the body
+/// buffers in order (any sizes); an empty stream yields an empty plan.
+///
+/// `now_fn` is read **per chunk** (not once), so each chunk is leased from its own write
+/// time and the in-flight leases are **renewed** as the upload progresses ([`lease_write_chunk`]).
+/// A slow upload therefore never lets the custodian GC reclaim an already-written chunk before
+/// the commit — the durability hole a single start-of-upload deadline left open (issue #364
+/// durability finding 2). It takes a clock closure rather than a fixed instant so a DST run
+/// still drives a deterministic logical clock (ADR-0009).
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_write_data<S>(
+    meta: &impl MetadataStore,
+    chunks: &impl PlacementChunkStore,
+    mut source: S,
+    chunk_size: usize,
+    scheme: EcScheme,
+    mut now_fn: impl FnMut() -> u64,
+    lease_ttl_millis: u64,
+    mut next_id: impl FnMut() -> ChunkId,
+) -> Result<WritePlan>
+where
+    S: futures_util::Stream<Item = Result<Bytes>> + Unpin,
+{
+    use futures_util::StreamExt;
+
+    let chunk_size = chunk_size.max(1);
+    let mut planned: Vec<PlannedChunk> = Vec::new();
+    // The chunk ids leased-but-not-yet-committed by this upload, and the next logical
+    // instant at which to renew their leases (half a TTL ahead of the most recent write).
+    let mut leased: Vec<ChunkId> = Vec::new();
+    let mut renew_at: u64 = 0;
+    let mut size: u64 = 0;
+    let mut buf: Vec<u8> = Vec::with_capacity(chunk_size);
+
+    while let Some(item) = source.next().await {
+        let bytes = item?;
+        let mut rest = &bytes[..];
+        while !rest.is_empty() {
+            let take = (chunk_size - buf.len()).min(rest.len());
+            buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if buf.len() == chunk_size {
+                let id = next_id();
+                planned.push(
+                    lease_write_chunk(
+                        meta,
+                        chunks,
+                        scheme,
+                        id,
+                        &buf,
+                        now_fn(),
+                        lease_ttl_millis,
+                        &mut leased,
+                        &mut renew_at,
+                    )
+                    .await?,
+                );
+                size += buf.len() as u64;
+                buf.clear();
+            }
+        }
+    }
+    if !buf.is_empty() {
+        let id = next_id();
+        planned.push(
+            lease_write_chunk(
+                meta,
+                chunks,
+                scheme,
+                id,
+                &buf,
+                now_fn(),
+                lease_ttl_millis,
+                &mut leased,
+                &mut renew_at,
+            )
+            .await?,
+        );
+        size += buf.len() as u64;
+    }
+
+    Ok(WritePlan {
+        chunks: planned,
+        size,
+    })
 }
 
 /// Reclaim expired pending-ledger entries — the custodian sweep stand-in
