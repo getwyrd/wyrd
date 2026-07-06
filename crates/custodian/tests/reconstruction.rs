@@ -282,8 +282,27 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
 
 // ---- criterion 1+2: kill a D server, reconstruct to full redundancy, reads never err ----
 
+/// Install a permissive global `tracing` default **once** so the durability metric
+/// callsites never latch `Interest::never` under the parallel test harness. `tracing`
+/// caches each callsite's interest in a process-global table the first time it is hit;
+/// a first hit racing a no-subscriber default can latch the callsite disabled, after
+/// which the test that reads the metric back (`gather_prometheus`) silently sees it
+/// missing (the flaky read-back the C4 gate caught, iteration-4). Registering against an
+/// always-enabling default before any callsite fires makes every first-registration
+/// agree; each test's own `.with_subscriber(...)` still routes its metrics into that
+/// test's provider. Called at the top of every metric-touching test so whichever runs
+/// first sets the default before any callsite fires (mirrors `scrub.rs:208`).
+fn enable_metric_callsites() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 #[tokio::test]
 async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_step() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -323,6 +342,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
         meta: &meta,
         fleet: &healthy_fleet,
         topology: &healthy_topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -387,6 +407,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
 
 #[tokio::test]
 async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -416,6 +437,7 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
         meta: &meta,
         fleet: &full_fleet,
         topology: &topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -473,6 +495,7 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
 /// survivors — never a re-committed short/empty vector.
 #[tokio::test]
 async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_record() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -532,6 +555,7 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
         meta: &meta,
         fleet: &healthy_fleet,
         topology: &healthy_topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -607,6 +631,7 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
 /// this goes red (the placement is repointed to `[9, 1, 3]` and the obligation is drained).
 #[tokio::test]
 async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3, d9) = (
         MemDServer::default(),
@@ -667,6 +692,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
         meta: &meta,
         fleet: &healthy_fleet,
         topology: &healthy_topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -729,6 +755,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
 /// red (the malformed `None` placement returns `Unrepairable`, no metric is exported).
 #[tokio::test]
 async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -766,6 +793,7 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
         meta: &meta,
         fleet: &healthy_fleet,
         topology: &topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -873,6 +901,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
 /// case above (RS{2,1}) leaves open.
 #[tokio::test]
 async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
     let fleet = Fleet {
@@ -911,6 +940,7 @@ async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() 
         meta: &meta,
         fleet: &healthy_fleet,
         topology: &healthy_topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -1089,6 +1119,7 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
         meta: &meta,
         fleet: &recon_fleet,
         topology: &topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -1130,6 +1161,7 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
 /// (`Err(e.into())`, `lib.rs:241`) — the exact production fault shape for the fs D server.
 #[tokio::test]
 async fn reads_around_a_depth0_permanent_read_fault_on_a_placed_fragment() {
+    enable_metric_callsites();
     reads_around_a_permanent_read_fault(permanent_eio_fault).await;
 }
 
@@ -1139,6 +1171,7 @@ async fn reads_around_a_depth0_permanent_read_fault_on_a_placed_fragment() {
 /// transient fault and propagated (the gap a depth-0-only fixture would leave open).
 #[tokio::test]
 async fn reads_around_a_wrapped_permanent_read_fault_on_a_placed_fragment() {
+    enable_metric_callsites();
     reads_around_a_permanent_read_fault(wrapped_permanent_eio_fault).await;
 }
 
@@ -1155,6 +1188,7 @@ async fn reads_around_a_wrapped_permanent_read_fault_on_a_placed_fragment() {
 /// bump), failing every assertion below.
 #[tokio::test]
 async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d2, d3) = (
         MemDServer::default(),
@@ -1187,6 +1221,7 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
         meta: &meta,
         fleet: &recon_fleet,
         topology: &topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -1224,6 +1259,7 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
 
 #[tokio::test]
 async fn emits_the_three_repair_metrics_on_the_durability_seam() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -1251,6 +1287,7 @@ async fn emits_the_three_repair_metrics_on_the_durability_seam() {
         meta: &meta,
         fleet: &healthy_fleet,
         topology: &healthy_topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();
@@ -1372,6 +1409,280 @@ fn counter_total(exposed: &str, name: &str) -> u64 {
         .sum()
 }
 
+/// The value of a **gauge** metric read back off the Prometheus surface — the last matching
+/// sample (a gauge is a *level*, not accumulated). A gauge never emitted is absent → `None`.
+fn gauge_value(exposed: &str, name: &str) -> Option<f64> {
+    exposed
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let key = fields.next()?;
+            let value = fields.next()?;
+            let metric = key.split('{').next().unwrap_or(key);
+            (metric == name).then(|| value.parse::<f64>().ok())?
+        })
+        .next_back()
+}
+
+/// **iteration-5 BLOCKING #1 — the under-replicated gauge must EXCLUDE malformed placements,
+/// so the day-one "returns to ZERO" signal is observable on a POPULATED store.**
+///
+/// `assess` classifies a wrong-length committed placement `Malformed` *before any fragment is
+/// fetched* — a chunk whose fragments may all be physically present. It is never auto-repaired
+/// (ADR-0040 decision 4: never rebuild over a fabricated identity vector), so its obligation
+/// stays queued every pass. If that chunk were counted on the `reconstruction_under_replicated`
+/// gauge, a store carrying **one** pre-existing malformed chunk would floor the gauge at ≥ 1
+/// forever: the day-one drill's "kill a D-server → rise then return to ZERO" would return to 1,
+/// never 0 — undemonstrable on the very production store (#367) the floor gates.
+///
+/// This drives a populated store with BOTH a genuinely under-replicated chunk (repairable) and
+/// a pre-existing malformed chunk. The gauge must read the REAL loss (rise to 1) and then
+/// RETURN TO ZERO once that loss is repaired — the malformed chunk contributing 0 throughout,
+/// surfaced instead on its own distinct `reconstruction_malformed_placement` counter.
+///
+/// Pre-fix (`Malformed` incremented `under_replicated`): the gauge reads **2** then **1** —
+/// pinned above zero by the malformed chunk. Post-fix: **1** then **0** — RED→GREEN.
+#[tokio::test]
+async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
+    enable_metric_callsites();
+    const CHUNK_B: ChunkId = 0x0BAD_0BAD;
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3, d9) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3), (9, &d9)],
+    };
+
+    // Chunk A (inode 1, CHUNK): a normal RS(2,1) chunk placed [0,1,2].
+    write_rs_2_1(&meta, &fleet).await;
+    // Chunk B (inode 2, CHUNK_B): a second RS(2,1) chunk placed [0,1,2] — then MALFORMED.
+    write_rs_2_1_as(&meta, &fleet, 2, "objB", CHUNK_B).await;
+
+    // Make chunk B MALFORMED: commit a short (len-1) placement vector on inode 2. Its
+    // fragments stay physically present; only the committed placement is wrong-length.
+    let prior_b = read_inode_id(&meta, 2).await;
+    let mut chunk_map_b = prior_b.chunk_map.clone();
+    chunk_map_b[0].placement = vec![9];
+    assert_eq!(
+        metadata::commit_chunk_map(&meta, 2, &prior_b, chunk_map_b, prior_b.size)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+
+    // KILL one fragment of chunk A (index 2 on server 2): a real, REPAIRABLE under-replication.
+    d2.delete_fragment(frag(2)).await.unwrap();
+
+    // Enqueue an obligation for BOTH chunks — the shared queue the loop drains.
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+    repair::enqueue_repair(&meta, CHUNK_B, "health")
+        .await
+        .unwrap();
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+
+    // PASS 1 — the gauge reads the REAL loss only (chunk A), NOT the malformed chunk B.
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+        topology: &four_domains(),
+        unreachable: &[],
+    };
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .with_subscriber(tracing_subscriber::registry().with(telemetry.metrics_layer()))
+        .await
+        .unwrap();
+    telemetry.flush().unwrap();
+    let exposed = telemetry.gather_prometheus().unwrap();
+    assert_eq!(
+        gauge_value(&exposed, "reconstruction_under_replicated"),
+        Some(1.0),
+        "the gauge counts the one REPAIRABLE loss (chunk A) — NOT the malformed chunk B; \
+         pre-fix (malformed counted) this is 2. Exposed:\n{exposed}"
+    );
+    assert!(
+        counter_total(&exposed, "reconstruction_malformed_placement") >= 1,
+        "the malformed chunk is surfaced on its OWN distinct metric, not the durability gauge"
+    );
+
+    // PASS 2 — chunk A is repaired (full redundancy → not counted); chunk B is still malformed
+    // (queued, still not counted). The gauge RETURNS TO ZERO on the populated store.
+    let telemetry2 = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let ctx2 = ReconstructionContext {
+        meta: &meta,
+        fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+        topology: &four_domains(),
+        unreachable: &[],
+    };
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, 600)
+        .with_subscriber(tracing_subscriber::registry().with(telemetry2.metrics_layer()))
+        .await
+        .unwrap();
+    telemetry2.flush().unwrap();
+    let exposed2 = telemetry2.gather_prometheus().unwrap();
+    assert_eq!(
+        gauge_value(&exposed2, "reconstruction_under_replicated"),
+        Some(0.0),
+        "once the real loss is repaired the gauge RETURNS TO ZERO despite the pre-existing \
+         malformed chunk — the day-one signal is observable on a populated store (BLOCKING #1). \
+         Pre-fix it stays pinned at 1. Exposed:\n{exposed2}"
+    );
+    // The malformed chunk's obligation is still queued (NEEDS-HUMAN), proving it was NOT the
+    // thing keeping the gauge above zero — it simply never counted toward it.
+    let queued = repair::queued_repairs(&meta).await.unwrap();
+    assert!(
+        queued.contains(&CHUNK_B),
+        "the malformed chunk stays queued for a human, off the durability gauge"
+    );
+}
+
+/// **iteration-6 rejection — an un-reconstructable loss (`Unrepairable`, below `k`) is a
+/// DATA-LOSS event on its OWN high-severity signal, and must EXCLUDE the repairable-backlog
+/// gauge so the day-one "returns to ZERO" signal is observable on a store carrying a
+/// permanent loss.**
+///
+/// An `Unrepairable` chunk (survivors < `k`) is the storage system failing its primary
+/// responsibility — data meant to be durable is actually lost — which is *more* severe than a
+/// repairable backlog, not less. But it is never drained by this loop, so counting it on the
+/// `reconstruction_under_replicated` gauge would floor that gauge at ≥ 1 forever: the day-one
+/// drill's "kill a D-server → rise then return to ZERO" would return to 1, never 0, on any
+/// store carrying one un-reconstructable chunk. It must instead be raised on a distinct
+/// `reconstruction_data_loss` signal (a counter + a NEEDS-HUMAN audit line), leaving the
+/// backlog gauge free to return to zero.
+///
+/// This drives a POPULATED store with BOTH a genuinely repairable loss (chunk A, one fragment
+/// gone) and a permanent data loss (chunk B, TWO of three fragments gone → below `k`). The
+/// backlog gauge must read the REAL repairable loss (rise to 1) and then RETURN TO ZERO once
+/// that loss is repaired — the un-reconstructable chunk contributing 0 to it throughout,
+/// surfaced instead on its own `reconstruction_data_loss` counter, and staying queued for a
+/// human.
+///
+/// Pre-fix (`Unrepairable` incremented `under_replicated`): the gauge reads **2** then **1** —
+/// pinned above zero by the lost chunk, and no `reconstruction_data_loss` signal exists.
+/// Post-fix: **1** then **0**, with `reconstruction_data_loss` raised — RED→GREEN.
+#[tokio::test]
+async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to_zero() {
+    enable_metric_callsites();
+    const CHUNK_B: ChunkId = 0x0D00_D000;
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+
+    // Chunk A (inode 1, CHUNK): a normal RS(2,1) chunk placed [0,1,2].
+    write_rs_2_1(&meta, &fleet).await;
+    // Chunk B (inode 2, CHUNK_B): a second RS(2,1) chunk placed [0,1,2].
+    write_rs_2_1_as(&meta, &fleet, 2, "objB", CHUNK_B).await;
+
+    // KILL one fragment of chunk A (index 2 on server 2): a real, REPAIRABLE under-replication
+    // (survivors 2 ≥ k = 2).
+    d2.delete_fragment(frag(2)).await.unwrap();
+
+    // KILL TWO fragments of chunk B (indices 0 and 1): survivors = 1 < k = 2 → UN-reconstructable,
+    // the data is LOST. This is the most severe durability state.
+    d0.delete_fragment(FragmentId {
+        chunk: CHUNK_B,
+        index: 0,
+    })
+    .await
+    .unwrap();
+    d1.delete_fragment(FragmentId {
+        chunk: CHUNK_B,
+        index: 1,
+    })
+    .await
+    .unwrap();
+
+    // Enqueue an obligation for BOTH chunks — the shared queue the loop drains.
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+    repair::enqueue_repair(&meta, CHUNK_B, "health")
+        .await
+        .unwrap();
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+
+    // PASS 1 — the backlog gauge reads the REAL repairable loss only (chunk A), NOT the lost
+    // chunk B; chunk B is raised on the distinct data-loss signal.
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+        topology: &four_domains(),
+        unreachable: &[],
+    };
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .with_subscriber(tracing_subscriber::registry().with(telemetry.metrics_layer()))
+        .await
+        .unwrap();
+    telemetry.flush().unwrap();
+    let exposed = telemetry.gather_prometheus().unwrap();
+    assert_eq!(
+        gauge_value(&exposed, "reconstruction_under_replicated"),
+        Some(1.0),
+        "the backlog gauge counts the one REPAIRABLE loss (chunk A) — NOT the un-reconstructable \
+         chunk B; pre-fix (data loss counted) this is 2. Exposed:\n{exposed}"
+    );
+    assert!(
+        counter_total(&exposed, "reconstruction_data_loss") >= 1,
+        "the un-reconstructable chunk is surfaced on its OWN distinct data-loss metric, not the \
+         durability backlog gauge; pre-fix this metric does not exist. Exposed:\n{exposed}"
+    );
+
+    // PASS 2 — chunk A is repaired (full redundancy → not counted); chunk B is still lost
+    // (queued, still un-reconstructable). The backlog gauge RETURNS TO ZERO on the populated
+    // store, and the data-loss signal keeps firing while the loss persists.
+    let telemetry2 = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let ctx2 = ReconstructionContext {
+        meta: &meta,
+        fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+        topology: &four_domains(),
+        unreachable: &[],
+    };
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, 600)
+        .with_subscriber(tracing_subscriber::registry().with(telemetry2.metrics_layer()))
+        .await
+        .unwrap();
+    telemetry2.flush().unwrap();
+    let exposed2 = telemetry2.gather_prometheus().unwrap();
+    assert_eq!(
+        gauge_value(&exposed2, "reconstruction_under_replicated"),
+        Some(0.0),
+        "once the real repairable loss is repaired the backlog gauge RETURNS TO ZERO despite the \
+         permanent data loss on chunk B — the day-one signal is observable on a populated store \
+         (iteration-6). Pre-fix it stays pinned at 1. Exposed:\n{exposed2}"
+    );
+    assert!(
+        counter_total(&exposed2, "reconstruction_data_loss") >= 1,
+        "the data-loss signal is STILL raised while the un-reconstructable chunk persists"
+    );
+    // The lost chunk's obligation is still queued (NEEDS-HUMAN), proving it was NOT the thing
+    // keeping the gauge above zero — it simply never counted toward it.
+    let queued = repair::queued_repairs(&meta).await.unwrap();
+    assert!(
+        queued.contains(&CHUNK_B),
+        "the un-reconstructable chunk stays queued for a human, off the durability backlog gauge"
+    );
+}
+
 /// BINDING success identity (proposal 0005 §326-332, ADR-0011; the in-code contract at
 /// `reconstruction.rs`): over a reconstruction pass, the quantity the durability-plane
 /// telemetry defines as "successful repairs" must equal **exactly** the count of plans
@@ -1390,6 +1701,7 @@ fn counter_total(exposed: &str, name: &str) -> u64 {
 /// identity holds.
 #[tokio::test]
 async fn an_aborted_repair_is_not_counted_as_a_successful_repair() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -1446,6 +1758,7 @@ async fn an_aborted_repair_is_not_counted_as_a_successful_repair() {
         meta: &meta,
         fleet: &recon_fleet,
         topology: &topo,
+        unreachable: &[],
     };
 
     let coord = MemCoordination::new();

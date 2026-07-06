@@ -1,0 +1,28 @@
+[package]
+name = "wyrd-telemetry"
+description = "The backend-agnostic OpenTelemetry seam (observability floor, proposal 0010 item 1): a dual Prometheus/OTLP export surface behind ExporterConfig, shared by every role that emits telemetry (custodian durability plane today; request/capacity planes next). No backend hardcoded (ADR-0012)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Telemetry is emitted through `tracing` bridged to OpenTelemetry and dual-exported
+# over a Prometheus registry AND OTLP push — no backend hardcoded (ADR-0012). This
+# crate owns those dependencies so no leaf crate (custodian, and soon server's
+# request/capacity planes) has to (observability-floor invariant: the export seam
+# stays behind `ExporterConfig`, backend chosen at role entry).
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-prometheus.workspace = true
+opentelemetry-otlp.workspace = true
+prometheus.workspace = true
+
+# Inherit the workspace lint policy (single source of truth).
+[lints]
+workspace = true

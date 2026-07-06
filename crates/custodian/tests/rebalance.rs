@@ -334,8 +334,27 @@ async fn write_pre_m3_chunk(meta: &MemMeta, fleet: &Fleet<'_>, scheme: EcScheme)
 // tests assert `Reconciled::Changed` and a full-length, repointed placement instead.
 
 /// `EcScheme::None` leg: the single fragment lives at index 0.
+/// Install a permissive global `tracing` default **once** so the durability metric
+/// callsites never latch `Interest::never` under the parallel test harness. `tracing`
+/// caches each callsite's interest in a process-global table the first time it is hit;
+/// a first hit racing a no-subscriber default can latch the callsite disabled, after
+/// which the test that reads the metric back (`gather_prometheus`) silently sees it
+/// missing (the flaky read-back the C4 gate caught, iteration-4). Registering against an
+/// always-enabling default before any callsite fires makes every first-registration
+/// agree; each test's own `.with_subscriber(...)` still routes its metrics into that
+/// test's provider. Called at the top of every metric-touching test so whichever runs
+/// first sets the default before any callsite fires (mirrors `scrub.rs:208`).
+fn enable_metric_callsites() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 #[tokio::test]
 async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -433,6 +452,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
 /// identity-resolved fragment set rather than the (empty) raw vector.
 #[tokio::test]
 async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zero() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -579,6 +599,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
 /// chunk on n=9 distinct domains throughout.
 #[tokio::test]
 async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
     let fleet = Fleet {
@@ -668,6 +689,7 @@ async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() 
 
 #[tokio::test]
 async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_step() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -772,6 +794,7 @@ async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_
 
 #[tokio::test]
 async fn spread_wins_when_no_free_distinct_domain_remains() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2) = (
         MemDServer::default(),
@@ -843,6 +866,7 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
 
 #[tokio::test]
 async fn emits_per_failure_domain_utilization_on_the_durability_seam() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -897,6 +921,7 @@ async fn emits_per_failure_domain_utilization_on_the_durability_seam() {
 
 #[tokio::test]
 async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3, d4) = (
         MemDServer::default(),
@@ -1108,6 +1133,7 @@ impl MetadataStore for RacingMeta {
 
 #[tokio::test]
 async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_garbage() {
+    enable_metric_callsites();
     let racing = RacingMeta::new();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
@@ -1247,6 +1273,7 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
 /// this goes red (the placement is repointed to length 3 and the fragment is moved).
 #[tokio::test]
 async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
         MemDServer::default(),
