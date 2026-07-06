@@ -174,7 +174,7 @@ several layers deep. How we address it:
   on a fork is thin. The residual risk is *direction*, not *capture* — acceptable
   and named.
 
-#### YugabyteDB — liabilities: (a) SQL impedance; (b) single-vendor governance; (c) a heavy server
+#### YugabyteDB — liabilities: (a) SQL impedance; (b) single-vendor governance; (c) a heavy, self-managed server (plus a non-issue to dispatch: global-topology licensing)
 
 - **SQL impedance — contain it behind the trait on a tiny, fixed SQL surface.**
   The `metadata-yugabyte` concrete maps the trait onto one small schema (an
@@ -197,11 +197,34 @@ several layers deep. How we address it:
   protocol** — an open, decades-stable standard — so the *client* is not
   lock-in even if the server's vendor changes course. Continuity is weaker than
   CNCF-TiKV; that is the trade this option makes and the ADR names it.
-- **Heavy Postgres-fork server — accept it for the prod tier only.** The
-  production tier is a multi-node deployment regardless of backend; a heavier
-  server there is an ops cost, not an architecture one, and it is self-hostable
-  and EU-hostable. The embedded slot stays `redb`, so the "heavy" never reaches
-  dev/NAS.
+- **Global-topology licensing — a non-issue for Wyrd.** YugabyteDB's commercial
+  tiers (the *Aeon* managed / BYOC product) gate "global deployment topologies"
+  behind paid plans, which can read as "can't grow globally without a licence."
+  Two reasons it does not bite. (1) The gate is around the *managed product*, not
+  the engine: the **Apache-2.0 core** self-hosts multi-region clusters,
+  row-level geo-partitioning, follower reads, and synchronous + asynchronous
+  (xCluster) replication — and since early 2025 the formerly-enterprise features
+  (distributed backup, encryption at rest, read replicas) are in the OSS project
+  too. (2) **Wyrd never asks the metadata backend to grow globally.**
+  `MetadataStore` is the *per-zone* store; Wyrd supplies the global layer itself
+  — L2's globally-consistent namespace plus cross-zone replication (M9) and the
+  global control plane (M10) — *above* it, and ADR-0015's home-zone authority
+  deliberately keeps the commit point zone-local. So Wyrd runs one
+  **single-region cluster per zone** (multi-node within the zone for HA), squarely
+  inside the free core; a globe-spanning metadata DB would be the *wrong* shape,
+  fighting the zone-local contract. What is genuinely licensed — *YugabyteDB
+  Anywhere* / *Aeon* — is the management/orchestration convenience, addressed next.
+- **Heavy Postgres-fork server + self-managed operations — accept it for the prod
+  tier, own it with Wyrd's substrate.** Two real costs, neither a wall. (i)
+  Per-node footprint: a full Postgres-fork is heavier than TiKV or FDB, but the
+  production tier is multi-node regardless of backend, it is self-hostable and
+  EU-hostable, and the embedded slot stays `redb` so "heavy" never reaches
+  dev/NAS. (ii) The OSS path forgoes *YugabyteDB Anywhere* (the Polyform control
+  plane), so cluster bring-up, upgrade, backup, and monitoring are self-managed
+  with the OSS tooling (`yugabyted`, `yb-admin`, the open-source Kubernetes
+  operator / Helm) rather than the paid UI — which is exactly the posture ADR-0003's
+  control-resilience test *wants* (self-host, no *required* managed service). How
+  that per-zone operation is owned — for all three finalists — is treated next.
 
 #### Common to all three: the gate does not shrink
 
@@ -211,6 +234,34 @@ simulation-tested core (FDB) buys confidence but does not exempt the backend:
 with YugabyteDB you are trusting *its* distributed-transaction correctness
 instead of a client's; with FDB you are trusting *your mapping layer* onto its
 optimistic model. The battery tests exactly those.
+
+#### Common to all three: operating the per-zone cluster
+
+The distributed backend is deployed **once per zone** (multi-node within the zone
+for HA), and that cluster must be brought up, upgraded, backed up, and monitored.
+This is a real ops cost, but a bounded one — and it is not a licensing wall for
+any finalist:
+
+- **It is not a new capability.** A Wyrd zone already runs a per-zone stateful
+  quorum — **etcd** for L5 coordination (ADR-0006) — alongside the D-server fleet
+  and the leader-elected custodians. The metadata cluster is one more stateful
+  component in a pattern the zone already operates.
+- **Wyrd's own substrate owns it, not a vendor SaaS.** ADR-0010 makes the
+  deployment substrate pluggable (systemd on storage hosts / docker-compose / k8s
+  with a placement-aware operator) and forbids coupling to orchestrator APIs; M8
+  (manageability — CLI + portal) and the day-one runbook (#367) own zone
+  lifecycle. So operating the cluster depends on **none** of *YugabyteDB Anywhere*,
+  a *TiDB Dashboard* SaaS, or an FDB vendor console — the metadata cluster is
+  deployed and observed the same way D-servers, etcd, and custodians already are.
+- **Ops weight differs — it is a comparison axis the runbook decides.** TiKV adds
+  **PD** (the placement driver) plus `tiup`/operator and rolling upgrades;
+  FoundationDB uses `fdbmonitor`/`fdbcli` + the FDB operator and imposes the
+  strictest discipline — **lockstep protocol upgrades**, bridged by the
+  multi-version client; YugabyteDB has the lightest bring-up (`yugabyted`,
+  one command) but the heaviest per-node footprint. Whichever wins, the #367
+  first-deployment gate must stand the per-zone cluster up **end-to-end on OSS
+  tooling** — that run *is* the evidence the management story holds, riding the
+  same gate as the #257 correctness battery.
 
 ## Consequences
 
