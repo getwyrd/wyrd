@@ -1,0 +1,95 @@
+# Throwaway ≥3-REPLICA TiKV Raft group for the M4.6 (#257) Tier-1 metadata
+# consistency-over-the-swap leg (proposal 0015 §"DST and tests", PR-sequence item 6;
+# ADR-0039 in-repo consistency scenario; ADR-0015 single-zone contract). Like its
+# single-node sibling it lives under `deploy/`, OUTSIDE the Cargo workspace (ADR-0010:
+# the guard that keeps orchestrator coupling out of the crates).
+#
+# `pd` is TiKV's coordinator (Placement Driver). Three `tikv-N` storage nodes form the
+# Raft group whose quorum the Tier-1 consistency leg reasons about. PD's default region
+# replication factor is 3, so every region is placed on all three nodes.
+#
+# **Bridge network with one netns per node (the iteration-13 topology fix).** The earlier
+# host-networking topology gave every node a "distinct loopback IP" — but all nodes shared
+# the HOST network namespace, so a node's own outbound connections (its PD heartbeats, its
+# Raft links) were sourced from 127.0.0.1, NOT from its advertised IP, and an
+# `iptables -s/-d <ip>` cut never matched them. Empirically confirmed (iteration-13 leg-1
+# run): under the loopback cut, PD kept receiving the "isolated" store's heartbeats and the
+# fault-effect oracle correctly reported the fault as NOT materialized. With a bridge
+# network each node owns its netns: every packet it sends or receives carries its own
+# static IP below, and the Tier-1 scenario isolates a node by running the symmetric
+# `iptables` DROP **inside that node's netns** (`docker run --network container:<node>`,
+# see `iptables-agent/`) — bidirectional by construction, and a leaked rule on the HOST is
+# structurally impossible (Invariant B: the worst-case residue dies with the container).
+#
+# The host reaches the static container IPs directly (Linux bridge routing), so the test
+# client and the PD-side fault-effect oracle need no published ports.
+#
+# Static endpoints only (reduced bar until #365 lands L5 discovery — the "Deployment
+# prerequisite" note in proposal 0015).
+name: wyrd-tier1-metadata
+networks:
+  tier1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.57.0/24
+services:
+  pd:
+    image: pingcap/pd:v8.5.1
+    networks:
+      tier1:
+        ipv4_address: 172.30.57.10
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://172.30.57.10:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-peer-urls=http://172.30.57.10:2380
+      - --initial-cluster=pd=http://172.30.57.10:2380
+    restart: on-failure
+
+  tikv-0:
+    image: pingcap/tikv:v8.5.1
+    networks:
+      tier1:
+        ipv4_address: 172.30.57.11
+    depends_on:
+      - pd
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=172.30.57.11:20160
+      - --status-addr=0.0.0.0:20180
+      - --data-dir=/data/tikv-0
+      - --pd-endpoints=172.30.57.10:2379
+    restart: on-failure
+
+  tikv-1:
+    image: pingcap/tikv:v8.5.1
+    networks:
+      tier1:
+        ipv4_address: 172.30.57.12
+    depends_on:
+      - pd
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=172.30.57.12:20160
+      - --status-addr=0.0.0.0:20180
+      - --data-dir=/data/tikv-1
+      - --pd-endpoints=172.30.57.10:2379
+    restart: on-failure
+
+  tikv-2:
+    image: pingcap/tikv:v8.5.1
+    networks:
+      tier1:
+        ipv4_address: 172.30.57.13
+    depends_on:
+      - pd
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=172.30.57.13:20160
+      - --status-addr=0.0.0.0:20180
+      - --data-dir=/data/tikv-2
+      - --pd-endpoints=172.30.57.10:2379
+    restart: on-failure

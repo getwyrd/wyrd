@@ -66,6 +66,8 @@ fn main() -> ExitCode {
         Some("disk-faults") => faults::run_disk_faults(),
         Some("jepsen") => faults::run_jepsen(),
         Some("kill-reconstruct") => faults::run_kill_reconstruct(),
+        Some("metadata-tier1") => faults::run_metadata_tier1(),
+        Some("metadata-tier2") => faults::run_metadata_tier2(),
         Some("bench") => run_bench(),
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
@@ -90,7 +92,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 
@@ -984,29 +986,108 @@ fn run_orchestrator_guard() -> Result<(), String> {
     }
 }
 
-/// The full CI gate (ADR-0009). Each step runs in workspace order; the first
-/// failure stops the run.
-fn run_ci() -> Result<(), String> {
+/// The dedicated `cargo check --features …` runs `run_ci` makes to type-check
+/// feature-gated code the default `--workspace` build never compiles.
+///
+/// `run_ci`'s `build`/`test`/`clippy` all run `--workspace` with **default**
+/// features. `--all-targets` widens the *target kinds* (bins, tests, benches) but
+/// **not the feature set**, so any `#[cfg(feature = "…")]` body that is off by
+/// default is compiled by **none** of those steps — a type error inside it passes
+/// the whole gate silently.
+///
+/// The M4.6 (#257) Tier-1/Tier-2 metadata scenarios
+/// (`crates/metadata-tikv/tests/tier1_metadata_consistency.rs`,
+/// `tier2_metadata_io.rs`) are exactly this shape: their live bodies — the
+/// `SymmetricPartition` fault, its `Drop` heal, the PD-side fault-effect oracle,
+/// and the `partition_took_effect` / `heal_is_complete` / `consistency_passes`
+/// wiring — sit behind `#[cfg(feature = "tikv")]` (off by default so the gate stays
+/// container-free). Without this check a regression in that off-Check live scenario
+/// flips no Check artifact. This step compiles and type-checks it in the whole-tree
+/// gate (it does not *run* it — the `#[ignore]`d scenario still needs a real cluster).
+///
+/// **Gated on the TiKV build toolchain** (`tikv_toolchain_available`): these
+/// steps compile the pre-1.0 `tikv-client` tree (grpcio/protoc), which the default
+/// container-free / offline `cargo xtask ci` must **never** touch
+/// (`crates/metadata-tikv/Cargo.toml`: `tikv` is off by default precisely so the
+/// gate stays green on a laptop or PDCA worktree with no TiKV toolchain). The
+/// privileged Tier CI job that owns the live Tier-1/Tier-2 legs opts in by setting
+/// `WYRD_TIKV_TOOLCHAIN`; `run_ci_steps` only emits these steps when it is set.
+///
+/// Returned as data (not inlined into `run_ci_steps`) so the wiring is
+/// unit-testable: `tests::ci_type_checks_feature_gated_metadata_scenario` drives
+/// `run_ci_steps` with a recording executor, so removing this step OR removing the
+/// toolchain gate flips it red.
+fn feature_gated_checks() -> Vec<Vec<&'static str>> {
+    vec![vec![
+        "check",
+        "-p",
+        "wyrd-metadata-tikv",
+        "--features",
+        "tikv",
+        "--tests",
+    ]]
+}
+
+/// Whether the TiKV build toolchain (and thus the `tikv` feature's grpcio/protoc
+/// build dependencies) is declared available. **Off by default**: a plain
+/// `cargo xtask ci` on a laptop or a PDCA worktree with no TiKV toolchain must
+/// never compile or audit the pre-1.0 `tikv-client` tree
+/// (`crates/metadata-tikv/Cargo.toml`) — the documented container-free/offline CI
+/// invariant. The privileged Tier CI/eval job that owns the live Tier-1/Tier-2
+/// legs sets `WYRD_TIKV_TOOLCHAIN=1` to opt the feature-gated type-check in.
+fn tikv_toolchain_available() -> bool {
+    std::env::var_os("WYRD_TIKV_TOOLCHAIN").is_some()
+}
+
+/// The ordered `cargo` steps of the CI gate, executed via the injected `exec`
+/// (`run_ci` passes `cargo`; the unit test passes a recording closure so the real
+/// wiring is exercised without spawning `cargo`). `tikv_toolchain` gates the
+/// feature-gated metadata check: it is emitted **only** when the TiKV build
+/// toolchain is declared present (`WYRD_TIKV_TOOLCHAIN`), so the default no-TiKV
+/// `cargo xtask ci` never compiles the pre-1.0 `tikv-client` tree
+/// (`crates/metadata-tikv/Cargo.toml`) and stays green offline.
+fn run_ci_steps(
+    tikv_toolchain: bool,
+    exec: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+) -> Result<(), String> {
     // `wyrd-dst` only compiles under `--cfg madsim`; it is excluded from the
-    // normal workspace commands and built solely by `run_dst` below.
-    cargo(&["fmt", "--all", "--", "--check"])?;
+    // normal workspace commands and built solely by `run_dst`.
+    exec(&["fmt", "--all", "--", "--check"])?;
     // Lint levels (incl. warnings-as-errors) come from `[workspace.lints]` in
     // the root Cargo.toml — the single source of truth — not a CLI flag here.
-    cargo(&[
+    exec(&[
         "clippy",
         "--workspace",
         "--exclude",
         "wyrd-dst",
         "--all-targets",
     ])?;
-    cargo(&[
+    exec(&[
         "build",
         "--workspace",
         "--exclude",
         "wyrd-dst",
         "--all-targets",
     ])?;
-    cargo(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
+    exec(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
+    // Type-check the feature-gated metadata Tier scenario bodies the default
+    // `--workspace` build skips (`--all-targets` selects target KINDS, not
+    // features, so a `#[cfg(feature = "tikv")]` body slips through). GATED on the
+    // TiKV toolchain: compiling the pre-1.0 `tikv-client` tree is opt-in via
+    // `WYRD_TIKV_TOOLCHAIN` (the privileged Tier CI job) so the default offline
+    // gate stays container-free (M4.6, #257).
+    if tikv_toolchain {
+        for check in feature_gated_checks() {
+            exec(&check)?;
+        }
+    }
+    Ok(())
+}
+
+/// The full CI gate (ADR-0009). Each step runs in workspace order; the first
+/// failure stops the run.
+fn run_ci() -> Result<(), String> {
+    run_ci_steps(tikv_toolchain_available(), &mut |args| cargo(args))?;
     cargo_machete_check()?;
     cargo_deny_check()?;
     run_conformance()?;
@@ -1226,6 +1307,53 @@ mod tests {
             *order.borrow(),
             vec!["capture_logs", "teardown"],
             "diagnostics must be captured before teardown destroys them",
+        );
+    }
+
+    // M4.6 (#257): exercise `run_ci`'s REAL wiring (via `run_ci_steps`, the sole
+    // cargo-step source `run_ci` iterates) with a recording executor — no `cargo`
+    // spawned — and assert the invocations it actually makes. This is not the
+    // iter-10 tautology (which restated the `feature_gated_checks` constant and
+    // stayed green if the wiring loop was deleted): here removing the step from the
+    // wiring OR making the gate unconditional flips a case red.
+    #[test]
+    fn ci_type_checks_feature_gated_metadata_scenario() {
+        // Drive run_ci's cargo wiring, recording every argv it invokes.
+        fn recorded_invocations(tikv_toolchain: bool) -> Vec<String> {
+            let mut calls = Vec::new();
+            run_ci_steps(tikv_toolchain, &mut |args| {
+                calls.push(args.join(" "));
+                Ok(())
+            })
+            .expect("recording executor never errors");
+            calls
+        }
+        let is_metadata_feature_check = |c: &String| {
+            c.starts_with("check ")
+                && c.contains("-p wyrd-metadata-tikv")
+                && c.contains("--features tikv")
+                && c.contains("--tests")
+        };
+
+        // Toolchain present → run_ci INVOKES the metadata feature check, so the
+        // #[cfg(feature = "tikv")] Tier-1/Tier-2 scenario bodies (SymmetricPartition,
+        // the PD oracle, the testkit-oracle wiring) are type-checked at Check.
+        let with_toolchain = recorded_invocations(true);
+        assert!(
+            with_toolchain.iter().any(is_metadata_feature_check),
+            "run_ci must invoke `cargo check -p wyrd-metadata-tikv --features tikv --tests` \
+             when the TiKV toolchain is present, so the feature-gated metadata Tier scenario \
+             bodies are type-checked at Check: {with_toolchain:?}"
+        );
+
+        // Gate honesty: toolchain absent (a laptop / PDCA worktree) → run_ci must
+        // NOT compile the pre-1.0 `tikv-client` tree — the container-free/offline
+        // CI invariant. Making the step unconditional flips this red.
+        let without_toolchain = recorded_invocations(false);
+        assert!(
+            !without_toolchain.iter().any(is_metadata_feature_check),
+            "the default no-TiKV `cargo xtask ci` must not compile the tikv feature tree \
+             (WYRD_TIKV_TOOLCHAIN unset): {without_toolchain:?}"
         );
     }
 

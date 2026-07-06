@@ -4936,6 +4936,7 @@ dependencies = [
  "tikv-client",
  "tokio",
  "wyrd-metadata-conformance",
+ "wyrd-testkit",
  "wyrd-traits",
 ]
 
@@ -5009,6 +5010,7 @@ dependencies = [
 name = "wyrd-testkit"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "rand 0.10.1",
  "rand_chacha 0.10.0",
 ]
