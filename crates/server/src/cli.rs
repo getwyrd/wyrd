@@ -235,7 +235,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
-    eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
+    eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
     eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd demo");
@@ -465,6 +465,12 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         .unwrap_or(DEFAULT_DSERVER_BIND)
         .parse()
         .map_err(|e| format!("d-server: invalid --bind address: {e}"))?;
+    // The endpoint to REGISTER for discovery, decoupled from `bind` above (#458):
+    // a routable DNS service name or NAT-mapped address, not necessarily a
+    // `SocketAddr` `bind` could parse (a container's wildcard bind has no such
+    // routable numeric form). Unset, `run_d_server` leaves the endpoint at the
+    // bound-address value `DServer::bind` derived (today's loopback behaviour).
+    let advertise_addr = parsed.flag("advertise-addr").map(str::to_string);
     let lease_ttl = Duration::from_secs(parse_u64_flag(
         &parsed,
         "lease-ttl-secs",
@@ -518,6 +524,7 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         .build()?;
     let params = DServerParams {
         bind,
+        advertise_addr,
         dserver_id,
         failure_domain,
         admission,
@@ -890,6 +897,10 @@ fn parse_str_list(raw: Option<&str>) -> Vec<String> {
 /// over the coordination concrete without a long argument list.
 struct DServerParams {
     bind: SocketAddr,
+    /// The endpoint to register for discovery, decoupled from `bind` (#458). `None`
+    /// leaves the registered endpoint at the bound-address value (today's loopback
+    /// behaviour); `Some` overrides it (a routable DNS name / NAT-mapped address).
+    advertise_addr: Option<String>,
     dserver_id: u64,
     failure_domain: String,
     admission: dserver::AdmissionControl,
@@ -911,10 +922,13 @@ async fn run_d_server<Co>(
 where
     Co: wyrd_traits::Coordination + 'static,
 {
-    let server = DServer::bind(store, params.bind)
+    let mut server = DServer::bind(store, params.bind)
         .await?
         .with_identity(params.dserver_id, params.failure_domain)
         .with_admission_control(params.admission);
+    if let Some(advertise_addr) = params.advertise_addr {
+        server = server.with_advertise_addr(advertise_addr);
+    }
     eprintln!(
         "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {})",
         server.endpoint(),
