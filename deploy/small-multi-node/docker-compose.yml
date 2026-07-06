@@ -31,17 +31,18 @@
 #     in-process `MemCoordination` default.
 #   - Custodians open the TiKV metadata backend (`--metadata-backend tikv` +
 #     `WYRD_TIKV_PD_ENDPOINTS`) — the same store the cluster metadata lives in.
+#   - S3 gateways compose over the cluster backends (`--metadata-backend tikv` +
+#     `--coordination-backend etcd` + `--endpoints` fanning chunks to the 9 D servers
+#     over gRPC, #454) — so the 3 gateways are ONE pool over the shared cluster state,
+#     not 3 independent single-node islands.
 #
-# **Two honest limits of the current code (tracked, do NOT read this as end-to-end).**
-#   - The `wyrd s3` gateway is STANDALONE (#454). `cmd_s3` (`crates/server/src/cli.rs`)
-#     hardcodes local redb + FS + `MemCoordination` and ignores `--metadata-backend` /
-#     `--coordination-backend`, so each of the 3 gateways is an independent single-node
-#     island — NOT a pool over the D servers / TiKV / etcd.
-#   - There is NO closed write path yet (#455, depends on #454). Nothing writes cluster
-#     metadata into TiKV or fans chunks to the 9 D servers, so a `--metadata-backend
-#     tikv` custodian opens an (initially empty) store and sees zero repair obligations
-#     until exercised out-of-band (`wyrd put --endpoints … --metadata-backend tikv`).
-#     This stack is a topology bring-up / smoke target, not an object pipeline.
+# **One honest limit of the current code (tracked, do NOT read this as end-to-end).**
+#   - The live 9-D-server + TiKV + etcd write/durability demonstration is not stood up
+#     here yet (#455, depends on #454). This slice ships the gateway wiring + this
+#     configuration; #455 exercises the closed write path end-to-end (an S3 PUT/GET
+#     through a gateway lands fragments on the D servers with metadata in TiKV) and the
+#     day-one durability loop on the stood-up stack. Until that demonstration lands this
+#     stack is a topology bring-up / smoke target, not a proven object pipeline.
 name: wyrd-small-multi-node-m45
 
 services:
@@ -378,17 +379,23 @@ services:
     restart: on-failure
 
   # ── S3 gateways — the `wyrd s3` HTTP front door, 3 nodes on host ports 8081/8082/8083.
-  #    STANDALONE per #454: `cmd_s3` hardcodes local redb + FS + `MemCoordination` and
-  #    does NOT read `--metadata-backend`/`--coordination-backend`, so each gateway is
-  #    an independent single-node store, NOT a pool over the D servers / TiKV / etcd.
-  #    Wiring them to the cluster backends (and closing the end-to-end write path) is
-  #    tracked as #454 → #455. SigV4 is mandatory; test credentials supplied via env.
+  #    COMPOSED OVER THE CLUSTER BACKENDS per #454: each gateway reads
+  #    `--metadata-backend tikv` (`WYRD_TIKV_PD_ENDPOINTS`), `--coordination-backend etcd`
+  #    (`WYRD_ETCD_ENDPOINTS`), and `--endpoints` fanning chunks to the 9 D servers over
+  #    gRPC — mirroring the custodian's backend wiring above — so the 3 gateways are ONE
+  #    pool over the shared TiKV metadata + etcd coordination + D-server chunk plane, not
+  #    3 independent single-node islands. Metadata (and the persisted inode allocator)
+  #    live in TiKV; chunks cross the wire to the D servers, never a local disk. SigV4 is
+  #    mandatory; test credentials supplied via env.
   gateway0:
     image: wyrd-single-zone:local
-    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1"]
+    depends_on: [tikv0, tikv1, tikv2, etcd0, etcd1, etcd2, dserver0, dserver8]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "tikv", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
     environment:
       WYRD_S3_ACCESS_KEY: "wyrd-test"
       WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+      WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
       - "8081:8080"
     volumes:
@@ -397,10 +404,13 @@ services:
 
   gateway1:
     image: wyrd-single-zone:local
-    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1"]
+    depends_on: [tikv0, tikv1, tikv2, etcd0, etcd1, etcd2, dserver0, dserver8]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "tikv", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
     environment:
       WYRD_S3_ACCESS_KEY: "wyrd-test"
       WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+      WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
       - "8082:8080"
     volumes:
@@ -409,10 +419,13 @@ services:
 
   gateway2:
     image: wyrd-single-zone:local
-    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1"]
+    depends_on: [tikv0, tikv1, tikv2, etcd0, etcd1, etcd2, dserver0, dserver8]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "tikv", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
     environment:
       WYRD_S3_ACCESS_KEY: "wyrd-test"
       WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+      WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
       - "8083:8080"
     volumes:
