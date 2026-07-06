@@ -53,6 +53,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0039](0039-tier1-consistency-in-repo-scenario.md) | Tier-1 consistency-over-repair as an in-repo Rust scenario; literal Jepsen deferred (refines proposal 0005 §13.2) | Accepted |
 | [0040](0040-mixed-era-placement-expansion.md) | Mixed-era placement expansion: one identity-fallback rule, liberal read / strict maintenance (refines proposal 0005 §placement) | Accepted |
 | [0041](0041-consistency-checker-substrate.md) | Consistency-checker substrate: model the mutable metadata register, not the immutable data path (refines the ADR-0039 deferral; unblocks #329) | Proposed |
+| [0042](0042-production-metadata-backend-reevaluation.md) | Production metadata backend: reaffirm the two-slot design, narrow to three finalists (TiKV / FoundationDB / YugabyteDB), each with a named liability + mitigation; the #257 battery decides, TiKV incumbent (reopens ADR-0008's distributed slot; does not supersede it) | Proposed |
 
 ## Why not ... ?
 
