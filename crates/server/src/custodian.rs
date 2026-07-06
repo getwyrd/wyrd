@@ -294,8 +294,15 @@ impl CustodianService {
     /// 1. derives the LIVE reconstruction view ([`live_reconstruction_view`]) — dropping
     ///    any D-server that fails its reachability probe, so a killed server is read
     ///    *around* rather than crashing the pass;
-    /// 2. runs one fenced [`Self::reconcile_pass`] over that view (the durability metrics
-    ///    land on this role's export surface);
+    /// 2. runs one fenced [`Self::reconcile_pass`] that first **scrubs** the live fleet to
+    ///    DERIVE this store's repair obligations from the committed (gateway-written)
+    ///    placement ([`wyrd_custodian::scrub`] enqueues any referenced fragment it finds
+    ///    absent/corrupt), then **reconstructs** — assessing and repairing those obligations
+    ///    (the durability metrics land on this role's export surface). Deriving the
+    ///    obligations here is what closes the write→durability loop: without the scrub half
+    ///    the loop would only drain obligations some *other* producer enqueued, so a
+    ///    custodian opened over the store a gateway wrote would compute NO repair work from
+    ///    the placement — the "empty store sees zero repair" symptom (#455);
     /// 3. **survives** a per-pass store fault — a [`ReconcileError::Store`] (a server that
     ///    died *after* the probe, a transient metadata blip) is logged to stderr and the
     ///    loop continues to the next pass; only a [`ReconcileError::Fenced`] (this
@@ -323,6 +330,24 @@ impl CustodianService {
         tokio::pin!(shutdown);
         loop {
             let (fleet, topology, unreachable) = live_reconstruction_view(configured).await;
+            // DERIVE this pass's repair obligations from the committed (gateway-written)
+            // placement rather than only draining ones some other producer already enqueued.
+            // The scrub loop walks every referenced fragment on the live fleet and enqueues
+            // any it finds absent or corrupt ([`wyrd_custodian::scrub`]), so the SAME pass's
+            // reconstruction then assesses and repairs them. This is the write→repair join
+            // the deployable role needs: the placement a gateway PUT records over the cluster
+            // store is exactly what scrub reads to compute that object's repair obligations —
+            // ONE placement contract shared by the write path and the repair scan. Without it
+            // the reconstruction plane would run over an EMPTY queue on a store nothing else
+            // scrubbed, and a custodian opened over the store a gateway wrote would see zero
+            // repair work (the "empty store" symptom, #455). Scrub runs over the LIVE
+            // (reachable) fleet — a wholly-unreachable peer is dropped by the reachability
+            // probe and read *around* by reconstruction, unchanged — so a transient scrub
+            // fault degrades the pass (logged-and-continued below), never the process.
+            let scrub_ctx = ScrubContext {
+                meta,
+                fleet: &fleet,
+            };
             let ctx = ReconstructionContext {
                 meta,
                 fleet: &fleet,
@@ -332,7 +357,15 @@ impl CustodianService {
                 unreachable: &unreachable,
             };
             match self
-                .reconcile_pass(zone, custodian, None, None, Some(&ctx), None, clock())
+                .reconcile_pass(
+                    zone,
+                    custodian,
+                    None,
+                    Some(&scrub_ctx),
+                    Some(&ctx),
+                    None,
+                    clock(),
+                )
                 .await
             {
                 Ok(_) => {}
