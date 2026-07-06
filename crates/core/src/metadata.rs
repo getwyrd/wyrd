@@ -15,7 +15,9 @@
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use wyrd_traits::{ChunkId, CommitOutcome, DServerId, MetadataStore, Result, WriteBatch};
+use wyrd_traits::{
+    ChunkId, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
+};
 
 /// An inode identifier.
 pub type InodeId = u64;
@@ -37,6 +39,37 @@ pub fn dirent_key(parent: InodeId, name: &str) -> Vec<u8> {
 /// Key for a pending-chunk ledger entry: `pending:<chunk_id>`.
 pub fn pending_key(chunk: ChunkId) -> Vec<u8> {
     format!("pending:{chunk}").into_bytes()
+}
+
+/// Key prefix for the **orphan ledger** — the reader-safe grace record an orphaning
+/// operation (a delete, or a completed reconstruction / rebalance) writes when it
+/// strands a fragment, so the custodian **GC** loop reclaims the bytes only once the
+/// grace window has elapsed (proposal 0005, "The four custodian loops" / GC,
+/// `0005:288-295`; the reader-safe window `0005:291-294`). The value is the
+/// logical-millis instant the fragment became orphaned.
+pub const ORPHAN_PREFIX: &[u8] = b"orphan:";
+
+/// Key for an orphan-ledger grace record: `orphan:<dserver>:<chunk>:<index>`.
+///
+/// Defined here beside [`pending_key`] because the orphan ledger is a **metadata-store
+/// key protocol shared by both sides of a delete**: the delete path ([`unlink`], and the
+/// gateway's `delete_object`) **writes** it, and the custodian GC
+/// (`crates/custodian/src/gc.rs`) **reads** it. A single source of truth so a delete's
+/// grace record and GC's scan can never key-format-drift — the crash-leak backstop is only
+/// real if the record a delete writes is the exact key GC reclaims (issue #364).
+pub fn orphan_key(dserver: DServerId, frag: FragmentId) -> Vec<u8> {
+    format!("orphan:{dserver}:{}:{}", frag.chunk, frag.index).into_bytes()
+}
+
+/// Parse an [`orphan_key`] back into its `(dserver, fragment)`, or `None` if `key` is
+/// not a well-formed orphan-ledger key. The inverse GC uses to read the ledger.
+pub fn parse_orphan_key(key: &[u8]) -> Option<(DServerId, FragmentId)> {
+    let rest = std::str::from_utf8(key).ok()?.strip_prefix("orphan:")?;
+    let mut parts = rest.splitn(3, ':');
+    let dserver = parts.next()?.parse().ok()?;
+    let chunk = parts.next()?.parse().ok()?;
+    let index = parts.next()?.parse().ok()?;
+    Some((dserver, FragmentId { chunk, index }))
 }
 
 /// Whether an inode's content is fully committed or still being written.
@@ -292,6 +325,95 @@ pub async fn rename(
     store.commit(batch).await
 }
 
+/// The result of an [`unlink`] attempt on a bound name: the commit `outcome` and, when
+/// the dirent resolved to one, the `inode` record that was removed — so the caller can
+/// reclaim exactly that object's chunk fragments on a winning commit (issue #364).
+#[derive(Debug, Clone)]
+pub struct Unlinked {
+    /// Whether the removal committed or lost a compare-and-set to a racing writer.
+    pub outcome: CommitOutcome,
+    /// The inode the removed dirent pointed at (`None` only for a dangling dirent).
+    pub inode: Option<InodeRecord>,
+}
+
+/// Atomically remove a name binding and the inode it resolves to — the metadata
+/// half of an S3 DELETE (issue #364). Returns `Ok(None)` if the name is already
+/// unbound (an idempotent no-op the caller reports as success), else an [`Unlinked`]
+/// carrying the commit outcome and the removed inode.
+///
+/// Compare-and-set on **both** the dirent and the inode so a delete racing an
+/// overwrite (which replaces the inode) or a concurrent delete loses with
+/// [`CommitOutcome::Conflict`] rather than removing a record a racing writer just
+/// changed — the caller retries or treats an already-absent key as success so the
+/// *observable* DELETE is idempotent (S3's 204).
+///
+/// This removes the **metadata** records **and**, in the *same atomic commit*, writes an
+/// **orphan grace record** ([`orphan_key`], value `orphaned_at_millis`) for every fragment
+/// the removed object placed — keyed by the **D-server the chunk map actually placed it on**
+/// ([`ChunkRef::fragments`]), the placement-aware address GC reclaims from. The fragment bytes
+/// are **not** reclaimed eagerly on the delete path: they are left under the orphan ledger for
+/// the custodian **GC** (`crates/custodian/src/gc.rs`) to reclaim once the reader-safe grace
+/// window elapses (proposal 0005, `0005:288-295`), so a concurrent reader still streaming the
+/// prior object from those fragments is never torn mid-read (a GET during a DELETE completes
+/// intact). Because the records are durable the instant the object becomes unreferenced, a
+/// crash never strands the bytes forever either. This is a *real* backstop, not the
+/// pending-ledger sweep: the **pending sweep**
+/// ([`sweep_pending`] / [`sweep_expired_leases`]) scans `pending:` lease keys only, and a
+/// committed object's fragments carry no pending entry, so without the orphan record GC would
+/// see an unreferenced-but-undeadlined fragment and conservatively keep it forever
+/// (`gc.rs:reconcile`) — the crash-leak this record closes (issue #364).
+///
+/// `orphaned_at_millis` is the caller's logical clock; GC honours the grace window relative
+/// to it. On a lost CAS ([`CommitOutcome::Conflict`]) the whole batch rolls back, so no
+/// orphan record is written for a delete that did not remove the object.
+pub async fn unlink(
+    store: &impl MetadataStore,
+    parent: InodeId,
+    name: &str,
+    orphaned_at_millis: u64,
+) -> Result<Option<Unlinked>> {
+    let dirent_key = dirent_key(parent, name);
+    let Some(dirent_bytes) = store.get(&dirent_key).await? else {
+        return Ok(None);
+    };
+    let dirent: DirentRecord = decode(&dirent_bytes)?;
+    let inode_key = inode_key(dirent.inode);
+    let inode_bytes = store.get(&inode_key).await?;
+    let inode = inode_bytes
+        .as_ref()
+        .map(|bytes| decode::<InodeRecord>(bytes))
+        .transpose()?;
+
+    let mut batch = WriteBatch::new()
+        .require(dirent_key.clone(), dirent_bytes)
+        .delete(dirent_key)
+        .delete(inode_key.clone());
+    batch = match inode_bytes {
+        Some(bytes) => batch.require(inode_key, bytes),
+        None => batch.require_absent(inode_key),
+    };
+    // Grace-record every fragment the removed object placed, in the SAME atomic commit
+    // that unbinds it (placement-aware: keyed by the D-server the chunk map placed the
+    // fragment on, not `index`), so GC can reclaim it after a crash before the eager
+    // reclaim runs.
+    if let Some(inode) = &inode {
+        for chunk in &inode.chunk_map {
+            for (index, dserver) in chunk.fragments() {
+                let frag = FragmentId {
+                    chunk: chunk.id,
+                    index,
+                };
+                batch = batch.put(
+                    orphan_key(dserver, frag),
+                    orphaned_at_millis.to_string().into_bytes(),
+                );
+            }
+        }
+    }
+    let outcome = store.commit(batch).await?;
+    Ok(Some(Unlinked { outcome, inode }))
+}
+
 /// Commit a chunk map and size onto an inode at the commit point, bumping its
 /// version **conditional on the prior record** (full-value compare-and-set). A
 /// writer holding a stale `prior` loses with [`CommitOutcome::Conflict`];
@@ -316,6 +438,57 @@ pub async fn commit_chunk_map(
     store.commit(batch).await
 }
 
+/// Commit a new chunk map onto an inode (an object-content **overwrite**), CAS-conditional
+/// on `prior`, **and** orphan every fragment the *prior* chunk map placed — in the *same
+/// atomic batch*. This is the overwrite counterpart of the orphan grace records [`unlink`]
+/// writes for a DELETE (issue #364, PUT-overwrite reclaim): the superseded fragments become
+/// unreferenced the instant the new map wins, so a crash *after* the CAS never strands the
+/// prior object's bytes — the custodian **GC** (`crates/custodian/src/gc.rs`) reclaims each
+/// recorded orphan once the reader-safe grace window elapses (proposal 0005, `0005:288-295`).
+///
+/// Reclaim is left to GC (not done eagerly) precisely so a concurrent reader still holding the
+/// prior chunk map reads its fragments intact within the grace window — the same reader-safe
+/// discipline that keeps a GET during a DELETE from being truncated. The prior fragments are
+/// orphaned by their **placed** D-server ([`ChunkRef::fragments`]), the address GC reclaims
+/// from. [`commit_chunk_map`] (used by reconstruction/backfill, which *keep* the fragments and
+/// only re-place them) is deliberately left non-orphaning — only a content overwrite
+/// supersedes the bytes.
+///
+/// A `Conflict` (a stale writer lost the CAS) rolls the whole batch back, so no orphan record
+/// is ever written for an overwrite that did not win.
+pub async fn commit_chunk_map_superseding(
+    store: &impl MetadataStore,
+    id: InodeId,
+    prior: &InodeRecord,
+    chunk_map: Vec<ChunkRef>,
+    size: u64,
+    orphaned_at_millis: u64,
+) -> Result<CommitOutcome> {
+    let next = InodeRecord {
+        size,
+        chunk_map,
+        state: InodeState::Committed,
+        version: prior.version + 1,
+    };
+    let key = inode_key(id);
+    let mut batch = WriteBatch::new()
+        .require(key.clone(), encode(prior))
+        .put(key, encode(&next));
+    for chunk in &prior.chunk_map {
+        for (index, dserver) in chunk.fragments() {
+            let frag = FragmentId {
+                chunk: chunk.id,
+                index,
+            };
+            batch = batch.put(
+                orphan_key(dserver, frag),
+                orphaned_at_millis.to_string().into_bytes(),
+            );
+        }
+    }
+    store.commit(batch).await
+}
+
 /// Write a pending-chunk ledger entry (the Intent phase of the write protocol).
 pub async fn put_pending(
     store: &impl MetadataStore,
@@ -337,6 +510,116 @@ pub async fn sweep_pending(
         batch = batch.delete(pending_key(chunk));
     }
     store.commit(batch).await
+}
+
+/// **Renew** the pending-ledger lease on every chunk in `chunks` to `entry` in one atomic
+/// batch. The streaming write path calls this as an upload progresses so an already-written
+/// but not-yet-committed chunk's lease never lapses before the final commit: until the
+/// commit publishes the inode, an in-flight chunk's fragments are protected from the
+/// custodian **GC** only by its unexpired pending lease (they are in no committed chunk map,
+/// so GC's reference set does not cover them). A single start-of-upload deadline let a slow
+/// upload run past it and the GC would reclaim the early chunks as expired garbage before
+/// the commit — publishing an object with missing fragments (issue #364 durability finding
+/// 2, `write::stream_write_data`). A plain overwrite of each `pending:<id>` entry, so it is
+/// idempotent; an empty slice is a no-op.
+pub async fn renew_pending(
+    store: &impl MetadataStore,
+    chunks: &[ChunkId],
+    entry: &PendingEntry,
+) -> Result<CommitOutcome> {
+    if chunks.is_empty() {
+        return Ok(CommitOutcome::Committed);
+    }
+    let mut batch = WriteBatch::new();
+    for &chunk in chunks {
+        batch = batch.put(pending_key(chunk), encode(entry));
+    }
+    store.commit(batch).await
+}
+
+/// Parse the inode id out of an `inode:<id>` key (the inverse of [`inode_key`]).
+fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix("inode:")?
+        .parse()
+        .ok()
+}
+
+/// Parse the chunk id out of a `pending:<id>` key (the inverse of [`pending_key`]).
+fn parse_pending_chunk_key(key: &[u8]) -> Option<ChunkId> {
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix("pending:")?
+        .parse()
+        .ok()
+}
+
+/// The high-water marks of the **in-process id allocators** over the persisted metadata:
+/// the largest inode id any record uses, and the largest **in-process-scheme** chunk id
+/// (those below `2^64`) any committed chunk map, pending-ledger entry, **or orphan-ledger
+/// grace record** references.
+///
+/// A single-process gateway (`wyrd_server::Gateway`) allocates inode and chunk ids from
+/// in-memory counters; on a restart over a **non-empty** store those counters must resume
+/// *above* everything already on disk. Otherwise a new-key PUT reuses a committed inode id
+/// — a bogus "concurrent writer won" conflict, because [`create`] is `require_absent` on the
+/// inode key — and an overwrite mints a chunk id that already backs a committed object,
+/// clobbering its fragments on the shared chunk store (issue #364 durability finding 1).
+/// This scan supplies those marks so `Gateway::recover` can bump the counters. An empty
+/// store yields `(0, 0)` and allocation starts at 1, unchanged.
+///
+/// The `orphan:` scan closes a third re-mint hazard: after `PUT → DELETE → restart` the
+/// deleted object's inode key is gone ([`unlink`] removes it) and its chunk was already
+/// committed (so no `pending:` entry survives), yet its fragments are still on disk under a
+/// live [`orphan_key`] grace record until the custodian GC's reader-safe window elapses
+/// (`crates/custodian/src/gc.rs:134-141`). Were that chunk id not counted here, `recover`
+/// would re-mint it for the next object — and GC's reference gate keys on `(dserver, chunk,
+/// index)` (`ReferenceSet::protects`, `gc.rs:200`), so the stale orphan record then either
+/// leaks the old bytes permanently (the id now looks referenced) or reclaims a fragment the
+/// re-minting object has just written but not yet committed (data loss). Projecting the
+/// orphan record's chunk id into `max_chunk` makes re-mint step past every id whose orphan
+/// record / on-disk fragments are still live (issue #364 durability finding, iter-8 review).
+///
+/// Chunk ids are projected to the `< 2^64` in-process space on purpose: the cluster client
+/// mode derives chunk ids as `(inode << 64) | seq` (`server::cli::chunk_id_minter`) and
+/// resumes *its* allocator from the durable `meta:next_inode` counter, so those disjoint,
+/// above-`2^64` ids are not the in-process counter's to recover from (and never collide with
+/// it — the in-process counter only ever mints ids below `2^64`).
+pub async fn high_water_marks(store: &impl MetadataStore) -> Result<(InodeId, ChunkId)> {
+    const IN_PROCESS_CHUNK_CEILING: ChunkId = 1 << 64;
+    let mut max_inode: InodeId = 0;
+    let mut max_chunk: ChunkId = 0;
+    for (key, value) in store.scan(b"inode:").await? {
+        if let Some(id) = parse_inode_key(&key) {
+            max_inode = max_inode.max(id);
+        }
+        let record: InodeRecord = decode(&value)?;
+        for chunk in &record.chunk_map {
+            if chunk.id < IN_PROCESS_CHUNK_CEILING {
+                max_chunk = max_chunk.max(chunk.id);
+            }
+        }
+    }
+    for (key, _value) in store.scan(b"pending:").await? {
+        if let Some(chunk) = parse_pending_chunk_key(&key) {
+            if chunk < IN_PROCESS_CHUNK_CEILING {
+                max_chunk = max_chunk.max(chunk);
+            }
+        }
+    }
+    // Orphan grace records (`orphan:<dserver>:<chunk>:<index>`): a deleted object's
+    // fragments still live on disk under this ledger until GC's grace window elapses, so
+    // their chunk id is not yet free to re-mint even though no `inode:`/`pending:` key
+    // references it any more (see the doc comment above; issue #364).
+    for (key, _value) in store.scan(ORPHAN_PREFIX).await? {
+        if let Some((_dserver, frag)) = parse_orphan_key(&key) {
+            if frag.chunk < IN_PROCESS_CHUNK_CEILING {
+                max_chunk = max_chunk.max(frag.chunk);
+            }
+        }
+    }
+    Ok((max_inode, max_chunk))
 }
 
 #[cfg(test)]
