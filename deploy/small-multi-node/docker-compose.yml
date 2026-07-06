@@ -221,12 +221,12 @@ services:
   #    other (ADR-0043). Every other wyrd role below reuses this image (same `wyrd`
   #    binary, different subcommand). Wired to L5: `--coordination-backend etcd` +
   #    `WYRD_ETCD_ENDPOINTS` (#449) — each D server really connects to the etcd
-  #    ensemble and publishes a registration record. CAVEAT: the record advertises the
-  #    server's *bound* address (`http://0.0.0.0:50051`), not a routable one — d-server
-  #    has no `--advertise-addr` yet (#458) — so the record is not usable for
-  #    cross-container discovery. Harmless here: nothing in this stack discovers D
-  #    servers through etcd (the custodian below dials static `--endpoints`), so this
-  #    proves the connect/register path, not discovery-driven placement.
+  #    ensemble and publishes a registration record. `--advertise-addr dserverN:50051`
+  #    (#458) makes that record carry the routable per-service DNS name instead of the
+  #    un-dialable bound wildcard (`http://0.0.0.0:50051`), so a peer container CAN dial
+  #    it. Still latent here: nothing in this stack discovers D servers through etcd
+  #    yet (the custodian below dials static `--endpoints`), so this proves the
+  #    connect/register/advertise path, not discovery-driven placement.
   dserver0:
     build:
       context: ../..
@@ -235,7 +235,7 @@ services:
         FEATURES: "tikv,etcd"
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "0", "--failure-domain", "fd0", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "0", "--failure-domain", "fd0", "--coordination-backend", "etcd", "--advertise-addr", "dserver0:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -247,7 +247,7 @@ services:
   dserver1:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "1", "--failure-domain", "fd1", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "1", "--failure-domain", "fd1", "--coordination-backend", "etcd", "--advertise-addr", "dserver1:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -259,7 +259,7 @@ services:
   dserver2:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "2", "--failure-domain", "fd2", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "2", "--failure-domain", "fd2", "--coordination-backend", "etcd", "--advertise-addr", "dserver2:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -271,7 +271,7 @@ services:
   dserver3:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "3", "--failure-domain", "fd3", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "3", "--failure-domain", "fd3", "--coordination-backend", "etcd", "--advertise-addr", "dserver3:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -283,7 +283,7 @@ services:
   dserver4:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "4", "--failure-domain", "fd4", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "4", "--failure-domain", "fd4", "--coordination-backend", "etcd", "--advertise-addr", "dserver4:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -295,7 +295,7 @@ services:
   dserver5:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "5", "--failure-domain", "fd5", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "5", "--failure-domain", "fd5", "--coordination-backend", "etcd", "--advertise-addr", "dserver5:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -307,7 +307,7 @@ services:
   dserver6:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "6", "--failure-domain", "fd6", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "6", "--failure-domain", "fd6", "--coordination-backend", "etcd", "--advertise-addr", "dserver6:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -319,7 +319,7 @@ services:
   dserver7:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "7", "--failure-domain", "fd7", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "7", "--failure-domain", "fd7", "--coordination-backend", "etcd", "--advertise-addr", "dserver7:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
@@ -331,7 +331,7 @@ services:
   dserver8:
     image: wyrd-single-zone:local
     depends_on: [etcd0, etcd1, etcd2, dserver0]
-    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "8", "--failure-domain", "fd8", "--coordination-backend", "etcd"]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "8", "--failure-domain", "fd8", "--coordination-backend", "etcd", "--advertise-addr", "dserver8:50051"]
     environment:
       WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
