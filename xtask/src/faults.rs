@@ -548,6 +548,264 @@ fn run_kill_reconstruct_test(endpoints: &str, victim_container: &str) -> Result<
     }
 }
 
+// ---- Tier-1/Tier-2 metadata-backend fault runners (M4.6, #257) ----
+
+/// Docker Compose project name for the ≥3-replica TiKV Raft-group cluster the metadata
+/// Tier-1 consistency leg partitions — isolated from the single-node throwaway
+/// (`wyrd-tikv-m41`) and the M4.5 small-multi-node stack.
+const METADATA_TIER_PROJECT: &str = "wyrd-tier1-metadata";
+
+/// The static bridge IP of the fallback isolation target (tikv-1 in
+/// `deploy/tikv-multi-replica`) — used only when `WYRD_TIER1_ISOLATE=leader` is unset.
+const METADATA_TIER1_ISOLATED_IP: &str = "172.30.57.12";
+/// Every store's advertised address, for the scenario's readiness wait.
+const METADATA_TIER1_STORE_ADDRS: &str = "172.30.57.11:20160,172.30.57.12:20160,172.30.57.13:20160";
+/// Which container owns each store IP's network namespace (the iteration-13 netns cut:
+/// the scenario applies the symmetric partition INSIDE the target's netns, because under a
+/// shared netns a per-IP host cut provably never matches the node's own outbound traffic).
+const METADATA_TIER1_NETNS_MAP: &str = "172.30.57.11=wyrd-tier1-metadata-tikv-0-1,\
+     172.30.57.12=wyrd-tier1-metadata-tikv-1-1,172.30.57.13=wyrd-tier1-metadata-tikv-2-1";
+/// The fault-agent image (an `iptables` entrypoint) the scenario runs inside the target's
+/// netns; built by the Tier-1 runner from `deploy/tikv-multi-replica/iptables-agent/`.
+const METADATA_IPTABLES_IMAGE: &str = "wyrd-iptables:local";
+
+/// PD's client endpoint per tier: the Tier-1 ≥3-replica stack lives on a bridge network
+/// (static container IPs, one netns per node — the partition premise), while the Tier-2
+/// single node keeps host networking (no partition; real-I/O honesty only).
+fn metadata_pd_endpoint(tier: &str) -> &'static str {
+    if tier == "WYRD_TIER1" {
+        "172.30.57.10:2379"
+    } else {
+        "127.0.0.1:2379"
+    }
+}
+
+/// **Tier-1 metadata consistency-over-the-swap** (proposal 0015 §"DST and tests",
+/// PR-sequence item 6; ADR-0039; ADR-0015): stand up a real ≥3-replica TiKV Raft group
+/// (`deploy/tikv-multi-replica`), symmetrically isolate the **region LEADER** (resolved from
+/// PD at runtime — a minority-follower cut is outcome-neutral against a linearizable store),
+/// and drive the **production** `TikvMetadataStore` commit path (behind the unchanged trait)
+/// through multi-key atomic create/rename/delete + ≥2 concurrent writers contending the
+/// version-cell CAS + the independent ADR-0015 signals across the heal.
+/// Deferred by default; opt in with `WYRD_TIER1=1`. Requires `docker`.
+///
+/// The run is ROUTED by the pure [`xtask::metadata_faults::metadata_tier_dispatch`] decision
+/// — re-pointing it at the removed external command flips the dispatch unit test red.
+pub fn run_metadata_tier1() -> Result<(), String> {
+    let p = plan(
+        "Tier-1 metadata consistency (≥3-replica TiKV)",
+        "docker",
+        opted_in("WYRD_TIER1"),
+        tool_available("docker"),
+    );
+    match p {
+        Plan::Deferred(reason) => {
+            eprintln!("xtask: {reason}");
+            return Ok(());
+        }
+        Plan::MissingTool(msg) => return Err(msg),
+        Plan::Run => {}
+    }
+
+    use xtask::metadata_faults::{
+        metadata_tier_dispatch, MetadataTierDispatch, METADATA_TIER1_LEGACY_CMD_VAR,
+        METADATA_TIER1_SCENARIO_TEST,
+    };
+    let test =
+        match metadata_tier_dispatch(std::env::var_os(METADATA_TIER1_LEGACY_CMD_VAR).is_some()) {
+            MetadataTierDispatch::InRepoScenario { test } => test,
+            MetadataTierDispatch::ExternalCommand { env_var } => {
+                return Err(format!(
+                    "there is no external `{env_var}` metadata harness; the in-repo \
+                 `{METADATA_TIER1_SCENARIO_TEST}` scenario is the Tier-1 harness — unset \
+                 `{env_var}` and re-run"
+                ))
+            }
+        };
+    run_metadata_scenario(test, "WYRD_TIER1")
+}
+
+/// **Tier-2 single-machine metadata I/O** (proposal 0015 §"DST and tests", PR-sequence item
+/// 6 — the Tier-2 rung): drive the production `TikvMetadataStore` durable create/read/CAS/
+/// delete cycle against a real single-node TiKV on one machine (real fsync / NVMe / OS).
+/// Deferred by default; opt in with `WYRD_TIER2=1`. Requires `docker`.
+pub fn run_metadata_tier2() -> Result<(), String> {
+    let p = plan(
+        "Tier-2 single-machine metadata I/O",
+        "docker",
+        opted_in("WYRD_TIER2"),
+        tool_available("docker"),
+    );
+    match p {
+        Plan::Deferred(reason) => {
+            eprintln!("xtask: {reason}");
+            return Ok(());
+        }
+        Plan::MissingTool(msg) => return Err(msg),
+        Plan::Run => {}
+    }
+    run_metadata_scenario(
+        xtask::metadata_faults::METADATA_TIER2_SCENARIO_TEST,
+        "WYRD_TIER2",
+    )
+}
+
+/// Bring up the metadata cluster, export the endpoints (and, for Tier-1, the symmetric
+/// isolation target), run the `#[ignore]`d scenario with `--features tikv`, and tear the
+/// cluster down on every path.
+fn run_metadata_scenario(test: &str, tier: &str) -> Result<(), String> {
+    // Tier-1 partitions a ≥3-replica group; Tier-2 is a single owned node.
+    let compose_rel = if tier == "WYRD_TIER1" {
+        "deploy/tikv-multi-replica/docker-compose.yml"
+    } else {
+        "deploy/tikv-single-node/docker-compose.yml"
+    };
+    let compose = crate::workspace_root()
+        .join(compose_rel)
+        .to_string_lossy()
+        .to_string();
+
+    // Tier-1 needs the fault-agent image (an `iptables` entrypoint) the scenario runs
+    // inside the target node's netns; build it before the cluster so a broken agent fails
+    // fast, not mid-partition.
+    if tier == "WYRD_TIER1" {
+        let agent_dir = crate::workspace_root()
+            .join("deploy/tikv-multi-replica/iptables-agent")
+            .to_string_lossy()
+            .to_string();
+        let build = ["build", "-t", METADATA_IPTABLES_IMAGE, agent_dir.as_str()];
+        crate::print_step(&{
+            let mut display = vec!["docker"];
+            display.extend_from_slice(&build);
+            display
+        });
+        let status = Command::new("docker")
+            .args(build)
+            .status()
+            .map_err(|e| format!("failed to spawn docker build for the fault agent: {e}"))?;
+        if !status.success() {
+            return Err(format!("fault-agent image build failed with {status}"));
+        }
+    }
+
+    metadata_compose(&compose, &["up", "-d"])?;
+    let result = crate::finalize_panic_safe(
+        || {
+            // Wait for PD (and, for Tier-1, every store port) to accept connections before
+            // dialing — the container's bootstrap lags `up -d`, so racing it fails spuriously
+            // (the v8 codex advisory; mirrors `run_tikv_conformance`'s `wait_for_port` gate).
+            // Inside the panic-safe closure so a readiness timeout still tears the stack down.
+            wait_metadata_cluster_ready(tier)?;
+            run_metadata_scenario_test(test, tier)
+        },
+        |result| {
+            crate::finish_integration(
+                result,
+                || metadata_compose_logs(&compose),
+                || {
+                    let _ = metadata_compose(&compose, &["down", "-v", "--remove-orphans"]);
+                },
+            )
+        },
+    );
+    result?;
+    println!("\nxtask {tier} metadata: `{test}` scenario passed");
+    Ok(())
+}
+
+/// Bounded readiness gate: wait for PD to accept clients, and — for Tier-1 — for every
+/// store's advertised port too, so the scenario does not race the cluster's bootstrap after
+/// `docker compose up -d` (the v8 codex advisory). Reuses the same `wait_for_port` bounded
+/// poll `run_tikv_conformance` uses; a store that never comes up is a hard error (surfaced),
+/// not a silent spurious failure mid-scenario.
+fn wait_metadata_cluster_ready(tier: &str) -> Result<(), String> {
+    crate::wait_for_port(metadata_pd_endpoint(tier))?;
+    if tier == "WYRD_TIER1" {
+        for addr in METADATA_TIER1_STORE_ADDRS.split(',') {
+            crate::wait_for_port(addr.trim())?;
+        }
+    }
+    Ok(())
+}
+
+/// Run the `#[ignore]`d metadata scenario test with `--features tikv` and the cluster
+/// coordinates exported (the argv comes from the pure
+/// [`xtask::metadata_faults::metadata_scenario_args`]).
+fn run_metadata_scenario_test(test: &str, tier: &str) -> Result<(), String> {
+    let args = xtask::metadata_faults::metadata_scenario_args(test);
+    crate::print_step(&{
+        let mut display = vec!["cargo"];
+        display.extend_from_slice(&args);
+        display
+    });
+    // Static endpoints (reduced bar until #365 lands L5 discovery — Deployment note). For
+    // Tier-1 every node owns its netns on the bridge network, the scenario resolves and cuts
+    // the region LEADER inside that netns (`WYRD_TIER1_NETNS_MAP`), and the fault-effect
+    // oracle observes isolation from PD's side (peer view), not by probing the dropped port.
+    let mut cmd = Command::new("cargo");
+    cmd.args(args)
+        .current_dir(crate::workspace_root())
+        .env("WYRD_TIKV_PD_ENDPOINTS", metadata_pd_endpoint(tier));
+    if tier == "WYRD_TIER1" {
+        // Leader isolation (the iteration-12 fix): the scenario resolves the txn region's
+        // LEADER from PD at runtime and cuts THAT store — a minority-follower cut never
+        // changes a linearizable outcome (the adversary's "no teeth" refutation). The static
+        // METADATA_TIER1_ISOLATED_IP stays exported as the fallback target for runs that
+        // unset WYRD_TIER1_ISOLATE (e.g. manual smoke runs).
+        cmd.env("WYRD_TIER1_ISOLATE", "leader")
+            .env("WYRD_TIER1_ISOLATED_IP", METADATA_TIER1_ISOLATED_IP)
+            .env("WYRD_TIER1_STORE_ADDRS", METADATA_TIER1_STORE_ADDRS)
+            .env("WYRD_TIER1_NETNS_MAP", METADATA_TIER1_NETNS_MAP)
+            .env("WYRD_TIER1_IPTABLES_IMAGE", METADATA_IPTABLES_IMAGE)
+            .env("WYRD_TIER1_REPLICAS", "3")
+            .env("WYRD_TIER1_ISOLATED", "1")
+            // ≥2 concurrent writers contending the version-cell CAS across the fault window
+            // (the no_lost_update teeth; tier1_metadata_consistency.rs).
+            .env("WYRD_TIER1_CONTENDERS", "2");
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to spawn cargo for metadata scenario: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("metadata `{test}` scenario failed with {status}"))
+    }
+}
+
+fn metadata_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", METADATA_TIER_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    crate::print_step(&display);
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(crate::workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`docker {}` failed with {status}", full.join(" ")))
+    }
+}
+
+fn metadata_compose_logs(compose: &str) {
+    let _ = Command::new("docker")
+        .args([
+            "compose",
+            "-p",
+            METADATA_TIER_PROJECT,
+            "-f",
+            compose,
+            "logs",
+            "--no-color",
+        ])
+        .current_dir(crate::workspace_root())
+        .status();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
