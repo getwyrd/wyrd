@@ -447,30 +447,53 @@ fn protoc_available() -> bool {
 const SMALL_MULTI_NODE_PROJECT: &str = "wyrd-small-multi-node-m45";
 /// Every component endpoint the smoke check waits on (host-published ports; see
 /// `deploy/small-multi-node/docker-compose.yml`): the 3-node etcd ensemble (L5
-/// Coordination), the 3-node PD ensemble, and TiKV-small itself.
+/// Coordination), the 3-node PD ensemble, the 3-node TiKV, the 9 local-disk D
+/// servers, and the 3 S3 gateways. The 3 custodians publish no port (their Prometheus
+/// registry is in-process read-back only), so their liveness is implied by the TiKV /
+/// D servers they depend on rather than waited on directly.
 const SMALL_MULTI_NODE_ENDPOINTS: &[&str] = &[
+    // etcd ensemble (L5 Coordination)
     "127.0.0.1:12379",
     "127.0.0.1:22379",
     "127.0.0.1:32379",
+    // PD ensemble (TiKV's coordinator)
     "127.0.0.1:23791",
     "127.0.0.1:23792",
     "127.0.0.1:23793",
+    // TiKV (3-node store)
     "127.0.0.1:20160",
+    "127.0.0.1:20161",
+    "127.0.0.1:20162",
+    // D servers (9, fd0..fd8)
+    "127.0.0.1:50061",
+    "127.0.0.1:50062",
+    "127.0.0.1:50063",
+    "127.0.0.1:50064",
+    "127.0.0.1:50065",
+    "127.0.0.1:50066",
+    "127.0.0.1:50067",
+    "127.0.0.1:50068",
+    "127.0.0.1:50069",
+    // S3 gateways (3)
+    "127.0.0.1:8081",
+    "127.0.0.1:8082",
+    "127.0.0.1:8083",
 ];
 
-/// Run the M4.5 production-topology bring-up smoke check (proposal 0015
+/// Run the consolidated single-zone bring-up smoke check (proposal 0015
 /// §"Deployment", PR sequence item 5, #256): bring up `deploy/small-multi-node/`
-/// (TiKV-small + its PD ensemble + a 3-node etcd ensemble for L5 Coordination +
-/// local-disk D servers) and wait for every component to accept connections, then
-/// tear the stack down. **Not** part of `run_ci` — it needs a container runtime,
-/// exactly like `run_tikv_conformance`.
+/// (3-node etcd for L5 Coordination + 3-node PD + 3-node TiKV + 9 local-disk D
+/// servers + 3 custodians + 3 S3 gateways) and wait for every published component to
+/// accept connections, then tear the stack down. **Not** part of `run_ci` — it needs
+/// a container runtime, exactly like `run_tikv_conformance`.
 ///
-/// This is the pre-prerequisite bring-up only (proposal 0015's "Deployment
-/// prerequisite" note): it proves the topology stands up on STATIC endpoints. It
-/// does not (and cannot yet) prove "peers discovered through L5" — `wyrd d-server`
-/// does not dial an external Coordination endpoint yet, and there is no runnable
-/// gateway/custodian process role to exercise discovery with. That DoD is gated on
-/// #365 plus the (likely untracked) gateway/custodian process-role work.
+/// This is a topology bring-up smoke check: it proves the whole stack stands up and
+/// every published port accepts connections. The image is built with `--features
+/// tikv,etcd`, so the D servers genuinely register through the etcd Coordination
+/// backend (#449) and the custodians open the TiKV metadata backend. It does not
+/// prove an end-to-end object write path: the `wyrd s3` gateway is still standalone
+/// (#454) and nothing yet writes cluster metadata into TiKV for the custodian to
+/// repair (#455).
 fn run_deploy_small_multi_node() -> Result<(), String> {
     let compose = workspace_root().join("deploy/small-multi-node/docker-compose.yml");
     let compose = compose.to_string_lossy().to_string();
@@ -496,8 +519,9 @@ fn run_deploy_small_multi_node() -> Result<(), String> {
     let _ = small_multi_node_compose(&compose, &["down", "-v", "--remove-orphans"]);
     result?;
     println!(
-        "\nxtask deploy-small-multi-node: TiKV-small + its PD ensemble + the 3-node etcd \
-         ensemble + local-disk D servers are all accepting connections"
+        "\nxtask deploy-small-multi-node: the 3-node etcd ensemble + 3-node PD ensemble + \
+         3-node TiKV + 9 D servers + 3 S3 gateways are all accepting connections \
+         (custodians run without a published port)"
     );
     Ok(())
 }

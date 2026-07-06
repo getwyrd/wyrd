@@ -1,9 +1,10 @@
 # Throwaway SINGLE-NODE etcd for the #365 L5 Coordination conformance run (proposal
 # 0015 §"Deployment prerequisite"). Like `deploy/tikv-single-node`, this lives under
 # `deploy/`, OUTSIDE the Cargo workspace (ADR-0010): the structural guard that keeps
-# orchestrator coupling out of the crates. It is NOT the production tier — the full
-# "Small multi-node Production" stack (TiKV-small + its PD cluster + a 3-node etcd
-# ensemble for L5) is M4.5 (#256).
+# orchestrator coupling out of the crates. It is NOT the production tier — the
+# consolidated single-zone stack (`deploy/small-multi-node/`: 3-node TiKV + its PD
+# ensemble + a 3-node etcd ensemble for L5 + D servers / custodians / gateways) is
+# M4.5 (#256).
 #
 # A single etcd node is sufficient to exercise the WHOLE `Coordination` contract
 # suite AND the cross-instance properties (single leader, mutual exclusion, fenced

@@ -1,31 +1,47 @@
-# The single-zone "Small multi-node Production" profile for CI/eval (M4.5, #256;
+# The consolidated single-zone "Small multi-node" stack for testing (M4.5, #256;
 # proposal 0015 §"Deployment: TiKV/PD as a stateful, disk-affine, orchestrator-agnostic
-# tier"; architecture §7.1's "Small multi-node" row). Composes the profile's FOUR
-# component roles:
-#   - a 3-node PD ensemble (TiKV's own placement driver / coordinator)
-#   - TiKV-small (one store node — the profile's "TiKV (small)")
-#   - a SEPARATE 3-node etcd ensemble for L5 Coordination (ADR-0006; distinct from
-#     PD's own embedded etcd — see the blueprint's "Component inventory")
-#   - local-disk D servers (the `wyrd d-server` role, reusing the `wyrd-dserver:local`
-#     image built for the root dev stack's `crates/chunkstore-grpc/tests/dserver/Dockerfile`)
+# tier"; architecture §7.1's "Small multi-node" row). This is the ONE canonical
+# minimum-viable single-zone deployment; the throwaway single-component testbeds
+# (`deploy/tikv-single-node/`, `deploy/etcd-single-node/`, `deploy/tikv-multi-replica/`)
+# and the root `docker-compose.yml` stay for their own conformance/fault suites.
+#
+# Topology — every role at a real cardinality for a single zone:
+#   - 3-node etcd ensemble (L5 Coordination, ADR-0006; minimum quorum) — SEPARATE
+#     from PD's own embedded etcd (blueprint "Component inventory").
+#   - 3-node PD ensemble (TiKV's own placement driver / coordinator; minimum quorum).
+#   - 3-node TiKV (minimum quorum for a replicated Raft group; the profile's "TiKV").
+#   - 9 local-disk D servers (`wyrd d-server`), one per failure domain fd0..fd8 —
+#     matches the default `rs(6,3)` durability (9 fragments across 9 domains, survives
+#     3 simultaneous losses).
+#   - 3 custodians (`wyrd custodian`) — leader-elected reconstruction/repair role.
+#   - 3 S3 gateways (`wyrd s3`) — the S3-compatible HTTP front door.
 # No L2/L3/TiDB (single-zone, ADR-0020 is out of scope until M9+).
 #
-# Lives under `deploy/`, OUTSIDE the Cargo workspace (ADR-0010) — the structural guard
+# Lives under `deploy/`, OUTSIDE the Cargo workspace (ADR-0010): the structural guard
 # that keeps orchestrator coupling out of the crates; see `deploy/README.md` and
-# `xtask/tests/deploy_no_orchestrator_coupling.rs`. Unlike `deploy/tikv-single-node/`
-# (a throwaway SINGLE-node PD+TiKV pair on host networking, M4.1), this stack has
-# MULTIPLE replicas of the same role (3 PD, 3 etcd), so it uses the default compose
-# BRIDGE network with per-service DNS names and distinct published host ports instead
-# — host networking cannot give three same-port replicas distinct addresses.
+# `xtask/tests/deploy_no_orchestrator_coupling.rs`. Multiple replicas of the same role
+# (3 etcd, 3 PD, 3 TiKV, 9 D servers, …) mean this uses the default compose BRIDGE
+# network with per-service DNS names and distinct published host ports — host
+# networking cannot give same-port replicas distinct addresses.
 #
-# **Deployment prerequisite (out of scope here — proposal 0015 "Deployment
-# prerequisite" note, tracked as #365 + an untracked gateway/custodian item).** The
-# etcd ensemble is L5 Coordination's *backend*, but `wyrd d-server` does not yet dial
-# an external Coordination endpoint — it registers against its own in-process
-# `MemCoordination` (`crates/server/src/cli.rs`), and there is no runnable
-# gateway/custodian process role yet. So this stack stands up TiKV + PD + etcd +
-# D servers on STATIC endpoints; "peers discovered through L5" moves with that
-# prerequisite, per the proposal.
+# **Genuinely wired backends.** The image is built with `--features tikv,etcd`
+# (`build.args.FEATURES` below), so:
+#   - D servers dial the etcd ensemble for L5 Coordination (`--coordination-backend
+#     etcd` + `WYRD_ETCD_ENDPOINTS`, #449) — real cross-process registration, not the
+#     in-process `MemCoordination` default.
+#   - Custodians open the TiKV metadata backend (`--metadata-backend tikv` +
+#     `WYRD_TIKV_PD_ENDPOINTS`) — the same store the cluster metadata lives in.
+#
+# **Two honest limits of the current code (tracked, do NOT read this as end-to-end).**
+#   - The `wyrd s3` gateway is STANDALONE (#454). `cmd_s3` (`crates/server/src/cli.rs`)
+#     hardcodes local redb + FS + `MemCoordination` and ignores `--metadata-backend` /
+#     `--coordination-backend`, so each of the 3 gateways is an independent single-node
+#     island — NOT a pool over the D servers / TiKV / etcd.
+#   - There is NO closed write path yet (#455, depends on #454). Nothing writes cluster
+#     metadata into TiKV or fans chunks to the 9 D servers, so a `--metadata-backend
+#     tikv` custodian opens an (initially empty) store and sees zero repair obligations
+#     until exercised out-of-band (`wyrd put --endpoints … --metadata-backend tikv`).
+#     This stack is a topology bring-up / smoke target, not an object pipeline.
 name: wyrd-small-multi-node-m45
 
 services:
@@ -142,100 +158,260 @@ services:
       - pd2-data:/data
     restart: on-failure
 
-  # ── TiKV-small: ONE store node (the profile's "TiKV (small)", §7.1). Registers
-  #    with the PD ensemble above, not the etcd ensemble.
-  tikv:
+  # ── TiKV — 3 store nodes (minimum quorum for a replicated Raft group). Each
+  #    registers with the PD ensemble above, not the etcd ensemble. Distinct host
+  #    ports per node (store 2016x, status 2018x) since all three share the same
+  #    container-internal ports on the bridge network.
+  tikv0:
     image: pingcap/tikv:v8.5.1
-    depends_on:
-      - pd0
-      - pd1
-      - pd2
+    depends_on: [pd0, pd1, pd2]
     command:
       - --addr=0.0.0.0:20160
-      - --advertise-addr=tikv:20160
+      - --advertise-addr=tikv0:20160
       - --status-addr=0.0.0.0:20180
-      - --advertise-status-addr=tikv:20180
+      - --advertise-status-addr=tikv0:20180
       - --data-dir=/data/tikv
       - --pd-endpoints=pd0:2379,pd1:2379,pd2:2379
     ports:
       - "20160:20160"
       - "20180:20180"
     volumes:
-      - tikv-data:/data
+      - tikv0-data:/data
     restart: on-failure
 
-  # ── Local-disk D servers — the `wyrd d-server` role (ADR-0014/ADR-0016), reusing
-  #    the SAME `wyrd-dserver:local` image the root dev `docker-compose.yml` builds
-  #    (`crates/chunkstore-grpc/tests/dserver/Dockerfile`). No `--coordination` flag:
-  #    `wyrd d-server` does not yet dial an external Coordination endpoint (the
-  #    deployment prerequisite, see the header note) — each registers against its
-  #    own in-process `MemCoordination`, so these are static, independently-addressed
-  #    endpoints for now, not yet peers "discovered through L5."
+  tikv1:
+    image: pingcap/tikv:v8.5.1
+    depends_on: [pd0, pd1, pd2]
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv1:20160
+      - --status-addr=0.0.0.0:20180
+      - --advertise-status-addr=tikv1:20180
+      - --data-dir=/data/tikv
+      - --pd-endpoints=pd0:2379,pd1:2379,pd2:2379
+    ports:
+      - "20161:20160"
+      - "20181:20180"
+    volumes:
+      - tikv1-data:/data
+    restart: on-failure
+
+  tikv2:
+    image: pingcap/tikv:v8.5.1
+    depends_on: [pd0, pd1, pd2]
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv2:20160
+      - --status-addr=0.0.0.0:20180
+      - --advertise-status-addr=tikv2:20180
+      - --data-dir=/data/tikv
+      - --pd-endpoints=pd0:2379,pd1:2379,pd2:2379
+    ports:
+      - "20162:20160"
+      - "20182:20180"
+    volumes:
+      - tikv2-data:/data
+    restart: on-failure
+
+  # ── Local-disk D servers — the `wyrd d-server` role (ADR-0014/ADR-0016), 9 nodes,
+  #    one per failure domain fd0..fd8 (default `rs(6,3)` = 9 fragments across 9
+  #    domains, survives 3 losses). Built ONCE here (dserver0) with FEATURES=tikv,etcd
+  #    and tagged `wyrd-single-zone:local` — a DISTINCT tag from the integration
+  #    fixture's default-feature `wyrd-dserver:test`, so the two never clobber each
+  #    other (ADR-0043). Every other wyrd role below reuses this image (same `wyrd`
+  #    binary, different subcommand). Genuinely wired to L5: `--coordination-backend etcd` +
+  #    `WYRD_ETCD_ENDPOINTS` (#449), so registration is real cross-process discovery.
   dserver0:
     build:
       context: ../..
       dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
-    image: wyrd-dserver:local
-    command:
-      [
-        "d-server",
-        "--bind",
-        "0.0.0.0:50051",
-        "--data-dir",
-        "/data",
-        "--group",
-        "small-multi-node-m45",
-        "--failure-domain",
-        "fd0",
-      ]
+      args:
+        FEATURES: "tikv,etcd"
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "0", "--failure-domain", "fd0", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
       - "50061:50051"
     volumes:
       - dserver0-data:/data
+    restart: on-failure
 
   dserver1:
-    image: wyrd-dserver:local
-    build:
-      context: ../..
-      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
-    command:
-      [
-        "d-server",
-        "--bind",
-        "0.0.0.0:50051",
-        "--data-dir",
-        "/data",
-        "--group",
-        "small-multi-node-m45",
-        "--failure-domain",
-        "fd1",
-      ]
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "1", "--failure-domain", "fd1", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
       - "50062:50051"
     volumes:
       - dserver1-data:/data
+    restart: on-failure
 
   dserver2:
-    image: wyrd-dserver:local
-    build:
-      context: ../..
-      dockerfile: crates/chunkstore-grpc/tests/dserver/Dockerfile
-    command:
-      [
-        "d-server",
-        "--bind",
-        "0.0.0.0:50051",
-        "--data-dir",
-        "/data",
-        "--group",
-        "small-multi-node-m45",
-        "--failure-domain",
-        "fd2",
-      ]
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "2", "--failure-domain", "fd2", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
     ports:
       - "50063:50051"
     volumes:
       - dserver2-data:/data
+    restart: on-failure
+
+  dserver3:
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "3", "--failure-domain", "fd3", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50064:50051"
+    volumes:
+      - dserver3-data:/data
+    restart: on-failure
+
+  dserver4:
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "4", "--failure-domain", "fd4", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50065:50051"
+    volumes:
+      - dserver4-data:/data
+    restart: on-failure
+
+  dserver5:
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "5", "--failure-domain", "fd5", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50066:50051"
+    volumes:
+      - dserver5-data:/data
+    restart: on-failure
+
+  dserver6:
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "6", "--failure-domain", "fd6", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50067:50051"
+    volumes:
+      - dserver6-data:/data
+    restart: on-failure
+
+  dserver7:
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "7", "--failure-domain", "fd7", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50068:50051"
+    volumes:
+      - dserver7-data:/data
+    restart: on-failure
+
+  dserver8:
+    image: wyrd-single-zone:local
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-m45", "--id", "8", "--failure-domain", "fd8", "--coordination-backend", "etcd"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50069:50051"
+    volumes:
+      - dserver8-data:/data
+    restart: on-failure
+
+  # ── Custodians — the `wyrd custodian` reconstruction/repair role, 3 nodes.
+  #    `--metadata-backend tikv` opens the same store the cluster metadata lives in
+  #    (`WYRD_TIKV_PD_ENDPOINTS`). The fleet topology is operator-supplied and aligned
+  #    1:1 with the D servers' own `--id`/`--failure-domain` (never fabricated — the
+  #    role REJECTS a mismatch). No published port: the Prometheus registry is
+  #    in-process read-back only (no OTLP collector in this stack).
+  #
+  #    NOTE: all 3 custodians self-elect leadership under the process-local
+  #    `MemCoordination` (`crates/server/src/cli.rs`), so there is NO cross-container
+  #    fencing here — they reconcile concurrently. Safe regardless: the reconstruction
+  #    repoint is a version-conditional (CAS) commit, so two racing custodians never
+  #    both win. Real fencing arrives when the custodian adopts the etcd Coordination
+  #    backend (#365) — out of scope for this stack.
+  custodian0:
+    image: wyrd-single-zone:local
+    depends_on: [tikv0, tikv1, tikv2, dserver0, dserver8]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "dserver0:50051,dserver1:50051,dserver2:50051,dserver3:50051,dserver4:50051,dserver5:50051,dserver6:50051,dserver7:50051,dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    environment:
+      WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
+    restart: on-failure
+
+  custodian1:
+    image: wyrd-single-zone:local
+    depends_on: [tikv0, tikv1, tikv2, dserver0, dserver8]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "dserver0:50051,dserver1:50051,dserver2:50051,dserver3:50051,dserver4:50051,dserver5:50051,dserver6:50051,dserver7:50051,dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    environment:
+      WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
+    restart: on-failure
+
+  custodian2:
+    image: wyrd-single-zone:local
+    depends_on: [tikv0, tikv1, tikv2, dserver0, dserver8]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "tikv", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "dserver0:50051,dserver1:50051,dserver2:50051,dserver3:50051,dserver4:50051,dserver5:50051,dserver6:50051,dserver7:50051,dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    environment:
+      WYRD_TIKV_PD_ENDPOINTS: "pd0:2379,pd1:2379,pd2:2379"
+    restart: on-failure
+
+  # ── S3 gateways — the `wyrd s3` HTTP front door, 3 nodes on host ports 8081/8082/8083.
+  #    STANDALONE per #454: `cmd_s3` hardcodes local redb + FS + `MemCoordination` and
+  #    does NOT read `--metadata-backend`/`--coordination-backend`, so each gateway is
+  #    an independent single-node store, NOT a pool over the D servers / TiKV / etcd.
+  #    Wiring them to the cluster backends (and closing the end-to-end write path) is
+  #    tracked as #454 → #455. SigV4 is mandatory; test credentials supplied via env.
+  gateway0:
+    image: wyrd-single-zone:local
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1"]
+    environment:
+      WYRD_S3_ACCESS_KEY: "wyrd-test"
+      WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+    ports:
+      - "8081:8080"
+    volumes:
+      - gateway0-data:/data
+    restart: on-failure
+
+  gateway1:
+    image: wyrd-single-zone:local
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1"]
+    environment:
+      WYRD_S3_ACCESS_KEY: "wyrd-test"
+      WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+    ports:
+      - "8082:8080"
+    volumes:
+      - gateway1-data:/data
+    restart: on-failure
+
+  gateway2:
+    image: wyrd-single-zone:local
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1"]
+    environment:
+      WYRD_S3_ACCESS_KEY: "wyrd-test"
+      WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+    ports:
+      - "8083:8080"
+    volumes:
+      - gateway2-data:/data
+    restart: on-failure
 
 volumes:
   etcd0-data:
@@ -244,7 +420,18 @@ volumes:
   pd0-data:
   pd1-data:
   pd2-data:
-  tikv-data:
+  tikv0-data:
+  tikv1-data:
+  tikv2-data:
   dserver0-data:
   dserver1-data:
   dserver2-data:
+  dserver3-data:
+  dserver4-data:
+  dserver5-data:
+  dserver6-data:
+  dserver7-data:
+  dserver8-data:
+  gateway0-data:
+  gateway1-data:
+  gateway2-data:

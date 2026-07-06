@@ -114,30 +114,29 @@ cargo run -p wyrd-server --bin wyrd -- demo
 
 ## Run a local cluster
 
-You can stand up a small **distributed** Wyrd cluster on one machine and drive it
-with the `wyrd` gateway client mode — several networked D servers in containers,
-with the binary fanning each object's erasure-coded fragments across them over
-gRPC. This is the milestone-2 networked path exercised end to end by hand; it is
-not yet a production deployment (no durability or stability promise).
+You can stand up the consolidated single-zone cluster on one machine and drive it
+with the `wyrd` gateway client mode — the binary fans each object's erasure-coded
+fragments across the cluster's networked D servers over gRPC. The bring-up
+fixtures under `deploy/` are organised as testing **profiles** (ADR-0043), each the
+minimal topology for a class of test; `deploy/small-multi-node/` is the full
+single-zone profile and the one to poke by hand.
 
-Bring up four D servers on fixed ports, each with its own persistent volume:
+Bring the stack up — a 3-node etcd + 3-node PD + 3-node TiKV + **9** D servers
+(one per failure domain, matching the default `rs(6,3)` = 9 fragments, any **k = 6**
+of which reconstruct the data) + custodians + S3 gateways:
 
 ```sh
-docker compose up --build -d        # uses ./docker-compose.yml
+docker compose -f deploy/small-multi-node/docker-compose.yml up -d
 ```
 
-Four, not three: the default durability is `rs(6,3)` — 9 fragments per chunk,
-any **k = 6** of which reconstruct the data. Three servers hold 3 fragments each,
-so losing one drops to exactly 6 (no headroom); a fourth server keeps a
-single-server loss above k. The loopback round-trip test uses the same four.
-
-Point the gateway at the cluster's published endpoints. `--endpoints` switches
-`put`/`get` from the local-disk path to the **static-endpoints gateway client
-mode**: fragments fan out over gRPC to the listed D servers, while the object
-metadata (and the persisted inode allocator) is held locally under `--data-dir`.
+Point the gateway client at the D servers' published endpoints. `--endpoints`
+switches `put`/`get` from the local-disk path to the **static-endpoints gateway
+client mode**: fragments fan out over gRPC to the listed D servers, while the
+object metadata (and the persisted inode allocator) is held locally under
+`--data-dir`.
 
 ```sh
-ENDPOINTS=http://127.0.0.1:50051,http://127.0.0.1:50052,http://127.0.0.1:50053,http://127.0.0.1:50054
+ENDPOINTS=http://127.0.0.1:50061,http://127.0.0.1:50062,http://127.0.0.1:50063,http://127.0.0.1:50064,http://127.0.0.1:50065,http://127.0.0.1:50066,http://127.0.0.1:50067,http://127.0.0.1:50068,http://127.0.0.1:50069
 
 # PUT: erasure-code each object and fan its fragments across the D servers.
 cargo run --bin wyrd -- put ./somefile --key obj/one \
@@ -162,20 +161,23 @@ owns which fragments).
 Tear the cluster down (and drop its volumes) when finished:
 
 ```sh
-docker compose down -v
+docker compose -f deploy/small-multi-node/docker-compose.yml down -v
 ```
 
 Notes and current limits:
 
-- The endpoint list is **static** — the gateway dials exactly the D servers you
-  name. Dynamic discovery (etcd or a non-static coordination backend), stable
-  placement records, and rebalance are milestone-3 work (ADR-0006).
+- This client-mode endpoint list is **static** — the gateway client dials exactly
+  the D servers you name. The stack's D servers *do* register through the etcd L5
+  Coordination backend (ADR-0006), but `wyrd put/get --endpoints` bypasses that and
+  talks to the listed endpoints directly; discovery-driven placement is later work.
 - Metadata is held locally under `--data-dir`, so the `put` and `get` above must
-  share it. This is a single-gateway shape; a shared-metadata gateway daemon is a
-  later topology choice.
-- The CI integration fixture (`crates/chunkstore-grpc/tests/docker-compose.yml`,
-  driven by `cargo xtask integration`) is separate — it uses ephemeral ports and
-  is not meant to be driven by hand.
+  share it. Wiring the S3 gateway role itself over the cluster's shared backends
+  (TiKV metadata + D-server fanout) is tracked as #454 → #455.
+- The other `deploy/` profiles are for automated tests, not hand-driving: the
+  single-node conformance fixtures (`tikv-single-node/`, `etcd-single-node/`), the
+  ephemeral integration fixture (`crates/chunkstore-grpc/tests/docker-compose.yml`,
+  `cargo xtask integration`), and the fault-injection fixture
+  (`tikv-multi-replica/`). See ADR-0043 for which test class uses which.
 
 ## Security
 
