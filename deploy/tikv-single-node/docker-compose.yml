@@ -1,8 +1,9 @@
 # Throwaway SINGLE-NODE TiKV for M4.1 CI/eval (proposal 0007 §"Crate touch-points",
 # §"Suggested PR sequence" item 1). This lives under `deploy/`, OUTSIDE the Cargo
 # workspace (ADR-0010): the structural guard that keeps orchestrator coupling out of
-# the crates. It is NOT the production tier — the full "Small multi-node Production"
-# stack (TiKV-small + its PD cluster + a 3-node etcd ensemble for L5) is M4.5 (#256).
+# the crates. It is NOT the production tier — the consolidated single-zone stack
+# (`deploy/small-multi-node/`: 3-node TiKV + its PD ensemble + a 3-node etcd ensemble
+# for L5 + D servers / custodians / gateways) is M4.5 (#256).
 #
 # `pd` is TiKV's own coordinator (Placement Driver: region placement + the timestamp
 # oracle); `tikv` is the single storage node. Host networking is used so a
