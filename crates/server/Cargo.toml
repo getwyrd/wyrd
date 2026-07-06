@@ -22,6 +22,12 @@ path = "src/main.rs"
 # so it is compiled OUT of the default Check build (proposal 0015 slice 4).
 default = []
 tikv = ["dep:wyrd-metadata-tikv", "wyrd-metadata-tikv/tikv"]
+# The `etcd` feature composes the production etcd-backed L5 Coordination behind the
+# unchanged `Coordination` seam (ADR-0006, #365); it forwards to
+# `coordination-etcd`'s own OFF-by-default `etcd` feature, so the DEFAULT build
+# never pulls the `etcd-client` tree (which needs `protoc`) and `ci` stays green.
+# The etcd selection arm in `cli.rs` is `#[cfg]`-gated out of the default build.
+etcd = ["dep:wyrd-coordination-etcd", "wyrd-coordination-etcd/etcd"]
 
 [dependencies]
 # `server` is the one crate that knows concretes (ADR-0010): it wires the redb
@@ -45,6 +51,9 @@ wyrd-coordination-mem.workspace = true
 # listener; the axum/hmac/SigV4 machinery lives in `gateway-s3`, not here.
 wyrd-gateway-core.workspace = true
 wyrd-gateway-s3.workspace = true
+# The production L5 Coordination backend, wired only under the OFF-by-default
+# `etcd` feature above — optional so the default build never compiles the etcd tree.
+wyrd-coordination-etcd = { workspace = true, optional = true }
 bytes.workspace = true
 # Stream combinators for the streaming PUT body adapter (map/StreamExt) and the
 # `HashingSource` wrapper — `alloc`-only, the same runtime-agnostic dep core uses.

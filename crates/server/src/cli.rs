@@ -133,6 +133,68 @@ async fn open_tikv_meta() -> Result<wyrd_metadata_tikv::TikvMetadataStore, BoxEr
     Ok(wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints).await?)
 }
 
+/// The L5 `Coordination` backend `server` composes behind the unchanged
+/// `Coordination` seam, chosen by configuration (ADR-0006, proposal 0015
+/// §"Deployment prerequisite", #365). Selecting it is "pass a different concrete",
+/// not a refactor of any consumer (ADR-0008/0016) — the mirror of
+/// [`MetadataBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinationBackend {
+    /// Process-local in-memory coordination — the dev / single-binary default; a
+    /// D server in a separate process is not discoverable by a separate gateway.
+    Mem,
+    /// etcd-backed coordination (ADR-0006): cross-process discovery, single-leader
+    /// election, and fencing across machines. Compiled only under the OFF-by-default
+    /// `etcd` feature, which forwards to `coordination-etcd`'s own `etcd` feature,
+    /// so the default build never pulls the `etcd-client` tree.
+    #[cfg(feature = "etcd")]
+    Etcd,
+}
+
+impl CoordinationBackend {
+    /// Select the backend from a config value (the `--coordination-backend` flag or
+    /// the `WYRD_COORDINATION_BACKEND` env var). Absent ⇒ the in-memory dev default.
+    /// `etcd` is only accepted when the binary was built `--features etcd`.
+    pub fn from_config(value: Option<&str>) -> Result<Self, BoxError> {
+        match value {
+            None | Some("mem") => Ok(Self::Mem),
+            #[cfg(feature = "etcd")]
+            Some("etcd") => Ok(Self::Etcd),
+            #[cfg(not(feature = "etcd"))]
+            Some("etcd") => Err(
+                "coordination backend `etcd` requires building `wyrd` with `--features etcd`"
+                    .into(),
+            ),
+            Some(other) => Err(format!(
+                "unknown coordination backend `{other}` (expected `mem` or `etcd`)"
+            )
+            .into()),
+        }
+    }
+}
+
+/// Resolve the coordination backend from config: the `--coordination-backend` flag
+/// wins, else the `WYRD_COORDINATION_BACKEND` env var, else the in-memory default.
+fn resolve_coordination_backend(parsed: &ParsedArgs) -> Result<CoordinationBackend, BoxError> {
+    let value = match parsed.flag("coordination-backend") {
+        Some(flag) => Some(flag.to_string()),
+        None => std::env::var("WYRD_COORDINATION_BACKEND").ok(),
+    };
+    CoordinationBackend::from_config(value.as_deref())
+}
+
+/// Connect the production etcd Coordination from its endpoints
+/// (`WYRD_ETCD_ENDPOINTS`, comma-separated). Compiled only under the `etcd`
+/// feature — the etcd selection arm is `#[cfg]`-gated out of the default build.
+#[cfg(feature = "etcd")]
+async fn open_etcd_coordination() -> Result<wyrd_coordination_etcd::EtcdCoordination, BoxError> {
+    let raw = std::env::var("WYRD_ETCD_ENDPOINTS").map_err(|_| {
+        "etcd backend: set WYRD_ETCD_ENDPOINTS to the etcd endpoints (comma-separated)"
+    })?;
+    let endpoints = parse_endpoints(&raw)?;
+    Ok(wyrd_coordination_etcd::EtcdCoordination::connect(&endpoints).await?)
+}
+
 /// Parse `args` (including argv[0]) and run the requested command, returning the
 /// process exit code.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
@@ -166,7 +228,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
-    eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N]");
+    eprintln!("  wyrd d-server [--bind ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME]");
     eprintln!("  wyrd demo");
     eprintln!();
@@ -427,35 +489,88 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
     let chunk_dir = Path::new(data_dir).join("chunks");
     let store = FsChunkStore::open(&chunk_dir)?;
 
+    // The L5 coordination backend is selected by config, byte-for-byte the same as
+    // the metadata backend (ADR-0008/0016): the process-local in-memory concrete by
+    // default, the etcd concrete (cross-process discovery) under `--features etcd`.
+    let coordination = resolve_coordination_backend(&parsed)?;
+
     // The d-server role is async (it hosts a tonic server); spin a tokio runtime
     // for it. The CLI's other commands stay sync (pollster) — only this role
     // needs a reactor.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    let params = DServerParams {
+        bind,
+        dserver_id,
+        failure_domain,
+        admission,
+        group: group.to_string(),
+        lease_ttl,
+        renew_interval,
+        data_dir: data_dir.to_string(),
+    };
     runtime.block_on(async move {
-        let coord = Arc::new(MemCoordination::new());
-        let server = DServer::bind(store, bind)
-            .await?
-            .with_identity(dserver_id, failure_domain)
-            .with_admission_control(admission);
-        eprintln!(
-            "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {data_dir})",
-            server.endpoint()
-        );
-        let lease = server.register(&*coord, group, lease_ttl).await?;
-        eprintln!(
-            "wyrd d-server: registered under `{group}` (lease {}); Ctrl-C to stop",
-            lease.id
-        );
-        server
-            .serve(coord, lease, renew_interval, async {
-                let _ = tokio::signal::ctrl_c().await;
-                eprintln!("wyrd d-server: shutting down");
-            })
-            .await
+        match coordination {
+            CoordinationBackend::Mem => {
+                run_d_server(Arc::new(MemCoordination::new()), store, params).await
+            }
+            #[cfg(feature = "etcd")]
+            CoordinationBackend::Etcd => {
+                run_d_server(Arc::new(open_etcd_coordination().await?), store, params).await
+            }
+        }
     })?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The d-server parameters resolved from config, so [`run_d_server`] stays generic
+/// over the coordination concrete without a long argument list.
+struct DServerParams {
+    bind: SocketAddr,
+    dserver_id: u64,
+    failure_domain: String,
+    admission: dserver::AdmissionControl,
+    group: String,
+    lease_ttl: Duration,
+    renew_interval: Duration,
+    data_dir: String,
+}
+
+/// Host the local filesystem `ChunkStore` over gRPC and register through the given
+/// `Coordination` concrete, until Ctrl-C. Generic over the coordination backend so
+/// selecting in-memory vs etcd is "pass a different concrete", not a code fork —
+/// the trait-level composition the ADR-0006 second implementation exists to prove.
+async fn run_d_server<Co>(
+    coord: Arc<Co>,
+    store: FsChunkStore,
+    params: DServerParams,
+) -> Result<(), BoxError>
+where
+    Co: wyrd_traits::Coordination + 'static,
+{
+    let server = DServer::bind(store, params.bind)
+        .await?
+        .with_identity(params.dserver_id, params.failure_domain)
+        .with_admission_control(params.admission);
+    eprintln!(
+        "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {})",
+        server.endpoint(),
+        params.data_dir
+    );
+    let lease = server
+        .register(&*coord, &params.group, params.lease_ttl)
+        .await?;
+    eprintln!(
+        "wyrd d-server: registered under `{}` (lease {}); Ctrl-C to stop",
+        params.group, lease.id
+    );
+    server
+        .serve(coord, lease, params.renew_interval, async {
+            let _ = tokio::signal::ctrl_c().await;
+            eprintln!("wyrd d-server: shutting down");
+        })
+        .await
 }
 
 /// Parse an optional `--<name> <u64>` flag, defaulting when absent.

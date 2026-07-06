@@ -18,8 +18,43 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use wyrd_metadata_redb::RedbMetadataStore;
-use wyrd_server::cli::{alloc_inode, MetadataBackend};
+use wyrd_server::cli::{alloc_inode, CoordinationBackend, MetadataBackend};
 use wyrd_traits::{CommitOutcome, MetadataStore, Result, WriteBatch};
+
+/// #365 — the L5 `Coordination` backend is selected by config exactly like the
+/// metadata backend (ADR-0006, ADR-0008/0016): the in-memory dev default with no
+/// config, and an unknown name is a config error. `etcd` is only *namable* in a
+/// build with `--features etcd` (in the default Check build it is rejected with a
+/// build-hint), so selecting it is a composition swap, not a caller edit.
+#[test]
+fn coordination_backend_selects_by_config() {
+    assert_eq!(
+        CoordinationBackend::from_config(None).unwrap(),
+        CoordinationBackend::Mem,
+        "no config selects the in-memory dev default"
+    );
+    assert_eq!(
+        CoordinationBackend::from_config(Some("mem")).unwrap(),
+        CoordinationBackend::Mem,
+    );
+    assert!(
+        CoordinationBackend::from_config(Some("nonsense")).is_err(),
+        "an unknown coordination backend name is a config error"
+    );
+    // `etcd` is accepted only under `--features etcd`; without it, it is rejected
+    // with a build hint rather than silently falling back (an invalid selection must
+    // fail loud). Under the feature the same value selects the etcd concrete.
+    #[cfg(not(feature = "etcd"))]
+    assert!(
+        CoordinationBackend::from_config(Some("etcd")).is_err(),
+        "etcd requires --features etcd; unavailable builds reject it, not fall back"
+    );
+    #[cfg(feature = "etcd")]
+    assert_eq!(
+        CoordinationBackend::from_config(Some("etcd")).unwrap(),
+        CoordinationBackend::Etcd,
+    );
+}
 
 /// (a) redb is the config default (and the explicit `redb` value), an unknown
 /// name is rejected, and the generic `alloc_inode` drives the redb backend:
