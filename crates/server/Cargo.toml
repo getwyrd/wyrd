@@ -22,6 +22,12 @@ path = "src/main.rs"
 # so it is compiled OUT of the default Check build (proposal 0015 slice 4).
 default = []
 tikv = ["dep:wyrd-metadata-tikv", "wyrd-metadata-tikv/tikv"]
+# The `etcd` feature composes the production etcd-backed L5 Coordination behind the
+# unchanged `Coordination` seam (ADR-0006, #365); it forwards to
+# `coordination-etcd`'s own OFF-by-default `etcd` feature, so the DEFAULT build
+# never pulls the `etcd-client` tree (which needs `protoc`) and `ci` stays green.
+# The etcd selection arm in `cli.rs` is `#[cfg]`-gated out of the default build.
+etcd = ["dep:wyrd-coordination-etcd", "wyrd-coordination-etcd/etcd"]
 
 [dependencies]
 # `server` is the one crate that knows concretes (ADR-0010): it wires the redb
@@ -53,6 +59,9 @@ async-trait.workspace = true
 # and runs the fenced reconciliation loop through it (ADR-0011/0012).
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The production L5 Coordination backend, wired only under the OFF-by-default
+# `etcd` feature above — optional so the default build never compiles the etcd tree.
+wyrd-coordination-etcd = { workspace = true, optional = true }
 bytes.workspace = true
 pollster.workspace = true
 # The D-server registration record (`{ id, endpoint, failure-domain label }`,

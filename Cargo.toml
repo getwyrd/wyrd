@@ -17,8 +17,10 @@ members = [
     "crates/metadata-tikv",
     "crates/chunkstore-fs",
     "crates/chunkstore-grpc",
+    "crates/coordination-conformance",
     "crates/coordination-mem",
     "crates/telemetry",
+    "crates/coordination-etcd",
     "crates/custodian",
     "crates/server",
     "crates/dst",
@@ -45,10 +47,12 @@ wyrd-metadata-redb = { path = "crates/metadata-redb" }
 wyrd-metadata-tikv = { path = "crates/metadata-tikv" }
 wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
 wyrd-chunkstore-grpc = { path = "crates/chunkstore-grpc" }
+wyrd-coordination-conformance = { path = "crates/coordination-conformance" }
 wyrd-coordination-mem = { path = "crates/coordination-mem" }
 # The shared backend-agnostic telemetry seam (observability floor, proposal 0010
 # item 1) — extracted from custodian so no leaf crate anchors the export path.
 wyrd-telemetry = { path = "crates/telemetry" }
+wyrd-coordination-etcd = { path = "crates/coordination-etcd" }
 wyrd-custodian = { path = "crates/custodian" }
 
 # Shared third-party dependencies, version-pinned once here.
@@ -88,6 +92,17 @@ prost = "0.14"
 # ADR-0003 three-test audit + `deny.toml` allowlist call — is a **NEEDS-HUMAN** at
 # sign-off (INTEGRATION §4; research issue #260 tracks the pin + API-shape confirmation).
 tikv-client = "0.4"
+# The production L5 Coordination backend's client (ADR-0006, proposal 0015
+# §"Deployment prerequisite", #365). Pinned here; consumed ONLY by
+# `wyrd-coordination-etcd` behind its OFF-by-default `etcd` feature, so the default
+# `cargo xtask ci` never compiles or audits this tree and stays green. The `0.14`
+# line regenerates the etcd protobufs at build time (it needs a system `protoc`),
+# which is why the feature is off by default and the real-etcd run is a dedicated
+# `xtask etcd-conformance` job. Introducing it into the shipped graph — the ADR-0003
+# three-test audit + `deny.toml` allowlist call, plus the TLS/auth posture — is a
+# **NEEDS-HUMAN** at sign-off (INTEGRATION §4). Under `--cfg madsim` the store instead
+# uses `madsim-etcd-client` (specified inline in the crate), which needs no protoc.
+etcd-client = "0.14"
 protox = "0.9"
 rand = "0.10"
 rand_chacha = "0.10"
