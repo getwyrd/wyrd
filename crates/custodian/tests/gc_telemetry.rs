@@ -155,8 +155,27 @@ async fn elect(coord: &MemCoordination) -> (FencedZone, Custodian) {
 
 // ---- criterion 4: GC actions on the durability-plane seam, read back in-process ----
 
+/// Install a permissive global `tracing` default **once** so the durability metric
+/// callsites never latch `Interest::never` under the parallel test harness. `tracing`
+/// caches each callsite's interest in a process-global table the first time it is hit;
+/// a first hit racing a no-subscriber default can latch the callsite disabled, after
+/// which the test that reads the metric back (`gather_prometheus`) silently sees it
+/// missing (the flaky read-back the C4 gate caught, iteration-4). Registering against an
+/// always-enabling default before any callsite fires makes every first-registration
+/// agree; each test's own `.with_subscriber(...)` still routes its metrics into that
+/// test's provider. Called at the top of every metric-touching test so whichever runs
+/// first sets the default before any callsite fires (mirrors `scrub.rs:208`).
+fn enable_metric_callsites() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 #[tokio::test]
 async fn emits_gc_actions_on_the_durability_seam() {
+    enable_metric_callsites();
     let meta = MemMeta::default();
     let d0 = MemDServer::default();
 

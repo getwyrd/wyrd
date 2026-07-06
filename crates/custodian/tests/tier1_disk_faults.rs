@@ -561,6 +561,7 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         meta: &meta,
         fleet: &recon_fleet,
         topology: &recon_topo,
+        unreachable: &[],
     };
 
     let recon_result =

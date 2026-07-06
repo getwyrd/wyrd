@@ -15,19 +15,19 @@ publish.workspace = true
 # leadership fence, the selector (in `core`), and the telemetry seam.
 wyrd-traits.workspace = true
 wyrd-core.workspace = true
-# Telemetry from the custodian's first commit (ADR-0011), backend-agnostic OTel
-# (ADR-0012): `tracing` emission bridged to OpenTelemetry, dual-exported over a
-# Prometheus registry AND OTLP push, no backend hardcoded.
+# The loops emit durability telemetry through `tracing` (ADR-0011 telemetry-from-
+# first-commit). The backend-agnostic OTel export seam itself lives in the shared
+# `wyrd-telemetry` crate (observability floor, proposal 0010 item 1) — extracted so
+# no leaf crate anchors it (ADR-0012, ADR-0010) — and is re-exported here for the M3
+# consumers that already name `DurabilityTelemetry`/`ExporterConfig`.
 tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-opentelemetry.workspace = true
-opentelemetry.workspace = true
-opentelemetry_sdk.workspace = true
-opentelemetry-prometheus.workspace = true
-opentelemetry-otlp.workspace = true
-prometheus.workspace = true
+wyrd-telemetry.workspace = true
 
 [dev-dependencies]
+# The telemetry read-back tests install the metrics bridge on a `tracing` subscriber
+# (`tracing_subscriber::registry().with(telemetry.metrics_layer())`); the OTel/
+# Prometheus export deps are the `wyrd-telemetry` crate's concern, not custodian's.
+tracing-subscriber.workspace = true
 # In-memory coordination concrete to exercise leader election + fencing in-process
 # (a test/dev composition may name a concrete — ADR-0010).
 wyrd-coordination-mem.workspace = true

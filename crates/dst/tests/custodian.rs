@@ -582,6 +582,7 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
+        unreachable: &[],
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reconstruction").await;
@@ -631,6 +632,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
+        unreachable: &[],
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-crash").await;
@@ -748,6 +750,7 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
         meta: &meta,
         fleet: &full,
         topology: &topo,
+        unreachable: &[],
     };
     let repaired = reconcile_step(&zone, &custodian, None, None, Some(&recon_ctx), None, 200)
         .await
@@ -936,6 +939,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
+        unreachable: &[],
     };
 
     // Two leadership terms: the first leader is deposed, the second is current. `zone`
@@ -1008,6 +1012,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
+        unreachable: &[],
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-telemetry").await;
@@ -1020,7 +1025,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed);
     assert_eq!(
-        rise.values("monotonic_counter.reconstruction_under_replicated"),
+        rise.values("gauge.reconstruction_under_replicated"),
         vec![1],
         "the under-replicated count rises to 1 after the injected loss"
     );
@@ -1043,7 +1048,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
         .unwrap();
     assert_eq!(outcome, Reconciled::Satisfied);
     assert_eq!(
-        settle.values("monotonic_counter.reconstruction_under_replicated"),
+        settle.values("gauge.reconstruction_under_replicated"),
         vec![0],
         "the under-replicated count returns to zero once repair completes"
     );
@@ -1112,6 +1117,7 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
+        unreachable: &[],
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-midwrite").await;
@@ -1220,6 +1226,7 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
+        unreachable: &[],
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reader-race").await;

@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod custodian;
 pub mod dserver;
 
 use std::sync::atomic::{AtomicU64, Ordering};

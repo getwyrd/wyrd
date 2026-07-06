@@ -25,8 +25,27 @@ use wyrd_custodian::{
 
 /// Leg 1 — single active custodian, fenced: the elected leader acts; a superseded
 /// leader's coordination action is rejected by the monotonic fencing token.
+/// Install a permissive global `tracing` default **once** so the durability metric
+/// callsites never latch `Interest::never` under the parallel test harness. `tracing`
+/// caches each callsite's interest in a process-global table the first time it is hit;
+/// a first hit racing a no-subscriber default can latch the callsite disabled, after
+/// which the test that reads the metric back (`gather_prometheus`) silently sees it
+/// missing (the flaky read-back the C4 gate caught, iteration-4). Registering against an
+/// always-enabling default before any callsite fires makes every first-registration
+/// agree; each test's own `.with_subscriber(...)` still routes its metrics into that
+/// test's provider. Called at the top of every metric-touching test so whichever runs
+/// first sets the default before any callsite fires (mirrors `scrub.rs:208`).
+fn enable_metric_callsites() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
 #[tokio::test]
 async fn elected_leader_is_fenced_and_deposed_leader_rejected() {
+    enable_metric_callsites();
     let coord = MemCoordination::new();
     let zone_key = "zone-alpha";
 
@@ -118,6 +137,7 @@ fn selector_places_distinct_domains_and_refuses_when_too_few() {
 /// hardcoded) and read back in-process off the Prometheus surface.
 #[tokio::test]
 async fn exporter_emits_first_metric_over_dual_surface() {
+    enable_metric_callsites();
     // The dual-export surface is BINDING (ADR-0012): both a Prometheus registry AND an
     // OTLP push exporter are wired, with no backend hardcoded. Constructing `Both`
     // proves the OTLP push surface is genuinely built (not a stub).
