@@ -1,0 +1,54 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Edit",
+      "Write",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(sed:*)",
+      "Bash(awk:*)",
+      "Bash(diff:*)",
+      "Bash(git status:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git show:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git branch:*)",
+      "Bash(git stash:*)"
+    ],
+    "deny": [
+      "Bash(sudo:*)",
+      "Bash(shutdown:*)",
+      "Bash(reboot:*)",
+      "Bash(mkfs:*)",
+      "Bash(dd:*)",
+      "Bash(rm -rf /*)",
+      "Bash(rm -rf ~*)",
+      "Bash(rm -rf $HOME*)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.ssh/**)",
+      "Read(**/credentials*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Edit(.env)",
+      "Edit(.env.*)",
+      "Write(.env)",
+      "Write(.env.*)"
+    ],
+    "ask": [
+      "Bash(gh pr ready:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh release:*)"
+    ]
+  }
+}
