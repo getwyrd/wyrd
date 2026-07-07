@@ -294,13 +294,24 @@ impl CustodianService {
     /// 1. derives the LIVE reconstruction view ([`live_reconstruction_view`]) — dropping
     ///    any D-server that fails its reachability probe, so a killed server is read
     ///    *around* rather than crashing the pass;
-    /// 2. runs one fenced [`Self::reconcile_pass`] over that view (the durability metrics
-    ///    land on this role's export surface);
+    /// 2. runs two fenced [`Self::reconcile_pass`] calls — first a **best-effort scrub** of
+    ///    the live fleet to DERIVE this store's repair obligations from the committed
+    ///    (gateway-written) placement ([`wyrd_custodian::scrub`] enqueues any referenced
+    ///    fragment it finds absent/corrupt), then a **reconstruction** pass that assesses and
+    ///    repairs those obligations (the durability metrics land on this role's export
+    ///    surface). Scrub's enqueue is persisted to the shared store, so the separate
+    ///    reconstruction pass still drains it in the same interval. Deriving the obligations
+    ///    here is what closes the write→durability loop: without the scrub half the loop would
+    ///    only drain obligations some *other* producer enqueued, so a custodian opened over
+    ///    the store a gateway wrote would compute NO repair work from the placement — the
+    ///    "empty store sees zero repair" symptom (#455);
     /// 3. **survives** a per-pass store fault — a [`ReconcileError::Store`] (a server that
-    ///    died *after* the probe, a transient metadata blip) is logged to stderr and the
-    ///    loop continues to the next pass; only a [`ReconcileError::Fenced`] (this
-    ///    custodian was superseded — a newer term holds the zone) stops the loop, since
-    ///    continuing would be an unfenced actor.
+    ///    died *after* the probe, a transient metadata blip) is logged to stderr and the loop
+    ///    continues. Crucially, a scrub-pass fault is isolated from reconstruction: it is
+    ///    logged and reconstruction still drains the backlog, so one reachable-but-flaky
+    ///    node/object cannot stall ALL repair every interval (Codex #461). Only a
+    ///    [`ReconcileError::Fenced`] (this custodian was superseded — a newer term holds the
+    ///    zone) stops the loop, since continuing would be an unfenced actor.
     ///
     /// This is the production wiring the day-one runbook exercises: kill a D-server, watch
     /// the under-replicated gauge rise then return to zero, through a role that does not
@@ -323,6 +334,24 @@ impl CustodianService {
         tokio::pin!(shutdown);
         loop {
             let (fleet, topology, unreachable) = live_reconstruction_view(configured).await;
+            // DERIVE this pass's repair obligations from the committed (gateway-written)
+            // placement rather than only draining ones some other producer already enqueued.
+            // The scrub loop walks every referenced fragment on the live fleet and enqueues
+            // any it finds absent or corrupt ([`wyrd_custodian::scrub`]), so the SAME pass's
+            // reconstruction then assesses and repairs them. This is the write→repair join
+            // the deployable role needs: the placement a gateway PUT records over the cluster
+            // store is exactly what scrub reads to compute that object's repair obligations —
+            // ONE placement contract shared by the write path and the repair scan. Without it
+            // the reconstruction plane would run over an EMPTY queue on a store nothing else
+            // scrubbed, and a custodian opened over the store a gateway wrote would see zero
+            // repair work (the "empty store" symptom, #455). Scrub runs over the LIVE
+            // (reachable) fleet — a wholly-unreachable peer is dropped by the reachability
+            // probe and read *around* by reconstruction, unchanged — so a transient scrub
+            // fault degrades ONLY scrub (logged below), never reconstruction or the process.
+            let scrub_ctx = ScrubContext {
+                meta,
+                fleet: &fleet,
+            };
             let ctx = ReconstructionContext {
                 meta,
                 fleet: &fleet,
@@ -331,6 +360,28 @@ impl CustodianService {
                 // fragments as transiently unavailable, not confirmed lost (no false data-loss).
                 unreachable: &unreachable,
             };
+            // Scrub and reconstruction run as TWO passes, not one. `reconcile_step` short-
+            // circuits on the first loop's error (scrub's `?`), so a combined pass would let a
+            // transient scrub fault — a reachable node erroring on a single `get_fragment` —
+            // abort before reconstruction runs, stalling the ENTIRE repair backlog every
+            // interval until a full scrub succeeds (Codex #461). Scrub enqueues into the shared
+            // store, which persists, so a separate reconstruction pass still drains this pass's
+            // enqueues (same-interval drain preserved). Scrub therefore runs BEST-EFFORT: its
+            // store fault is logged and reconstruction proceeds; a superseded term still stops.
+            match self
+                .reconcile_pass(zone, custodian, None, Some(&scrub_ctx), None, None, clock())
+                .await
+            {
+                Ok(_) => {}
+                Err(e @ ReconcileError::Fenced(_)) => return Err(e),
+                Err(ReconcileError::Store(e)) => {
+                    eprintln!(
+                        "wyrd custodian: scrub pass degraded (repair backlog still drained): {e}"
+                    );
+                }
+            }
+            // Reconstruction pass — drains the shared repair queue (what scrub just enqueued
+            // plus any prior backlog), independent of a scrub blip.
             match self
                 .reconcile_pass(zone, custodian, None, None, Some(&ctx), None, clock())
                 .await
