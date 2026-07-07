@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cli;
+pub mod consistency_observable;
 pub mod custodian;
 pub mod dserver;
 
