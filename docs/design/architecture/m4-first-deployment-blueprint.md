@@ -188,7 +188,17 @@ Helsinki — pick one for M4; multi-location is M9). Within it:
   control nodes adds no machine but does add that shared SQL backend. SPIRE reserved
   for fleet scale; single-binary uses a dev-CA.
 - **Gateway — 1–2 small cloud servers**, stateless, behind Hetzner's load balancer
-  if you want HA on the S3 front door. (One is fine for first deployment.)
+  if you want HA on the S3 front door (one is fine for first deployment). The
+  gateway keeps **no durable state** — object metadata and the persisted inode
+  allocator live in TiKV, chunks fan out to the D servers over gRPC, and
+  coordination is in etcd (the gateway composes over the cluster backends, #454) —
+  so the fleet is **one shared front door, not N independent islands**: any request
+  may hit any gateway, and an object PUT through one is immediately readable through
+  another. The front-door LB therefore needs **no sticky/session affinity** — plain
+  L4 round-robin (or DNS round-robin) is correct, and a gateway can be added,
+  drained, or restarted with nothing to migrate. Wyrd ships **no** load balancer of
+  its own: the S3 front door is a standard cloud LB (Hetzner LB / k8s Service /
+  nginx / HAProxy), an operator concern, not a Wyrd component.
 - **Custodian — co-locate with a gateway or a small dedicated server**; stateless,
   leader-elected.
 - **Network**: Hetzner's **private network (vSwitch)** for the client→D-server,
