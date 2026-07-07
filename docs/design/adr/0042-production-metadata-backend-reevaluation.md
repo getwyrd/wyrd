@@ -1,7 +1,8 @@
 ---
 created: 06.07.2026 12:00
 type: adr
-status: Proposed
+status: Accepted
+supersedes: 0008
 tags:
   - adr
   - metadata
@@ -9,7 +10,7 @@ tags:
   - pluggability
   - sovereignty
 ---
-# 0042. Production metadata backend: reaffirmed two-slot design, three finalists
+# 0042. Production metadata backend: FoundationDB (supersedes ADR-0008)
 
 ## Context
 
@@ -245,37 +246,68 @@ SQL backend exactly as it absorbs a KV one.
 
 ## Decision
 
-1. **Reaffirm the two-slot `MetadataStore` design** (ADR-0008): `redb` embedded,
-   one distributed backend behind the same trait, selected as a composition
-   change (ADR-0010). This is not in question.
+**We adopt FoundationDB as the production distributed `MetadataStore` backend.**
+This moves the decision from *framed* to *made*, and therefore **supersedes
+ADR-0008**. What carries forward and what changes:
 
-2. **Narrow the production distributed field to three finalists** — **TiKV**,
-   **FoundationDB**, **YugabyteDB** — all of which clear the gate. The full
-   candidate field, with each rejection reasoned so it is never relitigated, is
-   the appendix.
+- The **two-slot design** and the **`redb` embedded slot** carry forward
+  unchanged.
+- ADR-0008's **per-zone durability-scheme decision** (`none` / `replication(n)` /
+  `rs(k,m)`, recorded per chunk so a zone can grow from replication into EC with
+  mixed-era data) carries forward unchanged.
+- ADR-0008's **TiKV** choice for the distributed slot is **replaced by
+  FoundationDB**.
 
-3. **Each finalist carries exactly one primary liability; it is adopted only
-   with the named mitigation below.** The finalists trade along three axes —
-   *client maturity · governance/continuity · link-graph purity* — and no
-   candidate wins all three. The honest shape is **pick two**:
-   - TiKV = governance + link-graph purity (− client maturity)
-   - YugabyteDB = client maturity + link-graph purity (− governance)
-   - FoundationDB = client maturity + best-consistency, but − governance **and**
-     − link-graph purity (its second win, strict serializability, sits on a
-     *fourth* axis outside the triangle; it is the least-sovereign finalist).
+1. **Reaffirm the two-slot `MetadataStore` design** (from ADR-0008): `redb`
+   embedded, one distributed backend behind the same trait, selected as a
+   composition change (ADR-0010). Unchanged.
 
-4. **The #257 conformance + contention + Jepsen battery is the tiebreaker, and
-   TiKV is the incumbent default.** TiKV remains the production backend until a
-   challenger *passes that battery* and its liability mitigation is demonstrated.
-   Therefore **this ADR does not itself supersede ADR-0008** — it reaffirms the
-   two-slot design and reopens only the distributed slot with TiKV still
-   standing. If a challenger wins, *that* outcome is recorded as a later
-   supersession of ADR-0008's TiKV clause (per [ADR-0038](0038-supersession-recorded-in-the-index.md);
-   the on-file `Superseded` stamp is now available, #444).
+2. **The production distributed backend is FoundationDB.** Of the three finalists
+   the elimination filter left standing — TiKV, FoundationDB, YugabyteDB — FDB is
+   selected on the two axes that dominate a correctness-critical metadata store:
+   - **Client/binding maturity.** FDB's client is a thin, stable binding over the
+     C API, exercised for years by the upstream BindingTester. That directly
+     answers the pain point that reopened ADR-0008 — TiKV's `client-rust` 0.4.0 is
+     self-declared not-production-ready (#435, #260) — without the standing cost of
+     fencing an immature, correctness-critical Rust client on every pin bump.
+   - **Strongest consistency, simulation-proven.** FDB provides **strict
+     serializability** (the gold standard, Matrix A), and its core is
+     deterministic-simulation-tested upstream — the same DST methodology Wyrd
+     mandates for itself (ADR-0009). For the store that maps every chunk, that is
+     the highest-confidence substrate on the board.
 
-### The three finalists — and how we address what each brings
+3. **FDB's two liabilities are accepted with the named mitigations** (detailed in
+   the finalist section below). `libfdb_c` in the link-graph is **confined to the
+   production gateway build** — the `fdb` feature is off by default, so the
+   embedded/NAS single-static-binary profile stays pure-Rust `redb` (ADR-0014),
+   untouched. The no-foundation governance risk is hedged by FDB's **Apache-2.0
+   forkability plus a full-history source mirror**, with the thin maintenance
+   surface a simulation-tested core implies. These are the two legs of "pick two"
+   FDB trades away (link-graph purity, foundation governance); the ADR names them
+   rather than hiding them.
 
-#### TiKV (incumbent) — liability: an immature, correctness-critical Rust client
+4. **TiKV and YugabyteDB are recorded as the ranked fallback, not discarded.** If
+   FDB's liabilities prove disqualifying under the #257 battery or in operation,
+   the reasoned fallback order is **TiKV** (governance + pure-Rust client, gated on
+   its client clearing the battery) then **YugabyteDB** (mature client + purity, at
+   the cost of SQL impedance + single-vendor governance). Their full liability +
+   mitigation analysis is retained below precisely so a fallback is a decision
+   already reasoned, not reopened.
+
+5. **The #257 conformance + contention + Jepsen battery remains the gate.** The
+   selection is architectural; FDB becomes the *running* production backend only
+   once `metadata-fdb` passes that battery against Wyrd's `MetadataStore` contract
+   and the #367 first-deployment gate stands the per-zone cluster up on OSS
+   tooling. Selecting FDB does not exempt it from the gate — it points the battery
+   at one target.
+
+### FoundationDB, and the two fallbacks — how each liability is addressed
+
+The chosen backend and its ranked fallbacks each carry named liabilities; the
+mitigation for every one is recorded here so neither the choice nor a later
+fallback is relitigated.
+
+#### TiKV (first fallback) — liability: an immature, correctness-critical Rust client
 
 `client-rust` 0.4.0 is pre-1.0 and self-declared not production-ready. It has
 already shown three sharp edges — a drop-time panic path (`CheckLevel::Panic`),
@@ -299,7 +331,7 @@ several layers deep. How we address it:
   challenger — the mitigation for TiKV's liability failing is FDB/YugabyteDB, not
   a heroic client rewrite.
 
-#### FoundationDB — liabilities: (a) a C library in the link-graph; (b) no-foundation governance
+#### FoundationDB (chosen) — liabilities: (a) a C library in the link-graph; (b) no-foundation governance
 
 - **`libfdb_c` in the link-graph — confine it to the production tier.** The
   purity cost is real but *bounded*: the `fdb` feature is off by default, so the
@@ -321,7 +353,7 @@ several layers deep. How we address it:
   on a fork is thin. The residual risk is *direction*, not *capture* — acceptable
   and named.
 
-#### YugabyteDB — liabilities: (a) SQL impedance; (b) single-vendor governance; (c) a heavy, self-managed server (plus a non-issue to dispatch: global-topology licensing)
+#### YugabyteDB (second fallback) — liabilities: (a) SQL impedance; (b) single-vendor governance; (c) a heavy, self-managed server (plus a non-issue to dispatch: global-topology licensing)
 
 - **SQL impedance — contain it behind the trait on a tiny, fixed SQL surface.**
   The `metadata-yugabyte` concrete maps the trait onto one small schema (an
@@ -412,22 +444,30 @@ any finalist:
 
 ## Consequences
 
-- The production backend decision is **framed, not yet made**: three finalists,
-  each with a named liability and a concrete mitigation, decided by a battery
-  that binds all three. TiKV stands until a challenger earns the swap.
-- ADR-0008 is **reaffirmed, not superseded**, by this ADR; a challenger win is a
-  future supersession event.
-- The downstream `metadata-client` milestone issues (#437–#443) that currently
-  assume FoundationDB are **conditional on this decision** and must be reframed to
-  the chosen backend (`metadata-<winner>`, its packaging/link-graph story, its
-  battery) once it lands.
+- The production backend decision is **made: FoundationDB**, with two named
+  liabilities each carrying a concrete mitigation. TiKV then YugabyteDB are the
+  reasoned fallback order if FDB is disqualified by the #257 battery or in
+  operation.
+- **ADR-0008 is superseded by this ADR.** The two-slot design and the `redb`
+  embedded slot carry forward unchanged; ADR-0008's per-zone durability-scheme
+  decision carries forward unchanged; ADR-0008's TiKV distributed-slot choice is
+  replaced by FoundationDB. Recorded per [ADR-0038](0038-supersession-recorded-in-the-index.md)
+  / ADR-0001: ADR-0008 is stamped `Superseded` (the one-way on-file stamp, #444)
+  and the ADR index marks it *superseded by 0042*.
+- The downstream `metadata-client` milestone issues (#437–#443) that assume
+  FoundationDB are **now on-decision**: they proceed as `metadata-fdb` (its
+  packaging/link-graph story, its battery) rather than being conditional on the
+  backend choice.
+- FDB becomes the *running* backend only when `metadata-fdb` passes the #257
+  battery and the #367 first-deployment gate stands the per-zone cluster up on OSS
+  tooling — selection is not deployment.
 - The two concept definitions (link-graph purity, SQL impedance) become shared
   vocabulary for this and later backend decisions.
 - Each requirement carries its own justification inline (architectural failure
   + user-visible consequence, R1–R5), so the filter reads as reasoned, not
   asserted, and doubles as the technical-eval defence for the storage pitch.
-- The candidate field is recorded once, with reasons, so the wide-column /
-  proprietary / embedded-slot rejections are not relitigated.
+- The candidate field and the R1–R7 filter are recorded once, with reasons, so
+  the rejected candidates and the two runner-up finalists are not relitigated.
 
 ## Appendix — candidates considered
 

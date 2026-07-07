@@ -1,7 +1,8 @@
 ---
 created: 13.06.2026 11:57
 type: adr
-status: Accepted
+status: Superseded
+superseded-by: 0042
 tags:
   - adr
   - metadata
