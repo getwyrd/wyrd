@@ -32,19 +32,166 @@ nothing else about ADR-0008 is in question.
 cross-compile to musl/NAS), and the gate below. Only the production distributed
 backend is re-decided here.
 
-### The gate (unchanged from ADR-0008)
+### Requirements
 
 The zonal metadata model is hierarchical **inode + dirent**. File creation writes
 an inode *and* its dirent atomically; rename is a single dirent mutation; the
-commit point is one linearizable, version-conditional mutation. The hard
-requirement is therefore:
+commit point is one linearizable, version-conditional mutation. That shape, plus
+the two-slot and sovereignty doctrine, yields the full requirement set the
+production distributed backend MUST satisfy — stated once here so the appendix
+matrices read as the *output* of a filter, not a free-standing table, and so the
+finalist field is **derived, not inherited from ADR-0008**.
 
-> **native cross-shard multi-key atomic transactions, with a linearizable
-> commit** — not single-row atomicity, not single-partition LWT, not
-> eventual-by-default.
+**Requirements (R1–R7).**
 
-This one requirement eliminates the entire wide-column family and most NoSQL up
-front (see the appendix). It is the same requirement that selected TiKV.
+- **R1 — Native cross-shard multi-key atomic transactions, linearizable commit.**
+  inode + dirent written as one indivisible act; the version-conditional commit
+  point totally orders a file's versions. *Not* single-row atomicity, *not*
+  single-partition LWT, *not* eventual-by-default. (This is the gate that selected
+  TiKV in ADR-0008.)
+- **R2 — Ordered keyspace with range scan.** dirent enumeration (list a
+  directory), the pending-chunk ledger sweep, and prefix scans over the
+  inode/dirent tree require ordered keys — not a hash-only KV.
+- **R3 — Conditional / compare-on-version write.** "Exactly one commit wins"
+  (Q5) is a CAS on `meta:version`; the store must carry the precondition
+  atomically with the mutation.
+- **R4 — Within-zone horizontal shard + consensus replication, never a single
+  writer.** Metadata is small but precious — losing it orphans every chunk
+  (§8.2) — so it is Raft-class replicated and sharded across failure domains
+  *inside one zone*.
+- **R5 — Data-proportional scale envelope.** The store holds storage metadata
+  (it grows with the namespace), not kilobytes of coordination state — the axis
+  that separates a metadata store from an L5 coordinator.
+- **R6 — Behind the narrow `MetadataStore` trait, distributed profile only.** The
+  embedded slot is `redb`; the distributed backend is a composition change in
+  `server` (ADR-0010), never a refactor. The distributed backend need not also be
+  embeddable — that is `redb`'s job.
+- **R7 — Open and sovereign.** Permissive / clearly-licensed (Apache-2.0 house
+  posture, ADR-0003), self-hostable, no hard dependency on a US-controlled
+  *service*; governance and continuity weighed as *longevity* risk.
+
+### Why R1–R5 are hard gates — architectural necessity and user-visible stakes
+
+Two justifications run in parallel and both are load-bearing, so the ADR records
+both. *Architecturally*, R1–R5 are not a wishlist — they are the
+**specification of the commodity primitive the differentiator consumes.** Each,
+if waived, either breaks a headline guarantee or forces Wyrd to rebuild the
+property itself, spending novelty budget outside the moat and violating
+reinvent-vs-consume. *Experientially*, each maps to a failure a **sovereign
+challenger cannot survive selling**: a hyperscaler absorbs a corruption incident
+as a footnote, but a new EU entrant whose entire pitch is "trust us with your
+data instead of the US hyperscaler" is finished by the first silent-loss event.
+R1–R5 are therefore the minimum bar to be a credible alternative at all — each is
+at once a line on the datasheet and a question in a hostile technical eval.
+
+- **R1 — atomic linearizable commit.** *Drop it:* single-row atomicity forces
+  either denormalizing the dirent into the inode (rename becomes a mass key
+  rewrite, killing scalability) or a write-ahead intent log (the Tectonic
+  contortion ADR-0008 rejects); mere eventual ordering leaves "the file exists"
+  with no defined moment, so torn state becomes observable — and with no
+  linearization point there is nothing to prove the commit protocol atomic
+  *against*, so the moat itself evaporates. *Felt as:* the end-user never sees a
+  half-written file — an upload fully appears or does not exist; a listing never
+  shows a phantom that 404s or opens as a 0-byte corpse (Q3); the app developer
+  gets an honest contract (a `200` on PUT means fully-there-and-readable) and
+  writes no verify-after-write defensive code. *Who it sinks:* R1 is the answer to
+  the most-asked question in a storage sales cycle — "what happens if a write is
+  interrupted?" — and trust in storage is binary: "sometimes files are weird"
+  reads as "unusable."
+- **R2 — ordered keyspace + range scan.** *Drop it:* the hierarchical
+  inode/dirent model (chosen so rename is one mutation, ADR-0008) is *defined* by
+  ordered keys — directory listing is a prefix scan, the GC ledger sweep is a scan
+  for expired leases (§8.2); a hash-only KV forces either a self-maintained ordered
+  index (a second consistency domain, a fresh correctness surface) or path-as-key
+  with O(n) rename. *Felt as:* listings are fast and complete at millions of
+  objects and a folder move is instant, not a multi-second half-completing freeze;
+  the developer's `LIST` behaves as the S3 compatibility you sold actually
+  promises. *Who it sinks:* without R2 the bolted-on index drifts and the developer
+  intermittently sees a file in a listing that GETs a 404 — the most maddening
+  class of support ticket, and it silently voids the "S3-compatible" claim. R2 also
+  makes GC a scan, so orphaned fragments are reclaimed and capacity does not leak —
+  directly the operator's $/TB and their ability to price against AWS without
+  subsidy.
+- **R3 — compare-on-version write.** *Drop it:* "exactly one concurrent writer
+  wins" (Q5) is arbitrated *inside* the atomic commit by a CAS on `meta:version`;
+  without it, concurrent writers silently clobber (lost updates, Q5 unprovable) and
+  the only recourse is pessimistic locking — a distributed lock on the write hot
+  path, violating the rule that nothing data-proportional touches L5 (§11).
+  *Felt as:* the user syncing one file from two devices gets no silent lost update
+  — one commit wins, the other is told to reconcile; the developer gets real
+  If-Match/CAS to build correct multi-writer logic on, and it is the primitive the
+  reserved collaborative-editor future stands on (ADR-0007). *Who it sinks:* the
+  locking alternative is felt by the user as "why is saving slow when a colleague
+  has the folder open?" and by the operator as lock-contention incidents — R3 is
+  the difference between "fast and correct under concurrency" and "pick one."
+- **R4 — synchronous consensus, never a single writer.** *Drop it:* metadata is
+  the map to the bytes, so losing it orphans every EC fragment — a total-loss event
+  though every byte survived (§8.2); an async-failover single primary loses the
+  last commits silently, i.e. the maps to chunks already stored successfully. And a
+  single writer caps whole-system metadata throughput regardless of D-server count,
+  with the small-files Drive workload (Q7) hitting the ceiling first. *Felt as:*
+  "acknowledged means durable, full stop" is a promise you can make (Q4) — no
+  user's "saved" file quietly vanishes days later while its data blocks sit intact
+  and unreferenced; and the product scales by *adding nodes*, not "it got slow as
+  it got popular." *Who it sinks:* the silent-loss variant is the single
+  unsurvivable trust-and-compliance event for a sovereign provider, and the
+  throughput ceiling is "we can't take more customers without a forklift" — R4
+  turns growth into a node addition instead of a wall.
+- **R5 — data-proportional scale envelope.** *Drop it:* the seductive shortcut —
+  "we already run etcd for L5, put metadata there too" — demos beautifully and
+  pilots fine, then degrades months into production as the namespace grows into the
+  range etcd was never sized for: the "treating etcd as a database" failure the
+  risk register names (§11), in the one component that must never wobble. *Felt
+  as:* the pilot's behaviour predicts production — the operator is not ambushed
+  *after* shipping, when migration cost is highest and customers are already on it;
+  the user never meets the system-wide slowdown that ambush produces. *Who it
+  sinks:* this is the cruelest mode because it is *delayed* — a provider staking its
+  name on Wyrd cannot afford to be blindsided by its own success. R5 keeps etcd
+  correctly consumed at L5 (ADR-0006) and forces the distributed slot to be a real,
+  sharding, data-proportional store (which is also why `redb` is fine embedded but
+  insufficient distributed).
+
+R6 and R7 are motivated differently — by house doctrine (pluggability behind the
+trait; sovereignty-first), not by a per-requirement architectural failure — so
+their justification lives with the design doctrine, not here.
+
+### The elimination filter
+
+Gates in kill-order; each candidate is cut at the *earliest* gate it fails, and
+G5's continuity clause *ranks* the survivors rather than eliminating. Reasoned
+once so it is never relitigated (per-candidate detail in the appendix):
+
+| Gate | Requirement | Cut at this gate |
+|---|---|---|
+| **G1** multi-key atomic + linearizable | R1, R3 | single-row / region-local: **HBase, Bigtable, Accumulo**; single-partition-LWT / eventual-by-default: **Cassandra, ScyllaDB, Riak, Couchbase** |
+| **G2** ordered range scan | R2 | hash-only / cache-shaped: **Redis / Valkey, Memcached** |
+| **G3** distributed, no single writer | R4 | single-primary servers: stock **PostgreSQL, MySQL** — they cluster for HA, not for sharded writes (the "just use Postgres" reflex ends here) |
+| **G4** correct scale envelope | R5 | right primitive, wrong layer: **etcd, rqlite / dqlite** — these *are* L5; "treating etcd as a database" is the classic failure mode |
+| **G5** open + sovereign | R7 | **cut:** proprietary managed services — **Spanner, DynamoDB, Cosmos** (US-controlled); non-OSI single-vendor — **MongoDB** (SSPL); no-longer-permissive — **CockroachDB** (CSL, ex-Apache). **ranked down on continuity:** single-vendor VC (**YugabyteDB**) below foundation-governed (**TiKV**/CNCF, **FoundationDB**/Apache) |
+
+**What passes.** Exactly two pure transactional ordered-KV survivors — **TiKV**
+and **FoundationDB** — plus the SQL-adjacent pair that clears the gates while
+paying SQL impedance: **YugabyteDB** and **TiDB** (the latter *is* TiKV with a SQL
+layer it does not need, so it collapses into TiKV-direct and is not carried
+separately). **CockroachDB** would have passed on architecture and is out on G5
+alone. That is the three-finalist field of the Decision — derived from R1–R7, not
+inherited.
+
+**Two doctrine notes the filter makes explicit.** *Sovereignty is a property of
+the deployment, not the steward's passport.* A self-hosted Apache-2.0 binary is
+sovereign even when the steward is American (FDB / Apple) or Chinese (TiKV /
+PingCAP), because there is no runtime dependency on a foreign-controlled *service*
+and the operator owns the bits; a hosted US service (Spanner, DynamoDB) is the
+hard fail. Governance domicile is therefore a *continuity* risk (G5's ranking
+clause), **not** a runtime-sovereignty violation — which is why TiKV and FDB both
+clear G5 and only Yugabyte is ranked down. *And the survivor set exposes a real
+gap:* there is no EU-origin, mature, distributed transactional ordered-KV. That
+absence is an instance of exactly the gap this program exists to close — but it is
+emphatically **not** one Wyrd should fill. Building a distributed transactional KV
+would spend the entire novelty budget on a *consumed* primitive, violating
+reinvent-vs-consume at its core. The sovereign move is to consume a survivor, own
+it by self-hosting, and hedge with a full-history source mirror — never to
+fork-and-maintain or rebuild.
 
 ## Two concepts this decision turns on
 
@@ -276,6 +423,9 @@ any finalist:
   battery) once it lands.
 - The two concept definitions (link-graph purity, SQL impedance) become shared
   vocabulary for this and later backend decisions.
+- Each requirement carries its own justification inline (architectural failure
+  + user-visible consequence, R1–R5), so the filter reads as reasoned, not
+  asserted, and doubles as the technical-eval defence for the storage pitch.
 - The candidate field is recorded once, with reasons, so the wide-column /
   proprietary / embedded-slot rejections are not relitigated.
 
@@ -283,6 +433,9 @@ any finalist:
 
 Licences verified July 2026. ✅ meets / good · ⚠️ partial / caveat · ❌ fails /
 absent.
+
+These matrices are the per-candidate instantiation of the R1–R7 filter in the
+Context: each verdict traces to the earliest gate a candidate clears or fails.
 
 ### Matrix A — architectural fit (does it do the job?)
 
