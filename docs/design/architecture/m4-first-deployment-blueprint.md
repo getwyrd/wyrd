@@ -56,7 +56,7 @@ Hetzner; the *roles* do not.
 | **PD** | TiKV's *own* placement driver / coordinator (embeds an internal etcd). Distinct from the L5 coordination etcd below. | **High** — 3 nodes for quorum; lose 2 and metadata stalls. |
 | **etcd (L5 coordination)** | The `Coordination` seam ([ADR-0006](../adr/0006-etcd-for-coordination.md)): service discovery, leader election, distributed locks (with fencing), and **D-server registration + leases**. A **separate 3-node ensemble** from TiKV's PD; every role dials it as `--coordination <L5-endpoint>`. | **High** — 3 nodes for quorum; lose 2 and discovery/registration/leader-election stall. Small but control-critical. |
 | **CA (step-ca)** | The internal PKI that issues short-lived mTLS certs for the fabric ([ADR-0036](../adr/0036-internal-ca-step-ca-spire.md)); the certificate is each component's identity ([ADR-0025](../adr/0025-internal-service-to-service-trust.md)). step-ca now, SPIRE reserved for fleet scale; the dev profile uses a built-in self-signed CA behind the same seam. | **High** — fail-closed mTLS (ADR-0025) makes an unreachable CA halt *every* new dial and cert rotation; run it **HA, off the D-server hosts**. |
-| **Gateway** | Stateless S3 front door; embeds the client library (chunk, EC, commit). | **Low** — stateless, horizontally scalable, restartable. |
+| **Gateway** | Stateless S3 front door; embeds the client library (chunk, EC, commit). | **Low** — no durable state, restartable. *Single active gateway for M4*; active/active scale-out is gated on cluster-coordinated id allocation (#477). |
 | **Custodian** | One active (leader-elected *via etcd*); runs GC/scrub/reconstruct/rebalance; emits durability telemetry. | **Low** — stateless logic; a restart re-elects. |
 
 The asymmetry to internalize: **D servers carry the durability**, **TiKV+PD carry
@@ -187,18 +187,23 @@ Helsinki — pick one for M4; multi-location is M9). Within it:
   and identical root/intermediate signing material**. Co-locating those on the 3
   control nodes adds no machine but does add that shared SQL backend. SPIRE reserved
   for fleet scale; single-binary uses a dev-CA.
-- **Gateway — 1–2 small cloud servers**, stateless, behind Hetzner's load balancer
-  if you want HA on the S3 front door (one is fine for first deployment). The
-  gateway keeps **no durable state** — object metadata and the persisted inode
-  allocator live in TiKV, chunks fan out to the D servers over gRPC, and
-  coordination is in etcd (the gateway composes over the cluster backends, #454) —
-  so the fleet is **one shared front door, not N independent islands**: any request
-  may hit any gateway, and an object PUT through one is immediately readable through
-  another. The front-door LB therefore needs **no sticky/session affinity** — plain
-  L4 round-robin (or DNS round-robin) is correct, and a gateway can be added,
-  drained, or restarted with nothing to migrate. Wyrd ships **no** load balancer of
-  its own: the S3 front door is a standard cloud LB (Hetzner LB / k8s Service /
-  nginx / HAProxy), an operator concern, not a Wyrd component.
+- **Gateway — 1 small cloud server for first deployment** (add a warm standby behind
+  the LB if you want S3-front-door failover). The gateway holds **no durable object
+  state** — object metadata lives in TiKV, chunks fan out to the D servers over gRPC,
+  and coordination is in etcd (the gateway composes over the cluster backends, #454) —
+  so a restarted or replaced gateway migrates nothing: on startup `recover()` re-seeds
+  its id allocator from the persisted high-water marks.
+  **M4 caveat — run exactly one *active* gateway.** The gateway currently mints inode
+  and chunk ids from a **per-process counter** (seeded once by `recover()`), **not** the
+  CAS-backed `meta:next_inode` allocator the CLI path uses. Two *active* gateways would
+  seed from the same high-water mark and mint colliding ids, overwriting each other's
+  fragments (data loss). So for M4 the front-door LB sits in front of a **single active
+  gateway** (TLS/DNS termination and standby failover — not active/active fan-out). The
+  **one-shared-front-door / no-affinity / plain-round-robin** property is the intended
+  design, but it is **gated on cluster-coordinated id allocation (#477)** — until that
+  lands, do not put N active gateways behind a round-robin LB. Wyrd still ships **no**
+  load balancer of its own: the S3 front door is a standard cloud LB (Hetzner LB / k8s
+  Service / nginx / HAProxy), an operator concern, not a Wyrd component.
 - **Custodian — co-locate with a gateway or a small dedicated server**; stateless,
   leader-elected.
 - **Network**: Hetzner's **private network (vSwitch)** for the client→D-server,
