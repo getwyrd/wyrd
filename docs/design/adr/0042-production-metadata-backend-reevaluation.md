@@ -1,7 +1,8 @@
 ---
 created: 06.07.2026 12:00
 type: adr
-status: Proposed
+status: Accepted
+supersedes: 0008
 tags:
   - adr
   - metadata
@@ -9,7 +10,7 @@ tags:
   - pluggability
   - sovereignty
 ---
-# 0042. Production metadata backend: reaffirmed two-slot design, three finalists
+# 0042. Production metadata backend: FoundationDB (supersedes ADR-0008)
 
 ## Context
 
@@ -32,19 +33,166 @@ nothing else about ADR-0008 is in question.
 cross-compile to musl/NAS), and the gate below. Only the production distributed
 backend is re-decided here.
 
-### The gate (unchanged from ADR-0008)
+### Requirements
 
 The zonal metadata model is hierarchical **inode + dirent**. File creation writes
 an inode *and* its dirent atomically; rename is a single dirent mutation; the
-commit point is one linearizable, version-conditional mutation. The hard
-requirement is therefore:
+commit point is one linearizable, version-conditional mutation. That shape, plus
+the two-slot and sovereignty doctrine, yields the full requirement set the
+production distributed backend MUST satisfy — stated once here so the appendix
+matrices read as the *output* of a filter, not a free-standing table, and so the
+finalist field is **derived, not inherited from ADR-0008**.
 
-> **native cross-shard multi-key atomic transactions, with a linearizable
-> commit** — not single-row atomicity, not single-partition LWT, not
-> eventual-by-default.
+**Requirements (R1–R7).**
 
-This one requirement eliminates the entire wide-column family and most NoSQL up
-front (see the appendix). It is the same requirement that selected TiKV.
+- **R1 — Native cross-shard multi-key atomic transactions, linearizable commit.**
+  inode + dirent written as one indivisible act; the version-conditional commit
+  point totally orders a file's versions. *Not* single-row atomicity, *not*
+  single-partition LWT, *not* eventual-by-default. (This is the gate that selected
+  TiKV in ADR-0008.)
+- **R2 — Ordered keyspace with range scan.** dirent enumeration (list a
+  directory), the pending-chunk ledger sweep, and prefix scans over the
+  inode/dirent tree require ordered keys — not a hash-only KV.
+- **R3 — Conditional / compare-on-version write.** "Exactly one commit wins"
+  (Q5) is a CAS on `meta:version`; the store must carry the precondition
+  atomically with the mutation.
+- **R4 — Within-zone horizontal shard + consensus replication, never a single
+  writer.** Metadata is small but precious — losing it orphans every chunk
+  (§8.2) — so it is Raft-class replicated and sharded across failure domains
+  *inside one zone*.
+- **R5 — Data-proportional scale envelope.** The store holds storage metadata
+  (it grows with the namespace), not kilobytes of coordination state — the axis
+  that separates a metadata store from an L5 coordinator.
+- **R6 — Behind the narrow `MetadataStore` trait, distributed profile only.** The
+  embedded slot is `redb`; the distributed backend is a composition change in
+  `server` (ADR-0010), never a refactor. The distributed backend need not also be
+  embeddable — that is `redb`'s job.
+- **R7 — Open and sovereign.** Permissive / clearly-licensed (Apache-2.0 house
+  posture, ADR-0003), self-hostable, no hard dependency on a US-controlled
+  *service*; governance and continuity weighed as *longevity* risk.
+
+### Why R1–R5 are hard gates — architectural necessity and user-visible stakes
+
+Two justifications run in parallel and both are load-bearing, so the ADR records
+both. *Architecturally*, R1–R5 are not a wishlist — they are the
+**specification of the commodity primitive the differentiator consumes.** Each,
+if waived, either breaks a headline guarantee or forces Wyrd to rebuild the
+property itself, spending novelty budget outside the moat and violating
+reinvent-vs-consume. *Experientially*, each maps to a failure a **sovereign
+challenger cannot survive selling**: a hyperscaler absorbs a corruption incident
+as a footnote, but a new EU entrant whose entire pitch is "trust us with your
+data instead of the US hyperscaler" is finished by the first silent-loss event.
+R1–R5 are therefore the minimum bar to be a credible alternative at all — each is
+at once a line on the datasheet and a question in a hostile technical eval.
+
+- **R1 — atomic linearizable commit.** *Drop it:* single-row atomicity forces
+  either denormalizing the dirent into the inode (rename becomes a mass key
+  rewrite, killing scalability) or a write-ahead intent log (the Tectonic
+  contortion ADR-0008 rejects); mere eventual ordering leaves "the file exists"
+  with no defined moment, so torn state becomes observable — and with no
+  linearization point there is nothing to prove the commit protocol atomic
+  *against*, so the moat itself evaporates. *Felt as:* the end-user never sees a
+  half-written file — an upload fully appears or does not exist; a listing never
+  shows a phantom that 404s or opens as a 0-byte corpse (Q3); the app developer
+  gets an honest contract (a `200` on PUT means fully-there-and-readable) and
+  writes no verify-after-write defensive code. *Who it sinks:* R1 is the answer to
+  the most-asked question in a storage sales cycle — "what happens if a write is
+  interrupted?" — and trust in storage is binary: "sometimes files are weird"
+  reads as "unusable."
+- **R2 — ordered keyspace + range scan.** *Drop it:* the hierarchical
+  inode/dirent model (chosen so rename is one mutation, ADR-0008) is *defined* by
+  ordered keys — directory listing is a prefix scan, the GC ledger sweep is a scan
+  for expired leases (§8.2); a hash-only KV forces either a self-maintained ordered
+  index (a second consistency domain, a fresh correctness surface) or path-as-key
+  with O(n) rename. *Felt as:* listings are fast and complete at millions of
+  objects and a folder move is instant, not a multi-second half-completing freeze;
+  the developer's `LIST` behaves as the S3 compatibility you sold actually
+  promises. *Who it sinks:* without R2 the bolted-on index drifts and the developer
+  intermittently sees a file in a listing that GETs a 404 — the most maddening
+  class of support ticket, and it silently voids the "S3-compatible" claim. R2 also
+  makes GC a scan, so orphaned fragments are reclaimed and capacity does not leak —
+  directly the operator's $/TB and their ability to price against AWS without
+  subsidy.
+- **R3 — compare-on-version write.** *Drop it:* "exactly one concurrent writer
+  wins" (Q5) is arbitrated *inside* the atomic commit by a CAS on `meta:version`;
+  without it, concurrent writers silently clobber (lost updates, Q5 unprovable) and
+  the only recourse is pessimistic locking — a distributed lock on the write hot
+  path, violating the rule that nothing data-proportional touches L5 (§11).
+  *Felt as:* the user syncing one file from two devices gets no silent lost update
+  — one commit wins, the other is told to reconcile; the developer gets real
+  If-Match/CAS to build correct multi-writer logic on, and it is the primitive the
+  reserved collaborative-editor future stands on (ADR-0007). *Who it sinks:* the
+  locking alternative is felt by the user as "why is saving slow when a colleague
+  has the folder open?" and by the operator as lock-contention incidents — R3 is
+  the difference between "fast and correct under concurrency" and "pick one."
+- **R4 — synchronous consensus, never a single writer.** *Drop it:* metadata is
+  the map to the bytes, so losing it orphans every EC fragment — a total-loss event
+  though every byte survived (§8.2); an async-failover single primary loses the
+  last commits silently, i.e. the maps to chunks already stored successfully. And a
+  single writer caps whole-system metadata throughput regardless of D-server count,
+  with the small-files Drive workload (Q7) hitting the ceiling first. *Felt as:*
+  "acknowledged means durable, full stop" is a promise you can make (Q4) — no
+  user's "saved" file quietly vanishes days later while its data blocks sit intact
+  and unreferenced; and the product scales by *adding nodes*, not "it got slow as
+  it got popular." *Who it sinks:* the silent-loss variant is the single
+  unsurvivable trust-and-compliance event for a sovereign provider, and the
+  throughput ceiling is "we can't take more customers without a forklift" — R4
+  turns growth into a node addition instead of a wall.
+- **R5 — data-proportional scale envelope.** *Drop it:* the seductive shortcut —
+  "we already run etcd for L5, put metadata there too" — demos beautifully and
+  pilots fine, then degrades months into production as the namespace grows into the
+  range etcd was never sized for: the "treating etcd as a database" failure the
+  risk register names (§11), in the one component that must never wobble. *Felt
+  as:* the pilot's behaviour predicts production — the operator is not ambushed
+  *after* shipping, when migration cost is highest and customers are already on it;
+  the user never meets the system-wide slowdown that ambush produces. *Who it
+  sinks:* this is the cruelest mode because it is *delayed* — a provider staking its
+  name on Wyrd cannot afford to be blindsided by its own success. R5 keeps etcd
+  correctly consumed at L5 (ADR-0006) and forces the distributed slot to be a real,
+  sharding, data-proportional store (which is also why `redb` is fine embedded but
+  insufficient distributed).
+
+R6 and R7 are motivated differently — by house doctrine (pluggability behind the
+trait; sovereignty-first), not by a per-requirement architectural failure — so
+their justification lives with the design doctrine, not here.
+
+### The elimination filter
+
+Gates in kill-order; each candidate is cut at the *earliest* gate it fails, and
+G5's continuity clause *ranks* the survivors rather than eliminating. Reasoned
+once so it is never relitigated (per-candidate detail in the appendix):
+
+| Gate | Requirement | Cut at this gate |
+|---|---|---|
+| **G1** multi-key atomic + linearizable | R1, R3 | single-row / region-local: **HBase, Bigtable, Accumulo**; single-partition-LWT / eventual-by-default: **Cassandra, ScyllaDB, Riak, Couchbase** |
+| **G2** ordered range scan | R2 | hash-only / cache-shaped: **Redis / Valkey, Memcached** |
+| **G3** distributed, no single writer | R4 | single-primary servers: stock **PostgreSQL, MySQL** — they cluster for HA, not for sharded writes (the "just use Postgres" reflex ends here) |
+| **G4** correct scale envelope | R5 | right primitive, wrong layer: **etcd, rqlite / dqlite** — these *are* L5; "treating etcd as a database" is the classic failure mode |
+| **G5** open + sovereign | R7 | **cut:** proprietary managed services — **Spanner, DynamoDB, Cosmos** (US-controlled); non-OSI single-vendor — **MongoDB** (SSPL); no-longer-permissive — **CockroachDB** (CSL, ex-Apache). **ranked down on continuity:** single-vendor VC (**YugabyteDB**) below foundation-governed (**TiKV**/CNCF, **FoundationDB**/Apache) |
+
+**What passes.** Exactly two pure transactional ordered-KV survivors — **TiKV**
+and **FoundationDB** — plus the SQL-adjacent pair that clears the gates while
+paying SQL impedance: **YugabyteDB** and **TiDB** (the latter *is* TiKV with a SQL
+layer it does not need, so it collapses into TiKV-direct and is not carried
+separately). **CockroachDB** would have passed on architecture and is out on G5
+alone. That is the three-finalist field of the Decision — derived from R1–R7, not
+inherited.
+
+**Two doctrine notes the filter makes explicit.** *Sovereignty is a property of
+the deployment, not the steward's passport.* A self-hosted Apache-2.0 binary is
+sovereign even when the steward is American (FDB / Apple) or Chinese (TiKV /
+PingCAP), because there is no runtime dependency on a foreign-controlled *service*
+and the operator owns the bits; a hosted US service (Spanner, DynamoDB) is the
+hard fail. Governance domicile is therefore a *continuity* risk (G5's ranking
+clause), **not** a runtime-sovereignty violation — which is why TiKV and FDB both
+clear G5 and only Yugabyte is ranked down. *And the survivor set exposes a real
+gap:* there is no EU-origin, mature, distributed transactional ordered-KV. That
+absence is an instance of exactly the gap this program exists to close — but it is
+emphatically **not** one Wyrd should fill. Building a distributed transactional KV
+would spend the entire novelty budget on a *consumed* primitive, violating
+reinvent-vs-consume at its core. The sovereign move is to consume a survivor, own
+it by self-hosting, and hedge with a full-history source mirror — never to
+fork-and-maintain or rebuild.
 
 ## Two concepts this decision turns on
 
@@ -98,37 +246,68 @@ SQL backend exactly as it absorbs a KV one.
 
 ## Decision
 
-1. **Reaffirm the two-slot `MetadataStore` design** (ADR-0008): `redb` embedded,
-   one distributed backend behind the same trait, selected as a composition
-   change (ADR-0010). This is not in question.
+**We adopt FoundationDB as the production distributed `MetadataStore` backend.**
+This moves the decision from *framed* to *made*, and therefore **supersedes
+ADR-0008**. What carries forward and what changes:
 
-2. **Narrow the production distributed field to three finalists** — **TiKV**,
-   **FoundationDB**, **YugabyteDB** — all of which clear the gate. The full
-   candidate field, with each rejection reasoned so it is never relitigated, is
-   the appendix.
+- The **two-slot design** and the **`redb` embedded slot** carry forward
+  unchanged.
+- ADR-0008's **per-zone durability-scheme decision** (`none` / `replication(n)` /
+  `rs(k,m)`, recorded per chunk so a zone can grow from replication into EC with
+  mixed-era data) carries forward unchanged.
+- ADR-0008's **TiKV** choice for the distributed slot is **replaced by
+  FoundationDB**.
 
-3. **Each finalist carries exactly one primary liability; it is adopted only
-   with the named mitigation below.** The finalists trade along three axes —
-   *client maturity · governance/continuity · link-graph purity* — and no
-   candidate wins all three. The honest shape is **pick two**:
-   - TiKV = governance + link-graph purity (− client maturity)
-   - YugabyteDB = client maturity + link-graph purity (− governance)
-   - FoundationDB = client maturity + best-consistency, but − governance **and**
-     − link-graph purity (its second win, strict serializability, sits on a
-     *fourth* axis outside the triangle; it is the least-sovereign finalist).
+1. **Reaffirm the two-slot `MetadataStore` design** (from ADR-0008): `redb`
+   embedded, one distributed backend behind the same trait, selected as a
+   composition change (ADR-0010). Unchanged.
 
-4. **The #257 conformance + contention + Jepsen battery is the tiebreaker, and
-   TiKV is the incumbent default.** TiKV remains the production backend until a
-   challenger *passes that battery* and its liability mitigation is demonstrated.
-   Therefore **this ADR does not itself supersede ADR-0008** — it reaffirms the
-   two-slot design and reopens only the distributed slot with TiKV still
-   standing. If a challenger wins, *that* outcome is recorded as a later
-   supersession of ADR-0008's TiKV clause (per [ADR-0038](0038-supersession-recorded-in-the-index.md);
-   the on-file `Superseded` stamp is now available, #444).
+2. **The production distributed backend is FoundationDB.** Of the three finalists
+   the elimination filter left standing — TiKV, FoundationDB, YugabyteDB — FDB is
+   selected on the two axes that dominate a correctness-critical metadata store:
+   - **Client/binding maturity.** FDB's client is a thin, stable binding over the
+     C API, exercised for years by the upstream BindingTester. That directly
+     answers the pain point that reopened ADR-0008 — TiKV's `client-rust` 0.4.0 is
+     self-declared not-production-ready (#435, #260) — without the standing cost of
+     fencing an immature, correctness-critical Rust client on every pin bump.
+   - **Strongest consistency, simulation-proven.** FDB provides **strict
+     serializability** (the gold standard, Matrix A), and its core is
+     deterministic-simulation-tested upstream — the same DST methodology Wyrd
+     mandates for itself (ADR-0009). For the store that maps every chunk, that is
+     the highest-confidence substrate on the board.
 
-### The three finalists — and how we address what each brings
+3. **FDB's two liabilities are accepted with the named mitigations** (detailed in
+   the finalist section below). `libfdb_c` in the link-graph is **confined to the
+   production gateway build** — the `fdb` feature is off by default, so the
+   embedded/NAS single-static-binary profile stays pure-Rust `redb` (ADR-0014),
+   untouched. The no-foundation governance risk is hedged by FDB's **Apache-2.0
+   forkability plus a full-history source mirror**, with the thin maintenance
+   surface a simulation-tested core implies. These are the two legs of "pick two"
+   FDB trades away (link-graph purity, foundation governance); the ADR names them
+   rather than hiding them.
 
-#### TiKV (incumbent) — liability: an immature, correctness-critical Rust client
+4. **TiKV and YugabyteDB are recorded as the ranked fallback, not discarded.** If
+   FDB's liabilities prove disqualifying under the #257 battery or in operation,
+   the reasoned fallback order is **TiKV** (governance + pure-Rust client, gated on
+   its client clearing the battery) then **YugabyteDB** (mature client + purity, at
+   the cost of SQL impedance + single-vendor governance). Their full liability +
+   mitigation analysis is retained below precisely so a fallback is a decision
+   already reasoned, not reopened.
+
+5. **The #257 conformance + contention + Jepsen battery remains the gate.** The
+   selection is architectural; FDB becomes the *running* production backend only
+   once `metadata-fdb` passes that battery against Wyrd's `MetadataStore` contract
+   and the #367 first-deployment gate stands the per-zone cluster up on OSS
+   tooling. Selecting FDB does not exempt it from the gate — it points the battery
+   at one target.
+
+### FoundationDB, and the two fallbacks — how each liability is addressed
+
+The chosen backend and its ranked fallbacks each carry named liabilities; the
+mitigation for every one is recorded here so neither the choice nor a later
+fallback is relitigated.
+
+#### TiKV (first fallback) — liability: an immature, correctness-critical Rust client
 
 `client-rust` 0.4.0 is pre-1.0 and self-declared not production-ready. It has
 already shown three sharp edges — a drop-time panic path (`CheckLevel::Panic`),
@@ -152,7 +331,7 @@ several layers deep. How we address it:
   challenger — the mitigation for TiKV's liability failing is FDB/YugabyteDB, not
   a heroic client rewrite.
 
-#### FoundationDB — liabilities: (a) a C library in the link-graph; (b) no-foundation governance
+#### FoundationDB (chosen) — liabilities: (a) a C library in the link-graph; (b) no-foundation governance
 
 - **`libfdb_c` in the link-graph — confine it to the production tier.** The
   purity cost is real but *bounded*: the `fdb` feature is off by default, so the
@@ -174,7 +353,7 @@ several layers deep. How we address it:
   on a fork is thin. The residual risk is *direction*, not *capture* — acceptable
   and named.
 
-#### YugabyteDB — liabilities: (a) SQL impedance; (b) single-vendor governance; (c) a heavy, self-managed server (plus a non-issue to dispatch: global-topology licensing)
+#### YugabyteDB (second fallback) — liabilities: (a) SQL impedance; (b) single-vendor governance; (c) a heavy, self-managed server (plus a non-issue to dispatch: global-topology licensing)
 
 - **SQL impedance — contain it behind the trait on a tiny, fixed SQL surface.**
   The `metadata-yugabyte` concrete maps the trait onto one small schema (an
@@ -265,24 +444,38 @@ any finalist:
 
 ## Consequences
 
-- The production backend decision is **framed, not yet made**: three finalists,
-  each with a named liability and a concrete mitigation, decided by a battery
-  that binds all three. TiKV stands until a challenger earns the swap.
-- ADR-0008 is **reaffirmed, not superseded**, by this ADR; a challenger win is a
-  future supersession event.
-- The downstream `metadata-client` milestone issues (#437–#443) that currently
-  assume FoundationDB are **conditional on this decision** and must be reframed to
-  the chosen backend (`metadata-<winner>`, its packaging/link-graph story, its
-  battery) once it lands.
+- The production backend decision is **made: FoundationDB**, with two named
+  liabilities each carrying a concrete mitigation. TiKV then YugabyteDB are the
+  reasoned fallback order if FDB is disqualified by the #257 battery or in
+  operation.
+- **ADR-0008 is superseded by this ADR.** The two-slot design and the `redb`
+  embedded slot carry forward unchanged; ADR-0008's per-zone durability-scheme
+  decision carries forward unchanged; ADR-0008's TiKV distributed-slot choice is
+  replaced by FoundationDB. Recorded per [ADR-0038](0038-supersession-recorded-in-the-index.md)
+  / ADR-0001: ADR-0008 is stamped `Superseded` (the one-way on-file stamp, #444)
+  and the ADR index marks it *superseded by 0042*.
+- The downstream `metadata-client` milestone issues (#437–#443) that assume
+  FoundationDB are **now on-decision**: they proceed as `metadata-fdb` (its
+  packaging/link-graph story, its battery) rather than being conditional on the
+  backend choice.
+- FDB becomes the *running* backend only when `metadata-fdb` passes the #257
+  battery and the #367 first-deployment gate stands the per-zone cluster up on OSS
+  tooling — selection is not deployment.
 - The two concept definitions (link-graph purity, SQL impedance) become shared
   vocabulary for this and later backend decisions.
-- The candidate field is recorded once, with reasons, so the wide-column /
-  proprietary / embedded-slot rejections are not relitigated.
+- Each requirement carries its own justification inline (architectural failure
+  + user-visible consequence, R1–R5), so the filter reads as reasoned, not
+  asserted, and doubles as the technical-eval defence for the storage pitch.
+- The candidate field and the R1–R7 filter are recorded once, with reasons, so
+  the rejected candidates and the two runner-up finalists are not relitigated.
 
 ## Appendix — candidates considered
 
 Licences verified July 2026. ✅ meets / good · ⚠️ partial / caveat · ❌ fails /
 absent.
+
+These matrices are the per-candidate instantiation of the R1–R7 filter in the
+Context: each verdict traces to the earliest gate a candidate clears or fails.
 
 ### Matrix A — architectural fit (does it do the job?)
 
