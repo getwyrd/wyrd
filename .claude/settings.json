@@ -23,9 +23,7 @@
       "Bash(git show:*)",
       "Bash(git rev-parse:*)",
       "Bash(git branch:*)",
-      "Bash(git stash:*)",
-      "Bash(git -C:*)",
-      "Bash(python3:*)"
+      "Bash(git stash:*)"
     ],
     "deny": [
       "Bash(sudo:*)",
