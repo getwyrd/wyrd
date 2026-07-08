@@ -137,6 +137,14 @@ const JEPSEN_PROJECT: &str = "wyrd-tier1-jepsen";
 /// is killed. Matches [`crate::kill_reconstruct::KR_DSERVER_COUNT`].
 const JEPSEN_DSERVER_COUNT: usize = 10; // N=9 + 1 spare
 
+/// The D-server container image built by `crates/chunkstore-grpc/tests/docker-compose.yml`
+/// (`image: wyrd-dserver:test`). The [`IsolationNemesis::NetworkPartition`] leg reuses this
+/// image — which now ships `iptables` (`crates/chunkstore-grpc/tests/dserver/Dockerfile`)
+/// — as a throwaway `--net container:<isolated>` sidecar that injects/heals the in-netns
+/// packet drop, so the isolated D-server itself is never touched (stays `running`, keeps
+/// its published-port mapping). Exported to the scenario as `WYRD_TIER1_DSERVER_IMAGE`.
+const JEPSEN_DSERVER_IMAGE: &str = "wyrd-dserver:test";
+
 /// The in-repo Tier-1 Jepsen consistency scenario test (the `cargo test --test <name>`
 /// target). The post-#250 route for [`run_jepsen`].
 const JEPSEN_SCENARIO_TEST: &str = "tier1_jepsen_consistency";
@@ -188,10 +196,65 @@ pub(crate) fn jepsen_dispatch(legacy_cmd_configured: bool) -> JepsenDispatch {
     }
 }
 
-/// The `cargo test --ignored` argv that runs the in-repo `test` scenario — the same
-/// `cargo test --test <name> -- --ignored` shape the sibling legs use. Downstream of the
-/// [`jepsen_dispatch`] decision (the `InRepoScenario { test }` route supplies `test`).
-fn jepsen_scenario_args(test: &str) -> [&str; 8] {
+/// **Tier-1 isolation nemesis** (issue #399, ADR-0039's named additive upgrade): which
+/// mechanism a Tier-1 Jepsen leg uses to make server 1 unreachable mid-repair.
+///
+/// Modeled as a value with BOTH alternatives representable — mirroring
+/// [`JepsenDispatch`]'s born-at-tier pattern — so that dropping the network-partition
+/// leg (collapsing the campaign back to freeze-only, the exact gap ADR-0039 names) is
+/// catchable by a Check-time unit test ([`tier1_jepsen_isolation_legs_includes_network_partition_not_freeze_only`]),
+/// not merely absent.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum IsolationNemesis {
+    /// Jepsen's `:pause` — a freezer-cgroup process freeze (`docker pause`/`unpause`,
+    /// `tier1_jepsen_consistency.rs:832-841`/`:901-909`). The isolated node's own clock
+    /// STOPS. Cheaper; kept as the existing leg (#250) — Scope says do not delete it.
+    ProcessFreeze,
+    /// Jepsen's `:partition` — a network-level packet drop (an in-netns `iptables` DROP
+    /// on the gRPC port) that keeps the container in the `running` state and PRESERVES
+    /// its published-port mapping: the node stays LIVE on its own clock,
+    /// network-unreachable, for the fault window, then is reachable again at the SAME
+    /// endpoint on heal. The #399 upgrade this issue adds.
+    NetworkPartition,
+}
+
+impl IsolationNemesis {
+    /// The `#[ignore]`d scenario test function (inside the [`JEPSEN_SCENARIO_TEST`]
+    /// binary) that injects this nemesis. Each nemesis routes to its OWN function so a
+    /// regression that points both at the same function silently collapses one leg into
+    /// the other — the [`tier1_jepsen_isolation_legs_includes_network_partition_not_freeze_only`]
+    /// test catches that too (distinct-function-names assertion).
+    pub(crate) fn scenario_fn(self) -> &'static str {
+        match self {
+            IsolationNemesis::ProcessFreeze => {
+                "jepsen_consistency_over_repair_under_partition_and_crash"
+            }
+            IsolationNemesis::NetworkPartition => {
+                "jepsen_consistency_over_repair_under_live_partition_and_crash"
+            }
+        }
+    }
+}
+
+/// Which isolation nemeses the Tier-1 Jepsen leg runs, and in what order, once
+/// [`run_jepsen`] routes to the in-repo scenario. Pure — a plain `Vec` the dispatch unit
+/// test inspects directly (not a downstream argv helper), so a regression that drops
+/// [`IsolationNemesis::NetworkPartition`] — collapsing the leg back to the freeze-only
+/// nemesis ADR-0039 names as the gap this issue closes — flips the test red rather than
+/// resting red on non-existence.
+pub(crate) fn tier1_jepsen_isolation_legs() -> Vec<IsolationNemesis> {
+    vec![
+        IsolationNemesis::ProcessFreeze,
+        IsolationNemesis::NetworkPartition,
+    ]
+}
+
+/// The `cargo test --ignored` argv that runs one `exact_fn` scenario function inside the
+/// in-repo `test` binary — the same `cargo test --test <name> -- --ignored --exact <fn>`
+/// shape the sibling legs use. Downstream of the [`jepsen_dispatch`] decision (the
+/// `InRepoScenario { test }` route supplies `test`) and of [`IsolationNemesis::scenario_fn`]
+/// (supplies `exact_fn`, selecting which of the two isolation-nemesis functions runs).
+fn jepsen_scenario_args<'a>(test: &'a str, exact_fn: &'a str) -> [&'a str; 10] {
     [
         "test",
         "-p",
@@ -200,6 +263,8 @@ fn jepsen_scenario_args(test: &str) -> [&str; 8] {
         test,
         "--",
         "--ignored",
+        "--exact",
+        exact_fn,
         "--nocapture",
     ]
 }
@@ -240,7 +305,15 @@ pub fn run_jepsen() -> Result<(), String> {
     // Route the run. The decision is a value (`jepsen_dispatch`) the dispatch test binds
     // to — re-pointing the live route at the removed external command flips that test red.
     match jepsen_dispatch(std::env::var_os(JEPSEN_LEGACY_CMD_VAR).is_some()) {
-        JepsenDispatch::InRepoScenario { test } => run_jepsen_scenario(test),
+        JepsenDispatch::InRepoScenario { test } => {
+            // Run each isolation-nemesis leg (`tier1_jepsen_isolation_legs`) against its
+            // OWN freshly-stood-up cluster — server 0 is `docker kill`ed (permanently
+            // dead) by each leg, so the legs cannot share one live cluster.
+            for nemesis in tier1_jepsen_isolation_legs() {
+                run_jepsen_scenario(test, nemesis)?;
+            }
+            Ok(())
+        }
         JepsenDispatch::ExternalCommand { env_var } => Err(format!(
             "the external `{env_var}` Tier-1 Jepsen harness was removed in #250; the \
              in-repo `{JEPSEN_SCENARIO_TEST}` consistency scenario is the Tier-1 harness \
@@ -249,12 +322,14 @@ pub fn run_jepsen() -> Result<(), String> {
     }
 }
 
-/// Orchestrate the Tier-1 Jepsen consistency run:
-/// stand up a [`JEPSEN_DSERVER_COUNT`]-server cluster, resolve endpoints, pass
+/// Orchestrate a single Tier-1 Jepsen consistency leg's run for the given `nemesis`:
+/// stand up a fresh [`JEPSEN_DSERVER_COUNT`]-server cluster, resolve endpoints, pass
 /// the cluster info to the scenario test via env vars, then finalize (log capture
 /// before teardown, unconditional teardown) — the same pattern as
-/// [`run_kill_reconstruct`].
-fn run_jepsen_scenario(test: &str) -> Result<(), String> {
+/// [`run_kill_reconstruct`]. Called once per leg in [`tier1_jepsen_isolation_legs`]
+/// order by [`run_jepsen`], each against its OWN cluster (server 0 is permanently
+/// killed within a leg, so legs cannot share one live cluster).
+fn run_jepsen_scenario(test: &str, nemesis: IsolationNemesis) -> Result<(), String> {
     let compose = crate::workspace_root()
         .join("crates/chunkstore-grpc/tests/docker-compose.yml")
         .to_string_lossy()
@@ -270,10 +345,16 @@ fn run_jepsen_scenario(test: &str) -> Result<(), String> {
         || {
             let endpoints = jepsen_resolve_endpoints(&compose)?;
             println!(
-                "\nxtask jepsen: {JEPSEN_DSERVER_COUNT} D servers at {endpoints}; \
-                 victim={victim_container}, partitioned={partition_container}"
+                "\nxtask jepsen ({nemesis:?}): {JEPSEN_DSERVER_COUNT} D servers at \
+                 {endpoints}; victim={victim_container}, isolated={partition_container}"
             );
-            run_jepsen_test(&endpoints, &victim_container, &partition_container, test)
+            run_jepsen_test(
+                &endpoints,
+                &victim_container,
+                &partition_container,
+                test,
+                nemesis,
+            )
         },
         |result| {
             crate::finish_integration(
@@ -283,24 +364,28 @@ fn run_jepsen_scenario(test: &str) -> Result<(), String> {
             )
         },
     )?;
-    println!("\nxtask jepsen: Tier-1 consistency scenario passed");
+    println!("\nxtask jepsen ({nemesis:?}): Tier-1 consistency scenario passed");
     Ok(())
 }
 
-/// Run the (otherwise `#[ignore]`d) Tier-1 Jepsen consistency scenario test with
-/// the resolved cluster endpoints and fault-injection targets exported as env vars,
-/// so the test dials the live container cluster and knows which containers to kill
-/// and pause.
+/// Run the (otherwise `#[ignore]`d) Tier-1 Jepsen consistency scenario function that
+/// injects `nemesis`, with the resolved cluster endpoints and fault-injection targets
+/// exported as env vars, so the test dials the live container cluster and knows which
+/// containers to kill and isolate.
 ///
-/// Runs the in-repo `test` scenario the [`jepsen_dispatch`] decision selected — the
-/// `cargo test --test <test> -- --ignored` invocation built by [`jepsen_scenario_args`].
+/// Runs the in-repo `test` scenario the [`jepsen_dispatch`] decision selected, filtered
+/// to `nemesis`'s [`IsolationNemesis::scenario_fn`] — the
+/// `cargo test --test <test> -- --ignored --exact <fn>` invocation built by
+/// [`jepsen_scenario_args`].
 fn run_jepsen_test(
     endpoints: &str,
     victim_container: &str,
     partition_container: &str,
     test: &str,
+    nemesis: IsolationNemesis,
 ) -> Result<(), String> {
-    let args = jepsen_scenario_args(test);
+    let exact_fn = nemesis.scenario_fn();
+    let args = jepsen_scenario_args(test, exact_fn);
     crate::print_step(&{
         let mut display = vec!["cargo"];
         display.extend_from_slice(&args);
@@ -312,13 +397,18 @@ fn run_jepsen_test(
         .env("WYRD_DSERVER_ENDPOINTS", endpoints)
         .env("WYRD_TIER1_VICTIM_CONTAINER", victim_container)
         .env("WYRD_TIER1_PARTITION_CONTAINER", partition_container)
+        // The image the [`IsolationNemesis::NetworkPartition`] leg reuses as a
+        // `--net container:<isolated>` iptables sidecar (unused by the `ProcessFreeze`
+        // leg's function, harmless to export always) — it never disconnects the
+        // container, so the published-port mapping survives the fault window.
+        .env("WYRD_TIER1_DSERVER_IMAGE", JEPSEN_DSERVER_IMAGE)
         .status()
-        .map_err(|e| format!("failed to spawn cargo for Tier-1 Jepsen: {e}"))?;
+        .map_err(|e| format!("failed to spawn cargo for Tier-1 Jepsen ({exact_fn}): {e}"))?;
     if status.success() {
         Ok(())
     } else {
         Err(format!(
-            "Tier-1 Jepsen consistency scenario failed with {status}"
+            "Tier-1 Jepsen consistency scenario `{exact_fn}` failed with {status}"
         ))
     }
 }
@@ -881,9 +971,13 @@ mod tests {
              external route"
         );
 
-        // The in-repo route assembles the sibling `cargo test --test <name> -- --ignored`
-        // shape against wyrd-chunkstore-grpc.
-        let args = jepsen_scenario_args("tier1_jepsen_consistency");
+        // The in-repo route assembles the sibling
+        // `cargo test --test <name> -- --ignored --exact <fn>` shape against
+        // wyrd-chunkstore-grpc, filtered to one isolation-nemesis scenario function.
+        let args = jepsen_scenario_args(
+            "tier1_jepsen_consistency",
+            IsolationNemesis::ProcessFreeze.scenario_fn(),
+        );
         assert_eq!(
             args[0], "test",
             "must be a `cargo test` invocation: {args:?}"
@@ -899,6 +993,58 @@ mod tests {
         assert!(
             !flat.contains("WYRD_TIER1_JEPSEN_CMD"),
             "in-repo route argv must not reference the external command var: {flat}"
+        );
+    }
+
+    /// The Tier-1 Jepsen leg's isolation-nemesis routing (Success criterion, issue #399):
+    /// binds directly to [`tier1_jepsen_isolation_legs`] (the value [`run_jepsen`]
+    /// iterates on its `Plan::Run` path), mirroring
+    /// [`jepsen_dispatch_routes_to_in_repo_scenario_not_external_command`]'s
+    /// bind-to-the-decision-not-the-plumbing shape.
+    ///
+    /// - **green now**: BOTH the existing, cheaper `ProcessFreeze` leg (kept, not
+    ///   deleted — Scope) and the new `NetworkPartition` leg (the #399 upgrade,
+    ///   ADR-0039's named additive gap-closer) are present.
+    /// - **red iff the leg collapses back to freeze-only**: dropping
+    ///   `IsolationNemesis::NetworkPartition` from the returned legs — the exact gap
+    ///   ADR-0039 names — flips this test red (the falsifiability demonstration: Do
+    ///   proved this via a temporary negation, see build-notes.md).
+    #[test]
+    fn tier1_jepsen_isolation_legs_includes_network_partition_not_freeze_only() {
+        let legs = tier1_jepsen_isolation_legs();
+        assert!(
+            legs.contains(&IsolationNemesis::NetworkPartition),
+            "the Tier-1 Jepsen leg must include a network-level partition nemesis \
+             (Jepsen's `:partition`) distinct from the process-freeze (`:pause`) \
+             nemesis — ADR-0039's #399 upgrade; got legs={legs:?}"
+        );
+        assert!(
+            legs.contains(&IsolationNemesis::ProcessFreeze),
+            "the existing process-freeze (`docker pause`) leg must be KEPT as a \
+             separate, cheaper nemesis, not deleted (Scope); got legs={legs:?}"
+        );
+
+        // Each nemesis must route to its OWN scenario function — sharing one would
+        // silently collapse the new leg into the old one.
+        let fns: std::collections::HashSet<&str> = legs.iter().map(|n| n.scenario_fn()).collect();
+        assert_eq!(
+            fns.len(),
+            legs.len(),
+            "each isolation nemesis must route to its own scenario function, not share \
+             one with another leg: {legs:?} -> {fns:?}"
+        );
+        assert!(
+            IsolationNemesis::NetworkPartition
+                .scenario_fn()
+                .contains("live_partition"),
+            "the network-partition leg's scenario function name must name the live \
+             partition it injects: {}",
+            IsolationNemesis::NetworkPartition.scenario_fn()
+        );
+        assert_ne!(
+            IsolationNemesis::NetworkPartition.scenario_fn(),
+            IsolationNemesis::ProcessFreeze.scenario_fn(),
+            "the network-partition leg must not route to the freeze leg's function"
         );
     }
 }

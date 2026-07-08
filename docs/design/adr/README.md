@@ -19,7 +19,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0005](0005-single-provider-closed-federation.md) | Single-provider, closed federation | Proposed |
 | [0006](0006-etcd-for-coordination.md) | etcd for coordination; openraft reserved | Accepted |
 | [0007](0007-reserve-append-cas-watch.md) | Reserve append / CAS / watch primitives | Accepted |
-| [0008](0008-tikv-metadata-and-pluggable-backends.md) | TiKV metadata store and pluggable backends | Accepted |
+| [0008](0008-tikv-metadata-and-pluggable-backends.md) | TiKV metadata store and pluggable backends | Superseded by 0042 |
 | [0009](0009-deterministic-simulation-testing.md) | Testing strategy | Accepted |
 | [0010](0010-pluggable-deployment-substrate.md) | Pluggable deployment substrate; Kubernetes optional | Accepted |
 | [0011](0011-durability-telemetry-and-declarative-management.md) | Durability telemetry and declarative management | Accepted |
@@ -52,9 +52,11 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0038](0038-supersession-recorded-in-the-index.md) | Supersession is recorded in the index, not on the frozen file | Proposed |
 | [0039](0039-tier1-consistency-in-repo-scenario.md) | Tier-1 consistency-over-repair as an in-repo Rust scenario; literal Jepsen deferred (refines proposal 0005 §13.2) | Accepted |
 | [0040](0040-mixed-era-placement-expansion.md) | Mixed-era placement expansion: one identity-fallback rule, liberal read / strict maintenance (refines proposal 0005 §placement) | Accepted |
-| [0041](0041-consistency-checker-substrate.md) | Consistency-checker substrate: model the mutable metadata register, not the immutable data path (refines the ADR-0039 deferral; unblocks #329) | Proposed |
-| 0042 | _(reserved for the MetadataStore two-slot / production-backend decision, #436)_ | — |
+| [0041](0041-consistency-checker-substrate.md) | Consistency-checker foundation: model the mutable metadata register, not the immutable data path (refines the ADR-0039 deferral; unblocks #329) | Accepted |
+| [0042](0042-production-metadata-backend-reevaluation.md) | Production metadata backend: adopt **FoundationDB** for the distributed slot (two-slot design + `redb` embedded + durability-scheme decision carried forward), two named liabilities each mitigated, TiKV then YugabyteDB as ranked fallback; the #257 battery gates deployment (supersedes ADR-0008) | Accepted |
 | [0043](0043-testing-fixture-profiles.md) | Testing fixture profiles: one minimal container topology per test class; root compose removed | Accepted |
+| [0044](0044-provisional-conformance-pins.md) | Provisional pins in the shared conformance suite: mark, don't gate (governs the multi-backend `MetadataStore` contract; refines ADR-0006) | Proposed |
+| [0045](0045-metadata-validation-boundaries.md) | Metadata validation boundaries: parse-don't-validate at decode, liberal read / strict maintenance (generalizes ADR-0040's posture across all metadata) | Proposed |
 
 ## Why not ... ?
 

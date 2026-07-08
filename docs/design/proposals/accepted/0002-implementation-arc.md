@@ -1,7 +1,8 @@
 ---
 created: 17.06.2026 19:53
 type: proposal
-status: accepted
+status: superseded
+superseded-by: 0013-implementation-arc-rescoped.md
 author: Eduard Ralph
 tracking-issue: TBD
 tags:

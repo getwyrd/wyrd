@@ -13,6 +13,16 @@ name: docs-immutability
 # and draft -> stable transitions legal while freezing the record from that
 # point on. Adding new documents and editing indexes/READMEs stays allowed.
 #
+# Supersession carve-out: a frozen document (Accepted ADR/proposal, stable spec)
+# MAY be edited in exactly one narrow way — a *supersession stamp* that flips its
+# `status:` to `Superseded` and, optionally, adds a `superseded-by:` frontmatter
+# field. Everything else in the file (the whole body, all other frontmatter) must
+# be byte-for-byte unchanged, and the stamp is one-way (a Superseded base is
+# frozen again). This lets the final "-> Superseded" transition in each lifecycle
+# above be recorded on the document itself; every other edit to a frozen document
+# still fails. NOTE: this is a deliberate reversal of ADR-0038's "old file left
+# byte-for-byte untouched" mechanic and must land with an ADR that supersedes it.
+#
 # Migration note: legacy records with no YAML frontmatter are outside this
 # regime until converted. Once converted, a non-editable base status freezes the
 # document.
@@ -41,17 +51,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          status_from_base() {
-            local path="$1"
-            local base_content status
+          # Read the `status:` frontmatter value of a path at a given git ref.
+          # Fails (non-zero) if the path is absent there or has no frontmatter.
+          status_at_ref() {
+            local ref="$1"
+            local path="$2"
+            local content status
 
-            base_content=$(git show "$BASE_SHA:$path" 2>/dev/null) || return 1
+            content=$(git show "$ref:$path" 2>/dev/null) || return 1
 
             # Legacy records with no YAML frontmatter are not yet under the
             # immutability regime.
-            [ "$(printf '%s\n' "$base_content" | head -n1)" = "---" ] || return 1
+            [ "$(printf '%s\n' "$content" | head -n1)" = "---" ] || return 1
 
-            status=$(printf '%s\n' "$base_content" | awk '
+            status=$(printf '%s\n' "$content" | awk '
               NR==1 && $0=="---" { infm=1; next }
               infm && /^---[[:space:]]*$/ { exit }
               infm && tolower($0) ~ /^status:/ {
@@ -59,6 +72,10 @@ jobs:
               }')
             [ -n "$status" ] || status="unknown"
             printf '%s' "$status"
+          }
+
+          status_from_base() {
+            status_at_ref "$BASE_SHA" "$1"
           }
 
           normalized_status() {
@@ -134,6 +151,70 @@ jobs:
             esac
           }
 
+          # The frozen status that a class transitions *out of* into Superseded:
+          # ADRs and proposals from `accepted`, specs from `stable`. Only the
+          # document file itself (a numbered *.md, or a spec *.md) can be stamped
+          # — never a spec conformance asset, whose supersession is expressed by
+          # superseding its governing spec.
+          frozen_source_status() {
+            case "$1" in
+              docs/design/adr/[0-9]*.md) printf 'accepted' ;;
+              docs/design/proposals/draft/[0-9]*.md|docs/design/proposals/accepted/[0-9]*.md) printf 'accepted' ;;
+              docs/design/specs/*.md) printf 'stable' ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # 1-based line number of the frontmatter's closing `---` on stdin, or
+          # empty if there is no closing delimiter. The body is everything after.
+          frontmatter_close_line() {
+            awk '
+              NR == 1 && $0 == "---" { fm = 1; next }
+              fm == 1 && /^---[[:space:]]*$/ { print NR; exit }
+            '
+          }
+
+          # The frontmatter (lines 1..close) with the `status:` and any
+          # `superseded-by:`/`superseded_by:` lines removed — the only fields a
+          # stamp may touch.
+          frontmatter_canon() {
+            local ref="$1" path="$2" close="$3"
+            git show "$ref:$path" | sed -n "1,${close}p" \
+              | grep -viE '^(status:|superseded[-_]by:)' || true
+          }
+
+          # True iff the change to `path` is a pure supersession stamp: base is the
+          # class's frozen source status, head is `superseded`, and the two files
+          # are byte-for-byte identical once the status / superseded-by fields are
+          # removed. Deletions and renames (head absent) never qualify.
+          is_supersession_stamp() {
+            local path="$1"
+            local want_base base_status head_status base_close head_close
+
+            want_base=$(frozen_source_status "$path") || return 1
+
+            base_status=$(status_at_ref "$BASE_SHA" "$path") || return 1
+            head_status=$(status_at_ref "$HEAD_SHA" "$path") || return 1
+            [ "$(normalized_status "$base_status")" = "$want_base" ] || return 1
+            [ "$(normalized_status "$head_status")" = "superseded" ] || return 1
+
+            base_close=$(git show "$BASE_SHA:$path" | frontmatter_close_line)
+            head_close=$(git show "$HEAD_SHA:$path" | frontmatter_close_line)
+            [ -n "$base_close" ] && [ -n "$head_close" ] || return 1
+
+            # Frontmatter (minus the status / superseded-by fields a stamp may
+            # touch) must match, and the body after the frontmatter must be
+            # byte-for-byte identical. cmp on the raw body stream — not a "$(...)"
+            # capture, which strips trailing newlines — so an added/removed blank
+            # line or terminal newline at EOF cannot slip a body change through.
+            cmp -s \
+              <(frontmatter_canon "$BASE_SHA" "$path" "$base_close") \
+              <(frontmatter_canon "$HEAD_SHA" "$path" "$head_close") || return 1
+            cmp -s \
+              <(git show "$BASE_SHA:$path" | tail -n +"$((base_close + 1))") \
+              <(git show "$HEAD_SHA:$path" | tail -n +"$((head_close + 1))")
+          }
+
           check_path() {
             local change="$1"
             local path="$2"
@@ -144,6 +225,10 @@ jobs:
             status_lc=$(normalized_status "$status")
 
             if ! is_editable_status "$path" "$status_lc"; then
+              # A frozen document may still receive a one-way supersession stamp.
+              if is_supersession_stamp "$path"; then
+                return 0
+              fi
               violations="${violations}  ${change}\t${path} (status: ${status:-unknown})"$'\n'
             fi
           }

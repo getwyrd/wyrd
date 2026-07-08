@@ -36,6 +36,16 @@ RUN cargo build --release --locked --bin wyrd ${FEATURES:+--features "$FEATURES"
 
 # Runtime stage — a minimal image hosting just the d-server role.
 FROM debian:bookworm-slim
+# `iptables` is used ONLY by the Tier-1 Jepsen live-network-partition leg (issue #399):
+# `cargo xtask jepsen` runs a throwaway `docker run --rm --net container:<isolated>
+# --cap-add NET_ADMIN --user 0 --entrypoint iptables wyrd-dserver:test ...` sidecar that
+# shares the isolated D-server's network namespace and DROPs its gRPC packets, then flushes
+# on heal. The D-server process itself never runs iptables (it stays the non-root `dserver`
+# user with no added capability) — the binary just has to be present in the image the
+# sidecar reuses. Inert for every other tier (Tier-2 integration / kill-reconstruct).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iptables \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/wyrd /usr/local/bin/wyrd
 # Drop root (issue #286): a dedicated unprivileged system user/group, and
 # `/data` pre-created and owned by it so a compose service's `--data-dir /data`

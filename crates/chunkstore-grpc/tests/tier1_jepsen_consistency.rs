@@ -4,8 +4,24 @@
 //! What this test proves that no in-process test can: the **production custodian repair
 //! path** (`custodian::reconcile_step` → `reconstruction::reconcile`) upholds the
 //! **ADR-0015 consistency contract** over **real gRPC D-server containers** when the
-//! cluster is hit by BOTH a **crash** (a killed node — `docker kill`) and a **network
-//! partition** (a live-but-unreachable node — `docker pause` / `docker unpause`).
+//! cluster is hit by a **crash** (a killed node — `docker kill`) and an **isolation
+//! nemesis** on a second node. Two isolation nemeses are covered, in two separate
+//! scenario functions (issue #399, ADR-0039's named additive upgrade):
+//!
+//! - [`jepsen_consistency_over_repair_under_partition_and_crash`] — Jepsen's `:pause`:
+//!   a freezer-cgroup process freeze (`docker pause` / `docker unpause`). The isolated
+//!   node's own clock **stops**. Cheaper; kept as the existing leg (#250).
+//! - [`jepsen_consistency_over_repair_under_live_partition_and_crash`] — Jepsen's
+//!   `:partition`: a network-level packet drop (an in-netns `iptables` DROP on the gRPC
+//!   port, injected by a `--net container:<isolated>` sidecar) that keeps the container
+//!   `running` **and preserves its published-port mapping**. The isolated node stays
+//!   **live** on its own clock, network-unreachable, for the fault window, then is
+//!   reachable again at the SAME endpoint on heal — the property
+//!   [`assert_node_live_during_isolation`] asserts and the freeze leg cannot exhibit.
+//!
+//! `xtask/src/faults.rs`'s `IsolationNemesis` value (mirroring `jepsen_dispatch`'s
+//! born-at-tier pattern, `xtask/src/faults.rs:179`) decides which of the two functions
+//! each `cargo xtask jepsen` leg runs.
 //!
 //! # ADR-0015 contract asserted (`0005:381-403`)
 //!
@@ -46,14 +62,18 @@
 //! happens only in the privileged off-Check job (`WYRD_TIER1=1`), run by
 //! `cargo xtask jepsen`.
 //!
-//! **Born-at-tier coverage** at Check: the five assertion helpers
+//! **Born-at-tier coverage** at Check: the six assertion helpers
 //! ([`assert_commit_point_atomic`], [`assert_read_after_commit`],
 //! [`assert_exactly_once_convergence`], [`assert_redundancy_outcome`],
-//! [`assert_distinct_domains`]) are regular functions the scenario body calls; their own
-//! non-`#[ignore]`d unit tests run inside `cargo xtask ci`'s `cargo test --workspace`,
-//! including **negative controls** (planted anomalies each oracle must CATCH). Stubbing
-//! or removing a helper fails both the unit tests AND the compile-time type-check of the
-//! scenario — the born-at-tier seam is load-bearing.
+//! [`assert_distinct_domains`], [`assert_node_live_during_isolation`]) are regular
+//! functions the scenario bodies call; their own non-`#[ignore]`d unit tests run inside
+//! `cargo xtask ci`'s `cargo test --workspace`, including **negative controls** (planted
+//! anomalies each oracle must CATCH). [`assert_node_live_during_isolation`]'s negative
+//! control plants a `"paused"` container state — the falsifiability demonstration for
+//! issue #399: if the network-partition leg collapsed back to `docker pause`, this is
+//! exactly the (now-caught) input it would produce. Stubbing or removing a helper fails
+//! both the unit tests AND the compile-time type-check of the scenario — the
+//! born-at-tier seam is load-bearing.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -356,6 +376,35 @@ where
     Ok(())
 }
 
+/// Assert **node liveness during isolation** (issue #399, ADR-0039's named additive
+/// upgrade) — the property that distinguishes Jepsen's `:partition` nemesis from
+/// `:pause`: the isolated node's container must stay in Docker's `running` state
+/// (`docker inspect -f '{{.State.Status}}' <container>`) for the whole fault window —
+/// it keeps running on its own clock, network-unreachable, rather than being suspended.
+///
+/// Returns `Ok(())` when `state == "running"`, `Err` describing the violation
+/// otherwise. In particular `"paused"` — a freezer-cgroup process freeze (Jepsen's
+/// `:pause`) — is the exact collapse this oracle exists to catch: it is the
+/// falsifiability negative control for this issue (a stub that routes the
+/// network-partition leg to `docker pause` produces exactly this input).
+pub(crate) fn assert_node_live_during_isolation(state: &str) -> AssertResult {
+    if state == "running" {
+        return Ok(());
+    }
+    if state == "paused" {
+        return Err(format!(
+            "node-liveness-during-isolation violation: container state is `paused` — a \
+             freezer-cgroup process freeze (Jepsen's `:pause`); the network-partition leg \
+             must keep the isolated node LIVE (`running`, network-unreachable — Jepsen's \
+             `:partition`), not suspend its clock (ADR-0039, issue #399). Got state: {state:?}"
+        ));
+    }
+    Err(format!(
+        "node-liveness-during-isolation violation: container state is `{state}`, expected \
+         `running` — the isolated node must stay live for the whole fault window"
+    ))
+}
+
 // ---- Helper unit tests (non-#[ignore], run at Check) ----
 //
 // These are the born-at-tier coverage for the shared consistency oracle. They run
@@ -542,6 +591,45 @@ fn distinct_domains_fails_for_unregistered_server() {
     assert!(result.unwrap_err().contains("no failure-domain assignment"));
 }
 
+// --- assert_node_live_during_isolation (issue #399) ---
+
+#[test]
+fn node_liveness_during_isolation_passes_when_running() {
+    // The network-partition leg's node stays `running` for the whole fault window —
+    // Jepsen's `:partition`, the property distinguishing it from `:pause`.
+    assert!(
+        assert_node_live_during_isolation("running").is_ok(),
+        "a `running` container must pass the node-liveness-during-isolation oracle"
+    );
+}
+
+#[test]
+fn node_liveness_during_isolation_fails_when_paused() {
+    // Negative control (the falsifiability demonstration for issue #399): a planted
+    // `"paused"` state is EXACTLY what the network-partition leg would produce if it
+    // collapsed back to `docker pause` (Jepsen's `:pause`) — the oracle MUST catch it.
+    let result = assert_node_live_during_isolation("paused");
+    assert!(
+        result.is_err(),
+        "a `paused` container must fail the node-liveness-during-isolation oracle — a \
+         freezer-cgroup process freeze suspends the node's own clock"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("paused") && err.contains(":pause"),
+        "error must name the pause/freeze violation: {err}"
+    );
+}
+
+#[test]
+fn node_liveness_during_isolation_fails_when_exited() {
+    // Negative control: a container that has stopped entirely also fails — the isolated
+    // node must be alive AND unreachable, not simply gone.
+    let result = assert_node_live_during_isolation("exited");
+    assert!(result.is_err(), "an `exited` container must fail");
+    assert!(result.unwrap_err().contains("running"));
+}
+
 // ---- Scenario helpers ----
 
 /// Per-request RPC deadline for the cluster clients. Bounds calls to a partitioned
@@ -580,6 +668,66 @@ fn healthy_topology(victim: usize) -> Topology {
         }
     }
     t
+}
+
+/// The D-server's in-container gRPC port (the compose service runs
+/// `--bind 0.0.0.0:50051`). The live-partition leg DROPs inbound traffic to this port to
+/// isolate the node without touching its container state or published-port mapping.
+const DSERVER_GRPC_PORT: &str = "50051";
+
+/// Query a container's Docker state (`docker inspect -f '{{.State.Status}}' <container>`)
+/// — e.g. `"running"`, `"paused"`, `"exited"`. The live-partition leg
+/// ([`jepsen_consistency_over_repair_under_live_partition_and_crash`]) uses this to prove
+/// the isolated node stays LIVE (`running`, never `paused`) for the whole fault window —
+/// the property [`assert_node_live_during_isolation`] checks (issue #399).
+fn docker_container_state(container: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Status}}", container])
+        .output()
+        .expect("docker inspect command");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Add or remove (`iptables_verb` = `"-A"` to add, `"-D"` to delete) an in-netns `iptables`
+/// DROP rule on `container`'s inbound gRPC port, injected by a throwaway sidecar that
+/// **shares the isolated container's network namespace** (`--net container:<container>`)
+/// and carries `NET_ADMIN` — so the D-server container itself is never disconnected,
+/// paused, or otherwise touched. This is what makes the leg a Jepsen `:partition` (a live
+/// node that keeps `running`) rather than `:pause`, AND what fixes the iteration-1 heal
+/// failure: because the container never leaves its network, its host-published-port
+/// mapping (`127.0.0.1:<host-port>`, which the scenario dials) survives the fault window,
+/// so Phase 3 reconnects at the SAME endpoint.
+///
+/// `image` is the D-server image (`WYRD_TIER1_DSERVER_IMAGE`, `wyrd-dserver:test`), reused
+/// here only because it now ships `iptables` — the sidecar overrides its entrypoint.
+/// A thin, deliberately untested I/O wrapper (same shape as the `docker kill`/`pause`
+/// shell-outs); the pure decision lives in [`assert_node_live_during_isolation`] and
+/// `xtask`'s `IsolationNemesis`.
+fn docker_netns_grpc_drop(
+    image: &str,
+    container: &str,
+    iptables_verb: &str,
+) -> std::process::ExitStatus {
+    std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            &format!("--net=container:{container}"),
+            "--cap-add=NET_ADMIN",
+            "--user=0",
+            "--entrypoint=iptables",
+            image,
+            iptables_verb,
+            "INPUT",
+            "-p",
+            "tcp",
+            "--dport",
+            DSERVER_GRPC_PORT,
+            "-j",
+            "DROP",
+        ])
+        .status()
+        .expect("docker run iptables sidecar command")
 }
 
 // ---- Scenario test ----
@@ -1080,6 +1228,505 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
 
     // Full redundancy: EVERY server named by the committed placement must hold an
     // intact fragment — including the freshly reconstructed one on the spare.
+    assert!(
+        missing.is_empty(),
+        "every fragment in the post-repair placement must be present and intact, \
+         including the rebuilt one on spare server {SPARE_INDEX}; \
+         missing/corrupt (frag_index, server_id): {missing:?}"
+    );
+    assert_eq!(
+        available.len(),
+        N,
+        "all N={N} placed fragments must be intact after reconstruction; got {}",
+        available.len()
+    );
+
+    let reconstructed = erasure::reconstruct(K, M, data.len(), &available)
+        .expect("erasure::reconstruct from post-repair shards");
+
+    assert_eq!(
+        reconstructed, data,
+        "data reconstructed from the post-repair placement must be byte-identical \
+         to the original (the rebuilt fragment on server {SPARE_INDEX} is correct)"
+    );
+}
+
+// ---- Scenario test (live network partition) ----
+
+/// **Tier-1 Jepsen LIVE network-partition leg** (issue #399, ADR-0039's named additive
+/// upgrade).
+///
+/// The same six-phase consistency campaign as
+/// [`jepsen_consistency_over_repair_under_partition_and_crash`], but Phase 2/3 isolate
+/// server 1 with a **network-level packet drop** instead of a freezer-cgroup process
+/// freeze — Jepsen's `:partition` nemesis, not `:pause`. The drop is an in-netns
+/// `iptables -A INPUT ... -j DROP` on the gRPC port, injected by a throwaway sidecar that
+/// shares the isolated container's network namespace ([`docker_netns_grpc_drop`]). Because
+/// the container is **never disconnected, paused, or otherwise touched**, it stays in the
+/// `running` state for the whole fault window — it keeps running on its own clock,
+/// network-unreachable ([`assert_node_live_during_isolation`] asserts this, and the freeze
+/// leg cannot exhibit it: `docker pause` reports `paused`, the gap ADR-0039 names) — AND
+/// its host-published-port mapping survives, so Phase 3 heals by flushing the rule and the
+/// scenario re-reaches the node at the SAME `127.0.0.1:<host-port>` endpoint it already
+/// holds (the fix for the iteration-1 `docker network disconnect`/`connect` heal failure,
+/// which tore down that mapping).
+///
+/// `#[ignore]`d for the same reason as the freeze leg: `cargo xtask ci`'s
+/// `cargo test --workspace` compiles and type-checks this body (the born-at-tier compile
+/// bar) without running it; the live execution happens only in the privileged
+/// `WYRD_TIER1=1` `tier1-jepsen` job via `cargo xtask jepsen`, which now runs BOTH legs
+/// in `xtask::faults::tier1_jepsen_isolation_legs` order (`xtask/src/faults.rs:179`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Tier-1: needs real containerized D servers — run via `cargo xtask jepsen`"]
+async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
+    // ---- Read cluster info from env (set by `cargo xtask jepsen`) ----
+
+    let raw_endpoints = match std::env::var("WYRD_DSERVER_ENDPOINTS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "tier1_jepsen_consistency (live partition): WYRD_DSERVER_ENDPOINTS unset — \
+                 skipping. Run `cargo xtask jepsen` to stand up the container D servers."
+            );
+            return;
+        }
+    };
+    let victim_container = match std::env::var("WYRD_TIER1_VICTIM_CONTAINER") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "tier1_jepsen_consistency (live partition): WYRD_TIER1_VICTIM_CONTAINER \
+                 unset — skipping. Run `cargo xtask jepsen` to supply the victim \
+                 container name."
+            );
+            return;
+        }
+    };
+    let partition_container = match std::env::var("WYRD_TIER1_PARTITION_CONTAINER") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "tier1_jepsen_consistency (live partition): WYRD_TIER1_PARTITION_CONTAINER \
+                 unset — skipping. Run `cargo xtask jepsen` to supply the isolated \
+                 container name."
+            );
+            return;
+        }
+    };
+    // The D-server image (`wyrd-dserver:test`) reused as an in-netns `iptables` sidecar
+    // for the partition. Unused by the freeze leg, so it is only required (not merely
+    // read) here.
+    let dserver_image = match std::env::var("WYRD_TIER1_DSERVER_IMAGE") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => {
+            eprintln!(
+                "tier1_jepsen_consistency (live partition): WYRD_TIER1_DSERVER_IMAGE \
+                 unset — skipping. Run `cargo xtask jepsen` to supply the D-server \
+                 image name (the iptables sidecar)."
+            );
+            return;
+        }
+    };
+
+    let endpoints: Vec<String> = raw_endpoints
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    assert_eq!(
+        endpoints.len(),
+        JC_DSERVER_COUNT,
+        "tier1_jepsen_consistency (live partition): need exactly {JC_DSERVER_COUNT} \
+         endpoints, got {} ({raw_endpoints:?})",
+        endpoints.len()
+    );
+
+    // ---- Connect to all 10 D servers ----
+
+    let mut clients: Vec<GrpcChunkStore> = Vec::with_capacity(JC_DSERVER_COUNT);
+    for endpoint in &endpoints {
+        clients.push(connect(endpoint).await);
+    }
+
+    // ---- Setup: identical to the freeze leg (write RS(6,3) fragments 0-8, spare 9 empty) ----
+
+    let data: Vec<u8> = (0u8..240).collect();
+    let all_shards = erasure::encode(K, M, &data).expect("erasure::encode RS(6,3)");
+    assert_eq!(all_shards.len(), N, "encoder must produce N={N} shards");
+
+    for (index, shard) in all_shards.iter().enumerate() {
+        let fragment_bytes = encode_ec_fragment(CHUNK, index as u16, K as u8, M as u8, shard);
+        let frag_id = FragmentId {
+            chunk: CHUNK,
+            index: index as u16,
+        };
+        clients[index]
+            .put_fragment(frag_id, fragment_bytes)
+            .await
+            .unwrap_or_else(|e| panic!("put_fragment index {index} to server {index}: {e}"));
+    }
+
+    let meta = CrashMeta::new();
+    let chunk_ref = ChunkRef {
+        id: CHUNK,
+        scheme: EcScheme::ReedSolomon {
+            k: K as u8,
+            m: M as u8,
+        },
+        len: data.len() as u64,
+        placement: (0..N as DServerId).collect(),
+    };
+    let inode_record = InodeRecord {
+        size: data.len() as u64,
+        chunk_map: vec![chunk_ref],
+        state: InodeState::Committed,
+        version: 1,
+    };
+    let create_outcome = metadata::create(&meta, 0, "test-file", INODE_ID, &inode_record)
+        .await
+        .expect("metadata::create inode");
+    assert_eq!(
+        create_outcome,
+        CommitOutcome::Committed,
+        "inode create must commit"
+    );
+
+    repair::enqueue_repair(&meta, CHUNK, "tier1-jepsen-live-partition-test")
+        .await
+        .expect("enqueue_repair");
+
+    // ---- Kill server 0: crash fault (unchanged from the freeze leg) ----
+
+    let kill_status = std::process::Command::new("docker")
+        .arg("kill")
+        .arg(&victim_container)
+        .status()
+        .expect("docker kill command");
+    assert!(
+        kill_status.success(),
+        "`docker kill {victim_container}` failed (exit {kill_status}); \
+         is the victim container name correct?"
+    );
+
+    let topology = healthy_topology(VICTIM_INDEX);
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = (0..JC_DSERVER_COUNT)
+        .filter(|&i| i != VICTIM_INDEX)
+        .map(|i| (i as DServerId, &clients[i] as &dyn ChunkStore))
+        .collect();
+
+    let coord = MemCoordination::new();
+    let custodian = Custodian::elect(&coord, "tier1-jepsen-live-partition-zone")
+        .await
+        .expect("Custodian::elect");
+    let mut zone = FencedZone::new();
+    zone.install(custodian.leadership());
+
+    // ====================================================================
+    // Phase 1: crash mid-repair (CrashMeta armed) — identical to the freeze leg.
+    // ====================================================================
+
+    meta.arm();
+    let phase1_outcome = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        None,
+        Some(&ReconstructionContext {
+            meta: &meta,
+            fleet: &fleet,
+            topology: &topology,
+        }),
+        None,
+        0,
+    )
+    .await
+    .expect("phase 1: reconcile_step (crash mid-repair)");
+
+    assert_eq!(
+        phase1_outcome,
+        Reconciled::Satisfied,
+        "phase 1 (crash mid-repair): reconcile_step must return Satisfied \
+         when the version-conditional commit is intercepted by CrashMeta"
+    );
+
+    let frag0_id = FragmentId {
+        chunk: CHUNK,
+        index: 0,
+    };
+    let orphan_bytes = clients[SPARE_INDEX]
+        .get_fragment(frag0_id)
+        .await
+        .expect("get_fragment fragment-0 from spare server after crash");
+
+    let inode_bytes_p1 = meta
+        .get(&metadata::inode_key(INODE_ID))
+        .await
+        .expect("meta.get inode after phase 1")
+        .expect("inode must exist after phase 1");
+    let inode_p1: InodeRecord =
+        metadata::decode(&inode_bytes_p1).expect("decode inode after phase 1");
+    assert_eq!(
+        inode_p1.version, 1,
+        "committed inode must still be at version 1 after crash (no commit landed)"
+    );
+    assert_eq!(
+        inode_p1.chunk_map[0].placement[VICTIM_INDEX], VICTIM_INDEX as DServerId,
+        "committed placement[{VICTIM_INDEX}] must still reference the dead server \
+         {VICTIM_INDEX} after crash — fully old, never a torn/hybrid chunk"
+    );
+    assert!(
+        !inode_p1.chunk_map[0]
+            .placement
+            .contains(&(SPARE_INDEX as DServerId)),
+        "spare server {SPARE_INDEX} must NOT appear in committed placement after crash; \
+         the orphan is collectable garbage, not recorded corruption"
+    );
+
+    let committed_has_victim = inode_p1.chunk_map[0]
+        .placement
+        .contains(&(VICTIM_INDEX as DServerId));
+    assert_commit_point_atomic(orphan_bytes.is_some(), committed_has_victim)
+        .expect("commit-point-atomic invariant violated after crash mid-repair");
+
+    // ====================================================================
+    // Phase 2: LIVE network partition mid-repair (server 1 isolated by an in-netns
+    // iptables DROP on its gRPC port — Jepsen's `:partition`, NOT `:pause`)
+    //
+    // Distinct from the freeze leg: server 1 is isolated by DROPping inbound gRPC packets
+    // from a sidecar sharing its network namespace, never by suspending the container. The
+    // node-liveness oracle proves the container stays `running` — its own clock keeps
+    // running (the registration-lease renewal loop, `crates/server/src/cli.rs:309`, and
+    // the request-timeout logic, `cli.rs:276`, both keep ticking) — for the whole fault
+    // window, unlike `docker pause`, which would report `paused`. Because the container is
+    // never disconnected, its published-port mapping is intact for Phase 3's heal.
+    // ====================================================================
+
+    meta.disarm();
+
+    let drop_status = docker_netns_grpc_drop(&dserver_image, &partition_container, "-A");
+    assert!(
+        drop_status.success(),
+        "injecting the in-netns iptables DROP on {partition_container} failed \
+         (exit {drop_status}); is the container name / image correct and NET_ADMIN allowed?"
+    );
+
+    // Node-liveness-during-isolation: the isolated node must stay `running`, never
+    // `paused` — the property that distinguishes this leg from the freeze leg
+    // (issue #399's falsifiable new property; ADR-0039 says the repair-path OUTCOME is
+    // unchanged over today's dumb D servers).
+    let isolated_state = docker_container_state(&partition_container);
+    assert_node_live_during_isolation(&isolated_state).unwrap_or_else(|e| {
+        panic!("phase 2 (live network partition): {e} (container={partition_container})")
+    });
+
+    let phase2_outcome = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        None,
+        Some(&ReconstructionContext {
+            meta: &meta,
+            fleet: &fleet,
+            topology: &topology,
+        }),
+        None,
+        0,
+    )
+    .await;
+
+    // Phase 2: a transient error from the network-partitioned server must abort the
+    // pass — no partial commit (ADR-0015).
+    assert!(
+        phase2_outcome.is_err(),
+        "phase 2 (live network partition mid-repair): reconcile_step must return Err \
+         (transient fault from the network-partitioned server {PARTITION_INDEX} must \
+         abort the pass — no partial commit); got: {phase2_outcome:?}"
+    );
+
+    let inode_bytes_p2 = meta
+        .get(&metadata::inode_key(INODE_ID))
+        .await
+        .expect("meta.get inode after phase 2")
+        .expect("inode must exist after phase 2");
+    let inode_p2: InodeRecord =
+        metadata::decode(&inode_bytes_p2).expect("decode inode after phase 2");
+    assert_eq!(
+        inode_p2.version, 1,
+        "phase 2: committed inode must still be at version 1 after partition abort; \
+         no partial commit must have landed"
+    );
+    assert!(
+        inode_p2.chunk_map[0]
+            .placement
+            .contains(&(VICTIM_INDEX as DServerId)),
+        "phase 2: victim server {VICTIM_INDEX} must still be in committed placement \
+         after partition abort — inode fully old"
+    );
+
+    // ====================================================================
+    // Phase 3: heal the network partition and converge exactly once.
+    //
+    // Flush the DROP rule (heals the partition). Because the container was never
+    // disconnected, its published-port mapping is intact — server 1 is reachable again at
+    // the SAME endpoint the scenario already holds. With CrashMeta disarmed and server 1
+    // reachable, reconcile_step succeeds: rebuilds fragment 0 from fragments 1-8 (K=6
+    // survivors), places it on spare server 9, and commits.
+    // ====================================================================
+
+    let heal_status = docker_netns_grpc_drop(&dserver_image, &partition_container, "-D");
+    assert!(
+        heal_status.success(),
+        "healing (removing) the in-netns iptables DROP on {partition_container} failed \
+         (exit {heal_status})"
+    );
+
+    let phase3_outcome = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        None,
+        Some(&ReconstructionContext {
+            meta: &meta,
+            fleet: &fleet,
+            topology: &topology,
+        }),
+        None,
+        0,
+    )
+    .await
+    .expect("phase 3: reconcile_step (after partition heal)");
+
+    assert_eq!(
+        phase3_outcome,
+        Reconciled::Changed,
+        "phase 3 (after partition heal): reconcile_step must return Changed \
+         (repair committed)"
+    );
+
+    let inode_bytes_p3 = meta
+        .get(&metadata::inode_key(INODE_ID))
+        .await
+        .expect("meta.get inode after phase 3")
+        .expect("inode must exist after phase 3");
+    let inode_p3: InodeRecord =
+        metadata::decode(&inode_bytes_p3).expect("decode inode after phase 3");
+
+    assert_exactly_once_convergence(1, inode_p3.version)
+        .expect("exactly-once convergence violated after phase 3");
+
+    let new_placement = &inode_p3.chunk_map[0].placement;
+
+    assert_redundancy_outcome(new_placement, VICTIM_INDEX as DServerId, N)
+        .expect("redundancy outcome violated after reconstruction");
+
+    assert_eq!(
+        new_placement[VICTIM_INDEX], SPARE_INDEX as DServerId,
+        "fragment {VICTIM_INDEX} must be re-placed on spare server {SPARE_INDEX} \
+         (the only domain distinct from all survivor domains B–I)"
+    );
+
+    assert_distinct_domains(new_placement, |server_id| {
+        DOMAINS.get(server_id as usize).copied()
+    })
+    .expect("distinct-domain invariant violated after reconstruction");
+
+    // ====================================================================
+    // Phase 4: exactly-once convergence check.
+    // ====================================================================
+
+    let phase4_outcome = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        None,
+        Some(&ReconstructionContext {
+            meta: &meta,
+            fleet: &fleet,
+            topology: &topology,
+        }),
+        None,
+        0,
+    )
+    .await
+    .expect("phase 4: reconcile_step (exactly-once check)");
+
+    assert_eq!(
+        phase4_outcome,
+        Reconciled::Satisfied,
+        "phase 4 (exactly-once check): a second reconcile_step must return Satisfied \
+         (repair queue empty after phase 3's commit drained it)"
+    );
+
+    let inode_bytes_p4 = meta
+        .get(&metadata::inode_key(INODE_ID))
+        .await
+        .expect("meta.get inode after phase 4")
+        .expect("inode must exist after phase 4");
+    let inode_p4: InodeRecord =
+        metadata::decode(&inode_bytes_p4).expect("decode inode after phase 4");
+    assert_eq!(
+        inode_p4.version, 2,
+        "phase 4: inode version must still be 2 after Satisfied pass — \
+         no duplicate commit must have landed"
+    );
+
+    // ====================================================================
+    // Phase 5: read-after-commit.
+    // ====================================================================
+
+    let committed_placement = &inode_p4.chunk_map[0].placement;
+    let mut readable_servers: Vec<DServerId> = Vec::new();
+
+    for (frag_index, &server_id) in committed_placement.iter().enumerate() {
+        let frag_id = FragmentId {
+            chunk: CHUNK,
+            index: frag_index as u16,
+        };
+        let maybe_bytes = clients[server_id as usize]
+            .get_fragment(frag_id)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("get_fragment index {frag_index} from server {server_id}: {e}")
+            });
+        if maybe_bytes
+            .as_deref()
+            .and_then(|b| repair::intact_shard(b, CHUNK))
+            .is_some()
+        {
+            readable_servers.push(server_id);
+        }
+    }
+
+    assert_read_after_commit(committed_placement, &readable_servers)
+        .expect("read-after-commit invariant violated after repair");
+
+    // ====================================================================
+    // Phase 6: data integrity.
+    // ====================================================================
+
+    let mut available: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut missing: Vec<(usize, DServerId)> = Vec::new();
+
+    for (frag_index, &server_id) in committed_placement.iter().enumerate() {
+        let frag_id = FragmentId {
+            chunk: CHUNK,
+            index: frag_index as u16,
+        };
+        let maybe_bytes = clients[server_id as usize]
+            .get_fragment(frag_id)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("get_fragment index {frag_index} from server {server_id}: {e}")
+            });
+        match maybe_bytes
+            .as_deref()
+            .and_then(|b| repair::intact_shard(b, CHUNK))
+        {
+            Some(shard) => available.push((frag_index, shard)),
+            None => missing.push((frag_index, server_id)),
+        }
+    }
+
     assert!(
         missing.is_empty(),
         "every fragment in the post-repair placement must be present and intact, \
