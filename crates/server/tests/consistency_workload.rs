@@ -398,6 +398,56 @@ fn session_read_your_writes_guards_indeterminate_on_every_arm() {
     );
 }
 
+// ─── (c) Session RYW is cross-process aware — an own delete/write is not a violation when
+//     another process legitimately recreated or removed the key in a merged history (INV-1) ──
+
+#[test]
+fn session_read_your_writes_is_cross_process_aware() {
+    // ACCEPT — cross-process RECREATE: P0 deletes k, then P1 PUTs k=1 (before P0's read), so P0
+    // observing k=1 is a valid read of a LATER write, not a resurrection. RED if the Absent
+    // obligation rejects without checking whether another process recreated the key.
+    let recreate = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Delete, "k", None, 204, 0, 10),
+        proc_op(1, OpKind::Put, "k", Some(1), 200, 15, 25),
+        proc_op(0, OpKind::Get, "k", Some(1), 200, 30, 40),
+    ]);
+    assert!(
+        recreate.session_read_your_writes(),
+        "a present read after our own delete is valid when another process recreated the key"
+    );
+
+    // ACCEPT — cross-process DELETE: P0 PUTs k=1, then P1 deletes k (before P0's read), so P0
+    // observing a 404 is a valid read of a LATER delete, not an own-write-lost.
+    let removed = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
+        proc_op(1, OpKind::Delete, "k", None, 204, 15, 25),
+        proc_op(0, OpKind::Get, "k", None, 404, 30, 40),
+    ]);
+    assert!(
+        removed.session_read_your_writes(),
+        "a 404 read after our own write is valid when another process deleted the key"
+    );
+
+    // REJECT sanity — SINGLE process (no other writer): the resurrection and own-write-lost
+    // rejections still fire, so the cross-process relaxation didn't defang the check.
+    let single_resurrect = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Delete, "k", None, 204, 0, 10),
+        proc_op(0, OpKind::Get, "k", Some(1), 200, 20, 30),
+    ]);
+    assert!(
+        !single_resurrect.session_read_your_writes(),
+        "with no other writer, a present read after our own delete is still a resurrection"
+    );
+    let single_lost = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
+        proc_op(0, OpKind::Get, "k", None, 404, 20, 30),
+    ]);
+    assert!(
+        !single_lost.session_read_your_writes(),
+        "with no other writer, a 404 read after our own write is still an own-write-lost"
+    );
+}
+
 // ─── (c) Session monotonic reads: guard indeterminate, reject determinate regression ───
 
 #[test]
@@ -453,6 +503,35 @@ fn reads_monotone_per_key_is_global_and_guards_indeterminate() {
     assert!(
         valid_indeterminate.reads_monotone_per_key(),
         "an indeterminate read must not be counted as a per-key monotonicity regression"
+    );
+}
+
+// ─── (c) Read monotonicity ignores OVERLAPPING reads (they have no real-time order) ────
+
+#[test]
+fn reads_monotone_ignores_overlapping_reads() {
+    // A long read observing v=2 spans [0,100]; a short read observing v=1 spans [10,20], fully
+    // inside it. The two OVERLAP, so they have no real-time order — the v=1 read can linearize
+    // before the write of v=2. A legal concurrent execution: ACCEPT. RED if the check compares
+    // reads in start-time order instead of requiring a strict real-time order.
+    let overlapping = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Get, "k", Some(2), 200, 0, 100),
+        proc_op(1, OpKind::Get, "k", Some(1), 200, 10, 20),
+    ]);
+    assert!(
+        overlapping.reads_monotone_per_key(),
+        "overlapping reads have no real-time order — a lower version inside a longer read is legal"
+    );
+
+    // Sanity — the same versions but NON-overlapping (the v=2 read ends before the v=1 read
+    // begins) is a genuine real-time-ordered regression and must still be REJECTED.
+    let ordered_regression = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Get, "k", Some(2), 200, 0, 10),
+        proc_op(1, OpKind::Get, "k", Some(1), 200, 20, 30),
+    ]);
+    assert!(
+        !ordered_regression.reads_monotone_per_key(),
+        "a strictly-earlier read that saw a newer version than a later read is a real regression"
     );
 }
 

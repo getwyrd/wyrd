@@ -231,7 +231,18 @@ impl MultiProcessHistory {
                         match op.record.version {
                             // A determinate present read of version `v`.
                             Some(v) => match obl {
-                                Obligation::Absent => return false, // resurrected after own delete
+                                // Resurrected after our own delete — but only a violation if no
+                                // OTHER process could have recreated the key (in a merged history a
+                                // concurrent PUT by another process legitimately explains it).
+                                Obligation::Absent
+                                    if !self.key_recreated_by_other(
+                                        key,
+                                        op.process,
+                                        op.record.end,
+                                    ) =>
+                                {
+                                    return false;
+                                }
                                 Obligation::AtLeast(w) if v < w => return false, // read older than own write
                                 _ => {}
                             },
@@ -240,7 +251,13 @@ impl MultiProcessHistory {
                             // read (403/409/412/416/…) observed nothing about the register, so it
                             // must NOT be counted an own-write-lost (INV-1: no fabricated absence).
                             None => {
-                                if status == 404 && matches!(obl, Obligation::AtLeast(_)) {
+                                // A 404 after our own write is own-write-lost — unless another
+                                // process could have deleted the key first (which legitimately
+                                // explains the absence).
+                                if status == 404
+                                    && matches!(obl, Obligation::AtLeast(_))
+                                    && !self.key_deleted_by_other(key, op.process, op.record.end)
+                                {
                                     return false; // own write lost: read absent (404) after writing
                                 }
                             }
@@ -347,6 +364,36 @@ impl MultiProcessHistory {
         }
         by
     }
+
+    /// Could a process OTHER than `reader` have (re)created `key` in a way this read (completing
+    /// at `read_end`) could observe? A cross-process successful PUT whose span starts before the
+    /// read completes can linearize before it, so a present read after the reader's OWN delete is
+    /// not provably a resurrection — another process may legitimately have recreated the key
+    /// (INV-1: never fabricate a violation). Conservative: it does not require the write to fall
+    /// strictly after the delete, so it errs toward accept.
+    fn key_recreated_by_other(&self, key: &str, reader: usize, read_end: SystemTime) -> bool {
+        self.ops.iter().any(|o| {
+            o.process != reader
+                && o.record.kind == OpKind::Put
+                && is_success(o.record.status)
+                && o.record.key.as_str() == key
+                && o.record.start < read_end
+        })
+    }
+
+    /// The delete mirror of [`key_recreated_by_other`](Self::key_recreated_by_other): could a
+    /// process OTHER than `reader` have removed `key` before this read completed? If so, a 404
+    /// read after the reader's own PUT is not provably an own-write-lost — another process may
+    /// have deleted the key.
+    fn key_deleted_by_other(&self, key: &str, reader: usize, read_end: SystemTime) -> bool {
+        self.ops.iter().any(|o| {
+            o.process != reader
+                && o.record.kind == OpKind::Delete
+                && (is_success(o.record.status) || o.record.status == 404)
+                && o.record.key.as_str() == key
+                && o.record.start < read_end
+        })
+    }
 }
 
 /// The standing per-key obligation a session's determinate ops establish.
@@ -380,32 +427,36 @@ fn spans_overlap(a: &OpRecord, b: &OpRecord) -> bool {
     a.start <= b.end && b.start <= a.end
 }
 
+/// `a` strictly precedes `b` in real time — its span ends before `b`'s begins, so the two are
+/// genuinely ordered. Overlapping (or endpoint-touching) spans are NOT ordered: either can
+/// linearize first.
+fn strictly_before(a: &OpRecord, b: &OpRecord) -> bool {
+    a.end < b.start
+}
+
 fn is_success(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
-/// Determinate-read monotonicity per key over an op sequence in real-time order (INV-1): an
-/// indeterminate GET is skipped on its **status**, an absent (404) read establishes no version,
-/// and a determinate present read that observes an older version than one already seen on the
-/// same key is a regression.
+/// Determinate-read monotonicity per key (INV-1): an indeterminate GET and an absent (404) read
+/// establish no version to compare. A present read regresses only against another present read on
+/// the same key that **strictly precedes it in real time** yet observed a newer version — two
+/// *overlapping* reads have no real-time order (either can linearize first), so they never force a
+/// monotonic comparison, and a valid concurrent execution is not rejected.
 fn reads_are_monotone<'a>(ops: impl Iterator<Item = &'a ProcOp>) -> bool {
-    let mut last: HashMap<&str, u64> = HashMap::new();
-    for op in ops {
-        if op.record.kind != OpKind::Get {
-            continue;
-        }
-        if is_indeterminate(op.record.status) {
-            // INV-1: an indeterminate read is not a monotonicity violation.
-            continue;
-        }
-        let Some(v) = op.record.version else {
-            // A determinate absent (404) read establishes no version to compare.
-            continue;
-        };
-        match last.get(op.record.key.as_str()) {
-            Some(&prev) if v < prev => return false,
-            _ => {
-                last.insert(op.record.key.as_str(), v);
+    let reads: Vec<&ProcOp> = ops
+        .filter(|op| {
+            op.record.kind == OpKind::Get
+                && !is_indeterminate(op.record.status)
+                && op.record.version.is_some()
+        })
+        .collect();
+    for b in &reads {
+        let bv = b.record.version.expect("filtered to Some");
+        for a in &reads {
+            let av = a.record.version.expect("filtered to Some");
+            if a.record.key == b.record.key && av > bv && strictly_before(&a.record, &b.record) {
+                return false; // an earlier, real-time-ordered read saw a newer version
             }
         }
     }
