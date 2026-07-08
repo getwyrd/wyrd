@@ -125,15 +125,16 @@ fn register_serializer_emits_byte_exact_elle_edn_with_info_for_indeterminate() {
 
     // The exact bytes (an EDN operation-history vector, one map per line). Written as a literal,
     // NOT recomputed with the serializer's own join, so a delimiter/field/order change is caught.
+    // Every register entry carries its `:key` so the checker can partition per register.
     let expected = concat!(
-        "[{:process 0, :type :invoke, :f :write, :value 1, :time 0}\n",
-        " {:process 1, :type :invoke, :f :read, :value nil, :time 5}\n",
-        " {:process 0, :type :ok, :f :write, :value 1, :time 10}\n",
-        " {:process 1, :type :ok, :f :read, :value 1, :time 15}\n",
-        " {:process 0, :type :invoke, :f :write, :value 2, :time 30}\n",
-        " {:process 0, :type :info, :f :write, :value 2, :time 40}\n",
-        " {:process 1, :type :invoke, :f :read, :value nil, :time 50}\n",
-        " {:process 1, :type :ok, :f :read, :value nil, :time 60}]",
+        "[{:process 0, :type :invoke, :f :write, :key \"k\", :value 1, :time 0}\n",
+        " {:process 1, :type :invoke, :f :read, :key \"k\", :value nil, :time 5}\n",
+        " {:process 0, :type :ok, :f :write, :key \"k\", :value 1, :time 10}\n",
+        " {:process 1, :type :ok, :f :read, :key \"k\", :value 1, :time 15}\n",
+        " {:process 0, :type :invoke, :f :write, :key \"k\", :value 2, :time 30}\n",
+        " {:process 0, :type :info, :f :write, :key \"k\", :value 2, :time 40}\n",
+        " {:process 1, :type :invoke, :f :read, :key \"k\", :value nil, :time 50}\n",
+        " {:process 1, :type :ok, :f :read, :key \"k\", :value nil, :time 60}]",
     );
 
     assert_eq!(
@@ -147,8 +148,35 @@ fn register_serializer_emits_byte_exact_elle_edn_with_info_for_indeterminate() {
     assert!(
         history
             .to_elle_edn()
-            .contains(":type :info, :f :write, :value 2"),
+            .contains(":type :info, :f :write, :key \"k\", :value 2"),
         "an indeterminate write must carry :info, not a fabricated definite outcome"
+    );
+}
+
+// ─── (a) Register serializer keeps distinct keys distinct (no single-register collapse) ─
+
+#[test]
+fn register_serializer_tags_each_op_with_its_key() {
+    // A write of key `a` then a read of key `b`. With the key dropped these collapse into one
+    // register, and `PUT a=1 ; GET b=absent` looks like a lost read-your-write on a single
+    // register — a false verdict (or, the other way, a real per-key bug is masked). Each op must
+    // carry its own `:key`, so distinct keys stay distinct in the serialized history.
+    let history = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Put, "a", Some(1), 200, 0, 10),
+        proc_op(1, OpKind::Get, "b", None, 404, 5, 15),
+    ]);
+    let edn = history.to_elle_edn();
+    assert!(
+        edn.contains(":f :write, :key \"a\", :value 1"),
+        "the write of key `a` must be tagged :key \"a\"; got:\n{edn}"
+    );
+    assert!(
+        edn.contains(":f :read, :key \"b\", :value nil"),
+        "the read of key `b` must be tagged :key \"b\"; got:\n{edn}"
+    );
+    assert!(
+        edn.contains(":key \"a\"") && edn.contains(":key \"b\""),
+        "distinct keys must remain distinct — the history must not collapse into one register"
     );
 }
 
@@ -192,6 +220,32 @@ fn directory_serializer_maps_indeterminate_probe_to_info_not_fabricated_absence(
     );
 }
 
+// ─── (d) Directory serializer escapes EDN-significant characters in member names ────────
+
+#[test]
+fn directory_serializer_escapes_special_characters_in_member_names() {
+    // Object names can contain EDN-significant characters — a quote, a backslash, a newline. The
+    // serializer must emit them as a valid escaped EDN string, never raw: a raw quote would close
+    // the string early (invalid checker input) and a raw backslash would change the parsed member.
+    let member = "a\"b\\c\nd";
+    let history = DirectoryHistory::from_records(vec![
+        dir_rec(DirOpKind::Create, member, 200, 0, 10),
+        dir_rec(DirOpKind::Probe, member, 200, 20, 30),
+    ]);
+    let edn = history.to_elle_edn();
+
+    // Escaped form present: " → \" , \ → \\ , newline → \n.
+    assert!(
+        edn.contains("\"a\\\"b\\\\c\\nd\""),
+        "the member must be emitted as a properly escaped EDN string; got:\n{edn}"
+    );
+    // The raw, unescaped member (with a bare quote and a real newline) must never leak through.
+    assert!(
+        !edn.contains(member),
+        "the raw unescaped member must never appear in the serialized EDN"
+    );
+}
+
 // ─── (d) Membership derivation: 200→present, 404→absent, else→unknown (INV-1 v) ────────
 
 #[test]
@@ -214,8 +268,7 @@ fn membership_derivation_never_coerces_unknown_to_absent() {
 #[test]
 fn session_read_your_writes_guards_indeterminate_on_every_arm() {
     // PUT arm (INV-1 ii-a): with NO prior obligation, an indeterminate write must not ESTABLISH a
-    // definite AtLeast from nothing — so reading v=1 afterward is valid. (Pins the "establish"
-    // direction only; the "clear a standing bound" direction is pinned by put_arm_clears below.)
+    // definite AtLeast from nothing — so reading v=1 afterward is valid.
     let put_arm = MultiProcessHistory::from_ops(vec![
         proc_op(0, OpKind::Put, "k", Some(2), 500, 0, 10),
         proc_op(0, OpKind::Get, "k", Some(1), 200, 20, 30),
@@ -225,20 +278,33 @@ fn session_read_your_writes_guards_indeterminate_on_every_arm() {
         "an indeterminate PUT must not create a definite AtLeast obligation from nothing"
     );
 
-    // PUT arm (INV-1 ii-b): an indeterminate write must CLEAR a STANDING AtLeast to Unknown — after
-    // a determinate v=5 (AtLeast(5)) an indeterminate v=2 write means the committed version is no
-    // longer known, so a later v=1 read is not provably a violation. This is the discriminating red
-    // the bare put_arm above misses: drop the `is_indeterminate → Unknown` clear and AtLeast(5)
-    // stands, so v=1 < 5 flips this to REJECT. (A determinate-failed 500 also fails is_success, so
-    // "does nothing" is NOT a safe substitute for the explicit clear.)
-    let put_arm_clears = MultiProcessHistory::from_ops(vec![
+    // PUT arm (INV-1 ii-b): an indeterminate write must NOT ERASE a standing committed AtLeast.
+    // After a determinate v=5 (AtLeast(5)) an indeterminate v=6 write, reading v=1 is a real
+    // read-your-writes violation whether or not the uncertain write took effect — the register
+    // only climbs, so the committed floor of 5 still holds. REJECT. (Regression guard for the
+    // erase-to-Unknown bug: storing Unknown here would wrongly accept the v=1 read.)
+    let put_arm_keeps_standing_atleast = MultiProcessHistory::from_ops(vec![
         proc_op(0, OpKind::Put, "k", Some(5), 200, 0, 10),
-        proc_op(0, OpKind::Put, "k", Some(2), 500, 20, 30),
+        proc_op(0, OpKind::Put, "k", Some(6), 500, 20, 30),
         proc_op(0, OpKind::Get, "k", Some(1), 200, 40, 50),
     ]);
     assert!(
-        put_arm_clears.session_read_your_writes(),
-        "an indeterminate PUT must clear a standing AtLeast(5), so a later v=1 read is not a violation"
+        !put_arm_keeps_standing_atleast.session_read_your_writes(),
+        "an indeterminate PUT must not erase a standing committed AtLeast(5); reading v=1 is a violation"
+    );
+
+    // PUT arm (INV-1 ii-c): an indeterminate write MAY relax a standing Absent — after a determinate
+    // delete (Absent), an indeterminate write may have (re)created the key, so a later present read
+    // is not provably a resurrection. ACCEPT. (Guards against over-correcting the fix into a pure
+    // no-op that would keep Absent and wrongly reject the v=2 read.)
+    let put_arm_relaxes_absent = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Delete, "k", None, 204, 0, 10),
+        proc_op(0, OpKind::Put, "k", Some(2), 500, 20, 30),
+        proc_op(0, OpKind::Get, "k", Some(2), 200, 40, 50),
+    ]);
+    assert!(
+        put_arm_relaxes_absent.session_read_your_writes(),
+        "an indeterminate PUT after a delete may have created the key — a later present read is valid"
     );
 
     // DELETE arm (INV-1 ii-a): the indeterminate delete must not ESTABLISH Absent — with a standing
@@ -254,19 +320,31 @@ fn session_read_your_writes_guards_indeterminate_on_every_arm() {
         "an indeterminate DELETE must not create a definite Absent obligation"
     );
 
-    // DELETE arm (INV-1 ii-b): an indeterminate delete must CLEAR a standing AtLeast to Unknown —
-    // after a determinate PUT v=1 (AtLeast(1)) an indeterminate delete means the key MIGHT now be
-    // absent, so a later determinate 404 read is not provably an own-write-lost. Discriminating red:
-    // drop the `is_indeterminate → Unknown` clear and AtLeast(1) stands, so the 404 read trips the
-    // own-write-lost branch and flips this to REJECT.
-    let delete_arm_clears = MultiProcessHistory::from_ops(vec![
+    // DELETE arm (INV-1 ii-b): an indeterminate delete MAY relax a standing AtLeast to Unknown —
+    // after a determinate PUT v=1 (AtLeast(1)) an indeterminate delete may have removed the key, so
+    // a later determinate 404 read is not provably an own-write-lost. ACCEPT.
+    let delete_arm_relaxes_atleast = MultiProcessHistory::from_ops(vec![
         proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
         proc_op(0, OpKind::Delete, "k", None, 500, 20, 30),
         proc_op(0, OpKind::Get, "k", None, 404, 40, 50),
     ]);
     assert!(
-        delete_arm_clears.session_read_your_writes(),
-        "an indeterminate DELETE must clear a standing AtLeast(1), so a later 404 read is not own-write-lost"
+        delete_arm_relaxes_atleast.session_read_your_writes(),
+        "an indeterminate DELETE may have removed the key, so a later 404 read is not own-write-lost"
+    );
+
+    // DELETE arm (INV-1 ii-c): an indeterminate delete must NOT erase a standing Absent — a delete
+    // can't resurrect a key, so after a determinate delete (Absent) an indeterminate delete leaves
+    // the key absent, and a later determinate present read IS a resurrection. REJECT. (Regression
+    // guard: storing Unknown here would wrongly accept the v=1 read.)
+    let delete_arm_keeps_standing_absent = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Delete, "k", None, 204, 0, 10),
+        proc_op(0, OpKind::Delete, "k", None, 500, 20, 30),
+        proc_op(0, OpKind::Get, "k", Some(1), 200, 40, 50),
+    ]);
+    assert!(
+        !delete_arm_keeps_standing_absent.session_read_your_writes(),
+        "an indeterminate DELETE must not erase a standing Absent; a later present read is a resurrection"
     );
 
     // Read arm (INV-1 iii): an indeterminate GET is no observation — even one crafted to carry a

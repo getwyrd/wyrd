@@ -194,7 +194,14 @@ impl MultiProcessHistory {
                     OpKind::Put => {
                         if is_indeterminate(status) {
                             // INV-1: an indeterminate write establishes no definite lower bound.
-                            obligation.insert(key, Obligation::Unknown);
+                            // It must NOT erase a standing committed AtLeast — the register version
+                            // only climbs, so a floor from an earlier *determinate* write still
+                            // holds whether or not this uncertain write took effect (a later read
+                            // below it is a real read-your-writes violation). It MAY relax a
+                            // standing Absent, since the write may have (re)created the key.
+                            if matches!(obligation.get(key), Some(Obligation::Absent)) {
+                                obligation.insert(key, Obligation::Unknown);
+                            }
                         } else if is_success(status) {
                             obligation
                                 .insert(key, Obligation::AtLeast(op.record.version.unwrap_or(0)));
@@ -203,8 +210,13 @@ impl MultiProcessHistory {
                     }
                     OpKind::Delete => {
                         if is_indeterminate(status) {
-                            // INV-1: an indeterminate delete establishes no definite absence.
-                            obligation.insert(key, Obligation::Unknown);
+                            // INV-1: an indeterminate delete establishes no definite absence. It
+                            // must NOT erase a standing Absent (a delete can't resurrect a key). It
+                            // MAY relax a standing AtLeast, since the delete may have removed the
+                            // committed value, so a later absent/older read is not provably a loss.
+                            if !matches!(obligation.get(key), Some(Obligation::Absent)) {
+                                obligation.insert(key, Obligation::Unknown);
+                            }
                         } else if is_success(status) || status == 404 {
                             obligation.insert(key, Obligation::Absent);
                         }
@@ -292,6 +304,10 @@ impl MultiProcessHistory {
         let mut entries: Vec<Entry> = Vec::with_capacity(self.ops.len() * 2);
         for op in &self.ops {
             let f = register_f(op.record.kind);
+            // Carry the register key on every entry — the checker partitions the history per key,
+            // so dropping it would collapse distinct keys into one register (INV-2 for the checker
+            // input). Object names can hold EDN-significant characters, so escape the key.
+            let key = edn_string(&op.record.key);
             entries.push(Entry {
                 time: rel_nanos(base, op.record.start),
                 process: op.process,
@@ -300,6 +316,7 @@ impl MultiProcessHistory {
                     op.process,
                     "invoke",
                     f,
+                    Some(&key),
                     &register_invoke_value(op.record.kind, op.record.version),
                     rel_nanos(base, op.record.start),
                 ),
@@ -312,6 +329,7 @@ impl MultiProcessHistory {
                     op.process,
                     register_completion_type(op.record.kind, op.record.status).keyword(),
                     f,
+                    Some(&key),
                     &register_completion_value(op.record.kind, op.record.version),
                     rel_nanos(base, op.record.end),
                 ),
@@ -444,8 +462,27 @@ fn render_history(mut entries: Vec<Entry>) -> String {
 }
 
 /// Render one operation-history map: `{:process P, :type :T, :f :F, :value V, :time N}`.
-fn render_entry(process: usize, type_kw: &str, f: &str, value: &str, time: u128) -> String {
-    format!("{{:process {process}, :type :{type_kw}, :f :{f}, :value {value}, :time {time}}}")
+/// Render one operation-history entry. `key`, when present, is the register key this op targeted
+/// (already an escaped EDN string) — it MUST be carried so a multi-key history is not collapsed
+/// into a single register (a read of key `b` after a write of key `a` would otherwise look like
+/// same-key traffic and produce a false verdict). The directory serializer carries its member in
+/// `:value`, so it passes `None`.
+fn render_entry(
+    process: usize,
+    type_kw: &str,
+    f: &str,
+    key: Option<&str>,
+    value: &str,
+    time: u128,
+) -> String {
+    match key {
+        Some(k) => format!(
+            "{{:process {process}, :type :{type_kw}, :f :{f}, :key {k}, :value {value}, :time {time}}}"
+        ),
+        None => {
+            format!("{{:process {process}, :type :{type_kw}, :f :{f}, :value {value}, :time {time}}}")
+        }
+    }
 }
 
 /// Nanoseconds of `t` relative to `base` (the history's earliest start).
@@ -459,6 +496,27 @@ fn edn_version(version: Option<u64>) -> String {
         Some(v) => v.to_string(),
         None => "nil".to_string(),
     }
+}
+
+/// A string as a quoted, escaped EDN string literal. Directory members are object names, which
+/// can contain `"`, `\`, or control characters; rendered raw into EDN they would produce invalid
+/// or corrupted checker input, so escape them the way EDN/Clojure readers expect.
+fn edn_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn register_f(kind: OpKind) -> &'static str {
@@ -600,6 +658,7 @@ impl DirectoryHistory {
                     op.process,
                     "invoke",
                     f,
+                    None, // the set model carries its member in :value, not a separate :key
                     &dir_invoke_value(op.op, &op.member),
                     rel_nanos(base, op.start),
                 ),
@@ -612,6 +671,7 @@ impl DirectoryHistory {
                     op.process,
                     dir_completion_type(op.op, op.status).keyword(),
                     f,
+                    None, // see above
                     &dir_completion_value(op.op, &op.member, op.status),
                     rel_nanos(base, op.end),
                 ),
@@ -658,8 +718,8 @@ fn dir_f(op: DirOpKind) -> &'static str {
 /// carries `[member nil]` (the membership result is unknown at invoke time).
 fn dir_invoke_value(op: DirOpKind, member: &str) -> String {
     match op {
-        DirOpKind::Create | DirOpKind::Delete => format!("\"{member}\""),
-        DirOpKind::Probe => format!("[\"{member}\" nil]"),
+        DirOpKind::Create | DirOpKind::Delete => edn_string(member),
+        DirOpKind::Probe => format!("[{} nil]", edn_string(member)),
     }
 }
 
@@ -668,14 +728,14 @@ fn dir_invoke_value(op: DirOpKind, member: &str) -> String {
 /// an indeterminate probe is `[member nil]`, never `[member false]` (INV-1).
 fn dir_completion_value(op: DirOpKind, member: &str, status: u16) -> String {
     match op {
-        DirOpKind::Create | DirOpKind::Delete => format!("\"{member}\""),
+        DirOpKind::Create | DirOpKind::Delete => edn_string(member),
         DirOpKind::Probe => {
             let present = match membership(status) {
                 Membership::Present => "true",
                 Membership::Absent => "false",
                 Membership::Unknown => "nil",
             };
-            format!("[\"{member}\" {present}]")
+            format!("[{} {present}]", edn_string(member))
         }
     }
 }
