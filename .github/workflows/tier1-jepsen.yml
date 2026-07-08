@@ -28,6 +28,17 @@ name: tier1-jepsen
 #
 # Opted in via `WYRD_TIER1=1`, which instructs `cargo xtask jepsen` to stand up the
 # real container cluster and drive the `#[ignore]`d scenario body.
+#
+# Issue #399 (ADR-0039's named additive upgrade): `cargo xtask jepsen` now runs BOTH
+# isolation-nemesis legs in sequence, each against its own freshly-stood-up cluster
+# (`xtask/src/faults.rs`'s `tier1_jepsen_isolation_legs`):
+#   1. the existing process-freeze (`:pause`, `docker pause`/`unpause`) leg — cheaper,
+#      kept as-is (#250);
+#   2. the new network-partition (`:partition`) leg — isolates the node with an in-netns
+#      `iptables` DROP on its gRPC port (injected by a `--net container:<isolated>`
+#      sidecar), so it stays LIVE (`running` on its own clock, network-unreachable) AND
+#      keeps its published-port mapping across the heal; asserts the same ADR-0015
+#      properties PLUS node liveness during isolation.
 
 on:
   schedule:
@@ -46,9 +57,10 @@ concurrency:
 jobs:
   jepsen:
     runs-on: ubuntu-latest
-    # Cold image build + 10-server cluster + six-phase consistency scenario fit under this.
-    # Matches tier2-kill-reconstruct.yml's bound.
-    timeout-minutes: 45
+    # Two full leg runs now (issue #399: process-freeze THEN network-partition), each a
+    # cold image build + 10-server cluster + six-phase consistency scenario — roughly
+    # double the single-leg bound tier2-kill-reconstruct.yml uses.
+    timeout-minutes: 80
     env:
       CI: "true"
       # Opt in to the Tier-1 Jepsen consistency scenario.
