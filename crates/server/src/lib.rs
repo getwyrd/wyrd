@@ -15,6 +15,7 @@
 
 pub mod cli;
 pub mod consistency_observable;
+pub mod consistency_workload;
 pub mod custodian;
 pub mod dserver;
 
