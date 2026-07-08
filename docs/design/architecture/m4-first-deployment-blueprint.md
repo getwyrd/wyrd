@@ -56,7 +56,7 @@ Hetzner; the *roles* do not.
 | **PD** | TiKV's *own* placement driver / coordinator (embeds an internal etcd). Distinct from the L5 coordination etcd below. | **High** — 3 nodes for quorum; lose 2 and metadata stalls. |
 | **etcd (L5 coordination)** | The `Coordination` seam ([ADR-0006](../adr/0006-etcd-for-coordination.md)): service discovery, leader election, distributed locks (with fencing), and **D-server registration + leases**. A **separate 3-node ensemble** from TiKV's PD; every role dials it as `--coordination <L5-endpoint>`. | **High** — 3 nodes for quorum; lose 2 and discovery/registration/leader-election stall. Small but control-critical. |
 | **CA (step-ca)** | The internal PKI that issues short-lived mTLS certs for the fabric ([ADR-0036](../adr/0036-internal-ca-step-ca-spire.md)); the certificate is each component's identity ([ADR-0025](../adr/0025-internal-service-to-service-trust.md)). step-ca now, SPIRE reserved for fleet scale; the dev profile uses a built-in self-signed CA behind the same seam. | **High** — fail-closed mTLS (ADR-0025) makes an unreachable CA halt *every* new dial and cert rotation; run it **HA, off the D-server hosts**. |
-| **Gateway** | Stateless S3 front door; embeds the client library (chunk, EC, commit). | **Low** — no durable state, restartable. *Single active gateway for M4*; active/active scale-out is gated on cluster-coordinated id allocation (#477). |
+| **Gateway** | Stateless S3 front door; embeds the client library (chunk, EC, commit). | **Low** — no durable state, restartable. Safe for **active/active** (#477): inodes from the shared `meta:next_inode` CAS allocator, chunk ids coordination-free (random epoch, ADR-0019). |
 | **Custodian** | One active (leader-elected *via etcd*); runs GC/scrub/reconstruct/rebalance; emits durability telemetry. | **Low** — stateless logic; a restart re-elects. |
 
 The asymmetry to internalize: **D servers carry the durability**, **TiKV+PD carry
@@ -191,19 +191,20 @@ Helsinki — pick one for M4; multi-location is M9). Within it:
   the LB if you want S3-front-door failover). The gateway holds **no durable object
   state** — object metadata lives in TiKV, chunks fan out to the D servers over gRPC,
   and coordination is in etcd (the gateway composes over the cluster backends, #454) —
-  so a restarted or replaced gateway migrates nothing: on startup `recover()` re-seeds
-  its id allocator from the persisted high-water marks.
-  **M4 caveat — run exactly one *active* gateway.** The gateway currently mints inode
-  and chunk ids from a **per-process counter** (seeded once by `recover()`), **not** the
-  CAS-backed `meta:next_inode` allocator the CLI path uses. Two *active* gateways would
-  seed from the same high-water mark and mint colliding ids, overwriting each other's
-  fragments (data loss). So for M4 the front-door LB sits in front of a **single active
-  gateway** (TLS/DNS termination and standby failover — not active/active fan-out). The
-  **one-shared-front-door / no-affinity / plain-round-robin** property is the intended
-  design, but it is **gated on cluster-coordinated id allocation (#477)** — until that
-  lands, do not put N active gateways behind a round-robin LB. Wyrd still ships **no**
-  load balancer of its own: the S3 front door is a standard cloud LB (Hetzner LB / k8s
-  Service / nginx / HAProxy), an operator concern, not a Wyrd component.
+  so a restarted or replaced gateway migrates nothing: on startup `recover()` re-seeds the
+  shared `meta:next_inode` allocator floor above the persisted high-water mark, and chunk
+  ids need no recovery (a fresh random epoch per process).
+  **Active/active is safe (#477).** The gateway allocates inodes from the shared
+  `meta:next_inode` **CAS** allocator (`cli::alloc_inode`, the same cluster path the CLI
+  uses) and mints chunk ids **coordination-free** — a per-process random 63-bit epoch as the
+  high bits plus a monotonic sequence as the low bits (ADR-0019) — so two *active* gateways
+  never mint a colliding inode, and collide on a chunk id only if they draw the same epoch
+  (~2⁻⁶³ per gateway pair). The **one-shared-front-door / no-affinity / plain-round-robin**
+  property (#454) therefore holds: N active gateways behind a round-robin LB is supported.
+  (A deterministic upgrade that drops even the ~2⁻⁶³ chunk residual — CAS block-reservation
+  for chunk ids — is tracked as #478.) Wyrd still ships **no** load balancer of its own: the
+  S3 front door is a standard cloud LB (Hetzner LB / k8s Service / nginx / HAProxy), an
+  operator concern, not a Wyrd component.
 - **Custodian — co-locate with a gateway or a small dedicated server**; stateless,
   leader-elected.
 - **Network**: Hetzner's **private network (vSwitch)** for the client→D-server,
