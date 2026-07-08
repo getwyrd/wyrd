@@ -1059,6 +1059,36 @@ pub async fn alloc_inode<M: MetadataStore>(meta: &M) -> Result<u64, BoxError> {
     .into())
 }
 
+/// Raise the persisted `meta:next_inode` allocator so the next [`alloc_inode`] returns an id
+/// **≥ `floor`**. This is the seed a gateway runs at startup ([`crate::Gateway::recover`]) so a
+/// restart over a non-empty store — or an in-place upgrade from a store an older single-process
+/// gateway wrote with no counter — resumes allocating strictly above every inode already
+/// committed (issue #364 durability finding 1). Idempotent and monotone: it only ever *raises*
+/// the counter, and a concurrent allocator already past `floor` leaves it untouched. Generic
+/// over `M` so the redb and TiKV backends share it, exactly as [`alloc_inode`] does.
+pub async fn seed_next_inode_floor<M: MetadataStore>(meta: &M, floor: u64) -> Result<(), BoxError> {
+    loop {
+        let current = meta.get(NEXT_INODE_KEY).await?;
+        // An absent counter means "the next id is 1" — `alloc_inode`'s own default.
+        let have: u64 = match &current {
+            Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
+            None => 1,
+        };
+        if have >= floor {
+            return Ok(());
+        }
+        let guard = match &current {
+            Some(bytes) => WriteBatch::new().require(NEXT_INODE_KEY.to_vec(), bytes.clone()),
+            None => WriteBatch::new().require_absent(NEXT_INODE_KEY.to_vec()),
+        };
+        let batch = guard.put(NEXT_INODE_KEY.to_vec(), floor.to_string().into_bytes());
+        if meta.commit(batch).await? == CommitOutcome::Committed {
+            return Ok(());
+        }
+        // Lost the race with a concurrent allocator/seed — re-read and re-check the floor.
+    }
+}
+
 /// Mint chunk ids `inode_id << 64 | seq` — unique across objects and stable
 /// across processes.
 fn chunk_id_minter(inode_id: u64) -> impl FnMut() -> ChunkId {
@@ -1392,8 +1422,8 @@ where
     }
 }
 
-/// Recover the gateway's id allocators from persisted state (#364 durability finding 1)
-/// and serve the S3 HTTP wire surface over `listener` until it stops. Generic over the
+/// Seed the gateway's shared, persisted inode allocator from persisted state (#364 durability
+/// finding 1) and serve the S3 HTTP wire surface over `listener` until it stops. Generic over the
 /// three backend seams (`M` metadata × `C` chunk plane × `Co` coordination) so every
 /// composition `cmd_s3` selects — the redb+mem+FS single-node front door, the
 /// redb+mem+gRPC-fanout cluster front door, and the tikv+etcd production composition —
@@ -1409,9 +1439,11 @@ where
     C: PlacementChunkStore + Send + Sync + 'static,
     Co: wyrd_traits::Coordination + Send + Sync + 'static,
 {
-    // Resume the in-process id allocators above everything already persisted under the
-    // data dir, so a RESTART over an existing store never reuses a committed inode or
-    // chunk id and corrupts an existing object (issue #364 durability finding 1).
+    // Seed the shared, persisted `meta:next_inode` allocator above every inode already under
+    // the data dir, so a RESTART over an existing store (or an in-place upgrade from a store an
+    // older single-process gateway wrote with no counter) never reuses a committed inode id and
+    // corrupts an existing object (issue #364 durability finding 1). Chunk ids are
+    // coordination-free (a fresh random epoch, ADR-0019) and need no recovery.
     gateway.recover().await?;
     let mut config = s3::S3Config::new(credentials);
     config.region = region;

@@ -522,19 +522,20 @@ async fn get_declares_accurate_content_length_for_truncation_detection() {
     );
 }
 
-/// Durability finding 1 (carry-forward): the in-process id allocators must **recover** from
-/// persisted state on a restart, or a new-key PUT after a restart reuses a committed inode
-/// id (a spurious conflict) and an overwrite reuses a committed chunk id (clobbering the
-/// prior object's fragments). A restart is modelled by dropping the gateway and its store
-/// handles and reopening the SAME persisted redb + filesystem state — the process-restart
-/// equivalent (mirrors `core/tests/placement_record.rs`).
+/// Durability finding 1 (carry-forward), now cluster-safe (issue #477): a new-key PUT after a
+/// restart must NOT reuse a committed inode id (a spurious conflict) or a committed chunk id
+/// (clobbering the prior object's fragments). The gateway resumes inodes from the SHARED
+/// persisted `meta:next_inode` allocator (seeded by `recover`) and mints coordination-free
+/// chunk ids (a fresh random epoch, ADR-0019), so neither collides. A restart is modelled by
+/// dropping the gateway and its store handles and reopening the SAME persisted redb +
+/// filesystem state — the process-restart equivalent (mirrors `core/tests/placement_record.rs`).
 #[tokio::test]
 async fn restart_recovers_id_allocators_no_collision() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("meta.redb");
     let frags = dir.path().join("frags");
 
-    // Process 1: store object A (inode 1, chunk 1), then "crash" (drop the handles).
+    // Process 1: store object A (inode 1), then "crash" (drop the handles).
     {
         let g1 = Gateway::new(
             RedbMetadataStore::open(&db_path).expect("redb"),
@@ -575,16 +576,30 @@ async fn restart_recovers_id_allocators_no_collision() {
     );
 }
 
-/// Proves `recover` is **load-bearing**, not a no-op: the SAME restart *without* recovery
-/// re-mints inode id 1 for a new key and collides with A's committed inode
-/// (`metadata::create` is `require_absent` on the inode key), so the new-key PUT is
-/// spuriously rejected. This is exactly the corruption finding 1 closes.
+/// A restart is safe **without** `recover` — but *only because the prior process already
+/// persisted the shared inode allocator* (issue #477, iteration-2 carry-forward: the earlier
+/// blanket "safe by construction" claim did not hold for a legacy store, so this test is
+/// narrowed to the case it actually proves). Under the cluster-safe scheme the gateway
+/// allocates inodes from the durable `meta:next_inode` CAS counter and mints coordination-free
+/// chunk ids (a fresh random epoch, ADR-0019). So when process 1 — running *this same code* —
+/// stores object A it also advances the persisted counter past A; a restarted process 2 then
+/// resumes strictly above A even if it never calls `recover`, and its fresh random chunk epoch
+/// keeps chunk ids disjoint. Under the OLD per-process counters this identical
+/// restart-without-recover replayed inode/chunk id 1 and corrupted the store (the finding-1
+/// bug); the coordinated-inode + coordination-free-chunk scheme removes that failure mode for
+/// this case outright.
+///
+/// The *migration* case — a store an older single-process gateway left with inodes on disk but
+/// **no** persisted counter — is a different matter: there `recover` is load-bearing, pinned by
+/// [`recover_seeds_the_allocator_over_a_legacy_store_without_meta_next_inode`].
 #[tokio::test]
-async fn restart_without_recover_collides_showing_the_bug() {
+async fn restart_without_recover_is_safe_when_prior_process_persisted_the_allocator() {
     let dir = tempfile::tempdir().expect("temp dir");
     let db_path = dir.path().join("meta.redb");
     let frags = dir.path().join("frags");
 
+    // Process 1 (this same coordinated code): storing A advances the persisted `meta:next_inode`
+    // counter past A, so the on-disk store already carries the allocator state.
     {
         let g1 = Gateway::new(
             RedbMetadataStore::open(&db_path).expect("redb"),
@@ -594,36 +609,155 @@ async fn restart_without_recover_collides_showing_the_bug() {
         g1.put_object("bucket/a", b"first").await.expect("PUT A");
     }
 
-    // Restart but SKIP recovery: the in-process counter replays from 1.
+    // Restart and SKIP recover: the persisted `meta:next_inode` counter still resumes the inode
+    // allocator above A, and a fresh random chunk epoch keeps the chunk ids disjoint — so the
+    // new-key PUT commits, with no collision.
     let g2 = Gateway::new(
         RedbMetadataStore::open(&db_path).expect("redb reopen"),
         FsChunkStore::open(&frags).expect("fs reopen"),
         MemCoordination::new(),
     );
-    let collided = g2.put_object("bucket/b", b"second").await;
-    assert!(
-        collided.is_err(),
-        "without recover, a new-key PUT re-mints a committed inode id and is rejected — the \
-         restart-collision bug finding 1 fixes",
+    g2.put_object("bucket/b", b"second").await.expect(
+        "a new-key PUT after a restart must commit without recover — the prior process persisted \
+         the allocator above A and the chunk epoch is fresh",
+    );
+
+    assert_eq!(
+        g2.get_object("bucket/a").await.expect("get A").as_deref(),
+        Some(&b"first"[..]),
+        "object A survives the restart intact — B's write did not clobber its fragments",
+    );
+    assert_eq!(
+        g2.get_object("bucket/b").await.expect("get B").as_deref(),
+        Some(&b"second"[..]),
+        "object B stored under fresh, non-colliding ids",
     );
 }
 
-/// Durability finding (iter-8 carry-forward): the id allocators must recover from the
-/// **orphan ledger** too, not only `inode:`/`pending:`. After `PUT → DELETE → restart` a
-/// deleted object's inode key is gone and its chunk was already committed (so no `pending:`
-/// entry survives), yet its fragments live on under a grace record (`orphan:<ds>:<chunk>:
-/// <index>`, `crates/core/src/metadata.rs:60`) until the custodian GC's reader-safe window
-/// elapses (`crates/custodian/src/gc.rs:134-141`). If `recover` does not count those chunk
-/// ids it re-mints one for the next object; the stale orphan record then reclaims a fragment
-/// the re-minting object just wrote — permanent data loss.
+/// `recover` is **load-bearing for the migration case it exists for** (issue #477, iteration-2
+/// carry-forward). A store an *older single-process gateway* wrote carries committed objects
+/// under `inode:` keys but **no** persisted `meta:next_inode` counter — that gateway minted
+/// inodes from an in-process counter and never persisted one. A new gateway started over such a
+/// legacy store:
+///
+/// * **WITHOUT `recover`** re-mints inode 1 for a new key and collides with the legacy inode
+///   (`metadata::create` is `require_absent` on the inode key), so the new-key PUT is spuriously
+///   rejected — exactly the corruption finding 1 closes, and precisely why the plain
+///   restart-without-recover safety claim does *not* extend to a legacy store; but
+/// * **WITH `recover`** (`seed_next_inode_floor` over `high_water_marks`) seeds the persisted
+///   allocator strictly above every legacy inode, so the migrating PUT commits and both objects
+///   round-trip byte-identical.
+///
+/// The legacy on-disk shape is reproduced faithfully by storing an object through the current
+/// gateway (which writes `inode:1` **and** advances `meta:next_inode`) and then deleting the
+/// `meta:next_inode` key — the one artificial step that leaves exactly what the old gateway
+/// left: inodes present, allocator counter absent. This drives the production
+/// `Gateway::{recover, put_object, get_object}`, so it proves `recover` is not a no-op for the
+/// migration it targets.
+#[tokio::test]
+async fn recover_seeds_the_allocator_over_a_legacy_store_without_meta_next_inode() {
+    use wyrd_traits::{MetadataStore, WriteBatch};
+
+    // `cli::NEXT_INODE_KEY` is crate-private; the on-disk key it single-sources is
+    // `meta:next_inode` (`crates/server/src/cli.rs:56`).
+    const NEXT_INODE_KEY: &[u8] = b"meta:next_inode";
+
+    // Reproduce the on-disk shape an older single-process gateway left: a committed object A
+    // under `inode:` keys, but NO persisted allocator. Store A through the current gateway
+    // (which writes inode:1 AND advances meta:next_inode), then DELETE meta:next_inode — the one
+    // artificial step that models a legacy store (inodes present, counter absent).
+    async fn seed_legacy_store(db_path: &std::path::Path, frags: &std::path::Path) {
+        {
+            let g = Gateway::new(
+                RedbMetadataStore::open(db_path).expect("redb"),
+                FsChunkStore::open(frags).expect("fs store"),
+                MemCoordination::new(),
+            );
+            g.put_object("bucket/a", b"first").await.expect("PUT A");
+        }
+        let meta = RedbMetadataStore::open(db_path).expect("redb reopen to strip counter");
+        assert!(
+            meta.get(NEXT_INODE_KEY)
+                .await
+                .expect("get counter")
+                .is_some(),
+            "the current gateway must persist meta:next_inode, so stripping it models a legacy store",
+        );
+        meta.commit(WriteBatch::new().delete(NEXT_INODE_KEY.to_vec()))
+            .await
+            .expect("strip meta:next_inode to model a legacy single-process store");
+    }
+
+    // (1) Over a legacy store WITHOUT recover, the migrating new-key PUT collides — `recover` is
+    //     load-bearing here (unlike the persisted-counter restart above).
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("meta.redb");
+        let frags = dir.path().join("frags");
+        seed_legacy_store(&db_path, &frags).await;
+
+        let g = Gateway::new(
+            RedbMetadataStore::open(&db_path).expect("redb reopen"),
+            FsChunkStore::open(&frags).expect("fs reopen"),
+            MemCoordination::new(),
+        );
+        let collided = g.put_object("bucket/b", b"second").await;
+        assert!(
+            collided.is_err(),
+            "over a legacy store WITHOUT recover, a new-key PUT re-mints inode 1 and collides \
+             with the legacy inode — recover is load-bearing for the migration finding 1 closes",
+        );
+    }
+
+    // (2) Over the same legacy shape WITH recover, the allocator is seeded above the legacy
+    //     inode, so the migrating PUT commits and both objects round-trip byte-identical.
+    {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("meta.redb");
+        let frags = dir.path().join("frags");
+        seed_legacy_store(&db_path, &frags).await;
+
+        let g = Gateway::new(
+            RedbMetadataStore::open(&db_path).expect("redb reopen"),
+            FsChunkStore::open(&frags).expect("fs reopen"),
+            MemCoordination::new(),
+        );
+        g.recover()
+            .await
+            .expect("recover seeds meta:next_inode above the legacy inodes");
+        g.put_object("bucket/b", b"second").await.expect(
+            "after recover, a new-key PUT over the legacy store must commit — the allocator is \
+             seeded above the legacy inode",
+        );
+        assert_eq!(
+            g.get_object("bucket/a").await.expect("get A").as_deref(),
+            Some(&b"first"[..]),
+            "legacy object A survives the migration byte-identical",
+        );
+        assert_eq!(
+            g.get_object("bucket/b").await.expect("get B").as_deref(),
+            Some(&b"second"[..]),
+            "object B stored under a fresh, non-colliding inode after recover",
+        );
+    }
+}
+
+/// Durability finding (iter-8 carry-forward), now cluster-safe (issue #477): a new object
+/// minted after `PUT → DELETE → restart` must not collide with the **orphan ledger**. After a
+/// DELETE the deleted object's inode key is gone and its chunk was already committed (so no
+/// `pending:` entry survives), yet its fragments live on under a grace record
+/// (`orphan:<ds>:<chunk>:<index>`, `crates/core/src/metadata.rs:60`) until the custodian GC's
+/// reader-safe window elapses (`crates/custodian/src/gc.rs:134-141`). If the next object
+/// re-minted that chunk id, the stale orphan record would reclaim a fragment the new object
+/// just wrote — permanent data loss.
 ///
 /// This drives the **production** paths (`put_object` / `delete_object` / `recover` /
 /// `get_object`) and then performs exactly the reclaim the orphan ledger authorises — GC
-/// deletes each fragment the ledger names once its grace elapses
-/// (`gc.rs:136,152`) — by deleting those very fragments through the same `ChunkStore`. With
-/// the orphan scan, B is minted a *fresh* chunk id, so reclaiming the old object's fragments
-/// leaves B byte-identical. Without it, B re-mints the orphaned chunk id and the reclaim
-/// deletes B's own fragments: GET B fails. RED before the orphan scan, GREEN after.
+/// deletes each fragment the ledger names once its grace elapses (`gc.rs:136,152`) — by
+/// deleting those very fragments through the same `ChunkStore`. Because chunk ids are now
+/// coordination-free (a fresh random epoch per process, ADR-0019), B's id is disjoint from the
+/// deleted object's orphaned id **by construction**, so reclaiming the old fragments leaves B
+/// byte-identical — no orphan-ledger scan of a per-process counter is needed to keep them apart.
 #[tokio::test]
 async fn restart_recovers_id_allocators_over_orphan_ledger_no_reclaim_loss() {
     use wyrd_core::metadata::{parse_orphan_key, ORPHAN_PREFIX};
@@ -634,9 +768,9 @@ async fn restart_recovers_id_allocators_over_orphan_ledger_no_reclaim_loss() {
     let frags = dir.path().join("frags");
     let object_b = b"object B must survive an orphan-ledger reclaim of the deleted object A";
 
-    // Process 1: store object A (inode 1, chunk 1), then DELETE it — its fragments are now
-    // orphaned under the grace ledger (still on disk), its inode key removed, its pending
-    // ledger already cleared at commit. Then "crash" (drop the handles).
+    // Process 1: store object A (inode 1), then DELETE it — its fragments are now orphaned
+    // under the grace ledger (still on disk), its inode key removed, its pending ledger already
+    // cleared at commit. Then "crash" (drop the handles).
     {
         let g1 = Gateway::new(
             RedbMetadataStore::open(&db_path).expect("redb"),
@@ -686,9 +820,9 @@ async fn restart_recovers_id_allocators_over_orphan_ledger_no_reclaim_loss() {
     }
 
     // Object B must still round-trip byte-identical: its fragments were minted under a chunk
-    // id DISJOINT from the reclaimed orphan chunk, so the reclaim never touched them. Without
-    // the orphan-ledger scan in `high_water_marks`, B re-mints the orphaned chunk id and the
-    // reclaim above deletes B's own fragments — this GET then fails.
+    // id DISJOINT from the reclaimed orphan chunk (a fresh random epoch, ADR-0019), so the
+    // reclaim never touched them. Were the gateway to re-mint the orphaned chunk id, the
+    // reclaim above would delete B's own fragments — this GET would then fail.
     let g3 = Gateway::new(
         RedbMetadataStore::open(&db_path).expect("redb reopen for read"),
         FsChunkStore::open(&frags).expect("fs reopen for read"),

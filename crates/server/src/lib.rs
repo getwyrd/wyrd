@@ -61,13 +61,20 @@ pub struct Gateway<M, C, Co> {
     chunk_size: usize,
     durability: EcScheme,
     lease_ttl_millis: u64,
-    // Id allocation is an in-process counter for the single-process gateway (one process,
-    // not a multi-writer cluster; random/uncoordinated chunk ids per ADR-0019 are a later
-    // refinement). The counters are seeded from 1 by `new` but MUST be resumed above the
-    // persisted high-water marks by `recover` before serving over a non-empty store, or a
-    // restart replays ids from 1 and collides with committed objects (issue #364 finding 1).
-    next_inode: AtomicU64,
-    next_chunk: AtomicU64,
+    // Id allocation is cluster-safe: several gateway processes may run active-active over one
+    // shared fleet (M4, "one shared front door, N gateways", #465), so no id may be minted
+    // from per-process state that two processes seeded identically. Inodes come from the
+    // SHARED store's `meta:next_inode` CAS allocator (`cli::alloc_inode`, the CLI cluster
+    // path's scheme), so two gateways never mint the same inode. Chunk ids are
+    // **coordination-free** (ADR-0019): a per-gateway random `chunk_epoch` (the high 64 bits)
+    // makes two processes draw disjoint id ranges without any shared counter, and a per-gateway
+    // monotonic `next_chunk_seq` (the low 64 bits) never repeats within a process — so an
+    // overwrite of an existing inode mints a fresh chunk id rather than re-minting (and
+    // clobbering) the prior version's. This is restart-safe by construction — a new process
+    // resumes inodes from the persisted counter and draws a fresh chunk epoch, never replaying
+    // a committed id and corrupting an object (issue #364 finding 1, preserved and generalised).
+    chunk_epoch: u64,
+    next_chunk_seq: AtomicU64,
 }
 
 impl<M, C, Co> Gateway<M, C, Co>
@@ -87,29 +94,29 @@ where
             chunk_size: DEFAULT_CHUNK_SIZE,
             durability: DEFAULT_DURABILITY,
             lease_ttl_millis: DEFAULT_LEASE_TTL_MILLIS,
-            next_inode: AtomicU64::new(1), // 0 is ROOT
-            next_chunk: AtomicU64::new(1),
+            chunk_epoch: random_chunk_epoch(),
+            next_chunk_seq: AtomicU64::new(0),
         }
     }
 
-    /// Recover the in-process id allocators from persisted state so a **restart** over a
-    /// non-empty store resumes allocating *above* every inode and chunk id already committed
-    /// or in-flight — never replaying ids from 1 and colliding with (corrupting) existing
-    /// objects (issue #364 durability finding 1). A fresh store recovers `(0, 0)` and the
-    /// allocators stay at 1, exactly as [`new`](Gateway::new) leaves them.
+    /// Seed the **shared, persisted** inode allocator from persisted state so this gateway
+    /// resumes allocating *above* every inode already on disk — a restart over a non-empty
+    /// store, or an in-place upgrade from a store an older single-process gateway wrote with
+    /// no `meta:next_inode` counter, never re-mints a committed inode id and spuriously
+    /// rejects a new-key PUT (issue #364 durability finding 1, preserved).
+    ///
+    /// Chunk ids need **no** recovery: they are coordination-free (a per-gateway random
+    /// [`chunk_epoch`](Self::chunk_epoch), ADR-0019), so a fresh process draws a disjoint id
+    /// range and can never replay a committed chunk id. A fresh store leaves the allocator at
+    /// its default (next id 1), exactly as [`new`](Gateway::new) leaves it.
     ///
     /// The composition root calls this after `new` and before serving
-    /// (`server::cli::cmd_s3`). Idempotent and monotone: it only ever *raises* the counters
-    /// (`fetch_max`), so a concurrent allocation already past the mark is never rewound.
+    /// (`server::cli::serve_s3`, `cli.rs:1415`). Idempotent and monotone: it only ever
+    /// *raises* the persisted counter, so a concurrent allocation already past the mark is
+    /// never rewound.
     pub async fn recover(&self) -> Result<()> {
-        let (max_inode, max_chunk) = metadata::high_water_marks(&self.meta).await?;
-        self.next_inode
-            .fetch_max(max_inode.saturating_add(1), Ordering::Relaxed);
-        // `high_water_marks` already projects the chunk id to the `< 2^64` in-process
-        // allocation space, so this conversion never truncates a live id.
-        let next_chunk = u64::try_from(max_chunk).unwrap_or(0).saturating_add(1);
-        self.next_chunk.fetch_max(next_chunk, Ordering::Relaxed);
-        Ok(())
+        let (max_inode, _max_chunk) = metadata::high_water_marks(&self.meta).await?;
+        crate::cli::seed_next_inode_floor(&self.meta, max_inode.saturating_add(1)).await
     }
 
     /// Set the chunk size (mainly so tests can force multi-chunk objects).
@@ -175,7 +182,12 @@ where
                 write::commit_overwrite(&self.meta, inode_id, &prior, plan, now_millis()).await?
             }
             None => {
-                let inode_id = self.next_inode.fetch_add(1, Ordering::Relaxed);
+                // Allocate the inode from the SHARED store's `meta:next_inode` CAS allocator,
+                // exactly as the CLI cluster path does (`cli::cluster_store_put`,
+                // `cli.rs:1158`; allocator body `cli.rs:1027`) — never a per-process counter,
+                // so two active-active gateways seeded from the same baseline mint DISTINCT
+                // inodes and the create CAS resolves any dirent race cleanly (issue #477).
+                let inode_id = crate::cli::alloc_inode(&self.meta).await?;
                 write::commit_create(&self.meta, ROOT, key, inode_id, plan).await?
             }
         };
@@ -194,9 +206,40 @@ where
         read::read_path(&self.meta, &self.chunks, ROOT, key).await
     }
 
+    /// Mint a **coordination-free** chunk id (ADR-0019). The per-gateway random
+    /// [`chunk_epoch`](Self::chunk_epoch) forms the high 64 bits, so two concurrently-active
+    /// gateways over the same fleet draw disjoint id ranges without any shared counter — neither
+    /// can write a fragment under a chunk id the other has committed or has in flight. The
+    /// monotonic [`next_chunk_seq`](Self::next_chunk_seq) forms the low 64 bits, so an id never
+    /// repeats within a process: an **overwrite** (which reuses the inode but stores a new
+    /// version's fragments) mints fresh ids rather than re-minting the prior version's. The
+    /// epoch's top bit is set, so every id is ≥ 2^127 — clear of the `< 2^64` in-process space
+    /// [`metadata::high_water_marks`] scans and of the cluster path's `(inode << 64) | seq` ids.
     fn mint_chunk_id(&self) -> ChunkId {
-        ChunkId::from(self.next_chunk.fetch_add(1, Ordering::Relaxed))
+        let seq = self.next_chunk_seq.fetch_add(1, Ordering::Relaxed);
+        (u128::from(self.chunk_epoch) << 64) | u128::from(seq)
     }
+}
+
+/// Draw a per-gateway random 64-bit chunk-id epoch (top bit set) from OS entropy.
+///
+/// This is the coordination-free half of the chunk-id scheme (ADR-0019): two gateway
+/// **processes** seeded from the same persisted state still draw **independent** epochs, so
+/// their chunk-id ranges are disjoint and neither can overwrite a chunk the other committed —
+/// the multi-writer invariant (issue #477), without a shared allocator. Setting the top bit
+/// keeps every minted id ≥ 2^127, clear of the `< 2^64` in-process space
+/// [`metadata::high_water_marks`] recovers and of the cluster path's `(inode << 64) | seq` ids.
+///
+/// The entropy comes from [`std::collections::hash_map::RandomState`], which the standard
+/// library seeds from the OS RNG (the same source that keys `HashMap` against collision
+/// attacks) — so no extra crate is pulled into the gateway binary, and each construction draws
+/// a fresh key, so two gateways built in one process draw different epochs too.
+fn random_chunk_epoch() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let raw = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    raw | (1u64 << 63)
 }
 
 /// `Gateway` **is** an [`ObjectGateway`] — the shared gateway seam (`wyrd-gateway-core`)
