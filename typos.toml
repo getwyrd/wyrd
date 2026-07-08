@@ -16,6 +16,10 @@ hel = "hel"
 # a standard disaster-recovery term used in the M7 failover/DR plan — not a typo
 # for "TO".
 rto = "rto"
+# "EDN" is Extensible Data Notation (Clojure/Elle's data format), used by the
+# consistency-checker serializers (to_elle_edn, edn_string, …) — not a typo for
+# "END".
+edn = "edn"
 
 [files]
 # Don't spell-check generated or non-prose files. (typos already honors
