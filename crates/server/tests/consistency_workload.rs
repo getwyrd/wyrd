@@ -446,6 +446,33 @@ fn session_read_your_writes_is_cross_process_aware() {
         !single_lost.session_read_your_writes(),
         "with no other writer, a 404 read after our own write is still an own-write-lost"
     );
+
+    // REJECT — the other process's write is ordered BEFORE our delete, so it cannot recreate the
+    // key afterward: P1 PUT k [0,10] (ends before) → P0 DELETE k [20,30] → P0 GET k=v1 [40,50] is
+    // still a resurrection. RED if the waiver accepts any earlier cross-process PUT regardless of
+    // whether it could linearize after our delete.
+    let pre_delete_put = MultiProcessHistory::from_ops(vec![
+        proc_op(1, OpKind::Put, "k", Some(1), 200, 0, 10),
+        proc_op(0, OpKind::Delete, "k", None, 204, 20, 30),
+        proc_op(0, OpKind::Get, "k", Some(1), 200, 40, 50),
+    ]);
+    assert!(
+        !pre_delete_put.session_read_your_writes(),
+        "a cross-process PUT ordered before our delete cannot recreate the key — still a resurrection"
+    );
+
+    // REJECT — the other process's delete is ordered BEFORE our write, so it cannot erase it: P1
+    // DELETE k [0,10] → P0 PUT k=1 [20,30] → P0 GET 404 [40,50] is still an own-write-lost. RED if
+    // the waiver accepts any earlier cross-process DELETE.
+    let pre_write_delete = MultiProcessHistory::from_ops(vec![
+        proc_op(1, OpKind::Delete, "k", None, 204, 0, 10),
+        proc_op(0, OpKind::Put, "k", Some(1), 200, 20, 30),
+        proc_op(0, OpKind::Get, "k", None, 404, 40, 50),
+    ]);
+    assert!(
+        !pre_write_delete.session_read_your_writes(),
+        "a cross-process DELETE ordered before our write cannot erase it — still an own-write-lost"
+    );
 }
 
 // ─── (c) Session monotonic reads: guard indeterminate, reject determinate regression ───

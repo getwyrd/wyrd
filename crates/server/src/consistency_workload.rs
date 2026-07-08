@@ -199,12 +199,17 @@ impl MultiProcessHistory {
                             // holds whether or not this uncertain write took effect (a later read
                             // below it is a real read-your-writes violation). It MAY relax a
                             // standing Absent, since the write may have (re)created the key.
-                            if matches!(obligation.get(key), Some(Obligation::Absent)) {
+                            if matches!(obligation.get(key), Some(Obligation::Absent(_))) {
                                 obligation.insert(key, Obligation::Unknown);
                             }
                         } else if is_success(status) {
-                            obligation
-                                .insert(key, Obligation::AtLeast(op.record.version.unwrap_or(0)));
+                            obligation.insert(
+                                key,
+                                Obligation::AtLeast(
+                                    op.record.version.unwrap_or(0),
+                                    op.record.start,
+                                ),
+                            );
                         }
                         // A determinate-failed PUT had no effect: the obligation is unchanged.
                     }
@@ -214,11 +219,11 @@ impl MultiProcessHistory {
                             // must NOT erase a standing Absent (a delete can't resurrect a key). It
                             // MAY relax a standing AtLeast, since the delete may have removed the
                             // committed value, so a later absent/older read is not provably a loss.
-                            if !matches!(obligation.get(key), Some(Obligation::Absent)) {
+                            if !matches!(obligation.get(key), Some(Obligation::Absent(_))) {
                                 obligation.insert(key, Obligation::Unknown);
                             }
                         } else if is_success(status) || status == 404 {
-                            obligation.insert(key, Obligation::Absent);
+                            obligation.insert(key, Obligation::Absent(op.record.start));
                         }
                         // A determinate-failed DELETE had no effect: obligation unchanged.
                     }
@@ -232,18 +237,20 @@ impl MultiProcessHistory {
                             // A determinate present read of version `v`.
                             Some(v) => match obl {
                                 // Resurrected after our own delete — but only a violation if no
-                                // OTHER process could have recreated the key (in a merged history a
-                                // concurrent PUT by another process legitimately explains it).
-                                Obligation::Absent
-                                    if !self.key_recreated_by_other(
+                                // OTHER process could have recreated the key AFTER that delete (a
+                                // concurrent PUT that can linearize between our delete and this read
+                                // legitimately explains it).
+                                Obligation::Absent(deleted_at)
+                                    if !self.key_recreated_between(
                                         key,
                                         op.process,
+                                        deleted_at,
                                         op.record.end,
                                     ) =>
                                 {
                                     return false;
                                 }
-                                Obligation::AtLeast(w) if v < w => return false, // read older than own write
+                                Obligation::AtLeast(w, _) if v < w => return false, // read older than own write
                                 _ => {}
                             },
                             // `None` version means only "status != 200", which is a definite
@@ -252,13 +259,19 @@ impl MultiProcessHistory {
                             // must NOT be counted an own-write-lost (INV-1: no fabricated absence).
                             None => {
                                 // A 404 after our own write is own-write-lost — unless another
-                                // process could have deleted the key first (which legitimately
-                                // explains the absence).
-                                if status == 404
-                                    && matches!(obl, Obligation::AtLeast(_))
-                                    && !self.key_deleted_by_other(key, op.process, op.record.end)
-                                {
-                                    return false; // own write lost: read absent (404) after writing
+                                // process could have deleted the key AFTER that write (which
+                                // legitimately explains the absence).
+                                if let Obligation::AtLeast(_, written_at) = obl {
+                                    if status == 404
+                                        && !self.key_deleted_between(
+                                            key,
+                                            op.process,
+                                            written_at,
+                                            op.record.end,
+                                        )
+                                    {
+                                        return false; // own write lost: read absent (404) after writing
+                                    }
                                 }
                             }
                         }
@@ -365,47 +378,68 @@ impl MultiProcessHistory {
         by
     }
 
-    /// Could a process OTHER than `reader` have (re)created `key` in a way this read (completing
-    /// at `read_end`) could observe? A cross-process successful PUT whose span starts before the
-    /// read completes can linearize before it, so a present read after the reader's OWN delete is
-    /// not provably a resurrection — another process may legitimately have recreated the key
-    /// (INV-1: never fabricate a violation). Conservative: it does not require the write to fall
-    /// strictly after the delete, so it errs toward accept.
-    fn key_recreated_by_other(&self, key: &str, reader: usize, read_end: SystemTime) -> bool {
+    /// Could a process OTHER than `reader` have (re)created `key` in the window between the
+    /// reader's own DELETE (which started at `deleted_at`) and this read (completing at
+    /// `read_end`)? Such a cross-process PUT can linearize after the delete and before the read, so
+    /// a present read after our own delete is not provably a resurrection — another process
+    /// legitimately recreated the key (INV-1: never fabricate a violation). The candidate PUT must
+    /// be able to linearize BOTH after our delete (`end >= deleted_at`, i.e. not strictly before
+    /// it) AND before this read (`start <= read_end`); a PUT ordered entirely before the delete
+    /// cannot recreate the key, so it does not waive the violation.
+    fn key_recreated_between(
+        &self,
+        key: &str,
+        reader: usize,
+        deleted_at: SystemTime,
+        read_end: SystemTime,
+    ) -> bool {
         self.ops.iter().any(|o| {
             o.process != reader
                 && o.record.kind == OpKind::Put
                 && is_success(o.record.status)
                 && o.record.key.as_str() == key
-                && o.record.start < read_end
+                && o.record.end >= deleted_at
+                && o.record.start <= read_end
         })
     }
 
-    /// The delete mirror of [`key_recreated_by_other`](Self::key_recreated_by_other): could a
-    /// process OTHER than `reader` have removed `key` before this read completed? If so, a 404
-    /// read after the reader's own PUT is not provably an own-write-lost — another process may
-    /// have deleted the key.
-    fn key_deleted_by_other(&self, key: &str, reader: usize, read_end: SystemTime) -> bool {
+    /// The delete mirror of [`key_recreated_between`](Self::key_recreated_between): could a process
+    /// OTHER than `reader` have removed `key` between the reader's own PUT (which started at
+    /// `written_at`) and this read? If so, a 404 read after our own write is not provably an
+    /// own-write-lost. The candidate DELETE must be able to linearize both after our write
+    /// (`end >= written_at`) and before this read (`start <= read_end`).
+    fn key_deleted_between(
+        &self,
+        key: &str,
+        reader: usize,
+        written_at: SystemTime,
+        read_end: SystemTime,
+    ) -> bool {
         self.ops.iter().any(|o| {
             o.process != reader
                 && o.record.kind == OpKind::Delete
                 && (is_success(o.record.status) || o.record.status == 404)
                 && o.record.key.as_str() == key
-                && o.record.start < read_end
+                && o.record.end >= written_at
+                && o.record.start <= read_end
         })
     }
 }
 
-/// The standing per-key obligation a session's determinate ops establish.
+/// The standing per-key obligation a session's determinate ops establish. Each mutation-derived
+/// obligation carries the `start` of the op that established it, so a cross-process waiver can
+/// require the other process's op to be able to linearize AFTER it (not merely before the read).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Obligation {
     /// No determinate obligation stands (including after an *indeterminate* mutation, whose
     /// effect is unknown — INV-1).
     Unknown,
-    /// A determinate PUT of this version stands: a later determinate read must observe ≥ it.
-    AtLeast(u64),
-    /// A determinate DELETE stands: a later determinate read must observe absence.
-    Absent,
+    /// A determinate PUT of this version stands (established at the given time): a later
+    /// determinate read must observe ≥ it.
+    AtLeast(u64, SystemTime),
+    /// A determinate DELETE stands (established at the given time): a later determinate read must
+    /// observe absence.
+    Absent(SystemTime),
 }
 
 /// A read (GET) versus a write (PUT/DELETE): exactly one of each. A read↔read or write↔write
