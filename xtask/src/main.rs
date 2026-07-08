@@ -14,10 +14,30 @@
 //!   cluster of real, networked gRPC D servers under docker-compose and run the
 //!   end-to-end write/read integration test against them. Not part of `ci` (it
 //!   needs a container runtime); a heavier-runner / nightly job.
+//! - `tikv-conformance` — the M4.1 backend-swap proof (proposal 0007): bring up the
+//!   throwaway single-node TiKV under `deploy/` and drive the shared `MetadataStore`
+//!   conformance suite against it. Not part of `ci` (it needs a container runtime);
+//!   the conformance test itself skips cleanly when no TiKV endpoint is configured.
+//! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
+//!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
+//!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
+//!   properties against it (`cargo test -p wyrd-coordination-etcd --features etcd`).
+//!   Not part of `ci` (it needs a container runtime AND a system `protoc`); the test
+//!   itself skips cleanly when no etcd endpoint is configured. The DETERMINISTIC proof
+//!   of the same store is in the `dst` tier (madsim etcd simulator), which is IN `ci`.
 //! - `disk-faults` / `jepsen` / `kill-reconstruct` — the deferred (off-Check)
 //!   Tier-1 / Tier-2 custodian fault runners (M3, proposal 0005 `0005:405-411`,
 //!   `0005:437-438`). Privileged / real-environment tiers, never part of `ci`;
 //!   deferred by default, opted in by the dedicated off-Check job.
+//! - `deploy-small-multi-node` — the M4.5 production-topology bring-up smoke check
+//!   (proposal 0015 §"Deployment", PR sequence item 5, #256): bring up the
+//!   `deploy/small-multi-node/` stack (TiKV-small + its PD ensemble + a 3-node etcd
+//!   ensemble for L5 Coordination + local-disk D servers) and wait for every
+//!   component to accept connections. Not part of `ci` (it needs a container
+//!   runtime), exactly like `tikv-conformance` / `integration`. This is the
+//!   pre-prerequisite bring-up (proposal 0015's "Deployment prerequisite" note): it
+//!   proves the topology stands up on static endpoints, not yet "peers discovered
+//!   through L5" (gated on #365 + the runnable gateway/custodian roles).
 //! - `bench` — the tracked throughput benchmarks (EC micro-bench + the M2
 //!   aggregate D-server throughput bench). Tracked, not gated.
 
@@ -40,9 +60,14 @@ fn main() -> ExitCode {
         Some("dst") => run_dst(),
         Some("statics") => run_statics(),
         Some("integration") => run_integration(),
+        Some("tikv-conformance") => run_tikv_conformance(),
+        Some("etcd-conformance") => run_etcd_conformance(),
+        Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("disk-faults") => faults::run_disk_faults(),
         Some("jepsen") => faults::run_jepsen(),
         Some("kill-reconstruct") => faults::run_kill_reconstruct(),
+        Some("metadata-tier1") => faults::run_metadata_tier1(),
+        Some("metadata-tier2") => faults::run_metadata_tier2(),
         Some("bench") => run_bench(),
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
@@ -67,7 +92,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|disk-faults|jepsen|kill-reconstruct|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 
@@ -138,6 +163,433 @@ fn run_integration() -> Result<(), String> {
     )?;
     println!("\nxtask integration: Tier-2 container integration passed");
     Ok(())
+}
+
+/// The compose project name for the throwaway single-node TiKV, so it is isolated
+/// and torn down cleanly.
+const TIKV_PROJECT: &str = "wyrd-tikv-m41";
+/// PD's client endpoint the host reaches (host networking, `deploy/tikv-single-node`).
+const TIKV_PD_ENDPOINT: &str = "127.0.0.1:2379";
+
+/// Run the M4.1 TiKV conformance job (proposal 0007 §"Suggested PR sequence" item
+/// 1): bring up the throwaway single-node TiKV under `deploy/`, drive the **shared**
+/// `MetadataStore` conformance suite against it (`cargo test -p wyrd-metadata-tikv
+/// --features tikv`), then tear it down. **Not** part of `run_ci` — it needs a
+/// container runtime, exactly like `run_integration`; without one it is a hard
+/// failure in CI and a warn-and-skip locally (the conformance test ITSELF also skips
+/// cleanly when `WYRD_TIKV_PD_ENDPOINTS` is unset, so `ci` stays green regardless).
+fn run_tikv_conformance() -> Result<(), String> {
+    let compose = workspace_root().join("deploy/tikv-single-node/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    if !docker_available() {
+        if is_ci() {
+            return Err(
+                "docker is not available but is required for the TiKV conformance job".into(),
+            );
+        }
+        eprintln!(
+            "warning: docker not available; skipping the TiKV conformance job locally. \
+             Install Docker (and the compose plugin) to run it."
+        );
+        return Ok(());
+    }
+
+    tikv_compose(&compose, &["up", "-d"])?;
+    let result = wait_for_port(TIKV_PD_ENDPOINT).and_then(|()| run_tikv_conformance_test());
+    // Always tear the stack down, even on failure — a run never leaks containers.
+    let _ = tikv_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    result?;
+    println!("\nxtask tikv-conformance: TiKV passed the shared MetadataStore conformance suite");
+    Ok(())
+}
+
+/// Run the endpoint-gated TiKV integration tests with the `tikv` feature on and PD
+/// exported. TiKV's store bootstrap can lag PD's port opening, so each test — which
+/// dials the cluster — is retried a few times with backoff before giving up.
+///
+/// Three test binaries run: `conformance` (the shared trait-contract suite, M4.1),
+/// `contention` (the write-conflict property tests, M4.2/#253), and `scan` (the
+/// at-scale native paged-scan completeness proof, M4.3/#254). All must pass for the
+/// job to exercise the commit conflict semantics AND the scan completeness invariant.
+fn run_tikv_conformance_test() -> Result<(), String> {
+    for test in ["conformance", "contention", "scan"] {
+        run_tikv_test(test)?;
+    }
+    Ok(())
+}
+
+/// Run one endpoint-gated TiKV test binary (`--test <name>`) with retry/backoff.
+fn run_tikv_test(test: &str) -> Result<(), String> {
+    print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-metadata-tikv",
+        "--features",
+        "tikv",
+        "--test",
+        test,
+    ]);
+    let mut last = String::new();
+    for attempt in 1..=5 {
+        let status = Command::new("cargo")
+            .args([
+                "test",
+                "-p",
+                "wyrd-metadata-tikv",
+                "--features",
+                "tikv",
+                "--test",
+                test,
+                "--",
+                "--nocapture",
+            ])
+            .current_dir(workspace_root())
+            .env("WYRD_TIKV_PD_ENDPOINTS", TIKV_PD_ENDPOINT)
+            .status()
+            .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        last = format!("TiKV `{test}` test failed with {status}");
+        eprintln!(
+            "xtask tikv-conformance: `{test}` attempt {attempt}/5 failed; \
+             TiKV may still be bootstrapping"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
+    }
+    Err(last)
+}
+
+/// The compose project name for the throwaway single-node etcd, isolated and torn
+/// down cleanly.
+const ETCD_PROJECT: &str = "wyrd-etcd-l5";
+/// etcd's client endpoint the host reaches (`deploy/etcd-single-node`).
+const ETCD_ENDPOINT: &str = "127.0.0.1:2379";
+
+/// Run the L5 Coordination conformance job (#365, proposal 0015 §"Deployment
+/// prerequisite"): bring up the throwaway single-node etcd under `deploy/`, drive
+/// the **shared** `Coordination` conformance suite + the cross-instance properties
+/// against it (`cargo test -p wyrd-coordination-etcd --features etcd`), then tear it
+/// down. **Not** part of `run_ci` — it needs a container runtime AND a system
+/// `protoc` to compile the real `etcd-client`, exactly like `run_tikv_conformance`
+/// needs a container; without either it is a hard failure in CI and a warn-and-skip
+/// locally (the conformance test ITSELF also skips cleanly when `WYRD_ETCD_ENDPOINTS`
+/// is unset, so `ci` stays green regardless).
+///
+/// The DETERMINISTIC proof of the same store lives in the `dst` tier
+/// (`crates/dst/tests/coordination.rs`, madsim etcd simulator), which needs neither a
+/// container nor `protoc`; this job is the real-etcd home that pins fidelity.
+fn run_etcd_conformance() -> Result<(), String> {
+    let compose = workspace_root().join("deploy/etcd-single-node/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    // This job's ONLY purpose is to prove the real etcd store passes the shared
+    // suite, so it must NEVER report success without actually having run it. If the
+    // required tooling is missing we FAIL LOUD — locally as well as in CI — rather
+    // than warn-and-return-`Ok` (a "false green": exit 0 having proved nothing).
+    // The DETERMINISTIC, always-runnable proof of the same store lives in the `dst`
+    // tier (madsim etcd simulator, in `ci`); this job is the real-etcd fidelity
+    // backstop and is invoked deliberately, not from `ci`.
+    if !docker_available() {
+        return Err(
+            "docker is not available but is required for the etcd conformance job; without it \
+             this job proves nothing and must not report success. Install Docker (and the \
+             compose plugin) to run it, or rely on the deterministic `cargo xtask dst` proof."
+                .into(),
+        );
+    }
+    // The real `etcd-client` regenerates its protobufs at build time; without a
+    // system `protoc` the `--features etcd` build cannot even compile, so a run
+    // would prove nothing.
+    if !protoc_available() {
+        return Err(
+            "protoc is not available but is required to build `--features etcd` for the etcd \
+             conformance job; without it this job proves nothing and must not report success. \
+             Install the Protocol Buffers compiler (`protoc`), or rely on the deterministic \
+             `cargo xtask dst` proof."
+                .into(),
+        );
+    }
+
+    etcd_compose(&compose, &["up", "-d"])?;
+    let result = wait_for_port(ETCD_ENDPOINT).and_then(|()| run_etcd_conformance_test());
+    // Always tear the stack down, even on failure — a run never leaks containers.
+    let _ = etcd_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    result?;
+    println!("\nxtask etcd-conformance: etcd passed the shared Coordination conformance suite");
+    Ok(())
+}
+
+/// Run the endpoint-gated etcd conformance test with `--features etcd` and the
+/// endpoint exported, with retry/backoff (etcd can lag its port opening).
+///
+/// COMPILE and RUN are separated deliberately. A build failure (e.g. the iter-5
+/// E0599 missing-import in a file no `ci` gate compiles) is NOT a bootstrap flake:
+/// retrying it 5× wastes minutes and — worse — reports it as "etcd may still be
+/// bootstrapping", masquerading a hard defect as transient. So `--no-run` builds
+/// first; a build failure fails LOUD and immediately, and only the actual test RUN
+/// (which genuinely can race etcd's port coming up) is retried with backoff.
+fn run_etcd_conformance_test() -> Result<(), String> {
+    // 1. Build the test binary. A non-zero exit here is a compile error, never a
+    //    bootstrap flake — surface it as such and do NOT retry.
+    print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-coordination-etcd",
+        "--features",
+        "etcd",
+        "--test",
+        "conformance",
+        "--no-run",
+    ]);
+    let build = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "wyrd-coordination-etcd",
+            "--features",
+            "etcd",
+            "--test",
+            "conformance",
+            "--no-run",
+        ])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if !build.success() {
+        return Err(format!(
+            "the `--features etcd` conformance test failed to COMPILE ({build}); this is a build \
+             error, not an etcd bootstrap flake — fix the code (it is not retried)."
+        ));
+    }
+
+    // 2. Run the (already-built) test, retrying only the RUN — etcd can lag its
+    //    port opening, which IS transient.
+    print_step(&[
+        "cargo",
+        "test",
+        "-p",
+        "wyrd-coordination-etcd",
+        "--features",
+        "etcd",
+        "--test",
+        "conformance",
+    ]);
+    let mut last = String::new();
+    for attempt in 1..=5 {
+        let status = Command::new("cargo")
+            .args([
+                "test",
+                "-p",
+                "wyrd-coordination-etcd",
+                "--features",
+                "etcd",
+                "--test",
+                "conformance",
+                "--",
+                "--nocapture",
+            ])
+            .current_dir(workspace_root())
+            .env("WYRD_ETCD_ENDPOINTS", format!("http://{ETCD_ENDPOINT}"))
+            .status()
+            .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        last = format!("etcd conformance test failed with {status}");
+        eprintln!(
+            "xtask etcd-conformance: run attempt {attempt}/5 failed; etcd may still be \
+             bootstrapping (the test binary already built, so this is a run-time retry)"
+        );
+        std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
+    }
+    Err(last)
+}
+
+/// Run a `docker compose -p <ETCD_PROJECT> -f <file> …` command from the workspace
+/// root, echoing it first. Mirrors `tikv_compose`.
+fn etcd_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", ETCD_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
+}
+
+/// Is a `protoc` binary reachable? (The real `etcd-client` build script needs it.)
+fn protoc_available() -> bool {
+    Command::new("protoc")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The compose project name for the M4.5 "Small multi-node Production" stack, so it
+/// is isolated and torn down cleanly (never collides with `TIKV_PROJECT`'s throwaway
+/// single-node stack — the two are never meant to run at once).
+const SMALL_MULTI_NODE_PROJECT: &str = "wyrd-small-multi-node-m45";
+/// Every component endpoint the smoke check waits on (host-published ports; see
+/// `deploy/small-multi-node/docker-compose.yml`): the 3-node etcd ensemble (L5
+/// Coordination), the 3-node PD ensemble, the 3-node TiKV, the 9 local-disk D
+/// servers, and the 3 S3 gateways. The 3 custodians publish no port (their Prometheus
+/// registry is in-process read-back only), so their liveness is implied by the TiKV /
+/// D servers they depend on rather than waited on directly.
+const SMALL_MULTI_NODE_ENDPOINTS: &[&str] = &[
+    // etcd ensemble (L5 Coordination)
+    "127.0.0.1:12379",
+    "127.0.0.1:22379",
+    "127.0.0.1:32379",
+    // PD ensemble (TiKV's coordinator)
+    "127.0.0.1:23791",
+    "127.0.0.1:23792",
+    "127.0.0.1:23793",
+    // TiKV (3-node store)
+    "127.0.0.1:20160",
+    "127.0.0.1:20161",
+    "127.0.0.1:20162",
+    // D servers (9, fd0..fd8)
+    "127.0.0.1:50061",
+    "127.0.0.1:50062",
+    "127.0.0.1:50063",
+    "127.0.0.1:50064",
+    "127.0.0.1:50065",
+    "127.0.0.1:50066",
+    "127.0.0.1:50067",
+    "127.0.0.1:50068",
+    "127.0.0.1:50069",
+    // S3 gateways (3)
+    "127.0.0.1:8081",
+    "127.0.0.1:8082",
+    "127.0.0.1:8083",
+];
+
+/// Run the consolidated single-zone bring-up smoke check (proposal 0015
+/// §"Deployment", PR sequence item 5, #256): bring up `deploy/small-multi-node/`
+/// (3-node etcd for L5 Coordination + 3-node PD + 3-node TiKV + 9 local-disk D
+/// servers + 3 custodians + 3 S3 gateways) and wait for every published component to
+/// accept connections, then tear the stack down. **Not** part of `run_ci` — it needs
+/// a container runtime, exactly like `run_tikv_conformance`.
+///
+/// This is a topology bring-up smoke check: it proves the whole stack stands up and
+/// every published port accepts connections. The image is built with `--features
+/// tikv,etcd`, so the D servers genuinely register through the etcd Coordination
+/// backend (#449) and the custodians open the TiKV metadata backend. It does not
+/// prove an end-to-end object write path: the `wyrd s3` gateway is still standalone
+/// (#454) and nothing yet writes cluster metadata into TiKV for the custodian to
+/// repair (#455).
+fn run_deploy_small_multi_node() -> Result<(), String> {
+    let compose = workspace_root().join("deploy/small-multi-node/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    if !docker_available() {
+        if is_ci() {
+            return Err(
+                "docker is not available but is required for the small-multi-node bring-up".into(),
+            );
+        }
+        eprintln!(
+            "warning: docker not available; skipping the small-multi-node bring-up locally. \
+             Install Docker (and the compose plugin) to run it."
+        );
+        return Ok(());
+    }
+
+    small_multi_node_compose(&compose, &["up", "-d"])?;
+    let result = SMALL_MULTI_NODE_ENDPOINTS
+        .iter()
+        .try_for_each(|endpoint| wait_for_port(endpoint));
+    // Always tear the stack down, even on failure — a run never leaks containers.
+    let _ = small_multi_node_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    result?;
+    println!(
+        "\nxtask deploy-small-multi-node: the 3-node etcd ensemble + 3-node PD ensemble + \
+         3-node TiKV + 9 D servers + 3 S3 gateways are all accepting connections \
+         (custodians run without a published port)"
+    );
+    Ok(())
+}
+
+/// Run a `docker compose -p <SMALL_MULTI_NODE_PROJECT> -f <file> …` command from the
+/// workspace root, echoing it first. Mirrors `tikv_compose`.
+fn small_multi_node_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", SMALL_MULTI_NODE_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
+}
+
+/// Poll `host:port` until a TCP connection succeeds (PD is accepting clients), up to
+/// ~30s. A bounded readiness gate so the test does not race the container's start.
+fn wait_for_port(endpoint: &str) -> Result<(), String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let addr = endpoint
+        .to_socket_addrs()
+        .map_err(|e| format!("could not resolve `{endpoint}`: {e}"))?
+        .next()
+        .ok_or_else(|| format!("`{endpoint}` resolved to no addresses"))?;
+    loop {
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "PD at `{endpoint}` did not accept connections within 30s"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Run a `docker compose -p <TIKV_PROJECT> -f <file> …` command from the workspace
+/// root, echoing it first.
+fn tikv_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", TIKV_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
 }
 
 /// Resolve the Tier-2 D-server count from a raw `WYRD_DSERVER_COUNT` value. An
@@ -404,6 +856,11 @@ const STATICS_SCAN_CRATES: &[&str] = &[
     "crates/testkit",
     "crates/custodian",
     "crates/coordination-mem",
+    // Now DST-reachable via `crates/dst/tests/coordination.rs`, which drives the
+    // etcd store over the madsim etcd simulator (#365) — so it falls under the
+    // ADR-0035 rule. It holds no process-global mutable state (only a `Mutex`
+    // FIELD), so the scan passes.
+    "crates/coordination-etcd",
     "crates/chunkstore-fs",
     "crates/chunkstore-grpc",
     "crates/chunk-format",
@@ -525,33 +982,141 @@ fn run_statics() -> Result<(), String> {
     }
 }
 
-/// The full CI gate (ADR-0009). Each step runs in workspace order; the first
-/// failure stops the run.
-fn run_ci() -> Result<(), String> {
+/// ADR-0010: no workspace crate may import an orchestrator/k8s API — the structural
+/// guard the `deploy/` bring-up (M4.5, #256) depends on ("makes it hard for
+/// orchestrator coupling to sneak into a component"). Scans every `.rs` file under
+/// `crates/` via the shared `xtask::deploy_guard::scan_dir` (the SAME function
+/// `xtask/tests/deploy_no_orchestrator_coupling.rs` drives over a planted fixture,
+/// proving it load-bearing rather than resting red on non-existence).
+fn run_orchestrator_guard() -> Result<(), String> {
+    print_step(&[
+        "xtask",
+        "deploy-guard",
+        "(ADR-0010 no-orchestrator-coupling gate)",
+    ]);
+    let violations = xtask::deploy_guard::scan_dir(&workspace_root().join("crates"));
+    if violations.is_empty() {
+        println!("xtask deploy-guard: no workspace crate imports an orchestrator API (ADR-0010)");
+        Ok(())
+    } else {
+        Err(format!(
+            "ADR-0010 violation — a crate imports an orchestrator/k8s API, breaking the \
+             deployment-substrate pluggability invariant (\"Kubernetes is available, never \
+             required\"):\n  {}\nMove the coupling behind a seam (peers are discovered \
+             through L5, never an orchestrator API), or if the dependency is genuinely \
+             needed, revisit ADR-0010 rather than working around it silently.",
+            violations.join("\n  ")
+        ))
+    }
+}
+
+/// The dedicated `cargo check --features …` runs `run_ci` makes to type-check
+/// feature-gated code the default `--workspace` build never compiles.
+///
+/// `run_ci`'s `build`/`test`/`clippy` all run `--workspace` with **default**
+/// features. `--all-targets` widens the *target kinds* (bins, tests, benches) but
+/// **not the feature set**, so any `#[cfg(feature = "…")]` body that is off by
+/// default is compiled by **none** of those steps — a type error inside it passes
+/// the whole gate silently.
+///
+/// The M4.6 (#257) Tier-1/Tier-2 metadata scenarios
+/// (`crates/metadata-tikv/tests/tier1_metadata_consistency.rs`,
+/// `tier2_metadata_io.rs`) are exactly this shape: their live bodies — the
+/// `SymmetricPartition` fault, its `Drop` heal, the PD-side fault-effect oracle,
+/// and the `partition_took_effect` / `heal_is_complete` / `consistency_passes`
+/// wiring — sit behind `#[cfg(feature = "tikv")]` (off by default so the gate stays
+/// container-free). Without this check a regression in that off-Check live scenario
+/// flips no Check artifact. This step compiles and type-checks it in the whole-tree
+/// gate (it does not *run* it — the `#[ignore]`d scenario still needs a real cluster).
+///
+/// **Gated on the TiKV build toolchain** (`tikv_toolchain_available`): these
+/// steps compile the pre-1.0 `tikv-client` tree (grpcio/protoc), which the default
+/// container-free / offline `cargo xtask ci` must **never** touch
+/// (`crates/metadata-tikv/Cargo.toml`: `tikv` is off by default precisely so the
+/// gate stays green on a laptop or PDCA worktree with no TiKV toolchain). The
+/// privileged Tier CI job that owns the live Tier-1/Tier-2 legs opts in by setting
+/// `WYRD_TIKV_TOOLCHAIN`; `run_ci_steps` only emits these steps when it is set.
+///
+/// Returned as data (not inlined into `run_ci_steps`) so the wiring is
+/// unit-testable: `tests::ci_type_checks_feature_gated_metadata_scenario` drives
+/// `run_ci_steps` with a recording executor, so removing this step OR removing the
+/// toolchain gate flips it red.
+fn feature_gated_checks() -> Vec<Vec<&'static str>> {
+    vec![vec![
+        "check",
+        "-p",
+        "wyrd-metadata-tikv",
+        "--features",
+        "tikv",
+        "--tests",
+    ]]
+}
+
+/// Whether the TiKV build toolchain (and thus the `tikv` feature's grpcio/protoc
+/// build dependencies) is declared available. **Off by default**: a plain
+/// `cargo xtask ci` on a laptop or a PDCA worktree with no TiKV toolchain must
+/// never compile or audit the pre-1.0 `tikv-client` tree
+/// (`crates/metadata-tikv/Cargo.toml`) — the documented container-free/offline CI
+/// invariant. The privileged Tier CI/eval job that owns the live Tier-1/Tier-2
+/// legs sets `WYRD_TIKV_TOOLCHAIN=1` to opt the feature-gated type-check in.
+fn tikv_toolchain_available() -> bool {
+    std::env::var_os("WYRD_TIKV_TOOLCHAIN").is_some()
+}
+
+/// The ordered `cargo` steps of the CI gate, executed via the injected `exec`
+/// (`run_ci` passes `cargo`; the unit test passes a recording closure so the real
+/// wiring is exercised without spawning `cargo`). `tikv_toolchain` gates the
+/// feature-gated metadata check: it is emitted **only** when the TiKV build
+/// toolchain is declared present (`WYRD_TIKV_TOOLCHAIN`), so the default no-TiKV
+/// `cargo xtask ci` never compiles the pre-1.0 `tikv-client` tree
+/// (`crates/metadata-tikv/Cargo.toml`) and stays green offline.
+fn run_ci_steps(
+    tikv_toolchain: bool,
+    exec: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+) -> Result<(), String> {
     // `wyrd-dst` only compiles under `--cfg madsim`; it is excluded from the
-    // normal workspace commands and built solely by `run_dst` below.
-    cargo(&["fmt", "--all", "--", "--check"])?;
+    // normal workspace commands and built solely by `run_dst`.
+    exec(&["fmt", "--all", "--", "--check"])?;
     // Lint levels (incl. warnings-as-errors) come from `[workspace.lints]` in
     // the root Cargo.toml — the single source of truth — not a CLI flag here.
-    cargo(&[
+    exec(&[
         "clippy",
         "--workspace",
         "--exclude",
         "wyrd-dst",
         "--all-targets",
     ])?;
-    cargo(&[
+    exec(&[
         "build",
         "--workspace",
         "--exclude",
         "wyrd-dst",
         "--all-targets",
     ])?;
-    cargo(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
+    exec(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
+    // Type-check the feature-gated metadata Tier scenario bodies the default
+    // `--workspace` build skips (`--all-targets` selects target KINDS, not
+    // features, so a `#[cfg(feature = "tikv")]` body slips through). GATED on the
+    // TiKV toolchain: compiling the pre-1.0 `tikv-client` tree is opt-in via
+    // `WYRD_TIKV_TOOLCHAIN` (the privileged Tier CI job) so the default offline
+    // gate stays container-free (M4.6, #257).
+    if tikv_toolchain {
+        for check in feature_gated_checks() {
+            exec(&check)?;
+        }
+    }
+    Ok(())
+}
+
+/// The full CI gate (ADR-0009). Each step runs in workspace order; the first
+/// failure stops the run.
+fn run_ci() -> Result<(), String> {
+    run_ci_steps(tikv_toolchain_available(), &mut |args| cargo(args))?;
     cargo_machete_check()?;
     cargo_deny_check()?;
     run_conformance()?;
     run_statics()?;
+    run_orchestrator_guard()?;
     run_dst()?;
     println!("\nxtask ci: all checks passed");
     Ok(())
@@ -766,6 +1331,53 @@ mod tests {
             *order.borrow(),
             vec!["capture_logs", "teardown"],
             "diagnostics must be captured before teardown destroys them",
+        );
+    }
+
+    // M4.6 (#257): exercise `run_ci`'s REAL wiring (via `run_ci_steps`, the sole
+    // cargo-step source `run_ci` iterates) with a recording executor — no `cargo`
+    // spawned — and assert the invocations it actually makes. This is not the
+    // iter-10 tautology (which restated the `feature_gated_checks` constant and
+    // stayed green if the wiring loop was deleted): here removing the step from the
+    // wiring OR making the gate unconditional flips a case red.
+    #[test]
+    fn ci_type_checks_feature_gated_metadata_scenario() {
+        // Drive run_ci's cargo wiring, recording every argv it invokes.
+        fn recorded_invocations(tikv_toolchain: bool) -> Vec<String> {
+            let mut calls = Vec::new();
+            run_ci_steps(tikv_toolchain, &mut |args| {
+                calls.push(args.join(" "));
+                Ok(())
+            })
+            .expect("recording executor never errors");
+            calls
+        }
+        let is_metadata_feature_check = |c: &String| {
+            c.starts_with("check ")
+                && c.contains("-p wyrd-metadata-tikv")
+                && c.contains("--features tikv")
+                && c.contains("--tests")
+        };
+
+        // Toolchain present → run_ci INVOKES the metadata feature check, so the
+        // #[cfg(feature = "tikv")] Tier-1/Tier-2 scenario bodies (SymmetricPartition,
+        // the PD oracle, the testkit-oracle wiring) are type-checked at Check.
+        let with_toolchain = recorded_invocations(true);
+        assert!(
+            with_toolchain.iter().any(is_metadata_feature_check),
+            "run_ci must invoke `cargo check -p wyrd-metadata-tikv --features tikv --tests` \
+             when the TiKV toolchain is present, so the feature-gated metadata Tier scenario \
+             bodies are type-checked at Check: {with_toolchain:?}"
+        );
+
+        // Gate honesty: toolchain absent (a laptop / PDCA worktree) → run_ci must
+        // NOT compile the pre-1.0 `tikv-client` tree — the container-free/offline
+        // CI invariant. Making the step unconditional flips this red.
+        let without_toolchain = recorded_invocations(false);
+        assert!(
+            !without_toolchain.iter().any(is_metadata_feature_check),
+            "the default no-TiKV `cargo xtask ci` must not compile the tikv feature tree \
+             (WYRD_TIKV_TOOLCHAIN unset): {without_toolchain:?}"
         );
     }
 

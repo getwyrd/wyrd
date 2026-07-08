@@ -178,9 +178,11 @@ pub struct DServer<S> {
 
 impl<S: ChunkStore + 'static> DServer<S> {
     /// Bind the gRPC listener on `bind` (use port 0 for an ephemeral port) over
-    /// `store`. The advertised endpoint is derived from the bound address; NAT /
-    /// split-horizon advertisement is a later deployment concern. The server starts
-    /// with a default stable id and the default failure domain; set them with
+    /// `store`. The advertised endpoint defaults to the bound address (today's
+    /// loopback behaviour); a wildcard/NAT'd/containerized bind can override it with
+    /// [`with_advertise_addr`](DServer::with_advertise_addr) — split-horizon
+    /// advertisement, decoupled from the listen socket. The server starts with a
+    /// default stable id and the default failure domain; set them with
     /// [`with_identity`](DServer::with_identity) before registering.
     pub async fn bind(store: S, bind: SocketAddr) -> Result<Self> {
         let listener = TcpListener::bind(bind).await?;
@@ -202,6 +204,19 @@ impl<S: ChunkStore + 'static> DServer<S> {
     pub fn with_identity(mut self, id: DServerId, failure_domain: impl Into<String>) -> Self {
         self.id = id;
         self.failure_domain = failure_domain.into();
+        self
+    }
+
+    /// Override the endpoint this server **registers** for discovery to `advertise`
+    /// (host:port — a routable DNS service name or NAT-mapped address), decoupling
+    /// the registration record from the bound socket address `bind` derived it from.
+    /// This is what lets a server bound to a wildcard/loopback address (a
+    /// containerized `--bind 0.0.0.0:PORT`) still publish an endpoint its consumers
+    /// can actually dial, instead of the un-dialable wildcard/ephemeral bind value
+    /// (the split-horizon advertisement gap this closes). Unset, the endpoint stays
+    /// the bound-address value `bind` set (today's loopback behaviour, preserved).
+    pub fn with_advertise_addr(mut self, advertise: impl Into<String>) -> Self {
+        self.endpoint = format!("http://{}", advertise.into());
         self
     }
 

@@ -17,7 +17,10 @@ redb.workspace = true
 [dev-dependencies]
 # The conformance/property tests exercise the model (core) against a real redb
 # store, driven by pollster (sync redb never yields) and seeded by testkit.
+# The generic trait-contract assertions come from the SHARED suite both backends
+# drive (proposal 0007, M4.1) — not a redb-local fork.
 wyrd-core.workspace = true
+wyrd-metadata-conformance.workspace = true
 wyrd-testkit.workspace = true
 pollster.workspace = true
 

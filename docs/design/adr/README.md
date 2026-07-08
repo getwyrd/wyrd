@@ -54,6 +54,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0040](0040-mixed-era-placement-expansion.md) | Mixed-era placement expansion: one identity-fallback rule, liberal read / strict maintenance (refines proposal 0005 §placement) | Accepted |
 | [0041](0041-consistency-checker-substrate.md) | Consistency-checker foundation: model the mutable metadata register, not the immutable data path (refines the ADR-0039 deferral; unblocks #329) | Accepted |
 | [0042](0042-production-metadata-backend-reevaluation.md) | Production metadata backend: adopt **FoundationDB** for the distributed slot (two-slot design + `redb` embedded + durability-scheme decision carried forward), two named liabilities each mitigated, TiKV then YugabyteDB as ranked fallback; the #257 battery gates deployment (supersedes ADR-0008) | Accepted |
+| [0043](0043-testing-fixture-profiles.md) | Testing fixture profiles: one minimal container topology per test class; root compose removed | Accepted |
 | [0044](0044-provisional-conformance-pins.md) | Provisional pins in the shared conformance suite: mark, don't gate (governs the multi-backend `MetadataStore` contract; refines ADR-0006) | Proposed |
 | [0045](0045-metadata-validation-boundaries.md) | Metadata validation boundaries: parse-don't-validate at decode, liberal read / strict maintenance (generalizes ADR-0040's posture across all metadata) | Proposed |
 

@@ -12,6 +12,23 @@ publish.workspace = true
 name = "wyrd"
 path = "src/main.rs"
 
+[features]
+# OFF by default (ADR-0014: redb is the dev/single-binary default). The `tikv`
+# feature composes the production TiKV metadata backend behind the unchanged
+# `MetadataStore` seam; it forwards to `metadata-tikv`'s own OFF-by-default `tikv`
+# feature (mirror of metadata-tikv/Cargo.toml:11-20), so the DEFAULT build never
+# pulls the pre-1.0 `tikv-client` tree and `cargo xtask ci` / `cargo deny` stay
+# green with no TiKV. The tikv selection arm in `cli.rs` is itself `#[cfg]`-gated,
+# so it is compiled OUT of the default Check build (proposal 0015 slice 4).
+default = []
+tikv = ["dep:wyrd-metadata-tikv", "wyrd-metadata-tikv/tikv"]
+# The `etcd` feature composes the production etcd-backed L5 Coordination behind the
+# unchanged `Coordination` seam (ADR-0006, #365); it forwards to
+# `coordination-etcd`'s own OFF-by-default `etcd` feature, so the DEFAULT build
+# never pulls the `etcd-client` tree (which needs `protoc`) and `ci` stays green.
+# The etcd selection arm in `cli.rs` is `#[cfg]`-gated out of the default build.
+etcd = ["dep:wyrd-coordination-etcd", "wyrd-coordination-etcd/etcd"]
+
 [dependencies]
 # `server` is the one crate that knows concretes (ADR-0010): it wires the redb
 # metadata store, the filesystem chunk store, and the in-memory coordination
@@ -19,13 +36,46 @@ path = "src/main.rs"
 wyrd-core.workspace = true
 wyrd-traits.workspace = true
 wyrd-metadata-redb.workspace = true
+# The production metadata backend, wired only under the OFF-by-default `tikv`
+# feature above — optional so the default build never compiles the tikv tree.
+wyrd-metadata-tikv = { workspace = true, optional = true }
 wyrd-chunkstore-fs.workspace = true
 # The networked-storage profile: the gRPC ChunkStore client/server (M2.2) and the
 # tokio runtime that hosts the `d-server` role. tokio is a server-binary host
 # detail; Wyrd's core stays runtime-agnostic (ADR-0009).
 wyrd-chunkstore-grpc.workspace = true
 wyrd-coordination-mem.workspace = true
+# The deployable `wyrd custodian` role (observability floor, proposal 0010 item 2):
+# `server` is the one crate that wires concretes (ADR-0010), so it owns the runnable
+# custodian process — it depends on the `custodian` maintenance plane and installs the
+# shared `telemetry` handle it runs the leader-elected loop through.
+wyrd-custodian.workspace = true
+wyrd-telemetry.workspace = true
+# The custodian role's D-server connector seam (`DServerConnector`) is an object-safe
+# async trait (the gRPC dial abstracted so the fleet assembly is testable), so `server`
+# needs `async-trait` at build time, not just for tests.
+async-trait.workspace = true
+# The custodian role installs the telemetry metrics bridge on a `tracing` subscriber
+# and runs the fenced reconciliation loop through it (ADR-0011/0012).
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# The client-facing gateway seam and its S3 wire surface (issue #364, T5-a). The wire
+# layer is its OWN crate, generic over `ObjectGateway` (which `Gateway` implements) — so
+# the S3 protocol never calcifies in this composition root. `cli::cmd_s3` binds the
+# listener; the axum/hmac/SigV4 machinery lives in `gateway-s3`, not here.
+wyrd-gateway-core.workspace = true
+wyrd-gateway-s3.workspace = true
+# The production L5 Coordination backend, wired only under the OFF-by-default
+# `etcd` feature above — optional so the default build never compiles the etcd tree.
+wyrd-coordination-etcd = { workspace = true, optional = true }
 bytes.workspace = true
+# Stream combinators for the streaming PUT body adapter (map/StreamExt) and the
+# `HashingSource` wrapper — `alloc`-only, the same runtime-agnostic dep core uses.
+futures-util.workspace = true
+# Vetted RustCrypto SHA-256 for the streaming PUT body hash (issue #364, carry-forward
+# T5-a): the running digest checked against the wire layer's authenticated content hash
+# before commit. MIT OR Apache-2.0, already deny.toml-allowed.
+sha2.workspace = true
 pollster.workspace = true
 # The D-server registration record (`{ id, endpoint, failure-domain label }`,
 # proposal 0005 "The placement record") is serialized into the coordination value.
@@ -44,9 +94,19 @@ tower.workspace = true
 wyrd-chunk-format.workspace = true
 wyrd-testkit.workspace = true
 tempfile.workspace = true
-# A fault-injecting ChunkStore fake (a hanging/down D server) for the any-k read
-# fan-out test (M2.5).
-async-trait.workspace = true
+# `test-util` adds the `start_paused` virtual clock so the alloc_inode budget test
+# auto-advances through its backoff sleeps instead of waiting the real budget.
+# Dev-only — dev-dependencies are not compiled into the production binary, so the
+# runtime tokio feature set is unchanged.
+tokio = { workspace = true, features = ["test-util"] }
+# The aws-sdk-s3 client + smithy runtime drive the S3 wire surface's real-SDK interop
+# test (issue #364). `async-trait` (used by the M2.5 fault-fake) is a normal dependency
+# above now — the custodian role needs it at build time — so it is not repeated here.
+aws-sdk-s3 = { version = "1.137.0", default-features = false, features = ["rt-tokio", "http-1x"] }
+aws-smithy-http-client = { version = "1.1.13", default-features = false, features = ["default-client"] }
+aws-smithy-runtime-api = { version = "1.12.3", features = ["client", "http-1x"] }
+aws-smithy-types = "1.5.0"
+aws-credential-types = "1.2.14"
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

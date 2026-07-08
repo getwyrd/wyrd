@@ -1,0 +1,56 @@
+[package]
+name = "wyrd-metadata-tikv"
+description = "TiKV-backed MetadataStore implementation: the distributed, production metadata backend (ADR-0008), behind the unchanged MetadataStore trait. Wired in by `server`; skeleton in M4.1 (proposal 0007)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# OFF by default (M4.1). The real backend pulls in the pre-1.0 `tikv-client` tree
+# whose ADR-0003 three-test audit + `deny.toml` allowlist review is a NEEDS-HUMAN
+# (INTEGRATION §4), and building it needs a networked toolchain. Keeping it off by
+# default means the workspace `cargo xtask ci` on a machine with no TiKV compiles
+# this crate as an empty skeleton, never touches the `tikv-client` tree, and stays
+# green — while the dedicated `xtask tikv-conformance` job turns the feature on and
+# drives the shared suite against the throwaway `deploy/` TiKV.
+default = []
+tikv = ["dep:tikv-client", "dep:tokio", "dep:async-trait", "dep:bytes"]
+
+[dependencies]
+wyrd-traits.workspace = true
+# All backend deps are optional and pulled in only by the `tikv` feature (ADR-0016:
+# a concrete backend depends on `traits` + its own backend client + runtime, never
+# on `core` or a sibling concrete).
+tikv-client = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The conformance test drives the SHARED trait-contract suite (proposal 0007,
+# M4.1) — the same one redb drives — and needs a tokio runtime to host the
+# networked store when the `tikv` feature is on.
+wyrd-metadata-conformance.workspace = true
+# The contention property tests (M4.2, #253) fan N concurrent `commit`s at one
+# shared namespace with `join_all` to force a server-side write-write race; used
+# only under `--features tikv` (endpoint-gated, like the conformance test).
+futures-util.workspace = true
+# The M4.6 (#257) Tier-1 consistency-over-the-swap scenario uses the metadata fault
+# seam (quorum/reachability arithmetic + the peer-side partition fault-effect oracle
+# `partition_took_effect`/`heal_is_complete`, wired into the live scenario) and Tier-2
+# uses `converged_exactly_once`. Test-only; no `src` dependency (proposal 0015 §"DST
+# and tests", PR-sequence item 6).
+wyrd-testkit.workspace = true
+
+# `tikv-client` is used only under the `tikv` feature; keep cargo-machete quiet on
+# the default (feature-off) scan, where the optional deps look unreferenced.
+[package.metadata.cargo-machete]
+ignored = ["tikv-client", "tokio", "async-trait", "bytes"]
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

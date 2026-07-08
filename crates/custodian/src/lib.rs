@@ -28,7 +28,6 @@ pub mod rebalance;
 pub mod reconciliation;
 pub mod reconstruction;
 pub mod scrub;
-pub mod telemetry;
 
 pub use backfill::BackfillContext;
 pub use desired_state::{
@@ -41,7 +40,10 @@ pub use rebalance::RebalanceContext;
 pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
 pub use reconstruction::{repair_priority, ReconstructionContext};
 pub use scrub::ScrubContext;
-pub use telemetry::{DurabilityTelemetry, ExporterConfig, TelemetryError};
+// The durability-plane telemetry seam now lives in the shared `wyrd-telemetry` crate
+// (observability floor, proposal 0010 item 1); re-exported so M3 consumers that name
+// `wyrd_custodian::DurabilityTelemetry` keep compiling unchanged.
+pub use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig, TelemetryError};
 
 /// The failure-domain-aware **selector** the custodian places against — it lives in
 /// `core` so it is the *same* selector the write fan-out uses (`0005:241-242`), and

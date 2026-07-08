@@ -101,7 +101,7 @@ fn reader_sees_old_or_new_version_never_a_hybrid() {
         write::intent(&meta, &plan2, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan2).await.unwrap();
         assert_eq!(
-            write::commit_overwrite(&meta, 1, &v1, &plan2)
+            write::commit_overwrite(&meta, 1, &v1, &plan2, 0)
                 .await
                 .unwrap(),
             CommitOutcome::Committed
