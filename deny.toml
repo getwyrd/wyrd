@@ -35,6 +35,14 @@ allow = [
     # hasher — reaches us transitively through the tonic/hyper gRPC stack (M2.1).
     # A deliberate addition (ADR-0003 §2).
     "Zlib",
+    # Permissive (OSI-approved, GPL-compatible; the "simplified BSD-2-Clause"
+    # in substance). libloading v0.8.9 reaches us as a BUILD-time dependency of
+    # the FoundationDB metadata backend (ADR-0042, M4): foundationdb-sys ->
+    # (build) bindgen -> clang-sys -> libloading, which dlopen()s libclang to
+    # generate the libfdb_c FFI bindings. No ISC-licensed code is linked into a
+    # shipped Wyrd binary. `ring` (Apache-2.0 AND ISC), behind the tikv-client
+    # tree, needs it too. A deliberate addition (ADR-0003 §2).
+    "ISC",
 ]
 confidence-threshold = 0.9
 

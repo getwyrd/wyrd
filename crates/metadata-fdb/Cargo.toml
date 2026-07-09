@@ -1,0 +1,52 @@
+[package]
+name = "wyrd-metadata-fdb"
+description = "FoundationDB-backed MetadataStore implementation: the production distributed metadata backend (ADR-0042, superseding ADR-0008), behind the unchanged MetadataStore trait. Composition, not a refactor (ADR-0010)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+# OFF by default, exactly like `wyrd-metadata-tikv`'s `tikv` feature
+# (`crates/metadata-tikv/Cargo.toml:11-20`). The real backend links `libfdb_c` at
+# BUILD time — the `foundationdb` crate is a binding over the FDB C client — so a
+# machine without it could not compile this crate at all if the feature were on by
+# default. Off by default means the workspace `cargo xtask ci` on a machine with no
+# FDB compiles this crate as a dependency-free skeleton (the `classify` module still
+# builds and its unit tests still run), never links `libfdb_c`, and stays green —
+# while the dedicated `xtask fdb-conformance` job turns the feature on and drives the
+# shared suite against the throwaway `deploy/` fdbserver.
+default = []
+fdb = ["dep:foundationdb", "dep:tokio", "dep:async-trait", "dep:bytes"]
+
+[dependencies]
+wyrd-traits.workspace = true
+# All backend deps are optional and pulled in only by the `fdb` feature (ADR-0016:
+# a concrete backend depends on `traits` + its own backend client + runtime, never
+# on `core` or a sibling concrete).
+foundationdb = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The conformance test drives the SHARED trait-contract suite — the same `run_all`
+# redb and TiKV drive — and needs a tokio runtime to host the networked store when
+# the `fdb` feature is on.
+wyrd-metadata-conformance.workspace = true
+# `tests/contention.rs` fans concurrent `commit`s at one shared key with `join_all`
+# to force a server-side conflict; used only under `--features fdb` (cluster-file
+# gated, like the conformance test).
+futures-util.workspace = true
+
+# `foundationdb` and the runtime deps are used only under the `fdb` feature; keep
+# cargo-machete quiet on the default (feature-off) scan, where they look unreferenced.
+[package.metadata.cargo-machete]
+ignored = ["foundationdb", "tokio", "async-trait", "bytes"]
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true
