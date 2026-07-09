@@ -14,8 +14,8 @@
 //! (RFC 5737 TEST-NET-1: routable-looking, guaranteed to answer nothing) and asserts the
 //! production `get` and `commit` return `Err` promptly. Every case is wrapped in
 //! [`WALL_CLOCK_GUARD`], so a regression that drops the deadline **fails the test** rather
-//! than hanging the run: without `trx`'s `set_option` these tests do not merely mis-assert,
-//! they never return.
+//! than hanging the run: without `trx`'s `set_option` these tests do not merely fail an
+//! assertion, they never return at all.
 //!
 //! What each case pins, beyond "it returns":
 //!
