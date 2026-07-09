@@ -73,6 +73,28 @@
 //! drive the *production* retry loop and its retry gate with a real `FdbError`, rather than
 //! by a live test that could only re-assert the pure classifier.
 //!
+//! # Every operation terminates
+//!
+//! FoundationDB's C client has **no** timeout by default and never gives up on a cluster it
+//! cannot reach — it retries the connection forever, so an awaited `get`, `get_range` or
+//! `commit` future simply never resolves. A wrong cluster file or an FDB outage would hang a
+//! metadata operation rather than fail it. So `store`'s `trx` — the one place a transaction
+//! is created — puts a deadline on every transaction
+//! ([`config::DEFAULT_TRANSACTION_TIMEOUT_MS`], overridable via
+//! [`config::TRANSACTION_TIMEOUT_ENV`]); `crates/metadata-fdb/tests/timeout.rs` drives the
+//! production `get` and `commit` against an unreachable cluster and fails if either hangs.
+//!
+//! The deadline sits **above** FoundationDB's own five-second transaction envelope, on
+//! purpose. A transaction that reached the cluster dies at five seconds with `1007
+//! transaction_too_old` — retryable, and definitively *not* committed. The deadline instead
+//! yields `1031 transaction_timed_out` ([`classify::TRANSACTION_TIMED_OUT`]), which FDB's own
+//! guide says carries *no* guarantee: the commit may have been sent and may land later. Ours
+//! is the worse error, so FDB's is given every chance to win the race, and 1031 fires only
+//! when the client cannot reach the cluster at all. When it does fire on a commit it joins
+//! 1021 in [`classify::CommitUnknownResult`] — never retried, never `Conflict` — and
+//! [`classify::CommitUnknownResult::may_still_commit`] tells the two apart, because after
+//! 1021 a re-read settles the outcome and after 1031 it does not.
+//!
 //! # `scan`: completeness or fail loud
 //!
 //! The prefix `scan` reads its bounded range inside one transaction, following FDB's
@@ -130,6 +152,25 @@ pub mod classify {
     /// guaranteed idempotent, so a blind retry can double-apply) and **never** `Conflict`.
     pub const COMMIT_UNKNOWN_RESULT: i32 = 1021;
 
+    /// FDB error `1031 transaction_timed_out`: the transaction outlived the deadline this
+    /// driver sets on every transaction it creates
+    /// ([`crate::config::DEFAULT_TRANSACTION_TIMEOUT_MS`]).
+    ///
+    /// On the **commit** path this is an undeterminable outcome, exactly like
+    /// [`COMMIT_UNKNOWN_RESULT`] — and **strictly weaker**. FoundationDB's own guide is
+    /// explicit that a timed-out transaction lacks the one guarantee `commit_unknown_result`
+    /// gives: *"if the commit has already been sent to the database, the transaction could
+    /// get committed at a later point in time"*
+    /// (<https://apple.github.io/foundationdb/developer-guide.html#transactions-with-unknown-results>).
+    /// Where 1021 promises the transaction is out of flight, 1031 promises nothing. So it is
+    /// **never** retried and **never** `Conflict`.
+    ///
+    /// It is only reachable because this driver bounds every transaction in time. Without a
+    /// timeout FoundationDB's C client waits for an unreachable cluster forever, so a
+    /// metadata `get` / `scan` / `commit` would hang rather than return `Err` — the deadline
+    /// buys termination, and this error code is its price.
+    pub const TRANSACTION_TIMED_OUT: i32 = 1031;
+
     /// What a failed FDB commit means in terms of the `MetadataStore` commit contract
     /// (`crates/traits/src/lib.rs:346-350`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,11 +190,11 @@ pub mod classify {
     ///
     /// Order is load-bearing:
     ///
-    /// 1. **1021 first.** `commit_unknown_result` is `UnknownResult` for *every* batch,
-    ///    conditional or not. It is not a lost race — the write may well have landed — so
-    ///    reporting it as `Conflict` would tell a CAS caller "nothing was written" when
-    ///    something may have been, and retrying it could double-apply a non-idempotent
-    ///    batch.
+    /// 1. **The undeterminable outcomes first.** `1021 commit_unknown_result` and `1031
+    ///    transaction_timed_out` are `UnknownResult` for *every* batch, conditional or not.
+    ///    Neither is a lost race — the write may well have landed — so reporting either as
+    ///    `Conflict` would tell a CAS caller "nothing was written" when something may have
+    ///    been, and retrying it could double-apply a non-idempotent batch.
     /// 2. **1020 only when `conditional`.** A conditional batch that loses a race on a
     ///    `require`d key is the trait's `Conflict`; the caller re-reads and retries (e.g.
     ///    `alloc_inode`'s budgeted backoff loop, `crates/server/src/cli.rs:1027-1049`). A
@@ -161,9 +202,15 @@ pub mod classify {
     ///    meaningful answer: it stays `Fault` (`Err`), and the caller *sees* the loss
     ///    instead of a `?`-only caller silently dropping the write.
     /// 3. Everything else is a `Fault`.
+    ///
+    /// Only *commit* errors reach here (the single callsite is `store`'s
+    /// `outcome_from_commit_error`, fed by `Transaction::commit`). That is what makes clause
+    /// 1 correct for 1031: a timeout raised while **reading** a precondition, before any
+    /// commit was sent, is a definite non-commit and is surfaced by `?` as a plain
+    /// `FdbError` without ever passing through this function.
     #[must_use]
     pub fn classify_commit_error(code: i32, conditional: bool) -> CommitClass {
-        if code == COMMIT_UNKNOWN_RESULT {
+        if code == COMMIT_UNKNOWN_RESULT || code == TRANSACTION_TIMED_OUT {
             return CommitClass::UnknownResult;
         }
         if conditional && code == NOT_COMMITTED {
@@ -172,17 +219,34 @@ pub mod classify {
         CommitClass::Fault
     }
 
-    /// A commit whose outcome FoundationDB could not determine (error
-    /// [`COMMIT_UNKNOWN_RESULT`]): the batch may or may not have been applied.
+    /// A commit whose outcome FoundationDB could not determine ([`COMMIT_UNKNOWN_RESULT`] or
+    /// [`TRANSACTION_TIMED_OUT`]): the batch may or may not have been applied.
     ///
     /// Surfaced as the store's `Err` — a **distinguishable** typed error a caller can
     /// downcast to — rather than retried, because a `WriteBatch` is not guaranteed
     /// idempotent (re-applying a blind `put` is harmless, but re-applying a batch that
     /// bumps a version counter is not, and the trait admits both).
+    ///
+    /// The two codes are not equally bad, so [`code`](Self::code) is carried rather than
+    /// discarded and [`may_still_commit`](Self::may_still_commit) reads the difference off
+    /// it: 1021 guarantees the transaction is no longer in flight, 1031 guarantees nothing.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct CommitUnknownResult {
         /// The FDB error code that reported the undeterminable outcome.
         pub code: i32,
+    }
+
+    impl CommitUnknownResult {
+        /// Whether the cluster may still apply this batch **after** the error was returned.
+        ///
+        /// `false` for [`COMMIT_UNKNOWN_RESULT`], whose guarantee is that the transaction is
+        /// already out of flight — so a re-read establishes the outcome once and for all.
+        /// `true` for [`TRANSACTION_TIMED_OUT`], where the commit may have been sent and may
+        /// land later: a re-read that sees nothing does **not** prove nothing will land.
+        #[must_use]
+        pub fn may_still_commit(self) -> bool {
+            self.code == TRANSACTION_TIMED_OUT
+        }
     }
 
     impl fmt::Display for CommitUnknownResult {
@@ -194,7 +258,16 @@ pub mod classify {
                  is not guaranteed idempotent — and it is not a Conflict; the caller must \
                  re-read to establish what happened.",
                 self.code,
-            )
+            )?;
+            if self.may_still_commit() {
+                write!(
+                    f,
+                    " The commit timed out rather than reporting an unknown result, so it \
+                     may still be applied AFTER this error: a re-read that observes nothing \
+                     does not prove the batch will never land.",
+                )?;
+            }
+            Ok(())
         }
     }
 
@@ -238,10 +311,28 @@ pub mod classify {
         }
 
         #[test]
+        fn a_timed_out_commit_is_an_unknown_result_for_every_batch() {
+            // The driver bounds every transaction in time, so a commit can time out. FDB
+            // gives a timed-out transaction *weaker* guarantees than 1021 — it may still
+            // land later — so it must never be `Conflict` (a CAS caller would retry a batch
+            // that may already have been applied) and never a bare `Fault` (which reads as
+            // a definite non-commit, like `2103 value_too_large`).
+            assert_eq!(
+                classify_commit_error(TRANSACTION_TIMED_OUT, true),
+                CommitClass::UnknownResult
+            );
+            assert_eq!(
+                classify_commit_error(TRANSACTION_TIMED_OUT, false),
+                CommitClass::UnknownResult
+            );
+        }
+
+        #[test]
         fn any_other_error_is_a_fault_for_every_batch() {
-            // 1007 transaction_too_old, 1031 transaction_timed_out, 1038 database_unavailable,
-            // 2103 value_too_large: faults, never conflicts, whatever the batch shape.
-            for code in [1007, 1031, 1038, 2103] {
+            // 1007 transaction_too_old, 1038 database_locked, 2103 value_too_large: faults,
+            // never conflicts, whatever the batch shape. Each is *definitively* not
+            // committed, which is what separates them from 1021 / 1031 above.
+            for code in [1007, 1038, 2103] {
                 assert_eq!(classify_commit_error(code, true), CommitClass::Fault);
                 assert_eq!(classify_commit_error(code, false), CommitClass::Fault);
             }
@@ -259,12 +350,37 @@ pub mod classify {
                 "states it refused to retry: {msg}"
             );
         }
+
+        #[test]
+        fn only_a_timeout_may_still_commit_after_the_error() {
+            // The distinction a caller acts on: after 1021 a re-read settles the question;
+            // after 1031 it does not, because the commit may still be in flight.
+            let unknown = CommitUnknownResult {
+                code: COMMIT_UNKNOWN_RESULT,
+            };
+            let timed_out = CommitUnknownResult {
+                code: TRANSACTION_TIMED_OUT,
+            };
+            assert!(!unknown.may_still_commit());
+            assert!(timed_out.may_still_commit());
+
+            let msg = timed_out.to_string();
+            assert!(msg.contains("1031"), "names the error code: {msg}");
+            assert!(
+                msg.contains("may still be applied"),
+                "states the weaker guarantee a re-read cannot settle: {msg}"
+            );
+            assert!(
+                !unknown.to_string().contains("may still be applied"),
+                "1021 keeps its stronger guarantee: {unknown}"
+            );
+        }
     }
 }
 
-/// Cluster-file configuration, owned by this driver's own constructor in this slice (no
-/// `server`-side selection arm exists yet). Pure input → output, so it is unit-tested with
-/// no FDB present.
+/// Cluster-file and transaction-deadline configuration, owned by this driver's own
+/// constructor in this slice (no `server`-side selection arm exists yet). Pure input →
+/// output, so it is unit-tested with no FDB present.
 pub mod config {
     /// The environment variable naming the FoundationDB cluster file.
     pub const CLUSTER_FILE_ENV: &str = "WYRD_FDB_CLUSTER_FILE";
@@ -272,6 +388,38 @@ pub mod config {
     /// Where FoundationDB's own packages install the cluster file; used when
     /// [`CLUSTER_FILE_ENV`] is unset or blank.
     pub const DEFAULT_CLUSTER_FILE: &str = "/etc/foundationdb/fdb.cluster";
+
+    /// The environment variable bounding how long one FoundationDB transaction may run,
+    /// in milliseconds. Unset, unparsable, or non-positive falls back to
+    /// [`DEFAULT_TRANSACTION_TIMEOUT_MS`].
+    pub const TRANSACTION_TIMEOUT_ENV: &str = "WYRD_FDB_TRANSACTION_TIMEOUT_MS";
+
+    /// FoundationDB's own transaction envelope: a transaction that has taken a read version
+    /// may not use it for longer than **five seconds**, after which the cluster fails it
+    /// with `1007 transaction_too_old` (the same envelope this crate's `with_scan_cap` docs
+    /// invoke). Not a knob — FDB's number, recorded here so
+    /// [`DEFAULT_TRANSACTION_TIMEOUT_MS`] can be justified against it.
+    pub const FDB_TRANSACTION_ENVELOPE_MS: i32 = 5_000;
+
+    /// The default deadline this driver puts on every transaction: **twice**
+    /// [`FDB_TRANSACTION_ENVELOPE_MS`].
+    ///
+    /// Deliberately above FDB's own envelope, and this is the whole of the reasoning. A
+    /// transaction that has *reached* the cluster dies at five seconds with `1007
+    /// transaction_too_old` — retryable, and definitively **not** committed. Our deadline
+    /// produces `1031 transaction_timed_out`
+    /// ([`crate::classify::TRANSACTION_TIMED_OUT`]), which promises nothing about whether
+    /// the batch landed. Setting the deadline *below* the envelope would race FDB's safe,
+    /// informative error and let the ambiguous one win; setting it above means 1031 fires
+    /// only when the client cannot reach the cluster at all — the hang this deadline exists
+    /// to end, and the one case where no better answer exists.
+    pub const DEFAULT_TRANSACTION_TIMEOUT_MS: i32 = 2 * FDB_TRANSACTION_ENVELOPE_MS;
+
+    /// The rule above, enforced at **compile time** rather than asserted in a test that a
+    /// future edit could delete: put the deadline under FDB's envelope and a slow — but
+    /// reachable — cluster starts reporting undeterminable commits (1031) where it used to
+    /// report retryable, definitively-not-committed ones (1007).
+    const _: () = assert!(DEFAULT_TRANSACTION_TIMEOUT_MS > FDB_TRANSACTION_ENVELOPE_MS);
 
     /// Resolve the cluster-file path from a raw [`CLUSTER_FILE_ENV`] value. An unset or
     /// whitespace-only value falls back to [`DEFAULT_CLUSTER_FILE`]; surrounding whitespace
@@ -281,6 +429,33 @@ pub mod config {
         match raw {
             Some(path) if !path.trim().is_empty() => path.trim().to_string(),
             _ => DEFAULT_CLUSTER_FILE.to_string(),
+        }
+    }
+
+    /// Resolve the per-transaction deadline from a raw [`TRANSACTION_TIMEOUT_ENV`] value.
+    /// Unset, blank, unparsable, or non-positive falls back to
+    /// [`DEFAULT_TRANSACTION_TIMEOUT_MS`] via [`sanitize_transaction_timeout_ms`].
+    #[must_use]
+    pub fn transaction_timeout_ms(raw: Option<String>) -> i32 {
+        raw.and_then(|v| v.trim().parse::<i32>().ok())
+            .map(sanitize_transaction_timeout_ms)
+            .unwrap_or(DEFAULT_TRANSACTION_TIMEOUT_MS)
+    }
+
+    /// Coerce a requested deadline into a *bounded* one.
+    ///
+    /// FoundationDB reads `timeout = 0` as **"disable all timeouts"**, and a negative value
+    /// is rejected outright. Both would restore the unbounded wait — a `get` against an
+    /// unreachable cluster never returning — so neither is an available choice here: the
+    /// deadline is a liveness constraint, not a tuning knob a caller may switch off. Same
+    /// register as `with_scan_cap`, which refuses to *raise* the scan cap. A caller who
+    /// wants a longer deadline may have one; a caller who wants none gets the default.
+    #[must_use]
+    pub fn sanitize_transaction_timeout_ms(ms: i32) -> i32 {
+        if ms > 0 {
+            ms
+        } else {
+            DEFAULT_TRANSACTION_TIMEOUT_MS
         }
     }
 
@@ -304,6 +479,51 @@ pub mod config {
         fn an_absent_or_blank_value_falls_back_to_the_package_default() {
             assert_eq!(cluster_file(None), DEFAULT_CLUSTER_FILE);
             assert_eq!(cluster_file(Some("   ".into())), DEFAULT_CLUSTER_FILE);
+        }
+
+        #[test]
+        fn an_explicit_transaction_timeout_wins() {
+            assert_eq!(transaction_timeout_ms(Some("250".into())), 250);
+            assert_eq!(transaction_timeout_ms(Some(" 60000 \n".into())), 60_000);
+        }
+
+        #[test]
+        fn an_absent_or_unparsable_timeout_falls_back_to_the_default() {
+            for raw in [
+                None,
+                Some(String::new()),
+                Some("   ".into()),
+                Some("soon".into()),
+            ] {
+                assert_eq!(transaction_timeout_ms(raw), DEFAULT_TRANSACTION_TIMEOUT_MS);
+            }
+        }
+
+        #[test]
+        fn zero_does_not_disable_the_timeout() {
+            // FDB reads `timeout = 0` as "disable all timeouts". Honouring it would hand
+            // back the unbounded wait: an operation against an unreachable cluster would
+            // hang forever instead of returning `Err`.
+            assert_eq!(
+                transaction_timeout_ms(Some("0".into())),
+                DEFAULT_TRANSACTION_TIMEOUT_MS
+            );
+            assert_eq!(
+                sanitize_transaction_timeout_ms(0),
+                DEFAULT_TRANSACTION_TIMEOUT_MS
+            );
+        }
+
+        #[test]
+        fn a_negative_timeout_does_not_disable_the_timeout() {
+            assert_eq!(
+                transaction_timeout_ms(Some("-1".into())),
+                DEFAULT_TRANSACTION_TIMEOUT_MS
+            );
+            assert_eq!(
+                sanitize_transaction_timeout_ms(i32::MIN),
+                DEFAULT_TRANSACTION_TIMEOUT_MS
+            );
         }
     }
 }
@@ -552,7 +772,7 @@ mod store {
     use async_trait::async_trait;
     use bytes::Bytes;
     use foundationdb::api::NetworkAutoStop;
-    use foundationdb::options::StreamingMode;
+    use foundationdb::options::{StreamingMode, TransactionOption};
     use foundationdb::{Database, FdbError, RangeOption, Transaction, TransactionCommitError};
     use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
 
@@ -660,23 +880,34 @@ mod store {
         prefix: Vec<u8>,
         /// Ceiling on the total results of one `scan`; see [`paging::SCAN_CAP`].
         scan_cap: usize,
+        /// Deadline applied to every transaction this store creates, in milliseconds; see
+        /// [`config::DEFAULT_TRANSACTION_TIMEOUT_MS`] and [`Self::trx`].
+        timeout_ms: i32,
     }
 
     impl FdbMetadataStore {
         /// Open the store against the cluster file named by
         /// [`config::CLUSTER_FILE_ENV`](crate::config::CLUSTER_FILE_ENV), falling back to
-        /// [`config::DEFAULT_CLUSTER_FILE`](crate::config::DEFAULT_CLUSTER_FILE).
+        /// [`config::DEFAULT_CLUSTER_FILE`](crate::config::DEFAULT_CLUSTER_FILE), with the
+        /// per-transaction deadline named by
+        /// [`config::TRANSACTION_TIMEOUT_ENV`](crate::config::TRANSACTION_TIMEOUT_ENV).
         ///
-        /// Cluster-file configuration is owned here, by the driver's own constructor: no
-        /// `server`-side selection arm exists yet (that is a later, blocked issue), so
-        /// there is nowhere else for it to live.
+        /// Configuration is owned here, by the driver's own constructor: no `server`-side
+        /// selection arm exists yet (that is a later, blocked issue), so there is nowhere
+        /// else for it to live.
         pub fn connect() -> Result<Self> {
-            Self::open(&config::cluster_file(
+            let store = Self::open(&config::cluster_file(
                 std::env::var(config::CLUSTER_FILE_ENV).ok(),
-            ))
+            ))?;
+            Ok(
+                store.with_transaction_timeout_ms(config::transaction_timeout_ms(
+                    std::env::var(config::TRANSACTION_TIMEOUT_ENV).ok(),
+                )),
+            )
         }
 
-        /// Open the store against an explicit `cluster_file` path.
+        /// Open the store against an explicit `cluster_file` path, with the default
+        /// per-transaction deadline ([`config::DEFAULT_TRANSACTION_TIMEOUT_MS`]).
         pub fn open(cluster_file: &str) -> Result<Self> {
             ensure_network();
             let db = Database::new(Some(cluster_file))?;
@@ -684,6 +915,7 @@ mod store {
                 db,
                 prefix: Vec::new(),
                 scan_cap: paging::SCAN_CAP,
+                timeout_ms: config::DEFAULT_TRANSACTION_TIMEOUT_MS,
             })
         }
 
@@ -714,13 +946,47 @@ mod store {
             self
         }
 
+        /// Set the deadline applied to every transaction this store creates.
+        ///
+        /// Non-positive values do **not** disable the deadline — FDB would read `0` as
+        /// "disable all timeouts", restoring the unbounded wait — they resolve to
+        /// [`config::DEFAULT_TRANSACTION_TIMEOUT_MS`]. See
+        /// [`config::sanitize_transaction_timeout_ms`].
+        ///
+        /// Lowering it is what makes the deadline *reachable by a test*: with a short
+        /// deadline `crates/metadata-fdb/tests/timeout.rs` drives the production `get` and
+        /// `commit` against an unreachable cluster and shows they return `Err` rather than
+        /// hanging.
+        #[must_use]
+        pub fn with_transaction_timeout_ms(mut self, timeout_ms: i32) -> Self {
+            self.timeout_ms = config::sanitize_transaction_timeout_ms(timeout_ms);
+            self
+        }
+
         fn physical(&self, key: &[u8]) -> Vec<u8> {
             keyspace::physical(&self.prefix, key)
         }
 
-        /// Begin a transaction against the cluster.
+        /// Begin a transaction against the cluster, **bounded in time**.
+        ///
+        /// Every `get`, `scan` and `commit` starts here, and the deadline is what makes each
+        /// of them terminate. FoundationDB's C client sets no timeout by default (`timeout`
+        /// defaults to `0`, "disable all timeouts") and does not give up on an unreachable
+        /// cluster: it retries the connection indefinitely, so an awaited `get`/`get_range`/
+        /// `commit` future simply never resolves. A wrong cluster file, a DNS failure or an
+        /// FDB outage would therefore hang a metadata operation forever rather than
+        /// surfacing `Err`. With the deadline set, the same operations fail with `1031
+        /// transaction_timed_out` ([`classify::TRANSACTION_TIMED_OUT`]).
+        ///
+        /// The option is `persistent` in FDB's own option table and is not cleared by
+        /// `on_error` at API version ≥ 610 (this crate binds 7.3), so it still bounds the
+        /// transaction across the `on_error` resets in `get`, `scan` and
+        /// [`blind_commit_loop`]. Worst case those loops run [`MAX_ATTEMPTS`] deadlines;
+        /// either way they terminate.
         fn trx(&self) -> Result<Transaction> {
-            Ok(self.db.create_trx()?)
+            let trx = self.db.create_trx()?;
+            trx.set_option(TransactionOption::Timeout(self.timeout_ms))?;
+            Ok(trx)
         }
 
         /// Read one bounded range to exhaustion inside a single `trx`, following FDB's

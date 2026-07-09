@@ -390,7 +390,7 @@ fn write_fdb_cluster_file() -> Result<String, String> {
 
 /// Run the FoundationDB test legs with the `fdb` feature on.
 ///
-/// Four legs, all of which must pass:
+/// Five legs, all of which must pass:
 ///
 /// * `--lib` — the driver's own unit tests. It needs no cluster, but it DOES need
 ///   `libfdb_c`, so it can only run here and not in `run_ci`. It carries the rules a live
@@ -402,9 +402,14 @@ fn write_fdb_cluster_file() -> Result<String, String> {
 /// * `contention` — the 1020 → `Conflict` classification and the blind-batch-`Err` rule.
 /// * `scan` — the at-scale paged-scan completeness proof AND the `SCAN_CAP` fail-loud rule
 ///   (the shared suite's scan clause stores three keys, so it reaches neither).
+/// * `timeout` — every operation terminates when the cluster is unreachable, and a timed-out
+///   commit is an undeterminable outcome rather than a `Conflict`. It ignores the cluster
+///   file entirely: it points its own at an unreachable coordinator, because the property is
+///   about the *absence* of a cluster. Its wall-clock guard turns a dropped transaction
+///   deadline into a failure instead of a hung job.
 fn run_fdb_conformance_test(cluster_file: &str) -> Result<(), String> {
     run_fdb_leg(&["--lib"], cluster_file)?;
-    for test in ["conformance", "contention", "scan"] {
+    for test in ["conformance", "contention", "scan", "timeout"] {
         run_fdb_leg(&["--test", test], cluster_file)?;
     }
     Ok(())
