@@ -1,0 +1,34 @@
+# Throwaway SINGLE-NODE FoundationDB for the M4 metadata-backend conformance run
+# (ADR-0042, issue #438). This lives under `deploy/`, OUTSIDE the Cargo workspace
+# (ADR-0010): the structural guard that keeps orchestrator coupling out of the crates.
+# It is NOT the production tier — the consolidated single-zone stack
+# (`deploy/small-multi-node/`) is a separate milestone item.
+#
+# FoundationDB needs no separate coordinator process: a single `fdbserver` is its own
+# coordinator, storage, and transaction role. Host networking is used so an `libfdb_c`
+# client running on the HOST reaches the process at the public address the server
+# advertises (127.0.0.1:4500) — the usual FDB-in-Docker-from-host snag, since a client
+# always redials the address it reads out of the cluster file.
+#
+# The image's own `/var/fdb/scripts/fdb.bash` entrypoint starts `fdbserver` and writes a
+# cluster file from `FDB_CLUSTER_FILE_CONTENTS`, but it deliberately does NOT create the
+# database — a fresh `fdbserver` reports `configuration missing` until someone runs
+# `configure new`. `xtask fdb-conformance` does that once, after the port opens, via
+# `docker compose exec`, and writes the matching host-side cluster file. Set
+# WYRD_FDB_CLUSTER_FILE to that file for the conformance run.
+name: wyrd-fdb-m4
+services:
+  fdb:
+    image: foundationdb/foundationdb:7.3.77
+    network_mode: host
+    environment:
+      # `host` makes the entrypoint advertise 127.0.0.1 as the public address, which is
+      # what the host-side client must be able to dial.
+      FDB_NETWORKING_MODE: host
+      FDB_PORT: "4500"
+      # A single process fills every role on this throwaway tier.
+      FDB_PROCESS_CLASS: unset
+      # Pinned so the host-side cluster file (written by `xtask fdb-conformance`) is
+      # byte-identical: a client whose cluster file disagrees never connects.
+      FDB_CLUSTER_FILE_CONTENTS: docker:docker@127.0.0.1:4500
+    restart: on-failure

@@ -15,6 +15,7 @@ members = [
     "crates/metadata-conformance",
     "crates/metadata-redb",
     "crates/metadata-tikv",
+    "crates/metadata-fdb",
     "crates/chunkstore-fs",
     "crates/chunkstore-grpc",
     "crates/coordination-conformance",
@@ -47,6 +48,7 @@ wyrd-core = { path = "crates/core" }
 wyrd-metadata-conformance = { path = "crates/metadata-conformance" }
 wyrd-metadata-redb = { path = "crates/metadata-redb" }
 wyrd-metadata-tikv = { path = "crates/metadata-tikv" }
+wyrd-metadata-fdb = { path = "crates/metadata-fdb" }
 wyrd-chunkstore-fs = { path = "crates/chunkstore-fs" }
 wyrd-chunkstore-grpc = { path = "crates/chunkstore-grpc" }
 wyrd-coordination-conformance = { path = "crates/coordination-conformance" }
@@ -103,6 +105,7 @@ prost = "0.14"
 # ADR-0003 three-test audit + `deny.toml` allowlist call — is a **NEEDS-HUMAN** at
 # sign-off (INTEGRATION §4; research issue #260 tracks the pin + API-shape confirmation).
 tikv-client = "0.4"
+foundationdb = { version = "0.10", default-features = false, features = ["fdb-7_3"] }
 # The production L5 Coordination backend's client (ADR-0006, proposal 0015
 # §"Deployment prerequisite", #365). Pinned here; consumed ONLY by
 # `wyrd-coordination-etcd` behind its OFF-by-default `etcd` feature, so the default

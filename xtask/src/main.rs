@@ -18,6 +18,13 @@
 //!   throwaway single-node TiKV under `deploy/` and drive the shared `MetadataStore`
 //!   conformance suite against it. Not part of `ci` (it needs a container runtime);
 //!   the conformance test itself skips cleanly when no TiKV endpoint is configured.
+//! - `fdb-conformance` — the ADR-0042 production-metadata-backend proof (#438): bring up
+//!   the throwaway single-node `fdbserver` under `deploy/`, create the database, and drive
+//!   the shared `MetadataStore` conformance suite plus the driver-level contention
+//!   properties against it (`cargo test -p wyrd-metadata-fdb --features fdb`). Not part of
+//!   `ci` (it needs a container runtime AND a system `libfdb_c` to link the real client);
+//!   all three cluster-file-gated test binaries skip cleanly when no cluster file is
+//!   configured.
 //! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
 //!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
 //!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
@@ -61,6 +68,7 @@ fn main() -> ExitCode {
         Some("statics") => run_statics(),
         Some("integration") => run_integration(),
         Some("tikv-conformance") => run_tikv_conformance(),
+        Some("fdb-conformance") => run_fdb_conformance(),
         Some("etcd-conformance") => run_etcd_conformance(),
         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("disk-faults") => faults::run_disk_faults(),
@@ -92,7 +100,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 
@@ -260,6 +268,209 @@ fn run_tikv_test(test: &str) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_secs(3 * attempt));
     }
     Err(last)
+}
+
+/// The compose project name for the throwaway single-node FoundationDB, so it is
+/// isolated and torn down cleanly.
+const FDB_PROJECT: &str = "wyrd-fdb-m4";
+/// The address the single `fdbserver` advertises and the host client dials
+/// (host networking, `deploy/fdb-single-node`).
+const FDB_ENDPOINT: &str = "127.0.0.1:4500";
+/// The cluster-file contents. Must be byte-identical to the compose file's
+/// `FDB_CLUSTER_FILE_CONTENTS`: a client whose cluster file disagrees never connects.
+const FDB_CLUSTER_FILE_CONTENTS: &str = "docker:docker@127.0.0.1:4500";
+
+/// Run the FoundationDB conformance job (ADR-0042, issue #438): bring up the throwaway
+/// single-node `fdbserver` under `deploy/`, create the database, drive the **shared**
+/// `MetadataStore` conformance suite plus the driver-level contention properties against
+/// it (`cargo test -p wyrd-metadata-fdb --features fdb`), then tear it down. **Not** part
+/// of `run_ci` — it needs a container runtime AND a system `libfdb_c` to link the real
+/// `foundationdb` client, exactly like `run_tikv_conformance` needs a container; without
+/// one it is a hard failure in CI and a warn-and-skip locally (all three cluster-file-gated
+/// test binaries THEMSELVES also skip cleanly when `WYRD_FDB_CLUSTER_FILE` is unset, so `ci`
+/// stays green regardless).
+fn run_fdb_conformance() -> Result<(), String> {
+    let compose = workspace_root().join("deploy/fdb-single-node/docker-compose.yml");
+    let compose = compose.to_string_lossy().to_string();
+
+    if !docker_available() {
+        if is_ci() {
+            return Err(
+                "docker is not available but is required for the FoundationDB conformance job"
+                    .into(),
+            );
+        }
+        eprintln!(
+            "warning: docker not available; skipping the FoundationDB conformance job locally. \
+             Install Docker (and the compose plugin) to run it."
+        );
+        return Ok(());
+    }
+
+    fdb_compose(&compose, &["up", "-d"])?;
+    let result = wait_for_port(FDB_ENDPOINT)
+        .and_then(|()| configure_fdb_database(&compose))
+        .and_then(|()| write_fdb_cluster_file())
+        .and_then(|cluster_file| run_fdb_conformance_test(&cluster_file));
+    // Always tear the stack down, even on failure — a run never leaks containers.
+    let _ = fdb_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    result?;
+    println!(
+        "\nxtask fdb-conformance: FoundationDB passed the shared MetadataStore conformance \
+         suite and the contention properties"
+    );
+    Ok(())
+}
+
+/// Create the database on a freshly-started `fdbserver`.
+///
+/// The image's entrypoint starts the server but deliberately leaves it unconfigured — a
+/// fresh process reports `configuration missing` until `configure new` runs once. This is
+/// executed *inside* the container (`docker compose exec`) so the job needs no host
+/// `fdbcli`; only `libfdb_c`, which the `--features fdb` build already requires.
+/// Re-running against an already-created database reports "Database already exists", which
+/// is a benign no-op here, so the exit status is not treated as fatal on its own — the
+/// readiness probe below is what actually gates the run.
+fn configure_fdb_database(compose: &str) -> Result<(), String> {
+    let _ = fdb_compose(
+        compose,
+        &[
+            "exec",
+            "-T",
+            "fdb",
+            "fdbcli",
+            "--exec",
+            "configure new single memory",
+        ],
+    );
+    // The database is created asynchronously; poll `status minimal` until it reports
+    // available rather than assuming the `configure` returned a usable cluster.
+    for attempt in 1..=20 {
+        let status = Command::new("docker")
+            .args([
+                "compose",
+                "-p",
+                FDB_PROJECT,
+                "-f",
+                compose,
+                "exec",
+                "-T",
+                "fdb",
+                "fdbcli",
+                "--exec",
+                "status minimal",
+            ])
+            .current_dir(workspace_root())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("failed to spawn docker: {e}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        eprintln!("xtask fdb-conformance: cluster not available yet (attempt {attempt}/20)");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Err("the FoundationDB cluster did not become available within 20s".into())
+}
+
+/// Write the host-side cluster file the `foundationdb` client dials, and return its path.
+///
+/// The container writes its own copy from the compose file's `FDB_CLUSTER_FILE_CONTENTS`;
+/// the host needs a byte-identical one. It lands under `target/` (build output, already
+/// git-ignored), never in the source tree.
+fn write_fdb_cluster_file() -> Result<String, String> {
+    let dir = workspace_root().join("target/fdb-single-node");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let path = dir.join("fdb.cluster");
+    std::fs::write(&path, FDB_CLUSTER_FILE_CONTENTS)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Run the FoundationDB test legs with the `fdb` feature on.
+///
+/// Five legs, all of which must pass:
+///
+/// * `--lib` — the driver's own unit tests. It needs no cluster, but it DOES need
+///   `libfdb_c`, so it can only run here and not in `run_ci`. It carries the rules a live
+///   server cannot exhibit: the commit **routing** rule (a precondition-free batch takes
+///   the blind path), "`1021 commit_unknown_result` is never blind-retried", and "an
+///   exhausted blind retry is `Err`, never `Conflict`"
+///   (`crates/metadata-fdb/src/lib.rs`, `store::tests`).
+/// * `conformance` — the shared trait-contract suite, all seven clauses through `run_all`.
+/// * `contention` — the 1020 → `Conflict` classification and the blind-batch-`Err` rule.
+/// * `scan` — the at-scale paged-scan completeness proof AND the `SCAN_CAP` fail-loud rule
+///   (the shared suite's scan clause stores three keys, so it reaches neither).
+/// * `timeout` — every operation terminates when the cluster is unreachable, and a timed-out
+///   commit is an undeterminable outcome rather than a `Conflict`. It ignores the cluster
+///   file entirely: it points its own at an unreachable coordinator, because the property is
+///   about the *absence* of a cluster. Its wall-clock guard turns a dropped transaction
+///   deadline into a failure instead of a hung job.
+fn run_fdb_conformance_test(cluster_file: &str) -> Result<(), String> {
+    run_fdb_leg(&["--lib"], cluster_file)?;
+    for test in ["conformance", "contention", "scan", "timeout"] {
+        run_fdb_leg(&["--test", test], cluster_file)?;
+    }
+    Ok(())
+}
+
+/// Run one cluster-file-gated FDB test leg (`--lib`, or `--test <name>`) **exactly once**.
+///
+/// Deliberately no retry/backoff, unlike the TiKV job (`run_tikv_test`): a failing test
+/// binary is re-run there because TiKV's store bootstrap can lag PD's port opening, and
+/// that inherited shape would launder a flaky *assertion* failure into a pass — the
+/// contention and scan binaries are the sole witnesses for the commit-conflict and
+/// scan-completeness invariants, so a green must mean they passed on the first run.
+///
+/// Nothing is lost. `configure_fdb_database` has already polled `status minimal` until the
+/// cluster reports available, and the FDB client *blocks* on a settling cluster rather than
+/// erroring (a transaction waits for a read version), so a not-yet-ready cluster shows up
+/// as a slow first test, not as a failure to retry away.
+fn run_fdb_leg(leg: &[&str], cluster_file: &str) -> Result<(), String> {
+    let mut args = vec!["test", "-p", "wyrd-metadata-fdb", "--features", "fdb"];
+    args.extend_from_slice(leg);
+
+    let mut display = vec!["cargo"];
+    display.extend_from_slice(&args);
+    print_step(&display);
+
+    let status = Command::new("cargo")
+        .args(&args)
+        .args(["--", "--nocapture"])
+        .current_dir(workspace_root())
+        .env("WYRD_FDB_CLUSTER_FILE", cluster_file)
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "FoundationDB `{}` test leg failed with {status}",
+            leg.join(" ")
+        ))
+    }
+}
+
+/// Run a `docker compose -p <FDB_PROJECT> -f <file> …` command from the workspace root,
+/// echoing it first.
+fn fdb_compose(compose: &str, args: &[&str]) -> Result<(), String> {
+    let mut full = vec!["compose", "-p", FDB_PROJECT, "-f", compose];
+    full.extend_from_slice(args);
+    let mut display = vec!["docker"];
+    display.extend_from_slice(&full);
+    print_step(&display);
+
+    let status = Command::new("docker")
+        .args(&full)
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn docker: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("`{}` failed with {status}", display.join(" ")))
+    }
 }
 
 /// The compose project name for the throwaway single-node etcd, isolated and torn
