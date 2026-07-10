@@ -1,0 +1,80 @@
+name: fdb-image
+
+# Builds the first-class FoundationDB `wyrd` OCI image (issue #470,
+# `deploy/docker/wyrd/Dockerfile`) on PRs that touch the FDB surface. This is the
+# deferred half of #470's verification posture: the binding `cargo test -p xtask
+# --test fdb_image` gate is container-free (it parses the Dockerfile and cross-checks
+# the pinned `FDB_VERSION`, ADR-0016 keeps `cargo xtask ci` container-free); THIS
+# workflow is what actually compiles the `fdb` feature (which pulls `bindgen` against
+# `libfdb_c` headers) and proves the produced binary links `libfdb_c` at load time.
+#
+# It is NOT part of the required `cargo xtask ci` gate — like `integration-nightly.yml`
+# it is a heavier container job. It runs only when the FDB image inputs change, so a
+# docs-only or unrelated PR never pays the multi-GB cold build.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths:
+      # The image definition itself, the CI job, and the backend whose client the image
+      # bakes. A change to any of these can break the client/cluster version coupling
+      # (`Cargo.toml`'s `fdb-7_3` pin ↔ the Dockerfile's `FDB_VERSION` ↔ the compose tag).
+      - "deploy/docker/wyrd/**"
+      - "deploy/fdb-single-node/**"
+      - ".github/workflows/fdb-image.yml"
+      - "crates/metadata-fdb/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fdb-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-fdb-image:
+    runs-on: ubuntu-latest
+    # Bound the job so a hung cold build fails fast rather than drifting toward the 6h
+    # GitHub default (#150). A cold `--features fdb,etcd` build compiles `bindgen` and
+    # the etcd/tonic tree, so budget generously.
+    timeout-minutes: 60
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v7
+
+      # ubuntu-latest ships Docker with the buildx/compose plugins; this confirms it,
+      # mirroring `integration-nightly.yml`'s availability check.
+      - name: Docker info
+        run: docker info
+
+      # Build the production FDB image. `FDB_VERSION` defaults from the Dockerfile
+      # (single source of truth); `FEATURES=fdb,etcd` turns on the FoundationDB backend
+      # and the etcd coordination client an operator runs together.
+      - name: Build the wyrd:fdb image
+        run: >-
+          docker build
+          --build-arg FEATURES=fdb,etcd
+          -f deploy/docker/wyrd/Dockerfile
+          -t wyrd:fdb
+          .
+
+      # Smoke: no-subcommand `wyrd` prints usage naming the metadata backends and exits
+      # non-zero (`crates/server/src/cli.rs:277-278`). Assert on captured stderr, not on
+      # the exit status, so the expected non-zero exit is not read as a job failure.
+      - name: wyrd usage smoke
+        run: |
+          set -eu
+          if docker run --rm wyrd:fdb 2> usage.txt; then
+            echo 'expected wyrd with no subcommand to exit non-zero' >&2
+            exit 1
+          fi
+          grep -Eq 'redb\|tikv\|fdb' usage.txt
+
+      # Confirm the runtime stage actually carries the pinned FDB client tooling the
+      # doctor (#439) and operators depend on.
+      - name: fdbcli present and pinned
+        run: docker run --rm --entrypoint fdbcli wyrd:fdb --version
