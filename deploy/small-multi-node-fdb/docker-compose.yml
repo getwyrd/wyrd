@@ -1,0 +1,425 @@
+# The single-zone "Small multi-node" stack, FoundationDB edition — the FDB PEER of
+# `deploy/small-multi-node/` (M4, ADR-0042/ADR-0043; issue #442's production track). It
+# has the IDENTICAL role topology to its TiKV peer (3-node etcd ensemble + 9 D servers +
+# 3 custodians + 3 S3 gateways) with the metadata tier swapped: PD + TiKV are replaced by
+# a 3-process FoundationDB cluster, and every wyrd role opens `--metadata-backend fdb`
+# instead of `--metadata-backend tikv`.
+#
+# **The naming pair (the rename is deferred — see `deploy/README.md`).** Its peer keeps
+# the unqualified name `deploy/small-multi-node/` and IS the TiKV member of this pair;
+# this directory is the FDB member. `small-multi-node/` stays canonical until #442's fault
+# battery records "go" on FDB, after which FDB (this stack) becomes canonical (#443's
+# retained-fallback posture). Neither is "the" stack — they are two named peers.
+#
+# Lives under `deploy/`, OUTSIDE the Cargo workspace (ADR-0010): the structural guard that
+# keeps orchestrator coupling out of the crates. Two directories, not a compose override:
+# the metadata tier swap is a whole service-set change, and the existing per-backend
+# convention already uses one directory per backend profile.
+#
+# Topology — every role at a real single-zone cardinality (no L2/L3/TiDB; ADR-0020 out of
+# scope until M9+):
+#   - 3-node etcd ensemble (L5 Coordination, ADR-0006) — UNCHANGED from the TiKV peer.
+#   - 3-process FoundationDB cluster (`fdb0..fdb2`), `configure new double ssd` — replaces
+#     the PD + TiKV tier. Static bridge IPs (172.30.59.11..13) so the shared cluster file
+#     the wyrd clients read names real coordinators.
+#   - 9 local-disk D servers (`wyrd d-server`), one per failure domain fd0..fd8 (default
+#     `rs(6,3)` = 9 fragments across 9 domains, survives 3 losses).
+#   - 3 custodians (`wyrd custodian`) — leader-elected reconstruction/repair.
+#   - 3 S3 gateways (`wyrd s3`) — the S3-compatible HTTP front door.
+#
+# **Image (#470's `wyrd:fdb`).** The wyrd roles all run the SAME `wyrd` binary (different
+# subcommand), built ONCE here (on `dserver0`) from #470's shared Dockerfile
+# `deploy/docker/wyrd/Dockerfile` with `--features fdb,etcd` (build arg `FEATURES`) and
+# tagged `wyrd:fdb`. That Dockerfile installs the FoundationDB client so `foundationdb-sys`
+# can link `libfdb_c` — the default test Dockerfile
+# (`crates/chunkstore-grpc/tests/dserver/Dockerfile`) cannot build `--features fdb`, which
+# is why #470 is a hard prerequisite of standing this stack up.
+#
+# **Cluster-file wiring.** The FDB client (libfdb_c) needs a cluster file on disk listing
+# the coordinators. The three `fdbserver` processes and every wyrd client share the
+# `fdb-cluster` volume at `/etc/foundationdb`, so the wyrd roles read the same
+# `/etc/foundationdb/fdb.cluster` the cluster maintains; `WYRD_FDB_CLUSTER_FILE` points
+# each role at it (`crates/server/src/cli.rs` `open_fdb_meta`; default is that same path).
+#
+# **A fresh FDB cluster reports `configuration missing` until configured.** After
+# `docker compose -f deploy/small-multi-node-fdb/docker-compose.yml up -d`, run once:
+#   docker compose -f deploy/small-multi-node-fdb/docker-compose.yml exec fdb0 \
+#     fdbcli --exec "configure new double ssd"
+#
+# **Same honest limits as the TiKV peer** (`deploy/small-multi-node/`, tracked #454/#455):
+# the `wyrd s3` gateway is standalone (`cmd_s3` hardcodes local redb + FS +
+# `MemCoordination`, #454) and there is no closed write path yet (#455). So this stack is a
+# topology bring-up / smoke target — "an S3 gateway answers with `--metadata-backend fdb`"
+# means the role starts and serves, not that an object round-trips through FDB and the 9 D
+# servers. That is exactly what #442 needs (topology bring-up parity), and it is the
+# deferred, maintainer-confirmed leg (see `deploy/README.md`), since a full bring-up is 21
+# containers and needs the multi-GB `wyrd:fdb` image built.
+name: wyrd-small-multi-node-fdb
+
+networks:
+  cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.59.0/24
+
+services:
+  # ── L5 Coordination: a 3-node etcd ensemble (ADR-0006) — identical to the TiKV peer.
+  etcd0:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    networks: [cluster]
+    command:
+      - etcd
+      - --name=etcd0
+      - --data-dir=/data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd0:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd0:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=wyrd-l5-coordination
+    ports:
+      - "12379:2379"
+    volumes:
+      - etcd0-data:/data
+    restart: on-failure
+
+  etcd1:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    networks: [cluster]
+    command:
+      - etcd
+      - --name=etcd1
+      - --data-dir=/data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd1:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd1:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=wyrd-l5-coordination
+    ports:
+      - "22379:2379"
+    volumes:
+      - etcd1-data:/data
+    restart: on-failure
+
+  etcd2:
+    image: gcr.io/etcd-development/etcd:v3.5.17
+    networks: [cluster]
+    command:
+      - etcd
+      - --name=etcd2
+      - --data-dir=/data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd2:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd2:2380
+      - --initial-cluster=etcd0=http://etcd0:2380,etcd1=http://etcd1:2380,etcd2=http://etcd2:2380
+      - --initial-cluster-state=new
+      - --initial-cluster-token=wyrd-l5-coordination
+    ports:
+      - "32379:2379"
+    volumes:
+      - etcd2-data:/data
+    restart: on-failure
+
+  # ── FoundationDB metadata tier — 3 processes, each its own coordinator/storage/log/txn
+  #    role, `double` redundancy (run `configure new double ssd` once after bring-up). This
+  #    REPLACES the PD + TiKV tier of the peer. Static bridge IPs so the shared cluster
+  #    file names real coordinators; all three write the same `FDB_CLUSTER_FILE_CONTENTS`.
+  fdb0:
+    image: foundationdb/foundationdb:7.3.77
+    networks:
+      cluster:
+        ipv4_address: 172.30.59.11
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_PORT: "4500"
+      FDB_PROCESS_CLASS: unset
+      FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.59.11:4500,172.30.59.12:4500,172.30.59.13:4500
+    # The image entrypoint runs `fdbserver --datadir /var/fdb/data`, so the metadata
+    # database lives there — in the container's writable layer unless persisted. Every
+    # OTHER stateful role here (etcd, D servers, gateways) and the TiKV peer stack
+    # (`deploy/small-multi-node/`: pd*/tikv* data dirs) keeps its data in a named volume,
+    # so without one PER fdbserver a plain `compose down && up` would silently discard the
+    # cluster metadata while every peer survived. Each process needs its OWN data volume —
+    # the three fdbservers do not share data files. (`/var/fdb/logs` is left ephemeral:
+    # diagnostic output, not state — matching the peers, which persist data dirs only.)
+    volumes:
+      - fdb-cluster:/etc/foundationdb
+      - fdb0-data:/var/fdb/data
+    restart: on-failure
+
+  fdb1:
+    image: foundationdb/foundationdb:7.3.77
+    networks:
+      cluster:
+        ipv4_address: 172.30.59.12
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_PORT: "4500"
+      FDB_PROCESS_CLASS: unset
+      FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.59.11:4500,172.30.59.12:4500,172.30.59.13:4500
+    volumes:
+      - fdb1-data:/var/fdb/data
+    restart: on-failure
+
+  fdb2:
+    image: foundationdb/foundationdb:7.3.77
+    networks:
+      cluster:
+        ipv4_address: 172.30.59.13
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_PORT: "4500"
+      FDB_PROCESS_CLASS: unset
+      FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.59.11:4500,172.30.59.12:4500,172.30.59.13:4500
+    volumes:
+      - fdb2-data:/var/fdb/data
+    restart: on-failure
+
+  # ── Local-disk D servers — the `wyrd d-server` role, 9 nodes, one per failure domain
+  #    fd0..fd8. Built ONCE here (dserver0) from #470's `deploy/docker/wyrd/Dockerfile`
+  #    with FEATURES=fdb,etcd and tagged `wyrd:fdb`; every other wyrd role reuses it. Wired
+  #    to L5: `--coordination-backend etcd` + `WYRD_ETCD_ENDPOINTS` (#449),
+  #    `--advertise-addr dserverN:50051` (#458) so the registration carries a routable name.
+  #    D servers open NO metadata backend — like the TiKV peer, only custodians and gateways
+  #    do (the metadata tier is not a D-server concern).
+  dserver0:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/wyrd/Dockerfile
+      args:
+        FEATURES: "fdb,etcd"
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "0", "--failure-domain", "fd0", "--coordination-backend", "etcd", "--advertise-addr", "dserver0:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50061:50051"
+    volumes:
+      - dserver0-data:/data
+    restart: on-failure
+
+  dserver1:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "1", "--failure-domain", "fd1", "--coordination-backend", "etcd", "--advertise-addr", "dserver1:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50062:50051"
+    volumes:
+      - dserver1-data:/data
+    restart: on-failure
+
+  dserver2:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "2", "--failure-domain", "fd2", "--coordination-backend", "etcd", "--advertise-addr", "dserver2:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50063:50051"
+    volumes:
+      - dserver2-data:/data
+    restart: on-failure
+
+  dserver3:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "3", "--failure-domain", "fd3", "--coordination-backend", "etcd", "--advertise-addr", "dserver3:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50064:50051"
+    volumes:
+      - dserver3-data:/data
+    restart: on-failure
+
+  dserver4:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "4", "--failure-domain", "fd4", "--coordination-backend", "etcd", "--advertise-addr", "dserver4:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50065:50051"
+    volumes:
+      - dserver4-data:/data
+    restart: on-failure
+
+  dserver5:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "5", "--failure-domain", "fd5", "--coordination-backend", "etcd", "--advertise-addr", "dserver5:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50066:50051"
+    volumes:
+      - dserver5-data:/data
+    restart: on-failure
+
+  dserver6:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "6", "--failure-domain", "fd6", "--coordination-backend", "etcd", "--advertise-addr", "dserver6:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50067:50051"
+    volumes:
+      - dserver6-data:/data
+    restart: on-failure
+
+  dserver7:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "7", "--failure-domain", "fd7", "--coordination-backend", "etcd", "--advertise-addr", "dserver7:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50068:50051"
+    volumes:
+      - dserver7-data:/data
+    restart: on-failure
+
+  dserver8:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [etcd0, etcd1, etcd2, dserver0]
+    command: ["d-server", "--bind", "0.0.0.0:50051", "--data-dir", "/data", "--group", "small-multi-node-fdb", "--id", "8", "--failure-domain", "fd8", "--coordination-backend", "etcd", "--advertise-addr", "dserver8:50051"]
+    environment:
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    ports:
+      - "50069:50051"
+    volumes:
+      - dserver8-data:/data
+    restart: on-failure
+
+  # ── Custodians — the `wyrd custodian` reconstruction/repair role, 3 nodes.
+  #    `--metadata-backend fdb` opens the FoundationDB store the cluster metadata lives in
+  #    (cluster file on the shared `fdb-cluster` volume, `WYRD_FDB_CLUSTER_FILE`). The fleet
+  #    topology is operator-supplied, aligned 1:1 with the D servers' `--id`/`--failure-domain`.
+  custodian0:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [fdb0, fdb1, fdb2, dserver0, dserver8]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "fdb", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    environment:
+      WYRD_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+    volumes:
+      - fdb-cluster:/etc/foundationdb:ro
+    restart: on-failure
+
+  custodian1:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [fdb0, fdb1, fdb2, dserver0, dserver8]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "fdb", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    environment:
+      WYRD_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+    volumes:
+      - fdb-cluster:/etc/foundationdb:ro
+    restart: on-failure
+
+  custodian2:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [fdb0, fdb1, fdb2, dserver0, dserver8]
+    command: ["custodian", "--zone", "zone-0", "--metadata-backend", "fdb", "--interval-secs", "15", "--data-dir", "/data", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051", "--ids", "0,1,2,3,4,5,6,7,8", "--failure-domains", "fd0,fd1,fd2,fd3,fd4,fd5,fd6,fd7,fd8"]
+    environment:
+      WYRD_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+    volumes:
+      - fdb-cluster:/etc/foundationdb:ro
+    restart: on-failure
+
+  # ── S3 gateways — the `wyrd s3` HTTP front door, 3 nodes on host ports 8081/8082/8083.
+  #    Wired `--metadata-backend fdb` (`WYRD_FDB_CLUSTER_FILE`) + `--coordination-backend
+  #    etcd` (`WYRD_ETCD_ENDPOINTS`) + `--endpoints` fanning chunks to the 9 D servers over
+  #    gRPC — mirroring the custodian wiring. SigV4 mandatory; test credentials via env.
+  #    Honest limit (#454): `cmd_s3` currently hardcodes local backends, so each gateway is
+  #    a standalone island — the role starts and serves, an object does not yet round-trip.
+  gateway0:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [fdb0, fdb1, fdb2, etcd0, etcd1, etcd2, dserver0, dserver8]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
+    environment:
+      WYRD_S3_ACCESS_KEY: "wyrd-test"
+      WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+      WYRD_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    volumes:
+      - gateway0-data:/data
+      - fdb-cluster:/etc/foundationdb:ro
+    ports:
+      - "8081:8080"
+    restart: on-failure
+
+  gateway1:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [fdb0, fdb1, fdb2, etcd0, etcd1, etcd2, dserver0, dserver8]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
+    environment:
+      WYRD_S3_ACCESS_KEY: "wyrd-test"
+      WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+      WYRD_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    volumes:
+      - gateway1-data:/data
+      - fdb-cluster:/etc/foundationdb:ro
+    ports:
+      - "8082:8080"
+    restart: on-failure
+
+  gateway2:
+    image: wyrd:fdb
+    networks: [cluster]
+    depends_on: [fdb0, fdb1, fdb2, etcd0, etcd1, etcd2, dserver0, dserver8]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
+    environment:
+      WYRD_S3_ACCESS_KEY: "wyrd-test"
+      WYRD_S3_SECRET_KEY: "wyrd-test-secret"
+      WYRD_FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
+      WYRD_ETCD_ENDPOINTS: "etcd0:2379,etcd1:2379,etcd2:2379"
+    volumes:
+      - gateway2-data:/data
+      - fdb-cluster:/etc/foundationdb:ro
+    ports:
+      - "8083:8080"
+    restart: on-failure
+
+volumes:
+  etcd0-data:
+  etcd1-data:
+  etcd2-data:
+  fdb-cluster:
+  fdb0-data:
+  fdb1-data:
+  fdb2-data:
+  dserver0-data:
+  dserver1-data:
+  dserver2-data:
+  dserver3-data:
+  dserver4-data:
+  dserver5-data:
+  dserver6-data:
+  dserver7-data:
+  dserver8-data:
+  gateway0-data:
+  gateway1-data:
+  gateway2-data:
