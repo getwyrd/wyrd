@@ -139,8 +139,17 @@ services:
       FDB_PORT: "4500"
       FDB_PROCESS_CLASS: unset
       FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.59.11:4500,172.30.59.12:4500,172.30.59.13:4500
+    # The image entrypoint runs `fdbserver --datadir /var/fdb/data`, so the metadata
+    # database lives there — in the container's writable layer unless persisted. Every
+    # OTHER stateful role here (etcd, D servers, gateways) and the TiKV peer stack
+    # (`deploy/small-multi-node/`: pd*/tikv* data dirs) keeps its data in a named volume,
+    # so without one PER fdbserver a plain `compose down && up` would silently discard the
+    # cluster metadata while every peer survived. Each process needs its OWN data volume —
+    # the three fdbservers do not share data files. (`/var/fdb/logs` is left ephemeral:
+    # diagnostic output, not state — matching the peers, which persist data dirs only.)
     volumes:
       - fdb-cluster:/etc/foundationdb
+      - fdb0-data:/var/fdb/data
     restart: on-failure
 
   fdb1:
@@ -153,6 +162,8 @@ services:
       FDB_PORT: "4500"
       FDB_PROCESS_CLASS: unset
       FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.59.11:4500,172.30.59.12:4500,172.30.59.13:4500
+    volumes:
+      - fdb1-data:/var/fdb/data
     restart: on-failure
 
   fdb2:
@@ -165,6 +176,8 @@ services:
       FDB_PORT: "4500"
       FDB_PROCESS_CLASS: unset
       FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.59.11:4500,172.30.59.12:4500,172.30.59.13:4500
+    volumes:
+      - fdb2-data:/var/fdb/data
     restart: on-failure
 
   # ── Local-disk D servers — the `wyrd d-server` role, 9 nodes, one per failure domain
@@ -395,6 +408,9 @@ volumes:
   etcd1-data:
   etcd2-data:
   fdb-cluster:
+  fdb0-data:
+  fdb1-data:
+  fdb2-data:
   dserver0-data:
   dserver1-data:
   dserver2-data:

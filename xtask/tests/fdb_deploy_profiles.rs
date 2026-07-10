@@ -96,6 +96,31 @@ fn fdb_single_zone_wires_every_metadata_role_to_fdb_and_none_to_tikv() {
     );
 }
 
+/// The single-zone FDB stack is the **persistent** tier (unlike the throwaway
+/// `fdb-multi-replica/` fault stack), so its metadata must survive a `compose down && up`.
+/// The image runs `fdbserver --datadir /var/fdb/data`, so each of the three processes needs
+/// its OWN named volume there — otherwise the cluster DB lives in the container writable
+/// layer and a recreate silently discards it while every peer (etcd / D servers / gateways,
+/// and the TiKV sibling's pd*/tikv* dirs) survives. Pure source read, so it runs without
+/// Docker.
+#[test]
+fn each_single_zone_fdbserver_persists_its_data_directory() {
+    let compose = read("deploy/small-multi-node-fdb/docker-compose.yml");
+    for process in ["fdb0", "fdb1", "fdb2"] {
+        let mount = format!("{process}-data:/var/fdb/data");
+        assert!(
+            compose.contains(&mount),
+            "small-multi-node-fdb: `{process}` must mount `{mount}` — without it a \
+             `compose down && up` discards the cluster metadata while every peer persists"
+        );
+        // …and the volume it names is actually declared, or `docker compose` rejects it.
+        assert!(
+            compose.contains(&format!("{process}-data:\n")),
+            "small-multi-node-fdb: the named volume `{process}-data` is used but not declared"
+        );
+    }
+}
+
 #[test]
 fn readme_profile_matrix_names_all_six_profiles() {
     let readme = read("deploy/README.md");
