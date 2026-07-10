@@ -19,7 +19,7 @@ publish.workspace = true
 # while the dedicated `xtask fdb-conformance` job turns the feature on and drives the
 # shared suite against the throwaway `deploy/` fdbserver.
 default = []
-fdb = ["dep:foundationdb", "dep:tokio", "dep:async-trait", "dep:bytes"]
+fdb = ["dep:foundationdb", "dep:tokio", "dep:async-trait", "dep:bytes", "dep:serde_json"]
 
 [dependencies]
 wyrd-traits.workspace = true
@@ -30,6 +30,11 @@ foundationdb = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
+# Parses `Database::get_client_status()`'s JSON for the #441 version-skew preflight
+# (`store::client_status`). Not new to the workspace tree — already pinned in the root
+# `Cargo.toml` and used by `wyrd-core`/`wyrd-server` — only new to this crate's own
+# graph, and only under the already-optional `fdb` feature.
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The conformance test drives the SHARED trait-contract suite — the same `run_all`
@@ -44,7 +49,7 @@ futures-util.workspace = true
 # `foundationdb` and the runtime deps are used only under the `fdb` feature; keep
 # cargo-machete quiet on the default (feature-off) scan, where they look unreferenced.
 [package.metadata.cargo-machete]
-ignored = ["foundationdb", "tokio", "async-trait", "bytes"]
+ignored = ["foundationdb", "tokio", "async-trait", "bytes", "serde_json"]
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).
