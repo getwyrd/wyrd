@@ -1,0 +1,116 @@
+# Throwaway ≥3-PROCESS FoundationDB cluster for the M4 metadata-backend fault battery
+# (#442 — the go/no-go gate for making FoundationDB the default production metadata
+# backend, ADR-0042). This is FoundationDB's peer to `deploy/tikv-multi-replica/`: a
+# replicated cluster whose quorum a fault leg can partition and whose processes it can
+# kill mid-commit. Like every stack here it lives under `deploy/`, OUTSIDE the Cargo
+# workspace (ADR-0010: the guard that keeps orchestrator coupling out of the crates).
+#
+# Three `fdbserver` processes (`fdb0..fdb2`), each its own coordinator, storage, log and
+# transaction role. Configured `double` redundancy (`configure new double ssd`, run once
+# after bring-up — see below): every key range is stored on two of the three processes,
+# so the cluster survives a single-process loss and re-replicates onto the surviving two.
+# Three coordinators (all three processes) give a coordination quorum that tolerates one
+# failure. That is the minimum that makes #442's replica-loss and mid-commit-kill faults
+# meaningful — a single-process cluster (the shape of `deploy/fdb-single-node/`) cannot
+# exhibit them.
+#
+# **Bridge network with one netns per node (the same iteration-13 topology fix as
+# `deploy/tikv-multi-replica/`).** A partition is injected by running a symmetric
+# `iptables` DROP INSIDE a target node's network namespace (`iptables-agent` below). That
+# only bites if every packet the node sends carries its own advertised IP — which is true
+# here because each `fdbserver` owns its netns and advertises its static bridge IP
+# (`FDB_NETWORKING_MODE: container` makes the entrypoint set `--public-address` to the
+# container's own IP via `hostname -i`). Under host networking every node would source its
+# traffic from 127.0.0.1 and an `iptables -s/-d <ip>` cut would never match — the fault
+# would silently not materialize (empirically confirmed on the TiKV peer's iteration-13
+# leg). This is the OPPOSITE choice from `deploy/fdb-single-node/`, which deliberately
+# uses `network_mode: host` so a *host* `libfdb_c` client can dial the advertised
+# 127.0.0.1 — there is no host client here, so the bridge is free to make partitions real.
+#
+# The host reaches the static container IPs directly (Linux bridge routing), so no ports
+# are published; a host `fdbcli` uses a cluster file of
+# `docker:docker@172.30.58.11:4500,172.30.58.12:4500,172.30.58.13:4500`.
+#
+# **A fresh cluster reports `configuration missing` until configured** (same as the
+# single-node tier — a fresh `fdbserver` will not create the database itself). After
+# `docker compose -f deploy/fdb-multi-replica/docker-compose.yml up -d`, run once:
+#   docker compose -f deploy/fdb-multi-replica/docker-compose.yml exec fdb0 \
+#     fdbcli --exec "configure new double ssd"
+# then `fdbcli --exec "status minimal"` reports the database available.
+#
+# **Fault sidecar — reused from `deploy/tikv-multi-replica/iptables-agent/` AS-IS** (a
+# generic `iptables` entrypoint image, not TiKV-specific: its ENTRYPOINT is literally
+# `["iptables"]`). Declared as the `iptables-agent` service below, behind the `fault`
+# compose profile so a plain `up` never starts it (a no-arg `iptables` would error). It
+# exists in the config so `docker compose --profile fault build` produces
+# `wyrd-iptables:local`, and to document the fault tool. The agent is run ON DEMAND in a
+# target node's netns, exactly as on the TiKV peer:
+#   docker run --rm --privileged --network container:<fdb0|fdb1|fdb2> \
+#     wyrd-iptables:local -A INPUT  -s <other-node-ip> -j DROP
+#   docker run --rm --privileged --network container:<fdb0|fdb1|fdb2> \
+#     wyrd-iptables:local -A OUTPUT -d <other-node-ip> -j DROP
+# and the cut is healed by replaying the same rules with `-D`. Running inside the
+# target's netns makes the partition bidirectional by construction and makes a leaked
+# HOST rule structurally impossible (Invariant B: the worst-case residue dies with the
+# throwaway container).
+name: wyrd-fdb-tier1-metadata
+
+networks:
+  tier1:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.58.0/24
+
+services:
+  fdb0:
+    image: foundationdb/foundationdb:7.3.77
+    networks:
+      tier1:
+        ipv4_address: 172.30.58.11
+    environment:
+      # `container` makes the entrypoint advertise the container's own bridge IP as the
+      # public address — what an in-netns `iptables` cut must match to bite.
+      FDB_NETWORKING_MODE: container
+      FDB_PORT: "4500"
+      # A single process fills every role on this throwaway tier.
+      FDB_PROCESS_CLASS: unset
+      # All three processes are coordinators — a quorum that tolerates one loss. Byte
+      # identical across the three so every process (and a host client) agrees on the
+      # coordinator set.
+      FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.58.11:4500,172.30.58.12:4500,172.30.58.13:4500
+    restart: on-failure
+
+  fdb1:
+    image: foundationdb/foundationdb:7.3.77
+    networks:
+      tier1:
+        ipv4_address: 172.30.58.12
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_PORT: "4500"
+      FDB_PROCESS_CLASS: unset
+      FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.58.11:4500,172.30.58.12:4500,172.30.58.13:4500
+    restart: on-failure
+
+  fdb2:
+    image: foundationdb/foundationdb:7.3.77
+    networks:
+      tier1:
+        ipv4_address: 172.30.58.13
+    environment:
+      FDB_NETWORKING_MODE: container
+      FDB_PORT: "4500"
+      FDB_PROCESS_CLASS: unset
+      FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.58.11:4500,172.30.58.12:4500,172.30.58.13:4500
+    restart: on-failure
+
+  # The Tier-1 fault agent, reused verbatim from `deploy/tikv-multi-replica/iptables-agent/`
+  # (build context points at that directory — the Dockerfile is NOT copied). Behind the
+  # `fault` profile so it is never started by a plain `up`; run on demand with
+  # `docker run --rm --privileged --network container:<fdbN> wyrd-iptables:local <args>`.
+  iptables-agent:
+    build:
+      context: ../tikv-multi-replica/iptables-agent
+    image: wyrd-iptables:local
+    profiles: ["fault"]
