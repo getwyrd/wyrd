@@ -94,12 +94,19 @@ pub enum MetadataBackend {
     /// `tikv` feature, so the default build never pulls the `tikv-client` tree.
     #[cfg(feature = "tikv")]
     Tikv,
+    /// Distributed FoundationDB — the production backend (ADR-0042, superseding
+    /// ADR-0008). Compiled only under the OFF-by-default `fdb` feature, which
+    /// forwards to `metadata-fdb`'s own `fdb` feature, so the default build never
+    /// links `libfdb_c`.
+    #[cfg(feature = "fdb")]
+    Fdb,
 }
 
 impl MetadataBackend {
     /// Select the backend from a config value (the `--metadata-backend` flag or the
     /// `WYRD_METADATA_BACKEND` env var). Absent ⇒ the redb dev default (ADR-0014).
-    /// `tikv` is only accepted when the binary was built `--features tikv`.
+    /// `tikv` / `fdb` are only accepted when the binary was built with the matching
+    /// `--features`.
     pub fn from_config(value: Option<&str>) -> Result<Self, BoxError> {
         match value {
             None | Some("redb") => Ok(Self::Redb),
@@ -109,8 +116,14 @@ impl MetadataBackend {
             Some("tikv") => Err(
                 "metadata backend `tikv` requires building `wyrd` with `--features tikv`".into(),
             ),
+            #[cfg(feature = "fdb")]
+            Some("fdb") => Ok(Self::Fdb),
+            #[cfg(not(feature = "fdb"))]
+            Some("fdb") => {
+                Err("metadata backend `fdb` requires building `wyrd` with `--features fdb`".into())
+            }
             Some(other) => Err(format!(
-                "unknown metadata backend `{other}` (expected `redb` or `tikv`)"
+                "unknown metadata backend `{other}` (expected `redb`, `tikv`, or `fdb`)"
             )
             .into()),
         }
@@ -137,6 +150,25 @@ async fn open_tikv_meta() -> Result<wyrd_metadata_tikv::TikvMetadataStore, BoxEr
     })?;
     let endpoints = parse_endpoints(&raw)?;
     Ok(wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints).await?)
+}
+
+/// Connect the production FoundationDB metadata store. Compiled only under the
+/// `fdb` feature — the fdb selection arm is `#[cfg]`-gated out of the default
+/// build.
+///
+/// Unlike [`open_tikv_meta`], there is no pre-check env lookup here: the driver's
+/// own `connect()` owns cluster-file env resolution (`WYRD_FDB_CLUSTER_FILE`) and
+/// deliberately falls back to `/etc/foundationdb/fdb.cluster` when it is unset
+/// (`metadata-fdb/src/lib.rs:424-433`, unit-tested at `:479-482`) — a hard
+/// pre-check here would contradict that contract and break a stock FDB install
+/// that relies on the default cluster file. `connect()` is synchronous (unlike
+/// `open_tikv_meta`'s `.await`), so this helper is too; the hint below is only
+/// error *context* on a failed connect, not a precondition.
+#[cfg(feature = "fdb")]
+fn open_fdb_meta() -> Result<wyrd_metadata_fdb::FdbMetadataStore, BoxError> {
+    wyrd_metadata_fdb::FdbMetadataStore::connect().map_err(|e| {
+        format!("fdb backend: set WYRD_FDB_CLUSTER_FILE to the cluster file path: {e}").into()
+    })
 }
 
 /// The L5 `Coordination` backend `server` composes behind the unchanged
@@ -233,11 +265,11 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
 
 fn usage() {
     eprintln!("usage:");
-    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
-    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv]");
+    eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
+    eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
-    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv] [--coordination-backend mem|etcd]");
+    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  --endpoints drives a local distributed cluster: fragments fan out over gRPC");
@@ -337,6 +369,11 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
                 let meta = open_tikv_meta().await?;
                 local_store_put(&meta, &chunks, key, &data, chunk_size, durability).await
             }
+            #[cfg(feature = "fdb")]
+            MetadataBackend::Fdb => {
+                let meta = open_fdb_meta()?;
+                local_store_put(&meta, &chunks, key, &data, chunk_size, durability).await
+            }
         }
     })
 }
@@ -416,6 +453,11 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
             #[cfg(feature = "tikv")]
             MetadataBackend::Tikv => {
                 let meta = open_tikv_meta().await?;
+                local_store_get(&meta, &chunks, key, out).await
+            }
+            #[cfg(feature = "fdb")]
+            MetadataBackend::Fdb => {
+                let meta = open_fdb_meta()?;
                 local_store_get(&meta, &chunks, key, out).await
             }
         }
@@ -668,6 +710,12 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
                  not run a second custodian against the same tikv store until the etcd \
                  Coordination backend lands (#365) — CAS commits keep it corruption-free meanwhile"
             }
+            #[cfg(feature = "fdb")]
+            MetadataBackend::Fdb => {
+                "WARNING: single-active is NOT enforced on the fdb backend (no store lock); do \
+                 not run a second custodian against the same fdb cluster until the etcd \
+                 Coordination backend lands (#365) — CAS commits keep it corruption-free meanwhile"
+            }
         };
         eprintln!(
             "wyrd custodian: leader for zone `{zone_name}` (term {}); {fencing}; \
@@ -782,6 +830,15 @@ where
         #[cfg(feature = "tikv")]
         MetadataBackend::Tikv => {
             let meta = open_tikv_meta().await?;
+            service
+                .run_reconstruction_until(
+                    zone, custodian, &meta, configured, interval, clock, shutdown,
+                )
+                .await?;
+        }
+        #[cfg(feature = "fdb")]
+        MetadataBackend::Fdb => {
+            let meta = open_fdb_meta()?;
             service
                 .run_reconstruction_until(
                     zone, custodian, &meta, configured, interval, clock, shutdown,
@@ -1419,6 +1476,19 @@ where
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
             serve_s3(gateway, credentials, region, listener).await
         }
+        #[cfg(feature = "fdb")]
+        (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
+            let meta = open_fdb_meta()?;
+            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            serve_s3(gateway, credentials, region, listener).await
+        }
+        #[cfg(all(feature = "fdb", feature = "etcd"))]
+        (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
+            let meta = open_fdb_meta()?;
+            let coord = open_etcd_coordination().await?;
+            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            serve_s3(gateway, credentials, region, listener).await
+        }
     }
 }
 
@@ -1477,6 +1547,11 @@ fn cluster_put(
                 let meta = open_tikv_meta().await?;
                 cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await?
             }
+            #[cfg(feature = "fdb")]
+            MetadataBackend::Fdb => {
+                let meta = open_fdb_meta()?;
+                cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await?
+            }
         };
         match outcome {
             CommitOutcome::Committed => {
@@ -1518,6 +1593,11 @@ fn cluster_get(
             #[cfg(feature = "tikv")]
             MetadataBackend::Tikv => {
                 let meta = open_tikv_meta().await?;
+                cluster_store_get(&meta, &fanout, key).await?
+            }
+            #[cfg(feature = "fdb")]
+            MetadataBackend::Fdb => {
+                let meta = open_fdb_meta()?;
                 cluster_store_get(&meta, &fanout, key).await?
             }
         };
