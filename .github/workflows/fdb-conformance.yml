@@ -46,7 +46,14 @@ on:
       - "xtask/**"
       - ".github/workflows/fdb-conformance.yml"
       # A dependency bump can move the `foundationdb` crate or its API version.
+      # `Cargo.lock` catches a resolved-version change; the root `Cargo.toml` catches
+      # what the lock cannot — it does not record features, so retargeting the API
+      # (`features = ["fdb-7_3"]` → `fdb-7_4`) or editing the dep spec leaves the lock
+      # untouched, and without this the fdb type-check/conformance signal would skip
+      # until after merge. (Per-crate manifests are already covered by the `crates/**`
+      # entries above; this is the workspace root only.)
       - "Cargo.lock"
+      - "Cargo.toml"
   schedule:
     # 06:00 UTC daily — after tier1-jepsen (02:00), tier1-disk-faults (03:00),
     # integration-nightly (04:00) and tier2-kill-reconstruct (05:00), so the container
@@ -133,6 +140,20 @@ jobs:
       # the install step above did not put libfdb_c where the linker looks.
       - name: cargo xtask fdb-conformance
         run: cargo xtask fdb-conformance
+
+      # `cargo xtask ci` shells out to `cargo-deny` and `cargo-machete`, and hard-fails
+      # under CI=true when either is absent (`run_ci` → `cargo_{machete,deny}_check`,
+      # xtask/src/main.rs). A fresh runner ships neither, so without this the whole-gate
+      # step below turns red at the license/unused-dep wall even after every FDB leg
+      # passed. Same prebuilt-binary action and tool list `ci.yml` installs before the
+      # same command — a fetch, not a from-source compile. Gated to the nightly/dispatch
+      # legs, the only ones that run the gate: the pull-request leg installs neither
+      # binary because it invokes neither.
+      - name: Install cargo-deny + cargo-machete
+        if: github.event_name != 'pull_request'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
 
       # The whole gate, with WYRD_FDB_TOOLCHAIN set — which is what makes
       # `xtask::feature_gated_checks` emit the same two `cargo check` rows from inside
