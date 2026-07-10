@@ -969,6 +969,18 @@ async fn deferred_1031_settles_against_current_truth(meta: Arc<SimFdbMetadataSto
         return false;
     }
 
+    // Every `get` runs `settle_in_flight(false)` (`support/mod.rs`), so B's own precondition
+    // reads and the `after_b` read above can each resolve A **opportunistically** — the
+    // non-forced path, which never skips the resolver on any fidelity. A seed that settled A
+    // there did NOT reach the forced deferral: on `DeferredResolverSkipped` its A went
+    // through the resolver and was rejected, so it produces no clobber, and counting it as
+    // "reached the case" would let the anti-vacuity floor be met by seeds that never
+    // exercise the branch the paired red is meant to break. Only a seed where A survives to
+    // here drives the FORCED `quiesce` below; the rest are not this scenario's.
+    if meta.in_flight() == 0 {
+        return false;
+    }
+
     // Force A's still-in-flight batch through the deferral.
     meta.quiesce();
     let settled = read::read_inode(&*meta, 1).await.unwrap().unwrap();
