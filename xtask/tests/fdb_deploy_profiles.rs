@@ -121,6 +121,29 @@ fn each_single_zone_fdbserver_persists_its_data_directory() {
     }
 }
 
+/// The wyrd roles reach FDB through a cluster file shared from `fdb0` at
+/// `/etc/foundationdb/fdb.cluster`. The `foundationdb` image ships
+/// `ENV FDB_CLUSTER_FILE=/var/fdb/fdb.cluster`, so `fdb0` MUST override it to the shared
+/// path or the entrypoint writes to `/var/fdb` and the shared volume stays empty — every
+/// wyrd role then reads an empty cluster file and cannot reach FDB (#499). Pure source
+/// read, so it runs without Docker.
+#[test]
+fn the_single_zone_shares_fdb0s_cluster_file_with_the_wyrd_roles() {
+    let compose = read("deploy/small-multi-node-fdb/docker-compose.yml");
+    const SHARED: &str = "/etc/foundationdb/fdb.cluster";
+    assert!(
+        compose.contains(&format!("FDB_CLUSTER_FILE: {SHARED}")),
+        "small-multi-node-fdb: fdb0 must redirect the image's FDB_CLUSTER_FILE to the shared \
+         `{SHARED}`, or the shared volume stays empty and no wyrd role can reach FDB (#499)"
+    );
+    // The clients must read the SAME path fdb0 writes to, or the share is pointless.
+    assert!(
+        compose.contains(&format!("WYRD_FDB_CLUSTER_FILE: {SHARED}")),
+        "small-multi-node-fdb: the wyrd roles must read `WYRD_FDB_CLUSTER_FILE = {SHARED}`, the \
+         path fdb0 writes its shared cluster file to"
+    );
+}
+
 #[test]
 fn readme_profile_matrix_names_all_six_profiles() {
     let readme = read("deploy/README.md");

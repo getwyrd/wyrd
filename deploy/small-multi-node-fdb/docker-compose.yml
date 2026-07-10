@@ -36,10 +36,17 @@
 # is why #470 is a hard prerequisite of standing this stack up.
 #
 # **Cluster-file wiring.** The FDB client (libfdb_c) needs a cluster file on disk listing
-# the coordinators. The three `fdbserver` processes and every wyrd client share the
-# `fdb-cluster` volume at `/etc/foundationdb`, so the wyrd roles read the same
-# `/etc/foundationdb/fdb.cluster` the cluster maintains; `WYRD_FDB_CLUSTER_FILE` points
-# each role at it (`crates/server/src/cli.rs` `open_fdb_meta`; default is that same path).
+# the coordinators. `fdb0` is the canonical writer: it mounts the `fdb-cluster` volume at
+# `/etc/foundationdb` and is told `FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster`, so the
+# image entrypoint writes `FDB_CLUSTER_FILE_CONTENTS` into the SHARED volume (its own
+# `fdbserver` reads the same path — it takes no `-C`, it uses the env). Every wyrd client
+# mounts that volume read-only and reads `/etc/foundationdb/fdb.cluster` via
+# `WYRD_FDB_CLUSTER_FILE` (`crates/server/src/cli.rs` `open_fdb_meta`; default is that same
+# path). This override is load-bearing: the image ships `ENV FDB_CLUSTER_FILE=
+# /var/fdb/fdb.cluster`, so WITHOUT it `fdb0` writes to `/var/fdb` and the shared
+# `/etc/foundationdb` stays empty — every wyrd role then reads an empty cluster file and
+# cannot reach FDB (#499). `fdb1`/`fdb2` do not mount the shared volume; they keep the image
+# default and write their own identical cluster file from `FDB_CLUSTER_FILE_CONTENTS`.
 #
 # **A fresh FDB cluster reports `configuration missing` until configured.** After
 # `docker compose -f deploy/small-multi-node-fdb/docker-compose.yml up -d`, run once:
@@ -129,6 +136,8 @@ services:
   #    role, `double` redundancy (run `configure new double ssd` once after bring-up). This
   #    REPLACES the PD + TiKV tier of the peer. Static bridge IPs so the shared cluster
   #    file names real coordinators; all three write the same `FDB_CLUSTER_FILE_CONTENTS`.
+  #    Only `fdb0` mounts the shared `fdb-cluster` volume and redirects its cluster file
+  #    there (`FDB_CLUSTER_FILE`) so the wyrd roles can read it — see "Cluster-file wiring".
   fdb0:
     image: foundationdb/foundationdb:7.3.77
     networks:
@@ -139,6 +148,11 @@ services:
       FDB_PORT: "4500"
       FDB_PROCESS_CLASS: unset
       FDB_CLUSTER_FILE_CONTENTS: docker:docker@172.30.59.11:4500,172.30.59.12:4500,172.30.59.13:4500
+      # Override the image's `ENV FDB_CLUSTER_FILE=/var/fdb/fdb.cluster` so the entrypoint
+      # writes the cluster file into the shared `/etc/foundationdb` volume the wyrd roles
+      # read, not the container-local `/var/fdb` (#499). fdbserver reads the same env, so
+      # fdb0 stays self-consistent.
+      FDB_CLUSTER_FILE: /etc/foundationdb/fdb.cluster
     # The image entrypoint runs `fdbserver --datadir /var/fdb/data`, so the metadata
     # database lives there — in the container's writable layer unless persisted. Every
     # OTHER stateful role here (etcd, D servers, gateways) and the TiKV peer stack
