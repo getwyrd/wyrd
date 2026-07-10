@@ -25,6 +25,13 @@
 //!   `ci` (it needs a container runtime AND a system `libfdb_c` to link the real client);
 //!   all three cluster-file-gated test binaries skip cleanly when no cluster file is
 //!   configured.
+//! - `fdb-doctor` — the FoundationDB environment preflight (#439): probe the three
+//!   things `fdb-conformance` needs (a loadable `libfdb_c`, a readable cluster file, a
+//!   healthy cluster) and print a verdict plus an actionable remediation for each,
+//!   instead of a raw linker error or a transaction timeout. The decision logic is
+//!   `xtask::fdb_doctor`'s (environment facts in, verdict out); `run_fdb_conformance`
+//!   *is* a call to `fdb_doctor::run_gated_conformance`, so the same client-library
+//!   row fails the job fast.
 //! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
 //!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
 //!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
@@ -58,6 +65,8 @@ mod vectors;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use xtask::fdb_doctor;
+
 fn main() -> ExitCode {
     let task = std::env::args().nth(1);
     let result = match task.as_deref() {
@@ -69,6 +78,7 @@ fn main() -> ExitCode {
         Some("integration") => run_integration(),
         Some("tikv-conformance") => run_tikv_conformance(),
         Some("fdb-conformance") => run_fdb_conformance(),
+        Some("fdb-doctor") => run_fdb_doctor(),
         Some("etcd-conformance") => run_etcd_conformance(),
         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("disk-faults") => faults::run_disk_faults(),
@@ -100,7 +110,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 
@@ -289,37 +299,126 @@ const FDB_CLUSTER_FILE_CONTENTS: &str = "docker:docker@127.0.0.1:4500";
 /// one it is a hard failure in CI and a warn-and-skip locally (all three cluster-file-gated
 /// test binaries THEMSELVES also skip cleanly when `WYRD_FDB_CLUSTER_FILE` is unset, so `ci`
 /// stays green regardless).
+///
+/// The body is **only** the gate (#439). `fdb_doctor::run_gated_conformance` owns the
+/// docker + client-library preflight and the CI-vs-local convention, and enters
+/// [`fdb_conformance_stack`] only when the environment is ready — so a missing client
+/// package is an actionable remediation, not a linker error minutes into a `cargo test`
+/// with a container already up. Both halves are unit-tested with no Docker and no
+/// `libfdb_c` (`xtask/tests/fdb_harness.rs`).
 fn run_fdb_conformance() -> Result<(), String> {
-    let compose = workspace_root().join("deploy/fdb-single-node/docker-compose.yml");
+    let compose = workspace_root().join(fdb_doctor::COMPOSE_FILE);
     let compose = compose.to_string_lossy().to_string();
+    fdb_doctor::run_gated_conformance(
+        docker_available(),
+        is_ci(),
+        fdb_doctor::probe_client_library_live(),
+        &mut || fdb_conformance_stack(&compose),
+    )
+}
 
-    if !docker_available() {
-        if is_ci() {
-            return Err(
-                "docker is not available but is required for the FoundationDB conformance job"
-                    .into(),
-            );
-        }
-        eprintln!(
-            "warning: docker not available; skipping the FoundationDB conformance job locally. \
-             Install Docker (and the compose plugin) to run it."
-        );
-        return Ok(());
-    }
-
-    fdb_compose(&compose, &["up", "-d"])?;
+/// The privileged half of `fdb-conformance`, entered only past the preflight: bring the
+/// compose stack up, create the database, write the host-side cluster file, drive the
+/// five `--features fdb` test legs, and tear the stack down unconditionally.
+fn fdb_conformance_stack(compose: &str) -> Result<(), String> {
+    fdb_compose(compose, &["up", "-d"])?;
     let result = wait_for_port(FDB_ENDPOINT)
-        .and_then(|()| configure_fdb_database(&compose))
+        .and_then(|()| configure_fdb_database(compose))
         .and_then(|()| write_fdb_cluster_file())
         .and_then(|cluster_file| run_fdb_conformance_test(&cluster_file));
     // Always tear the stack down, even on failure — a run never leaks containers.
-    let _ = fdb_compose(&compose, &["down", "-v", "--remove-orphans"]);
+    let _ = fdb_compose(compose, &["down", "-v", "--remove-orphans"]);
     result?;
     println!(
         "\nxtask fdb-conformance: FoundationDB passed the shared MetadataStore conformance \
          suite and the contention properties"
     );
     Ok(())
+}
+
+/// Run the FoundationDB environment doctor (#439): probe the three things
+/// `run_fdb_conformance` needs, print the verdict + remediation for each row, and exit
+/// non-zero if the environment is not ready.
+///
+/// Every probe below is the **impure** half — it stats files and spawns `fdbcli`. The
+/// verdict and the remediation text are `xtask::fdb_doctor`'s, a module unit-tested with
+/// no FoundationDB present (`xtask/tests/fdb_harness.rs`).
+fn run_fdb_doctor() -> Result<(), String> {
+    print_step(&[
+        "xtask",
+        "fdb-doctor",
+        "(FoundationDB environment preflight)",
+    ]);
+    let cluster_file =
+        fdb_doctor::cluster_file_path(std::env::var(fdb_doctor::CLUSTER_FILE_ENV).ok().as_deref());
+    let report = fdb_doctor::diagnose(vec![
+        (
+            fdb_doctor::Probe::ClientLibrary,
+            fdb_doctor::probe_client_library_live(),
+        ),
+        (
+            fdb_doctor::Probe::ClusterFile,
+            probe_cluster_file(&cluster_file),
+        ),
+        (
+            fdb_doctor::Probe::ClusterHealth,
+            probe_cluster_health(&cluster_file),
+        ),
+    ]);
+    print!("{}", report.render());
+    if report.is_ok() {
+        println!("\nxtask fdb-doctor: the FoundationDB environment is ready");
+    }
+    report.into_result()
+}
+
+/// Probe: is the cluster file readable and non-empty? An empty file is the classic
+/// half-installed state — the client accepts the path and then never connects.
+fn probe_cluster_file(cluster_file: &str) -> fdb_doctor::Outcome {
+    match std::fs::read_to_string(cluster_file) {
+        Ok(contents) if contents.trim().is_empty() => {
+            fdb_doctor::Outcome::failed(format!("{cluster_file} is empty"))
+        }
+        Ok(contents) => fdb_doctor::Outcome::ok(format!(
+            "{cluster_file} names the coordinator {}",
+            contents.trim()
+        )),
+        Err(e) => fdb_doctor::Outcome::failed(format!("{cluster_file}: {e}")),
+    }
+}
+
+/// Probe: does `fdbcli --exec "status minimal"` report the database available? A missing
+/// `fdbcli`, an unreachable coordinator, and a running-but-unconfigured cluster
+/// (`configuration missing`) are all failures of the same row, each with its own detail.
+///
+/// The verdict is read out of the **text**, not the exit status: `fdbcli` 7.3.77 exits 0
+/// against a dead coordinator (verified on 7.3.77), so `status.success()` is not a
+/// health predicate.
+fn probe_cluster_health(cluster_file: &str) -> fdb_doctor::Outcome {
+    let output = Command::new("fdbcli")
+        .args(["-C", cluster_file, "--exec", "status minimal"])
+        .output();
+    match output {
+        Err(e) => fdb_doctor::Outcome::failed(format!("could not run fdbcli: {e}")),
+        Ok(output) => {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            if fdb_doctor::cluster_status_is_healthy(&text) {
+                fdb_doctor::Outcome::ok(format!(
+                    "`{}` reports available",
+                    fdb_doctor::HEALTH_COMMAND
+                ))
+            } else {
+                let detail = text.trim();
+                let detail = if detail.is_empty() {
+                    "fdbcli reported no status".to_string()
+                } else {
+                    detail.lines().take(2).collect::<Vec<_>>().join("; ")
+                };
+                fdb_doctor::Outcome::failed(detail)
+            }
+        }
+    }
 }
 
 /// Create the database on a freshly-started `fdbserver`.
@@ -1221,68 +1320,28 @@ fn run_orchestrator_guard() -> Result<(), String> {
     }
 }
 
-/// The dedicated `cargo check --features …` runs `run_ci` makes to type-check
-/// feature-gated code the default `--workspace` build never compiles.
-///
-/// `run_ci`'s `build`/`test`/`clippy` all run `--workspace` with **default**
-/// features. `--all-targets` widens the *target kinds* (bins, tests, benches) but
-/// **not the feature set**, so any `#[cfg(feature = "…")]` body that is off by
-/// default is compiled by **none** of those steps — a type error inside it passes
-/// the whole gate silently.
-///
-/// The M4.6 (#257) Tier-1/Tier-2 metadata scenarios
-/// (`crates/metadata-tikv/tests/tier1_metadata_consistency.rs`,
-/// `tier2_metadata_io.rs`) are exactly this shape: their live bodies — the
-/// `SymmetricPartition` fault, its `Drop` heal, the PD-side fault-effect oracle,
-/// and the `partition_took_effect` / `heal_is_complete` / `consistency_passes`
-/// wiring — sit behind `#[cfg(feature = "tikv")]` (off by default so the gate stays
-/// container-free). Without this check a regression in that off-Check live scenario
-/// flips no Check artifact. This step compiles and type-checks it in the whole-tree
-/// gate (it does not *run* it — the `#[ignore]`d scenario still needs a real cluster).
-///
-/// **Gated on the TiKV build toolchain** (`tikv_toolchain_available`): these
-/// steps compile the pre-1.0 `tikv-client` tree (grpcio/protoc), which the default
-/// container-free / offline `cargo xtask ci` must **never** touch
-/// (`crates/metadata-tikv/Cargo.toml`: `tikv` is off by default precisely so the
-/// gate stays green on a laptop or PDCA worktree with no TiKV toolchain). The
-/// privileged Tier CI job that owns the live Tier-1/Tier-2 legs opts in by setting
-/// `WYRD_TIKV_TOOLCHAIN`; `run_ci_steps` only emits these steps when it is set.
-///
-/// Returned as data (not inlined into `run_ci_steps`) so the wiring is
-/// unit-testable: `tests::ci_type_checks_feature_gated_metadata_scenario` drives
-/// `run_ci_steps` with a recording executor, so removing this step OR removing the
-/// toolchain gate flips it red.
-fn feature_gated_checks() -> Vec<Vec<&'static str>> {
-    vec![vec![
-        "check",
-        "-p",
-        "wyrd-metadata-tikv",
-        "--features",
-        "tikv",
-        "--tests",
-    ]]
-}
-
-/// Whether the TiKV build toolchain (and thus the `tikv` feature's grpcio/protoc
-/// build dependencies) is declared available. **Off by default**: a plain
-/// `cargo xtask ci` on a laptop or a PDCA worktree with no TiKV toolchain must
-/// never compile or audit the pre-1.0 `tikv-client` tree
-/// (`crates/metadata-tikv/Cargo.toml`) — the documented container-free/offline CI
-/// invariant. The privileged Tier CI/eval job that owns the live Tier-1/Tier-2
-/// legs sets `WYRD_TIKV_TOOLCHAIN=1` to opt the feature-gated type-check in.
-fn tikv_toolchain_available() -> bool {
-    std::env::var_os("WYRD_TIKV_TOOLCHAIN").is_some()
-}
-
 /// The ordered `cargo` steps of the CI gate, executed via the injected `exec`
 /// (`run_ci` passes `cargo`; the unit test passes a recording closure so the real
-/// wiring is exercised without spawning `cargo`). `tikv_toolchain` gates the
-/// feature-gated metadata check: it is emitted **only** when the TiKV build
-/// toolchain is declared present (`WYRD_TIKV_TOOLCHAIN`), so the default no-TiKV
-/// `cargo xtask ci` never compiles the pre-1.0 `tikv-client` tree
-/// (`crates/metadata-tikv/Cargo.toml`) and stays green offline.
+/// wiring is exercised without spawning `cargo`).
+///
+/// `toolchain` is the injected **environment lookup** — `run_ci` passes
+/// `std::env::var_os(..).is_some()`; the unit test passes a fixed set of declared
+/// names. Reading the two feature gates *here*, by name
+/// (`xtask::TIKV_TOOLCHAIN_ENV`, `xtask::FDB_TOOLCHAIN_ENV`), rather than accepting
+/// two booleans from `run_ci`, is deliberate (#439): it leaves no call site in which
+/// one backend's gate can be passed for the other's. The old shape — one
+/// `tikv_toolchain` boolean gating the whole `feature_gated_checks()` list — would have
+/// made the FDB typecheck fire only when `WYRD_TIKV_TOOLCHAIN` was also set, and no test
+/// could have seen it, because the wrong wiring lived in `run_ci`'s untestable body.
+///
+/// Each gate is emitted **only** when its own toolchain is declared present, so the
+/// default `cargo xtask ci` never compiles the pre-1.0 `tikv-client` tree
+/// (`crates/metadata-tikv/Cargo.toml`) nor links `libfdb_c`
+/// (`crates/metadata-fdb/Cargo.toml`), and stays green offline and container-free.
+/// The row list itself lives in `xtask::feature_gated_checks` (the lib target) so
+/// `xtask/tests/fdb_harness.rs` can assert its content directly.
 fn run_ci_steps(
-    tikv_toolchain: bool,
+    toolchain: &mut dyn FnMut(&str) -> bool,
     exec: &mut dyn FnMut(&[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
     // `wyrd-dst` only compiles under `--cfg madsim`; it is excluded from the
@@ -1305,16 +1364,18 @@ fn run_ci_steps(
         "--all-targets",
     ])?;
     exec(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
-    // Type-check the feature-gated metadata Tier scenario bodies the default
-    // `--workspace` build skips (`--all-targets` selects target KINDS, not
-    // features, so a `#[cfg(feature = "tikv")]` body slips through). GATED on the
-    // TiKV toolchain: compiling the pre-1.0 `tikv-client` tree is opt-in via
-    // `WYRD_TIKV_TOOLCHAIN` (the privileged Tier CI job) so the default offline
-    // gate stays container-free (M4.6, #257).
-    if tikv_toolchain {
-        for check in feature_gated_checks() {
-            exec(&check)?;
-        }
+    // Type-check the feature-gated backend bodies the default `--workspace` build skips
+    // (`--all-targets` selects target KINDS, not features, so a `#[cfg(feature = "tikv")]`
+    // / `#[cfg(feature = "fdb")]` body slips through). Each row is GATED on ITS OWN
+    // toolchain (M4.6 #257; ADR-0042 #439): compiling the pre-1.0 `tikv-client` tree is
+    // opt-in via WYRD_TIKV_TOOLCHAIN, linking `libfdb_c` is opt-in via
+    // WYRD_FDB_TOOLCHAIN, and neither implies the other — so the default offline gate
+    // stays container-free.
+    for check in xtask::feature_gated_checks(
+        toolchain(xtask::TIKV_TOOLCHAIN_ENV),
+        toolchain(xtask::FDB_TOOLCHAIN_ENV),
+    ) {
+        exec(&check)?;
     }
     Ok(())
 }
@@ -1322,7 +1383,9 @@ fn run_ci_steps(
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
 /// failure stops the run.
 fn run_ci() -> Result<(), String> {
-    run_ci_steps(tikv_toolchain_available(), &mut |args| cargo(args))?;
+    run_ci_steps(&mut |name| std::env::var_os(name).is_some(), &mut |args| {
+        cargo(args)
+    })?;
     cargo_machete_check()?;
     cargo_deny_check()?;
     run_conformance()?;
@@ -1545,37 +1608,47 @@ mod tests {
         );
     }
 
-    // M4.6 (#257): exercise `run_ci`'s REAL wiring (via `run_ci_steps`, the sole
-    // cargo-step source `run_ci` iterates) with a recording executor — no `cargo`
-    // spawned — and assert the invocations it actually makes. This is not the
-    // iter-10 tautology (which restated the `feature_gated_checks` constant and
-    // stayed green if the wiring loop was deleted): here removing the step from the
-    // wiring OR making the gate unconditional flips a case red.
+    // Drive `run_ci`'s cargo wiring (via `run_ci_steps`, the sole cargo-step source
+    // `run_ci` iterates) with a recording executor and a FAKE environment — no `cargo`
+    // spawned, no process env touched — and return every argv it invokes.
+    //
+    // `declared` is the set of toolchain env vars that are "set". Because `run_ci_steps`
+    // resolves both gates from this lookup ITSELF, reading `WYRD_TIKV_TOOLCHAIN` where it
+    // should read `WYRD_FDB_TOOLCHAIN` (the #439 coupling hazard) is visible here.
+    fn recorded_invocations(declared: &[&str]) -> Vec<String> {
+        let mut calls = Vec::new();
+        run_ci_steps(&mut |name| declared.contains(&name), &mut |args| {
+            calls.push(args.join(" "));
+            Ok(())
+        })
+        .expect("recording executor never errors");
+        calls
+    }
+
+    fn is_feature_check(pkg: &'static str, feature: &'static str) -> impl Fn(&String) -> bool {
+        move |c: &String| {
+            c.starts_with("check ")
+                && c.contains(&format!("-p {pkg}"))
+                && c.contains(&format!("--features {feature}"))
+                && c.contains("--tests")
+        }
+    }
+
+    // M4.6 (#257): exercise `run_ci`'s REAL wiring with a recording executor and assert
+    // the invocations it actually makes. This is not the iter-10 tautology (which
+    // restated the `feature_gated_checks` constant and stayed green if the wiring loop
+    // was deleted): here removing the step from the wiring OR making the gate
+    // unconditional flips a case red.
     #[test]
     fn ci_type_checks_feature_gated_metadata_scenario() {
-        // Drive run_ci's cargo wiring, recording every argv it invokes.
-        fn recorded_invocations(tikv_toolchain: bool) -> Vec<String> {
-            let mut calls = Vec::new();
-            run_ci_steps(tikv_toolchain, &mut |args| {
-                calls.push(args.join(" "));
-                Ok(())
-            })
-            .expect("recording executor never errors");
-            calls
-        }
-        let is_metadata_feature_check = |c: &String| {
-            c.starts_with("check ")
-                && c.contains("-p wyrd-metadata-tikv")
-                && c.contains("--features tikv")
-                && c.contains("--tests")
-        };
+        let is_metadata_feature_check = is_feature_check("wyrd-metadata-tikv", "tikv");
 
         // Toolchain present → run_ci INVOKES the metadata feature check, so the
         // #[cfg(feature = "tikv")] Tier-1/Tier-2 scenario bodies (SymmetricPartition,
         // the PD oracle, the testkit-oracle wiring) are type-checked at Check.
-        let with_toolchain = recorded_invocations(true);
+        let with_toolchain = recorded_invocations(&[xtask::TIKV_TOOLCHAIN_ENV]);
         assert!(
-            with_toolchain.iter().any(is_metadata_feature_check),
+            with_toolchain.iter().any(&is_metadata_feature_check),
             "run_ci must invoke `cargo check -p wyrd-metadata-tikv --features tikv --tests` \
              when the TiKV toolchain is present, so the feature-gated metadata Tier scenario \
              bodies are type-checked at Check: {with_toolchain:?}"
@@ -1584,11 +1657,49 @@ mod tests {
         // Gate honesty: toolchain absent (a laptop / PDCA worktree) → run_ci must
         // NOT compile the pre-1.0 `tikv-client` tree — the container-free/offline
         // CI invariant. Making the step unconditional flips this red.
-        let without_toolchain = recorded_invocations(false);
+        let without_toolchain = recorded_invocations(&[]);
         assert!(
-            !without_toolchain.iter().any(is_metadata_feature_check),
+            !without_toolchain.iter().any(&is_metadata_feature_check),
             "the default no-TiKV `cargo xtask ci` must not compile the tikv feature tree \
              (WYRD_TIKV_TOOLCHAIN unset): {without_toolchain:?}"
+        );
+    }
+
+    // ADR-0042 (#439): the same wiring assertion for the `fdb` rows, driven through the
+    // env lookup `run_ci` really uses. This is the test that binds the coupling hazard the
+    // brief names: with ONLY `WYRD_FDB_TOOLCHAIN` declared, both fdb rows must fire. Make
+    // the fdb gate read `WYRD_TIKV_TOOLCHAIN` (or gate the loop on the tikv boolean, the
+    // pre-#439 shape) and this goes red.
+    #[test]
+    fn ci_type_checks_the_fdb_feature_on_the_fdb_toolchain_alone() {
+        let fdb_only = recorded_invocations(&[xtask::FDB_TOOLCHAIN_ENV]);
+        for pkg in ["wyrd-metadata-fdb", "wyrd-server"] {
+            let is_fdb_check = is_feature_check(pkg, "fdb");
+            assert!(
+                fdb_only.iter().any(&is_fdb_check),
+                "run_ci must invoke `cargo check -p {pkg} --features fdb --tests` when the FDB \
+                 toolchain is declared, independently of WYRD_TIKV_TOOLCHAIN: {fdb_only:?}"
+            );
+        }
+        assert!(
+            !fdb_only.iter().any(|c| c.contains("--features tikv")),
+            "the FDB toolchain must not drag in the pre-1.0 tikv-client tree: {fdb_only:?}"
+        );
+
+        // The converse: a TiKV-only runner must not link `libfdb_c`.
+        let tikv_only = recorded_invocations(&[xtask::TIKV_TOOLCHAIN_ENV]);
+        assert!(
+            !tikv_only.iter().any(|c| c.contains("--features fdb")),
+            "the TiKV toolchain must not compile the fdb feature tree (no libfdb_c there): \
+             {tikv_only:?}"
+        );
+
+        // And the default gate compiles neither.
+        let neither = recorded_invocations(&[]);
+        assert!(
+            !neither.iter().any(|c| c.contains("--features")),
+            "the default `cargo xtask ci` must compile no feature-gated backend tree: \
+             {neither:?}"
         );
     }
 

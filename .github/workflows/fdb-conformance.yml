@@ -1,0 +1,178 @@
+name: fdb-conformance
+
+# **FoundationDB conformance tier** (ADR-0042, issues #438 / #439): the standing
+# automated signal for the *chosen production metadata backend*.
+#
+# The conformance driver (added by #438) brings up the throwaway single-node
+# `fdbserver` under `deploy/fdb-single-node/`, creates the database, and drives the shared
+# `MetadataStore` conformance suite plus the driver-level contention/scan/timeout
+# properties against it. Until this job existed nothing invoked that subcommand: the
+# `fdb` backend had zero automated coverage on any PR or nightly and could rot silently
+# (#439).
+#
+# Runs on TWO triggers:
+#   1. **pull_request**, filtered to the paths that can plausibly break it — the backend
+#      crate, the server's backend-selection arms, the compose stack, the xtask driver,
+#      the lockfile, and this file. The filter keeps every unrelated PR off a container
+#      runner.
+#   2. **nightly cron + workflow_dispatch**, mirroring `tier1-jepsen.yml` — post-merge
+#      regression visibility for what the path filter cannot catch (an upstream image
+#      change, a transitive dependency bump).
+#
+# Both triggers type-check the `fdb` feature arms (the step below), because a
+# `crates/server/**` PR is filtered in here precisely so the server's `#[cfg(feature =
+# "fdb")]` arms — which NO default-feature build compiles — get compiled. Only the
+# whole-gate re-run is nightly-only.
+#
+# Gating policy (ADR-0016): this is NOT a required merge-gate status check. The
+# unprivileged, container-free merge gate stays as it is — it neither links `libfdb_c`
+# nor starts a container. This job is the privileged sibling that supplies the live
+# evidence, exactly as `tier1-jepsen.yml` and `integration-nightly.yml` do for theirs.
+#
+# It deliberately does NOT consume a prebuilt `wyrd:fdb` image (#470): it installs the
+# FoundationDB *client package* on the runner and runs the test harness, so the signal
+# stays fast and un-blocked by an image build.
+
+on:
+  pull_request:
+    paths:
+      # The backend itself, and the server arms that select it. Both are compiled with
+      # the feature on by the type-check step below — the filter promises nothing it
+      # does not perform.
+      - "crates/metadata-fdb/**"
+      - "crates/server/**"
+      # The throwaway cluster and the driver that stands it up.
+      - "deploy/fdb-single-node/**"
+      - "xtask/**"
+      - ".github/workflows/fdb-conformance.yml"
+      # A dependency bump can move the `foundationdb` crate or its API version.
+      # `Cargo.lock` catches a resolved-version change; the root `Cargo.toml` catches
+      # what the lock cannot — it does not record features, so retargeting the API
+      # (`features = ["fdb-7_3"]` → `fdb-7_4`) or editing the dep spec leaves the lock
+      # untouched, and without this the fdb type-check/conformance signal would skip
+      # until after merge. (Per-crate manifests are already covered by the `crates/**`
+      # entries above; this is the workspace root only.)
+      - "Cargo.lock"
+      - "Cargo.toml"
+  schedule:
+    # 06:00 UTC daily — after tier1-jepsen (02:00), tier1-disk-faults (03:00),
+    # integration-nightly (04:00) and tier2-kill-reconstruct (05:00), so the container
+    # jobs never contend for a runner.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fdb-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fdb-conformance:
+    runs-on: ubuntu-latest
+    # Cold Rust build + image pull + cluster bring-up + the five `--features fdb` test
+    # legs fit well under this, and on the nightly leg the whole gate as well. The bound
+    # stops a hung `fdbcli` drifting toward GitHub's 6h default (#150).
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      # Pinned to the server image `deploy/fdb-single-node/docker-compose.yml` runs and to
+      # the crate's `fdb-7_3` API feature (root Cargo.toml). A client library from a
+      # different version never connects, so this pin is load-bearing, not cosmetic. It is
+      # also `xtask::fdb_doctor::FDB_VERSION`, which `xtask/tests/fdb_harness.rs` asserts
+      # equal to both of the above.
+      FDB_VERSION: "7.3.77"
+      # Opt the two `--features fdb` type-checks (`xtask::feature_gated_checks`) into the
+      # whole-gate step below. Gated SEPARATELY from `WYRD_TIKV_TOOLCHAIN`: the two
+      # backends need different privileged toolchains and must never imply one another.
+      # This runner is the only one that installs `libfdb_c`, so it is the only place
+      # those checks can compile.
+      WYRD_FDB_TOOLCHAIN: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest ships Docker with the compose plugin; this confirms the daemon is
+      # reachable (the same step integration-nightly.yml and tier1-jepsen.yml use). The
+      # conformance driver re-checks it and hard-fails when CI=true.
+      - name: Docker info
+        run: docker info
+
+      # The `fdb` feature is a binding over the FoundationDB C client: `libfdb_c` must be
+      # present at BUILD time or the link fails. `fdbcli`, from the same package, backs
+      # the doctor's cluster-health probe.
+      - name: Install the FoundationDB client package
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            --output foundationdb-clients.deb \
+            "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb"
+          sudo dpkg --install foundationdb-clients.deb
+          rm -f foundationdb-clients.deb
+          fdbcli --version
+
+      # Gap 2 of #439, on EVERY trigger. Nothing else in CI compiles these: the merge
+      # gate builds `--workspace` with default features, and `--all-targets` widens target
+      # kinds, not the feature set. So the `#[cfg(feature = "fdb")]` store module of
+      # crates/metadata-fdb and every `#[cfg(feature = "fdb")]` backend-selection arm in
+      # crates/server/src/cli.rs are type-checked HERE or nowhere. Running them on the
+      # pull-request leg is what makes the `crates/server/**` path filter above honest —
+      # the conformance driver's own legs build `-p wyrd-metadata-fdb` only, so without
+      # this step a type error in a server arm would surface a day later, on the cron.
+      #
+      # These two commands are `xtask::feature_gated_checks(false, true)` verbatim;
+      # xtask/tests/fdb_harness.rs asserts the workflow and the function agree, so a
+      # future row added to one cannot silently skip the other.
+      - name: Type-check the fdb feature arms
+        run: |
+          cargo check -p wyrd-metadata-fdb --features fdb --tests
+          cargo check -p wyrd-server --features fdb --tests
+
+      # Brings up deploy/fdb-single-node, runs `configure new single memory`, writes the
+      # host-side cluster file, drives the five `--features fdb` test legs, and tears the
+      # stack down unconditionally. Its own preflight (`xtask::fdb_doctor`) fails fast if
+      # the install step above did not put libfdb_c where the linker looks.
+      - name: cargo xtask fdb-conformance
+        run: cargo xtask fdb-conformance
+
+      # `cargo xtask ci` shells out to `cargo-deny` and `cargo-machete`, and hard-fails
+      # under CI=true when either is absent (`run_ci` → `cargo_{machete,deny}_check`,
+      # xtask/src/main.rs). A fresh runner ships neither, so without this the whole-gate
+      # step below turns red at the license/unused-dep wall even after every FDB leg
+      # passed. Same prebuilt-binary action and tool list `ci.yml` installs before the
+      # same command — a fetch, not a from-source compile. Gated to the nightly/dispatch
+      # legs, the only ones that run the gate: the pull-request leg installs neither
+      # binary because it invokes neither.
+      - name: Install cargo-deny + cargo-machete
+        if: github.event_name != 'pull_request'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny,cargo-machete
+
+      # The whole gate, with WYRD_FDB_TOOLCHAIN set — which is what makes
+      # `xtask::feature_gated_checks` emit the same two `cargo check` rows from inside
+      # `cargo xtask ci`, proving that wiring end-to-end on a runner that really has
+      # `libfdb_c`. Restricted to the nightly/dispatch legs: on a pull request `ci.yml`
+      # already runs this gate (minus the fdb rows) and the dedicated step above already
+      # supplies the fdb type-checks, so running it here too would duplicate ~15 minutes
+      # of CI per PR for no new signal.
+      - name: cargo xtask ci (fdb feature type-checks opted in)
+        if: github.event_name != 'pull_request'
+        run: cargo xtask ci
+
+      # Surface the failure diagnostics before they are lost (#150): the host-side cluster
+      # file and anything the run wrote under target/fdb-single-node/.
+      - name: Upload FoundationDB diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fdb-conformance-logs
+          path: target/fdb-single-node/
+          if-no-files-found: ignore
+          retention-days: 14

@@ -3,6 +3,28 @@
 # "paywall" licenses (BSL/SSPL), plus the RUSTSEC advisory database. A
 # contribution that pulls in a disqualified license or a vulnerable crate fails
 # `cargo deny check` in CI.
+#
+# AUDIT POLICY — what this file can and cannot see (ADR-0042, issue #439).
+# `cargo deny` / `cargo audit` traverse the **Rust dependency graph** recorded in
+# Cargo.lock. For the FoundationDB metadata backend that graph is
+# `foundationdb -> foundationdb-sys -> (build) bindgen -> clang-sys -> libloading`,
+# and it IS audited here — the ISC allowlist entry below exists precisely because
+# `cargo deny check` (run by `cargo xtask ci`, xtask/src/main.rs) walks it even
+# though the `fdb` feature is off by default.
+#
+# What neither tool can see is **`libfdb_c` itself**: the FoundationDB C client is
+# a system shared object installed from an upstream .deb/.rpm, linked at build
+# time by `foundationdb-sys`. It appears in no lockfile, has no crates.io version,
+# and carries no RUSTSEC advisories. Its advisory surface is therefore tracked
+# OUT of band, by following upstream FoundationDB release notes and security
+# announcements (https://github.com/apple/foundationdb/releases) and bumping the
+# pinned version in lockstep across the three places that name it:
+# `deploy/fdb-single-node/docker-compose.yml` (server image),
+# `.github/workflows/fdb-conformance.yml` (client package), and
+# `xtask::fdb_doctor::FDB_VERSION` (which xtask/tests/fdb_harness.rs asserts
+# equal to the other two, so a partial bump fails the gate). The same split
+# applies to any future backend whose Rust crate is a binding over a system
+# library; it is a property of the tooling, not of this dependency.
 
 [advisories]
 # Fail on any RUSTSEC advisory for a crate in the dependency graph.
