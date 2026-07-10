@@ -35,6 +35,70 @@ fn trait_contract_against_fdb() {
     run(cluster_file);
 }
 
+/// The **production** constructor, driven the way production drives it: `connect()` awaited
+/// from inside a Tokio runtime, resolving its own cluster file from `WYRD_FDB_CLUSTER_FILE`
+/// (#441).
+///
+/// `open()` — what the suite above uses — is deliberately probe-free. `connect()` is the
+/// operator path (`open_fdb_meta`, `crates/server/src/cli.rs:175`, awaited from seven call
+/// sites), and it is the one that runs the version-skew readiness probe. This case is the
+/// only place the *whole* production entry point runs: env resolution → `Database::new` →
+/// `preflight().await` → `Ok`.
+///
+/// It pins two things a pure unit test cannot:
+///
+/// 1. **No nested runtime.** Every caller of `connect()` is already on a runtime, so a
+///    `connect()` that drove its probe on a runtime of its own would panic here with
+///    *"Cannot start a runtime from within a runtime"* — the exact way a `wyrd
+///    --metadata-backend fdb` invocation would die, in code no `cargo xtask ci` job
+///    compiles.
+/// 2. **`Ready` against a real, matched cluster.** `store::client_status` parses the real
+///    `get_client_status()` JSON of the live `libfdb_c`, and `preflight::verdict` calls it
+///    `Ready` — so the probe now standing in front of every production connect does not
+///    reject the healthy case it must let through.
+#[test]
+fn connect_probes_the_real_cluster_from_inside_a_runtime() {
+    let Some(cluster_file) = cluster_file() else {
+        eprintln!(
+            "wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE not set — skipping the FoundationDB \
+             connect probe (clean skip; the gate stays green without an FDB)."
+        );
+        return;
+    };
+    run_connect(cluster_file);
+}
+
+/// `connect()` reads `WYRD_FDB_CLUSTER_FILE` itself — the value `xtask fdb-conformance`
+/// exported. `cluster_file` is re-read here only so the skip gate and the failure message
+/// name the same cluster; nothing mutates the environment.
+#[cfg(feature = "fdb")]
+fn run_connect(cluster_file: String) {
+    use wyrd_metadata_fdb::FdbMetadataStore;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    let store = runtime.block_on(async { FdbMetadataStore::connect().await });
+
+    assert!(
+        store.is_ok(),
+        "connect() must reach the matched cluster at {cluster_file} and pass its readiness \
+         probe; it returned: {:?}",
+        store.err().map(|e| e.to_string()),
+    );
+}
+
+#[cfg(not(feature = "fdb"))]
+fn run_connect(cluster_file: String) {
+    let _ = cluster_file;
+    eprintln!(
+        "wyrd-metadata-fdb: WYRD_FDB_CLUSTER_FILE is set but the crate was built without \
+         `--features fdb` — skipping. Run it via `cargo xtask fdb-conformance`."
+    );
+}
+
 #[cfg(feature = "fdb")]
 fn run(cluster_file: String) {
     use wyrd_metadata_conformance as conformance;

@@ -78,6 +78,26 @@ fn a_conditional_commit_that_times_out_is_never_a_conflict() {
     run_conditional_commit_times_out();
 }
 
+/// The #441 readiness probe, driven **from inside a Tokio runtime** — the shape every
+/// production caller has (`open_fdb_meta`, `crates/server/src/cli.rs:175`, is awaited from
+/// seven call sites that are all already on a runtime).
+///
+/// Two properties, and the first is why this case exists at all:
+///
+/// 1. **It returns.** `preflight` owns no runtime and calls no `block_on`; it awaits on the
+///    caller's. A version of it that built its own runtime and blocked on it would panic
+///    here with Tokio's *"Cannot start a runtime from within a runtime"* — silently, for
+///    every `wyrd … --metadata-backend fdb` invocation, since no gate compiles the `fdb`
+///    feature. `guarded` drives it on a real multi-thread runtime, so that panic is a test
+///    failure rather than a production one.
+/// 2. **It fails honest.** An unreachable coordinator is `Unreachable`, never a guessed
+///    `VersionSkew`: the client never exchanged a protocol version with anything, so it has
+///    no basis to claim a mismatch (`preflight`'s fail-honest rule).
+#[test]
+fn preflight_against_an_unreachable_cluster_is_err_not_a_panic() {
+    run_preflight_times_out();
+}
+
 #[cfg(feature = "fdb")]
 fn run_get_times_out() {
     use wyrd_traits::MetadataStore;
@@ -138,6 +158,26 @@ fn run_conditional_commit_times_out() {
             "the timeout must surface as an Err the caller cannot ignore",
         ),
     }
+}
+
+#[cfg(feature = "fdb")]
+fn run_preflight_times_out() {
+    let store = unreachable_store("preflight");
+    // The production probe, on the caller's runtime — exactly as `connect()` awaits it.
+    let outcome = guarded(async move { store.preflight().await });
+
+    let err = outcome
+        .expect_err("a readiness probe against an unreachable cluster must not report Ready");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unreachable"),
+        "an unreachable coordinator must be reported as unreachable: {msg}",
+    );
+    assert!(
+        !msg.contains("mismatch"),
+        "the client never exchanged a protocol version with anything, so it must not claim \
+         a version mismatch — that is the misdiagnosis #441 exists to prevent: {msg}",
+    );
 }
 
 /// Drive `fut` on a fresh runtime, failing the test if it does not finish within
@@ -212,6 +252,11 @@ fn run_blind_commit_times_out() {
 
 #[cfg(not(feature = "fdb"))]
 fn run_conditional_commit_times_out() {
+    feature_off();
+}
+
+#[cfg(not(feature = "fdb"))]
+fn run_preflight_times_out() {
     feature_off();
 }
 

@@ -159,16 +159,25 @@ async fn open_tikv_meta() -> Result<wyrd_metadata_tikv::TikvMetadataStore, BoxEr
 /// Unlike [`open_tikv_meta`], there is no pre-check env lookup here: the driver's
 /// own `connect()` owns cluster-file env resolution (`WYRD_FDB_CLUSTER_FILE`) and
 /// deliberately falls back to `/etc/foundationdb/fdb.cluster` when it is unset
-/// (`metadata-fdb/src/lib.rs:424-433`, unit-tested at `:479-482`) — a hard
+/// (`metadata-fdb/src/lib.rs:432-441`, unit-tested at `:494-498`) — a hard
 /// pre-check here would contradict that contract and break a stock FDB install
-/// that relies on the default cluster file. `connect()` is synchronous (unlike
-/// `open_tikv_meta`'s `.await`), so this helper is too; the hint below is only
-/// error *context* on a failed connect, not a precondition.
+/// that relies on the default cluster file. The hint below is only error *context*
+/// on a failed connect, not a precondition.
+///
+/// `async`, **exactly like [`open_tikv_meta`]**, and for the same reason: `connect()`
+/// awaits a bounded `get_client_status()` readiness probe (#441's version-skew guard,
+/// `metadata-fdb/src/lib.rs:1250`), and that future needs a running reactor. Every caller
+/// of this helper is already inside one — four inside `runtime.block_on(async { … })`,
+/// three inside an `async fn` — so driving the probe on a runtime of its own would
+/// panic with Tokio's "Cannot start a runtime from within a runtime". Await it on the
+/// caller's runtime instead; the seam is the peer's, not a new one.
 #[cfg(feature = "fdb")]
-fn open_fdb_meta() -> Result<wyrd_metadata_fdb::FdbMetadataStore, BoxError> {
-    wyrd_metadata_fdb::FdbMetadataStore::connect().map_err(|e| {
-        format!("fdb backend: set WYRD_FDB_CLUSTER_FILE to the cluster file path: {e}").into()
-    })
+async fn open_fdb_meta() -> Result<wyrd_metadata_fdb::FdbMetadataStore, BoxError> {
+    wyrd_metadata_fdb::FdbMetadataStore::connect()
+        .await
+        .map_err(|e| {
+            format!("fdb backend: set WYRD_FDB_CLUSTER_FILE to the cluster file path: {e}").into()
+        })
 }
 
 /// The L5 `Coordination` backend `server` composes behind the unchanged
@@ -371,7 +380,7 @@ fn cmd_put(args: &[String]) -> Result<ExitCode, BoxError> {
             }
             #[cfg(feature = "fdb")]
             MetadataBackend::Fdb => {
-                let meta = open_fdb_meta()?;
+                let meta = open_fdb_meta().await?;
                 local_store_put(&meta, &chunks, key, &data, chunk_size, durability).await
             }
         }
@@ -457,7 +466,7 @@ fn cmd_get(args: &[String]) -> Result<ExitCode, BoxError> {
             }
             #[cfg(feature = "fdb")]
             MetadataBackend::Fdb => {
-                let meta = open_fdb_meta()?;
+                let meta = open_fdb_meta().await?;
                 local_store_get(&meta, &chunks, key, out).await
             }
         }
@@ -838,7 +847,7 @@ where
         }
         #[cfg(feature = "fdb")]
         MetadataBackend::Fdb => {
-            let meta = open_fdb_meta()?;
+            let meta = open_fdb_meta().await?;
             service
                 .run_reconstruction_until(
                     zone, custodian, &meta, configured, interval, clock, shutdown,
@@ -1478,13 +1487,13 @@ where
         }
         #[cfg(feature = "fdb")]
         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
-            let meta = open_fdb_meta()?;
+            let meta = open_fdb_meta().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
             serve_s3(gateway, credentials, region, listener).await
         }
         #[cfg(all(feature = "fdb", feature = "etcd"))]
         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
-            let meta = open_fdb_meta()?;
+            let meta = open_fdb_meta().await?;
             let coord = open_etcd_coordination().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
             serve_s3(gateway, credentials, region, listener).await
@@ -1549,7 +1558,7 @@ fn cluster_put(
             }
             #[cfg(feature = "fdb")]
             MetadataBackend::Fdb => {
-                let meta = open_fdb_meta()?;
+                let meta = open_fdb_meta().await?;
                 cluster_store_put(&meta, &fanout, key, data, chunk_size, durability).await?
             }
         };
@@ -1597,7 +1606,7 @@ fn cluster_get(
             }
             #[cfg(feature = "fdb")]
             MetadataBackend::Fdb => {
-                let meta = open_fdb_meta()?;
+                let meta = open_fdb_meta().await?;
                 cluster_store_get(&meta, &fanout, key).await?
             }
         };

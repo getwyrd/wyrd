@@ -5102,6 +5102,7 @@ dependencies = [
  "bytes",
  "foundationdb",
  "futures-util",
+ "serde_json",
  "tokio",
  "wyrd-metadata-conformance",
  "wyrd-traits",
