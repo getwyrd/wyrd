@@ -25,6 +25,21 @@ on:
       - "crates/metadata-fdb/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      # The image bakes `wyrd` built `--features fdb,etcd` from the whole workspace
+      # (the Dockerfile is `COPY . .`). We do NOT filter on every crate the binary pulls
+      # in: `cargo xtask ci` (the required gate) already default-compiles core/traits/
+      # chunkstore/…, so a break there fails a PR regardless. What it does NOT build are
+      # the OFF-by-default FEATURE trees — and this is the only CI job that compiles the
+      # `etcd` feature at all, and the only one that compiles the `fdb,etcd` COMBINATION
+      # (fdb-conformance builds `--features fdb` alone). So the feature-gated inputs this
+      # smoke owns, invisible to the default gate, must be listed here:
+      #   - the server bin's own `#[cfg(feature = "fdb"/"etcd")]` arms and the usage line
+      #     the smoke greps (`crates/server/src/cli.rs`);
+      #   - the etcd coordination tree the `etcd` feature composes;
+      #   - `.dockerignore`, which decides what `COPY . .` actually ships into the build.
+      - "crates/server/**"
+      - "crates/coordination-etcd/**"
+      - ".dockerignore"
   workflow_dispatch: {}
 
 permissions:

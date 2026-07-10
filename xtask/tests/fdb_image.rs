@@ -311,16 +311,24 @@ fn workflow_exists_resolves_and_filters_the_fdb_surface() {
         );
     }
 
-    // (c) The PR path filter must fire on the FDB surface: the backend crate and the
-    //     image home. (Substring is enough — a `paths:` entry is the literal glob string.)
-    assert!(
-        wf.contains("crates/metadata-fdb/**"),
-        "{WORKFLOW} path filter omits `crates/metadata-fdb/**`"
-    );
-    assert!(
-        wf.contains("deploy/docker/wyrd/**"),
-        "{WORKFLOW} path filter omits `deploy/docker/wyrd/**`"
-    );
+    // (c) The PR path filter must fire on every image build input the required gate does
+    //     NOT already cover. `cargo xtask ci` default-compiles core/traits/chunkstore/…,
+    //     so those are guarded there; what only THIS job builds is the OFF-by-default
+    //     feature surface the image bakes (`--features fdb,etcd`) plus the Docker context.
+    //     (Substring is enough — a `paths:` entry is the literal glob string.)
+    for entry in [
+        "crates/metadata-fdb/**",      // the fdb backend + its client version pin
+        "deploy/docker/wyrd/**",       // the image home
+        "crates/server/**",            // the baked bin: its fdb/etcd cfg arms + usage smoke
+        "crates/coordination-etcd/**", // the etcd feature tree — no other CI builds it
+        ".dockerignore",               // decides what `COPY . .` ships into the build
+    ] {
+        assert!(
+            wf.contains(entry),
+            "{WORKFLOW} path filter omits `{entry}` — a change there can break the \
+             `fdb,etcd` image with no other CI job catching it"
+        );
+    }
 }
 
 // ─── (4) demonstrated red — the consistency check is load-bearing ─────────────
