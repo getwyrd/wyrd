@@ -131,15 +131,36 @@ fn each_single_zone_fdbserver_persists_its_data_directory() {
 fn the_single_zone_shares_fdb0s_cluster_file_with_the_wyrd_roles() {
     let compose = read("deploy/small-multi-node-fdb/docker-compose.yml");
     const SHARED: &str = "/etc/foundationdb/fdb.cluster";
+
+    // Scope to the `fdb0` service block — and match the EXACT trimmed line, not a substring.
+    // Both matter: `FDB_CLUSTER_FILE: <path>` is a substring of every client's
+    // `WYRD_FDB_CLUSTER_FILE: <path>` line, so a whole-file `contains` (or an unscoped
+    // search) passes on the WYRD_ lines alone and would still be green if the load-bearing
+    // fdb0 override were deleted (#499 could silently return).
+    let fdb0_block = {
+        let start = compose
+            .find("\n  fdb0:")
+            .expect("small-multi-node-fdb must declare an `fdb0` service");
+        let rest = &compose[start + 1..];
+        let end = rest.find("\n  fdb1:").unwrap_or(rest.len()); // next service at the same indent
+        &rest[..end]
+    };
     assert!(
-        compose.contains(&format!("FDB_CLUSTER_FILE: {SHARED}")),
-        "small-multi-node-fdb: fdb0 must redirect the image's FDB_CLUSTER_FILE to the shared \
-         `{SHARED}`, or the shared volume stays empty and no wyrd role can reach FDB (#499)"
+        fdb0_block
+            .lines()
+            .any(|l| l.trim() == format!("FDB_CLUSTER_FILE: {SHARED}")),
+        "small-multi-node-fdb: the `fdb0` service must set `FDB_CLUSTER_FILE: {SHARED}` (the \
+         exact key, NOT the WYRD_-prefixed client var) to redirect the image's default off \
+         `/var/fdb`; without it the shared volume stays empty and no wyrd role can reach FDB \
+         (#499). fdb0 block:\n{fdb0_block}"
     );
-    // The clients must read the SAME path fdb0 writes to, or the share is pointless.
+    // The clients must read the SAME path fdb0 writes to. Exact-line match here too, so this
+    // clause can't be satisfied by fdb0's own `FDB_CLUSTER_FILE` line.
     assert!(
-        compose.contains(&format!("WYRD_FDB_CLUSTER_FILE: {SHARED}")),
-        "small-multi-node-fdb: the wyrd roles must read `WYRD_FDB_CLUSTER_FILE = {SHARED}`, the \
+        compose
+            .lines()
+            .any(|l| l.trim() == format!("WYRD_FDB_CLUSTER_FILE: {SHARED}")),
+        "small-multi-node-fdb: the wyrd roles must read `WYRD_FDB_CLUSTER_FILE: {SHARED}`, the \
          path fdb0 writes its shared cluster file to"
     );
 }
