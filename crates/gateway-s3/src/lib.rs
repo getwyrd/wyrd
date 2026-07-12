@@ -497,12 +497,22 @@ where
     ) {
         Ok(payload) => payload,
         Err(err) => {
+            // A rejected signature is worth a line of its own: in a field experiment a
+            // misconfigured client (wrong region, skewed clock, stale key) presents as a wall
+            // of 403s, and "which check failed" is the whole diagnosis. `warn`, not `error` —
+            // the gateway is behaving correctly; the caller is not.
+            tracing::warn!(
+                target: "wyrd.gateway.s3.auth",
+                s3_code = err.s3_code(),
+                reason = %err,
+                "refused an unauthenticated request",
+            );
             return error_response(
                 request_id,
                 StatusCode::FORBIDDEN,
                 err.s3_code(),
                 &err.to_string(),
-            )
+            );
         }
     };
 
@@ -695,45 +705,107 @@ fn error_response(
         .expect("static response is always valid")
 }
 
+/// Renders an error's full `source()` chain — the detail the typed errors carry and that
+/// nothing has ever read.
+///
+/// `metadata-fdb` classifies FoundationDB's error 1021 (`commit_unknown_result`) into a typed
+/// value holding the native code and a `may_still_commit` discriminator; `chunkstore-grpc`
+/// classifies a transport fault into `Unavailable`/`Timeout`/`Rpc`/`Connect` and keeps the
+/// gRPC `Status` as its `source()`; `ReadError::InsufficientFragments` names the chunk and
+/// how many fragments of how many it found. All of it is boxed into a `BoxError` on the way
+/// up, and all of it was thrown away at the wire layer. Walking the chain recovers it.
+struct CauseChain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for CauseChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut source = self.0.source();
+        let mut first = true;
+        while let Some(cause) = source {
+            if !first {
+                write!(f, ": ")?;
+            }
+            write!(f, "{cause}")?;
+            first = false;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
 /// Map a gateway error onto an S3-compatible HTTP response. A commit `Conflict`
 /// (a concurrent writer won) is 409; a payload/hash mismatch is 400; a failed
 /// `aws-chunked` chunk signature is 403 (fail-closed — the body was not signed by the
 /// credential holder); malformed chunk framing is 400; anything else 500.
+///
+/// **And it records what happened.** This function took an `err: &BoxError` and, on every
+/// path that was not one of the four recognised variants, never touched it: the error was
+/// collapsed into one 500 and one 18-word string, and nothing was written anywhere. An FDB
+/// `CommitUnknownResult` — *the write may or may not have landed*, the one condition where
+/// the client's retry policy and the durability audit both depend on knowing — was reported
+/// identically to a dangling dirent, a dead D-server, a scan-cap breach, an exhausted retry
+/// budget, and an unreconstructable chunk. Five root causes, one indistinguishable message,
+/// no server-side record (#528).
+///
+/// The log line carries the full `source()` chain, and rides in the `s3.request` span, so it
+/// is joined to the client's `x-amz-request-id` (#529) without any further work.
+///
+/// The client-facing `<Message>` deliberately stays free of internal detail — **detail to the
+/// log, request id to the client**. That is also why the 500 arm's message is unchanged: what
+/// was missing was never a better string for the client, it was a record for the operator.
 fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
+    let (status, code, message) = classify(err);
+    tracing::error!(
+        target: "wyrd.gateway.s3.error",
+        s3_code = code,
+        http_status = status.as_u16(),
+        error = %err,
+        cause_chain = %CauseChain(err.as_ref()),
+        "the gateway failed the request",
+    );
+    error_response(request_id, status, code, &message)
+}
+
+/// The error → (status, S3 code, client message) mapping, split out so the *classification*
+/// is one expression and [`gateway_error_response`] can record it before answering.
+///
+/// **Known gap, deliberately not closed here.** The backends raise richly-typed errors —
+/// FoundationDB's undetermined-commit class above all — but those types live *inside*
+/// `metadata-fdb`, and this crate is generic over [`ObjectGateway`] and must not name a
+/// concrete backend (ADR-0010). Classifying them needs the backend-agnostic error classes at
+/// the **trait seam**, which is proposal 0010 floor item 6 and is in flight (#515, #517).
+/// Once `wyrd_traits::CommitUnknownResult` lands, an arm here maps it to its own S3 code —
+/// a client must be able to tell "your write may have landed" from a clean failure. Until
+/// then the operator gets the full class from the log line above, which is the larger half.
+fn classify(err: &BoxError) -> (StatusCode, &'static str, String) {
     if let Some(streaming) = err.downcast_ref::<streaming::StreamingError>() {
         return match streaming {
-            streaming::StreamingError::ChunkSignature => error_response(
-                request_id,
+            streaming::StreamingError::ChunkSignature => (
                 StatusCode::FORBIDDEN,
                 "SignatureDoesNotMatch",
-                "an aws-chunked chunk signature does not verify",
+                "an aws-chunked chunk signature does not verify".to_string(),
             ),
-            streaming::StreamingError::Framing(what) => error_response(
-                request_id,
+            streaming::StreamingError::Framing(what) => (
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
-                &format!("malformed aws-chunked streaming body: {what}"),
+                format!("malformed aws-chunked streaming body: {what}"),
             ),
         };
     }
     match err.downcast_ref::<GatewayError>() {
-        Some(GatewayError::Conflict) => error_response(
-            request_id,
+        Some(GatewayError::Conflict) => (
             StatusCode::CONFLICT,
             "OperationAborted",
-            "a concurrent writer won the commit",
+            "a concurrent writer won the commit".to_string(),
         ),
-        Some(GatewayError::PayloadMismatch) => error_response(
-            request_id,
+        Some(GatewayError::PayloadMismatch) => (
             StatusCode::BAD_REQUEST,
             "XAmzContentSHA256Mismatch",
-            "the delivered body does not match the signed x-amz-content-sha256",
+            "the delivered body does not match the signed x-amz-content-sha256".to_string(),
         ),
-        _ => error_response(
-            request_id,
+        _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalError",
-            "the gateway could not complete the request",
+            "the gateway could not complete the request".to_string(),
         ),
     }
 }
@@ -741,6 +813,103 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error whose real diagnosis lives in its `source()` chain — the shape every backend
+    /// error arrives in. `metadata-fdb`'s `CommitUnknownResult` carries the FDB code and
+    /// `may_still_commit` this way; `chunkstore-grpc`'s `TransportError` keeps the gRPC
+    /// `Status` as its source; `ReadError::InsufficientFragments` names chunk/have/need.
+    #[derive(Debug)]
+    struct Backend(&'static str, Option<Box<Backend>>);
+
+    impl std::fmt::Display for Backend {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Backend {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// **The fix.** An unrecognised backend error must be RECORDED — with its whole cause
+    /// chain — not silently collapsed into a bare 500.
+    ///
+    /// Pre-fix, `gateway_error_response`'s `_` arm returned the 500 while the `err` binding
+    /// sat in scope, untouched: an FDB `commit_unknown_result` (the write MAY have landed),
+    /// a scan-cap breach, an exhausted retry budget, a dangling dirent and an unreconstructable
+    /// chunk all produced the same 18-word string and nothing else, anywhere. The capture
+    /// buffer is EMPTY — RED.
+    ///
+    /// Mutation guard: delete the `tracing::error!` and this fails; the assertions cannot pass
+    /// against an empty buffer.
+    #[test]
+    fn an_unrecognised_backend_error_is_recorded_with_its_whole_cause_chain() {
+        let capture = Capture::default();
+        let dispatch = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::Dispatch::new(
+                tracing_subscriber::registry().with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(capture.clone()),
+                ),
+            )
+        };
+
+        // The FDB undetermined-commit shape: the class, its native code, and the caller's
+        // remedy — every bit of it present in the error and, pre-fix, every bit discarded.
+        let err: BoxError = Box::new(Backend(
+            "commit outcome is undetermined; the batch may or may not have been applied",
+            Some(Box::new(Backend(
+                "foundationdb error 1021 (commit_unknown_result); may_still_commit=false",
+                None,
+            ))),
+        ));
+
+        let response = tracing::dispatcher::with_default(&dispatch, || {
+            gateway_error_response(RequestIds::new().mint(), &err)
+        });
+
+        // The client contract is unchanged — the fix was never a better string for the client.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains("commit outcome is undetermined"),
+            "the error itself must be recorded; pre-fix the buffer is EMPTY. got: {logged}"
+        );
+        assert!(
+            logged.contains("1021") && logged.contains("may_still_commit=false"),
+            "the CAUSE CHAIN must survive — the FDB code and the caller's remedy live there, \
+             and a 500 that omits them is indistinguishable from four other root causes. \
+             got: {logged}"
+        );
+        assert!(
+            logged.contains(r#""target":"wyrd.gateway.s3.error""#),
+            "a collector must be able to select the gateway's error plane. got: {logged}"
+        );
+    }
+
+    /// The recognised classes keep their S3 contract exactly — this change adds a record, it
+    /// does not renegotiate any status code.
+    #[test]
+    fn the_recognised_error_classes_keep_their_s3_codes() {
+        let conflict: BoxError = Box::new(GatewayError::Conflict);
+        assert_eq!(classify(&conflict).0, StatusCode::CONFLICT);
+        assert_eq!(classify(&conflict).1, "OperationAborted");
+
+        let mismatch: BoxError = Box::new(GatewayError::PayloadMismatch);
+        assert_eq!(classify(&mismatch).0, StatusCode::BAD_REQUEST);
+        assert_eq!(classify(&mismatch).1, "XAmzContentSHA256Mismatch");
+
+        let sig: BoxError = Box::new(streaming::StreamingError::ChunkSignature);
+        assert_eq!(classify(&sig).0, StatusCode::FORBIDDEN);
+        assert_eq!(classify(&sig).1, "SignatureDoesNotMatch");
+    }
 
     use std::sync::{Arc as StdArc, Mutex};
 
