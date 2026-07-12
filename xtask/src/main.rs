@@ -226,12 +226,14 @@ fn run_tikv_conformance() -> Result<(), String> {
 /// exported. TiKV's store bootstrap can lag PD's port opening, so each test — which
 /// dials the cluster — is retried a few times with backoff before giving up.
 ///
-/// Three test binaries run: `conformance` (the shared trait-contract suite, M4.1),
-/// `contention` (the write-conflict property tests, M4.2/#253), and `scan` (the
-/// at-scale native paged-scan completeness proof, M4.3/#254). All must pass for the
-/// job to exercise the commit conflict semantics AND the scan completeness invariant.
+/// Four test binaries run: `conformance` (the shared trait-contract suite, M4.1),
+/// `contention` (the write-conflict property tests, M4.2/#253), `scan` (the at-scale
+/// native paged-scan completeness proof, M4.3/#254), and `deadline` (the operation
+/// deadline's drop-safety, #517 — a cancelled operation must return its error, not abort
+/// the process on a dropped active transaction). All must pass for the job to exercise the
+/// commit conflict semantics, the scan completeness invariant AND the liveness guard.
 fn run_tikv_conformance_test() -> Result<(), String> {
-    for test in ["conformance", "contention", "scan"] {
+    for test in ["conformance", "contention", "scan", "deadline"] {
         run_tikv_test(test)?;
     }
     Ok(())

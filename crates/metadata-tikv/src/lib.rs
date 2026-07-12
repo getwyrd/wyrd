@@ -474,7 +474,7 @@ mod store {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use tikv_client::{BoundRange, Transaction, TransactionClient};
+    use tikv_client::{BoundRange, CheckLevel, Transaction, TransactionClient, TransactionOptions};
     use wyrd_traits::{
         BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, Result, WriteBatch,
     };
@@ -490,9 +490,17 @@ mod store {
     /// the pessimistic txn is still open — would abort the process instead of
     /// yielding `Err`. Finishing the txn with a best-effort rollback (a secondary
     /// rollback error is deliberately ignored so it can't mask the original error)
-    /// both preserves the caller's error and leaves no active txn to panic on drop.
-    /// The terminal `commit()` needs no such guard: it finalizes the txn whether it
+    /// both preserves the caller's error and releases the txn's locks promptly. The
+    /// terminal `commit()` needs no such guard: it finalizes the txn whether it
     /// succeeds or fails, so its drop is already safe.
+    ///
+    /// Since #517 this store opens its transactions with `drop_check(CheckLevel::Warn)`
+    /// (see `TikvMetadataStore::begin`), because the operation deadline can **cancel** an
+    /// operation's future and drop its txn at any await — a path no rollback can guard,
+    /// the future being already gone. So a dropped active txn no longer aborts the process.
+    /// This rollback stays, and is still right on every *reachable* error path: it releases
+    /// the locks immediately instead of leaving them to expire on their TTL. What changed is
+    /// that it is now a promptness measure rather than a crash guard.
     async fn rollback_then(txn: &mut Transaction, err: tikv_client::Error) -> BoxError {
         let _ = txn.rollback().await;
         err.into()
@@ -785,6 +793,39 @@ mod store {
         fn physical(&self, key: &[u8]) -> Vec<u8> {
             keyspace::physical(&self.namespace, key)
         }
+
+        /// Open the pessimistic transaction every operation runs in — and make it **safe to
+        /// drop** (#517, review of #521).
+        ///
+        /// `begin_pessimistic()` takes `TransactionOptions::new_pessimistic()`, whose
+        /// `check_level` is `CheckLevel::Panic` (tikv-client 0.4.0 `transaction.rs`), and
+        /// `Transaction::drop` **panics the process** when a still-`Active` transaction is
+        /// dropped. That is survivable only while every path either commits or rolls back
+        /// explicitly — which is exactly what the operation deadline broke: an elapsed
+        /// `tokio::time::timeout` CANCELS the operation's future, and cancelling drops the
+        /// `Transaction` wherever the await happened to be. A slow multi-page `scan`, a slow
+        /// `get_for_update`, a large conditional batch mid-`put` — any of them, on deadline,
+        /// would abort the process instead of returning the timeout error the deadline exists
+        /// to produce. A liveness guard that turns a hang into a crash is not a fix.
+        ///
+        /// So every transaction is opened with `drop_check(CheckLevel::Warn)`: a cancelled
+        /// operation drops its transaction with a log line, not a panic. The explicit
+        /// rollbacks on the non-cancelled paths are unchanged — they remain the normal route
+        /// and still release locks promptly. What is given up on the cancellation path is only
+        /// the *eager* release: the locks are left to TiKV's own resolution (a pessimistic
+        /// lock carries a TTL, and its heartbeat stops the moment the dropped transaction
+        /// stops renewing it). That is the only trade available — rolling back before the drop
+        /// would mean issuing an RPC to the very cluster whose unreachability caused the
+        /// deadline, which cannot be done from `Drop` (not async) and cannot be awaited (the
+        /// future has already been cancelled).
+        async fn begin(&self) -> Result<Transaction> {
+            self.client
+                .begin_with_options(
+                    TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn),
+                )
+                .await
+                .map_err(BoxError::from)
+        }
     }
 
     #[async_trait]
@@ -795,7 +836,7 @@ mod store {
         /// read-consistency contract (#261, ADR-0015).
         async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
             under_deadline("get", self.deadline, async {
-                let mut txn = self.client.begin_pessimistic().await?;
+                let mut txn = self.begin().await?;
                 let value = match txn.get(self.physical(key)).await {
                     Ok(value) => value,
                     Err(e) => return Err(rollback_then(&mut txn, e).await),
@@ -828,7 +869,7 @@ mod store {
                 // ONE transaction (one start timestamp) held across every page — the
                 // #261 consistent cut. `begin_pessimistic` reads at a single TSO, so
                 // keeping this one txn across all pages IS the snapshot guarantee.
-                let mut txn = self.client.begin_pessimistic().await?;
+                let mut txn = self.begin().await?;
                 let mut out: Vec<(Vec<u8>, Bytes)> = Vec::new();
                 let mut cursor = start;
                 loop {
@@ -896,7 +937,7 @@ mod store {
             // as `Conflict` — the blind writers that use `?` and ignore `CommitOutcome`
             // would silently drop the write; it stays `Err` (see `conflict_or_err`).
             let conditional = !batch.preconditions.is_empty();
-            let mut txn = self.client.begin_pessimistic().await?;
+            let mut txn = self.begin().await?;
 
             // Read + byte-compare every precondition INSIDE the one transaction, so
             // preconditions and mutations are all-or-nothing across keys.
