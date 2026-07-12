@@ -5030,6 +5030,8 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.14.6",
+ "tracing",
+ "tracing-subscriber",
  "wyrd-chunk-format",
  "wyrd-chunkstore-fs",
  "wyrd-chunkstore-grpc",
