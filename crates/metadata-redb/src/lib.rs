@@ -8,13 +8,29 @@
 //! transactions, checking preconditions *inside* that transaction is what makes
 //! version compare-and-set correct — a second writer sees the first's committed
 //! state and its precondition fails.
+//!
+//! **Completeness-or-fail-loud (#262, ADR-0011; #516).** A `scan` returns the
+//! complete matching set or `Err` — never a silently truncated `Vec`, because a
+//! short `inode:` listing shrinks GC's never-reclaim safety set (data loss). The
+//! two distributed backends enforce that with a shared [`SCAN_CAP`] above which
+//! they fail loud; this backend had *neither* a cap nor a truncation — it could
+//! not silently truncate (so it never violated the clause), but it did not
+//! enforce it either, and would happily materialize an unbounded `Vec` where FDB
+//! or TiKV had returned a loud [`ScanCapExceeded`]. It now raises the **same**
+//! seam-crate error at the **same** cap, so the local/dev backend behaves like
+//! production at the boundary.
 
 #![forbid(unsafe_code)]
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use redb::{backends::InMemoryBackend, Database, ReadableDatabase, ReadableTable, TableDefinition};
-use wyrd_traits::{CommitOutcome, MetadataStore, Result, WriteBatch};
+use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
+
+/// The shared per-`scan` ceiling and its fail-loud error, re-exported from the
+/// seam crate so a caller can name them without depending on `wyrd-traits`
+/// directly — the same courtesy `metadata-fdb` and `metadata-tikv` extend.
+pub use wyrd_traits::{ScanCapExceeded, SCAN_CAP};
 
 /// All metadata lives in one keyspace; the model namespaces keys by prefix
 /// (`inode:`, `dirent:`, `pending:`, `meta:`).
@@ -23,6 +39,7 @@ const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("wyrd.metadata
 /// A [`MetadataStore`] backed by an embedded redb database.
 pub struct RedbMetadataStore {
     db: Database,
+    scan_cap: usize,
 }
 
 impl RedbMetadataStore {
@@ -37,13 +54,35 @@ impl RedbMetadataStore {
         Self::from_db(Database::builder().create_with_backend(InMemoryBackend::new())?)
     }
 
+    /// Lower this store's per-`scan` cap, so the fail-loud arm is reachable in a
+    /// test without materializing 2^20 keys.
+    ///
+    /// It **refuses to raise** the cap — `min` with [`SCAN_CAP`], exactly as
+    /// `FdbMetadataStore::with_scan_cap` does: the cap is a correctness constraint
+    /// (#262), not a knob a caller may loosen.
+    #[must_use]
+    pub fn with_scan_cap(mut self, cap: usize) -> Self {
+        self.scan_cap = cap.min(SCAN_CAP);
+        self
+    }
+
+    /// This store's effective per-`scan` cap — so the clamp above is observable, and
+    /// therefore testable, rather than merely asserted around.
+    #[must_use]
+    pub fn scan_cap(&self) -> usize {
+        self.scan_cap
+    }
+
     fn from_db(db: Database) -> Result<Self> {
         // Materialize the table up front so the read paths never race a
         // not-yet-created table.
         let txn = db.begin_write()?;
         txn.open_table(TABLE)?;
         txn.commit()?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            scan_cap: SCAN_CAP,
+        })
     }
 }
 
@@ -64,6 +103,17 @@ impl MetadataStore for RedbMetadataStore {
             let key = k.value();
             if key.starts_with(prefix) {
                 out.push((key.to_vec(), Bytes::copy_from_slice(v.value())));
+                // Fail loud the moment the accumulated set passes the cap, and drop
+                // the partial `Vec` — never return a truncated result (#262,
+                // ADR-0011). `>` not `>=`, so a scan returning exactly `cap` keys is
+                // a legal complete result, matching the boundary the other two
+                // backends already agreed on (`metadata-tikv`'s `after_page`).
+                if out.len() > self.scan_cap {
+                    return Err(BoxError::from(ScanCapExceeded {
+                        cap: self.scan_cap,
+                        prefix: prefix.to_vec(),
+                    }));
+                }
             }
         }
         Ok(out)
