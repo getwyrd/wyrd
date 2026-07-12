@@ -758,21 +758,42 @@ impl std::fmt::Display for CauseChain<'_> {
 /// was missing was never a better string for the client, it was a record for the operator.
 fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     let (status, code, message) = classify(err);
-    tracing::error!(
-        target: "wyrd.gateway.s3.error",
-        // The join key is recorded on the EVENT, not merely inherited from the `s3.request`
-        // span. The span is an `info_span!`, so under an error-only filter (`--log-level
-        // error`, `RUST_LOG=error`) it is never enabled and `with_current_span(true)` has no
-        // fields to attach — and this line, the one an operator reaches for at 3am, would be
-        // the ONE that lost the `x-amz-request-id` the client is holding. Recording it here
-        // costs a field and survives any filter (#528; codex review of #533).
-        request_id = %request_id,
-        s3_code = code,
-        http_status = status.as_u16(),
-        error = %err,
-        cause_chain = %CauseChain(err.as_ref()),
-        "the gateway failed the request",
-    );
+
+    // **The level follows the status, because the error plane is an alerting surface.**
+    // A 4xx is the CLIENT being wrong — a bad payload hash, malformed `aws-chunked` framing,
+    // a bad chunk signature, a concurrent writer losing a CAS (409, which a correct client
+    // simply retries). Those are routine, they are the caller's fault, and firing them at
+    // `error` means a wall of ordinary bad uploads drowns the plane an operator watches for
+    // the gateway actually failing. It would also contradict this crate's own precedent: the
+    // rejected-signature 403 is deliberately a `warn`, "the gateway is behaving correctly;
+    // the caller is not". A 5xx is us. (Codex review of #533.)
+    //
+    // Both arms carry the identical fields — including `request_id` on the EVENT, not merely
+    // inherited from the `s3.request` span: that span is an `info_span!`, so under an
+    // error-only filter (`--log-level error`) it is never enabled and `with_current_span(true)`
+    // has no fields to attach. This line, the one an operator reaches for at 3am, would be the
+    // ONE that lost the `x-amz-request-id` the client is holding.
+    if status.is_server_error() {
+        tracing::error!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway failed the request",
+        );
+    } else {
+        tracing::warn!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway refused the request",
+        );
+    }
     error_response(request_id, status, code, &message)
 }
 
@@ -961,6 +982,210 @@ mod tests {
             "the failure record must carry the request id the CLIENT was handed, even with the \
              `info` span filtered out — otherwise the 500 has no join key under exactly the \
              log level a production gateway runs at. got: {logged}",
+        );
+    }
+
+    /// **The ACCESS line keeps its join key under a target-scoped filter** (codex review of
+    /// #533).
+    ///
+    /// `RUST_LOG=wyrd.gateway.s3.access=info` is the natural way to keep the access plane while
+    /// quietening everything else — and it enables *this event* without enabling the
+    /// `s3.request` span, whose target is the module path, not the event's. Inheriting the id
+    /// from the span alone meant the access line — the one record that proves a request even
+    /// REACHED the gateway, the first question of any field post-mortem — lost the join key
+    /// under exactly the directive an operator would reach for.
+    ///
+    /// Driven through the REAL router with `oneshot`, not by re-emitting the event here: a test
+    /// that logged its own line would only prove the test can log. The request is unsigned, so
+    /// it is refused with a 403 — which is fine and is the point: the access line is emitted for
+    /// every request that arrives, whatever the verdict.
+    ///
+    /// Mutation guard: drop `request_id = %request_id` from the access event and this fails.
+    #[tokio::test]
+    async fn the_access_line_carries_the_request_id_under_a_target_scoped_filter() {
+        use tower::ServiceExt;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        struct NoGateway;
+        impl ObjectGateway for NoGateway {
+            async fn put_object_streaming<S>(
+                &self,
+                _key: &str,
+                _source: S,
+                _expected: ContentHash,
+            ) -> wyrd_traits::Result<()>
+            where
+                S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
+                    + Send
+                    + Unpin
+                    + 'static,
+            {
+                Ok(())
+            }
+
+            async fn get_object_streaming(
+                self: Arc<Self>,
+                _key: &str,
+            ) -> wyrd_traits::Result<Option<ObjectRead>> {
+                Ok(None)
+            }
+
+            async fn delete_object(&self, _key: &str) -> wyrd_traits::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    // The directive in question: the access plane ON, everything else — the
+                    // `s3.request` span included — OFF.
+                    .with_filter(EnvFilter::new("wyrd.gateway.s3.access=info")),
+            ),
+        );
+
+        let router = S3Gateway::new(
+            Arc::new(NoGateway),
+            S3Config::new(vec![Credentials {
+                access_key_id: "AKIA".into(),
+                secret_access_key: "secret".into(),
+            }]),
+        )
+        .router();
+
+        // A thread-scoped default, not `with_default`: the request is `await`ed, and a
+        // sync-scoped dispatcher would not be installed across the await points. `#[tokio::test]`
+        // runs a current-thread runtime, so the whole future stays on this thread.
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/bucket/key")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("the router answers");
+
+        // Unsigned ⇒ refused. Immaterial to the property: the access line is emitted for every
+        // request that arrives, and it is the *arrival* this line exists to record.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Read the id off the head BEFORE draining — the drain consumes the response.
+        let served_id = response
+            .headers()
+            .get(request_id::HEADER)
+            .expect("every response carries the id")
+            .to_str()
+            .expect("ascii")
+            .to_string();
+
+        // Drain the body, as a real client does: the row is written when the TRANSFER ends, not
+        // when the head is built (#529), so nothing is logged until the body is consumed.
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain the body");
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains(r#""target":"wyrd.gateway.s3.access""#),
+            "the access line must be emitted under its own target directive. got: {logged}",
+        );
+        assert!(
+            logged.contains(&served_id),
+            "the access line must carry the SAME id the client was handed in \
+             `x-amz-request-id` — with the `s3.request` span filtered out, inheriting it from \
+             the span records nothing, and the one line proving the request arrived has no join \
+             key. got: {logged}",
+        );
+    }
+
+    /// **A 4xx is the caller's fault and must not page the error plane** (codex review of
+    /// #533).
+    ///
+    /// `wyrd.gateway.s3.error` is an alerting surface. A payload-hash mismatch, a bad chunk
+    /// signature, malformed framing, or a `Conflict` (409 — a concurrent writer won, which a
+    /// correct client just retries) are all *routine* and all the caller's doing. Firing them
+    /// at `error` buries the gateway's own failures under a wall of ordinary bad uploads, and
+    /// contradicts this crate's own precedent, where the rejected-signature 403 is deliberately
+    /// a `warn`.
+    ///
+    /// The subscriber filters at `error`, so a `warn` is dropped: an empty buffer IS the
+    /// assertion. The 500 case is covered by the tests above, so both directions are pinned —
+    /// without that pairing, "log nothing at all" would pass this one.
+    #[test]
+    fn a_client_error_is_not_recorded_on_the_error_plane() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_filter(EnvFilter::new("error")),
+            ),
+        );
+
+        // 409: a concurrent writer won the CAS. The client retries; nothing is broken.
+        let conflict: BoxError = Box::new(GatewayError::Conflict);
+        let response = tracing::dispatcher::with_default(&dispatch, || {
+            gateway_error_response(RequestIds::new().mint(), &conflict)
+        });
+
+        // The client contract is untouched — only the log LEVEL moved.
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            capture.contents().is_empty(),
+            "a 4xx must not reach the error plane at `error` level — it is the caller being \
+             wrong, not the gateway failing, and it would drown the signal an operator alerts \
+             on. got: {}",
+            capture.contents(),
+        );
+    }
+
+    /// …and it is still RECORDED, at `warn`, with its request id — refused, not silently
+    /// dropped. (The pair to the test above: together they pin "warn, not error", where either
+    /// alone would also pass for "not logged at all".)
+    #[test]
+    fn a_client_error_is_still_recorded_at_warn_with_its_request_id() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_filter(EnvFilter::new("warn")),
+            ),
+        );
+
+        let request_id = RequestIds::new().mint();
+        let conflict: BoxError = Box::new(GatewayError::Conflict);
+        tracing::dispatcher::with_default(&dispatch, || {
+            gateway_error_response(request_id, &conflict)
+        });
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains(&request_id.to_string()),
+            "a refused request must still carry its request id — the client was handed one and \
+             will quote it. got: {logged}",
+        );
+        assert!(
+            logged.contains(r#""level":"WARN""#),
+            "a 4xx is a `warn`: the gateway is behaving correctly; the caller is not. \
+             got: {logged}",
         );
     }
 
