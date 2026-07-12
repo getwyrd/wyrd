@@ -1262,3 +1262,120 @@ mod real_sdk_interop {
         );
     }
 }
+
+// ---- the request id: the join key between a client failure and the server's record (#529) ----
+
+/// Like [`send`], but also returns the response's header block, so a test can assert on
+/// `x-amz-request-id` — which [`parse_response`] discards.
+async fn send_with_headers(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> (u16, String, Vec<u8>) {
+    let host = addr.to_string();
+    let mut request = format!("{method} {path} HTTP/1.1\r\n");
+    request.push_str(&format!("host: {host}\r\n"));
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!("content-length: {}\r\n", body.len()));
+    request.push_str("connection: close\r\n\r\n");
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write head");
+    stream.write_all(body).await.expect("write body");
+    stream.flush().await.expect("flush");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response has a header terminator");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let (status, body) = parse_response(&raw);
+    (status, head, body)
+}
+
+/// Pull a header value out of a raw HTTP/1.1 head block, case-insensitively.
+fn header_value(head: &str, name: &str) -> Option<String> {
+    head.lines()
+        .find(|line| {
+            line.to_ascii_lowercase()
+                .starts_with(&format!("{}:", name.to_ascii_lowercase()))
+        })
+        .map(|line| line.split_once(':').expect("header").1.trim().to_string())
+}
+
+/// **Every** response carries `x-amz-request-id` — success as well as failure.
+///
+/// A field tester who reports "it failed at 14:32" gives you a timestamp and nothing else.
+/// The id is what turns that into a `jq` selector over the server's own record. It has to be
+/// on the success path too: a corruption noticed *later* is traced back through the PUT that
+/// wrote it, and that PUT returned 200.
+///
+/// Pre-fix the header does not exist on any response — RED.
+#[tokio::test]
+async fn every_response_carries_a_request_id_header() {
+    let (addr, _dir) = start_gateway().await;
+    let body = b"trace me";
+
+    let headers = signed_headers("PUT", "/b/traced", &addr.to_string(), body);
+    let (status, head, _) = send_with_headers(addr, "PUT", "/b/traced", &headers, body).await;
+    assert_eq!(status, 200, "the PUT succeeds");
+    let put_id = header_value(&head, "x-amz-request-id")
+        .expect("a 200 PUT must carry x-amz-request-id; pre-fix no response carries one");
+    assert_eq!(
+        put_id.len(),
+        32,
+        "the canonical 32-char hex rendering: {put_id}"
+    );
+
+    let headers = signed_headers("GET", "/b/traced", &addr.to_string(), b"");
+    let (status, head, _) = send_with_headers(addr, "GET", "/b/traced", &headers, b"").await;
+    assert_eq!(status, 200);
+    let get_id = header_value(&head, "x-amz-request-id").expect("a 200 GET must carry one too");
+
+    assert_ne!(
+        put_id, get_id,
+        "two requests must not share an id, or a log search returns the wrong one"
+    );
+}
+
+/// On a failure, the id is in **both** places a client can see it: the `x-amz-request-id`
+/// header (which an SDK surfaces in its own error reporting) and `<RequestId>` in the S3
+/// error body (which a `curl`ing operator reads). They must be the SAME id — two different
+/// ids would be worse than none, sending the operator to search for a request that never was.
+///
+/// Pre-fix the error XML is `<Error><Code/><Message/></Error>` with no `<RequestId>` at all,
+/// and no header exists — RED on both assertions.
+#[tokio::test]
+async fn a_failure_reports_the_same_request_id_in_the_header_and_the_error_body() {
+    let (addr, _dir) = start_gateway().await;
+
+    // An unsigned request: refused at the SigV4 gate, the earliest error path there is. If
+    // the id survives to *this* response it survives to all of them — it is minted before
+    // any dispatch, so no failure mode can outrun it.
+    let (status, head, body) = send_with_headers(addr, "GET", "/b/missing", &[], b"").await;
+    assert_eq!(status, 403, "unsigned is refused");
+
+    let header_id = header_value(&head, "x-amz-request-id")
+        .expect("an error response must carry x-amz-request-id; pre-fix it does not");
+    let xml = String::from_utf8_lossy(&body);
+    let body_id = xml
+        .split_once("<RequestId>")
+        .and_then(|(_, rest)| rest.split_once("</RequestId>"))
+        .map(|(id, _)| id.to_string())
+        .expect("the S3 error body must carry <RequestId>; pre-fix the element is absent");
+
+    assert_eq!(
+        header_id, body_id,
+        "the header and the body must name the SAME request, or the operator searches for a \
+         request that never existed"
+    );
+}

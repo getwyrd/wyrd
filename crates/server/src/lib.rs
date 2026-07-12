@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::Instrument;
 use wyrd_core::metadata::{self, EcScheme, InodeId};
 use wyrd_core::{read, write};
 use wyrd_traits::{
@@ -322,15 +323,24 @@ where
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
         let this = Arc::clone(&self);
         let chunk_map = inode.chunk_map;
-        tokio::spawn(async move {
-            for chunk in &chunk_map {
-                let piece = read::read_chunk_verified(&this.meta, &this.chunks, chunk).await;
-                let is_err = piece.is_err();
-                if tx.send(piece).await.is_err() || is_err {
-                    break;
+        // `in_current_span` carries the caller's span — the S3 request span holding
+        // `request_id` (#529) — across the spawn. Without it the reader task starts with no
+        // span, and every fault the read path raises here would be logged unattributed: the
+        // task is *detached*, so its errors already reach no caller (#464 — "the gateway
+        // logged nothing for the failed read"), and an unattributed log line could not be
+        // joined back to the request that provoked it either.
+        tokio::spawn(
+            async move {
+                for chunk in &chunk_map {
+                    let piece = read::read_chunk_verified(&this.meta, &this.chunks, chunk).await;
+                    let is_err = piece.is_err();
+                    if tx.send(piece).await.is_err() || is_err {
+                        break;
+                    }
                 }
             }
-        });
+            .in_current_span(),
+        );
         Ok(Some(ObjectRead {
             size,
             stream: Box::pin(ReceiverStream::new(rx)),

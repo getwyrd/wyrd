@@ -52,6 +52,7 @@
 //! the public-TLS terminator ([`S3Gateway::serve`] takes an already-bound listener).
 
 pub mod crypto;
+pub mod request_id;
 pub mod sigv4;
 pub mod streaming;
 
@@ -60,13 +61,15 @@ use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use futures_util::StreamExt;
+use tracing::Instrument;
 use wyrd_gateway_core::{ContentHash, GatewayError, ObjectGateway, ObjectRead};
 use wyrd_traits::BoxError;
 
+use crate::request_id::{RequestId, RequestIds};
 use crate::sigv4::Credentials;
 
 /// The public S3 TLS identity — deliberately a **distinct** type from any internal
@@ -117,6 +120,9 @@ pub struct S3Gateway<G> {
 struct AppState<G> {
     gateway: Arc<G>,
     config: Arc<S3Config>,
+    /// This process's request-id minter (#529). Shared, not per-request: the monotonic
+    /// half of the id must be drawn from one counter.
+    request_ids: Arc<RequestIds>,
 }
 
 // `Arc` makes the state cheap to clone regardless of the gateway type, so avoid a
@@ -126,6 +132,7 @@ impl<G> Clone for AppState<G> {
         Self {
             gateway: Arc::clone(&self.gateway),
             config: Arc::clone(&self.config),
+            request_ids: Arc::clone(&self.request_ids),
         }
     }
 }
@@ -148,6 +155,7 @@ where
         let state = AppState {
             gateway: self.gateway,
             config: self.config,
+            request_ids: Arc::new(RequestIds::new()),
         };
         Router::new().fallback(handle::<G>).with_state(state)
     }
@@ -217,7 +225,36 @@ fn split_bucket_key(path: &str) -> Option<(&str, &str)> {
     Some((bucket, key))
 }
 
+/// Mint this request's id, run the dispatcher **inside a span carrying it**, and stamp the
+/// id onto the response — every response, success or failure (#529).
+///
+/// The span is what makes the id a join key rather than a decoration: `tracing` attaches the
+/// enclosing span's fields to every event emitted under it, so once the log subscriber (#527)
+/// is installed, *everything* wyrd logs while serving this request — the gateway's own error
+/// record, the read path's fragment faults — carries `request_id` automatically. A client
+/// reporting a failure hands the operator a `jq` selector over the whole server-side trail.
 async fn handle<G>(State(state): State<AppState<G>>, req: Request) -> Response
+where
+    G: ObjectGateway,
+{
+    let request_id = state.request_ids.mint();
+    let span = tracing::info_span!(
+        "s3.request",
+        request_id = %request_id,
+        method = %req.method(),
+        path = %req.uri().path(),
+    );
+    let mut response = dispatch(state, req, request_id).instrument(span).await;
+    // Stamp it on the wire too. An SDK surfaces `x-amz-request-id` in its own error
+    // reporting, so the tester who hits the failure can quote the id without any
+    // client-side change.
+    if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
+        response.headers_mut().insert(request_id::HEADER, value);
+    }
+    response
+}
+
+async fn dispatch<G>(state: AppState<G>, req: Request, request_id: RequestId) -> Response
 where
     G: ObjectGateway,
 {
@@ -239,11 +276,19 @@ where
         SystemTime::now(),
     ) {
         Ok(payload) => payload,
-        Err(err) => return error_response(StatusCode::FORBIDDEN, err.s3_code(), &err.to_string()),
+        Err(err) => {
+            return error_response(
+                request_id,
+                StatusCode::FORBIDDEN,
+                err.s3_code(),
+                &err.to_string(),
+            )
+        }
     };
 
     let Some((bucket, key)) = split_bucket_key(&path) else {
         return error_response(
+            request_id,
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
             "expected a bucket-scoped object path /{bucket}/{key}",
@@ -268,6 +313,7 @@ where
     // returning 2xx. Refuse a form we do not implement rather than mishandle it.
     if let Some(sub) = unsupported_subresource(&query) {
         return error_response(
+            request_id,
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",
             &format!("the `{sub}` S3 subresource/operation is not supported"),
@@ -313,7 +359,7 @@ where
             };
             match result {
                 Ok(()) => empty_response(StatusCode::OK),
-                Err(err) => gateway_error_response(&err),
+                Err(err) => gateway_error_response(request_id, &err),
             }
         }
         Method::GET => match Arc::clone(&state.gateway)
@@ -330,18 +376,20 @@ where
                 .body(Body::from_stream(stream))
                 .expect("streaming response is always valid"),
             Ok(None) => error_response(
+                request_id,
                 StatusCode::NOT_FOUND,
                 "NoSuchKey",
                 "the specified key does not exist",
             ),
-            Err(err) => gateway_error_response(&err),
+            Err(err) => gateway_error_response(request_id, &err),
         },
         Method::DELETE => match state.gateway.delete_object(&object_key).await {
             // DELETE is idempotent: removing a present or an absent key both succeed.
             Ok(_) => empty_response(StatusCode::NO_CONTENT),
-            Err(err) => gateway_error_response(&err),
+            Err(err) => gateway_error_response(request_id, &err),
         },
         _ => error_response(
+            request_id,
             StatusCode::METHOD_NOT_ALLOWED,
             "MethodNotAllowed",
             "only object PUT, GET, and DELETE are supported",
@@ -401,12 +449,24 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
-fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
+/// An S3 error body. It carries the **`<RequestId>`** (#529): without it a client-reported
+/// failure cannot be joined to the server's record of that request, and the operator is left
+/// correlating by wall-clock timestamp across every node.
+fn error_response(
+    request_id: RequestId,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response {
     let code = xml_escape(code);
     let message = xml_escape(message);
+    // `request_id` renders as hex, so it needs no escaping — but go through the same escape
+    // as the rest rather than rely on that invariant holding if the rendering ever changes.
+    let request_id = xml_escape(&request_id.to_string());
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <Error><Code>{code}</Code><Message>{message}</Message></Error>"
+         <Error><Code>{code}</Code><Message>{message}</Message>\
+         <RequestId>{request_id}</RequestId></Error>"
     );
     Response::builder()
         .status(status)
@@ -419,15 +479,17 @@ fn error_response(status: StatusCode, code: &str, message: &str) -> Response {
 /// (a concurrent writer won) is 409; a payload/hash mismatch is 400; a failed
 /// `aws-chunked` chunk signature is 403 (fail-closed — the body was not signed by the
 /// credential holder); malformed chunk framing is 400; anything else 500.
-fn gateway_error_response(err: &BoxError) -> Response {
+fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     if let Some(streaming) = err.downcast_ref::<streaming::StreamingError>() {
         return match streaming {
             streaming::StreamingError::ChunkSignature => error_response(
+                request_id,
                 StatusCode::FORBIDDEN,
                 "SignatureDoesNotMatch",
                 "an aws-chunked chunk signature does not verify",
             ),
             streaming::StreamingError::Framing(what) => error_response(
+                request_id,
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
                 &format!("malformed aws-chunked streaming body: {what}"),
@@ -436,16 +498,19 @@ fn gateway_error_response(err: &BoxError) -> Response {
     }
     match err.downcast_ref::<GatewayError>() {
         Some(GatewayError::Conflict) => error_response(
+            request_id,
             StatusCode::CONFLICT,
             "OperationAborted",
             "a concurrent writer won the commit",
         ),
         Some(GatewayError::PayloadMismatch) => error_response(
+            request_id,
             StatusCode::BAD_REQUEST,
             "XAmzContentSHA256Mismatch",
             "the delivered body does not match the signed x-amz-content-sha256",
         ),
         _ => error_response(
+            request_id,
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalError",
             "the gateway could not complete the request",

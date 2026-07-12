@@ -13,6 +13,10 @@ publish.workspace = true
 # listener drives objects through `ObjectGateway`, never a concrete `Gateway<M,C,Co>`.
 wyrd-gateway-core.workspace = true
 wyrd-traits.workspace = true
+# The request-id span (#529): every log line emitted while serving a request inherits the
+# `request_id` field from the enclosing span, which is what makes a client's
+# `x-amz-request-id` a `jq` selector over the server-side trail.
+tracing.workspace = true
 # axum hosts the client-facing HTTP listener; already `cargo deny`-vetted via tonic.
 axum.workspace = true
 bytes.workspace = true
