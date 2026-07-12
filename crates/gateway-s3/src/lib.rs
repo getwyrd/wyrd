@@ -632,8 +632,21 @@ where
 }
 
 fn empty_response(status: StatusCode) -> Response {
-    Response::builder()
-        .status(status)
+    let mut builder = Response::builder().status(status);
+    // **A body-less 2xx must still DECLARE its zero length.** A successful PUT answers `200` with
+    // an empty body, and hyper may drop a zero-length body without ever polling it — which sends
+    // the access wrapper straight to its `Drop` arm. With no declared length there is nothing to
+    // compare the bytes sent against, so an ordinary successful PUT was recorded as
+    // `transfer="aborted"`: a client that hung up, except no client hung up. Declaring `0` makes
+    // the accounting exact (`bytes >= declared` ⇒ delivered), and it is what the response should
+    // carry on the wire anyway. (Codex review, cross-vendor pass.)
+    //
+    // `204` is exempt: HTTP says a No Content response should not carry `Content-Length`, and it
+    // never reaches the wrapper — `finish_response` records it as complete at head time.
+    if status != StatusCode::NO_CONTENT {
+        builder = builder.header("content-length", "0");
+    }
+    builder
         .body(Body::empty())
         .expect("static response is always valid")
 }
@@ -774,11 +787,19 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     // has no fields to attach. This line, the one an operator reaches for at 3am, would be the
     // ONE that lost the `x-amz-request-id` the client is holding.
     if status.is_server_error() {
+        // `may_still_commit` is a FIELD, not prose in the message: it is the one bit an operator
+        // filters on. `true` means the batch may land AFTER this response, so a re-read that sees
+        // nothing proves nothing — the single hardest state to reason about, and the reason the
+        // client's generic 500 is not the whole story (#515).
+        let may_still_commit = err
+            .downcast_ref::<wyrd_traits::CommitUnknownResult>()
+            .map(|u| u.may_still_commit);
         tracing::error!(
             target: "wyrd.gateway.s3.error",
             request_id = %request_id,
             s3_code = code,
             http_status = status.as_u16(),
+            may_still_commit,
             error = %err,
             cause_chain = %CauseChain(err.as_ref()),
             "the gateway failed the request",
@@ -800,15 +821,42 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
 /// The error → (status, S3 code, client message) mapping, split out so the *classification*
 /// is one expression and [`gateway_error_response`] can record it before answering.
 ///
-/// **Known gap, deliberately not closed here.** The backends raise richly-typed errors —
-/// FoundationDB's undetermined-commit class above all — but those types live *inside*
-/// `metadata-fdb`, and this crate is generic over [`ObjectGateway`] and must not name a
-/// concrete backend (ADR-0010). Classifying them needs the backend-agnostic error classes at
-/// the **trait seam**, which is proposal 0010 floor item 6 and is in flight (#515, #517).
-/// Once `wyrd_traits::CommitUnknownResult` lands, an arm here maps it to its own S3 code —
-/// a client must be able to tell "your write may have landed" from a clean failure. Until
-/// then the operator gets the full class from the log line above, which is the larger half.
+/// **The undetermined-commit class is recognised here, and deliberately NOT given a bespoke S3
+/// code.** The gap this doc used to describe — "the typed errors live inside `metadata-fdb`, and
+/// this crate must not name a concrete backend" — is closed: `wyrd_traits::CommitUnknownResult`
+/// is now a seam type (#515), and `cmd_s3` resolves a real metadata backend by configuration
+/// (#454), so a *"the write may or may not have landed"* really can arrive here.
+///
+/// It stays `500 InternalError` on the wire, and that is a decision rather than an oversight:
+///
+/// * **S3 has no code for "unknown".** AWS answers exactly this situation with `InternalError`,
+///   and SDK retry policies are written against the standard codes. A bespoke code would be read
+///   by a stock SDK as *non*-retryable, which is strictly worse than the truth.
+/// * **The distinction does not change what a correct client does.** An S3 `PUT` (same key, same
+///   bytes) and a `DELETE` are idempotent, so the safe action after either a clean transient
+///   failure or a may-have-landed commit is the same: retry.
+/// * **The party that needs the distinction is the OPERATOR**, and it is served — the error
+///   record carries `may_still_commit` as a structured field, plus the whole cause chain, so
+///   `may_still_commit=true` selects exactly the commits a re-read cannot settle.
+///
+/// Giving the client a distinct status/code is a product decision about the S3 contract, not a
+/// classification bug, and it is not one to make silently inside a logging change.
 fn classify(err: &BoxError) -> (StatusCode, &'static str, String) {
+    if err
+        .downcast_ref::<wyrd_traits::CommitUnknownResult>()
+        .is_some()
+    {
+        // Recognised explicitly rather than falling through the `_` arm below — the class is now
+        // nameable at the seam, and an error that reaches the client as a generic 500 should at
+        // least have been *seen* by the classifier.
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            // The client-facing message stays free of internal detail, as every other arm does:
+            // detail to the log, request id to the client.
+            "the gateway could not complete the request".to_string(),
+        );
+    }
     if let Some(streaming) = err.downcast_ref::<streaming::StreamingError>() {
         return match streaming {
             streaming::StreamingError::ChunkSignature => (
@@ -1186,6 +1234,58 @@ mod tests {
             logged.contains(r#""level":"WARN""#),
             "a 4xx is a `warn`: the gateway is behaving correctly; the caller is not. \
              got: {logged}",
+        );
+    }
+
+    /// **An undetermined commit is RECOGNISED, and the operator can filter on it** (codex
+    /// cross-vendor review).
+    ///
+    /// `wyrd_traits::CommitUnknownResult` — *the write may or may not have landed* — used to fall
+    /// through the classifier's `_` arm into a generic 500, indistinguishable from a dangling
+    /// dirent or a dead D-server. It is now nameable at the seam (#515) and the S3 gateway
+    /// resolves a real metadata backend (#454), so it genuinely arrives here.
+    ///
+    /// The wire contract is deliberately unchanged (`500 InternalError` — S3 has no code for
+    /// "unknown", and a bespoke one reads as non-retryable to a stock SDK). What changes is that
+    /// the class is *seen*: `may_still_commit` is a structured field on the error record, so
+    /// `may_still_commit=true` selects exactly the commits a re-read cannot settle — the hardest
+    /// state in the system to reason about, and the one an operator most needs to find.
+    #[test]
+    fn an_undetermined_commit_is_recorded_with_its_may_still_commit_flag() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(capture.clone()),
+            ),
+        );
+
+        let err: BoxError = Box::new(wyrd_traits::CommitUnknownResult {
+            backend: "foundationdb",
+            code: Some(1031),
+            detail: "FoundationDB error 1031".to_string(),
+            may_still_commit: true,
+        });
+
+        let response = tracing::dispatcher::with_default(&dispatch, || {
+            gateway_error_response(RequestIds::new().mint(), &err)
+        });
+
+        // The wire contract is unchanged — a stock SDK still sees a retryable 500.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains(r#""may_still_commit":true"#),
+            "the operator must be able to select the commits a re-read CANNOT settle — that is \
+             the whole distinction the client's generic 500 cannot carry: {logged}",
+        );
+        assert!(
+            logged.contains("1031"),
+            "…and the cause chain must still name the backend's own code: {logged}",
         );
     }
 
@@ -1599,6 +1699,21 @@ mod tests {
             abandoned.contains(r#""transfer":"aborted""#),
             "a body that is dropped unread IS an abandoned transfer — the 204 fix must not \
              flatten every outcome to `complete`. got: {abandoned}",
+        );
+
+        // A successful PUT answers `200` with an EMPTY body, and hyper may drop a zero-length
+        // body without ever polling it — straight to the `Drop` arm. With no declared length
+        // there was nothing to compare the bytes sent against, so every ordinary successful PUT
+        // was recorded as `aborted`: a client that hung up, except none did. `empty_response`
+        // now declares `content-length: 0`, which makes the accounting exact.
+        // (Codex review, cross-vendor pass.)
+        let put_ok = drive(empty_response(StatusCode::OK), Method::PUT, false).await;
+        assert!(
+            put_ok.contains(r#""transfer":"complete""#)
+                && !put_ok.contains(r#""transfer":"aborted""#),
+            "a successful PUT (200, empty body, dropped unpolled by hyper) is a COMPLETED \
+             request — recording it as an aborted transfer would mislabel every upload in the \
+             fleet: {put_ok}",
         );
 
         // HEAD: hyper SUPPRESSES the body of any response to a HEAD and drops it unpolled, so a
