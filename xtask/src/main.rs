@@ -59,6 +59,7 @@
 
 mod conformance;
 mod faults;
+mod fdb_faults;
 mod kill_reconstruct;
 mod vectors;
 
@@ -79,6 +80,7 @@ fn main() -> ExitCode {
         Some("tikv-conformance") => run_tikv_conformance(),
         Some("fdb-conformance") => run_fdb_conformance(),
         Some("fdb-doctor") => run_fdb_doctor(),
+        Some("fdb-metadata-tier1") => fdb_faults::run_fdb_metadata_tier1(),
         Some("etcd-conformance") => run_etcd_conformance(),
         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("disk-faults") => faults::run_disk_faults(),
@@ -110,7 +112,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 

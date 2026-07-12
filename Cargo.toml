@@ -13,6 +13,7 @@ members = [
     "crates/testkit",
     "crates/core",
     "crates/metadata-conformance",
+    "crates/metadata-fault-conformance",
     "crates/metadata-redb",
     "crates/metadata-tikv",
     "crates/metadata-fdb",
@@ -46,6 +47,7 @@ wyrd-traits = { path = "crates/traits" }
 wyrd-testkit = { path = "crates/testkit" }
 wyrd-core = { path = "crates/core" }
 wyrd-metadata-conformance = { path = "crates/metadata-conformance" }
+wyrd-metadata-fault-conformance = { path = "crates/metadata-fault-conformance" }
 wyrd-metadata-redb = { path = "crates/metadata-redb" }
 wyrd-metadata-tikv = { path = "crates/metadata-tikv" }
 wyrd-metadata-fdb = { path = "crates/metadata-fdb" }

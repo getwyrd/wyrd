@@ -569,6 +569,81 @@ pub fn parse_store_ip(stores_json: &str, store_id: u64) -> Option<String> {
     after[..end].rsplit_once(':').map(|(ip, _)| ip.to_string())
 }
 
+/// Whether a **surviving** FoundationDB process still reaches the coordinator at
+/// `target_addr` (`<ip>:<port>`), read off `fdbcli --exec "status json"`. `None` when that
+/// coordinator is absent from the report. (#442 — the FDB fault-effect oracle.)
+///
+/// This is the FDB counterpart of [`parse_store_last_heartbeat`] + [`heartbeat_is_fresh`],
+/// and it exists because the TiKV oracle has **no FDB analogue**: there is no PD, no store
+/// heartbeat, no `state_name`. What FDB does publish is a peer's own reachability view —
+/// `client.coordinators.coordinators[] = { address, protocol, reachable }` — so the oracle
+/// asks a node on the *majority* side whether it can still reach the node we cut. That keeps
+/// the Invariant-B discipline the TiKV leg established: the fault is confirmed from the
+/// PEERS' side, never by probing the dropped port ourselves (which would only prove our own
+/// packets are dropped, not that the cluster noticed).
+///
+/// Pure string parse, no `serde` — the same shape as the PD parsers above, so it is
+/// unit-checkable inside the unprivileged gate while the live leg calls this very function.
+/// Within a coordinator entry FDB emits `"address"` before `"reachable"`, so the first
+/// `reachable` after the target's address is that coordinator's own.
+#[must_use]
+pub fn parse_fdb_coordinator_reachable(status_json: &str, target_addr: &str) -> Option<bool> {
+    let compact: String = status_json.chars().filter(|c| !c.is_whitespace()).collect();
+    let needle = format!("\"address\":\"{target_addr}\"");
+    let at = compact.find(&needle)?;
+    let rest = &compact[at..];
+    let key = "\"reachable\":";
+    let ks = rest.find(key)? + key.len();
+    let after = &rest[ks..];
+    if after.starts_with("true") {
+        Some(true)
+    } else if after.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether a **surviving** FoundationDB node still sees the cut node as live — the boolean
+/// fed to [`partition_took_effect`] (fresh/reachable before the cut, unreachable during it).
+/// (#442.)
+///
+/// An absent coordinator (`None` from [`parse_fdb_coordinator_reachable`]) counts as **not
+/// live**: a process the surviving side can no longer describe is, from the peers' view,
+/// gone. Erring that way is safe here because the *before* sample must come back `true` for
+/// [`partition_took_effect`] to pass at all — so a parser that always returned "not live"
+/// would fail the pre-fault sample and could not manufacture a false pass.
+#[must_use]
+pub fn fdb_peer_sees_target_live(status_json: &str, target_addr: &str) -> bool {
+    parse_fdb_coordinator_reachable(status_json, target_addr).unwrap_or(false)
+}
+
+/// The **address of the FoundationDB process holding `role`** (e.g. `"master"`), read off
+/// `fdbcli --exec "status json"`, or `None` when no process reports it. (#442.)
+///
+/// The FDB counterpart of [`parse_first_region_leader_store_id`], and it exists for the same
+/// reason #257's iteration-12 fix did: cutting an arbitrary node is **outcome-neutral**. FDB
+/// keeps quorum on the majority side, so isolating a bystander proves nothing about the commit
+/// path. Isolating the process that holds the cluster's `master` role forces a recovery while
+/// the contenders' commits are in flight — the cut that can actually perturb a commit outcome.
+///
+/// Parsing note: within a process object FDB emits `"address"` **before** `"roles"`, so the
+/// address of the role-holder is the *nearest preceding* `"address"` — searched backwards from
+/// the role, not forwards (a forward search would return the NEXT process's address, silently
+/// cutting the wrong node).
+#[must_use]
+pub fn parse_fdb_process_with_role(status_json: &str, role: &str) -> Option<String> {
+    let compact: String = status_json.chars().filter(|c| !c.is_whitespace()).collect();
+    let role_needle = format!("\"role\":\"{role}\"");
+    let at = compact.find(&role_needle)?;
+    let before = &compact[..at];
+    let key = "\"address\":\"";
+    let ks = before.rfind(key)? + key.len();
+    let after = &compact[ks..];
+    let end = after.find('"')?;
+    Some(after[..end].to_string())
+}
+
 /// Resolve which container owns `target_ip` from a `ip=container,ip=container` map (the
 /// runner-exported `WYRD_TIER1_NETNS_MAP`), or `None` when the IP is unmapped. (M4.6, #257;
 /// the iteration-13 netns-cut fix.)
@@ -1057,6 +1132,108 @@ mod tests {
         assert!(
             !heal_is_complete(&both[..1], &both[..1], false),
             "peer still down after heal → the heal did not restore the target"
+        );
+    }
+
+    /// A trimmed `fdbcli --exec "status json"` body, in FoundationDB's real shape: the
+    /// `client.coordinators.coordinators[]` array, one entry per coordinator, each carrying
+    /// `address` / `protocol` / `reachable`. (#442.)
+    fn fdb_status(cut_reachable: bool) -> String {
+        format!(
+            r#"{{
+              "client": {{
+                "coordinators": {{
+                  "coordinators": [
+                    {{ "address": "172.30.58.11:4500", "protocol": "0fdb00b073000000", "reachable": {cut_reachable} }},
+                    {{ "address": "172.30.58.12:4500", "protocol": "0fdb00b073000000", "reachable": true }},
+                    {{ "address": "172.30.58.13:4500", "protocol": "0fdb00b073000000", "reachable": true }}
+                  ],
+                  "quorum_reachable": true
+                }}
+              }},
+              "cluster": {{ "processes": {{}} }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn an_fdb_coordinator_is_read_as_reachable_before_the_cut() {
+        let json = fdb_status(true);
+        assert_eq!(
+            parse_fdb_coordinator_reachable(&json, "172.30.58.11:4500"),
+            Some(true)
+        );
+        assert!(fdb_peer_sees_target_live(&json, "172.30.58.11:4500"));
+    }
+
+    #[test]
+    fn an_fdb_coordinator_is_read_as_unreachable_during_the_cut() {
+        // The Invariant-B signal: a SURVIVOR reports it can no longer reach the cut node.
+        let json = fdb_status(false);
+        assert_eq!(
+            parse_fdb_coordinator_reachable(&json, "172.30.58.11:4500"),
+            Some(false)
+        );
+        assert!(!fdb_peer_sees_target_live(&json, "172.30.58.11:4500"));
+        // …while its peers stay reachable — the cut is targeted, not a cluster-wide outage
+        // (which would make the fault-effect signal meaningless).
+        assert!(fdb_peer_sees_target_live(&json, "172.30.58.12:4500"));
+        assert!(fdb_peer_sees_target_live(&json, "172.30.58.13:4500"));
+    }
+
+    #[test]
+    fn the_fdb_oracle_reads_the_reachable_belonging_to_the_targets_own_address() {
+        // The trap this parser must not fall into: `reachable` appears three times, so a
+        // parser that grabbed the FIRST one in the document would report the wrong node's
+        // view. Cut the LAST coordinator and confirm the earlier `true`s do not mask it.
+        let json = r#"{"client":{"coordinators":{"coordinators":[
+            {"address":"172.30.58.11:4500","reachable":true},
+            {"address":"172.30.58.12:4500","reachable":true},
+            {"address":"172.30.58.13:4500","reachable":false}]}}}"#;
+        assert_eq!(
+            parse_fdb_coordinator_reachable(json, "172.30.58.13:4500"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_fdb_coordinator_reachable(json, "172.30.58.11:4500"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn an_absent_fdb_coordinator_is_not_live_and_cannot_manufacture_a_pass() {
+        let json = fdb_status(true);
+        assert_eq!(
+            parse_fdb_coordinator_reachable(&json, "10.0.0.1:4500"),
+            None
+        );
+        // Absent ⇒ not live. Safe direction: `partition_took_effect` needs the BEFORE sample
+        // to be `true`, so a parser that always said "not live" fails the pre-fault sample
+        // rather than fabricating a fault that never happened.
+        assert!(!fdb_peer_sees_target_live(&json, "10.0.0.1:4500"));
+        assert!(!partition_took_effect(
+            fdb_peer_sees_target_live(&json, "10.0.0.1:4500"),
+            false
+        ));
+    }
+
+    #[test]
+    fn the_fdb_master_process_is_resolved_by_its_role() {
+        // Two processes; the SECOND holds `master`. A parser that searched FORWARD from the
+        // role for an address would return the next process's (or nothing) and cut the wrong
+        // node — the mistake this test exists to catch.
+        let json = r#"{"cluster":{"processes":{
+            "aaa":{"address":"172.30.58.11:4500","roles":[{"role":"storage"},{"role":"log"}]},
+            "bbb":{"address":"172.30.58.12:4500","roles":[{"role":"master"},{"role":"storage"}]},
+            "ccc":{"address":"172.30.58.13:4500","roles":[{"role":"storage"}]}}}}"#;
+        assert_eq!(
+            parse_fdb_process_with_role(json, "master").as_deref(),
+            Some("172.30.58.12:4500"),
+        );
+        assert_eq!(
+            parse_fdb_process_with_role(json, "cluster_controller"),
+            None,
+            "a role no process holds must be None — the leg then refuses to cut a guess",
         );
     }
 }

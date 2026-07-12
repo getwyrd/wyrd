@@ -126,12 +126,6 @@ fn tier1_metadata_consistency_over_the_swap() {
 
 #[cfg(feature = "tikv")]
 fn run(endpoints: Vec<String>) {
-    use wyrd_testkit::{
-        consistency_passes, converged_exactly_once, heal_is_complete, no_lost_update,
-        partition_materialized, partition_took_effect, ConsistencySignals,
-    };
-    use wyrd_traits::{CommitOutcome, MetadataStore, WriteBatch};
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -139,219 +133,69 @@ fn run(endpoints: Vec<String>) {
 
     runtime.block_on(async move {
         let ns = format!("wyrd-tier1-consistency/{}/", std::process::id()).into_bytes();
-        let store = connect(&endpoints, &ns).await;
 
-        // A per-key monotonic "version" cell so exactly-once convergence is observable as an
-        // arithmetic delta (testkit::converged_exactly_once), independent of the value read.
-        let vkey = b"dir/version".to_vec();
-        let a = b"dir/a".to_vec();
-        let b = b"dir/b".to_vec();
-
-        // ── Tier-1 integration: multi-key atomic CREATE (all-or-nothing) ──
-        assert_eq!(
-            store
-                .commit(
-                    WriteBatch::new()
-                        .require_absent(a.clone())
-                        .require_absent(vkey.clone())
-                        .put(a.clone(), b"payload-0".to_vec())
-                        .put(vkey.clone(), 0u64.to_be_bytes().to_vec()),
-                )
-                .await
-                .expect("atomic create must not fault"),
-            CommitOutcome::Committed,
-            "multi-key atomic create must commit all-or-nothing",
-        );
-        let version_before = read_version(&store, &vkey).await;
-        // ADR-0015 read-after-commit signal #1: the committed value is readable now.
-        let read_after_create =
-            store.get(&a).await.expect("get a").as_deref() == Some(b"payload-0".as_slice());
-
-        // ── Prepare the contenders BEFORE the cut (connections + region cache warm) ──
-        // Each contender gets its OWN connection so the race is between real clients, not one
-        // client's internal mutex; warmed with a read so the cut lands on commits, not on
-        // connection setup.
-        let n_contenders = contender_count();
-        let mut contenders = Vec::with_capacity(n_contenders);
-        for _ in 0..n_contenders {
-            let c = connect(&endpoints, &ns).await;
-            let _ = c.get(&vkey).await.expect("warm contender region cache");
-            contenders.push(c);
-        }
-
-        // ── Apply the SYMMETRIC, bidirectional partition of the region LEADER (Invariant B;
-        //    the iteration-12 leader-isolation fix — a minority-follower cut is outcome-neutral
-        //    against a linearizable store) ──
+        // The SHARED scenario (`wyrd-metadata-fault-conformance`) drives the workload, the invariants and
+        // the signal arithmetic — the identical code FoundationDB is judged by (#442). Only
+        // the two backend-shaped parts stay here: how a node is cut (the leader, resolved from
+        // PD, isolated inside its own netns) and how its PEERS are asked whether the cut bit
+        // (PD's store-heartbeat freshness). That seam is `ClusterFault`, implemented below.
+        //
+        // Lifting this out of #257's TiKV-concrete test is what made an FDB verdict comparable
+        // to a TiKV one rather than a parallel story with its own private notion of "pass".
         let partition = SymmetricPartition::from_env(&endpoints);
-        let fault_materialized = match &partition {
-            Some(p) => {
-                p.wait_store_ready();
-                // Peer-side (PD) view BEFORE the fault: PD's last heartbeat for the target is
-                // fresh (the transient-liveness signal, NOT the administrative `state_name`).
-                let connected_before = p.pd_sees_target_live();
-                p.apply().expect("apply symmetric partition");
-                // Peer-side view DURING: poll until PD's heartbeat for the store goes STALE (a
-                // real isolation) or a timeout with it still fresh (a no-op cut we must catch).
-                let connected_during = p.pd_still_sees_target_live_after(Duration::from_secs(45));
-                // A minority partition of a linearizable Raft group leaves quorum on the
-                // majority side (partition_materialized), AND the peer coordinator must
-                // provably have lost the isolated node (partition_took_effect over PD's view).
-                partition_materialized(p.total_replicas, p.isolated)
-                    && partition_took_effect(connected_before, connected_during)
-            }
-            // No partition target configured (e.g. a single-node smoke run): the fault did
-            // NOT materialize, so the consistency verdict below cannot pass — honest by design.
-            None => false,
+        let fault: Option<&dyn ClusterFault> = match &partition {
+            Some(p) => Some(p),
+            None => None,
         };
 
-        // ── Tier-1 integration under the fault: multi-key atomic RENAME a→b + version bump ──
-        // A rename is delete-old + put-new in one batch; guarded on the version cell so the
-        // commit point is a single CAS. The majority side retains quorum, so this commits.
-        let rename = store
-            .commit(
-                WriteBatch::new()
-                    .require(vkey.clone(), version_before.to_be_bytes().to_vec())
-                    .require(a.clone(), b"payload-0".to_vec())
-                    .delete(a.clone())
-                    .put(b.clone(), b"payload-0".to_vec())
-                    .put(vkey.clone(), (version_before + 1).to_be_bytes().to_vec()),
-            )
-            .await
-            .expect("atomic rename must not fault on the majority side");
-        assert_eq!(
-            rename,
-            CommitOutcome::Committed,
-            "the rename must commit on the quorum-holding majority side across the partition",
-        );
-        let version_mid = version_before + 1; // the rename's committed CAS bump
+        wyrd_metadata_fault_conformance::run_consistency_under_fault(
+            || connect(&endpoints, &ns),
+            fault,
+            contender_count(),
+        )
+        .await;
 
-        // ── The TEETH: ≥2 concurrent writers race the SAME CAS across the fault window ──
-        // Barrier-released together, each contender attempts require(vkey == version_mid) +
-        // put(its own marker) + bump. The get_for_update commit-point re-check
-        // (metadata-tikv/src/lib.rs:555-573) is what forces all but one to Conflict; delete or
-        // weaken it and a stale precondition is admitted — two "winners", a lost update, and
-        // the no_lost_update signal below goes red (the iteration-12 adversary's acceptance
-        // test, now executed).
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(n_contenders));
-        let mut tasks = Vec::with_capacity(n_contenders);
-        for (i, c) in contenders.into_iter().enumerate() {
-            let barrier = barrier.clone();
-            let vkey = vkey.clone();
-            let ckey = contender_key(i);
-            tasks.push(tokio::spawn(async move {
-                barrier.wait().await;
-                c.commit(
-                    WriteBatch::new()
-                        .require(vkey.clone(), version_mid.to_be_bytes().to_vec())
-                        .put(ckey, format!("contender-{i}").into_bytes())
-                        .put(vkey, (version_mid + 1).to_be_bytes().to_vec()),
-                )
-                .await
-                .expect("a contended commit must resolve to Committed or Conflict, not fault")
-            }));
-        }
-        let mut outcomes = Vec::with_capacity(n_contenders);
-        for t in tasks {
-            outcomes.push(t.await.expect("contender task must not panic"));
-        }
-        let committed_contenders = outcomes
-            .iter()
-            .filter(|o| **o == CommitOutcome::Committed)
-            .count();
-
-        // ── Stale-CAS probe: a precondition the cell has ALREADY LEFT must be rejected ──
-        // version is at version_mid + 1 now; requiring version_before (two bumps stale) is a
-        // blind write unless the commit point re-checks. Deliberately does NOT touch vkey, so
-        // this probe flips only the no_lost_update / marker signals, not the convergence
-        // arithmetic — independent clauses stay independent.
-        let stale_key = contender_key(usize::MAX);
-        let stale_probe_committed = store
-            .commit(
-                WriteBatch::new()
-                    .require(vkey.clone(), version_before.to_be_bytes().to_vec())
-                    .put(stale_key.clone(), b"stale-probe".to_vec()),
-            )
-            .await
-            .expect("the stale probe must resolve, not fault")
-            == CommitOutcome::Committed;
-
-        // ── Heal AFTER the assertions run under partition (heal across, not before) ──
-        let heal_ok = match &partition {
-            Some(p) => {
-                let healed = p.heal().expect("heal (remove every isolation rule)");
-                // Peer-side confirmation the heal took: PD's heartbeat for the store is fresh
-                // again (it resumed heartbeating after the rules came out).
-                let connected_after = p.wait_pd_sees_target_live(Duration::from_secs(60));
-                heal_is_complete(&p.applied_rules(), &healed, connected_after)
-            }
-            None => true,
-        };
         drop(partition); // RAII safety net: warns loudly on any residual rule (no host leak).
-        assert!(
-            heal_ok || partition_is_none(&endpoints),
-            "the partition must heal completely: every isolation rule removed AND PD sees the \
-             isolated store's heartbeat fresh again (Invariant B — no leaked host firewall state)",
-        );
-
-        // ── Consistency signals, INDEPENDENT, asserted ACROSS the heal ──
-        let version_after = read_version(&store, &vkey).await;
-        // A contender's marker may be visible IFF its commit reported Committed — a visible
-        // "Conflict" write is a torn commit; an invisible "Committed" write is a lost one.
-        let mut markers_match_outcomes = true;
-        for (i, outcome) in outcomes.iter().enumerate() {
-            let present = store
-                .get(&contender_key(i))
-                .await
-                .expect("read contender marker")
-                .is_some();
-            markers_match_outcomes &= present == (*outcome == CommitOutcome::Committed);
-        }
-        let stale_marker_absent = store
-            .get(&stale_key)
-            .await
-            .expect("read stale-probe marker")
-            .is_none()
-            || stale_probe_committed; // visible only if (wrongly) committed — caught below
-        let signals = ConsistencySignals {
-            // read-after-commit: the pre-fault create, the under-fault rename, AND every
-            // contended write are readable exactly as committed, with no torn/stale state
-            // (a and b are mutually exclusive after rename; markers match outcomes).
-            read_after_commit: read_after_create
-                && store.get(&b).await.expect("get b").as_deref() == Some(b"payload-0".as_slice())
-                && store.get(&a).await.expect("get a").is_none()
-                && markers_match_outcomes
-                && stale_marker_absent,
-            // exactly-once convergence: the contended CAS round advanced the version by
-            // EXACTLY one across the heal, despite n_contenders concurrent attempts.
-            converged_once: converged_exactly_once(version_mid, version_after),
-            fault_materialized,
-            // the iteration-12 teeth: exactly one contended winner, stale probe rejected.
-            no_lost_update: no_lost_update(committed_contenders, stale_probe_committed),
-        };
-        assert!(
-            consistency_passes(&signals),
-            "ADR-0015 single-zone contract must hold across the swap+heal (independent \
-             signals; {n_contenders} contenders, {committed_contenders} committed): {signals:?}",
-        );
-
-        // ── Tier-1 integration: multi-key atomic DELETE (cleanup, all-or-nothing) ──
-        let mut cleanup = WriteBatch::new()
-            .require(b.clone(), b"payload-0".to_vec())
-            .delete(b.clone())
-            .delete(vkey.clone())
-            .delete(stale_key);
-        for i in 0..n_contenders {
-            cleanup = cleanup.delete(contender_key(i));
-        }
-        assert_eq!(
-            store
-                .commit(cleanup)
-                .await
-                .expect("atomic delete must not fault"),
-            CommitOutcome::Committed,
-            "multi-key atomic delete must commit all-or-nothing",
-        );
     });
+}
+
+/// The TiKV half of the [`ClusterFault`] seam: cut the Raft **leader** (a minority-follower
+/// cut cannot change a linearizable outcome), and confirm from **PD** — the peers'
+/// coordinator — that the store's heartbeat went stale. A thin adapter; every method already
+/// existed on [`SymmetricPartition`] before the lift.
+#[cfg(feature = "tikv")]
+impl ClusterFault for SymmetricPartition {
+    fn wait_cluster_ready(&self) {
+        self.wait_store_ready();
+    }
+
+    fn topology(&self) -> (usize, usize) {
+        (self.total_replicas, self.isolated)
+    }
+
+    fn peers_see_target_live(&self) -> bool {
+        self.pd_sees_target_live()
+    }
+
+    fn apply(&self) -> Result<(), String> {
+        SymmetricPartition::apply(self)
+    }
+
+    fn peers_still_see_target_live_after(&self, timeout: Duration) -> bool {
+        self.pd_still_sees_target_live_after(timeout)
+    }
+
+    fn heal(&self) -> Result<Vec<String>, String> {
+        SymmetricPartition::heal(self)
+    }
+
+    fn wait_peers_see_target_live(&self, timeout: Duration) -> bool {
+        self.wait_pd_sees_target_live(timeout)
+    }
+
+    fn applied_rules(&self) -> Vec<String> {
+        SymmetricPartition::applied_rules(self)
+    }
 }
 
 /// How many concurrent writers contend the version-cell CAS (`WYRD_TIER1_CONTENDERS`,
@@ -364,20 +208,6 @@ fn contender_count() -> usize {
 /// The marker key contender `i` writes iff its CAS wins (`usize::MAX` = the stale-CAS
 /// probe's marker). Plain like `dir/a` — the store's `with_namespace` prefixes it.
 #[cfg(feature = "tikv")]
-fn contender_key(i: usize) -> Vec<u8> {
-    if i == usize::MAX {
-        b"contend/stale-probe".to_vec()
-    } else {
-        format!("contend/{i}").into_bytes()
-    }
-}
-
-#[cfg(feature = "tikv")]
-fn partition_is_none(endpoints: &[String]) -> bool {
-    SymmetricPartition::from_env(endpoints).is_none()
-}
-
-#[cfg(feature = "tikv")]
 async fn connect(endpoints: &[String], namespace: &[u8]) -> wyrd_metadata_tikv::TikvMetadataStore {
     wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints.to_vec())
         .await
@@ -386,20 +216,10 @@ async fn connect(endpoints: &[String], namespace: &[u8]) -> wyrd_metadata_tikv::
 }
 
 #[cfg(feature = "tikv")]
-async fn read_version(store: &wyrd_metadata_tikv::TikvMetadataStore, vkey: &[u8]) -> u64 {
-    use wyrd_traits::MetadataStore;
-    let bytes = store
-        .get(vkey)
-        .await
-        .expect("read version cell")
-        .expect("version cell present");
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&bytes[..8]);
-    u64::from_be_bytes(buf)
-}
+use std::time::Duration;
 
 #[cfg(feature = "tikv")]
-use std::time::Duration;
+use wyrd_metadata_fault_conformance::ClusterFault;
 
 /// A **symmetric**, bidirectional, self-healing network partition of the targeted TiKV node
 /// (Invariant B; the v7 must-fixes; the iteration-13 netns cut).

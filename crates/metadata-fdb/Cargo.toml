@@ -41,6 +41,14 @@ serde_json = { workspace = true, optional = true }
 # redb and TiKV drive — and needs a tokio runtime to host the networked store when
 # the `fdb` feature is on.
 wyrd-metadata-conformance.workspace = true
+# The SHARED Tier-1 fault + contention battery (#442's go/no-go gate): the scenario,
+# invariants and signal arithmetic are the IDENTICAL code TiKV is judged by (#257) — only
+# the fault mechanism (cut the master-role process; ask a survivor's `status json` whether
+# the cut bit) is FDB-shaped and lives in this crate's tests.
+wyrd-metadata-fault-conformance.workspace = true
+# The backend-agnostic oracles (`parse_fdb_process_with_role`, `fdb_peer_sees_target_live`,
+# `parse_netns_map`) the Tier-1 fault leg resolves its target and confirms its cut with.
+wyrd-testkit.workspace = true
 # `tests/contention.rs` fans concurrent `commit`s at one shared key with `join_all`
 # to force a server-side conflict; used only under `--features fdb` (cluster-file
 # gated, like the conformance test).
