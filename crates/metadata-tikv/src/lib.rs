@@ -110,6 +110,178 @@ pub mod keyspace {
     }
 }
 
+/// The **operation deadline** that makes "every operation terminates" true on this
+/// backend (#517) — the trait's liveness clause (`wyrd_traits::MetadataStore`,
+/// "Operational envelope"). Dependency-free like [`keyspace`], so the decisions are
+/// unit-tested on every machine, TiKV or not.
+///
+/// **Why the driver must supply one.** tikv-client 0.4.0 does bound each *RPC
+/// attempt*: `Config::timeout` (default **2 s**) is written into the `grpc-timeout`
+/// header and enforced client-side by tonic, and the region/store backoffs are finite
+/// (`Backoff::no_jitter_backoff(_, _, 10)`), so a blackholed TiKV *store* on an
+/// established connection fails in ≈25 s. But two paths escape that bound entirely, and
+/// both are on wyrd's hot path:
+///
+/// 1. **Connection establishment is unbounded.** `SecurityManager::endpoint` never calls
+///    tonic's `connect_timeout`, and PD's connect explicitly *discards* the configured
+///    timeout (`pd/cluster.rs`'s `connect(&self, addr, _timeout: Duration)`). A connect
+///    to a blackholed node is bounded only by the OS TCP handshake (~2 min on Linux
+///    defaults), and the PD retry loop multiplies that.
+/// 2. **The TSO stream has no deadline at all.** `TimestampOracle::get_timestamp` parks
+///    on a `oneshot` with no timeout, awaiting a long-lived bidirectional stream on which
+///    no per-RPC timeout is (or can be) set. tikv-client sets no HTTP/2 keepalive
+///    interval, so under a blackhole the stream does not break at the application layer —
+///    only TCP keepalive eventually tears it down, on the order of **10+ minutes**. And
+///    *every* `get`/`scan`/`commit` takes a TSO first (`begin_pessimistic`).
+///
+/// So an operation that the client believes is bounded can block for ten minutes or more,
+/// which for a custodian loop or an S3 request is indistinguishable from a hang. A
+/// deadline the driver owns is the only bound available to us; setting `Config::timeout`
+/// alone would not close either gap.
+pub mod deadline {
+    use std::fmt;
+
+    /// Override the operation deadline (milliseconds).
+    pub const OPERATION_TIMEOUT_ENV: &str = "WYRD_TIKV_OPERATION_TIMEOUT_MS";
+
+    /// What tikv-client's *own* bounded machinery costs in the worst case it does handle:
+    /// ≤11 attempts × the 2 s per-RPC `grpc-timeout`, plus a sub-3 s total backoff. Our
+    /// deadline must sit **above** this, or it would cut off the client's legitimate
+    /// retries and turn a recoverable region move into a spurious failure.
+    pub const CLIENT_BOUNDED_PATH_MS: u64 = 25_000;
+
+    /// The default deadline: twice the client's own bounded path, so its retries have room
+    /// while the unbounded connect/TSO paths above are still cut off long before the OS
+    /// would notice. (The same shape as the FDB driver's deadline, which is twice
+    /// FoundationDB's own 5 s transaction envelope.)
+    pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 2 * CLIENT_BOUNDED_PATH_MS;
+
+    /// The deadline must leave the client's own retry machinery intact.
+    const _: () = assert!(DEFAULT_OPERATION_TIMEOUT_MS > CLIENT_BOUNDED_PATH_MS);
+
+    /// Resolve the deadline from a raw [`OPERATION_TIMEOUT_ENV`] value. Unset, blank,
+    /// unparsable or non-positive falls back to [`DEFAULT_OPERATION_TIMEOUT_MS`].
+    #[must_use]
+    pub fn operation_timeout_ms(raw: Option<String>) -> u64 {
+        raw.and_then(|v| v.trim().parse::<i64>().ok())
+            .map(sanitize_operation_timeout_ms)
+            .unwrap_or(DEFAULT_OPERATION_TIMEOUT_MS)
+    }
+
+    /// Coerce a requested deadline into a *bounded* one: `0` (which would read as "no
+    /// deadline") and negatives fall back to the default.
+    ///
+    /// The deadline is a **liveness constraint, not a tuning knob a caller may switch
+    /// off** — the same register as `SCAN_CAP`, which refuses to be raised. A caller who
+    /// wants a longer deadline may have one; a caller who wants *none* gets the default.
+    #[must_use]
+    pub fn sanitize_operation_timeout_ms(ms: i64) -> u64 {
+        if ms > 0 {
+            #[allow(clippy::cast_sign_loss)] // guarded positive
+            {
+                ms as u64
+            }
+        } else {
+            DEFAULT_OPERATION_TIMEOUT_MS
+        }
+    }
+
+    /// A `MetadataStore` operation exceeded the driver's deadline.
+    ///
+    /// Raised for `get` / `scan` / `connect`, which mutate nothing, so a deadline is a
+    /// definite failure and nothing is in doubt. A timed-out **`commit`** is NOT this: it
+    /// is by construction an *unknown result* (the commit may still land), so it surfaces
+    /// as `wyrd_traits::CommitUnknownResult` instead — the same call the FDB driver makes
+    /// for its `1031 transaction_timed_out`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct OperationTimedOut {
+        /// The operation that ran out of time (`"get"`, `"scan"`, `"connect"`).
+        pub op: &'static str,
+        /// The deadline it exceeded.
+        pub after_ms: u64,
+    }
+
+    impl fmt::Display for OperationTimedOut {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "metadata `{}` exceeded the {} ms operation deadline and was abandoned: \
+                 tikv-client bounds each RPC attempt but neither connection establishment \
+                 nor the TSO stream, so without this deadline the call could block for \
+                 many minutes against an unreachable PD (#517). Nothing was written.",
+                self.op, self.after_ms,
+            )
+        }
+    }
+
+    impl std::error::Error for OperationTimedOut {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn an_explicit_deadline_wins() {
+            assert_eq!(operation_timeout_ms(Some("1500".into())), 1500);
+            assert_eq!(operation_timeout_ms(Some("  1500 \n".into())), 1500);
+        }
+
+        #[test]
+        fn an_absent_blank_or_unparsable_value_falls_back_to_the_default() {
+            assert_eq!(operation_timeout_ms(None), DEFAULT_OPERATION_TIMEOUT_MS);
+            assert_eq!(
+                operation_timeout_ms(Some("  ".into())),
+                DEFAULT_OPERATION_TIMEOUT_MS
+            );
+            assert_eq!(
+                operation_timeout_ms(Some("soon".into())),
+                DEFAULT_OPERATION_TIMEOUT_MS
+            );
+        }
+
+        #[test]
+        fn the_deadline_cannot_be_switched_off() {
+            // `0` would read as "wait forever", which is the very hang this exists to
+            // prevent — so it is not an available choice, and neither is a negative.
+            assert_eq!(
+                operation_timeout_ms(Some("0".into())),
+                DEFAULT_OPERATION_TIMEOUT_MS
+            );
+            assert_eq!(
+                operation_timeout_ms(Some("-1".into())),
+                DEFAULT_OPERATION_TIMEOUT_MS
+            );
+            assert_eq!(
+                sanitize_operation_timeout_ms(0),
+                DEFAULT_OPERATION_TIMEOUT_MS
+            );
+            assert_eq!(
+                sanitize_operation_timeout_ms(-5),
+                DEFAULT_OPERATION_TIMEOUT_MS
+            );
+        }
+
+        // That the default leaves tikv-client's own ≈25 s bounded path room — below it, our
+        // deadline would abort legitimate region-move retries and manufacture failures — is
+        // pinned at COMPILE time by the `const _: () = assert!(…)` above, which is stricter
+        // than a test: it cannot be skipped, and a bad edit does not build.
+
+        #[test]
+        fn the_timeout_error_tells_an_operator_nothing_was_written() {
+            let msg = OperationTimedOut {
+                op: "get",
+                after_ms: 50_000,
+            }
+            .to_string();
+            assert!(msg.contains("get"), "names the operation: {msg}");
+            assert!(
+                msg.contains("Nothing was written"),
+                "a read deadline is a definite failure: {msg}"
+            );
+        }
+    }
+}
+
 /// Internal paging + fail-loud completeness for the native prefix `scan` (proposal
 /// 0015 §"Native prefix scan", §"Suggested PR sequence" item 3, Open questions
 /// "Large-directory `scan` buffering"). Kept free of any `tikv-client` dependency —
@@ -298,6 +470,8 @@ mod store {
     //!   contract does **not** alter `commit`; it documents why the split read/commit
     //!   pattern is already sound.
 
+    use std::time::Duration;
+
     use async_trait::async_trait;
     use bytes::Bytes;
     use tikv_client::{BoundRange, Transaction, TransactionClient};
@@ -305,6 +479,7 @@ mod store {
         BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, Result, WriteBatch,
     };
 
+    use crate::deadline::{self, OperationTimedOut};
     use crate::keyspace;
     use crate::paging::{self, PageStep, ScanCapExceeded};
 
@@ -462,6 +637,51 @@ mod store {
         }
     }
 
+    /// Drive `fut` under the store's operation deadline (#517).
+    ///
+    /// For a **read** (`get`, `scan`) and for `connect`, a deadline is a definite failure —
+    /// nothing was written, nothing is in doubt — so it surfaces as the typed
+    /// [`OperationTimedOut`]. `commit` does NOT use this: a timed-out commit is by
+    /// construction an *unknown result*, so it has its own arm below.
+    async fn under_deadline<T>(
+        op: &'static str,
+        deadline: Duration,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        match tokio::time::timeout(deadline, fut).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(BoxError::from(OperationTimedOut {
+                op,
+                #[allow(clippy::cast_possible_truncation)] // the deadline is milliseconds
+                after_ms: deadline.as_millis() as u64,
+            })),
+        }
+    }
+
+    /// A **commit** that exceeded the operation deadline is an *unknown result*, never a
+    /// definite failure (#517 meeting #515).
+    ///
+    /// We abandoned the await; TiKV did not abandon the commit. The RPC may already have
+    /// been sent, and Percolator commits the moment the primary key's commit record lands
+    /// — so the batch may land *after* we gave up. That is precisely `may_still_commit`,
+    /// and it is the same call the FDB driver makes for `1031 transaction_timed_out`
+    /// (which is likewise "the commit may still be applied"), rather than for 1021.
+    ///
+    /// Reporting a timed-out commit as a plain fault would be the dangerous lie: a caller
+    /// would take "it failed" at face value and never re-read.
+    fn timed_out_commit(deadline: Duration) -> CommitUnknownResult {
+        CommitUnknownResult {
+            backend: "tikv",
+            code: None,
+            detail: format!(
+                "commit exceeded the {} ms operation deadline and the await was abandoned; \
+                 the commit RPC may already have been sent",
+                deadline.as_millis()
+            ),
+            may_still_commit: true,
+        }
+    }
+
     /// Classify an error returned by **`Transaction::commit`** — the one site where a
     /// failure may leave the batch applied (#515).
     ///
@@ -506,6 +726,9 @@ mod store {
         /// Prepended to every key. Empty in production; a per-test value gives the
         /// isolated keyspace each shared-suite clause needs.
         namespace: Vec<u8>,
+        /// The deadline every operation runs under (#517) — the trait's "every
+        /// operation terminates" clause, which tikv-client cannot supply for us.
+        deadline: Duration,
     }
 
     impl TikvMetadataStore {
@@ -517,11 +740,38 @@ mod store {
         /// error path) are reconfirmed at build time against the pinned version —
         /// this crate compiles only under `--features tikv`.
         pub async fn connect(pd_endpoints: Vec<String>) -> Result<Self> {
-            let client = TransactionClient::new(pd_endpoints).await?;
+            let deadline = Duration::from_millis(deadline::operation_timeout_ms(
+                std::env::var(deadline::OPERATION_TIMEOUT_ENV).ok(),
+            ));
+            // Bounded like every other operation: `TransactionClient::new` connects to PD,
+            // and tikv-client sets no connect timeout at all — an unreachable PD would
+            // otherwise hang this for as long as the OS takes to give up on the handshake.
+            let client = under_deadline("connect", deadline, async {
+                TransactionClient::new(pd_endpoints)
+                    .await
+                    .map_err(BoxError::from)
+            })
+            .await?;
             Ok(Self {
                 client,
                 namespace: Vec::new(),
+                deadline,
             })
+        }
+
+        /// Override the operation deadline (#517). It cannot be switched off — `0` and
+        /// negatives fall back to the default, since the deadline is a liveness
+        /// constraint, not a knob (see [`deadline::sanitize_operation_timeout_ms`]).
+        #[must_use]
+        pub fn with_deadline_ms(mut self, ms: i64) -> Self {
+            self.deadline = Duration::from_millis(deadline::sanitize_operation_timeout_ms(ms));
+            self
+        }
+
+        /// This store's effective operation deadline — so the clamp above is observable.
+        #[must_use]
+        pub fn deadline(&self) -> Duration {
+            self.deadline
         }
 
         /// Scope this store to an isolated `namespace` (used by the conformance
@@ -544,13 +794,16 @@ mod store {
         /// of the call (no stale/follower/cached-ts read). See the module-level
         /// read-consistency contract (#261, ADR-0015).
         async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-            let mut txn = self.client.begin_pessimistic().await?;
-            let value = match txn.get(self.physical(key)).await {
-                Ok(value) => value,
-                Err(e) => return Err(rollback_then(&mut txn, e).await),
-            };
-            txn.rollback().await?;
-            Ok(value.map(Bytes::from))
+            under_deadline("get", self.deadline, async {
+                let mut txn = self.client.begin_pessimistic().await?;
+                let value = match txn.get(self.physical(key)).await {
+                    Ok(value) => value,
+                    Err(e) => return Err(rollback_then(&mut txn, e).await),
+                };
+                txn.rollback().await?;
+                Ok(value.map(Bytes::from))
+            })
+            .await
         }
 
         /// Native, **internally paged** prefix scan (proposal 0015 §"Native prefix
@@ -569,59 +822,74 @@ mod store {
         /// truncated `inode:` scan would corrupt GC's never-reclaim safety set (data
         /// loss). Order stays unspecified (callers collect into a set/map).
         async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
-            let start = self.physical(prefix);
-            let upper = keyspace::prefix_upper_bound(&start);
-            // ONE transaction (one start timestamp) held across every page — the
-            // #261 consistent cut. `begin_pessimistic` reads at a single TSO, so
-            // keeping this one txn across all pages IS the snapshot guarantee.
-            let mut txn = self.client.begin_pessimistic().await?;
-            let mut out: Vec<(Vec<u8>, Bytes)> = Vec::new();
-            let mut cursor = start;
-            loop {
-                let range: BoundRange = match &upper {
-                    Some(end) => (cursor.clone()..end.clone()).into(),
-                    None => (cursor.clone()..).into(),
-                };
-                let page: Vec<_> = match txn.scan(range, paging::PAGE_SIZE).await {
-                    Ok(page) => page.collect(),
-                    Err(e) => return Err(rollback_then(&mut txn, e).await),
-                };
-                let page_len = page.len();
-                let mut last_physical: Option<Vec<u8>> = None;
-                for pair in page {
-                    let physical: Vec<u8> = pair.0.into();
-                    if let Some(logical) = keyspace::logical(&self.namespace, &physical) {
-                        out.push((logical, Bytes::from(pair.1)));
+            under_deadline("scan", self.deadline, async {
+                let start = self.physical(prefix);
+                let upper = keyspace::prefix_upper_bound(&start);
+                // ONE transaction (one start timestamp) held across every page — the
+                // #261 consistent cut. `begin_pessimistic` reads at a single TSO, so
+                // keeping this one txn across all pages IS the snapshot guarantee.
+                let mut txn = self.client.begin_pessimistic().await?;
+                let mut out: Vec<(Vec<u8>, Bytes)> = Vec::new();
+                let mut cursor = start;
+                loop {
+                    let range: BoundRange = match &upper {
+                        Some(end) => (cursor.clone()..end.clone()).into(),
+                        None => (cursor.clone()..).into(),
+                    };
+                    let page: Vec<_> = match txn.scan(range, paging::PAGE_SIZE).await {
+                        Ok(page) => page.collect(),
+                        Err(e) => return Err(rollback_then(&mut txn, e).await),
+                    };
+                    let page_len = page.len();
+                    let mut last_physical: Option<Vec<u8>> = None;
+                    for pair in page {
+                        let physical: Vec<u8> = pair.0.into();
+                        if let Some(logical) = keyspace::logical(&self.namespace, &physical) {
+                            out.push((logical, Bytes::from(pair.1)));
+                        }
+                        last_physical = Some(physical);
                     }
-                    last_physical = Some(physical);
-                }
-                match paging::after_page(
-                    out.len(),
-                    page_len,
-                    last_physical.as_deref(),
-                    paging::PAGE_SIZE,
-                    paging::SCAN_CAP,
-                ) {
-                    PageStep::CapExceeded => {
-                        // Fail loud — return NO partial Vec (#262). Roll back first
-                        // so no active txn is left to panic on drop (see
-                        // `rollback_then`); a secondary rollback error is ignored so
-                        // it cannot mask the cap-breach error the caller must see.
-                        let _ = txn.rollback().await;
-                        return Err(BoxError::from(ScanCapExceeded {
-                            cap: paging::SCAN_CAP,
-                            prefix: prefix.to_vec(),
-                        }));
+                    match paging::after_page(
+                        out.len(),
+                        page_len,
+                        last_physical.as_deref(),
+                        paging::PAGE_SIZE,
+                        paging::SCAN_CAP,
+                    ) {
+                        PageStep::CapExceeded => {
+                            // Fail loud — return NO partial Vec (#262). Roll back first
+                            // so no active txn is left to panic on drop (see
+                            // `rollback_then`); a secondary rollback error is ignored so
+                            // it cannot mask the cap-breach error the caller must see.
+                            let _ = txn.rollback().await;
+                            return Err(BoxError::from(ScanCapExceeded {
+                                cap: paging::SCAN_CAP,
+                                prefix: prefix.to_vec(),
+                            }));
+                        }
+                        PageStep::Continue(next) => cursor = next,
+                        PageStep::Done => break,
                     }
-                    PageStep::Continue(next) => cursor = next,
-                    PageStep::Done => break,
                 }
-            }
-            txn.rollback().await?;
-            Ok(out)
+                txn.rollback().await?;
+                Ok(out)
+            })
+            .await
         }
 
         async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            // The deadline (#517) — but NOT via `under_deadline`, whose error says "nothing
+            // was written". A commit we stopped awaiting may still land, so an elapsed
+            // deadline here is an UNKNOWN RESULT, exactly as FDB's 1031 is (#515).
+            match tokio::time::timeout(self.deadline, self.commit_inner(batch)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(BoxError::from(timed_out_commit(self.deadline))),
+            }
+        }
+    }
+
+    impl TikvMetadataStore {
+        async fn commit_inner(&self, batch: WriteBatch) -> Result<CommitOutcome> {
             // A batch WITH preconditions is a CAS: a write-write conflict is a lost race
             // the caller re-reads and retries (`Ok(Conflict)`). A precondition-FREE
             // (blind) batch has no precondition to fail, so a conflict must NOT surface
@@ -689,8 +957,13 @@ mod store {
 
     #[cfg(test)]
     mod tests {
-        use super::{is_undetermined_commit, is_write_conflict, tikv_unknown_result};
+        use std::time::Duration;
+
         use tikv_client::{Error, ProtoKeyError, ProtoRegionError};
+        use wyrd_traits::{BoxError, CommitUnknownResult};
+
+        use super::{is_undetermined_commit, is_write_conflict, tikv_unknown_result};
+        use crate::deadline::OperationTimedOut;
 
         /// A `KeyError` carrying `conflict` — TiKV's single write-conflict signal.
         fn write_conflict() -> Error {
@@ -707,6 +980,51 @@ mod store {
 
         fn region_error() -> Error {
             Error::RegionError(Box::new(ProtoRegionError::default()))
+        }
+
+        /// The deadline fires on a read that never completes — the hang this exists to
+        /// prevent (an unreachable PD parks the TSO oneshot for 10+ minutes), reproduced
+        /// deterministically with a future that simply never resolves. No cluster, no
+        /// timing luck: `pending()` cannot finish, so if `under_deadline` did not bound it
+        /// this test would hang rather than fail — which is itself the signal.
+        #[tokio::test]
+        async fn a_read_that_never_completes_is_cut_off_by_the_deadline() {
+            let deadline = Duration::from_millis(20);
+            let err = super::under_deadline("get", deadline, async {
+                std::future::pending::<std::result::Result<(), BoxError>>().await
+            })
+            .await
+            .expect_err("a never-completing read must be cut off, not awaited forever");
+
+            let timed_out = err
+                .downcast_ref::<OperationTimedOut>()
+                .unwrap_or_else(|| panic!("a deadline must be a typed OperationTimedOut: {err}"));
+            assert_eq!(timed_out.op, "get");
+            assert_eq!(timed_out.after_ms, 20);
+            // A read mutates nothing, so the deadline is a DEFINITE failure…
+            assert!(
+                err.downcast_ref::<CommitUnknownResult>().is_none(),
+                "a read deadline is not an unknown result — nothing was written"
+            );
+        }
+
+        /// …but a COMMIT deadline is not. We stopped awaiting; TiKV did not stop
+        /// committing.
+        #[test]
+        fn a_commit_deadline_is_an_unknown_result_not_a_definite_failure() {
+            let unknown = super::timed_out_commit(Duration::from_millis(50_000));
+            assert_eq!(unknown.backend, "tikv");
+            assert!(
+                unknown.may_still_commit,
+                "the commit RPC may already be in flight and may land after we gave up, so \
+                 a re-read that sees nothing does not prove nothing will land"
+            );
+            let msg = unknown.to_string();
+            assert!(msg.contains("50000 ms"), "names the deadline: {msg}");
+            assert!(
+                msg.contains("not retried"),
+                "a non-idempotent batch is never replayed on our own timeout: {msg}"
+            );
         }
 
         #[test]
