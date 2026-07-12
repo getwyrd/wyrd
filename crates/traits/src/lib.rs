@@ -190,6 +190,74 @@ impl std::error::Error for BlockReadFault {
     }
 }
 
+/// A [`MetadataStore::commit`] whose outcome the backend **could not determine**:
+/// the batch may or may not have been applied.
+///
+/// The contract's hardest error class (see [`MetadataStore`], "Errors and the
+/// caller's obligations"). It is `Err`, never [`CommitOutcome::Conflict`] —
+/// `Conflict` asserts *nothing was written*, which is exactly what is not known —
+/// and a backend must **never silently retry** it, because a [`WriteBatch`] is not
+/// guaranteed idempotent. The caller's only remedy is to **re-read** and establish
+/// what happened.
+///
+/// It lives in the seam crate, like [`IntegrityFault`] and [`ScanCapExceeded`], so
+/// one `downcast_ref::<CommitUnknownResult>()` classifies the class on **any**
+/// backend. It was previously an FDB-only type (`metadata-fdb`'s
+/// `classify::CommitUnknownResult`), with the DST harness carrying a third
+/// hand-rolled copy — so a consumer could only recognise an undetermined commit if
+/// it happened to know it was talking to FoundationDB (#515).
+///
+/// Every distributed backend has the class; only its spelling differs.
+/// FoundationDB reports it natively (`1021 commit_unknown_result`, `1031
+/// transaction_timed_out`). TiKV does **not**: `tikv_client::Error::Undetermined`
+/// exists but is set only when the client cannot *connect* to the primary — which
+/// is a definite non-commit — and is **not** set when the commit RPC times out,
+/// which is the case that genuinely is undetermined (Percolator commits once the
+/// primary key's commit record lands, whether or not the client learns it). So the
+/// TiKV driver derives the class itself, conservatively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitUnknownResult {
+    /// The backend that could not determine the outcome (`"foundationdb"`, `"tikv"`).
+    pub backend: &'static str,
+    /// The backend-native error code, where it has one — FoundationDB's `1021` /
+    /// `1031`. `None` for a backend (TiKV) whose client reports no code for the
+    /// class.
+    pub code: Option<i32>,
+    /// Backend detail for the audit trail.
+    pub detail: String,
+    /// Whether the batch may still be applied **after** this error was returned.
+    ///
+    /// `false` means the transaction is already out of flight, so a single re-read
+    /// establishes the outcome once and for all (FoundationDB's 1021). `true` means
+    /// a re-read that observes nothing does **not** prove nothing will land — the
+    /// commit may still be in flight (FoundationDB's 1031; every TiKV case, since
+    /// the client may have given up on a commit RPC that TiKV goes on to apply).
+    pub may_still_commit: bool,
+}
+
+impl fmt::Display for CommitUnknownResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "metadata commit returned an unknown result ({} — {}): the batch may or may \
+             not have been applied. It is not retried — a WriteBatch is not guaranteed \
+             idempotent — and it is not a Conflict; the caller must re-read to establish \
+             what happened.",
+            self.backend, self.detail,
+        )?;
+        if self.may_still_commit {
+            write!(
+                f,
+                " The batch may still be applied AFTER this error, so a re-read that \
+                 observes nothing does not prove it will never land.",
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CommitUnknownResult {}
+
 /// Interim ceiling on the **total** materialized results of a single
 /// [`MetadataStore::scan`]. On breach a backend fails loud (`Err`, via
 /// [`ScanCapExceeded`]) and returns **no** partial `Vec` — the
@@ -450,8 +518,9 @@ pub trait PlacementChunkStore: ChunkStore {
 ///
 /// - **An unknown-result commit is never reported as [`CommitOutcome::Conflict`]**
 ///   — `Conflict` asserts nothing was written, which is exactly what is not known.
-///   It surfaces as `Err`, distinguishable by downcast (the FDB backend's
-///   `CommitUnknownResult` carries the code and a `may_still_commit()` flag).
+///   It surfaces as `Err`, distinguishable by **one** downcast on every backend:
+///   [`CommitUnknownResult`], whose `may_still_commit` says whether a re-read can
+///   settle the outcome at all.
 /// - **A backend never silently retries an unknown-result commit**, because a
 ///   [`WriteBatch`] is **not guaranteed idempotent** (see its docs) — a blind
 ///   re-apply could double-apply it. A backend may retry only errors its

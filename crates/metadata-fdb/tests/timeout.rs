@@ -128,9 +128,10 @@ fn run_blind_commit_times_out() {
         .downcast_ref::<CommitUnknownResult>()
         .unwrap_or_else(|| panic!("a timed-out commit must be a CommitUnknownResult: {err}"));
 
-    assert_eq!(unknown.code, TRANSACTION_TIMED_OUT);
+    assert_eq!(unknown.code, Some(TRANSACTION_TIMED_OUT));
+    assert_eq!(unknown.backend, "foundationdb");
     assert!(
-        unknown.may_still_commit(),
+        unknown.may_still_commit,
         "a timed-out commit may still be applied after the error, unlike 1021: {unknown}",
     );
 }
@@ -233,7 +234,7 @@ fn fdb_code(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
         if let Some(unknown) =
             current.downcast_ref::<wyrd_metadata_fdb::classify::CommitUnknownResult>()
         {
-            return Some(unknown.code);
+            return unknown.code;
         }
         cursor = current.source();
     }
