@@ -125,6 +125,77 @@ fn fragment_dserver(chunk: &ChunkRef, index: u16) -> DServerId {
 /// Each fragment is fetched from the D server the **placement record** names
 /// ([`fragment_dserver`]), not from `index % n` — the location authority is the
 /// committed chunk map, not the fan-out.
+/// How a fragment fetch failed on the read path.
+///
+/// The read path already *distinguishes* these four — it reads around all of them but records
+/// a repair obligation only for the two corruption classes. What it never did was **say**
+/// which one happened, on which fragment, on which D-server, though it held all three in hand
+/// (#530). The classes are exactly the trichotomy the trait seam defines (`IntegrityFault` /
+/// transient / absent), so the log agrees with the type system.
+#[derive(Debug, Clone, Copy)]
+enum FaultClass {
+    /// A present fragment whose checksum does not verify — bit rot.
+    Corrupt,
+    /// A present, intact fragment whose header names a *different* chunk — a misrouted write.
+    Misplaced,
+    /// The D-server answered, and holds no such fragment.
+    Absent,
+    /// A verifying store surfaced corruption as a typed [`wyrd_traits::IntegrityFault`]
+    /// instead of handing back bad bytes.
+    IntegrityFault,
+    /// Unreachable, timed out, or an RPC error — the D-server may be perfectly healthy a
+    /// second later. **Not** a corruption finding.
+    Transient,
+}
+
+impl FaultClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Corrupt => "corrupt",
+            Self::Misplaced => "misplaced",
+            Self::Absent => "absent",
+            Self::IntegrityFault => "integrity-fault",
+            Self::Transient => "transient",
+        }
+    }
+}
+
+/// Record a fragment fault with the identity the read path has always had and never reported:
+/// **which D-server, which fragment index, which chunk, and what went wrong**.
+///
+/// Shaped to match `custodian::scrub::emit_corruption` (`crates/custodian/src/scrub.rs`) —
+/// same `dserver` / `chunk` / `index` fields, same split between the metric event and the
+/// audit event — so the read and scrub audit planes read alike and one collector query spans
+/// both. A per-class counter (rather than one counter for all faults) is what lets an operator
+/// see *transient faults rising on one node* — the single blindest spot in the old code, where
+/// a D-server failing every RPC looked exactly like a healthy one.
+fn emit_fragment_fault(
+    class: FaultClass,
+    dserver: DServerId,
+    frag: FragmentId,
+    detail: impl std::fmt::Display,
+) {
+    match class {
+        FaultClass::Corrupt => tracing::warn!(monotonic_counter.read_fragment_corrupt = 1_u64),
+        FaultClass::Misplaced => tracing::warn!(monotonic_counter.read_fragment_misplaced = 1_u64),
+        FaultClass::Absent => tracing::warn!(monotonic_counter.read_fragment_absent = 1_u64),
+        FaultClass::IntegrityFault => {
+            tracing::warn!(monotonic_counter.read_fragment_integrity_fault = 1_u64)
+        }
+        FaultClass::Transient => tracing::warn!(monotonic_counter.read_fragment_transient = 1_u64),
+    }
+    tracing::warn!(
+        target: "wyrd.read.fragment.audit",
+        action = "fragment-fault",
+        class = class.as_str(),
+        dserver,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
+        index = frag.index,
+        detail = %detail,
+        "read fetched a fragment it could not use: excluded from the decoder, read around",
+    );
+}
+
 async fn read_chunk(
     chunks: &impl PlacementChunkStore,
     chunk: &ChunkRef,
@@ -223,12 +294,20 @@ async fn read_chunk(
                         index,
                     };
                     let dserver = fragment_dserver(chunk, index);
-                    async move { (index, chunks.get_fragment_at(dserver, id).await) }
+                    // `dserver` rides out with the result. It was computed here and dropped on
+                    // the floor: every failure arm below recorded only `chunk.id`, so an
+                    // operator could learn that *something* was rotting and never *which disk*
+                    // (#530). It costs nothing to carry.
+                    async move { (index, dserver, chunks.get_fragment_at(dserver, id).await) }
                 })
                 .collect();
 
             let mut shards: Vec<(usize, Vec<u8>)> = Vec::with_capacity(k);
-            while let Some((index, fetched)) = inflight.next().await {
+            while let Some((index, dserver, fetched)) = inflight.next().await {
+                let frag = FragmentId {
+                    chunk: chunk.id,
+                    index,
+                };
                 match fetched {
                     Ok(Some(fragment)) => {
                         match decode(&fragment) {
@@ -250,28 +329,71 @@ async fn read_chunk(
                             // fragment: excluded from the decoder (read around) AND its
                             // chunk recorded as a repair obligation, never silently
                             // absorbed (`0005:174-176`, `0005:262-264`).
-                            _ => {
+                            Ok(decoded) => {
+                                emit_fragment_fault(
+                                    FaultClass::Misplaced,
+                                    dserver,
+                                    frag,
+                                    format_args!(
+                                        "fragment decodes but its header names chunk {}",
+                                        wyrd_traits::chunk_hex(decoded.header.chunk_id)
+                                    ),
+                                );
+                                corrupt.push(chunk.id);
+                            }
+                            Err(e) => {
+                                emit_fragment_fault(FaultClass::Corrupt, dserver, frag, e);
                                 corrupt.push(chunk.id);
                             }
                         }
                     }
                     // Absent — read around.
-                    Ok(None) => {}
+                    Ok(None) => emit_fragment_fault(
+                        FaultClass::Absent,
+                        dserver,
+                        frag,
+                        format_args!("the D-server holds no such fragment"),
+                    ),
                     // A verifying store (FsChunkStore, gRPC DATA_LOSS mapping) surfaced
                     // corruption as a typed fault instead of raw bytes.  Mirror the
                     // corrupt-bytes arm: record as a repair obligation and read around
                     // (never absorbed silently, `0005:174-176`,
                     // `crates/custodian/src/scrub.rs:102`).
                     Err(e) if wyrd_traits::is_integrity_fault(e.as_ref()) => {
+                        emit_fragment_fault(FaultClass::IntegrityFault, dserver, frag, &e);
                         corrupt.push(chunk.id);
                     }
-                    // A transient / non-integrity error: silently drop (treat as absent,
-                    // existing behaviour) — do NOT record as a corruption finding
-                    // (reclassifying non-integrity errors is out of scope).
-                    Err(_) => {}
+                    // A transient / non-integrity error: read around (treat as absent) — do
+                    // NOT record as a corruption finding (reclassifying non-integrity errors
+                    // is out of scope, and #431 owns the block-fault repair question).
+                    //
+                    // But SAY SO. This arm was `Err(_) => {}`: a D-server that is up but
+                    // failing, timing out, or returning `Rpc(Status::internal(..))` on every
+                    // single read produced no counter, no log and no trace, and so was
+                    // indistinguishable from a healthy one from every available vantage point.
+                    // Reads quietly got slower and leaned on parity, and nobody found out
+                    // until the chunk dropped below `k`. `chunkstore-grpc` classifies the
+                    // fault (`Unavailable`/`Timeout`/`Rpc`/`Connect`) and that classification
+                    // was thrown in the bin by its one consumer. The control flow is
+                    // unchanged; only the silence is.
+                    Err(e) => emit_fragment_fault(FaultClass::Transient, dserver, frag, &e),
                 }
             }
             if shards.len() < k {
+                // The "why did this GET die" line. It did not exist: `InsufficientFragments`
+                // carries the chunk and exactly how many of how many fragments were readable,
+                // and on the streaming path it is raised inside a DETACHED task whose `Err` is
+                // sent down a channel and dropped — so the client saw a broken connection and
+                // the operator saw nothing at all (#464, confirmed in the field).
+                tracing::error!(
+                    target: "wyrd.read.audit",
+                    action = "insufficient-fragments",
+                    chunk = %wyrd_traits::chunk_hex(chunk.id),
+                    have = shards.len(),
+                    need = k,
+                    total = n,
+                    "read cannot reconstruct the chunk: fewer than k fragments verified",
+                );
                 return Err(ReadError::InsufficientFragments {
                     chunk_id: chunk.id,
                     have: shards.len(),

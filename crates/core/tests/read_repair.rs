@@ -588,3 +588,279 @@ async fn ec_read_treats_a_misplaced_but_intact_fragment_as_absent() {
         "a misplaced-but-intact shard must be read around, not fed to the decoder; got {got:?}"
     );
 }
+
+// ---- #530: the read path must NAME the failing fragment and its D-server ----
+
+/// A store that fails one fragment with a **transient** (non-integrity) error — an
+/// unreachable / timing-out / erroring D-server, the shape `chunkstore-grpc`'s
+/// `TransportError` arrives in. All other fragments serve normally.
+struct TransientlyFailingStore {
+    inner: MemChunks,
+    fail_id: FragmentId,
+}
+
+#[async_trait]
+impl ChunkStore for TransientlyFailingStore {
+    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+        self.inner.put_fragment(id, fragment).await
+    }
+    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+        if id == self.fail_id {
+            return Err("transport: the D-server is unreachable (connect refused)".into());
+        }
+        self.inner.get_fragment(id).await
+    }
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        self.inner.list_fragments().await
+    }
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.inner.delete_fragment(id).await
+    }
+    async fn health(&self) -> Result<Health> {
+        Ok(Health::Healthy)
+    }
+}
+
+impl PlacementChunkStore for TransientlyFailingStore {}
+
+/// A `MakeWriter` collecting what the subscriber emits, so the test asserts on the record
+/// the read path actually produced rather than assuming one exists.
+#[derive(Clone, Default)]
+struct Capture(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
+    type Writer = Self;
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install a permissive global `tracing` default **once**, so the read path's audit callsites
+/// never latch `Interest::never` under the parallel test harness.
+///
+/// `tracing` caches each callsite's interest in a process-global table the first time it is
+/// hit. A sibling test in this binary that reads a corrupt fragment with no subscriber
+/// installed would hit `emit_fragment_fault`'s callsites first and latch them **disabled for
+/// the whole process** — after which the tests below capture an empty buffer and fail, or
+/// worse, would silently pass a weaker assertion. Registering an always-enabling default
+/// before any callsite fires makes every first-registration agree.
+///
+/// This is the proven pattern from `crates/custodian/tests/scrub.rs` and
+/// `crates/server/tests/custodian_day_one.rs` (`enable_metric_callsites`), which exist for
+/// exactly this hazard.
+fn enable_audit_callsites() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
+fn capturing_dispatch(capture: Capture) -> tracing::Dispatch {
+    use tracing_subscriber::layer::SubscriberExt;
+    tracing::Dispatch::new(
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().json().with_writer(capture)),
+    )
+}
+
+/// **A corrupt fragment must be reported with the D-server it was placed on, not merely the
+/// chunk it belongs to.**
+///
+/// The placement here is deliberately **non-identity** (`[7, 1, 2]`): fragment index 0 lives
+/// on D-server **7**. So an implementation that logs the fragment index in the `dserver` field
+/// — the obvious way to get this wrong — reports `0` and fails. The read path resolves the
+/// D-server through `placed_dserver`, and the log must report *that*.
+///
+/// Pre-fix the failure arm was `corrupt.push(chunk.id)` — the chunk id and nothing else, into
+/// a `Vec<ChunkId>` — while `index` and `dserver` sat live in the enclosing scope. The
+/// operator could learn that *something* was rotting and never *which disk* (#530). And it
+/// went to no sink regardless (#527). The capture buffer is EMPTY — RED.
+#[tokio::test]
+async fn a_corrupt_fragment_is_reported_with_its_index_and_its_placed_dserver() {
+    enable_audit_callsites();
+    let meta = MemMeta::default();
+    let chunks = MemChunks::default();
+    let (k, m) = (2u8, 1u8);
+    let data = b"which disk is rotting?";
+    let chunk_id: ChunkId = 0xF00D;
+    let shards = erasure::encode(k as usize, m as usize, data).unwrap();
+
+    for (index, shard) in shards.iter().enumerate() {
+        chunks
+            .put_fragment(
+                FragmentId {
+                    chunk: chunk_id,
+                    index: index as u16,
+                },
+                fragment(chunk_id, shard),
+            )
+            .await
+            .unwrap();
+    }
+    // Rot fragment index 0 — which the placement puts on D-server 7.
+    let mut rotten = fragment(chunk_id, &shards[0]).to_vec();
+    rotten[CORE_HEADER_LEN as usize] ^= 0xff;
+    chunks
+        .put_fragment(
+            FragmentId {
+                chunk: chunk_id,
+                index: 0,
+            },
+            Bytes::from(rotten),
+        )
+        .await
+        .unwrap();
+
+    commit_inode(
+        &meta,
+        1,
+        ChunkRef {
+            id: chunk_id,
+            scheme: EcScheme::ReedSolomon { k, m },
+            len: data.len() as u64,
+            placement: vec![7, 1, 2],
+        },
+        data.len() as u64,
+    )
+    .await;
+
+    let capture = Capture::default();
+    let dispatch = capturing_dispatch(capture.clone());
+    let got = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        read::read_object(&meta, &chunks, 1).await.unwrap()
+    };
+
+    // The fail-closed guarantee is untouched: the object still reconstructs from the k
+    // survivors. This change adds a record; it does not alter control flow.
+    assert_eq!(got.as_deref(), Some(data.as_slice()));
+
+    let logged = capture.contents();
+    assert!(
+        logged.contains(r#""class":"corrupt""#),
+        "the fault CLASS must be reported — corruption and a dead node need different \
+         responses. pre-fix the buffer is EMPTY. got: {logged}"
+    );
+    assert!(
+        logged.contains(r#""dserver":7"#),
+        "the log must name the PLACED D-server (7), not the fragment index (0) — this is the \
+         whole question a fault-injection experiment asks. got: {logged}"
+    );
+    assert!(
+        logged.contains(r#""index":0"#),
+        "the fragment index must be named. got: {logged}"
+    );
+    assert!(
+        logged.contains(&format!("{chunk_id:032x}")),
+        "the chunk must be named in the canonical hex form. got: {logged}"
+    );
+}
+
+/// **A D-server that fails every RPC must not look healthy.**
+///
+/// This is the sharpest gap in the old code: the transient arm was literally `Err(_) => {}`.
+/// A D-server that was up but timing out, refusing connections, or returning
+/// `Rpc(Status::internal(..))` on every single read produced **no counter, no log, no trace** —
+/// indistinguishable from a healthy node from every available vantage point. Reads quietly got
+/// slower and leaned on parity, and nobody found out until a chunk fell below `k`.
+///
+/// The control flow is deliberately unchanged (the fragment is still read around, and it is
+/// still NOT a corruption finding — reclassification is #431's question). Only the silence is.
+///
+/// Pre-fix: empty buffer, and `queued_repairs` empty — RED on the first assertion, and the
+/// last assertion guards against over-correcting into a false corruption finding.
+#[tokio::test]
+async fn a_transient_dserver_failure_is_no_longer_silent() {
+    enable_audit_callsites();
+    let meta = MemMeta::default();
+    let (k, m) = (2u8, 1u8);
+    let data = b"a node that fails every rpc must not look healthy";
+    let chunk_id: ChunkId = 0xBEEF;
+    let shards = erasure::encode(k as usize, m as usize, data).unwrap();
+
+    let inner = MemChunks::default();
+    for (index, shard) in shards.iter().enumerate() {
+        inner
+            .put_fragment(
+                FragmentId {
+                    chunk: chunk_id,
+                    index: index as u16,
+                },
+                fragment(chunk_id, shard),
+            )
+            .await
+            .unwrap();
+    }
+    // Fragment index 0 — placed on D-server 3 — comes from a node that refuses every read.
+    //
+    // Index 0, not index 2, and that matters: the read fires all n fetches and stops the
+    // instant k of them verify (any-k-arrive-first, §6.2), CANCELLING the rest. A fault on the
+    // last-polled fragment would never be observed at all — not a gap, the design working. The
+    // node the read actually has to touch is the one whose silence was costing us.
+    let chunks = TransientlyFailingStore {
+        inner,
+        fail_id: FragmentId {
+            chunk: chunk_id,
+            index: 0,
+        },
+    };
+
+    commit_inode(
+        &meta,
+        1,
+        ChunkRef {
+            id: chunk_id,
+            scheme: EcScheme::ReedSolomon { k, m },
+            len: data.len() as u64,
+            placement: vec![3, 4, 5],
+        },
+        data.len() as u64,
+    )
+    .await;
+
+    let capture = Capture::default();
+    let dispatch = capturing_dispatch(capture.clone());
+    let got = {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        read::read_object(&meta, &chunks, 1).await.unwrap()
+    };
+    assert_eq!(
+        got.as_deref(),
+        Some(data.as_slice()),
+        "still reads around it"
+    );
+
+    let logged = capture.contents();
+    assert!(
+        logged.contains(r#""class":"transient""#) && logged.contains(r#""dserver":3"#),
+        "the failing node must be NAMED and classed transient; pre-fix `Err(_) => {{}}` made it \
+         invisible. got: {logged}"
+    );
+    assert!(
+        logged.contains("unreachable"),
+        "the transport's own classification must survive to the log — chunkstore-grpc computes \
+         Unavailable/Timeout/Rpc/Connect and its one consumer used to bin it. got: {logged}"
+    );
+    assert!(
+        repair::queued_repairs(&meta).await.unwrap().is_empty(),
+        "a transient fault is NOT a corruption finding — this must not enqueue a repair \
+         obligation (that reclassification is #431's question, not this change's)"
+    );
+}
