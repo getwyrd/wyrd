@@ -128,7 +128,7 @@ serde_json = "1"
 # streaming PUT body hash (issue #364). Vetted maintained crate replacing the earlier
 # hand-rolled SHA-256 on the auth boundary (carry-forward T5-a); `MIT OR Apache-2.0`
 # (already allowed), pure-Rust, no build script. Paired with `hmac` above.
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 # Async runtime, used only to *host* a tonic server (the gRPC stack is built on
 # tokio/hyper, already in the tree via tonic). Wyrd's own async surface stays
