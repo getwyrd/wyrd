@@ -278,16 +278,31 @@ fn run(cluster_file: String) {
             believed_committed.len(),
             settled_by_reread.len(),
         );
-        // The leg is only meaningful if the kill actually perturbed the commit path. A run in
-        // which every single commit sailed through untouched proves nothing about the
-        // unknown-result rules — say so rather than bank a hollow green.
-        if unknown_results == 0 && faults == 0 && settled_by_reread.is_empty() {
-            eprintln!(
-                "wyrd-tier1-fdb: NOTE — the kill perturbed no commit (no unknown results, no \
-                 faults). The atomicity and no-phantom-conflict invariants still held, but this \
-                 run did not exercise the unknown-result path. Recorded as such in the verdict."
-            );
-        }
+        // **A run that perturbed nothing is INCONCLUSIVE, and inconclusive is not green.**
+        //
+        // This leg exists to exercise one thing: a commit whose fate the cluster genuinely
+        // could not report. If every commit sailed through untouched, the atomicity and
+        // no-phantom-conflict invariants above still held — but they held *without the fault*,
+        // which proves nothing about the unknown-result rules, and `xtask fdb-metadata-tier1`
+        // would go on to report that FoundationDB "passed the battery". A go/no-go gate that
+        // can record a GO for a run in which the hard path never executed is worth nothing.
+        //
+        // The first draft printed a NOTE here and passed. That was the same hollow green the
+        // round-boundary kill produced, one level up: honest in the log, wrong in the exit
+        // code. Codex's review of #535 called it, and it is right — the run must fail loudly so
+        // the operator re-runs (the kill window is timing-dependent, so a re-run is the
+        // remedy), rather than banking a verdict nobody earned.
+        let perturbed = unknown_results + faults + settled_by_reread.len();
+        assert!(
+            perturbed > 0,
+            "the mid-commit kill perturbed NO commit: {} committed, 0 unknown results, 0 faults, \
+             0 settled-by-re-read across {ROUNDS} rounds and {kill_cycles} kill/restart \
+             cycle(s). The invariants held, but they held with the fault effectively absent — \
+             this run did NOT exercise the unknown-result path, so it cannot support a GO. The \
+             kill window is timing-dependent: re-run. (If it never reproduces, the leg's timing \
+             needs widening — do not weaken this assertion.)",
+            believed_committed.len(),
+        );
     });
 }
 

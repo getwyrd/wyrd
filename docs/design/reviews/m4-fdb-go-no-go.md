@@ -102,6 +102,18 @@ as the seam's `CommitUnknownResult` — never as `Conflict`, never silently retr
 permits — re-read — and settled each one. Of the two, **one had landed and one had not**, which
 is precisely why the contract forbids guessing.
 
+A second run, after the leg was hardened (below), reproduced it independently: `399 committed, 0
+settled by re-read, 1 unknown-result commit(s), 0 phantom conflict(s); final version 399` — that
+1021's batch had *not* landed, and the accounting closes on the other side of the same rule.
+
+**An unperturbed run now FAILS.** The leg originally *printed a note* when the kill perturbed no
+commit and passed anyway. That was the round-boundary hollow green one level up: honest in the
+log, wrong in the exit code — `xtask fdb-metadata-tier1` would have reported that FoundationDB
+"passed the battery" for a run in which the hard path never executed, and a gate that can record
+a GO on that is worth nothing. It now asserts `unknown_results + faults + settled_by_reread > 0`
+and fails as **inconclusive** otherwise, telling the operator to re-run (the kill window is
+timing-dependent). Caught by a `codex review` of #535 — a note is not a gate.
+
 Three properties this leg pins that nothing else could:
 
 - **No phantom `Conflict`.** With a single writer, nothing can legitimately lose a race, so an

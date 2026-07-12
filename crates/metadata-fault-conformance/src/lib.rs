@@ -601,32 +601,35 @@ pub async fn contention_blind_batch_storm<S, F, Fut>(
             barrier.wait().await;
             let mut conflicts = 0usize;
             let mut errors = 0usize;
+            // The keys THIS client was told committed. Recorded per write, not counted in
+            // aggregate — see the assertion below for why that distinction is the whole test.
+            let mut committed_keys: Vec<Vec<u8>> = Vec::new();
             for w in 0..writes_each {
                 // Deliberately OVERLAPPING keys: every client writes the same `storm/hot`
                 // cell, plus a private one. The hot cell is where a backend is tempted to
                 // report a lost race — and where a blind batch must not.
+                let private = format!("storm/{c_idx}/{w}").into_bytes();
                 let batch = WriteBatch::new()
                     .put(b"storm/hot".to_vec(), format!("c{c_idx}-w{w}").into_bytes())
-                    .put(
-                        format!("storm/{c_idx}/{w}").into_bytes(),
-                        b"private".to_vec(),
-                    );
+                    .put(private.clone(), b"private".to_vec());
                 match c.commit(batch).await {
-                    Ok(CommitOutcome::Committed) => {}
+                    Ok(CommitOutcome::Committed) => committed_keys.push(private),
                     Ok(CommitOutcome::Conflict) => conflicts += 1,
                     Err(_) => errors += 1,
                 }
             }
-            (conflicts, errors)
+            (conflicts, errors, committed_keys)
         }));
     }
 
     let mut total_conflicts = 0usize;
     let mut total_errors = 0usize;
+    let mut committed_keys: Vec<Vec<u8>> = Vec::new();
     for t in tasks {
-        let (c, e) = t.await.expect("storm client must not panic");
+        let (c, e, keys) = t.await.expect("storm client must not panic");
         total_conflicts += c;
         total_errors += e;
+        committed_keys.extend(keys);
     }
 
     assert_eq!(
@@ -637,23 +640,30 @@ pub async fn contention_blind_batch_storm<S, F, Fut>(
          CommitOutcome would read this as success while their write was dropped (#437).",
     );
 
-    // Every write a client believed committed must be visible. (Errors are legal — the
-    // caller SEES them — so only the successful ones are checked.)
+    // **Every key whose commit reported `Committed` must be present — checked KEY BY KEY.**
+    //
+    // The first draft compared aggregates: `missing.len() <= total_errors`. That let one
+    // write's error EXCUSE a different write's disappearance. Concretely: client A's commit
+    // errors but its key lands anyway (a legal unknown result), while client B is told
+    // `Committed` and its key vanishes. Missing = 1, errors = 1, and the storm passed —
+    // through the exact data-loss scenario it exists to catch. (Codex's review of #535; my own
+    // comment there even conceded "we cannot attribute errors to keys", which was simply
+    // false — the client knows which key it was told about.)
+    //
+    // A key whose commit ERRORED is not checked either way: it may be absent (the batch never
+    // landed) or present (an unknown result that did land). Both are legal, and that is
+    // precisely why the errored writes cannot be allowed to launder a missing successful one.
     let mut missing = Vec::new();
-    for c_idx in 0..clients {
-        for w in 0..writes_each {
-            let key = format!("storm/{c_idx}/{w}").into_bytes();
-            if seed.get(&key).await.expect("read storm key").is_none() {
-                missing.push(format!("storm/{c_idx}/{w}"));
-            }
+    for key in &committed_keys {
+        if seed.get(key).await.expect("read storm key").is_none() {
+            missing.push(String::from_utf8_lossy(key).into_owned());
         }
     }
-    // A key is legitimately absent only if its commit errored; we cannot attribute errors to
-    // keys here, so the check is: no more missing keys than there were errors.
     assert!(
-        missing.len() <= total_errors,
-        "{} blind writes are missing but only {total_errors} commits reported an error — a \
-         write vanished while its caller was told it committed: {missing:?}",
+        missing.is_empty(),
+        "{} blind write(s) VANISHED after their commit reported `Committed` — the caller was \
+         told the write landed and it did not. ({total_errors} other commit(s) errored; those \
+         are legal and are not what this asserts.) Missing: {missing:?}",
         missing.len(),
     );
 
