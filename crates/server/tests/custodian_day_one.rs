@@ -1684,3 +1684,96 @@ async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
         "the audit target must survive to the sink so a collector can select on it. got: {logged}"
     );
 }
+
+/// **Lowering log verbosity must not switch off the durability metrics.** (#531 review, P1.)
+///
+/// The durability plane emits its metrics as `tracing::info!` events
+/// (`gauge.reconstruction_under_replicated`, the repair counters). The log subscriber's
+/// `EnvFilter` was originally attached to the *registry*, making it a **subscriber-wide**
+/// filter — which short-circuits `register_callsite`/`enabled` for the whole stack, so a
+/// filtered-out event never reaches **any** layer, `MetricsLayer` included.
+///
+/// So `wyrd custodian --log-level warn` — an ordinary thing for an operator to do, and the
+/// obvious thing to do when JSON logs get noisy — silently starved the metrics bridge and
+/// turned off the Prometheus/OTLP durability signals. No error, no warning, no metric. The
+/// operator would have been watching a gauge that could never rise, in the one plane that
+/// tells them data is being lost.
+///
+/// The filter is now attached to the fmt layer only (`Layer::with_filter`). This test runs the
+/// REAL reconcile pass at `--log-level error` — two levels below the `info` the metrics are
+/// emitted at — and asserts the gauge still rises and the audit line is still logged.
+///
+/// Pre-fix: `under_replicated` is `None` (the registry is empty) — RED.
+#[tokio::test]
+async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+    );
+    let fleet = Fleet {
+        servers: vec![
+            (0, d0.as_ref()),
+            (1, d1.as_ref()),
+            (2, d2.as_ref()),
+            (3, d3.as_ref()),
+        ],
+    };
+    write_rs_2_1(&meta, &fleet).await;
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    // Server 1 is dead: a real, repairable under-replication.
+    let dead = Arc::new(DeadDServer);
+    let servers = configured([
+        (0, "A", dyn_store(&d0)),
+        (1, "B", dyn_store(&dead)),
+        (2, "C", dyn_store(&d2)),
+        (3, "D", dyn_store(&d3)),
+    ]);
+    let (live_fleet, live_topo, unreachable) = live_reconstruction_view(&servers).await;
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &live_fleet,
+        topology: &live_topo,
+        unreachable: &unreachable,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let capture = Capture::default();
+    // `error` — two levels ABOVE the `info` the durability metrics are emitted at. Pre-fix this
+    // is exactly the configuration that silently killed them.
+    let service = CustodianService::with_logging_to(
+        telemetry,
+        &wyrd_server::logging::LogConfig::new(Some("error"), None).unwrap(),
+        capture.clone(),
+    );
+
+    service
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .expect("the pass survives the killed D-server");
+
+    assert_eq!(
+        under_replicated(&service),
+        Some(1.0),
+        "the durability gauge MUST still rise at --log-level error; pre-fix the subscriber-wide \
+         EnvFilter starved the MetricsLayer and this reads None — an operator lowering log \
+         verbosity silently lost the signal that data is at risk"
+    );
+
+    // And the log plane is genuinely quiet at `error` — the filter still does its job on the
+    // layer it belongs to. (`info`-level metric events emit no log line of their own.)
+    let logged = capture.contents();
+    assert!(
+        !logged.contains(r#""level":"INFO""#),
+        "the fmt layer must still honour --log-level error; the fix scopes the filter, it does \
+         not remove it. got: {logged}"
+    );
+}

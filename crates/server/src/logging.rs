@@ -137,7 +137,31 @@ impl LogConfig {
 ///
 /// `extra` is the seam the custodian role hangs its
 /// [`MetricsLayer`](wyrd_telemetry::DurabilityTelemetry::metrics_layer) on, so one dispatch
-/// carries both the metric bridge and the log sink. Pass `()` for a log-only subscriber.
+/// carries both the metric bridge and the log sink. Pass [`Identity`] for a log-only
+/// subscriber.
+///
+/// # The filter is scoped to the fmt layer, and that is load-bearing
+///
+/// The `EnvFilter` is attached with [`Layer::with_filter`] — a **per-layer** filter — and not
+/// with `.with(filter)` on the registry, which would make it a **subscriber-wide** one.
+///
+/// The distinction is not stylistic. A subscriber-wide `EnvFilter` short-circuits
+/// `register_callsite` / `enabled` for the whole stack, so a filtered-out event is never
+/// dispatched to **any** layer — including `extra`. And the durability plane emits its metrics
+/// as `tracing::info!` events (`gauge.reconstruction_under_replicated`, the repair counters,
+/// …). So `wyrd custodian --log-level warn` — an entirely reasonable thing for an operator to
+/// do — would silently starve the [`MetricsLayer`](wyrd_telemetry::DurabilityTelemetry::metrics_layer)
+/// and **switch off the Prometheus/OTLP durability signals**, with no error and no
+/// missing-metric warning. Lowering log verbosity must never disable metric collection: logs
+/// and metrics are different planes, and only one of them is what an operator watches to see
+/// that data is being lost.
+///
+/// Caught in review on #531, and verified before fixing: with a subscriber-wide filter at
+/// `warn`, an `info`-level `monotonic_counter.*` event yields an **empty** Prometheus registry.
+///
+/// Per-layer filtering costs a little — the registry enables every callsite, so events the fmt
+/// layer will discard are still dispatched. That is the right trade: a little work on a dropped
+/// event, against silently losing the signal that says the data is gone.
 pub fn dispatch<W, L>(config: &LogConfig, writer: W, extra: L) -> Dispatch
 where
     W: for<'w> fmt::MakeWriter<'w> + Send + Sync + 'static,
@@ -146,8 +170,7 @@ where
     Dispatch::new(
         Registry::default()
             .with(extra)
-            .with(config.filter())
-            .with(config.fmt_layer(writer)),
+            .with(config.fmt_layer(writer).with_filter(config.filter())),
     )
 }
 
