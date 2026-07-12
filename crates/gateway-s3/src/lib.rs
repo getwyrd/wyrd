@@ -233,18 +233,238 @@ fn split_bucket_key(path: &str) -> Option<(&str, &str)> {
 /// is installed, *everything* wyrd logs while serving this request — the gateway's own error
 /// record, the read path's fragment faults — carries `request_id` automatically. A client
 /// reporting a failure hands the operator a `jq` selector over the whole server-side trail.
+/// The response body, wrapped so the **access row is written when the transfer actually ends**
+/// (#529 review).
+///
+/// A GET's body is a `Body::from_stream(...)` that hyper polls *after* the handler returns, so an
+/// access row emitted at head time claims `200` and a near-zero duration for a transfer that may
+/// still truncate, error, or be abandoned by the client. That is worse than no row: it is a
+/// confident, wrong answer, in the one place a field post-mortem starts.
+///
+/// So the row is written exactly once, from whichever of these happens first:
+///
+/// * the stream ends cleanly (`Ready(None)`) — `transfer = "complete"`;
+/// * the stream yields an error — `transfer = "failed"`, and the object was truncated on the wire;
+/// * the body is dropped before either (the client hung up, or hyper abandoned it) —
+///   `transfer = "aborted"`. Without the `Drop` arm a disconnected client would leave NO row at
+///   all, which is the same hole this whole change closes.
+///
+/// A non-streaming response (every error path, and PUT/DELETE) has a one-shot body, so it takes
+/// the same path and its row is written the moment that single frame is consumed — same shape,
+/// no special case.
+struct AccessLogged<S> {
+    inner: S,
+    request_id: RequestId,
+    started: SystemTime,
+    status: u16,
+    bytes: u64,
+    /// The `content-length` the response DECLARED, when it declared one. A GET announces the
+    /// object's exact size for precisely this reason — its own code says a body truncated by a
+    /// mid-stream fault "is a detectable short read, not a silent complete 200". So a stream that
+    /// ends cleanly but SHORT is a truncation, and the row must say so rather than call it
+    /// complete just because the stream returned EOF. (Codex review of #532.)
+    declared: Option<u64>,
+    finished: bool,
+    span: tracing::Span,
+}
+
+/// Write ONE access row — the single place it is emitted, so the body-carrying and body-less
+/// paths cannot drift in what they record.
+///
+/// `request_id` is a field of the EVENT, not merely inherited from `span`: a target-scoped
+/// directive (`RUST_LOG=wyrd.gateway.s3.access=info` — the natural way to keep the access plane
+/// and quieten the rest) enables this event without enabling the span, whose target is the module
+/// path, so inheriting alone would lose the join key under exactly that directive.
+fn record_access(
+    span: &tracing::Span,
+    request_id: RequestId,
+    started: SystemTime,
+    status: u16,
+    bytes: u64,
+    outcome: &'static str,
+) {
+    let duration_ms = started.elapsed().map(|d| d.as_millis()).unwrap_or(0);
+    span.in_scope(|| {
+        tracing::info!(
+            target: "wyrd.gateway.s3.access",
+            request_id = %request_id,
+            http_status = status,
+            bytes,
+            duration_ms,
+            transfer = outcome,
+            "request served",
+        );
+    });
+}
+
+impl<S> AccessLogged<S> {
+    /// Write the row, exactly once. `outcome` is the *observed* fate of the transfer, not the
+    /// status line's optimism.
+    fn record(&mut self, outcome: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        record_access(
+            &self.span,
+            self.request_id,
+            self.started,
+            self.status,
+            self.bytes,
+            outcome,
+        );
+    }
+}
+
+impl<S> futures_util::Stream for AccessLogged<S>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, axum::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.bytes += chunk.len() as u64;
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                // The client got a 200 head and then a truncated body. The row must say so —
+                // this is precisely the case a head-time log would have reported as "served".
+                self.record("failed");
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                // EOF is not the same as "all of it". A stream that ends short of the declared
+                // `content-length` truncated the object on the wire — the client sees a failed
+                // transfer, and a row calling it `complete` would hide exactly the fault this
+                // logging exists to diagnose.
+                let short = self.declared.is_some_and(|declared| self.bytes < declared);
+                self.record(if short { "truncated" } else { "complete" });
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for AccessLogged<S> {
+    fn drop(&mut self) {
+        // Dropped without EOF — and that is NOT automatically an abandoned transfer.
+        //
+        // Hyper's HTTP/1 encoder stops polling a `content-length`-delimited body the moment the
+        // declared number of bytes has been written, and then drops it: a perfectly successful GET
+        // never yields `Ready(None)`. Recording `aborted` here unconditionally would therefore
+        // mislabel every ordinary download — the exact opposite of what this row is for.
+        // (Codex review of #532.)
+        //
+        // So the verdict comes from the bytes actually sent: all of what was declared ⇒ the client
+        // got the whole object, whoever stopped polling first. Anything less ⇒ the transfer really
+        // was abandoned (a client that hung up, or hyper tearing the connection down).
+        let delivered = self.declared.is_some_and(|declared| self.bytes >= declared);
+        self.record(if delivered { "complete" } else { "aborted" });
+    }
+}
+
+/// Arrange for the access row to be written when the transfer actually ends, and hand back the
+/// response to serve.
+///
+/// Two shapes, and the distinction is load-bearing:
+///
+/// * **A response with a body** is wrapped in [`AccessLogged`], so the row carries the *observed*
+///   outcome — bytes actually sent, real duration, and whether the transfer completed, failed
+///   mid-stream, or was abandoned. A GET's body is polled only after the handler returns, so a
+///   row written here would claim `200` and a near-zero duration for a transfer that may still
+///   truncate.
+/// * **A body-less response** (`204`/`304`/`1xx` — HTTP forbids a body, so hyper is *required* not
+///   to poll one and drops it instead) is complete the moment its head is written. Wrapping it
+///   would send every successful DELETE, which answers `204`, straight to the `Drop` arm and
+///   record it as `aborted` — a systematic lie about the most ordinary success there is, and one
+///   that would read as a fleet of clients hanging up mid-download. (Codex review of #532.)
+fn finish_response(
+    response: Response,
+    method: &Method,
+    span: &tracing::Span,
+    request_id: RequestId,
+    started: SystemTime,
+) -> Response {
+    let status = response.status();
+    // Hyper never polls the body of a `204`/`304`/`1xx` (HTTP forbids one), and it SUPPRESSES the
+    // body of any response to a `HEAD` — in both cases it drops the body instead. Wrapping those
+    // would send them straight to the `Drop` arm as `aborted`: every successful DELETE, and every
+    // HEAD probe (an S3 client's most routine call), recorded as a client that hung up.
+    let bodyless =
+        matches!(status.as_u16(), 204 | 304) || status.is_informational() || method == Method::HEAD;
+    if bodyless {
+        record_access(span, request_id, started, status.as_u16(), 0, "complete");
+        return response;
+    }
+    let declared = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    response.map(|body| {
+        Body::from_stream(AccessLogged {
+            inner: body.into_data_stream(),
+            request_id,
+            started,
+            status: status.as_u16(),
+            bytes: 0,
+            declared,
+            finished: false,
+            span: span.clone(),
+        })
+    })
+}
+
 async fn handle<G>(State(state): State<AppState<G>>, req: Request) -> Response
 where
     G: ObjectGateway,
 {
     let request_id = state.request_ids.mint();
+    let started = SystemTime::now();
+    let method = req.method().clone();
     let span = tracing::info_span!(
         "s3.request",
         request_id = %request_id,
         method = %req.method(),
         path = %req.uri().path(),
     );
-    let mut response = dispatch(state, req, request_id).instrument(span).await;
+    let response = dispatch(state, req, request_id)
+        .instrument(span.clone())
+        .await;
+
+    // **The access line — without it the id is a promise this crate does not keep.**
+    //
+    // A span is not a log record: the `fmt` layer attaches a span's fields to the *events*
+    // emitted under it, and does not write span lifecycle rows. So a request that fails before
+    // the gateway is even reached — an unsigned or badly-signed request, an unparsable path, an
+    // unsupported verb — emitted NOTHING, and the `x-amz-request-id` handed to the client
+    // selected zero server-side rows. The id was findable only for requests that happened to log
+    // something else, which is the opposite of the failures it exists for (#529 review).
+    //
+    // One row per request, whatever the verdict, is also the first question of any field
+    // post-mortem — *did the request even reach us?* — and it is the one question no error log
+    // can answer, because the failure mode may be that nothing arrived.
+    //
+    // `request_id` is recorded on the EVENT, not merely inherited from the span: a target-scoped
+    // directive (`RUST_LOG=wyrd.gateway.s3.access=info` — the natural way to keep the access
+    // plane and quieten the rest) enables this event without enabling the span, whose target is
+    // the module path. Inheriting alone would lose the join key under exactly that directive.
+    //
+    // **It is emitted when the BODY finishes, not when the head is built.** A GET returns a
+    // `Body::from_stream(...)` whose chunks are read only after this handler returns, so logging
+    // here would record `200` and a near-zero duration for a transfer that may still truncate or
+    // fail mid-stream — a row that is actively misleading in exactly the field-diagnosis case the
+    // id exists for. The body is wrapped so the row carries the *observed* outcome: bytes
+    // actually sent, the real duration, and whether the transfer completed (#529 review).
+    let mut response = finish_response(response, &method, &span, request_id, started);
+
     // Stamp it on the wire too. An SDK surfaces `x-amz-request-id` in its own error
     // reporting, so the tester who hits the failure can quote the id without any
     // client-side change.
@@ -521,6 +741,424 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc as StdArc, Mutex};
+
+    /// A `MakeWriter` that appends every line into a shared buffer, so a test can read back
+    /// exactly what the subscriber emitted — the only way to prove a log row EXISTS.
+    #[derive(Clone, Default)]
+    struct Capture(StdArc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
+        type Writer = Self;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A gateway that is never reached: the request under test is refused at the signature
+    /// check, which is the whole point — the id must be findable for a request that never got
+    /// near a backend.
+    struct NoGateway;
+
+    impl ObjectGateway for NoGateway {
+        async fn put_object_streaming<S>(
+            &self,
+            _key: &str,
+            _source: S,
+            _expected: ContentHash,
+        ) -> wyrd_traits::Result<()>
+        where
+            S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
+                + Send
+                + Unpin
+                + 'static,
+        {
+            Ok(())
+        }
+
+        async fn get_object_streaming(
+            self: Arc<Self>,
+            _key: &str,
+        ) -> wyrd_traits::Result<Option<ObjectRead>> {
+            Ok(None)
+        }
+
+        async fn delete_object(&self, _key: &str) -> wyrd_traits::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// **The id the client is handed must select a server-side row** — including for a request
+    /// that never reaches the gateway (#529 review).
+    ///
+    /// A span is not a log record. The `fmt` layer attaches a span's fields to the EVENTS under
+    /// it and writes no span lifecycle rows, so before the access line this crate emitted
+    /// *nothing at all*: an unsigned request got an `x-amz-request-id` in its 403 and that id
+    /// selected zero rows on the server. The id was findable only for requests that happened to
+    /// log something else — the opposite of the failures it exists for.
+    ///
+    /// Driven through the REAL router with `oneshot`, not by re-emitting the event here: a test
+    /// that logged its own line would only prove the test can log. The request is unsigned, so
+    /// it is refused at the signature check — exactly the "common client failure" the review
+    /// named.
+    ///
+    /// Mutation guard: delete the `tracing::info!` access line and this fails — the buffer is
+    /// empty.
+    #[tokio::test]
+    async fn the_id_handed_to_the_client_selects_a_server_side_row_even_when_refused() {
+        use tower::ServiceExt;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(capture.clone()),
+            ),
+        );
+
+        let router = S3Gateway::new(
+            Arc::new(NoGateway),
+            S3Config::new(vec![crate::sigv4::Credentials {
+                access_key_id: "AKIA".into(),
+                secret_access_key: "secret".into(),
+            }]),
+        )
+        .router();
+
+        // A thread-scoped default, not `with_default`: the request is awaited, and a
+        // sync-scoped dispatcher would not be installed across the await points.
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/bucket/key")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("the router answers");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "an unsigned request is refused — and that is precisely the case whose id must still \
+             be findable",
+        );
+
+        let served_id = response
+            .headers()
+            .get(request_id::HEADER)
+            .expect("every response carries the id")
+            .to_str()
+            .expect("ascii")
+            .to_string();
+
+        // Drain the body, as a real client does. The access row is written when the TRANSFER
+        // ends, not when the head is built — a head-time row would claim `200` for a stream
+        // that later truncates. Nothing is logged until the body is consumed, which is the
+        // property, so the test must consume it.
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain the body");
+
+        let logged = capture.contents();
+        assert!(
+            !logged.is_empty(),
+            "the request emitted NO server-side row — the `x-amz-request-id` handed to the \
+             client selects nothing, which is the whole failure #529 exists to end",
+        );
+        assert!(
+            logged.contains(&served_id),
+            "the server-side row must carry the SAME id the client was handed ({served_id}), or \
+             the join key joins to nothing. got: {logged}",
+        );
+        assert!(
+            logged.contains(r#""target":"wyrd.gateway.s3.access""#),
+            "the row must be on the access plane, so a collector can select it. got: {logged}",
+        );
+    }
+
+    /// **The access row reports the transfer that actually happened** (#529 review).
+    ///
+    /// A GET's body is a `Body::from_stream(...)` that hyper polls *after* the handler returns.
+    /// A row emitted at head time therefore claims `200` with a near-zero duration for a
+    /// transfer that may still truncate, fail, or be abandoned — a confident, wrong answer in
+    /// the one place a field post-mortem starts. The row is written from the body wrapper
+    /// instead, so it carries the observed outcome.
+    ///
+    /// Driven directly against `AccessLogged` rather than through the router, because the
+    /// failure mode is a *mid-stream* error and no in-process gateway stub can produce one on
+    /// the wire. The three fates, each pinned:
+    ///
+    /// * a stream that ends cleanly → `transfer="complete"` with the true byte count;
+    /// * a stream that errors after some bytes → `transfer="failed"` — the client got a 200 head
+    ///   and a truncated body, and the row must NOT read "served";
+    /// * a body dropped before either → `transfer="aborted"`, so a client that hangs up
+    ///   mid-download still leaves exactly one row rather than none.
+    #[tokio::test]
+    async fn the_access_row_reports_the_observed_transfer_not_the_status_line() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        async fn drive(
+            chunks: Vec<Result<bytes::Bytes, axum::Error>>,
+            declared: Option<u64>,
+            drain: bool,
+        ) -> String {
+            let capture = Capture::default();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(capture.clone()),
+                ),
+            );
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+
+            let logged = AccessLogged {
+                inner: futures_util::stream::iter(chunks),
+                request_id: RequestIds::new().mint(),
+                started: SystemTime::now(),
+                status: 200,
+                bytes: 0,
+                declared,
+                finished: false,
+                span: tracing::info_span!("s3.request"),
+            };
+            let body = Body::from_stream(logged);
+            if drain {
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+            } else {
+                drop(body); // the client hung up
+            }
+            capture.contents()
+        }
+
+        let complete = drive(vec![Ok(bytes::Bytes::from_static(b"hello"))], Some(5), true).await;
+        assert!(
+            complete.contains(r#""transfer":"complete""#) && complete.contains(r#""bytes":5"#),
+            "a stream that ends cleanly is `complete`, with the bytes actually sent: {complete}",
+        );
+
+        let failed = drive(
+            vec![
+                Ok(bytes::Bytes::from_static(b"partial")),
+                Err(axum::Error::new(std::io::Error::other("mid-stream fault"))),
+            ],
+            Some(99),
+            true,
+        )
+        .await;
+        assert!(
+            failed.contains(r#""transfer":"failed""#),
+            "a stream that errors mid-body must NOT be recorded as served — the client got a 200 \
+             head and a truncated object, which is exactly what a head-time row would have \
+             hidden: {failed}",
+        );
+        assert!(
+            !failed.contains(r#""transfer":"complete""#),
+            "and it must not ALSO claim completion — one row, one verdict: {failed}",
+        );
+
+        let aborted = drive(
+            vec![Ok(bytes::Bytes::from_static(b"unread"))],
+            Some(6),
+            false,
+        )
+        .await;
+        assert!(
+            aborted.contains(r#""transfer":"aborted""#),
+            "a body dropped before it finishes (the client hung up) must still leave ONE row — \
+             without the Drop arm it would leave none: {aborted}",
+        );
+
+        // EOF is not the same as "all of it". A GET declares the object's exact `content-length`
+        // so a short read is DETECTABLE — the response builder says so in as many words — and a
+        // stream that ends cleanly but short truncated the object on the wire. Calling that
+        // `complete` because the stream returned EOF hides the very fault this row exists for.
+        // (Codex review of #532.)
+        let truncated = drive(
+            vec![Ok(bytes::Bytes::from_static(b"half"))],
+            Some(1024),
+            true,
+        )
+        .await;
+        assert!(
+            truncated.contains(r#""transfer":"truncated""#),
+            "a stream that ends short of the declared content-length is a TRUNCATION, not a \
+             completion — the client received a partial object: {truncated}",
+        );
+        assert!(
+            !truncated.contains(r#""transfer":"complete""#),
+            "…and it must not also claim completion — one row, one verdict: {truncated}",
+        );
+
+        // **Hyper drops a content-length body once it has written the declared bytes — it never
+        // polls for EOF.** So an ORDINARY successful GET reaches the `Drop` arm, and a `Drop` that
+        // says "aborted" unconditionally would mislabel every download in the fleet. The verdict
+        // must come from the bytes actually sent. (Codex review of #532.)
+        //
+        // Simulated exactly: consume the declared 5 bytes, then drop without polling to EOF.
+        let delivered_then_dropped = {
+            let capture = Capture::default();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(capture.clone()),
+                ),
+            );
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+
+            let mut logged = AccessLogged {
+                inner: futures_util::stream::iter(vec![Ok(bytes::Bytes::from_static(b"hello"))]),
+                request_id: RequestIds::new().mint(),
+                started: SystemTime::now(),
+                status: 200,
+                bytes: 0,
+                declared: Some(5),
+                finished: false,
+                span: tracing::info_span!("s3.request"),
+            };
+            let _ = futures_util::StreamExt::next(&mut logged).await; // the 5 declared bytes
+            drop(logged); // hyper stops here: no EOF poll
+            capture.contents()
+        };
+        assert!(
+            delivered_then_dropped.contains(r#""transfer":"complete""#),
+            "a body that delivered every declared byte and was then dropped unpolled is a \
+             SUCCESSFUL download — that is what hyper does with every content-length response, \
+             and calling it `aborted` would mislabel every ordinary GET: \
+             {delivered_then_dropped}",
+        );
+        assert!(
+            !delivered_then_dropped.contains(r#""transfer":"aborted""#),
+            "…and it must not read as a client that hung up: {delivered_then_dropped}",
+        );
+    }
+
+    /// **A body-less response is `complete`, not `aborted`** (codex review of #532).
+    ///
+    /// HTTP forbids a body on `204`/`304`/`1xx`, so hyper is *required* not to poll one — it drops
+    /// the body instead. The first draft wrapped every response unconditionally, so the `Drop` arm
+    /// fired and recorded `transfer="aborted"` for every successful DELETE (which answers `204`):
+    /// a systematic lie about the most ordinary success there is, and one that would have read as
+    /// a fleet of clients hanging up mid-download.
+    ///
+    /// Driven against `finish_response` — the production function `handle` calls — with the body
+    /// left UNDRAINED, because that is exactly what hyper does with a `204` and what made the bug
+    /// fire. The body-carrying case is included as the control: there, an undrained body genuinely
+    /// IS an abandoned transfer, and must still say so.
+    #[tokio::test]
+    async fn a_bodyless_response_is_recorded_complete_not_aborted() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        async fn drive(response: Response, method: Method, drain: bool) -> String {
+            let capture = Capture::default();
+            let dispatch = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(capture.clone()),
+                ),
+            );
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+
+            let span = tracing::info_span!("s3.request");
+            let finished = finish_response(
+                response,
+                &method,
+                &span,
+                RequestIds::new().mint(),
+                SystemTime::now(),
+            );
+            if drain {
+                let _ = axum::body::to_bytes(finished.into_body(), usize::MAX).await;
+            } else {
+                drop(finished);
+            }
+            capture.contents()
+        }
+
+        // A successful DELETE: 204, no body, and hyper will never poll it.
+        let logged = drive(
+            empty_response(StatusCode::NO_CONTENT),
+            Method::DELETE,
+            false,
+        )
+        .await;
+        assert!(
+            logged.contains(r#""transfer":"complete""#),
+            "a 204 carries no body and hyper never polls it — the row must say `complete`. \
+             Wrapping it sent every successful DELETE to the Drop arm as `aborted`. got: {logged}",
+        );
+        assert!(
+            !logged.contains(r#""transfer":"aborted""#),
+            "…and it must NOT read as an abandoned transfer: there was no client to hang up. \
+             got: {logged}",
+        );
+
+        // The control: a response that DOES carry a body, dropped without being read, is a
+        // genuinely abandoned transfer and must still be recorded as one — otherwise the fix
+        // above would have been "call everything complete", which reports nothing.
+        let abandoned = drive(
+            error_response(
+                RequestIds::new().mint(),
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "unsigned",
+            ),
+            Method::GET,
+            false,
+        )
+        .await;
+        assert!(
+            abandoned.contains(r#""transfer":"aborted""#),
+            "a body that is dropped unread IS an abandoned transfer — the 204 fix must not \
+             flatten every outcome to `complete`. got: {abandoned}",
+        );
+
+        // HEAD: hyper SUPPRESSES the body of any response to a HEAD and drops it unpolled, so a
+        // wrapped HEAD lands in the `Drop` arm and reads as `aborted` — for an S3 client's most
+        // routine probe. The response here carries a body (a 403 refusal); what makes it bodyless
+        // on the wire is the METHOD, which is why the status alone was not enough.
+        // (Codex review of #532.)
+        let head = drive(
+            error_response(
+                RequestIds::new().mint(),
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "unsigned",
+            ),
+            Method::HEAD,
+            false,
+        )
+        .await;
+        assert!(
+            head.contains(r#""transfer":"complete""#) && !head.contains(r#""transfer":"aborted""#),
+            "a HEAD response is body-less on the wire whatever its status — hyper never polls it, \
+             so it must be recorded `complete`, not as a client that hung up: {head}",
+        );
+    }
 
     #[test]
     fn split_bucket_key_parses_object_paths() {
