@@ -138,8 +138,20 @@ services:
   #    file names real coordinators; all three write the same `FDB_CLUSTER_FILE_CONTENTS`.
   #    Only `fdb0` mounts the shared `fdb-cluster` volume and redirects its cluster file
   #    there (`FDB_CLUSTER_FILE`) so the wyrd roles can read it — see "Cluster-file wiring".
+  #
+  #    **Pinned `hostname:` (#501).** The image entrypoint (`/var/fdb/scripts/fdb.bash`)
+  #    launches `fdbserver --locality-zoneid="$(hostname)" --locality-machineid="$(hostname)"`.
+  #    Unpinned, that is Docker's ephemeral container ID, so every recreate hands FDB a
+  #    brand-new zone/machine identity for the SAME persisted data dir — the fault domains
+  #    are relabelled on each `up`, and `status` / the trace logs name processes by a hex id
+  #    that is meaningless the moment the container is replaced. Pinning the hostname to the
+  #    service name makes the locality stable across recreation and legible in status output.
+  #    (Measured: the persistent tier does recover from a recreate WITHOUT this — the data
+  #    dirs carry storage-server identity, so #498 + #499 already suffice for survival. This
+  #    is locality hygiene, not the fix for a live wedge; see #501 for the evidence.)
   fdb0:
     image: foundationdb/foundationdb:7.3.77
+    hostname: fdb0
     networks:
       cluster:
         ipv4_address: 172.30.59.11
@@ -168,6 +180,7 @@ services:
 
   fdb1:
     image: foundationdb/foundationdb:7.3.77
+    hostname: fdb1
     networks:
       cluster:
         ipv4_address: 172.30.59.12
@@ -182,6 +195,7 @@ services:
 
   fdb2:
     image: foundationdb/foundationdb:7.3.77
+    hostname: fdb2
     networks:
       cluster:
         ipv4_address: 172.30.59.13
