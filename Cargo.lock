@@ -5090,6 +5090,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "pollster",
  "wyrd-traits",
 ]
