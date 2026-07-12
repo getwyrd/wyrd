@@ -94,7 +94,7 @@ madsim = "0.2"
 # Codegen counterpart, used by `proto`'s build.rs only when `CARGO_CFG_MADSIM`
 # is set; it emits the simulated client/server stubs into `OUT_DIR/sim/`.
 madsim-tonic-build = "0.6.0"
-pollster = "0.4"
+pollster = "1.0"
 prost = "0.14"
 # The distributed (production) metadata backend's client (ADR-0008, proposal 0007
 # M4.1). Pinned here; consumed ONLY by `wyrd-metadata-tikv` behind its OFF-by-default
