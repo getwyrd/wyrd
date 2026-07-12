@@ -25,6 +25,18 @@ use bytes::Bytes;
 /// central coordination, which suits the direct-write data path.
 pub type ChunkId = u128;
 
+/// The **canonical textual rendering of a [`ChunkId`]** — zero-padded lowercase hex.
+///
+/// This is not cosmetic. `{:032x}` is already the form the on-disk fragment directory is
+/// named after (`chunkstore-fs`), the form [`IntegrityFault`] and [`BlockReadFault`] print,
+/// and the form the read path's error messages carry. A log line that renders the same id
+/// as decimal is a **broken join key**: the operator holding `…c0ffee` from an error, or
+/// from an `ls` of the data directory, cannot grep for it. One definition here so every
+/// emitter agrees (#527).
+pub fn chunk_hex(id: ChunkId) -> String {
+    format!("{id:032x}")
+}
+
 /// Addresses one fragment of a chunk: the chunk id plus the fragment's
 /// `ec_fragment_index` (ADR-0019). A chunk under `replication(1)`/`none` has a
 /// single fragment at index 0; an erasure-coded chunk has `k + m` fragments at

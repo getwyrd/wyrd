@@ -690,7 +690,7 @@ fn emit_repaired(chunk: ChunkId, rebuilt: usize, now_millis: u64) {
     tracing::info!(
         target: "wyrd.custodian.reconstruction.audit",
         action = "repair",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         rebuilt,
         "reconstruction is rebuilding the missing shard(s) and repointing the placement record",
     );
@@ -706,7 +706,7 @@ fn emit_needs_human(chunk: ChunkId) {
     tracing::warn!(
         target: "wyrd.custodian.reconstruction.audit",
         action = "needs-human",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         "reconstruction skipped a chunk with a malformed committed placement (wrong length); NEEDS-HUMAN, obligation left queued",
     );
 }
@@ -729,7 +729,7 @@ fn emit_data_loss(chunk: ChunkId) {
     tracing::error!(
         target: "wyrd.custodian.reconstruction.audit",
         action = "data-loss",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         "reconstruction found a chunk with fewer than k intact fragments — un-reconstructable, DATA IS LOST; NEEDS-HUMAN, obligation left queued for out-of-band recovery",
     );
 }
@@ -741,7 +741,7 @@ fn emit_conflict(chunk: ChunkId) {
     tracing::info!(
         target: "wyrd.custodian.reconstruction.audit",
         action = "conflict",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         "reconstruction lost the version-conditional commit; rebuilt fragments are collectable garbage",
     );
 }
@@ -757,7 +757,7 @@ fn emit_aborted(chunk: ChunkId) {
     tracing::info!(
         target: "wyrd.custodian.reconstruction.audit",
         action = "aborted",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         "reconstruction could not place the rebuilt shard(s); nothing was committed and the obligation stays queued",
     );
 }

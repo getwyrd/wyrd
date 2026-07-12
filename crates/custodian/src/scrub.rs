@@ -180,7 +180,7 @@ fn emit_scrubbed(dserver: DServerId, frag: FragmentId) {
         target: "wyrd.custodian.scrub.audit",
         action = "verify",
         dserver,
-        chunk = %frag.chunk,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
         "scrub verified a referenced fragment's checksum against the chunk map",
     );
@@ -194,7 +194,7 @@ fn emit_corruption(dserver: DServerId, frag: FragmentId) {
         target: "wyrd.custodian.scrub.audit",
         action = "corruption",
         dserver,
-        chunk = %frag.chunk,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
         "scrub detected bit rot: fragment excluded, chunk enqueued for reconstruction",
     );
@@ -210,7 +210,7 @@ fn emit_malformed(chunk: ChunkId, expected: u16, actual: usize) {
     tracing::warn!(
         target: "wyrd.custodian.scrub.audit",
         action = "malformed-placement",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         expected,
         actual,
         "scrub found a committed placement of the wrong length (truncation/corruption); chunk treated as fully referenced, no phantom repair enqueued — operator signal",
@@ -227,7 +227,7 @@ fn emit_missing(dserver: DServerId, frag: FragmentId) {
         target: "wyrd.custodian.scrub.audit",
         action = "missing",
         dserver,
-        chunk = %frag.chunk,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
         "scrub detected a placed fragment absent from its D server: chunk enqueued for reconstruction",
     );

@@ -5,8 +5,12 @@
 //!
 //! Stream discipline: `get` writes the object's raw bytes to **stdout**, so all
 //! diagnostics (errors, usage, summaries with no payload) go to **stderr** and a
-//! redirect like `wyrd get k > out.bin` is never corrupted. No logging crate —
-//! observability is deferred past M0 (ADR-0012).
+//! redirect like `wyrd get k > out.bin` is never corrupted. The structured log
+//! subscriber ([`crate::logging`], proposal 0010 items 1 + 3) is installed at [`run`]
+//! for every role and writes to **stderr**, honouring that same discipline. It lifts the
+//! M0 "no logging crate" deferral (ADR-0012): before it, every `tracing` event the
+//! workspace emitted — including the custodian's `action = "data-loss"` audit line —
+//! reached no sink at all (#527).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -32,6 +36,7 @@ use wyrd_traits::{
 
 use crate::custodian::{connect_fleet, ConfiguredDServer, CustodianService, DServerConnector};
 use crate::dserver::{self, DServer};
+use crate::logging::{self, LogConfig};
 use crate::{Gateway, DEFAULT_DURABILITY};
 use wyrd_gateway_s3 as s3;
 
@@ -246,6 +251,17 @@ async fn open_etcd_coordination() -> Result<wyrd_coordination_etcd::EtcdCoordina
 /// process exit code.
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let args: Vec<String> = args.skip(1).collect();
+    // Install the log sink FIRST, before any role runs. `tracing` caches each callsite's
+    // interest the first time it is hit, so a callsite fired before a subscriber exists can
+    // latch disabled for the life of the process — installing here means every role's events
+    // register against a real sink. A malformed `--log-level`/`--log-format` fails the process
+    // rather than degrading it to silent, which is the whole failure mode #527 closes.
+    // Flags are read generically (every subcommand's arg shape is `--flag value`), so a bad
+    // subcommand-specific arg is still reported by that subcommand, not swallowed here.
+    if let Err(e) = install_logging(&args) {
+        eprintln!("wyrd: {e}");
+        return ExitCode::from(2);
+    }
     let result = match args.first().map(String::as_str) {
         Some("put") => cmd_put(&args[1..]),
         Some("get") => cmd_get(&args[1..]),
@@ -272,6 +288,26 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
+/// Resolve the log configuration from a subcommand's flags (`--log-level`, `--log-format`).
+fn log_config(parsed: &ParsedArgs) -> Result<LogConfig, BoxError> {
+    LogConfig::new(parsed.flag("log-level"), parsed.flag("log-format"))
+}
+
+/// Install the process-global log subscriber from the raw argv, before dispatch.
+fn install_logging(args: &[String]) -> Result<(), BoxError> {
+    // The subcommand is `args[0]`; its flags follow. A parse failure here is not fatal to
+    // logging — the subcommand will report it properly — so fall back to the defaults and
+    // let the role produce the real error message.
+    let config = match args.len() {
+        0 => LogConfig::default(),
+        _ => match ParsedArgs::parse(&args[1..]) {
+            Ok(parsed) => log_config(&parsed)?,
+            Err(_) => LogConfig::default(),
+        },
+    };
+    logging::init_global(&config)
+}
+
 fn usage() {
     eprintln!("usage:");
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
@@ -280,6 +316,11 @@ fn usage() {
     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
     eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd demo");
+    eprintln!();
+    eprintln!("  every command also accepts:");
+    eprintln!("  [--log-level DIRECTIVE] [--log-format json|text]");
+    eprintln!("  Structured logs go to stderr (stdout stays the payload stream). The level");
+    eprintln!("  defaults to `info`, or $RUST_LOG when set; --log-level overrides both.");
     eprintln!();
     eprintln!("  --endpoints drives a local distributed cluster: fragments fan out over gRPC");
     eprintln!(
@@ -669,6 +710,7 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
         DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS,
     )?);
     let backend = resolve_backend(&parsed)?;
+    let log = log_config(&parsed)?;
     // The export surface: a Prometheus registry is always wired (in-process read-back);
     // `--otlp-endpoint` additionally pushes to a collector (the production path).
     let exporter = match parsed.flag("otlp-endpoint") {
@@ -692,7 +734,11 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
         // Item 1: install the shared telemetry handle at role entry (the OTLP exporter is
         // built on this runtime). Item 2: run the leader-elected loop through it.
         let telemetry = DurabilityTelemetry::new(exporter)?;
-        let service = CustodianService::new(telemetry);
+        // The role's dispatch carries the LOG layers as well as the metrics bridge (#527):
+        // a scoped dispatch replaces the global default for the pass it wraps, so a
+        // metrics-only one would swallow the loops' audit lines — `emit_data_loss`'s
+        // "DATA IS LOST; NEEDS-HUMAN" among them — even with a global subscriber installed.
+        let service = CustodianService::with_logging(telemetry, &log);
 
         let coord = MemCoordination::new();
         let custodian = Custodian::elect(&coord, zone_name).await?;
@@ -731,6 +777,17 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
              reconciling every {}s; Ctrl-C to stop",
             custodian.term(),
             interval.as_secs(),
+        );
+        // The structured twin of the banner above. A field post-mortem needs to know when a
+        // role (re)started and under which term — the prose line is for the operator at the
+        // terminal, this one is for the collector.
+        tracing::info!(
+            target: "wyrd.role",
+            role = "custodian",
+            zone = zone_name,
+            term = custodian.term(),
+            interval_secs = interval.as_secs(),
+            "role started",
         );
 
         let shutdown = async {
@@ -988,6 +1045,7 @@ async fn run_d_server<Co>(
 where
     Co: wyrd_traits::Coordination + 'static,
 {
+    let failure_domain = params.failure_domain.clone();
     let mut server = DServer::bind(store, params.bind)
         .await?
         .with_identity(params.dserver_id, params.failure_domain)
@@ -1006,6 +1064,16 @@ where
     eprintln!(
         "wyrd d-server: registered under `{}` (lease {}); Ctrl-C to stop",
         params.group, lease.id
+    );
+    tracing::info!(
+        target: "wyrd.role",
+        role = "d-server",
+        dserver = params.dserver_id,
+        endpoint = %server.endpoint(),
+        failure_domain = %failure_domain,
+        group = %params.group,
+        lease = lease.id,
+        "role started",
     );
     server
         .serve(coord, lease, params.renew_interval, async {
@@ -1366,6 +1434,14 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
         }
         eprintln!(
             "wyrd s3: SigV4 required (region {region}, service s3); no anonymous access. Ctrl-C to stop"
+        );
+        tracing::info!(
+            target: "wyrd.role",
+            role = "s3",
+            listen = %listener.local_addr()?,
+            region = region,
+            dservers = endpoints.as_deref().map_or(0, <[String]>::len),
+            "role started",
         );
         serve_s3_role(
             backend,

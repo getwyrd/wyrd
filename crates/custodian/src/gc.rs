@@ -287,7 +287,7 @@ fn emit_reclaim(dserver: DServerId, frag: FragmentId, reason: &str) {
         action = "reclaim",
         reason,
         dserver,
-        chunk = %frag.chunk,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
         "gc reclaimed collectable fragment bytes after the grace window",
     );
@@ -303,7 +303,7 @@ fn emit_malformed(chunk: ChunkId, expected: u16, actual: usize) {
     tracing::warn!(
         target: "wyrd.custodian.gc.audit",
         action = "malformed-placement",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         expected,
         actual,
         "gc found a committed placement of the wrong length (truncation/corruption); chunk treated as fully referenced, NEVER reclaimed — operator signal",
@@ -319,7 +319,7 @@ fn emit_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
         action = "skip",
         reason,
         dserver,
-        chunk = %frag.chunk,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
         "gc declined a fragment (still referenced, or within its grace window)",
     );

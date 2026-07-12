@@ -18,6 +18,7 @@ pub mod consistency_observable;
 pub mod consistency_workload;
 pub mod custodian;
 pub mod dserver;
+pub mod logging;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
