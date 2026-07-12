@@ -45,6 +45,34 @@ fn exists(rel: &str) -> bool {
     workspace_root().join(rel).exists()
 }
 
+/// The lines of one compose service block, `name` included: from `  <name>:` up to the next
+/// service key at the same two-space indent (comment lines in between belong to the block
+/// that follows, but they carry no keys, so including them is harmless).
+///
+/// Block scoping is load-bearing for these guards, not tidiness: a whole-file `contains` is
+/// satisfied by ANY service's line, so it cannot tell "fdb0 sets this" from "some client
+/// sets something that looks like it" — exactly how the first #499 guard went vacuous.
+fn service_block<'a>(compose: &'a str, name: &str) -> &'a str {
+    let start = compose
+        .find(&format!("\n  {name}:\n"))
+        .unwrap_or_else(|| panic!("compose must declare a `{name}` service"))
+        + 1;
+    let rest = &compose[start..];
+    let end = rest
+        .match_indices("\n  ")
+        .filter(|(i, _)| {
+            // A service key at the same indent: `  word:` — not a nested key (deeper
+            // indent), not a comment, not a list item.
+            let line = rest[i + 1..].lines().next().unwrap_or("");
+            let key = &line[2..];
+            !key.starts_with([' ', '#', '-']) && key.trim_end().ends_with(':')
+        })
+        .map(|(i, _)| i + 1)
+        .next()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 // ─── (1) unconditional, pure-filesystem parity checks ─────────────────────────
 
 #[test]
@@ -137,14 +165,7 @@ fn the_single_zone_shares_fdb0s_cluster_file_with_the_wyrd_roles() {
     // `WYRD_FDB_CLUSTER_FILE: <path>` line, so a whole-file `contains` (or an unscoped
     // search) passes on the WYRD_ lines alone and would still be green if the load-bearing
     // fdb0 override were deleted (#499 could silently return).
-    let fdb0_block = {
-        let start = compose
-            .find("\n  fdb0:")
-            .expect("small-multi-node-fdb must declare an `fdb0` service");
-        let rest = &compose[start + 1..];
-        let end = rest.find("\n  fdb1:").unwrap_or(rest.len()); // next service at the same indent
-        &rest[..end]
-    };
+    let fdb0_block = service_block(&compose, "fdb0");
     assert!(
         fdb0_block
             .lines()
@@ -163,6 +184,33 @@ fn the_single_zone_shares_fdb0s_cluster_file_with_the_wyrd_roles() {
         "small-multi-node-fdb: the wyrd roles must read `WYRD_FDB_CLUSTER_FILE: {SHARED}`, the \
          path fdb0 writes its shared cluster file to"
     );
+}
+
+/// Each `fdbserver` must pin its container hostname to its service name (#501). The
+/// `foundationdb` image entrypoint launches
+/// `fdbserver --locality-zoneid="$(hostname)" --locality-machineid="$(hostname)"`, and an
+/// unpinned container hostname is Docker's ephemeral container ID — so on this PERSISTENT
+/// tier every recreate hands FDB a fresh zone/machine identity for the same persisted data
+/// dir, relabelling the fault domains and naming processes in `status`/trace output by a hex
+/// id that dies with the container. (The cluster does still recover without this — the data
+/// dirs carry storage-server identity — so this guard pins locality stability, not
+/// recreate-survival, which `each_single_zone_fdbserver_persists_its_data_directory` covers.)
+/// Pure source read, so it runs without Docker.
+#[test]
+fn each_single_zone_fdbserver_pins_a_stable_locality_hostname() {
+    let compose = read("deploy/small-multi-node-fdb/docker-compose.yml");
+    for process in ["fdb0", "fdb1", "fdb2"] {
+        let block = service_block(&compose, process);
+        assert!(
+            block
+                .lines()
+                .any(|l| l.trim() == format!("hostname: {process}")),
+            "small-multi-node-fdb: `{process}` must set `hostname: {process}` — the image \
+             derives `--locality-zoneid`/`--locality-machineid` from `$(hostname)`, so \
+             without it the process's locality is the ephemeral container ID and churns on \
+             every recreate (#501). {process} block:\n{block}"
+        );
+    }
 }
 
 #[test]
