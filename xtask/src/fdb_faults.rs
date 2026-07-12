@@ -142,8 +142,21 @@ fn configure_database() -> Result<(), String> {
         "--exec",
         "configure new double ssd",
     ]);
+    let mut last_seen = String::new();
     for attempt in 1..=45 {
-        let status = Command::new("docker")
+        // **Readiness is read out of the TEXT, never the exit status.** `fdbcli` 7.3.77 exits 0
+        // against a dead coordinator — this repo established that and acts on it everywhere else
+        // (`main.rs`'s `probe_cluster_health`, `fdb_doctor::cluster_status_is_healthy`), so
+        // `status.success()` is not a health predicate. Trusting it here would let the runner
+        // march into the fault legs against a cluster that is still `configuration missing` or
+        // unavailable, and report *test* failures for what is really a SETUP failure — the most
+        // expensive kind of misleading red there is, because it indicts the driver for the
+        // harness's mistake. (Codex review of #535.)
+        //
+        // The predicate is `fdb_doctor`'s own, so this runner and the doctor cannot drift about
+        // what "healthy" means — and it is the one that knows `The database is unavailable`
+        // contains the substring "available".
+        let output = Command::new("docker")
             .args([
                 "compose",
                 "-p",
@@ -160,17 +173,27 @@ fn configure_database() -> Result<(), String> {
                 "status minimal",
             ])
             .current_dir(workspace_root())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .output()
             .map_err(|e| format!("failed to spawn docker: {e}"))?;
-        if status.success() {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        if crate::fdb_doctor::cluster_status_is_healthy(&text) {
             return Ok(());
         }
-        eprintln!("xtask fdb-metadata-tier1: cluster not available yet (attempt {attempt}/45)");
+        last_seen = text.trim().to_string();
+        eprintln!(
+            "xtask fdb-metadata-tier1: cluster not available yet (attempt {attempt}/45): {last_seen}"
+        );
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    Err("the FoundationDB cluster did not become available within 90s".into())
+    // Fail as a SETUP error, naming what the cluster actually said — never let the battery run on.
+    Err(format!(
+        "the FoundationDB cluster did not report `database is available` within 90s; last \
+         status was: {last_seen}"
+    ))
 }
 
 /// The host-side cluster file the `foundationdb` client dials. Lands under `target/` (build
@@ -337,6 +360,44 @@ mod tests {
                 "the cluster file must name coordinator {ip}: {contents}",
             );
         }
+    }
+
+    /// **The readiness gate reads the STATUS TEXT, never `fdbcli`'s exit status** (codex review
+    /// of #535).
+    ///
+    /// `fdbcli` 7.3.77 exits 0 against a dead coordinator — this repo established that and says so
+    /// in `main.rs`'s `probe_cluster_health` and `fdb_doctor::cluster_status_is_healthy`. A runner
+    /// that gated on `status.success()` would march into the fault legs against a cluster that is
+    /// still `configuration missing`, and then report *test* failures for what is really a SETUP
+    /// failure — indicting the driver for the harness's mistake.
+    ///
+    /// This pins the predicate itself, on the exact strings a real cluster emits: an unconfigured
+    /// or unavailable cluster is NOT ready, and the "unavailable" case is the trap, because
+    /// `The database is unavailable` contains the substring "available".
+    #[test]
+    fn the_readiness_gate_is_not_fooled_by_an_unhealthy_cluster() {
+        use crate::fdb_doctor::cluster_status_is_healthy;
+
+        assert!(
+            cluster_status_is_healthy("The database is available."),
+            "the only healthy answer",
+        );
+        assert!(
+            !cluster_status_is_healthy("The database is unavailable; type `status` for more info."),
+            "`unavailable` CONTAINS `available` — a naive substring check calls a dead cluster \
+             healthy, which is precisely the bug this predicate exists to avoid",
+        );
+        assert!(
+            !cluster_status_is_healthy(
+                "The coordinator(s) have no record of this database. Either the coordinator \
+                 addresses are incorrect or the database is not configured."
+            ),
+            "a fresh, unconfigured cluster is NOT ready — the battery would test nothing",
+        );
+        assert!(
+            !cluster_status_is_healthy(""),
+            "no output at all is not readiness",
+        );
     }
 
     /// Every leg named here must exist as a test binary, or the runner would report a green
