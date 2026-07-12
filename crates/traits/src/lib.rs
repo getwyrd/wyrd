@@ -540,7 +540,7 @@ pub trait PlacementChunkStore: ChunkStore {
 ///
 /// So a caller that must know the outcome of a batch it cannot replay has one
 /// remedy: **re-read** and establish what happened. A caller may also retry
-/// a [`Conflict`] — that is what `Conflict` is *for* — but the retry belongs to
+/// a [`CommitOutcome::Conflict`] — that is what `Conflict` is *for* — but the retry belongs to
 /// the caller, who owns the decision the precondition encodes; a backend must not
 /// retry a conditional batch internally, since re-reading the precondition at a
 /// newer version would quietly turn the caller's compare-and-set into a
