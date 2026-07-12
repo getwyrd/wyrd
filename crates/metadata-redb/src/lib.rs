@@ -19,6 +19,19 @@
 //! or TiKV had returned a loud [`ScanCapExceeded`]. It now raises the **same**
 //! seam-crate error at the **same** cap, so the local/dev backend behaves like
 //! production at the boundary.
+//!
+//! **Every operation terminates (#517)** — the contract's liveness clause — is
+//! satisfied here *vacuously*, and that is a finding, not an omission. The other
+//! two backends need an explicit deadline because they can wait on a network that
+//! never answers: FoundationDB's client retries an unreachable cluster forever, and
+//! tikv-client leaves both connection establishment and the TSO stream unbounded.
+//! redb is an **embedded, single-process** store — every operation is a local
+//! memory or file read under a redb transaction, with no network, no retry loop and
+//! nothing to wait on that is not the OS's own I/O. There is no unbounded wait to
+//! bound, so this backend adds no timeout: one would be a knob with nothing behind
+//! it. (Contention is not a hazard either: redb serializes write transactions
+//! internally, so a `commit` waits on a lock held by an in-process writer that is
+//! itself bounded.)
 
 #![forbid(unsafe_code)]
 

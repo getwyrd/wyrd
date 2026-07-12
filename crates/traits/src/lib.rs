@@ -544,6 +544,16 @@ pub trait PlacementChunkStore: ChunkStore {
 /// they are correctness rather than tuning: the `scan` cap of clause 5, and that
 /// **every operation terminates** — a backend must bound its own waiting rather
 /// than block a caller forever on an unreachable cluster.
+///
+/// Termination is the backend's own responsibility, and a *networked* backend
+/// cannot assume its client library provides it: FoundationDB's client retries an
+/// unreachable cluster indefinitely, and tikv-client bounds each RPC attempt but
+/// neither connection establishment nor the timestamp stream every operation opens
+/// with — so both drivers impose their own deadline (#517). An **embedded** backend
+/// (redb) satisfies the clause with nothing to add: it has no network to wait on.
+/// Note the interaction with the unknown-result rule above: a `commit` abandoned at
+/// a deadline is **undetermined**, not a definite failure — the store stopped
+/// waiting, which is not the same as the cluster stopping.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
     /// Read the raw value stored under `key`, if any — the latest committed
