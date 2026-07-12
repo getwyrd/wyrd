@@ -13,6 +13,10 @@ publish.workspace = true
 # listener drives objects through `ObjectGateway`, never a concrete `Gateway<M,C,Co>`.
 wyrd-gateway-core.workspace = true
 wyrd-traits.workspace = true
+# The request-id span (#529): every log line emitted while serving a request inherits the
+# `request_id` field from the enclosing span, which is what makes a client's
+# `x-amz-request-id` a `jq` selector over the server-side trail.
+tracing.workspace = true
 # axum hosts the client-facing HTTP listener; already `cargo deny`-vetted via tonic.
 axum.workspace = true
 bytes.workspace = true
@@ -28,6 +32,12 @@ tokio-stream.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The access-line test asserts on what the subscriber ACTUALLY emitted — a capturing `fmt`
+# layer is the only way to prove a log row exists rather than assume it.
+tracing-subscriber.workspace = true
+# …and it drives a real request through the router (`ServiceExt::oneshot`), because a test
+# that re-emitted the event itself would only prove the test can log.
+tower = { workspace = true, features = ["util"] }
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

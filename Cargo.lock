@@ -5106,6 +5106,9 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-stream",
+ "tower 0.5.3",
+ "tracing",
+ "tracing-subscriber",
  "wyrd-gateway-core",
  "wyrd-traits",
 ]
