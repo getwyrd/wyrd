@@ -20,7 +20,7 @@
 //! ## The id scheme — deliberately the chunk-id scheme
 //!
 //! A per-process random 64-bit epoch (top bit set) forms the high half; a monotonic counter
-//! forms the low half. This is exactly [`Gateway::mint_chunk_id`]'s coordination-free scheme
+//! forms the low half. This is exactly `Gateway::mint_chunk_id`'s coordination-free scheme
 //! (ADR-0019), reused rather than reinvented, and it inherits its properties:
 //!
 //! - **No new dependency.** The entropy is [`std::collections::hash_map::RandomState`], which
