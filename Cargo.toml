@@ -89,7 +89,7 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # the earlier hand-rolled one (carry-forward T5-a); `MIT OR Apache-2.0` (already on the
 # deny.toml allowlist), pure-Rust, no build script. Paired with `sha2` (same digest 0.10
 # core). Adopted through the ADR-0003 §2 three-test dependency audit (see build-notes).
-hmac = "0.12"
+hmac = "0.13"
 madsim = "0.2"
 # Codegen counterpart, used by `proto`'s build.rs only when `CARGO_CFG_MADSIM`
 # is set; it emits the simulated client/server stubs into `OUT_DIR/sim/`.
