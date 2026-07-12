@@ -503,6 +503,10 @@ where
             // the gateway is behaving correctly; the caller is not.
             tracing::warn!(
                 target: "wyrd.gateway.s3.auth",
+                // On the event, not inherited from the `info_span!` — a `warn`-only or
+                // `error`-only filter drops the span and would strip the join key off the
+                // very line the operator is grepping for (the same reason as the 500 path).
+                request_id = %request_id,
                 s3_code = err.s3_code(),
                 reason = %err,
                 "refused an unauthenticated request",
@@ -756,6 +760,13 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     let (status, code, message) = classify(err);
     tracing::error!(
         target: "wyrd.gateway.s3.error",
+        // The join key is recorded on the EVENT, not merely inherited from the `s3.request`
+        // span. The span is an `info_span!`, so under an error-only filter (`--log-level
+        // error`, `RUST_LOG=error`) it is never enabled and `with_current_span(true)` has no
+        // fields to attach — and this line, the one an operator reaches for at 3am, would be
+        // the ONE that lost the `x-amz-request-id` the client is holding. Recording it here
+        // costs a field and survives any filter (#528; codex review of #533).
+        request_id = %request_id,
         s3_code = code,
         http_status = status.as_u16(),
         error = %err,
@@ -891,6 +902,65 @@ mod tests {
         assert!(
             logged.contains(r#""target":"wyrd.gateway.s3.error""#),
             "a collector must be able to select the gateway's error plane. got: {logged}"
+        );
+    }
+
+    /// **The failure record keeps its join key under an ERROR-ONLY filter** (codex review of
+    /// #533).
+    ///
+    /// The `x-amz-request-id` a client quotes is only useful if the server-side line it selects
+    /// actually carries it. The request id lives on the `s3.request` span — but that is an
+    /// `info_span!`, and a production server run with `--log-level error` (or `RUST_LOG=error`)
+    /// never *enables* it, so `with_current_span(true)` has no fields to attach. Relying on the
+    /// span alone meant the 500 — the one line an operator is grepping for — was exactly the
+    /// line that lost the join key, and only under the filter a production deployment is most
+    /// likely to be running.
+    ///
+    /// The subscriber here is the production one in miniature: an `EnvFilter` at `error`, plus a
+    /// JSON `fmt` layer with `with_current_span(true)` — the same construction as
+    /// `crates/server/src/logging.rs`. The event is emitted INSIDE an `info_span!` carrying the
+    /// id, so a span-only implementation would look correct at `info` and go blank here.
+    ///
+    /// Mutation guard: drop `request_id = %request_id` from the `tracing::error!` and this
+    /// fails, while the `info`-level test above keeps passing — which is precisely the trap.
+    #[test]
+    fn the_failure_record_carries_the_request_id_even_when_info_spans_are_filtered_out() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    .with_filter(EnvFilter::new("error")),
+            ),
+        );
+
+        let request_id = RequestIds::new().mint();
+        let err: BoxError = Box::new(Backend("the backend fell over", None));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            // The real shape: the handler mints the id, opens the request span, and the error
+            // is recorded from inside it. Under this filter the span is never enabled.
+            let span = tracing::info_span!("s3.request", request_id = %request_id);
+            let _guard = span.enter();
+            gateway_error_response(request_id, &err);
+        });
+
+        let logged = capture.contents();
+        assert!(
+            !logged.is_empty(),
+            "the error event must survive an error-only filter — it is `tracing::error!`",
+        );
+        assert!(
+            logged.contains(&request_id.to_string()),
+            "the failure record must carry the request id the CLIENT was handed, even with the \
+             `info` span filtered out — otherwise the 500 has no join key under exactly the \
+             log level a production gateway runs at. got: {logged}",
         );
     }
 
