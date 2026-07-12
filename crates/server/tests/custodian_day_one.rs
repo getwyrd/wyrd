@@ -1543,3 +1543,301 @@ fn cmd_custodian_fails_loud_when_the_whole_fleet_is_unreachable_at_startup() {
     // is unsatisfied — RED; post-fix it panics — GREEN.
     let _ = wyrd_server::cli::cmd_custodian(&args);
 }
+
+// ---- 6: the audit plane reaches a log sink (#527, proposal 0010 items 1 + 3) ----
+
+/// A `MakeWriter` that appends everything the subscriber writes into a shared buffer, so
+/// the test can assert on **what the role actually emitted** rather than trusting that it
+/// emitted anything.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
+    type Writer = Self;
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// **The keystone.** A real reconciliation pass over a store carrying an un-reconstructable
+/// chunk must land its `action = "data-loss"` audit line — chunk id and all — in a log sink.
+///
+/// This is the same fixture as
+/// [`a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_to_zero`], driven
+/// through the same production `reconcile_pass`; the only difference is that the role is
+/// built with [`CustodianService::with_logging_to`] (what `wyrd custodian` now uses) instead
+/// of [`CustodianService::new`], and the sink is captured.
+///
+/// Pre-fix the role's scoped dispatch was `Registry + MetricsLayer` and nothing else, so
+/// `emit_data_loss`'s `tracing::error!` — the loudest alarm the system can raise, *"DATA IS
+/// LOST; NEEDS-HUMAN"* — was written into a subscriber with no log layer and discarded. The
+/// operator learned only that an unlabelled counter had ticked, and **only** if `--otlp-endpoint`
+/// was set. The buffer was empty; this test is RED. Post-fix the line is there, with the chunk
+/// named, on stderr, with no collector infrastructure at all.
+///
+/// Mutation guard: swap `with_logging_to` back to `new` and this test fails — the assertion
+/// cannot pass vacuously, because an empty buffer contains none of the substrings.
+#[tokio::test]
+async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
+    enable_metric_callsites();
+    const CHUNK_LOST: ChunkId = 0x0D00_D000;
+    const INODE_LOST: InodeId = 2;
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+    );
+    let fleet = Fleet {
+        servers: vec![
+            (0, d0.as_ref()),
+            (1, d1.as_ref()),
+            (2, d2.as_ref()),
+            (3, d3.as_ref()),
+        ],
+    };
+    write_rs_2_1_as(&meta, &fleet, INODE_LOST, "lost", CHUNK_LOST).await;
+
+    // Two of the three RS(2,1) fragments destroyed → below k = 2 → un-reconstructable.
+    d0.delete_fragment(FragmentId {
+        chunk: CHUNK_LOST,
+        index: 0,
+    })
+    .await
+    .unwrap();
+    d2.delete_fragment(FragmentId {
+        chunk: CHUNK_LOST,
+        index: 2,
+    })
+    .await
+    .unwrap();
+    repair::enqueue_repair(&meta, CHUNK_LOST, "health")
+        .await
+        .unwrap();
+
+    let servers = configured([
+        (0, "A", dyn_store(&d0)),
+        (1, "B", dyn_store(&d1)),
+        (2, "C", dyn_store(&d2)),
+        (3, "D", dyn_store(&d3)),
+    ]);
+    let (live_fleet, live_topo, unreachable) = live_reconstruction_view(&servers).await;
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &live_fleet,
+        topology: &live_topo,
+        unreachable: &unreachable,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let capture = Capture::default();
+    // The production constructor the `wyrd custodian` role uses: metrics bridge AND log sink
+    // on ONE dispatch. With `CustodianService::new` (metrics only) the buffer stays empty.
+    let service = CustodianService::with_logging_to(
+        telemetry,
+        &wyrd_server::logging::LogConfig::new(None, None).unwrap(),
+        capture.clone(),
+    );
+
+    service
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .expect("the pass completes; the chunk is simply unrecoverable");
+
+    // The metric still fires — the bridge is not displaced by the log layers.
+    assert!(
+        data_loss(&service) >= 1,
+        "the metrics bridge must survive composition with the log layers"
+    );
+
+    let logged = capture.contents();
+    assert!(
+        logged.contains(r#""action":"data-loss""#),
+        "the data-loss audit line must reach the sink; pre-fix the buffer is EMPTY. got: {logged}"
+    );
+    assert!(
+        logged.contains(&format!("{CHUNK_LOST:032x}")),
+        "the audit line must NAME the lost chunk — a bare counter tells an operator nothing \
+         about WHICH data is gone. got: {logged}"
+    );
+    assert!(
+        logged.contains(r#""target":"wyrd.custodian.reconstruction.audit""#),
+        "the audit target must survive to the sink so a collector can select on it. got: {logged}"
+    );
+}
+
+/// **Lowering log verbosity must not switch off the durability metrics.** (#531 review, P1.)
+///
+/// The durability plane emits its metrics as `tracing::info!` events
+/// (`gauge.reconstruction_under_replicated`, the repair counters). The log subscriber's
+/// `EnvFilter` was originally attached to the *registry*, making it a **subscriber-wide**
+/// filter — which short-circuits `register_callsite`/`enabled` for the whole stack, so a
+/// filtered-out event never reaches **any** layer, `MetricsLayer` included.
+///
+/// So `wyrd custodian --log-level warn` — an ordinary thing for an operator to do, and the
+/// obvious thing to do when JSON logs get noisy — silently starved the metrics bridge and
+/// turned off the Prometheus/OTLP durability signals. No error, no warning, no metric. The
+/// operator would have been watching a gauge that could never rise, in the one plane that
+/// tells them data is being lost.
+///
+/// The filter is now attached to the fmt layer only (`Layer::with_filter`). This test runs the
+/// REAL reconcile pass at `--log-level error` — two levels below the `info` the metrics are
+/// emitted at — and asserts the gauge still rises and the audit line is still logged.
+///
+/// Pre-fix: `under_replicated` is `None` (the registry is empty) — RED.
+#[tokio::test]
+async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::default()),
+    );
+    let fleet = Fleet {
+        servers: vec![
+            (0, d0.as_ref()),
+            (1, d1.as_ref()),
+            (2, d2.as_ref()),
+            (3, d3.as_ref()),
+        ],
+    };
+    write_rs_2_1(&meta, &fleet).await;
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    // Server 1 is dead: a real, repairable under-replication.
+    let dead = Arc::new(DeadDServer);
+    let servers = configured([
+        (0, "A", dyn_store(&d0)),
+        (1, "B", dyn_store(&dead)),
+        (2, "C", dyn_store(&d2)),
+        (3, "D", dyn_store(&d3)),
+    ]);
+    let (live_fleet, live_topo, unreachable) = live_reconstruction_view(&servers).await;
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &live_fleet,
+        topology: &live_topo,
+        unreachable: &unreachable,
+    };
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let capture = Capture::default();
+    // `error` — two levels ABOVE the `info` the durability metrics are emitted at. Pre-fix this
+    // is exactly the configuration that silently killed them.
+    let service = CustodianService::with_logging_to(
+        telemetry,
+        &wyrd_server::logging::LogConfig::new(Some("error"), None).unwrap(),
+        capture.clone(),
+    );
+
+    service
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .expect("the pass survives the killed D-server");
+
+    assert_eq!(
+        under_replicated(&service),
+        Some(1.0),
+        "the durability gauge MUST still rise at --log-level error; pre-fix the subscriber-wide \
+         EnvFilter starved the MetricsLayer and this reads None — an operator lowering log \
+         verbosity silently lost the signal that data is at risk"
+    );
+
+    // And the log plane is genuinely quiet at `error` — the filter still does its job on the
+    // layer it belongs to. (`info`-level metric events emit no log line of their own.)
+    let logged = capture.contents();
+    assert!(
+        !logged.contains(r#""level":"INFO""#),
+        "the fmt layer must still honour --log-level error; the fix scopes the filter, it does \
+         not remove it. got: {logged}"
+    );
+}
+
+// ---- #531 review (P2): installing logging must never take the program down ----
+
+/// **A second in-process `cli::run` must still run the command.**
+///
+/// `cli::run` is public and in-process callable — that is the module's stated premise ("the
+/// command logic lives in the library so it is unit-testable"). Installing the log subscriber
+/// used to treat an already-installed global as a hard error, so the SECOND call returned
+/// `ExitCode(2)` — *before dispatching the command at all*:
+///
+/// ```text
+/// wyrd: could not install the log subscriber: a global default trace dispatcher has already been set
+/// PROBE first=ExitCode(0)  second=ExitCode(2)
+/// ```
+///
+/// Logging refusing to initialise took the whole program down with it — a spectacular
+/// inversion for a diagnostics feature, and it would equally have broken any embedder that
+/// installed its own subscriber first. An already-present subscriber is an ordinary state, not
+/// a fault.
+///
+/// Pre-fix this is RED on the second call.
+#[test]
+fn running_the_cli_twice_in_process_still_dispatches_the_command() {
+    let argv = || ["wyrd".to_string(), "demo".to_string()].into_iter();
+
+    let first = wyrd_server::cli::run(argv());
+    let second = wyrd_server::cli::run(argv());
+
+    // `demo` is the zero-setup in-memory round trip: it must succeed both times.
+    assert_eq!(
+        format!("{second:?}"),
+        format!("{first:?}"),
+        "the second in-process `cli::run` must behave exactly like the first; pre-fix it exits \
+         2 without ever dispatching `demo`, because the subscriber from the first call is \
+         already installed"
+    );
+    assert_eq!(
+        format!("{first:?}"),
+        format!("{:?}", std::process::ExitCode::SUCCESS),
+        "`wyrd demo` succeeds — so the assertion above is comparing two SUCCESSES, not two \
+         identical failures"
+    );
+}
+
+/// The other half, which the fix must not trade away: a **malformed** `--log-level` is still
+/// fatal. Silently running mute because of a typo is the exact failure mode this feature exists
+/// to end, so it is a genuine operator error — unlike an already-installed subscriber.
+#[test]
+fn a_malformed_log_level_still_fails_the_process_loudly() {
+    let code = wyrd_server::cli::run(
+        [
+            "wyrd".to_string(),
+            "demo".to_string(),
+            "--log-level".to_string(),
+            "==nonsense==".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(
+        format!("{code:?}"),
+        format!("{:?}", std::process::ExitCode::from(2)),
+        "a typo in --log-level must stop the process, not degrade it to silence"
+    );
+}

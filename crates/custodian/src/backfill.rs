@@ -192,7 +192,7 @@ fn emit_malformed(chunk: ChunkId, expected: u16, actual: usize) {
     tracing::warn!(
         target: "wyrd.custodian.backfill.audit",
         action = "needs-human",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         expected,
         actual,
         "backfill found a committed placement of the wrong length (truncation/corruption); left untouched, NEVER rewritten — operator signal",

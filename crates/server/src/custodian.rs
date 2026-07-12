@@ -26,14 +26,19 @@
 //! It installs the bridge **scoped** (per pass, via [`WithSubscriber`]) rather than as a
 //! global default, and building the dispatch once at construction and cloning it per pass
 //! (`Dispatch` is `Arc`-backed) means every pass records into the same instruments, so one
-//! callsite-interest registration covers the role's lifetime. This scoped dispatch is a
-//! **metrics-only** bridge ([`DurabilityTelemetry::metrics_layer`]): it routes the loops'
-//! metric events into the export surface, but it is *not* a process-global
-//! `fmt`/`EnvFilter` log subscriber. The `--log-level`/`RUST_LOG` structured-log subscriber
-//! (proposal 0010 item 3) is a follow-on floor slice; until it lands, the loops'
-//! non-metric events (the reconstruction audit lines, the malformed-placement NEEDS-HUMAN
-//! warning) are emitted but captured by no log sink — a documented gap, not a claim that
-//! this keystone wires it.
+//! callsite-interest registration covers the role's lifetime. The scoping is what lets the
+//! durability tests each own an isolated provider to read back in-process; a single global
+//! provider could not.
+//!
+//! Because a scoped dispatch **replaces** the global default for the future it wraps, the
+//! role's dispatch must carry the log layers too — otherwise the loops' non-metric events
+//! (the reconstruction audit lines, the malformed-placement NEEDS-HUMAN warning) would
+//! still reach no sink even with a global subscriber installed, which is exactly the gap
+//! this file used to document. [`CustodianService::with_logging`] therefore composes
+//! `EnvFilter` + `fmt` + [`DurabilityTelemetry::metrics_layer`] into one dispatch, and the
+//! `wyrd custodian` role uses it (#527). [`CustodianService::new`] stays **metrics-only**:
+//! it is the library/test constructor, and a test that reads a metric back has no use for
+//! a formatter writing to the harness's stderr.
 //!
 //! ## Surviving a killed D-server (the day-one fault) — the honest scope
 //!
@@ -67,6 +72,8 @@ use async_trait::async_trait;
 use tracing::instrument::WithSubscriber;
 use tracing::Dispatch;
 use tracing_subscriber::prelude::*;
+
+use crate::logging::{self, LogConfig};
 use tracing_subscriber::Registry;
 use wyrd_core::placement::Topology;
 use wyrd_custodian::{
@@ -244,6 +251,33 @@ impl CustodianService {
     /// ADR-0012); this role only routes the loops' emission into it.
     pub fn new(telemetry: DurabilityTelemetry) -> Self {
         let dispatch = Dispatch::new(Registry::default().with(telemetry.metrics_layer()));
+        Self {
+            telemetry,
+            dispatch,
+        }
+    }
+
+    /// Wire a role over `telemetry` **and** the operational log sink (#527) — the
+    /// constructor the deployable `wyrd custodian` binary uses.
+    ///
+    /// [`Self::new`] gives a metrics-only dispatch, which is right for a test that reads a
+    /// metric back but wrong for a running role: a scoped dispatch replaces the global
+    /// default for the pass it wraps, so with a metrics-only dispatch the loops' audit
+    /// lines — `emit_data_loss`'s *"DATA IS LOST; NEEDS-HUMAN"* among them — would be
+    /// swallowed inside every pass even though the process has a global subscriber. This
+    /// constructor composes the log layers into the same dispatch, so a pass emits both.
+    pub fn with_logging(telemetry: DurabilityTelemetry, log: &LogConfig) -> Self {
+        Self::with_logging_to(telemetry, log, std::io::stderr)
+    }
+
+    /// [`Self::with_logging`] over an arbitrary writer. The writer is a seam so a test can
+    /// assert *what the role actually emits* — the only way to prove the audit lines reach
+    /// a sink rather than trusting that they do.
+    pub fn with_logging_to<W>(telemetry: DurabilityTelemetry, log: &LogConfig, writer: W) -> Self
+    where
+        W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+    {
+        let dispatch = logging::dispatch(log, writer, telemetry.metrics_layer());
         Self {
             telemetry,
             dispatch,

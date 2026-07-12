@@ -332,7 +332,7 @@ fn emit_evacuated(chunk: ChunkId, moved: usize) {
     tracing::info!(
         target: "wyrd.custodian.rebalance.audit",
         action = "evacuate",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         moved,
         "rebalance evacuated fragment(s) off a draining server and repointed the placement record",
     );
@@ -348,7 +348,7 @@ fn emit_needs_human(chunk: ChunkId) {
     tracing::warn!(
         target: "wyrd.custodian.rebalance.audit",
         action = "needs-human",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         "rebalance skipped a chunk with a malformed committed placement (wrong length); NEEDS-HUMAN, fragment left in place",
     );
 }
@@ -360,7 +360,7 @@ fn emit_conflict(chunk: ChunkId) {
     tracing::info!(
         target: "wyrd.custodian.rebalance.audit",
         action = "conflict",
-        chunk = %chunk,
+        chunk = %wyrd_traits::chunk_hex(chunk),
         "rebalance lost the version-conditional commit; copied fragments are collectable garbage",
     );
 }
