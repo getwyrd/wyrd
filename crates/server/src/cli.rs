@@ -304,15 +304,24 @@ fn log_config(parsed: &ParsedArgs) -> Result<LogConfig, BoxError> {
 /// its own subscriber). Treating it as fatal made `run` exit 2 without dispatching the command
 /// at all (#531 review).
 fn install_logging(args: &[String]) -> Result<(), BoxError> {
-    // The subcommand is `args[0]`; its flags follow. A parse failure here is not fatal to
-    // logging — the subcommand will report it properly — so fall back to the defaults and
-    // let the role produce the real error message.
+    // The subcommand is `args[0]`; its flags follow.
+    //
+    // **A parse failure is NOT swallowed** (#531 review). It used to fall back to the defaults,
+    // on the reasoning that "the subcommand will report it properly" — true for every role that
+    // re-parses its tail, and FALSE for `demo`, which the dispatcher calls as `cmd_demo()` with
+    // no args at all. So `wyrd demo --log-level` (value missing) silently installed the default
+    // config and exited 0: the typo simply vanished, in the one PR whose whole point is that a
+    // malformed log option fails at startup rather than degrading the process.
+    //
+    // Propagating is safe for every role, not just `demo`: `ParsedArgs::parse` fails on exactly
+    // one thing — a `--flag` with no value — and no subcommand has a boolean flag, so that
+    // invocation is malformed for all of them. It now fails here, before any role runs, with
+    // the same exit code the role would have produced.
     let config = match args.len() {
-        0 => LogConfig::default(),
-        _ => match ParsedArgs::parse(&args[1..]) {
-            Ok(parsed) => log_config(&parsed)?,
-            Err(_) => LogConfig::default(),
-        },
+        // No subcommand: still go through `new`, so a malformed `RUST_LOG` is caught on this
+        // path too rather than only when a role happens to pass its flags.
+        0 => LogConfig::new(None, None)?,
+        _ => log_config(&ParsedArgs::parse(&args[1..])?)?,
     };
     logging::init_global(&config);
     Ok(())
@@ -1751,6 +1760,47 @@ impl ParsedArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A dangling log flag fails at startup, on EVERY subcommand — `demo` included**
+    /// (#531 review).
+    ///
+    /// `install_logging` used to swallow a `ParsedArgs` failure and fall back to the defaults,
+    /// on the reasoning that "the subcommand will report it properly". True for every role that
+    /// re-parses its tail — and FALSE for `demo`, which the dispatcher calls as `cmd_demo()`
+    /// with no args at all. So `wyrd demo --log-level` (value missing) installed the default
+    /// config and exited 0: the typo vanished, in the very PR whose point is that a malformed
+    /// log option stops the process.
+    ///
+    /// Mutation guard: restore the `Err(_) => LogConfig::default()` arm and the `demo` case
+    /// below goes green while the others stay green — which is exactly how the hole survived.
+    #[test]
+    fn a_flag_without_a_value_fails_logging_setup_on_every_subcommand() {
+        let argv = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // `demo` is the one that mattered: it never re-parses its tail, so nothing downstream
+        // would have caught this.
+        assert!(
+            install_logging(&argv(&["demo", "--log-level"])).is_err(),
+            "`wyrd demo --log-level` (no value) must FAIL — `demo` never re-parses its tail, so \
+             if logging setup swallows this the typo is silently ignored and the process exits 0",
+        );
+        // …and the roles that do re-parse still fail here, before any of them runs.
+        assert!(install_logging(&argv(&["s3", "--log-format"])).is_err());
+        assert!(install_logging(&argv(&["custodian", "--zone"])).is_err());
+
+        // A well-formed invocation is unaffected — the check rejects malformed argv, not flags
+        // it does not recognise (a subcommand's own unknown-flag handling is its business).
+        assert!(install_logging(&argv(&["demo"])).is_ok());
+        assert!(install_logging(&argv(&["s3", "--log-level", "warn"])).is_ok());
+        assert!(install_logging(&argv(&[
+            "custodian",
+            "--zone",
+            "z0",
+            "--interval-secs",
+            "15"
+        ]))
+        .is_ok(),);
+    }
 
     /// `parse_durability` — `:95` `==`/`||` and `:110` `k == 0`. Pin every form:
     /// the two `none` aliases, a real `rs(k,m)`, the `k == 0` refusal, and a

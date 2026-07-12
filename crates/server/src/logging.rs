@@ -120,6 +120,40 @@ where
 /// The level applied when neither `--log-level` nor `RUST_LOG` says otherwise.
 pub const DEFAULT_LEVEL: &str = "info";
 
+/// The `RUST_LOG` directive, or `None` when it is unset or blank (blank ⇒ "unset", not "a
+/// directive that happens to be empty", so `RUST_LOG=` keeps the default rather than failing).
+fn rust_log_directive() -> Option<String> {
+    match std::env::var(EnvFilter::DEFAULT_ENV) {
+        Ok(raw) if !raw.trim().is_empty() => Some(raw),
+        _ => None,
+    }
+}
+
+/// Reject a malformed `RUST_LOG` directive instead of silently substituting the default
+/// (#531 review).
+///
+/// A typo'd `RUST_LOG` used to be swallowed: the process started, `EnvFilter` fell back to
+/// [`DEFAULT_LEVEL`], and the operator was left with a filter they never asked for and no
+/// indication of it. `--log-level` was already held to this standard; `RUST_LOG` — the route an
+/// operator is far more likely to take — was not.
+///
+/// Pure (the directive is passed in, not read from the environment) so the rejection rule is
+/// unit-testable without mutating process-global state, and so this exact function is the one
+/// [`LogConfig::new`] calls — a regression flips both.
+fn validate_env_directive(raw: Option<&str>) -> Result<(), BoxError> {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    EnvFilter::builder().parse(raw).map_err(|e| {
+        format!(
+            "invalid RUST_LOG `{raw}`: {e}. Refusing to start with a log filter you did not \
+             ask for — fix the directive, or unset RUST_LOG to take the `{DEFAULT_LEVEL}` \
+             default."
+        )
+    })?;
+    Ok(())
+}
+
 /// The line format the `fmt` layer writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFormat {
@@ -162,6 +196,13 @@ impl LogConfig {
             EnvFilter::builder()
                 .parse(level)
                 .map_err(|e| format!("invalid --log-level `{level}`: {e}"))?;
+        } else {
+            // No flag ⇒ `RUST_LOG` decides, so `RUST_LOG` must be held to the SAME standard.
+            // It was not: a typo'd directive was swallowed and the default filter installed
+            // silently, so the operator got a running process whose log configuration looked
+            // applied and was not — the exact "degrade quietly" failure this feature exists to
+            // end, reached by the one route most operators actually use (#531 review).
+            validate_env_directive(rust_log_directive().as_deref())?;
         }
         Ok(Self {
             level: level.map(str::to_owned),
@@ -178,9 +219,16 @@ impl LogConfig {
         match &self.level {
             // Validated in `new`, so this cannot be a lossy parse.
             Some(level) => EnvFilter::new(level),
-            None => {
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LEVEL))
-            }
+            None => match rust_log_directive() {
+                // Also validated in `new` — so for any config built through `new` this parse
+                // cannot fail. The fallible form is kept rather than `EnvFilter::new` (which
+                // PANICS on a bad directive) because `LogConfig::default()` bypasses `new`;
+                // a bad `RUST_LOG` must degrade a defaulted config, never abort the process.
+                Some(raw) => EnvFilter::builder()
+                    .parse(&raw)
+                    .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LEVEL)),
+                None => EnvFilter::new(DEFAULT_LEVEL),
+            },
         }
     }
 
@@ -405,6 +453,52 @@ mod tests {
         assert!(
             out.contains("did a thing") && !out.contains(r#""action":"repair""#),
             "{out}"
+        );
+    }
+
+    /// **A malformed `RUST_LOG` is REJECTED, not silently replaced** (#531 review).
+    ///
+    /// The rule the whole feature rests on — a bad log option stops the process rather than
+    /// degrading it — applied to `--log-level` and not to `RUST_LOG`, which is the route an
+    /// operator is far more likely to take. A typo'd directive was swallowed, the default filter
+    /// installed, and the process came up with a log configuration that LOOKED applied and was
+    /// not.
+    ///
+    /// Pure: the directive is passed in, so the rule is pinned without mutating process-global
+    /// env, and `LogConfig::new` calls this exact function.
+    #[test]
+    fn a_malformed_rust_log_directive_is_rejected() {
+        // The shapes an operator actually fat-fingers.
+        // What `EnvFilter` ACTUALLY rejects, established by running it rather than by guessing
+        // what looks malformed: an invalid LEVEL. It is otherwise lenient — `info,,` (empty
+        // directive) and `wyrd::=` (bare target) both parse, so neither belongs here. The
+        // caught class is the one that matters: the operator typed a level that does not exist.
+        for bad in ["=bad", "wyrd=nonsense"] {
+            assert!(
+                validate_env_directive(Some(bad)).is_err(),
+                "RUST_LOG=`{bad}` must be REFUSED, not swallowed in favour of the default — the \
+                 operator would be running a filter they never asked for",
+            );
+        }
+    }
+
+    /// …and a well-formed or absent one is accepted, so the rejection is not a blanket refusal.
+    #[test]
+    fn a_valid_or_absent_rust_log_directive_is_accepted() {
+        for ok in [
+            "info",
+            "warn",
+            "wyrd=debug,info",
+            "wyrd.gateway.s3.access=info",
+        ] {
+            assert!(
+                validate_env_directive(Some(ok)).is_ok(),
+                "RUST_LOG=`{ok}` is a legitimate directive and must be accepted",
+            );
+        }
+        assert!(
+            validate_env_directive(None).is_ok(),
+            "unset RUST_LOG takes the default"
         );
     }
 }
