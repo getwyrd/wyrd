@@ -497,12 +497,26 @@ where
     ) {
         Ok(payload) => payload,
         Err(err) => {
+            // A rejected signature is worth a line of its own: in a field experiment a
+            // misconfigured client (wrong region, skewed clock, stale key) presents as a wall
+            // of 403s, and "which check failed" is the whole diagnosis. `warn`, not `error` —
+            // the gateway is behaving correctly; the caller is not.
+            tracing::warn!(
+                target: "wyrd.gateway.s3.auth",
+                // On the event, not inherited from the `info_span!` — a `warn`-only or
+                // `error`-only filter drops the span and would strip the join key off the
+                // very line the operator is grepping for (the same reason as the 500 path).
+                request_id = %request_id,
+                s3_code = err.s3_code(),
+                reason = %err,
+                "refused an unauthenticated request",
+            );
             return error_response(
                 request_id,
                 StatusCode::FORBIDDEN,
                 err.s3_code(),
                 &err.to_string(),
-            )
+            );
         }
     };
 
@@ -695,45 +709,135 @@ fn error_response(
         .expect("static response is always valid")
 }
 
+/// Renders an error's full `source()` chain — the detail the typed errors carry and that
+/// nothing has ever read.
+///
+/// `metadata-fdb` classifies FoundationDB's error 1021 (`commit_unknown_result`) into a typed
+/// value holding the native code and a `may_still_commit` discriminator; `chunkstore-grpc`
+/// classifies a transport fault into `Unavailable`/`Timeout`/`Rpc`/`Connect` and keeps the
+/// gRPC `Status` as its `source()`; `ReadError::InsufficientFragments` names the chunk and
+/// how many fragments of how many it found. All of it is boxed into a `BoxError` on the way
+/// up, and all of it was thrown away at the wire layer. Walking the chain recovers it.
+struct CauseChain<'a>(&'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for CauseChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut source = self.0.source();
+        let mut first = true;
+        while let Some(cause) = source {
+            if !first {
+                write!(f, ": ")?;
+            }
+            write!(f, "{cause}")?;
+            first = false;
+            source = cause.source();
+        }
+        Ok(())
+    }
+}
+
 /// Map a gateway error onto an S3-compatible HTTP response. A commit `Conflict`
 /// (a concurrent writer won) is 409; a payload/hash mismatch is 400; a failed
 /// `aws-chunked` chunk signature is 403 (fail-closed — the body was not signed by the
 /// credential holder); malformed chunk framing is 400; anything else 500.
+///
+/// **And it records what happened.** This function took an `err: &BoxError` and, on every
+/// path that was not one of the four recognised variants, never touched it: the error was
+/// collapsed into one 500 and one 18-word string, and nothing was written anywhere. An FDB
+/// `CommitUnknownResult` — *the write may or may not have landed*, the one condition where
+/// the client's retry policy and the durability audit both depend on knowing — was reported
+/// identically to a dangling dirent, a dead D-server, a scan-cap breach, an exhausted retry
+/// budget, and an unreconstructable chunk. Five root causes, one indistinguishable message,
+/// no server-side record (#528).
+///
+/// The log line carries the full `source()` chain, and rides in the `s3.request` span, so it
+/// is joined to the client's `x-amz-request-id` (#529) without any further work.
+///
+/// The client-facing `<Message>` deliberately stays free of internal detail — **detail to the
+/// log, request id to the client**. That is also why the 500 arm's message is unchanged: what
+/// was missing was never a better string for the client, it was a record for the operator.
 fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
+    let (status, code, message) = classify(err);
+
+    // **The level follows the status, because the error plane is an alerting surface.**
+    // A 4xx is the CLIENT being wrong — a bad payload hash, malformed `aws-chunked` framing,
+    // a bad chunk signature, a concurrent writer losing a CAS (409, which a correct client
+    // simply retries). Those are routine, they are the caller's fault, and firing them at
+    // `error` means a wall of ordinary bad uploads drowns the plane an operator watches for
+    // the gateway actually failing. It would also contradict this crate's own precedent: the
+    // rejected-signature 403 is deliberately a `warn`, "the gateway is behaving correctly;
+    // the caller is not". A 5xx is us. (Codex review of #533.)
+    //
+    // Both arms carry the identical fields — including `request_id` on the EVENT, not merely
+    // inherited from the `s3.request` span: that span is an `info_span!`, so under an
+    // error-only filter (`--log-level error`) it is never enabled and `with_current_span(true)`
+    // has no fields to attach. This line, the one an operator reaches for at 3am, would be the
+    // ONE that lost the `x-amz-request-id` the client is holding.
+    if status.is_server_error() {
+        tracing::error!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway failed the request",
+        );
+    } else {
+        tracing::warn!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway refused the request",
+        );
+    }
+    error_response(request_id, status, code, &message)
+}
+
+/// The error → (status, S3 code, client message) mapping, split out so the *classification*
+/// is one expression and [`gateway_error_response`] can record it before answering.
+///
+/// **Known gap, deliberately not closed here.** The backends raise richly-typed errors —
+/// FoundationDB's undetermined-commit class above all — but those types live *inside*
+/// `metadata-fdb`, and this crate is generic over [`ObjectGateway`] and must not name a
+/// concrete backend (ADR-0010). Classifying them needs the backend-agnostic error classes at
+/// the **trait seam**, which is proposal 0010 floor item 6 and is in flight (#515, #517).
+/// Once `wyrd_traits::CommitUnknownResult` lands, an arm here maps it to its own S3 code —
+/// a client must be able to tell "your write may have landed" from a clean failure. Until
+/// then the operator gets the full class from the log line above, which is the larger half.
+fn classify(err: &BoxError) -> (StatusCode, &'static str, String) {
     if let Some(streaming) = err.downcast_ref::<streaming::StreamingError>() {
         return match streaming {
-            streaming::StreamingError::ChunkSignature => error_response(
-                request_id,
+            streaming::StreamingError::ChunkSignature => (
                 StatusCode::FORBIDDEN,
                 "SignatureDoesNotMatch",
-                "an aws-chunked chunk signature does not verify",
+                "an aws-chunked chunk signature does not verify".to_string(),
             ),
-            streaming::StreamingError::Framing(what) => error_response(
-                request_id,
+            streaming::StreamingError::Framing(what) => (
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
-                &format!("malformed aws-chunked streaming body: {what}"),
+                format!("malformed aws-chunked streaming body: {what}"),
             ),
         };
     }
     match err.downcast_ref::<GatewayError>() {
-        Some(GatewayError::Conflict) => error_response(
-            request_id,
+        Some(GatewayError::Conflict) => (
             StatusCode::CONFLICT,
             "OperationAborted",
-            "a concurrent writer won the commit",
+            "a concurrent writer won the commit".to_string(),
         ),
-        Some(GatewayError::PayloadMismatch) => error_response(
-            request_id,
+        Some(GatewayError::PayloadMismatch) => (
             StatusCode::BAD_REQUEST,
             "XAmzContentSHA256Mismatch",
-            "the delivered body does not match the signed x-amz-content-sha256",
+            "the delivered body does not match the signed x-amz-content-sha256".to_string(),
         ),
-        _ => error_response(
-            request_id,
+        _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalError",
-            "the gateway could not complete the request",
+            "the gateway could not complete the request".to_string(),
         ),
     }
 }
@@ -741,6 +845,366 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error whose real diagnosis lives in its `source()` chain — the shape every backend
+    /// error arrives in. `metadata-fdb`'s `CommitUnknownResult` carries the FDB code and
+    /// `may_still_commit` this way; `chunkstore-grpc`'s `TransportError` keeps the gRPC
+    /// `Status` as its source; `ReadError::InsufficientFragments` names chunk/have/need.
+    #[derive(Debug)]
+    struct Backend(&'static str, Option<Box<Backend>>);
+
+    impl std::fmt::Display for Backend {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Backend {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1
+                .as_deref()
+                .map(|e| e as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    /// **The fix.** An unrecognised backend error must be RECORDED — with its whole cause
+    /// chain — not silently collapsed into a bare 500.
+    ///
+    /// Pre-fix, `gateway_error_response`'s `_` arm returned the 500 while the `err` binding
+    /// sat in scope, untouched: an FDB `commit_unknown_result` (the write MAY have landed),
+    /// a scan-cap breach, an exhausted retry budget, a dangling dirent and an unreconstructable
+    /// chunk all produced the same 18-word string and nothing else, anywhere. The capture
+    /// buffer is EMPTY — RED.
+    ///
+    /// Mutation guard: delete the `tracing::error!` and this fails; the assertions cannot pass
+    /// against an empty buffer.
+    #[test]
+    fn an_unrecognised_backend_error_is_recorded_with_its_whole_cause_chain() {
+        let capture = Capture::default();
+        let dispatch = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing::Dispatch::new(
+                tracing_subscriber::registry().with(
+                    tracing_subscriber::fmt::layer()
+                        .json()
+                        .with_writer(capture.clone()),
+                ),
+            )
+        };
+
+        // The FDB undetermined-commit shape: the class, its native code, and the caller's
+        // remedy — every bit of it present in the error and, pre-fix, every bit discarded.
+        let err: BoxError = Box::new(Backend(
+            "commit outcome is undetermined; the batch may or may not have been applied",
+            Some(Box::new(Backend(
+                "foundationdb error 1021 (commit_unknown_result); may_still_commit=false",
+                None,
+            ))),
+        ));
+
+        let response = tracing::dispatcher::with_default(&dispatch, || {
+            gateway_error_response(RequestIds::new().mint(), &err)
+        });
+
+        // The client contract is unchanged — the fix was never a better string for the client.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains("commit outcome is undetermined"),
+            "the error itself must be recorded; pre-fix the buffer is EMPTY. got: {logged}"
+        );
+        assert!(
+            logged.contains("1021") && logged.contains("may_still_commit=false"),
+            "the CAUSE CHAIN must survive — the FDB code and the caller's remedy live there, \
+             and a 500 that omits them is indistinguishable from four other root causes. \
+             got: {logged}"
+        );
+        assert!(
+            logged.contains(r#""target":"wyrd.gateway.s3.error""#),
+            "a collector must be able to select the gateway's error plane. got: {logged}"
+        );
+    }
+
+    /// **The failure record keeps its join key under an ERROR-ONLY filter** (codex review of
+    /// #533).
+    ///
+    /// The `x-amz-request-id` a client quotes is only useful if the server-side line it selects
+    /// actually carries it. The request id lives on the `s3.request` span — but that is an
+    /// `info_span!`, and a production server run with `--log-level error` (or `RUST_LOG=error`)
+    /// never *enables* it, so `with_current_span(true)` has no fields to attach. Relying on the
+    /// span alone meant the 500 — the one line an operator is grepping for — was exactly the
+    /// line that lost the join key, and only under the filter a production deployment is most
+    /// likely to be running.
+    ///
+    /// The subscriber here is the production one in miniature: an `EnvFilter` at `error`, plus a
+    /// JSON `fmt` layer with `with_current_span(true)` — the same construction as
+    /// `crates/server/src/logging.rs`. The event is emitted INSIDE an `info_span!` carrying the
+    /// id, so a span-only implementation would look correct at `info` and go blank here.
+    ///
+    /// Mutation guard: drop `request_id = %request_id` from the `tracing::error!` and this
+    /// fails, while the `info`-level test above keeps passing — which is precisely the trap.
+    #[test]
+    fn the_failure_record_carries_the_request_id_even_when_info_spans_are_filtered_out() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    .with_filter(EnvFilter::new("error")),
+            ),
+        );
+
+        let request_id = RequestIds::new().mint();
+        let err: BoxError = Box::new(Backend("the backend fell over", None));
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            // The real shape: the handler mints the id, opens the request span, and the error
+            // is recorded from inside it. Under this filter the span is never enabled.
+            let span = tracing::info_span!("s3.request", request_id = %request_id);
+            let _guard = span.enter();
+            gateway_error_response(request_id, &err);
+        });
+
+        let logged = capture.contents();
+        assert!(
+            !logged.is_empty(),
+            "the error event must survive an error-only filter — it is `tracing::error!`",
+        );
+        assert!(
+            logged.contains(&request_id.to_string()),
+            "the failure record must carry the request id the CLIENT was handed, even with the \
+             `info` span filtered out — otherwise the 500 has no join key under exactly the \
+             log level a production gateway runs at. got: {logged}",
+        );
+    }
+
+    /// **The ACCESS line keeps its join key under a target-scoped filter** (codex review of
+    /// #533).
+    ///
+    /// `RUST_LOG=wyrd.gateway.s3.access=info` is the natural way to keep the access plane while
+    /// quietening everything else — and it enables *this event* without enabling the
+    /// `s3.request` span, whose target is the module path, not the event's. Inheriting the id
+    /// from the span alone meant the access line — the one record that proves a request even
+    /// REACHED the gateway, the first question of any field post-mortem — lost the join key
+    /// under exactly the directive an operator would reach for.
+    ///
+    /// Driven through the REAL router with `oneshot`, not by re-emitting the event here: a test
+    /// that logged its own line would only prove the test can log. The request is unsigned, so
+    /// it is refused with a 403 — which is fine and is the point: the access line is emitted for
+    /// every request that arrives, whatever the verdict.
+    ///
+    /// Mutation guard: drop `request_id = %request_id` from the access event and this fails.
+    #[tokio::test]
+    async fn the_access_line_carries_the_request_id_under_a_target_scoped_filter() {
+        use tower::ServiceExt;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        struct NoGateway;
+        impl ObjectGateway for NoGateway {
+            async fn put_object_streaming<S>(
+                &self,
+                _key: &str,
+                _source: S,
+                _expected: ContentHash,
+            ) -> wyrd_traits::Result<()>
+            where
+                S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
+                    + Send
+                    + Unpin
+                    + 'static,
+            {
+                Ok(())
+            }
+
+            async fn get_object_streaming(
+                self: Arc<Self>,
+                _key: &str,
+            ) -> wyrd_traits::Result<Option<ObjectRead>> {
+                Ok(None)
+            }
+
+            async fn delete_object(&self, _key: &str) -> wyrd_traits::Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    // The directive in question: the access plane ON, everything else — the
+                    // `s3.request` span included — OFF.
+                    .with_filter(EnvFilter::new("wyrd.gateway.s3.access=info")),
+            ),
+        );
+
+        let router = S3Gateway::new(
+            Arc::new(NoGateway),
+            S3Config::new(vec![Credentials {
+                access_key_id: "AKIA".into(),
+                secret_access_key: "secret".into(),
+            }]),
+        )
+        .router();
+
+        // A thread-scoped default, not `with_default`: the request is `await`ed, and a
+        // sync-scoped dispatcher would not be installed across the await points. `#[tokio::test]`
+        // runs a current-thread runtime, so the whole future stays on this thread.
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/bucket/key")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("the router answers");
+
+        // Unsigned ⇒ refused. Immaterial to the property: the access line is emitted for every
+        // request that arrives, and it is the *arrival* this line exists to record.
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Read the id off the head BEFORE draining — the drain consumes the response.
+        let served_id = response
+            .headers()
+            .get(request_id::HEADER)
+            .expect("every response carries the id")
+            .to_str()
+            .expect("ascii")
+            .to_string();
+
+        // Drain the body, as a real client does: the row is written when the TRANSFER ends, not
+        // when the head is built (#529), so nothing is logged until the body is consumed.
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain the body");
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains(r#""target":"wyrd.gateway.s3.access""#),
+            "the access line must be emitted under its own target directive. got: {logged}",
+        );
+        assert!(
+            logged.contains(&served_id),
+            "the access line must carry the SAME id the client was handed in \
+             `x-amz-request-id` — with the `s3.request` span filtered out, inheriting it from \
+             the span records nothing, and the one line proving the request arrived has no join \
+             key. got: {logged}",
+        );
+    }
+
+    /// **A 4xx is the caller's fault and must not page the error plane** (codex review of
+    /// #533).
+    ///
+    /// `wyrd.gateway.s3.error` is an alerting surface. A payload-hash mismatch, a bad chunk
+    /// signature, malformed framing, or a `Conflict` (409 — a concurrent writer won, which a
+    /// correct client just retries) are all *routine* and all the caller's doing. Firing them
+    /// at `error` buries the gateway's own failures under a wall of ordinary bad uploads, and
+    /// contradicts this crate's own precedent, where the rejected-signature 403 is deliberately
+    /// a `warn`.
+    ///
+    /// The subscriber filters at `error`, so a `warn` is dropped: an empty buffer IS the
+    /// assertion. The 500 case is covered by the tests above, so both directions are pinned —
+    /// without that pairing, "log nothing at all" would pass this one.
+    #[test]
+    fn a_client_error_is_not_recorded_on_the_error_plane() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_filter(EnvFilter::new("error")),
+            ),
+        );
+
+        // 409: a concurrent writer won the CAS. The client retries; nothing is broken.
+        let conflict: BoxError = Box::new(GatewayError::Conflict);
+        let response = tracing::dispatcher::with_default(&dispatch, || {
+            gateway_error_response(RequestIds::new().mint(), &conflict)
+        });
+
+        // The client contract is untouched — only the log LEVEL moved.
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            capture.contents().is_empty(),
+            "a 4xx must not reach the error plane at `error` level — it is the caller being \
+             wrong, not the gateway failing, and it would drown the signal an operator alerts \
+             on. got: {}",
+            capture.contents(),
+        );
+    }
+
+    /// …and it is still RECORDED, at `warn`, with its request id — refused, not silently
+    /// dropped. (The pair to the test above: together they pin "warn, not error", where either
+    /// alone would also pass for "not logged at all".)
+    #[test]
+    fn a_client_error_is_still_recorded_at_warn_with_its_request_id() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
+
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tsfmt::layer()
+                    .json()
+                    .with_writer(capture.clone())
+                    .with_filter(EnvFilter::new("warn")),
+            ),
+        );
+
+        let request_id = RequestIds::new().mint();
+        let conflict: BoxError = Box::new(GatewayError::Conflict);
+        tracing::dispatcher::with_default(&dispatch, || {
+            gateway_error_response(request_id, &conflict)
+        });
+
+        let logged = capture.contents();
+        assert!(
+            logged.contains(&request_id.to_string()),
+            "a refused request must still carry its request id — the client was handed one and \
+             will quote it. got: {logged}",
+        );
+        assert!(
+            logged.contains(r#""level":"WARN""#),
+            "a 4xx is a `warn`: the gateway is behaving correctly; the caller is not. \
+             got: {logged}",
+        );
+    }
+
+    /// The recognised classes keep their S3 contract exactly — this change adds a record, it
+    /// does not renegotiate any status code.
+    #[test]
+    fn the_recognised_error_classes_keep_their_s3_codes() {
+        let conflict: BoxError = Box::new(GatewayError::Conflict);
+        assert_eq!(classify(&conflict).0, StatusCode::CONFLICT);
+        assert_eq!(classify(&conflict).1, "OperationAborted");
+
+        let mismatch: BoxError = Box::new(GatewayError::PayloadMismatch);
+        assert_eq!(classify(&mismatch).0, StatusCode::BAD_REQUEST);
+        assert_eq!(classify(&mismatch).1, "XAmzContentSHA256Mismatch");
+
+        let sig: BoxError = Box::new(streaming::StreamingError::ChunkSignature);
+        assert_eq!(classify(&sig).0, StatusCode::FORBIDDEN);
+        assert_eq!(classify(&sig).1, "SignatureDoesNotMatch");
+    }
 
     use std::sync::{Arc as StdArc, Mutex};
 
