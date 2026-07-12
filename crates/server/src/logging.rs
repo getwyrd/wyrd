@@ -35,13 +35,87 @@
 
 use std::io;
 
-use tracing::Dispatch;
+use tracing::span;
+use tracing::subscriber::Interest;
+use tracing::{Dispatch, Event, Metadata, Subscriber};
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
-use tracing_subscriber::layer::{Identity, SubscriberExt};
+use tracing_subscriber::layer::{Context, Filter, Identity, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Applies the operator's level directive to **events**, and never to **spans**.
+///
+/// A span is *context*, not a message. Throttling it does not make the log quieter — it makes
+/// the log **unjoinable**, which is strictly worse than verbose.
+///
+/// The concrete failure this exists to prevent: the S3 gateway opens an `info`-level
+/// `s3.request` span carrying the `request_id` (#529), and every event emitted while serving
+/// the request inherits that field. Under a plain `EnvFilter` at `--log-level warn` — the
+/// obvious setting for a production operator who finds `info` noisy — the *span* is filtered
+/// out too. The fmt layer then never records its fields, so `with_current_span` has nothing to
+/// attach, and the `ERROR` line reporting the failure comes out with **no `request_id`**:
+///
+/// ```text
+/// {"level":"ERROR","fields":{"message":"the gateway failed the request"},"target":"wyrd.gateway.s3.error"}
+/// ```
+///
+/// The client is handed an `x-amz-request-id` and the server's record of the failure cannot be
+/// joined to it — the correlation id disappears precisely in the configuration where it is most
+/// needed, and the whole point of #529 evaporates. (Caught in review on #531/#532.)
+///
+/// So: events obey the directive; spans are always recorded. The cost is that span callsites
+/// are always evaluated (hence [`Self::max_level_hint`] returns `None`), which is the same
+/// trade already made for the metrics plane in [`dispatch`] — a little work, against silently
+/// losing the ability to diagnose anything.
+struct EventsOnly(EnvFilter);
+
+impl<S> Filter<S> for EventsOnly
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn enabled(&self, meta: &Metadata<'_>, cx: &Context<'_, S>) -> bool {
+        // The whole point: a span is context and is never throttled.
+        meta.is_span() || Filter::<S>::enabled(&self.0, meta, cx)
+    }
+
+    fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
+        if meta.is_span() {
+            return Interest::always();
+        }
+        Filter::<S>::callsite_enabled(&self.0, meta)
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, cx: &Context<'_, S>) -> bool {
+        Filter::<S>::event_enabled(&self.0, event, cx)
+    }
+
+    /// `None`, deliberately: a hint would let `tracing` short-circuit span callsites above the
+    /// event level, which is exactly what must not happen.
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        None
+    }
+
+    // The span lifecycle is forwarded so the inner `EnvFilter` keeps its own per-span state —
+    // that is what makes span-scoped directives (`RUST_LOG=[s3.request]=debug`) keep working.
+    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_new_span(&self.0, attrs, id, cx);
+    }
+    fn on_record(&self, id: &span::Id, values: &span::Record<'_>, cx: Context<'_, S>) {
+        Filter::<S>::on_record(&self.0, id, values, cx);
+    }
+    fn on_enter(&self, id: &span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_enter(&self.0, id, cx);
+    }
+    fn on_exit(&self, id: &span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_exit(&self.0, id, cx);
+    }
+    fn on_close(&self, id: span::Id, cx: Context<'_, S>) {
+        Filter::<S>::on_close(&self.0, id, cx);
+    }
+}
 
 /// The level applied when neither `--log-level` nor `RUST_LOG` says otherwise.
 pub const DEFAULT_LEVEL: &str = "info";
@@ -168,9 +242,11 @@ where
     L: Layer<Registry> + Send + Sync + 'static,
 {
     Dispatch::new(
-        Registry::default()
-            .with(extra)
-            .with(config.fmt_layer(writer).with_filter(config.filter())),
+        Registry::default().with(extra).with(
+            config
+                .fmt_layer(writer)
+                .with_filter(EventsOnly(config.filter())),
+        ),
     )
 }
 
