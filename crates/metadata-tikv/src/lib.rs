@@ -124,7 +124,18 @@ pub mod keyspace {
 /// at one snapshot, or `Err` — it **never** returns a silently truncated `Vec` (a
 /// truncated `inode:` scan corrupts GC's never-reclaim safety set — data loss).
 pub mod paging {
-    use std::fmt;
+    /// The shared per-`scan` ceiling and its fail-loud error, re-exported from the seam
+    /// crate (`wyrd_traits`) where they now live (#516).
+    ///
+    /// They were defined *here*, and independently in `metadata-fdb`, with identical
+    /// values, fields and `Display` — each crate's comment asserting the other's had to
+    /// match. Two backends of the same trait must not disagree about how large a listing
+    /// may be, and a caller must not have to know which backend it holds to downcast the
+    /// error, so the cap and the type are one definition in the seam and every backend
+    /// (redb included) raises it. Re-exported under the old paths so callers that name
+    /// `wyrd_metadata_tikv::paging::ScanCapExceeded` keep compiling. [`PAGE_SIZE`] and
+    /// [`after_page`] stay here: the *cursor* mechanics are this backend's own.
+    pub use wyrd_traits::{ScanCapExceeded, SCAN_CAP};
 
     /// Maximum keys pulled per internal range read — a bounded network round-trip's
     /// worth of dirents. The whole prefix is assembled by *looping* these pages
@@ -132,47 +143,6 @@ pub mod paging {
     /// "Large-directory `scan` buffering"). Interim (#262): the paging mechanism and
     /// value are Do's call *within* the completeness-or-fail-loud invariant.
     pub const PAGE_SIZE: u32 = 1024;
-
-    /// Interim ceiling on the **total** materialized results of a single `scan`. On
-    /// breach the call fails loud (`Err`, via [`ScanCapExceeded`]) and returns **no**
-    /// partial `Vec`: a silently truncated `inode:` scan corrupts GC's never-reclaim
-    /// safety set (data loss), so this is a **correctness constraint, not a tuning
-    /// knob** (#262). 2^20 dirents is far past any legitimate single directory yet
-    /// bounds the gateway heap against a pathological prefix; it is revisited if a
-    /// paginated/streaming trait method is measured in (out of M4's unchanged-trait
-    /// scope). A product-facing "max dirents per listing" is the human's to confirm
-    /// (INTEGRATION §4 / #262).
-    pub const SCAN_CAP: usize = 1 << 20;
-
-    /// The interim per-`scan` cap was exceeded. Returned as the store's `Err` so the
-    /// scan **fails loud instead of truncating** (#262); the operator-visible
-    /// ADR-0011 audit signal is surfaced by the caller (GC/custodian), which already
-    /// owns the telemetry path — `metadata-tikv` carries no tracing dependency today,
-    /// so pushing the emit into the store would be a new-dependency ADR-0003 review.
-    /// A descriptive typed error keeps the audit signal caller-side and lets a caller
-    /// downcast to distinguish "too big, fail loud" from a genuine backend fault.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ScanCapExceeded {
-        /// The interim cap that was breached.
-        pub cap: usize,
-        /// The logical prefix whose scan overflowed (lossy-rendered for operators).
-        pub prefix: Vec<u8>,
-    }
-
-    impl fmt::Display for ScanCapExceeded {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "metadata scan exceeded the interim per-listing cap of {} keys for \
-                 prefix {:?}: failing loud rather than returning a truncated result set \
-                 (a silently truncated scan is data loss — #262, ADR-0011)",
-                self.cap,
-                String::from_utf8_lossy(&self.prefix),
-            )
-        }
-    }
-
-    impl std::error::Error for ScanCapExceeded {}
 
     /// The next page's **inclusive** start key: the last key of the page just read
     /// with a `0x00` byte appended — the smallest key strictly greater than

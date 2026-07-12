@@ -674,53 +674,23 @@ pub mod keyspace {
 /// driver is the one the peer calls out as a **correctness constraint, not a tuning
 /// knob** — the total-results ceiling.
 pub mod paging {
-    use std::fmt;
-
-    /// Interim ceiling on the **total** materialized results of a single `scan`. On breach
-    /// the call fails loud (`Err`, via [`ScanCapExceeded`]) and returns **no** partial
-    /// `Vec`: a silently truncated `inode:` scan corrupts GC's never-reclaim safety set
-    /// (data loss), so this is a **correctness constraint, not a tuning knob** (#262).
+    /// The shared per-`scan` ceiling and its fail-loud error, re-exported from the seam
+    /// crate (`wyrd_traits`) where they now live (#516).
     ///
-    /// The value is the sibling backend's, deliberately (`crates/metadata-tikv/src/lib.rs:145`):
-    /// 2^20 dirents is far past any legitimate single directory yet bounds the gateway heap
-    /// against a pathological prefix. Two backends of the same trait must not disagree about
-    /// how large a listing may be. Revisited if a paginated/streaming trait method is
-    /// measured in (out of M4's unchanged-trait scope); a product-facing "max dirents per
-    /// listing" is the human's to confirm (INTEGRATION §4 / #262).
+    /// They were defined *here*, and independently in `metadata-tikv`, with identical
+    /// values, fields and `Display` — each crate's comment asserting the other's had to
+    /// match. Two backends of the same trait must not disagree about how large a listing
+    /// may be, and a caller must not have to know which backend it holds to downcast the
+    /// error, so the cap and the type are one definition in the seam and every backend
+    /// (redb included) raises it. Re-exported under the old paths so callers that name
+    /// `wyrd_metadata_fdb::paging::ScanCapExceeded` keep compiling.
     ///
-    /// Without it, an FDB `scan` of a pathological prefix grows the gateway heap unbounded
-    /// until FDB's own 5 s transaction limit trips `1007 transaction_too_old`, whereupon the
-    /// driver restarts the *whole* scan and finally reports a retry-budget exhaustion — an
-    /// opaque, expensive, timing-dependent way to say "too big".
-    pub const SCAN_CAP: usize = 1 << 20;
-
-    /// The interim per-`scan` cap was exceeded. Returned as the store's `Err` so the scan
-    /// **fails loud instead of truncating** (#262); the operator-visible ADR-0011 audit
-    /// signal is surfaced by the caller (GC/custodian), which already owns the telemetry
-    /// path. A descriptive typed error keeps the audit signal caller-side and lets a caller
-    /// downcast to distinguish "too big, fail loud" from a genuine backend fault.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct ScanCapExceeded {
-        /// The interim cap that was breached.
-        pub cap: usize,
-        /// The logical prefix whose scan overflowed (lossy-rendered for operators).
-        pub prefix: Vec<u8>,
-    }
-
-    impl fmt::Display for ScanCapExceeded {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "metadata scan exceeded the interim per-listing cap of {} keys for \
-                 prefix {:?}: failing loud rather than returning a truncated result set \
-                 (a silently truncated scan is data loss — #262, ADR-0011)",
-                self.cap,
-                String::from_utf8_lossy(&self.prefix),
-            )
-        }
-    }
-
-    impl std::error::Error for ScanCapExceeded {}
+    /// Why FDB needs the cap specifically: without it, a `scan` of a pathological prefix
+    /// grows the gateway heap unbounded until FDB's own 5 s transaction limit trips
+    /// `1007 transaction_too_old`, whereupon the driver restarts the *whole* scan and
+    /// finally reports a retry-budget exhaustion — an opaque, expensive, timing-dependent
+    /// way to say "too big".
+    pub use wyrd_traits::{ScanCapExceeded, SCAN_CAP};
 
     /// What the paged `scan` loop does after materializing one FDB page.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

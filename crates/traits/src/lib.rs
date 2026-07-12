@@ -190,6 +190,59 @@ impl std::error::Error for BlockReadFault {
     }
 }
 
+/// Interim ceiling on the **total** materialized results of a single
+/// [`MetadataStore::scan`]. On breach a backend fails loud (`Err`, via
+/// [`ScanCapExceeded`]) and returns **no** partial `Vec` — the
+/// completeness-or-fail-loud clause of the store contract (#262, ADR-0011): a
+/// silently truncated `inode:` scan shrinks GC's never-reclaim safety set, which
+/// is data loss, so this is a **correctness constraint, not a tuning knob**.
+///
+/// 2^20 dirents is far past any legitimate single directory yet bounds a
+/// gateway's heap against a pathological prefix. It lives here, in the seam
+/// crate, because **backends of the same trait must not disagree about how large
+/// a listing may be** — it was previously a per-crate constant duplicated
+/// verbatim in `metadata-tikv` and `metadata-fdb`, each asserting in a comment
+/// that the other's value had to match (#516).
+pub const SCAN_CAP: usize = 1 << 20;
+
+/// A [`MetadataStore::scan`] exceeded [`SCAN_CAP`] (or a store's lower configured
+/// cap): the call fails loud instead of truncating (#262, ADR-0011), and returns
+/// **no** partial result set.
+///
+/// Like [`IntegrityFault`] and [`BlockReadFault`], this lives in the seam crate so
+/// **every** backend raises the *same* type and every consumer classifies it the
+/// *same* way — `err.downcast_ref::<ScanCapExceeded>()` distinguishes "too big,
+/// failed loud" from a genuine backend fault without the caller knowing which
+/// store it holds. It was previously defined *separately* in `metadata-tikv` and
+/// `metadata-fdb` with identical fields and `Display`, so the same downcast
+/// silently depended on which backend was wired in (#516).
+///
+/// The operator-visible ADR-0011 audit signal is surfaced by the caller
+/// (GC/custodian), which already owns the telemetry path; a descriptive typed
+/// error keeps that signal caller-side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanCapExceeded {
+    /// The cap that was breached.
+    pub cap: usize,
+    /// The logical prefix whose scan overflowed (lossy-rendered for operators).
+    pub prefix: Vec<u8>,
+}
+
+impl fmt::Display for ScanCapExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "metadata scan exceeded the interim per-listing cap of {} keys for \
+             prefix {:?}: failing loud rather than returning a truncated result set \
+             (a silently truncated scan is data loss — #262, ADR-0011)",
+            self.cap,
+            String::from_utf8_lossy(&self.prefix),
+        )
+    }
+}
+
+impl std::error::Error for ScanCapExceeded {}
+
 /// Whether `err` is a block-layer read fault anywhere in its source chain —
 /// checks for [`BlockReadFault`] (the seam type a remote gRPC backend
 /// reconstructs on the client) **or** a [`std::io::Error`] with
