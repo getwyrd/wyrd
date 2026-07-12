@@ -5127,6 +5127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-metadata-fault-conformance"
+version = "0.0.0"
+dependencies = [
+ "tokio",
+ "wyrd-testkit",
+ "wyrd-traits",
+]
+
+[[package]]
 name = "wyrd-metadata-fdb"
 version = "0.0.0"
 dependencies = [
@@ -5137,6 +5146,8 @@ dependencies = [
  "serde_json",
  "tokio",
  "wyrd-metadata-conformance",
+ "wyrd-metadata-fault-conformance",
+ "wyrd-testkit",
  "wyrd-traits",
 ]
 
@@ -5164,6 +5175,7 @@ dependencies = [
  "tikv-client",
  "tokio",
  "wyrd-metadata-conformance",
+ "wyrd-metadata-fault-conformance",
  "wyrd-testkit",
  "wyrd-traits",
 ]

@@ -1,0 +1,26 @@
+[package]
+name = "wyrd-metadata-fault-conformance"
+description = "The shared MetadataStore FAULT-conformance suite (#257, #442): the trait contract asserted under a real cluster fault and under write-write contention. Sibling of wyrd-metadata-conformance, which asserts it on a quiet store. Trait-only deps, so TiKV and FoundationDB are judged by IDENTICAL invariants."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The battery is written against the trait surface ONLY (ADR-0016 dependency rule) — it
+# never depends on a concrete backend, which is precisely what lets one scenario judge
+# both. The backend-specific parts (how to cut a node, how to ask its PEERS whether the
+# cut bit) enter through the `ClusterFault` seam, implemented by each backend's test.
+wyrd-traits.workspace = true
+# The backend-agnostic oracles and signal arithmetic (quorum, partition_materialized,
+# converged_exactly_once, no_lost_update, consistency_passes, heal_is_complete) — already
+# shared by #257's TiKV leg, and unit-checked inside the unprivileged gate.
+wyrd-testkit.workspace = true
+tokio = { workspace = true }
+
+# Inherit the workspace lint policy (single source of truth in the root
+# Cargo.toml [workspace.lints.*]).
+[lints]
+workspace = true

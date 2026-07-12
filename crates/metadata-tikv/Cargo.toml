@@ -44,6 +44,10 @@ futures-util.workspace = true
 # uses `converged_exactly_once`. Test-only; no `src` dependency (proposal 0015 §"DST
 # and tests", PR-sequence item 6).
 wyrd-testkit.workspace = true
+# The SHARED Tier-1 fault + contention battery (#257/#442): the scenario, invariants and
+# signal arithmetic both backends are judged by. Only the backend-shaped fault mechanism
+# (leader resolution + PD's heartbeat oracle) stays in this crate's test.
+wyrd-metadata-fault-conformance.workspace = true
 
 # `tikv-client` is used only under the `tikv` feature; keep cargo-machete quiet on
 # the default (feature-off) scan, where the optional deps look unreferenced.
