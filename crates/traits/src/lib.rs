@@ -333,30 +333,149 @@ pub trait PlacementChunkStore: ChunkStore {
 /// records, version compare-and-set, the pending-chunk ledger — are expressed
 /// *through* this primitive by the metadata model in `core`, never baked into
 /// the trait, which keeps the layer honest about the KV features it depends on
-/// and makes a backend swap (redb → TiKV) a composition change (ADR-0010).
+/// and makes a backend swap (redb → TiKV → FoundationDB) a composition change
+/// (ADR-0010).
+///
+/// # The contract
+///
+/// Written down **after** the FoundationDB port (#438) from what it taught, per
+/// ADR-0002's implementation-first posture for component interfaces (#437); the
+/// clauses of the shared `wyrd-metadata-conformance` suite (`run_all`) are the
+/// *executable* record, and this prose says what they mean. Stated
+/// backend-neutrally: the three shipped backends reach these guarantees by three
+/// different mechanisms — redb serializes write transactions, TiKV takes
+/// pessimistic locking reads, FoundationDB uses an optimistic read-conflict set —
+/// and a fourth backend may use a fourth, but it must land here.
+///
+/// **1. Keys and values are opaque bytes.** A backend stores them
+/// byte-identically and never interprets them, so a full-value
+/// [`Precondition`] is an exact compare-and-set.
+///
+/// **2. `commit` is the only mutation point, and it is atomic.** Every
+/// precondition is evaluated against *committed* state, atomically with the
+/// batch's own writes — not against a snapshot read taken earlier. So a caller
+/// may safely `get` a key, decide, and then guard its batch with a
+/// [`require`](WriteBatch::require) on what it read: correctness rests on the
+/// **in-commit re-check**, never on the freshness of that earlier read. This is
+/// what makes the read-then-commit `rename` in `core::metadata` safe, and it is
+/// pinned by `contract_rename_race_yields_conflict`.
+///
+/// **3. `Conflict` means a precondition lost — and only a *conditional* batch
+/// can conflict.** See [`CommitOutcome`], whose docs carry the full partition;
+/// the blind-batch half is pinned by `contract_blind_batch_is_never_conflict`.
+///
+/// **4. Reads observe the most recent committed state, and a `scan` is one
+/// consistent cut.** No stale, cached, bounded-staleness or follower reads
+/// (ADR-0015 clause 3, decided in #261): a `get` never serves a value older than
+/// the latest committed one for that key (`contract_read_after_commit`), and a
+/// single `scan` observes one instant — a concurrent rename under the scanned
+/// prefix appears at exactly one of its two positions, never both and never
+/// neither, however many pages the backend internally reads
+/// (`contract_scan_is_consistent_cut`). A backend that pages a `scan` therefore
+/// holds ONE read version across all of its pages; it may not stitch pages from
+/// different versions, which would tear the cut.
+///
+/// **5. A `scan` is complete or it fails loudly.** It returns the whole matching
+/// set at that one version, or `Err` — never a silently truncated `Vec` (#262,
+/// ADR-0011). Silent truncation is a data-loss bug, not a performance
+/// characteristic: a short `inode:` listing would shrink GC's never-reclaim
+/// safety set. The distributed backends enforce this with a shared result cap
+/// (`SCAN_CAP`, deliberately identical across them) above which they `Err`
+/// rather than truncate.
+///
+/// # Errors and the caller's obligations
+///
+/// The error channel is [`BoxError`], so backends distinguish failures by the
+/// **concrete type** the caller downcasts to, not by a trait-level enum.
+///
+/// **An `Err` from `commit` does not mean "nothing was written."** For a
+/// distributed backend some commit failures are *unknown-result*: the transaction
+/// may or may not have been applied (FoundationDB's `commit_unknown_result`
+/// (1021) and `transaction_timed_out` (1031) are the concrete instances; any
+/// networked backend has the class). Two rules follow, and they bind every
+/// backend:
+///
+/// - **An unknown-result commit is never reported as [`CommitOutcome::Conflict`]**
+///   — `Conflict` asserts nothing was written, which is exactly what is not known.
+///   It surfaces as `Err`, distinguishable by downcast (the FDB backend's
+///   `CommitUnknownResult` carries the code and a `may_still_commit()` flag).
+/// - **A backend never silently retries an unknown-result commit**, because a
+///   [`WriteBatch`] is **not guaranteed idempotent** (see its docs) — a blind
+///   re-apply could double-apply it. A backend may retry only errors its
+///   substrate reports as *definitively not committed*.
+///
+/// So a caller that must know the outcome of a batch it cannot replay has one
+/// remedy: **re-read** and establish what happened. A caller may also retry
+/// a [`Conflict`] — that is what `Conflict` is *for* — but the retry belongs to
+/// the caller, who owns the decision the precondition encodes; a backend must not
+/// retry a conditional batch internally, since re-reading the precondition at a
+/// newer version would quietly turn the caller's compare-and-set into a
+/// last-writer-wins overwrite.
+///
+/// # Operational envelope
+///
+/// The trait sets no key/value/batch size limits of its own; a backend's native
+/// limits are **inherited and surface as `Err`** (FoundationDB's are the tightest
+/// in play and are therefore the de-facto ceiling: 10 KB key, 100 KB value, 10 MB
+/// and 5 s per transaction). The metadata model in `core` writes small records
+/// and stays far inside them. Two envelope properties *are* contractual, because
+/// they are correctness rather than tuning: the `scan` cap of clause 5, and that
+/// **every operation terminates** — a backend must bound its own waiting rather
+/// than block a caller forever on an unreachable cluster.
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
-    /// Read the raw value stored under `key`, if any.
+    /// Read the raw value stored under `key`, if any — the latest committed
+    /// value, never a stale or cached one (contract clause 4).
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>>;
 
     /// Return every `(key, value)` whose key begins with `prefix`, e.g. every
-    /// dirent under a parent. Order is unspecified.
+    /// dirent under a parent, as one consistent cut (contract clause 4). Order is
+    /// unspecified. The result is complete or this returns `Err`; it is never
+    /// silently truncated (clause 5).
     async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>>;
 
     /// Apply `batch` as a single atomic mutation — the commit point. Either
     /// every precondition holds and every put/delete lands, or nothing changes.
+    ///
     /// Returns [`CommitOutcome::Conflict`] (not `Err`) when a precondition fails,
-    /// so a stale writer is rejected distinguishably from a backend fault.
+    /// so a stale writer is rejected distinguishably from a backend fault. An
+    /// `Err` may be an *unknown-result* commit rather than a definite non-commit —
+    /// see the trait's "Errors and the caller's obligations".
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome>;
 }
 
 /// The result of a [`commit`](MetadataStore::commit).
+///
+/// The partition is three-way, and the third clause is the one the FoundationDB
+/// port made load-bearing (#437):
+///
+/// 1. All preconditions held and the batch was applied → `Committed`.
+/// 2. A **conditional** batch (one carrying at least one [`Precondition`]) lost —
+///    either the precondition was already false, or it held at the batch's read
+///    point and a concurrent writer invalidated it before the commit landed →
+///    `Conflict`. Both are "a stale writer was rejected"; a backend must not
+///    distinguish them, because a caller cannot act on the difference.
+/// 3. A **blind** batch (one carrying NO preconditions) is **never** `Conflict`.
+///    It has asserted nothing about prior state, so there is nothing for it to
+///    lose; if it cannot be applied, that is `Err`. This is not a nicety: blind
+///    writers throughout the codebase (`core::repair::enqueue_repair`, the
+///    custodian's desired-state writes) `?` the call and ignore the
+///    [`CommitOutcome`], so a `Conflict` returned to them would read as success
+///    while the write silently vanished. An optimistic backend that must give up
+///    on a blind batch therefore exhausts its retries into `Err`, and a
+///    pessimistic one reports the lost race as `Err` — never as `Conflict`.
+///
+/// Pinned by `contract_require_absent_gates`, `contract_require_value_gates`,
+/// `contract_rename_race_yields_conflict` (clause 2) and
+/// `contract_blind_batch_is_never_conflict` (clause 3) in the shared suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitOutcome {
     /// All preconditions held; the batch was applied.
     Committed,
-    /// A precondition did not hold; nothing was written (e.g. a stale-version
-    /// writer, or a name that already exists).
+    /// A conditional batch's precondition did not hold — because it was already
+    /// false, or because a concurrent writer invalidated it before the commit
+    /// landed. Nothing was written (e.g. a stale-version writer, or a name that
+    /// already exists). A batch with no preconditions never yields this.
     Conflict,
 }
 
@@ -372,6 +491,15 @@ pub struct Precondition {
 
 /// A set of preconditions plus puts and deletes, applied atomically by
 /// [`commit`](MetadataStore::commit). Build it with the helpers below.
+///
+/// **A batch is not guaranteed idempotent.** Nothing here stops a caller from
+/// building one whose re-application is not a no-op (a counter bump guarded by a
+/// [`require`](WriteBatch::require) is the everyday case: replayed against the
+/// value it just wrote, it no longer means what it meant). That is why a backend
+/// may not blindly re-apply a batch whose commit returned an *unknown result* —
+/// see [`MetadataStore`]'s "Errors and the caller's obligations". A caller that
+/// wants replay safety must build that safety into the batch itself, with a
+/// precondition that makes the second application a `Conflict`.
 #[derive(Debug, Clone, Default)]
 pub struct WriteBatch {
     /// Conditions that must all hold for the batch to apply.

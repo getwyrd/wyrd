@@ -263,3 +263,123 @@ fn leaky_scan_index_store_passes_existing_sequential_contracts() {
         conformance::contract_require_value_gates(&LeakyScanIndexStore::default()).await;
     });
 }
+
+// ---- Violating store 4: a lost race reported as `Conflict` on a BLIND batch --
+//
+// Models the mistake an optimistic backend is structurally invited to make
+// (#437): its substrate reports ONE lost-race error for both batch shapes
+// (FoundationDB's `1020 not_committed`), so the lazy routing — "lost race ⇒
+// CommitOutcome::Conflict" — is right for a conditional batch and WRONG for a
+// blind one, which asserted nothing about prior state and therefore cannot lose
+// a precondition. Blind writers that `?` the commit and ignore the outcome
+// (`core::repair::enqueue_repair`, the custodian's desired-state writes) then
+// read a dropped write as success.
+//
+// The bug is race-only, which is the point: sequentially this store is a
+// perfectly correct `MetadataStore` and passes every OTHER clause in the suite,
+// including `contract_read_after_commit` (whose repeated blind overwrites would
+// catch any cruder violator that conflicted blind writes unconditionally). Only a
+// clause that drives two commits CONCURRENTLY can see it — which is why
+// `contract_blind_batch_is_never_conflict` has a concurrent half.
+
+/// A future that returns `Pending` exactly once, waking itself — a yield point,
+/// so two commits driven by `futures_util::future::join` on a single-threaded
+/// executor genuinely overlap (both enter `commit` before either finishes).
+struct YieldOnce(bool);
+
+impl std::future::Future for YieldOnce {
+    type Output = ();
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+#[derive(Default)]
+struct RaceConflatingStore {
+    truth: Mutex<HashMap<Vec<u8>, Bytes>>,
+    /// Commits currently between entry and apply — the stand-in for "another
+    /// writer touched my keys before my commit landed".
+    in_flight: Mutex<usize>,
+}
+
+#[async_trait]
+impl MetadataStore for RaceConflatingStore {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(self.truth.lock().unwrap().get(key).cloned())
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        let truth = self.truth.lock().unwrap();
+        Ok(truth
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        *self.in_flight.lock().unwrap() += 1;
+        // Give a concurrent sibling the chance to enter `commit` too — without this
+        // the executor would run each commit to completion and no race could form.
+        YieldOnce(false).await;
+        let raced = *self.in_flight.lock().unwrap() > 1;
+
+        let mut truth = self.truth.lock().unwrap();
+        let holds = batch
+            .preconditions
+            .iter()
+            .all(|pre| truth.get(&pre.key).cloned() == pre.expected);
+        if !holds {
+            *self.in_flight.lock().unwrap() -= 1;
+            return Ok(CommitOutcome::Conflict);
+        }
+        // THE BUG: the lost race is reported as `Conflict` whatever the batch's
+        // shape. Correct for the conditional batch above; a swallowed write here.
+        if raced {
+            *self.in_flight.lock().unwrap() -= 1;
+            return Ok(CommitOutcome::Conflict);
+        }
+        for k in &batch.deletes {
+            truth.remove(k);
+        }
+        for (k, v) in batch.puts {
+            truth.insert(k, v);
+        }
+        *self.in_flight.lock().unwrap() -= 1;
+        Ok(CommitOutcome::Committed)
+    }
+}
+
+#[test]
+#[should_panic(expected = "must never conflict")]
+fn race_conflating_store_fails_blind_batch_is_never_conflict() {
+    block_on(conformance::contract_blind_batch_is_never_conflict(
+        &RaceConflatingStore::default(),
+    ));
+}
+
+#[test]
+fn race_conflating_store_passes_every_other_contract() {
+    // The whole rest of the suite — not just the four sequential clauses — because
+    // this store's bug is invisible without concurrency, and no other clause drives
+    // two commits at once. That is precisely the discriminating power
+    // `contract_blind_batch_is_never_conflict` adds: without it, a backend could
+    // swallow every raced blind write and stay green across all seven other clauses.
+    block_on(async {
+        conformance::contract_commit_and_get(&RaceConflatingStore::default()).await;
+        conformance::contract_scan_by_prefix(&RaceConflatingStore::default()).await;
+        conformance::contract_require_absent_gates(&RaceConflatingStore::default()).await;
+        conformance::contract_require_value_gates(&RaceConflatingStore::default()).await;
+        conformance::contract_read_after_commit(&RaceConflatingStore::default()).await;
+        conformance::contract_rename_race_yields_conflict(&RaceConflatingStore::default()).await;
+        conformance::contract_scan_is_consistent_cut(&RaceConflatingStore::default()).await;
+    });
+}

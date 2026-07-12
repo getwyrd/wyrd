@@ -279,6 +279,126 @@ pub async fn contract_scan_is_consistent_cut(store: &impl MetadataStore) {
     );
 }
 
+// ---- The commit partition's third clause (#437) -----------------------------
+
+/// A **blind** batch — one carrying no preconditions — never yields
+/// [`CommitOutcome::Conflict`]: it either commits, or fails with `Err`.
+///
+/// The contract point the FoundationDB port made load-bearing, and the one the
+/// suite did not pin (`wyrd_traits::CommitOutcome`, clause 3). `Conflict` is the
+/// answer to "your precondition lost"; a batch that asserted nothing about prior
+/// state has nothing to lose, so a backend that gives up on one owes the caller an
+/// `Err`. It is not a stylistic preference: blind writers across the codebase
+/// (`core::repair::enqueue_repair`, the custodian's desired-state writes) `?` the
+/// call and ignore the returned [`CommitOutcome`] — a `Conflict` handed to them
+/// reads as success while the write silently vanished. The pressure to get this
+/// wrong is real and backend-shaped: an optimistic backend receives ONE lost-race
+/// error code for both batch shapes (FoundationDB's `1020 not_committed`) and must
+/// route it by shape, and a pessimistic one must not let a lock loss on a blind
+/// batch fall through the same path as a failed precondition.
+///
+/// Two halves, because the sequential half cannot reach the race:
+///
+/// - **Sequential**: blind overwrites and blind deletes of keys that already exist
+///   commit — including on a key a conditional writer just conflicted on.
+/// - **Concurrent**: two blind batches racing on the SAME key. Neither may come
+///   back `Conflict`; each must be `Committed` or `Err`. Which of the two, and
+///   whether either errors, is deliberately NOT asserted — that is backend
+///   latitude (an optimistic backend retries both to `Committed`; a pessimistic one
+///   may report the loser's lock loss as `Err`). The clause forbids exactly one
+///   answer: `Ok(Conflict)`.
+///
+/// A backend whose futures do not actually overlap (redb, whose write
+/// transactions serialize) passes the concurrent half trivially — as with
+/// [`contract_scan_is_consistent_cut`], the property's teeth are shown against a
+/// deliberately-violating store in `tests/demonstrated_red.rs`, not against the
+/// backend that cannot make it bite.
+pub async fn contract_blind_batch_is_never_conflict(store: &impl MetadataStore) {
+    let key = b"blind:k".to_vec();
+
+    // Seed, then blind-overwrite the now-existing key: no preconditions, so the
+    // overwrite must land — a store that reports "someone else already wrote this"
+    // as a Conflict is swallowing the write.
+    store
+        .commit(WriteBatch::new().put(key.clone(), "v1"))
+        .await
+        .unwrap();
+    let overwrite = store
+        .commit(WriteBatch::new().put(key.clone(), "v2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        overwrite,
+        CommitOutcome::Committed,
+        "a blind overwrite of an existing key must commit — it asserted nothing about \
+         the prior value, so there is nothing for it to lose"
+    );
+
+    // A conditional writer loses on this key…
+    let doomed = store
+        .commit(
+            WriteBatch::new()
+                .require(key.clone(), "STALE")
+                .put(key.clone(), "v3"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(doomed, CommitOutcome::Conflict, "the CAS writer loses");
+
+    // …and a blind batch on the very same key still commits: the Conflict belonged
+    // to the precondition, not to the key.
+    let blind_after_conflict = store
+        .commit(WriteBatch::new().put(key.clone(), "v4"))
+        .await
+        .unwrap();
+    assert_eq!(
+        blind_after_conflict,
+        CommitOutcome::Committed,
+        "a blind batch must commit even on a key a conditional writer just lost on"
+    );
+
+    // A blind delete of an existing key is the same rule on the other verb.
+    let blind_delete = store
+        .commit(WriteBatch::new().delete(key.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        blind_delete,
+        CommitOutcome::Committed,
+        "a blind delete of an existing key must commit"
+    );
+    assert_eq!(store.get(&key).await.unwrap(), None, "the delete landed");
+
+    // The race: two blind batches on ONE key, driven concurrently. Neither may be
+    // reported as a Conflict — that is the whole clause; anything else is latitude.
+    let racer = b"blind:race".to_vec();
+    let (left, right) = futures_util::future::join(
+        store.commit(WriteBatch::new().put(racer.clone(), "left")),
+        store.commit(WriteBatch::new().put(racer.clone(), "right")),
+    )
+    .await;
+    for (side, result) in [("left", left), ("right", right)] {
+        match result {
+            Ok(CommitOutcome::Committed) => {}
+            Ok(CommitOutcome::Conflict) => panic!(
+                "the {side} blind racer came back Conflict — a batch with no preconditions \
+                 must never conflict. Callers that `?` the commit and ignore the \
+                 CommitOutcome would read this as success while their write was dropped; \
+                 a backend that cannot apply a blind batch owes them an Err"
+            ),
+            Err(_) => {} // Backend latitude: a lost race on a blind batch may be an Err.
+        }
+    }
+    // Whatever the race decided, the key holds one of the two racers' values — the
+    // loser was never silently dropped in favour of nothing.
+    if let Some(value) = store.get(&racer).await.unwrap() {
+        assert!(
+            value.as_ref() == b"left" || value.as_ref() == b"right",
+            "the surviving value must be one of the two racers', not a torn write"
+        );
+    }
+}
+
 /// Drive **every** contract in this suite against a fresh store per clause.
 ///
 /// A backend runs the whole contract by calling this ONE function, so there is no
@@ -301,4 +421,5 @@ where
     contract_read_after_commit(&make_store("read_after_commit").await).await;
     contract_rename_race_yields_conflict(&make_store("rename_race").await).await;
     contract_scan_is_consistent_cut(&make_store("scan_consistent_cut").await).await;
+    contract_blind_batch_is_never_conflict(&make_store("blind_never_conflict").await).await;
 }

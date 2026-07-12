@@ -10,9 +10,14 @@ publish.workspace = true
 
 [dependencies]
 # The suite is written against the trait surface ONLY (ADR-0016 dependency rule):
-# it never depends on a concrete backend, so both `metadata-redb` and
-# `metadata-tikv` can drive the identical assertions.
+# it never depends on a concrete backend, so `metadata-redb`, `metadata-tikv` and
+# `metadata-fdb` can drive the identical assertions.
 wyrd-traits.workspace = true
+# `contract_blind_batch_is_never_conflict` (#437) has to drive TWO commits that
+# genuinely overlap — a blind batch can only *lose a race* concurrently, and the
+# race is the half of the clause a sequential interleaving cannot reach. This is
+# a combinator over the trait's own futures, not a backend dependency.
+futures-util.workspace = true
 
 [dev-dependencies]
 # `tests/demonstrated_red.rs` (#419) implements deliberately-violating
