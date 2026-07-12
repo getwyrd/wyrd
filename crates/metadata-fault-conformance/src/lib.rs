@@ -40,7 +40,7 @@
 //! Two properties, inherited from #257's iteration-12 amendment, are what stop this being a
 //! hollow green:
 //!
-//! * **Contention.** The defect class this guards — a missing or mis-ordered commit-point
+//! * **Contention.** The defect class this guards — a missing or misordered commit-point
 //!   re-check of a precondition — only fires under concurrent write-write contention. So ≥2
 //!   writers, each on its **own connection**, barrier-released together, race the SAME
 //!   compare-and-swap on a version cell across the fault window. Exactly one may win
@@ -463,7 +463,7 @@ where
 ///
 /// The unsharded path is what is under test here. #429's sharded/batched allocator reduces the
 /// pressure, but the unsharded path must still be *correct* under it, and a CAS allocator is
-/// exactly where a mis-classified `Conflict` (a lost race reported as success) hands two
+/// exactly where a misclassified `Conflict` (a lost race reported as success) hands two
 /// clients the same id.
 pub async fn contention_inode_allocator_hot_path<S, F, Fut>(
     make_store: F,
