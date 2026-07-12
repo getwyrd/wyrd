@@ -377,9 +377,10 @@ pub async fn contract_blind_batch_is_never_conflict(store: &impl MetadataStore) 
         store.commit(WriteBatch::new().put(racer.clone(), "right")),
     )
     .await;
+    let mut anyone_committed = false;
     for (side, result) in [("left", left), ("right", right)] {
         match result {
-            Ok(CommitOutcome::Committed) => {}
+            Ok(CommitOutcome::Committed) => anyone_committed = true,
             Ok(CommitOutcome::Conflict) => panic!(
                 "the {side} blind racer came back Conflict — a batch with no preconditions \
                  must never conflict. Callers that `?` the commit and ignore the \
@@ -389,13 +390,29 @@ pub async fn contract_blind_batch_is_never_conflict(store: &impl MetadataStore) 
             Err(_) => {} // Backend latitude: a lost race on a blind batch may be an Err.
         }
     }
-    // Whatever the race decided, the key holds one of the two racers' values — the
-    // loser was never silently dropped in favour of nothing.
-    if let Some(value) = store.get(&racer).await.unwrap() {
-        assert!(
+
+    // `Committed` is a claim about the world, and the clause holds the backend to it: if
+    // EITHER racer said Committed, the key must EXIST and hold one of the two racers'
+    // values. Absence is legal only when BOTH racers errored — the one case in which
+    // nothing was ever claimed to have landed.
+    //
+    // Asserting only "if a value is present it is one of the two" would let the very bug
+    // this clause exists to catch walk straight through: a backend that returns
+    // `Ok(Committed)` for a raced blind batch and then drops the write leaves the key
+    // absent, so a presence-conditional assertion simply skips and the clause passes.
+    // `Conflict` is not the only way to swallow a blind write — lying about `Committed` is
+    // the other.
+    match store.get(&racer).await.unwrap() {
+        Some(value) => assert!(
             value.as_ref() == b"left" || value.as_ref() == b"right",
             "the surviving value must be one of the two racers', not a torn write"
-        );
+        ),
+        None => assert!(
+            !anyone_committed,
+            "a blind racer returned Committed, but the key is absent — the write was \
+             dropped while the caller was told it landed. `Committed` means the batch was \
+             applied; a backend that cannot apply a blind batch must return Err"
+        ),
     }
 }
 

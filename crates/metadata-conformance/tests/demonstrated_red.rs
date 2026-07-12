@@ -383,3 +383,99 @@ fn race_conflating_store_passes_every_other_contract() {
         conformance::contract_scan_is_consistent_cut(&RaceConflatingStore::default()).await;
     });
 }
+
+// ---- Violating store 5: a raced blind write reported as `Committed` and DROPPED ----
+//
+// The other half of "swallowing a blind write" (#437, and the review of the clause that
+// caught it): `Conflict` is the loud way to swallow one, and this is the quiet way — the
+// backend gives up on the raced batch, reports `Ok(Committed)`, and writes nothing. Every
+// caller believes the write landed; none of them re-reads, because `Committed` is a claim
+// that it already did.
+//
+// Like `RaceConflatingStore`, the bug is race-only: sequentially this is a perfectly
+// correct store, so it passes every other clause in the suite. And it slips past the FIRST
+// draft of `contract_blind_batch_is_never_conflict`, whose closing assertion was
+// presence-conditional (`if let Some(value) = …`) — key absent ⇒ assertion skipped ⇒ green.
+// The clause now requires the key to EXIST whenever either racer claimed `Committed`, which
+// is what makes this store go red.
+
+#[derive(Default)]
+struct LyingCommitStore {
+    truth: Mutex<HashMap<Vec<u8>, Bytes>>,
+    in_flight: Mutex<usize>,
+    /// Sticky: set the moment two commits are in flight at once. `in_flight` alone is not
+    /// enough — the first racer decrements on its way out, so by the time the second
+    /// resumes the counter reads 1 and it would not see the collision it was part of.
+    collided: Mutex<bool>,
+}
+
+#[async_trait]
+impl MetadataStore for LyingCommitStore {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(self.truth.lock().unwrap().get(key).cloned())
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        let truth = self.truth.lock().unwrap();
+        Ok(truth
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        *self.in_flight.lock().unwrap() += 1;
+        YieldOnce(false).await;
+        if *self.in_flight.lock().unwrap() > 1 {
+            *self.collided.lock().unwrap() = true;
+        }
+        let raced = *self.collided.lock().unwrap();
+
+        let mut truth = self.truth.lock().unwrap();
+        let holds = batch
+            .preconditions
+            .iter()
+            .all(|pre| truth.get(&pre.key).cloned() == pre.expected);
+        if !holds {
+            *self.in_flight.lock().unwrap() -= 1;
+            return Ok(CommitOutcome::Conflict);
+        }
+        // THE BUG: the raced blind batch is abandoned — and reported as if it had landed.
+        if raced && batch.preconditions.is_empty() {
+            *self.in_flight.lock().unwrap() -= 1;
+            return Ok(CommitOutcome::Committed);
+        }
+        for k in &batch.deletes {
+            truth.remove(k);
+        }
+        for (k, v) in batch.puts {
+            truth.insert(k, v);
+        }
+        *self.in_flight.lock().unwrap() -= 1;
+        Ok(CommitOutcome::Committed)
+    }
+}
+
+#[test]
+#[should_panic(expected = "the key is absent")]
+fn lying_commit_store_fails_blind_batch_is_never_conflict() {
+    block_on(conformance::contract_blind_batch_is_never_conflict(
+        &LyingCommitStore::default(),
+    ));
+}
+
+#[test]
+fn lying_commit_store_passes_every_other_contract() {
+    // Race-only, so the whole rest of the suite is green against it — including
+    // `contract_commit_and_get`, whose blind puts all land because nothing races them.
+    block_on(async {
+        conformance::contract_commit_and_get(&LyingCommitStore::default()).await;
+        conformance::contract_scan_by_prefix(&LyingCommitStore::default()).await;
+        conformance::contract_require_absent_gates(&LyingCommitStore::default()).await;
+        conformance::contract_require_value_gates(&LyingCommitStore::default()).await;
+        conformance::contract_read_after_commit(&LyingCommitStore::default()).await;
+        conformance::contract_rename_race_yields_conflict(&LyingCommitStore::default()).await;
+        conformance::contract_scan_is_consistent_cut(&LyingCommitStore::default()).await;
+    });
+}
