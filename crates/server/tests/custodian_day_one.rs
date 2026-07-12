@@ -1777,3 +1777,67 @@ async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
          not remove it. got: {logged}"
     );
 }
+
+// ---- #531 review (P2): installing logging must never take the program down ----
+
+/// **A second in-process `cli::run` must still run the command.**
+///
+/// `cli::run` is public and in-process callable — that is the module's stated premise ("the
+/// command logic lives in the library so it is unit-testable"). Installing the log subscriber
+/// used to treat an already-installed global as a hard error, so the SECOND call returned
+/// `ExitCode(2)` — *before dispatching the command at all*:
+///
+/// ```text
+/// wyrd: could not install the log subscriber: a global default trace dispatcher has already been set
+/// PROBE first=ExitCode(0)  second=ExitCode(2)
+/// ```
+///
+/// Logging refusing to initialise took the whole program down with it — a spectacular
+/// inversion for a diagnostics feature, and it would equally have broken any embedder that
+/// installed its own subscriber first. An already-present subscriber is an ordinary state, not
+/// a fault.
+///
+/// Pre-fix this is RED on the second call.
+#[test]
+fn running_the_cli_twice_in_process_still_dispatches_the_command() {
+    let argv = || ["wyrd".to_string(), "demo".to_string()].into_iter();
+
+    let first = wyrd_server::cli::run(argv());
+    let second = wyrd_server::cli::run(argv());
+
+    // `demo` is the zero-setup in-memory round trip: it must succeed both times.
+    assert_eq!(
+        format!("{second:?}"),
+        format!("{first:?}"),
+        "the second in-process `cli::run` must behave exactly like the first; pre-fix it exits \
+         2 without ever dispatching `demo`, because the subscriber from the first call is \
+         already installed"
+    );
+    assert_eq!(
+        format!("{first:?}"),
+        format!("{:?}", std::process::ExitCode::SUCCESS),
+        "`wyrd demo` succeeds — so the assertion above is comparing two SUCCESSES, not two \
+         identical failures"
+    );
+}
+
+/// The other half, which the fix must not trade away: a **malformed** `--log-level` is still
+/// fatal. Silently running mute because of a typo is the exact failure mode this feature exists
+/// to end, so it is a genuine operator error — unlike an already-installed subscriber.
+#[test]
+fn a_malformed_log_level_still_fails_the_process_loudly() {
+    let code = wyrd_server::cli::run(
+        [
+            "wyrd".to_string(),
+            "demo".to_string(),
+            "--log-level".to_string(),
+            "==nonsense==".to_string(),
+        ]
+        .into_iter(),
+    );
+    assert_eq!(
+        format!("{code:?}"),
+        format!("{:?}", std::process::ExitCode::from(2)),
+        "a typo in --log-level must stop the process, not degrade it to silence"
+    );
+}

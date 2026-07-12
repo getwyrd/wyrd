@@ -294,6 +294,15 @@ fn log_config(parsed: &ParsedArgs) -> Result<LogConfig, BoxError> {
 }
 
 /// Install the process-global log subscriber from the raw argv, before dispatch.
+///
+/// The only thing that can fail here is a **malformed** `--log-level` / `--log-format`, which
+/// is a genuine operator error and must stop the process — running mute because of a typo is
+/// the failure mode this whole feature exists to end.
+///
+/// Installing the subscriber itself is *infallible* ([`logging::init_global`]): finding one
+/// already installed is ordinary, not a fault (a second in-process [`run`], or an embedder with
+/// its own subscriber). Treating it as fatal made `run` exit 2 without dispatching the command
+/// at all (#531 review).
 fn install_logging(args: &[String]) -> Result<(), BoxError> {
     // The subcommand is `args[0]`; its flags follow. A parse failure here is not fatal to
     // logging — the subcommand will report it properly — so fall back to the defaults and
@@ -305,7 +314,8 @@ fn install_logging(args: &[String]) -> Result<(), BoxError> {
             Err(_) => LogConfig::default(),
         },
     };
-    logging::init_global(&config)
+    logging::init_global(&config);
+    Ok(())
 }
 
 fn usage() {

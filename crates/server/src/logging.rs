@@ -176,12 +176,32 @@ where
 
 /// Install the log subscriber as the process-global default, writing to **stderr**.
 ///
-/// Called once at CLI entry, before any role runs, so a callsite hit early in startup
-/// registers its interest against a real subscriber rather than latching
-/// `Interest::never` against an empty one.
-pub fn init_global(config: &LogConfig) -> Result<(), BoxError> {
-    tracing::dispatcher::set_global_default(dispatch(config, io::stderr, Identity::new()))
-        .map_err(|e| format!("could not install the log subscriber: {e}").into())
+/// Called at CLI entry, before any role runs, so a callsite hit early in startup registers its
+/// interest against a real subscriber rather than latching `Interest::never` against an empty
+/// one.
+///
+/// # An already-installed subscriber is not an error
+///
+/// Infallible on purpose. `set_global_default` has exactly one failure — *a global default has
+/// already been set* — and that is a perfectly ordinary state, not a fault:
+///
+/// * [`crate::cli::run`] is **public and in-process callable** (the module doc's whole premise:
+///   the command logic lives in the library "so it is unit-testable"). A second call in one
+///   process necessarily finds the subscriber from the first.
+/// * An **embedder** that installed its own subscriber must keep it. Ours must not fight it.
+///
+/// Treating that as fatal made `run` return exit code 2 **before dispatching the command at
+/// all** — logging refusing to initialise took the whole program down with it, which is a
+/// spectacular inversion for a diagnostics feature (caught in review on #531).
+///
+/// A *malformed* `--log-level` / `--log-format` still fails the process loudly — but that is
+/// caught earlier, by [`LogConfig::new`], and is a genuine operator error: silently running
+/// mute because of a typo is the failure mode this module exists to end. The two cases are
+/// deliberately different.
+///
+/// When a subscriber is already present, this config is ignored — the installed one wins.
+pub fn init_global(config: &LogConfig) {
+    let _ = tracing::dispatcher::set_global_default(dispatch(config, io::stderr, Identity::new()));
 }
 
 #[cfg(test)]
