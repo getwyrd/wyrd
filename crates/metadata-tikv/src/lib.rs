@@ -383,12 +383,18 @@ mod store {
     /// pessimistic-lock RPC is always a definite non-commit — no prewrite has happened, so
     /// nothing can have been applied — which is why those sites keep the definite
     /// classifier below.
+    /// **The rule is per-LEAF, deliberately.** A multi-region commit reports its per-region
+    /// failures wrapped (`ExtractedErrors` / `MultipleKeyErrors`), so ONE aggregate can
+    /// carry a write conflict from one region *and* a transport error from another. Asking
+    /// "is this whole error a write conflict?" first, as a short-circuit, would answer
+    /// **yes** on that mixed aggregate — `is_write_conflict` recurses too — and classify the
+    /// batch as a definite `Conflict`, discarding the nested transport error whose region
+    /// may well have committed. That is backwards: **unknown outranks conflict**, because
+    /// `Conflict` promises *nothing was written* and the mixed case cannot promise it. So a
+    /// conflict short-circuits nothing. Each leaf is judged on its own, and any undetermined
+    /// leaf makes the whole commit undetermined.
     fn is_undetermined_commit(err: &tikv_client::Error) -> bool {
         use tikv_client::Error;
-        // A write conflict is a decision the server sent us: definite, never unknown.
-        if is_write_conflict(err) {
-            return false;
-        }
         match err {
             Error::UndeterminedError(_)
             | Error::Grpc(_)
@@ -397,6 +403,10 @@ mod store {
             Error::MultipleKeyErrors(errs) | Error::ExtractedErrors(errs) => {
                 errs.iter().any(is_undetermined_commit)
             }
+            Error::PessimisticLockError { inner, .. } => is_undetermined_commit(inner),
+            // A `KeyError` LEAF — a write conflict, `locked`, `abort`, a rollback record —
+            // arrived inside a response we RECEIVED: the server decided and told us.
+            // Definite, never unknown.
             _ => false,
         }
     }
@@ -736,6 +746,30 @@ mod store {
             // must not be lost in the wrapper.
             let wrapped = Error::MultipleKeyErrors(vec![region_error()]);
             assert!(is_undetermined_commit(&wrapped));
+        }
+
+        #[test]
+        fn a_mixed_aggregate_is_undetermined_conflict_must_not_mask_it() {
+            // A multi-region commit can fail with ONE aggregate carrying a write conflict
+            // from one region and a transport error from another. `is_write_conflict`
+            // recurses, so it answers `true` here — and an earlier draft short-circuited on
+            // that and reported `Ok(Conflict)`, throwing away a nested error whose region
+            // may well have committed. `Conflict` promises nothing was written; this
+            // aggregate cannot promise it. Unknown outranks conflict.
+            let mixed = Error::ExtractedErrors(vec![write_conflict(), region_error()]);
+            assert!(
+                is_write_conflict(&mixed),
+                "the conflict predicate does see the conflict leaf — which is exactly why \
+                 it must not be allowed to short-circuit the undetermined check"
+            );
+            assert!(
+                is_undetermined_commit(&mixed),
+                "a conflict leaf must NOT mask an undetermined leaf: a caller told \
+                 `Conflict` retries a CAS whose fate is still ambiguous"
+            );
+            // Order-independent: the classifier must not depend on which leaf comes first.
+            let mixed_reversed = Error::MultipleKeyErrors(vec![region_error(), write_conflict()]);
+            assert!(is_undetermined_commit(&mixed_reversed));
         }
 
         #[test]
