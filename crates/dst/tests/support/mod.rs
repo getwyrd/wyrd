@@ -54,7 +54,7 @@
 //!   before the `conditional` check (`crates/metadata-fdb/src/lib.rs:212-215`, doc at
 //!   `:191-204`). It carries the code on the error so a caller can tell them apart:
 //!   "Where 1021 promises the transaction is out of flight, 1031 promises nothing"
-//!   (`:165`, and `may_still_commit`, `:240-249`). [`SimCommitUnknownResult`] carries
+//!   (`:165`, and `may_still_commit`, `:240-249`). the seam's `CommitUnknownResult` carries
 //!   the same code and reproduces the same split: after a 1021 a re-read settles the
 //!   outcome once and for all; after a 1031 the batch may still land **later**, so a
 //!   re-read that observes nothing proves nothing.
@@ -71,7 +71,7 @@
 //!   byte-identically (`crates/metadata-fdb/src/lib.rs:873-875`). As with the
 //!   simulated-TiKV choice above, **the human ratifies this at sign-off.**
 //! * **No `Undeterminable` `CommitOutcome`.** The production driver models the
-//!   ambiguous outcome as `Err(classify::CommitUnknownResult)`, never `Ok(Conflict)`
+//!   ambiguous outcome as `Err(wyrd_traits::CommitUnknownResult)`, never `Ok(Conflict)`
 //!   (`crates/metadata-fdb/src/lib.rs:67-73`, `:150-153`). The model reproduces exactly
 //!   that; adding a third `CommitOutcome` variant would make the simulation *less*
 //!   faithful, not more.
@@ -79,13 +79,14 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
-use std::fmt;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Precondition, Result, WriteBatch};
+use wyrd_traits::{
+    BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, Precondition, Result, WriteBatch,
+};
 
 /// How faithfully the model renders a commit's async shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,53 +330,30 @@ pub const SIM_TRANSACTION_TIMED_OUT: i32 = 1031;
 /// The simulated undeterminable commit outcome: the batch **may or may not** have been
 /// applied and the client cannot tell.
 ///
-/// A distinguishable error type carrying the FDB code, not a `String` — mirroring the
-/// production driver's downcastable `classify::CommitUnknownResult`
-/// (`crates/metadata-fdb/src/lib.rs:233-237`, "Errors a caller can tell apart" at
-/// `:110-117`) — so a scenario settles an ambiguous commit by *type*, never by
-/// string-matching a message, and can tell the two codes apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SimCommitUnknownResult {
-    /// The FDB error code that reported the undeterminable outcome: either
-    /// [`SIM_COMMIT_UNKNOWN_RESULT`] or [`SIM_TRANSACTION_TIMED_OUT`].
-    pub code: i32,
-}
-
-impl SimCommitUnknownResult {
-    /// Whether the cluster may still apply this batch **after** the error was returned —
-    /// the byte-for-byte rule of `classify::CommitUnknownResult::may_still_commit`
-    /// (`crates/metadata-fdb/src/lib.rs:247-249`).
-    ///
-    /// `false` for 1021, whose guarantee is that the transaction is already out of
-    /// flight. `true` for 1031, where the commit may have been sent and may land later:
-    /// a re-read that observes nothing does **not** prove nothing will land.
-    pub fn may_still_commit(self) -> bool {
-        self.code == SIM_TRANSACTION_TIMED_OUT
+/// The **seam** error the production drivers raise (`wyrd_traits::CommitUnknownResult`),
+/// built for a simulated-FDB commit code (#515).
+///
+/// The simulator used to define its OWN `SimCommitUnknownResult`, a third copy of a type
+/// FDB and the seam already had. That defeated the point of the model: the DST exists to
+/// exercise the caller's obligation after an ambiguous commit, but a scenario (or any
+/// generic helper) that downcasts to the seam type — as production callers now do — saw a
+/// simulated unknown commit as a plain fault. The simulator raises the real type, so the
+/// DST path exercises the same downcast the FDB and TiKV backends do.
+///
+/// The code is carried through, and `may_still_commit` is derived from it by the same rule
+/// production uses (`crates/metadata-fdb/src/lib.rs`, `classify::commit_unknown_result`):
+/// `false` for 1021, whose guarantee is that the transaction is already out of flight;
+/// `true` for 1031, where the commit may still land later, so a re-read that observes
+/// nothing does not prove nothing will land.
+#[must_use]
+pub fn sim_commit_unknown_result(code: i32) -> CommitUnknownResult {
+    CommitUnknownResult {
+        backend: "foundationdb (simulated)",
+        code: Some(code),
+        detail: format!("simulated FoundationDB error {code}"),
+        may_still_commit: code == SIM_TRANSACTION_TIMED_OUT,
     }
 }
-
-impl fmt::Display for SimCommitUnknownResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "simulated-FDB: commit returned an unknown result (error {}): the batch may \
-             or may not have been applied; the caller must re-read to establish what \
-             happened",
-            self.code,
-        )?;
-        if self.may_still_commit() {
-            write!(
-                f,
-                ". It timed out rather than reporting an unknown result, so it may still \
-                 be applied AFTER this error: a re-read that observes nothing does not \
-                 prove the batch will never land.",
-            )?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for SimCommitUnknownResult {}
 
 /// One `u64` from a `ChaCha8Rng`, without pulling the `rand::Rng` trait into scope at
 /// every call site (the same helper shape as `crates/dst/tests/network.rs:521-525`).
@@ -401,7 +379,7 @@ pub enum FdbFidelity {
     /// [`SimFdbMetadataStore::arm_commit_ambiguity`]): on a commit the resolver accepted,
     /// the reply is lost. The model decides from the seed whether the mutation landed —
     /// and, for [`SIM_TRANSACTION_TIMED_OUT`], whether it is still in flight and lands
-    /// *later* — then returns [`SimCommitUnknownResult`] **without telling the caller
+    /// *later* — then returns the seam's `CommitUnknownResult` **without telling the caller
     /// which**. When the batch does land it is applied **whole**: one atomic step.
     CommitUnknownResult,
     /// The **violating twin** of [`Self::CommitUnknownResult`] (cf. the violating stores
@@ -738,7 +716,7 @@ impl SimFdbMetadataStore {
 
         // Never `Ok(Conflict)`, never retried by the driver: a `WriteBatch` is not
         // guaranteed idempotent (`crates/metadata-fdb/src/lib.rs:67-69`).
-        Err(BoxError::from(SimCommitUnknownResult { code }))
+        Err(BoxError::from(sim_commit_unknown_result(code)))
     }
 }
 

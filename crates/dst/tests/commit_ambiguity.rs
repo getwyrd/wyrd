@@ -69,12 +69,12 @@ use std::sync::Arc;
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_core::metadata::{ChunkRef, EcScheme, InodeRecord};
 use wyrd_core::{metadata, read, write};
-use wyrd_traits::{BoxError, CommitOutcome, MetadataStore};
+use wyrd_traits::{BoxError, CommitOutcome, CommitUnknownResult, MetadataStore};
 
 #[path = "support/mod.rs"]
 mod support;
 use support::{
-    FdbFidelity, FdbObservations, SimCommitUnknownResult, SimFdbMetadataStore,
+    sim_commit_unknown_result, FdbFidelity, FdbObservations, SimFdbMetadataStore,
     SIM_COMMIT_UNKNOWN_RESULT, SIM_TRANSACTION_TIMED_OUT,
 };
 
@@ -107,9 +107,10 @@ fn ids_from(base: u128) -> impl FnMut() -> u128 {
 /// The `Err` a simulated-FDB commit may legitimately return, by **type** — never by
 /// string-matching a message. Any other `Err` (a blind batch losing a race, a fault) is a
 /// bug and fails here.
-fn expect_ambiguous(err: &BoxError) -> SimCommitUnknownResult {
-    *err.downcast_ref::<SimCommitUnknownResult>()
+fn expect_ambiguous(err: &BoxError) -> CommitUnknownResult {
+    err.downcast_ref::<CommitUnknownResult>()
         .unwrap_or_else(|| panic!("a simulated-FDB commit returned a non-ambiguous Err: {err}"))
+        .clone()
 }
 
 /// How many `orphan:` records the superseding batch of an overwrite over `prior` stages —
@@ -254,9 +255,9 @@ async fn ambiguous_cas_settles_over(meta: Arc<SimFdbMetadataStore>, observer: Ob
             Ok(CommitOutcome::Conflict) => false,
             Err(err) => {
                 let ambiguous = expect_ambiguous(err);
-                assert_eq!(ambiguous.code, SIM_COMMIT_UNKNOWN_RESULT);
+                assert_eq!(ambiguous.code, Some(SIM_COMMIT_UNKNOWN_RESULT));
                 assert!(
-                    !ambiguous.may_still_commit(),
+                    !ambiguous.may_still_commit,
                     "1021 promises the transaction is out of flight"
                 );
                 match observer {
@@ -473,7 +474,7 @@ async fn ambiguous_pending_put_over(meta: Arc<SimFdbMetadataStore>, observer: Bl
         .await
         .expect_err("the nemesis must strike the Intent phase's blind put");
     let ambiguous = expect_ambiguous(&err);
-    assert_eq!(ambiguous.code, SIM_COMMIT_UNKNOWN_RESULT);
+    assert_eq!(ambiguous.code, Some(SIM_COMMIT_UNKNOWN_RESULT));
     assert_eq!(
         meta.observations().ambiguous_blind_commits,
         1,
@@ -586,17 +587,11 @@ fn assuming_an_ambiguous_blind_put_landed_leaves_a_chunk_unprotected() {
 #[test]
 fn the_two_undeterminable_codes_are_not_equally_bad() {
     assert!(
-        !SimCommitUnknownResult {
-            code: SIM_COMMIT_UNKNOWN_RESULT
-        }
-        .may_still_commit(),
+        !sim_commit_unknown_result(SIM_COMMIT_UNKNOWN_RESULT).may_still_commit,
         "1021 promises the transaction is out of flight"
     );
     assert!(
-        SimCommitUnknownResult {
-            code: SIM_TRANSACTION_TIMED_OUT
-        }
-        .may_still_commit(),
+        sim_commit_unknown_result(SIM_TRANSACTION_TIMED_OUT).may_still_commit,
         "1031 promises nothing (crates/metadata-fdb/src/lib.rs:165)"
     );
 }
@@ -638,9 +633,9 @@ async fn timed_out_commit_over(meta: Arc<SimFdbMetadataStore>, observer: Timeout
         .await
         .expect_err("the nemesis must strike the CAS");
     let ambiguous = expect_ambiguous(&err);
-    assert_eq!(ambiguous.code, SIM_TRANSACTION_TIMED_OUT);
+    assert_eq!(ambiguous.code, Some(SIM_TRANSACTION_TIMED_OUT));
     assert!(
-        ambiguous.may_still_commit(),
+        ambiguous.may_still_commit,
         "1031 must be distinguishable from 1021 by the code the error carries"
     );
 
@@ -709,7 +704,7 @@ fn a_timed_out_commit_may_still_land_after_the_settling_re_read() {
 /// The observer settles the timed-out commit with one re-read, exactly as it is entitled to
 /// do after a 1021. On the seeds where the batch was still in flight, it lands afterwards and
 /// the observer's "settled" answer was wrong. This is the assertion that would be missing if
-/// `SimCommitUnknownResult` were the previous unit struct carrying no code — the ambiguity
+/// the seam's `CommitUnknownResult` were the previous unit struct carrying no code — the ambiguity
 /// space would be only the out-of-flight half of itself.
 #[test]
 #[should_panic(expected = "a re-read does not settle a timed-out commit")]
@@ -807,9 +802,9 @@ async fn contended_cas_under_1031_over(
             Ok(CommitOutcome::Conflict) => false,
             Err(err) => {
                 let ambiguous = expect_ambiguous(err);
-                assert_eq!(ambiguous.code, SIM_TRANSACTION_TIMED_OUT);
+                assert_eq!(ambiguous.code, Some(SIM_TRANSACTION_TIMED_OUT));
                 assert!(
-                    ambiguous.may_still_commit(),
+                    ambiguous.may_still_commit,
                     "1031 is not out of flight — only the deferral settles its outcome"
                 );
                 match observer {
@@ -953,7 +948,10 @@ async fn deferred_1031_settles_against_current_truth(meta: Arc<SimFdbMetadataSto
     let a_err = write::commit_overwrite(&*meta, 1, &prior, &a, ORPHANED_AT)
         .await
         .expect_err("the 1031 nemesis must strike A's CAS");
-    assert_eq!(expect_ambiguous(&a_err).code, SIM_TRANSACTION_TIMED_OUT);
+    assert_eq!(
+        expect_ambiguous(&a_err).code,
+        Some(SIM_TRANSACTION_TIMED_OUT)
+    );
 
     // Only the in-flight fate exercises the deferral; landed-now / dropped are leg 4a's.
     if meta.in_flight() == 0 {

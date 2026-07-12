@@ -563,6 +563,15 @@ fn the_dst_support_module_declares_the_simulated_fdb_store() {
     // Each needle names a *load-bearing* part of the model, so an empty struct would not
     // satisfy this: the store, its `MetadataStore` impl, the ambiguity nemesis, and both
     // members of the undeterminable class.
+    //
+    // The model raises the SEAM error (`wyrd_traits::CommitUnknownResult`), not a private
+    // look-alike of its own (#515). That is what makes the DST exercise the same caller
+    // obligation the real backends impose: a scenario — or any generic helper — downcasts
+    // to the one type production raises. It used to define its own `SimCommitUnknownResult`
+    // with a `may_still_commit` method, so a seam-level downcast saw a simulated unknown
+    // commit as a plain fault. The needles below pin the replacement, including that the
+    // 1021-vs-1031 distinction is still DERIVED from the code rather than flattened away —
+    // an `Err` that always said `may_still_commit: true` would model only half the class.
     let support = crate_dir().join("tests/support/mod.rs");
     let text = std::fs::read_to_string(&support)
         .unwrap_or_else(|e| panic!("read {}: {e}", support.display()));
@@ -572,7 +581,8 @@ fn the_dst_support_module_declares_the_simulated_fdb_store() {
         "pub fn arm_commit_ambiguity",
         "pub const SIM_COMMIT_UNKNOWN_RESULT: i32 = 1021",
         "pub const SIM_TRANSACTION_TIMED_OUT: i32 = 1031",
-        "pub fn may_still_commit",
+        "pub fn sim_commit_unknown_result(code: i32) -> CommitUnknownResult",
+        "may_still_commit: code == SIM_TRANSACTION_TIMED_OUT",
     ] {
         assert!(
             text.contains(needle),

@@ -139,7 +139,6 @@
 /// conditional = !batch.preconditions.is_empty();` and a lost race is `Conflict` **only**
 /// for a conditional batch.
 pub mod classify {
-    use std::fmt;
 
     /// FDB error `1020 not_committed`: "Transaction not committed due to conflict with
     /// another transaction." The single FDB signal for a lost read-write race — the
@@ -219,59 +218,31 @@ pub mod classify {
         CommitClass::Fault
     }
 
-    /// A commit whose outcome FoundationDB could not determine ([`COMMIT_UNKNOWN_RESULT`] or
-    /// [`TRANSACTION_TIMED_OUT`]): the batch may or may not have been applied.
+    /// The seam-crate unknown-result error, re-exported (#515).
     ///
-    /// Surfaced as the store's `Err` — a **distinguishable** typed error a caller can
-    /// downcast to — rather than retried, because a `WriteBatch` is not guaranteed
-    /// idempotent (re-applying a blind `put` is harmless, but re-applying a batch that
-    /// bumps a version counter is not, and the trait admits both).
-    ///
-    /// The two codes are not equally bad, so [`code`](Self::code) is carried rather than
-    /// discarded and [`may_still_commit`](Self::may_still_commit) reads the difference off
-    /// it: 1021 guarantees the transaction is no longer in flight, 1031 guarantees nothing.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct CommitUnknownResult {
-        /// The FDB error code that reported the undeterminable outcome.
-        pub code: i32,
-    }
+    /// It was defined *here*, as an FDB-only type — so a consumer could only recognise an
+    /// undetermined commit if it happened to know it held a FoundationDB store, and the DST
+    /// harness carried a third hand-rolled copy. One class, one type, in `wyrd_traits`; the
+    /// FDB-native code survives as [`CommitUnknownResult::code`].
+    pub use wyrd_traits::CommitUnknownResult;
 
-    impl CommitUnknownResult {
-        /// Whether the cluster may still apply this batch **after** the error was returned.
-        ///
-        /// `false` for [`COMMIT_UNKNOWN_RESULT`], whose guarantee is that the transaction is
-        /// already out of flight — so a re-read establishes the outcome once and for all.
-        /// `true` for [`TRANSACTION_TIMED_OUT`], where the commit may have been sent and may
-        /// land later: a re-read that sees nothing does **not** prove nothing will land.
-        #[must_use]
-        pub fn may_still_commit(self) -> bool {
-            self.code == TRANSACTION_TIMED_OUT
+    /// Build the seam error for an FDB commit code that reported an undeterminable outcome
+    /// ([`COMMIT_UNKNOWN_RESULT`] or [`TRANSACTION_TIMED_OUT`]).
+    ///
+    /// The two codes are not equally bad, and `may_still_commit` reads the difference off
+    /// the code: 1021 guarantees the transaction is already out of flight, so a re-read
+    /// settles the outcome once and for all; 1031 guarantees nothing — the commit may have
+    /// been sent and may land *after* the error, so a re-read that sees nothing proves
+    /// nothing.
+    #[must_use]
+    pub fn commit_unknown_result(code: i32) -> CommitUnknownResult {
+        CommitUnknownResult {
+            backend: "foundationdb",
+            code: Some(code),
+            detail: format!("FoundationDB error {code}"),
+            may_still_commit: code == TRANSACTION_TIMED_OUT,
         }
     }
-
-    impl fmt::Display for CommitUnknownResult {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "metadata commit returned an unknown result (FoundationDB error {}): the \
-                 batch may or may not have been applied. It is not retried — a WriteBatch \
-                 is not guaranteed idempotent — and it is not a Conflict; the caller must \
-                 re-read to establish what happened.",
-                self.code,
-            )?;
-            if self.may_still_commit() {
-                write!(
-                    f,
-                    " The commit timed out rather than reporting an unknown result, so it \
-                     may still be applied AFTER this error: a re-read that observes nothing \
-                     does not prove the batch will never land.",
-                )?;
-            }
-            Ok(())
-        }
-    }
-
-    impl std::error::Error for CommitUnknownResult {}
 
     #[cfg(test)]
     mod tests {
@@ -340,10 +311,7 @@ pub mod classify {
 
         #[test]
         fn unknown_result_error_is_operator_visible() {
-            let msg = CommitUnknownResult {
-                code: COMMIT_UNKNOWN_RESULT,
-            }
-            .to_string();
+            let msg = commit_unknown_result(COMMIT_UNKNOWN_RESULT).to_string();
             assert!(msg.contains("1021"), "names the error code: {msg}");
             assert!(
                 msg.contains("not retried"),
@@ -355,14 +323,10 @@ pub mod classify {
         fn only_a_timeout_may_still_commit_after_the_error() {
             // The distinction a caller acts on: after 1021 a re-read settles the question;
             // after 1031 it does not, because the commit may still be in flight.
-            let unknown = CommitUnknownResult {
-                code: COMMIT_UNKNOWN_RESULT,
-            };
-            let timed_out = CommitUnknownResult {
-                code: TRANSACTION_TIMED_OUT,
-            };
-            assert!(!unknown.may_still_commit());
-            assert!(timed_out.may_still_commit());
+            let unknown = commit_unknown_result(COMMIT_UNKNOWN_RESULT);
+            let timed_out = commit_unknown_result(TRANSACTION_TIMED_OUT);
+            assert!(!unknown.may_still_commit);
+            assert!(timed_out.may_still_commit);
 
             let msg = timed_out.to_string();
             assert!(msg.contains("1031"), "names the error code: {msg}");
@@ -994,7 +958,7 @@ mod store {
     use foundationdb::{Database, FdbError, RangeOption, Transaction, TransactionCommitError};
     use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
 
-    use crate::classify::{self, CommitClass, CommitUnknownResult};
+    use crate::classify::{self, CommitClass};
     use crate::paging::{self, PageStep, ScanCapExceeded};
     use crate::preflight;
     use crate::{config, keyspace};
@@ -1646,7 +1610,7 @@ mod store {
         match classify::classify_commit_error(err.code(), conditional) {
             CommitClass::Conflict => Ok(CommitOutcome::Conflict),
             CommitClass::UnknownResult => {
-                Err(BoxError::from(CommitUnknownResult { code: err.code() }))
+                Err(BoxError::from(classify::commit_unknown_result(err.code())))
             }
             CommitClass::Fault => Err(BoxError::from(err)),
         }
@@ -1907,7 +1871,8 @@ mod store {
                  Ok(Conflict) (a `?`-only caller would drop the write)",
             );
             assert!(
-                err.downcast_ref::<CommitUnknownResult>().is_some(),
+                err.downcast_ref::<crate::classify::CommitUnknownResult>()
+                    .is_some(),
                 "1021 must be distinguishable by downcast, not an opaque fault: {err}",
             );
         }
@@ -1939,7 +1904,8 @@ mod store {
             assert_eq!(target.resets, 0);
             let err = outcome.expect_err("2103 value_too_large must surface as Err");
             assert!(
-                err.downcast_ref::<CommitUnknownResult>().is_none(),
+                err.downcast_ref::<crate::classify::CommitUnknownResult>()
+                    .is_none(),
                 "a plain fault must not masquerade as an unknown result: {err}",
             );
         }

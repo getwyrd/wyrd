@@ -301,7 +301,9 @@ mod store {
     use async_trait::async_trait;
     use bytes::Bytes;
     use tikv_client::{BoundRange, Transaction, TransactionClient};
-    use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
+    use wyrd_traits::{
+        BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, Result, WriteBatch,
+    };
 
     use crate::keyspace;
     use crate::paging::{self, PageStep, ScanCapExceeded};
@@ -349,6 +351,83 @@ mod store {
         }
     }
 
+    /// Whether `err`, returned by **`Transaction::commit`**, leaves the batch's fate
+    /// **undetermined** — it may or may not have been applied (#515).
+    ///
+    /// Percolator commits the transaction the moment the *primary key's* commit record
+    /// lands; whether the client learns of it is a separate matter. So a commit-phase
+    /// failure where the request may have reached TiKV is possibly-committed — and the
+    /// client cannot tell us which phase failed:
+    ///
+    /// * `tikv_client::Error::UndeterminedError` exists, but the crate raises it **only**
+    ///   for `Error::Grpc` — a *connection-establishment* failure, i.e. a definite NON-
+    ///   commit — while every dispatched RPC failure, a timed-out commit included, is built
+    ///   as `Error::GrpcAPI` (`store/request.rs`'s `impl_request!` does
+    ///   `map_err(Error::GrpcAPI)` unconditionally). The one signal the crate offers for
+    ///   this class fires on the wrong case and stays silent on the right one. We do not
+    ///   rely on it — we treat it as undetermined anyway, which costs a re-read and never a
+    ///   wrong answer.
+    /// * A prewrite-phase transport error is a definite non-commit; a commit-phase one is
+    ///   possibly-committed. **Both surface as the same variants** (`GrpcAPI`,
+    ///   `RegionError`), so we cannot separate them from outside and are deliberately
+    ///   **conservative**: the whole transport/region class is undetermined. Calling a
+    ///   definite non-commit "unknown" costs the caller one re-read; calling a possibly-
+    ///   committed batch "definitely not committed" corrupts state. The asymmetry decides
+    ///   it.
+    ///
+    /// A `KeyError` is **not** undetermined: it arrived *inside a response we received*, so
+    /// the server reached a decision and told us — a definite rejection (write conflict,
+    /// `locked`, `abort`, a rollback record).
+    ///
+    /// Only a `commit()` error may reach here. A failing `get_for_update` read or eager
+    /// pessimistic-lock RPC is always a definite non-commit — no prewrite has happened, so
+    /// nothing can have been applied — which is why those sites keep the definite
+    /// classifier below.
+    /// **The rule is per-LEAF, deliberately.** A multi-region commit reports its per-region
+    /// failures wrapped (`ExtractedErrors` / `MultipleKeyErrors`), so ONE aggregate can
+    /// carry a write conflict from one region *and* a transport error from another. Asking
+    /// "is this whole error a write conflict?" first, as a short-circuit, would answer
+    /// **yes** on that mixed aggregate — `is_write_conflict` recurses too — and classify the
+    /// batch as a definite `Conflict`, discarding the nested transport error whose region
+    /// may well have committed. That is backwards: **unknown outranks conflict**, because
+    /// `Conflict` promises *nothing was written* and the mixed case cannot promise it. So a
+    /// conflict short-circuits nothing. Each leaf is judged on its own, and any undetermined
+    /// leaf makes the whole commit undetermined.
+    fn is_undetermined_commit(err: &tikv_client::Error) -> bool {
+        use tikv_client::Error;
+        match err {
+            Error::UndeterminedError(_)
+            | Error::Grpc(_)
+            | Error::GrpcAPI(_)
+            | Error::RegionError(_) => true,
+            Error::MultipleKeyErrors(errs) | Error::ExtractedErrors(errs) => {
+                errs.iter().any(is_undetermined_commit)
+            }
+            Error::PessimisticLockError { inner, .. } => is_undetermined_commit(inner),
+            // A `KeyError` LEAF — a write conflict, `locked`, `abort`, a rollback record —
+            // arrived inside a response we RECEIVED: the server decided and told us.
+            // Definite, never unknown.
+            _ => false,
+        }
+    }
+
+    /// The seam error ([`CommitUnknownResult`]) for an undetermined TiKV commit.
+    ///
+    /// `may_still_commit` is **always true**: the client retries the commit RPC up to 11
+    /// times and then gives up, but TiKV may still apply an in-flight commit afterwards, so
+    /// a re-read that observes nothing does not prove nothing will land. FoundationDB's
+    /// 1021 — "the transaction is already out of flight" — is the stronger guarantee, and
+    /// TiKV has no analogue of it. `code` is `None`: the tikv-client error carries no code
+    /// for this class.
+    fn tikv_unknown_result(err: &tikv_client::Error) -> CommitUnknownResult {
+        CommitUnknownResult {
+            backend: "tikv",
+            code: None,
+            detail: err.to_string(),
+            may_still_commit: true,
+        }
+    }
+
     /// Finish `txn` and classify `err` as either a lost race (`Ok(Conflict)`) or a
     /// fault (`Err`).
     ///
@@ -381,6 +460,41 @@ mod store {
         } else {
             Err(err.into())
         }
+    }
+
+    /// Classify an error returned by **`Transaction::commit`** — the one site where a
+    /// failure may leave the batch applied (#515).
+    ///
+    /// Three outcomes, in this order:
+    ///
+    /// 1. **Undetermined** ([`is_undetermined_commit`]) → `Err(CommitUnknownResult)`, the
+    ///    seam type FoundationDB also raises, so a caller downcasts *once* whatever backend
+    ///    it holds. Checked **first**, and for *every* batch shape: an undetermined commit
+    ///    is not a lost race, so reporting it as `Conflict` would tell a CAS caller
+    ///    "nothing was written" when something may have been.
+    /// 2. **A lost race on a conditional batch** → `Ok(Conflict)`, unchanged.
+    /// 3. Anything else → `Err`, unchanged.
+    ///
+    /// **The undetermined arm does not roll back.** `conflict_or_err` rolls back to release
+    /// prewrite locks promptly, which is right for a definite failure — but a rollback here
+    /// would be an attempt to erase a transaction that may already be committed, and its
+    /// result is discarded anyway (`let _ =`), so it could not even inform the answer. We
+    /// leave the transaction alone and let TiKV's own lock resolution settle it against the
+    /// primary. This is drop-safe: `Transaction::drop` panics only while the status is
+    /// `Active` (tikv-client 0.4.0 `transaction.rs`'s `Drop`), and a failed `commit()` has
+    /// already moved it to `StartedCommit`.
+    ///
+    /// The batch is **never retried** — a `WriteBatch` is not guaranteed idempotent, so
+    /// re-applying one whose fate is unknown could double-apply it. The caller re-reads.
+    async fn commit_outcome_from_error(
+        txn: &mut Transaction,
+        err: tikv_client::Error,
+        conditional: bool,
+    ) -> Result<CommitOutcome> {
+        if is_undetermined_commit(&err) {
+            return Err(BoxError::from(tikv_unknown_result(&err)));
+        }
+        conflict_or_err(txn, err, conditional).await
     }
 
     /// A [`MetadataStore`] backed by a TiKV cluster, reached through its
@@ -565,9 +679,121 @@ mod store {
             // other commit error stays `Err` (faults, undetermined) — the delicate
             // partition proposal 0007 calls out.
             if let Err(e) = txn.commit().await {
-                return conflict_or_err(&mut txn, e, conditional).await;
+                // The ONE site where a failure may leave the batch applied — every other
+                // arm above failed before prewrite, so nothing can have landed (#515).
+                return commit_outcome_from_error(&mut txn, e, conditional).await;
             }
             Ok(CommitOutcome::Committed)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{is_undetermined_commit, is_write_conflict, tikv_unknown_result};
+        use tikv_client::{Error, ProtoKeyError, ProtoRegionError};
+
+        /// A `KeyError` carrying `conflict` — TiKV's single write-conflict signal.
+        fn write_conflict() -> Error {
+            let mut ke = ProtoKeyError::default();
+            ke.conflict = Some(Default::default());
+            Error::KeyError(Box::new(ke))
+        }
+
+        /// A `KeyError` that is NOT a conflict (a `locked` key, say) — still a decision the
+        /// server sent us inside a response.
+        fn other_key_error() -> Error {
+            Error::KeyError(Box::new(ProtoKeyError::default()))
+        }
+
+        fn region_error() -> Error {
+            Error::RegionError(Box::new(ProtoRegionError::default()))
+        }
+
+        #[test]
+        fn a_transport_or_region_failure_at_commit_is_undetermined() {
+            // The commit RPC may have reached TiKV and been applied while the response was
+            // lost — and the client cannot tell us whether it failed in prewrite (a definite
+            // non-commit) or in the commit phase (possibly committed). Conservative: unknown.
+            assert!(is_undetermined_commit(&region_error()));
+            assert!(is_undetermined_commit(&Error::UndeterminedError(Box::new(
+                region_error()
+            ))));
+        }
+
+        #[test]
+        fn a_server_decision_is_never_undetermined() {
+            // A KeyError arrived INSIDE a response we received: the server decided and told
+            // us. Treating these as unknown would send every ordinary CAS loser off to
+            // re-read for nothing.
+            assert!(!is_undetermined_commit(&write_conflict()));
+            assert!(!is_undetermined_commit(&other_key_error()));
+        }
+
+        #[test]
+        fn a_write_conflict_stays_a_conflict_even_when_wrapped() {
+            // The conflict classification must survive the wrappers a pessimistic commit
+            // puts around it, and must still NOT be read as undetermined — otherwise every
+            // lost race would degrade from `Ok(Conflict)` into an unknown-result `Err`,
+            // which is the regression this ordering guards.
+            let wrapped = Error::ExtractedErrors(vec![write_conflict()]);
+            assert!(is_write_conflict(&wrapped));
+            assert!(!is_undetermined_commit(&wrapped));
+        }
+
+        #[test]
+        fn a_transport_error_nested_in_the_wrappers_is_still_undetermined() {
+            // A prewrite batch surfaces its per-region failures wrapped; an undetermined one
+            // must not be lost in the wrapper.
+            let wrapped = Error::MultipleKeyErrors(vec![region_error()]);
+            assert!(is_undetermined_commit(&wrapped));
+        }
+
+        #[test]
+        fn a_mixed_aggregate_is_undetermined_conflict_must_not_mask_it() {
+            // A multi-region commit can fail with ONE aggregate carrying a write conflict
+            // from one region and a transport error from another. `is_write_conflict`
+            // recurses, so it answers `true` here — and an earlier draft short-circuited on
+            // that and reported `Ok(Conflict)`, throwing away a nested error whose region
+            // may well have committed. `Conflict` promises nothing was written; this
+            // aggregate cannot promise it. Unknown outranks conflict.
+            let mixed = Error::ExtractedErrors(vec![write_conflict(), region_error()]);
+            assert!(
+                is_write_conflict(&mixed),
+                "the conflict predicate does see the conflict leaf — which is exactly why \
+                 it must not be allowed to short-circuit the undetermined check"
+            );
+            assert!(
+                is_undetermined_commit(&mixed),
+                "a conflict leaf must NOT mask an undetermined leaf: a caller told \
+                 `Conflict` retries a CAS whose fate is still ambiguous"
+            );
+            // Order-independent: the classifier must not depend on which leaf comes first.
+            let mixed_reversed = Error::MultipleKeyErrors(vec![region_error(), write_conflict()]);
+            assert!(is_undetermined_commit(&mixed_reversed));
+        }
+
+        #[test]
+        fn the_unknown_result_error_is_the_seam_type_and_says_a_re_read_is_not_conclusive() {
+            let unknown = tikv_unknown_result(&region_error());
+            assert_eq!(unknown.backend, "tikv");
+            assert_eq!(
+                unknown.code, None,
+                "the tikv-client error carries no code for this class"
+            );
+            assert!(
+                unknown.may_still_commit,
+                "TiKV may apply a commit RPC the client gave up on, so a re-read that sees \
+                 nothing does not prove nothing will land — unlike FoundationDB's 1021"
+            );
+            let msg = unknown.to_string();
+            assert!(
+                msg.contains("not retried"),
+                "states it refused to retry: {msg}"
+            );
+            assert!(
+                msg.contains("may still be applied"),
+                "states the weaker guarantee a re-read cannot settle: {msg}"
+            );
         }
     }
 }
