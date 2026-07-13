@@ -23,12 +23,24 @@
 # suppress that advisory if a future DEFAULT dependency ever pulled an affected
 # version — silently holing the very wall this file exists to be.
 #
-# The off-by-default trees are audited SEPARATELY, by `deny-all-features.toml`
-# (#543). `cargo xtask ci` runs both walls — this one, then:
-#     cargo deny --all-features --config deny-all-features.toml check advisories
-# That is where the tikv-client advisory boundary is recorded. Read it before
-# assuming this file's silence about TiKV means TiKV is clean — it means TiKV is
-# out of frame.
+# The off-by-default trees ARE audited — by two further walls `cargo xtask ci` runs
+# after this one:
+#
+#   * ADVISORIES, from a SEPARATE config, because its exceptions must never reach
+#     the shipped graph (#543):
+#         cargo deny --all-features --config deny-all-features.toml check advisories
+#     That is where the tikv-client advisory boundary is recorded. Read it before
+#     assuming this file's silence about TiKV means TiKV is clean — it means TiKV's
+#     ADVISORIES are out of this file's frame.
+#
+#   * LICENCES / bans / sources, from THIS file's policy, over the wider graph (#547):
+#         cargo deny --all-features check licenses bans sources
+#     ADR-0003 §2 judges *linked* crates, and a `--features fdb` / `--features tikv`
+#     build genuinely links crates the default graph never sees. The allowlist below
+#     therefore governs BOTH graphs and stays single-source: an allowlist applied to a
+#     wider graph can only ever reject more, so — unlike an advisory `ignore`, which
+#     SUPPRESSES — it carries no risk of holing the shipped-artifact wall, and needs no
+#     second copy to drift out of step.
 #
 # What neither tool can see is **`libfdb_c` itself**: the FoundationDB C client is
 # a system shared object installed from an upstream .deb/.rpm, linked at build
@@ -84,21 +96,18 @@ allow = [
     # A deliberate addition (ADR-0003 §2).
     "Zlib",
     # Permissive (OSI-approved, GPL-compatible; the "simplified BSD-2-Clause" in
-    # substance). NOT ENCOUNTERED in the default graph — `cargo deny check` warns
-    # `license-not-encountered` for it on every run, and that warning is correct:
-    # the crates that need ISC sit behind the off-by-default backend features.
-    # libloading v0.8.9 is a BUILD-time dependency of the FoundationDB backend
-    # (ADR-0042, M4: foundationdb-sys -> (build) bindgen -> clang-sys ->
-    # libloading, which dlopen()s libclang to generate the libfdb_c FFI bindings),
-    # and `ring` (Apache-2.0 AND ISC) sits behind the tikv-client tree. No
-    # ISC-licensed code is linked into a shipped Wyrd binary.
+    # substance). Not encountered in the DEFAULT graph — every crate that needs it sits
+    # behind an off-by-default backend feature — but genuinely linked by the builds this
+    # allowlist now also governs (#547): `libloading` is a BUILD-time dependency of the
+    # FoundationDB backend (ADR-0042: foundationdb-sys -> (build) bindgen -> clang-sys ->
+    # libloading, which dlopen()s libclang to generate the libfdb_c FFI bindings), and
+    # `ring` / `rustls` / `sct` / `untrusted` sit behind the tikv-client tree. No
+    # ISC-licensed code is linked into a SHIPPED Wyrd binary.
     #
-    # Retained rather than deleted because those crates ARE linked by a
-    # `--features fdb` / `--features tikv` build, which ADR-0003 §2's license wall
-    # is meant to cover. It does not cover them today: `deny-all-features.toml`
-    # audits the optional trees for ADVISORIES only, so no license check runs
-    # against them at all. Extending the wall to the off-by-default graphs is a
-    # named gap (#547), not something this entry quietly papers over.
+    # This entry used to be a fossil: retained for crates no wall actually inspected, and
+    # warning `license-not-encountered` on every run because of it. The `--all-features`
+    # licence wall (#547) now inspects them, so the entry is load-bearing and the warning
+    # is gone — which is precisely the signal that the gap closed.
     "ISC",
 ]
 confidence-threshold = 0.9

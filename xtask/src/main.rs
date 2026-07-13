@@ -1491,44 +1491,51 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// 1. `cargo deny check` — the DEFAULT graph, i.e. the artifact we ship. Licenses,
 ///    advisories, bans, sources; zero tolerance, no backend exceptions (`deny.toml`).
 /// 2. `cargo deny --all-features --config deny-all-features.toml check advisories` — the
-///    OFF-BY-DEFAULT trees, which step 1 cannot see at all: neither `foundationdb` nor
-///    `tikv-client` resolves into the default graph. Without this, a new advisory in the
+///    OFF-BY-DEFAULT trees' ADVISORIES, which step 1 cannot see at all: neither `foundationdb`
+///    nor `tikv-client` resolves into the default graph. Without this, a new advisory in the
 ///    abandoned `tikv-client` tree is caught by nothing (#543).
+/// 3. `cargo deny --all-features check licenses bans sources` — the same off-by-default trees'
+///    LICENCES (and bans/sources), against `deny.toml`'s policy (#547). ADR-0003 §2 judges
+///    **linked** crates, and a `--features fdb` / `--features tikv` build genuinely links these
+///    (ISC-licensed `ring` and `libloading` among them) — but step 1 never sees them, so an
+///    AGPL/BSL dependency could enter either optional tree and pass CI. It cannot now.
 ///
-/// A separate config for step 2 on purpose: cargo-deny's `[advisories] ignore` entries are
-/// keyed by advisory ID alone and apply to whatever graph they are used with, so parking the
-/// tikv-client exceptions in `deny.toml` would let them suppress those same IDs if a future
-/// DEFAULT dependency ever pulled an affected version — holing the shipped-artifact wall.
+/// **Why steps 2 and 3 use DIFFERENT configs, and why that is not duplication.** The split is
+/// exactly the difference between a *suppression* and an *allowlist*:
 ///
-/// Both run HERE rather than in the workflow YAML, so `cargo xtask ci` remains the complete
+/// * `[advisories] ignore` SUPPRESSES, and cargo-deny keys it by advisory ID alone — so parking
+///   the tikv-client exceptions in `deny.toml` would let them suppress those same IDs if a
+///   future DEFAULT dependency ever pulled an affected version, holing the shipped-artifact
+///   wall. Hence a second config (step 2), carrying the exceptions the shipped graph must never
+///   inherit.
+/// * `[licenses] allow` is an ALLOWLIST, and has no such hazard: applying it to a WIDER graph
+///   can only ever reject more. So step 3 reuses `deny.toml`'s policy verbatim — the ADR-0003
+///   allowlist stays SINGLE-SOURCE, and there is no second copy to drift.
+///
+/// Advisories are therefore excluded from step 3 (that is step 2's job, with its ignores), and
+/// licences/bans/sources are excluded from step 2 (its config defines no such policy).
+///
+/// All three run HERE rather than in the workflow YAML, so `cargo xtask ci` remains the complete
 /// local equivalent of the Rust gate (ADR-0009: CI is xtask-driven and runs the same checks
 /// locally). A YAML-only audit would pass on a contributor's laptop and fail only in CI.
 ///
-/// Step 2 costs seconds: cargo-deny resolves `Cargo.lock` and compiles nothing, so auditing
-/// the optional trees needs none of their native toolchains (no `libfdb_c`, no cmake/protoc).
+/// Steps 2 and 3 cost seconds: cargo-deny resolves `Cargo.lock` and compiles nothing, so
+/// auditing the optional trees needs none of their native toolchains (no `libfdb_c`, no
+/// cmake/protoc).
 ///
 /// If cargo-deny is not installed locally, warn and skip; in CI (where `CI` is set) a missing
 /// binary is a hard failure, so the wall is always enforced on every PR.
 fn cargo_deny_check() -> Result<(), String> {
-    let invocations: [&[&str]; 2] = [
-        &["deny", "check"],
-        &[
-            "deny",
-            "--all-features",
-            "--config",
-            "deny-all-features.toml",
-            "check",
-            "advisories",
-        ],
-    ];
+    let invocations = xtask::dependency_wall_invocations();
 
     for args in invocations {
+        let args: Vec<&str> = args;
         let mut printed = vec!["cargo"];
-        printed.extend_from_slice(args);
+        printed.extend_from_slice(&args);
         print_step(&printed);
 
         let status = Command::new("cargo")
-            .args(args)
+            .args(&args)
             .current_dir(workspace_root())
             .status();
 

@@ -24,11 +24,19 @@
 #                                 compiles nothing, so it needs none of the native
 #                                 toolchains those backends link.
 #
-# SCOPE: ADVISORIES ONLY. This config is used for `check advisories` and nothing else, so
-# it defines no license/ban/source policy — those still live in `deny.toml` and still
-# apply to the shipped graph. Extending the ADR-0003 *license* wall to the off-by-default
-# trees (a `--features tikv` build does link ISC-licensed `ring`) is a real, separate gap;
-# it is not silently covered here.
+# SCOPE: ADVISORIES ONLY — and deliberately so. This config exists because advisory
+# `ignore` entries SUPPRESS, and cargo-deny keys them by advisory ID alone, so they must be
+# kept out of the wall that guards the shipped artifact. A licence allowlist has the
+# opposite property: applied to a wider graph it can only ever reject MORE, so it needs no
+# separate copy and must not have one (two allowlists would drift, and a drifted licence
+# wall is worse than one wall).
+#
+# The off-by-default trees' LICENCES are therefore audited against `deny.toml`'s policy
+# directly, over this same wider graph (#547), by a third invocation in `cargo xtask ci`:
+#
+#     cargo deny --all-features check licenses bans sources
+#
+# So: advisories here, licences there, one allowlist, no duplication.
 
 [advisories]
 version = 2

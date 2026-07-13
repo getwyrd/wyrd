@@ -1283,3 +1283,42 @@ fn the_shipped_artifact_wall_carries_no_off_by_default_backend_exception() {
         );
     }
 }
+
+/// #547: the ADR-0003 licence wall must cover the graphs a `--features fdb` / `--features tikv`
+/// build actually LINKS — not just the shipped artifact.
+///
+/// ADR-0003 §2 judges *linked* crates. The default `cargo deny check` never sees `foundationdb`,
+/// `libloading`, `ring` or the rest of the optional trees, so before this an AGPL/BSL dependency
+/// could enter either one and pass CI — the licence wall is the one check whose whole purpose is
+/// to be non-negotiable, and it had a blind spot the size of two backends.
+///
+/// This also pins the shape of the fix, because the tempting "simplification" reopens the hole:
+/// a SECOND licence allowlist in `deny-all-features.toml` would drift out of step with the
+/// ADR-0003 one, and a drifted licence wall is worse than a single wall.
+#[test]
+fn the_licence_wall_covers_the_optional_backend_graphs_from_one_allowlist() {
+    let walls = xtask::dependency_wall_invocations();
+
+    let licence_wall = walls.iter().find(|w| w.contains(&"licenses")).expect(
+        "the dependency wall must include a LICENCE check over the off-by-default graphs —          without it a denied licence (AGPL/BSL/SSPL) can enter the fdb/tikv trees and pass CI          (#547)",
+    );
+    assert!(
+        licence_wall.contains(&"--all-features"),
+        "the licence wall must run over --all-features: the DEFAULT graph resolves none of the          optional backends, which is exactly the blind spot: {licence_wall:?}"
+    );
+    assert!(
+        !licence_wall.contains(&"--config"),
+        "the licence wall must use deny.toml's allowlist directly — a second config would mean a          second ADR-0003 allowlist, and two allowlists DRIFT. An allowlist applied to a wider          graph can only reject more, so it needs no quarantined copy (unlike an advisory ignore,          which suppresses): {licence_wall:?}"
+    );
+    assert!(
+        !licence_wall.contains(&"advisories"),
+        "advisories must NOT ride along on deny.toml over --all-features: the tikv-client          exceptions live in deny-all-features.toml precisely so they can never reach the shipped          wall (#543), and this invocation would fire them without those ignores: {licence_wall:?}"
+    );
+
+    // The single-source invariant, from the other side: no second allowlist may exist.
+    let all_features = read("deny-all-features.toml");
+    assert!(
+        !all_features.contains("[licenses]"),
+        "deny-all-features.toml must NOT define a licence policy: the ADR-0003 allowlist stays          SINGLE-SOURCE in deny.toml, which the --all-features licence wall reuses verbatim. Two          copies drift, and the drift is silent until a denied licence slips through the stale one"
+    );
+}
