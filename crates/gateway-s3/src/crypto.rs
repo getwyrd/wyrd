@@ -14,7 +14,10 @@
 //! are still pinned against the published vectors — NIST FIPS-180-4 for SHA-256, RFC 4231
 //! for HMAC, and the AWS SigV4 published example end to end (`sigv4` module).
 
-use hmac::{Hmac, Mac};
+// `KeyInit` carries `new_from_slice` from digest 0.11 on (hmac 0.13). Under digest 0.10 it
+// reached us implicitly through `Mac`; the newer trait split makes it an explicit import,
+// which is the whole of this crate's API migration (#541).
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256 as Sha256Impl};
 
 type HmacSha256 = Hmac<Sha256Impl>;

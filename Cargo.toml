@@ -89,8 +89,12 @@ futures-util = { version = "0.3", default-features = false, features = ["alloc"]
 # RustCrypto HMAC-SHA256 — the SigV4 signing/verification MAC on the gateway's
 # fail-closed auth boundary (issue #364). A vetted, maintained implementation replacing
 # the earlier hand-rolled one (carry-forward T5-a); `MIT OR Apache-2.0` (already on the
-# deny.toml allowlist), pure-Rust, no build script. Paired with `sha2` (same digest 0.10
-# core). Adopted through the ADR-0003 §2 three-test dependency audit (see build-notes).
+# deny.toml allowlist), pure-Rust, no build script. **Coupled to `sha2` through the shared
+# `digest` core** — hmac 0.13 and sha2 0.11 both move it to digest 0.11, so the two must be
+# bumped TOGETHER or the graph carries two `digest` majors and the HMAC trait bounds stop
+# resolving. That coupling is why Dependabot groups them (#542) and why #541 landed the
+# bump and the API migration as one change. Adopted through the ADR-0003 §2 three-test
+# dependency audit (see build-notes).
 hmac = "0.13"
 madsim = "0.2"
 # Codegen counterpart, used by `proto`'s build.rs only when `CARGO_CFG_MADSIM`
@@ -129,7 +133,8 @@ serde_json = "1"
 # RustCrypto SHA-256 — the SigV4 payload hash + canonical-request digest, and the
 # streaming PUT body hash (issue #364). Vetted maintained crate replacing the earlier
 # hand-rolled SHA-256 on the auth boundary (carry-forward T5-a); `MIT OR Apache-2.0`
-# (already allowed), pure-Rust, no build script. Paired with `hmac` above.
+# (already allowed), pure-Rust, no build script. **Coupled to `hmac` above** through the
+# shared `digest` 0.11 core — bump the pair together, never one alone (#541, #542).
 sha2 = "0.11"
 tempfile = "3"
 # Async runtime, used only to *host* a tonic server (the gRPC stack is built on
