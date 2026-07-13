@@ -262,7 +262,9 @@ async fn expired_pending_chunks(
 
 /// The orphan ledger: each stranded `(dserver, fragment)` and the instant it became
 /// orphaned.
-async fn orphan_leases(meta: &dyn MetadataStore) -> Result<HashMap<(DServerId, FragmentId), u64>> {
+pub(crate) async fn orphan_leases(
+    meta: &dyn MetadataStore,
+) -> Result<HashMap<(DServerId, FragmentId), u64>> {
     let mut map = HashMap::new();
     for (key, value) in meta.scan(ORPHAN_PREFIX).await? {
         if let Some(slot) = parse_orphan_key(&key) {
