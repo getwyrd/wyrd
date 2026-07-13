@@ -30,7 +30,7 @@ The strategy (ADR-0009, section 4.2): **not bottom-up**. A vertical slice throug
 | M1 | Erasure coding | real RS(k,m) in the hottest loop; reconstruction from any *k* | ✅ built |
 | M2 | Networked D servers | the direct client→D-server data path; the `ChunkStore` seam is real | ✅ built |
 | M3 | Custodians | the system maintains its own durability (GC, scrub, reconstruction, rebalance) and reports it | ✅ built (closing) |
-| M4 | Production metadata backend | pluggability is real: redb→TiKV behind the unchanged trait is a composition change, not a refactor | next — proposal 0007 |
+| M4 | Production metadata backend | pluggability is real: redb→FoundationDB behind the unchanged trait is a composition change, not a refactor — proven twice, since the backend choice itself moved from TiKV to FDB (ADR-0042) without touching a consumer | FoundationDB is the production backend (ADR-0042, #442 "go"); TiKV retained as a stood-down fallback (#443) — proposals 0007, 0015 |
 | M5 | Internal CA (step-ca) | the fabric authenticates itself; least authority on a SPIFFE-shaped identity | planned — proposal 0011 |
 | M6 | Encryption at rest (KeyService/KMS) | envelope encryption behind the `KeyService` trait against a real KMS | planned — proposal 0012 |
 | M7 | Failover & DR, single-datacenter | node / disk / rack loss survived and recovered, drilled rather than asserted | planned — proposal owed |

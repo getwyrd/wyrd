@@ -88,7 +88,7 @@ Real environments are the **second line**, and they exist to catch precisely wha
 - **Real performance** — actual latency, real EC encode/decode throughput on real CPUs, real disk and network throughput, tail latencies, and the linear-throughput-scaling claim (scenario Q6).
 - **Real I/O and OS behaviour** — honest fsync semantics, real filesystem quirks, io_uring, page cache, the real network stack under load.
 - **Unmodeled faults** — the failures we did *not* think to inject: a disk failing slowly rather than cleanly, a NIC corrupting rather than dropping, an OOM-killer intervening, clock skew weirder than the model.
-- **Real integration** — actual etcd, actual TiKV, actual gRPC over a real network, behaving as they really do rather than as their in-memory fakes do.
+- **Real integration** — actual etcd, actual FoundationDB, actual gRPC over a real network, behaving as they really do rather than as their in-memory fakes do.
 
 A real environment is therefore never used to test correctness the simulation already covers. If validating the commit protocol's atomicity seems to need a real cluster, that is a signal something is wrong — that is DST's job.
 
@@ -154,7 +154,7 @@ Two notes on the reference choices:
 | M1 — erasure coding | Tier 0; Tier 1/2 for first honest EC benchmarks |
 | M2 — networked D servers | Tier 0; Tier 1 (software faults), Tier 2 (real host); Jepsen begins |
 | M3 — custodians | Tier 0–2; Jepsen consistency; disk-fault injection for scrub/repair |
-| M4 — production metadata backend | Tier 0–2 against real TiKV |
+| M4 — production metadata backend | Tier 0–2 against real FoundationDB, incl. the fault + contention battery that gated the "go" (#442). TiKV keeps the same suites as the retained fallback, but its Tier-1 leg is currently red (#537) and its nightly conformance is unbuilt (#420) — under the stand-down (#443) the standing bar is build-only |
 | M5 — internal CA (step-ca) | Tier 0–2; mTLS handshake/identity fault injection — plaintext and wrong-identity dials refused; the `PeerIdentity` guard test |
 | M6 — encryption at rest (KMS) | Tier 0–2 against a real KMS (OpenBao); fail-closed on KMS unavailability; crypto-erase-vs-hold tests |
 | M7 — failover & DR (single-datacenter) | Tier 0–2; zone-internal node/disk/rack fault injection + local recovery drill |

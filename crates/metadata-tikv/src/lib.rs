@@ -1,8 +1,32 @@
-//! TiKV-backed [`MetadataStore`](wyrd_traits::MetadataStore): the distributed,
-//! **production** metadata backend (ADR-0008), behind the *unchanged*
-//! `MetadataStore` trait. Choosing it over embedded redb is composition in
-//! `server` (ADR-0010), not a refactor here — the milestone's whole thesis
-//! (proposal 0007).
+//! TiKV-backed [`MetadataStore`](wyrd_traits::MetadataStore): a distributed
+//! metadata backend behind the *unchanged* `MetadataStore` trait. Choosing it over
+//! embedded redb is composition in `server` (ADR-0010), not a refactor here — the
+//! milestone's whole thesis (proposal 0007).
+//!
+//! # Status: retained fallback, development stood down (#443)
+//!
+//! This was the production backend under ADR-0008. It is **not** any more:
+//! **ADR-0042 supersedes 0008 and chooses FoundationDB** (`wyrd-metadata-fdb`),
+//! which passed the M4 fault + contention battery (#442). Under #443 this crate is
+//! **kept, not removed** — buildable, community-continuable, and still held to the
+//! shared `metadata-conformance` suite — but the core team has stood active
+//! development down. The continuation backlog is the *Metadata Store TiKV*
+//! milestone, open for anyone to pick up.
+//!
+//! Two things a would-be user must know before turning the `tikv` feature on:
+//!
+//! - `tikv-client` 0.4.0 is abandoned upstream (#435) and carries unpatched
+//!   advisories in its TLS stack, including a **live DoS in CRL parsing**
+//!   (RUSTSEC-2026-0104, high). The exposure boundary — why the shipped artifact is
+//!   unaffected, and why that is *not* a claim this backend is safe — is recorded in
+//!   `deny-all-features.toml` (#543).
+//! - The Tier-1 metadata fault battery is **red** on this backend for a pre-existing
+//!   reason unrelated to the FDB work: the rename faults on tikv-client's own 2 s
+//!   per-RPC timeout during leader election (#537).
+//!
+//! The standing CI bar for this crate is therefore **build-only** — the `tikv`
+//! feature must keep compiling (including its tests), nothing more. Conformance and
+//! the fault battery are not run.
 //!
 //! The basic `get` / `scan` / `commit` shapes over TiKV's transactional API, so
 //! the **shared** conformance suite that redb passes also passes against a real

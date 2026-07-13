@@ -123,6 +123,83 @@ jobs:
         run: cargo xtask bench
         continue-on-error: true
 
+  # The TiKV anti-rot bar (#443). TiKV is the RETAINED FALLBACK: development is stood
+  # down, FoundationDB is the production backend (ADR-0042), and the crate/feature/CLI
+  # variant stay in the tree "community-continuable". This job is what makes
+  # "continuable" a fact instead of a claim — before #443 NO workflow compiled the
+  # `tikv` feature at all, so the fallback could have rotted silently.
+  #
+  # The bar is deliberately BUILD-ONLY, and it is the honest maximum:
+  #   * the TiKV Tier-1 fault battery is RED on main for a pre-existing reason
+  #     (tikv-client's own 2 s per-RPC timeout during leader election, #537), so a
+  #     conformance/fault gate could not be green today; and
+  #   * the nightly TiKV conformance workflow (#420) was never built. It stays in the
+  #     continuation backlog for whoever picks the backend up.
+  # Claiming a bar we do not run would be the hollow green #442's verdict warns about.
+  #
+  # It compiles the WHOLE tikv surface, not just the backend crate: the `Tikv` variant of
+  # `MetadataBackend` and its selection arms live in `crates/server/src/cli.rs` behind
+  # `#[cfg(feature = "tikv")]`, so checking only `wyrd-metadata-tikv` would leave the CLI
+  # wiring — the very thing #443 retains — free to rot. `--tests` keeps the TiKV test
+  # suite compiling too, even though it is not executed here.
+  #
+  # The server row is `tikv,etcd`, not `tikv`: the S3 gateway's metadata×coordination
+  # dispatch arm is `#[cfg(all(feature = "tikv", feature = "etcd"))]`, so a `--features tikv`
+  # build cfg's it out — the bar could stay green while the combination rotted. And that
+  # combination is what the retained fallback stack actually runs
+  # (`deploy/small-multi-node/`, FEATURES="tikv,etcd", gateways on `--metadata-backend tikv
+  # --coordination-backend etcd`). Compiling the pair is a superset of the tikv-only arms.
+  #
+  # NOT here: the ADVISORY audit of the tikv dependency tree. That belongs to the wall,
+  # not to this job, and lives in `cargo xtask ci` (xtask::cargo_deny_check), which runs
+  # `cargo deny --all-features --config deny-all-features.toml check advisories` on every
+  # PR and on every laptop (#543). It needs no toolchain — cargo-deny reads Cargo.lock and
+  # compiles nothing — so duplicating it here would buy nothing and cost a cargo-deny
+  # install in a job whose whole point is the compiler.
+  tikv:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      # Opts the tikv rows into xtask's feature-gated checks. Unset everywhere else, which
+      # is why a laptop / PDCA worktree never compiles the pre-1.0 tikv-client tree.
+      WYRD_TIKV_TOOLCHAIN: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # tikv-client's transitive tree needs a C toolchain and OpenSSL headers (grpcio /
+      # prost build protobuf definitions at build time; openssl-sys needs pkg-config to
+      # find libssl). Absent any of these the feature does not compile at all. This is
+      # the SAME list the container builds already use to produce a `--features tikv`
+      # binary — `deploy/docker/wyrd/Dockerfile` and
+      # `crates/chunkstore-grpc/tests/dserver/Dockerfile` — kept identical on purpose.
+      - name: Install tikv-client native build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake protobuf-compiler libssl-dev pkg-config
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: tikv
+
+      # These two rows are exactly `xtask::feature_gated_checks(tikv: true, ..)`. They are
+      # spelled out rather than run via `WYRD_TIKV_TOOLCHAIN=1 cargo xtask ci`, which would
+      # re-run the entire gate (fmt, clippy, tests, deny, conformance) a second time just to
+      # reach two `cargo check`s. The xtask side is pinned by
+      # `ci_type_checks_feature_gated_metadata_scenario`, so if you change the rows there,
+      # change them here too — the local command is:
+      #     WYRD_TIKV_TOOLCHAIN=1 cargo xtask ci
+      - name: Compile the tikv feature (crate + cli.rs selection arms + tikv×etcd + tests)
+        run: |
+          cargo check -p wyrd-metadata-tikv --features tikv --tests
+          cargo check -p wyrd-server --features tikv,etcd --tests
+
   # Spell-check (typos) as its OWN always-on status check. Unlike the Rust gate,
   # it carries no docs-skip: prose lives in docs/ and specs, so a docs-only PR is
   # exactly when it matters most. Installed via the same prebuilt-binary action as
@@ -143,28 +220,44 @@ jobs:
         run: typos
 
   # Always-runs aggregation: this is the job to mark as a required status check.
-  # It needs both `changes` and `rust` and runs unconditionally (`if: always()`),
-  # so it reports a status even when `rust` was skipped on a docs-only change.
-  # Success iff the change was classified (changes succeeded) AND the Rust gate
-  # either passed or was skipped (docs-only); failure otherwise.
+  # It needs `changes`, `rust` and `tikv`, and runs unconditionally (`if: always()`),
+  # so it reports a status even when those were skipped on a docs-only change.
+  # Success iff the change was classified (changes succeeded) AND the Rust gate and the
+  # TiKV anti-rot bar each either passed or were skipped (docs-only); failure otherwise.
+  #
+  # Why `tikv` gates: #443's acceptance criterion is that the `tikv` feature KEEPS
+  # COMPILING. A bar that does not fail a PR is not a bar — the fallback would rot on
+  # the first refactor that misses a `#[cfg(feature = "tikv")]` arm, and the "you can
+  # pick this up" promise would be false. It is cheap (two `cargo check`s) and fully
+  # within a contributor's control.
+  #
+  # (The tikv tree's ADVISORY exposure is guarded elsewhere — by `cargo xtask ci`'s
+  # second dependency wall, `deny-all-features.toml` (#543) — so a new advisory there
+  # turns `rust` red, not this job.)
   gate:
-    needs: [changes, rust]
+    needs: [changes, rust, tikv]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Verify the Rust gate passed or was correctly skipped
+      - name: Verify the Rust gate and the TiKV anti-rot bar passed or were skipped
         env:
           CHANGES: ${{ needs.changes.result }}
           RUST: ${{ needs.rust.result }}
+          TIKV: ${{ needs.tikv.result }}
         run: |
           set -u
           if [ "$CHANGES" != "success" ]; then
             echo "::error::change classification failed (changes result=$CHANGES)"
             exit 1
           fi
-          if [ "$RUST" = "success" ] || [ "$RUST" = "skipped" ]; then
-            echo "OK: Rust gate result=$RUST (success = passed or docs-only skip)"
-            exit 0
+          if [ "$RUST" != "success" ] && [ "$RUST" != "skipped" ]; then
+            echo "::error::the Rust gate did not pass (rust result=$RUST)"
+            exit 1
           fi
-          echo "::error::the Rust gate did not pass (rust result=$RUST)"
-          exit 1
+          if [ "$TIKV" != "success" ] && [ "$TIKV" != "skipped" ]; then
+            echo "::error::the TiKV anti-rot bar did not pass (tikv result=$TIKV). The tikv \
+          feature must keep compiling — it is the retained fallback (#443)."
+            exit 1
+          fi
+          echo "OK: rust=$RUST tikv=$TIKV (success = passed or docs-only skip)"
+          exit 0

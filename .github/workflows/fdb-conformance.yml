@@ -117,6 +117,15 @@ jobs:
           rm -f foundationdb-clients.deb
           fdbcli --version
 
+      # The `etcd` feature (added to the server type-check row below, #443) is NOT pure Rust:
+      # `etcd-client` REGENERATES its etcd protobufs at build time and needs a system `protoc`
+      # (crates/coordination-etcd/Cargo.toml says so). Without this the `--features fdb,etcd`
+      # check fails on a fresh runner — the FDB client package alone is not enough.
+      - name: Install protoc (etcd-client regenerates its protobufs at build time)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
       # Gap 2 of #439, on EVERY trigger. Nothing else in CI compiles these: the merge
       # gate builds `--workspace` with default features, and `--all-targets` widens target
       # kinds, not the feature set. So the `#[cfg(feature = "fdb")]` store module of
@@ -129,10 +138,18 @@ jobs:
       # These two commands are `xtask::feature_gated_checks(false, true)` verbatim;
       # xtask/tests/fdb_harness.rs asserts the workflow and the function agree, so a
       # future row added to one cannot silently skip the other.
+      #
+      # The server row is `fdb,etcd`, not `fdb` (#443): the S3 gateway's
+      # metadata×coordination dispatch arm is `#[cfg(all(feature = "fdb", feature =
+      # "etcd"))]`, so a plain `--features fdb` check cfg's it out — and that pairing is
+      # exactly what the canonical production stack runs (`deploy/small-multi-node-fdb/`
+      # builds `FEATURES: "fdb,etcd"`). It was compiled by no CI job at all. Enabling `etcd`
+      # is why this job now installs `protoc` above: `etcd-client` regenerates its protobufs
+      # at build time.
       - name: Type-check the fdb feature arms
         run: |
           cargo check -p wyrd-metadata-fdb --features fdb --tests
-          cargo check -p wyrd-server --features fdb --tests
+          cargo check -p wyrd-server --features fdb,etcd --tests
 
       # Brings up deploy/fdb-single-node, runs `configure new single memory`, writes the
       # host-side cluster file, drives the five `--features fdb` test legs, and tears the
