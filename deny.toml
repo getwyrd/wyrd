@@ -4,13 +4,31 @@
 # contribution that pulls in a disqualified license or a vulnerable crate fails
 # `cargo deny check` in CI.
 #
-# AUDIT POLICY — what this file can and cannot see (ADR-0042, issue #439).
+# AUDIT POLICY — what this file can and cannot see (ADR-0042, issues #439, #543).
 # `cargo deny` / `cargo audit` traverse the **Rust dependency graph** recorded in
-# Cargo.lock. For the FoundationDB metadata backend that graph is
-# `foundationdb -> foundationdb-sys -> (build) bindgen -> clang-sys -> libloading`,
-# and it IS audited here — the ISC allowlist entry below exists precisely because
-# `cargo deny check` (run by `cargo xtask ci`, xtask/src/main.rs) walks it even
-# though the `fdb` feature is off by default.
+# Cargo.lock, but only as **resolved for the features they are invoked with**.
+#
+# THIS FILE GUARDS THE DEFAULT FEATURE GRAPH — the artifact we ship. `cargo deny
+# check` (run by `cargo xtask ci`, xtask/src/main.rs) passes no feature flags, so
+# the off-by-default backend features (`fdb`, `tikv`) resolve NO crates into the
+# graph it walks: `foundationdb`, `libloading` and `tikv-client` are all absent
+# from it. (Verify: `cargo tree -i tikv-client` fails on the default graph and
+# resolves only under `--all-features`; `cargo deny list` likewise shows none of
+# the three.)
+#
+# It therefore keeps a ZERO-TOLERANCE advisory wall: the `ignore` list below
+# carries no exception for any off-by-default backend, and must not gain one.
+# `cargo deny`'s ignores are keyed by advisory ID alone and apply to the whole
+# graph they are used with, so a tikv-client exception parked here would also
+# suppress that advisory if a future DEFAULT dependency ever pulled an affected
+# version — silently holing the very wall this file exists to be.
+#
+# The off-by-default trees are audited SEPARATELY, by `deny-all-features.toml`
+# (#543). `cargo xtask ci` runs both walls — this one, then:
+#     cargo deny --all-features --config deny-all-features.toml check advisories
+# That is where the tikv-client advisory boundary is recorded. Read it before
+# assuming this file's silence about TiKV means TiKV is clean — it means TiKV is
+# out of frame.
 #
 # What neither tool can see is **`libfdb_c` itself**: the FoundationDB C client is
 # a system shared object installed from an upstream .deb/.rpm, linked at build
@@ -30,6 +48,14 @@
 # Fail on any RUSTSEC advisory for a crate in the dependency graph.
 version = 2
 yanked = "deny"
+# Unsoundness advisories — a safe API that can cause UB — are scoped, not on/off:
+# cargo-deny's default is `workspace`, i.e. only advisories against OUR OWN crates. That
+# is close to useless here, because every crate we link is transitive; the shipped graph
+# carried RUSTSEC-2026-0190 (`anyhow` <= 1.0.102: UB via `Error::downcast_mut()` after
+# `Error::context`) and the wall said nothing. `all` audits the whole graph, which is the
+# only scope that matches what "the dependency wall" claims to be. (#543; the anyhow bump
+# to the patched 1.0.103 lands with this, so the wall is green on a real fix, not a waiver.)
+unsound = "all"
 ignore = [
     # bincode 1.3.3 is "unmaintained" — its team declared 1.3.3 complete and
     # ceased development; this is a maintenance notice, not a vulnerability. It
@@ -57,13 +83,22 @@ allow = [
     # hasher — reaches us transitively through the tonic/hyper gRPC stack (M2.1).
     # A deliberate addition (ADR-0003 §2).
     "Zlib",
-    # Permissive (OSI-approved, GPL-compatible; the "simplified BSD-2-Clause"
-    # in substance). libloading v0.8.9 reaches us as a BUILD-time dependency of
-    # the FoundationDB metadata backend (ADR-0042, M4): foundationdb-sys ->
-    # (build) bindgen -> clang-sys -> libloading, which dlopen()s libclang to
-    # generate the libfdb_c FFI bindings. No ISC-licensed code is linked into a
-    # shipped Wyrd binary. `ring` (Apache-2.0 AND ISC), behind the tikv-client
-    # tree, needs it too. A deliberate addition (ADR-0003 §2).
+    # Permissive (OSI-approved, GPL-compatible; the "simplified BSD-2-Clause" in
+    # substance). NOT ENCOUNTERED in the default graph — `cargo deny check` warns
+    # `license-not-encountered` for it on every run, and that warning is correct:
+    # the crates that need ISC sit behind the off-by-default backend features.
+    # libloading v0.8.9 is a BUILD-time dependency of the FoundationDB backend
+    # (ADR-0042, M4: foundationdb-sys -> (build) bindgen -> clang-sys ->
+    # libloading, which dlopen()s libclang to generate the libfdb_c FFI bindings),
+    # and `ring` (Apache-2.0 AND ISC) sits behind the tikv-client tree. No
+    # ISC-licensed code is linked into a shipped Wyrd binary.
+    #
+    # Retained rather than deleted because those crates ARE linked by a
+    # `--features fdb` / `--features tikv` build, which ADR-0003 §2's license wall
+    # is meant to cover. It does not cover them today: `deny-all-features.toml`
+    # audits the optional trees for ADVISORIES only, so no license check runs
+    # against them at all. Extending the wall to the off-by-default graphs is a
+    # named gap (#547), not something this entry quietly papers over.
     "ISC",
 ]
 confidence-threshold = 0.9

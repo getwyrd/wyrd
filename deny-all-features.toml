@@ -1,0 +1,137 @@
+# The OFF-BY-DEFAULT feature graph's advisory wall (#543) — deliberately a SEPARATE
+# config from `deny.toml`.
+#
+# WHY TWO FILES. `cargo deny`'s `[advisories] ignore` list is **global**: an entry is
+# keyed by advisory ID alone (cargo-deny 0.20 accepts only `id` and `reason` — there is
+# no crate- or feature-scoping), so it suppresses that advisory *anywhere in the graph it
+# is applied to*. Putting the tikv-client exceptions in `deny.toml` would therefore mean
+# the wall guarding the **shipped artifact** carries them too, and a future DEFAULT
+# dependency that happened to pull a version affected by one of these same IDs would be
+# silently waved through. That is exactly the guarantee `deny.toml` claims to make, so
+# the exceptions do not belong there.
+#
+# Split instead:
+#   * `deny.toml`               — the DEFAULT feature graph, i.e. what we ship.
+#                                 Zero tikv/fdb exceptions. Zero tolerance. Run by
+#                                 `cargo deny check` in `cargo xtask ci`, on every PR.
+#   * `deny-all-features.toml`  — THIS FILE. The off-by-default backend trees (`tikv`,
+#                                 `fdb`), which the default run cannot see at all. Run by
+#                                 `cargo xtask ci` (xtask::cargo_deny_check) on every PR AND
+#                                 on every laptop, as:
+#                                     cargo deny --all-features \
+#                                       --config deny-all-features.toml check advisories
+#                                 It costs seconds — cargo-deny resolves Cargo.lock and
+#                                 compiles nothing, so it needs none of the native
+#                                 toolchains those backends link.
+#
+# SCOPE: ADVISORIES ONLY. This config is used for `check advisories` and nothing else, so
+# it defines no license/ban/source policy — those still live in `deny.toml` and still
+# apply to the shipped graph. Extending the ADR-0003 *license* wall to the off-by-default
+# trees (a `--features tikv` build does link ISC-licensed `ring`) is a real, separate gap;
+# it is not silently covered here.
+
+[advisories]
+version = 2
+yanked = "deny"
+# Must match `deny.toml`. cargo-deny's default unsound scope is `workspace` — only our own
+# crates — which would leave every TRANSITIVE unsoundness in the optional backend trees
+# unchecked, including RUSTSEC-2026-0097 below (rand 0.7.3, reached through tikv-client).
+# A wall over a graph we do not otherwise audit has to look at the whole graph.
+unsound = "all"
+
+# THE tikv-client EXPOSURE BOUNDARY (#543).
+#
+# The six tikv entries below all reach us through exactly one crate — `tikv-client` 0.4.0 —
+# which is pulled in only by the OFF-by-default `tikv` feature (`crates/server/Cargo.toml`).
+# They are therefore reachable **only** under `--features tikv`: by the `tikv-conformance`
+# and Tier-1 TiKV fault legs, and by an operator who deliberately builds the TiKV backend.
+# The default artifact — the software we ship — contains none of the vulnerable versions.
+# (Verify: `cargo tree -i tikv-client` fails on the default graph and resolves only under
+# `--all-features`.)
+#
+# THIS IS A STATEMENT ABOUT THE SHIPPED ARTIFACT, NOT A CLAIM THAT THE TiKV LEG IS SAFE.
+# RUSTSEC-2026-0104 in particular is a genuine DoS in the TLS certificate-validation path,
+# and it is live for anyone who builds `--features tikv` and talks TLS-with-CRLs to a
+# PD/TiKV cluster. Ignoring it here silences the wall for a build we do not ship; it does
+# not fix the TiKV backend.
+#
+# WHY THERE IS NO FIX TO APPLY. `tikv-client` 0.4.0 pins `tonic` 0.10 -> `rustls` 0.21 ->
+# the vulnerable `rustls-webpki`. There is no newer `tikv-client` release; upstream
+# declares 0.4.0 not production-ready (#435). The tonic/TLS-stack upgrade that clears the
+# rustls chain merged upstream on 2026-06-26 (https://github.com/tikv/client-rust/pull/541)
+# but has never been released. Chasing a patch here is chasing a release that is not coming.
+#
+# WHEN THESE ENTRIES GET DELETED. Under the stand-down (#443) the `tikv` feature is
+# RETAINED, not removed — so, unlike a normal deferral, these entries have no scheduled
+# end. They are deleted only by:
+#   (a) a `tikv-client` release carrying client-rust#541, which clears the rustls chain
+#       (and probably the protobuf/rand ones with it); or
+#   (b) an explicit future decision to decommission the TiKV backend, which #443
+#       deliberately does NOT make.
+#
+# REVIEW TRIGGER — so "tracked, not waived" does not decay into a silent, permanent waiver
+# of a high-severity advisory:
+#   * re-review by 2027-01-31 if no `tikv-client` release carrying #541 has appeared; and
+#   * immediately if a NEW high/critical advisory enters this tree.
+# Either trigger is grounds to reopen the carrying-cost-vs-option-value question that #443
+# leaves open. The machine-check behind this is `cargo xtask ci`'s second `cargo deny`
+# invocation over this config (xtask::cargo_deny_check), which runs on every PR and on every
+# laptop: a NEW advisory in this tree turns the gate red instead of sitting here unnoticed.
+# That invocation is what makes "tracked, not waived" a fact rather than a comment — do not
+# delete it and leave this file behind, or the ignores become an unmonitored waiver of a
+# live high-severity advisory.
+ignore = [
+    # --- Inherited from `deny.toml`, because this graph is a SUPERSET of the default one ---
+    #
+    # The all-features graph contains everything the default graph does, so every ignore the
+    # default wall needs applies here too. cargo-deny has no config `include`, so this entry
+    # is duplicated deliberately. It fails CLOSED, not silently: add an ignore to `deny.toml`
+    # and forget it here, and the gate goes red rather than the two walls quietly diverging.
+    #
+    # bincode 1.3.3 is "unmaintained" — its team declared 1.3.3 complete and ceased
+    # development; a maintenance notice, not a vulnerability. It reaches us only as a
+    # test-only transitive dependency of `madsim` (the DST tier, `wyrd-dst`), never in
+    # shipped code. Revisit if madsim moves off it.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3, unmaintained; test-only via madsim (wyrd-dst), never in shipped code. Mirrors the entry in deny.toml." },
+
+    # --- The tikv-client tree (#543). All six: `--features tikv` only. ---
+
+    # HIGH (7.5). Reachable panic parsing a certificate revocation list, BEFORE the CRL's
+    # signature is verified. rustls-webpki 0.101.7 <- rustls 0.21.12 <- tokio-rustls 0.24 /
+    # tonic 0.10 <- tikv-client 0.4.0. Live for a TiKV build that uses TLS with CRLs; see
+    # the boundary note above.
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7, reachable only via tikv-client 0.4.0 behind the off-by-default `tikv` feature; absent from the shipped graph. No upstream release carries the fix (client-rust#541 is unreleased). Review trigger: 2027-01-31 (#543)." },
+
+    # LOW. Name constraints accepted for certificates asserting a wildcard name. Same
+    # rustls-webpki 0.101.7 chain. Requires misissuance to exploit.
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7, same tikv-client-only chain as RUSTSEC-2026-0104 (#543)." },
+
+    # LOW. Name constraints for URI names incorrectly accepted. Same rustls-webpki 0.101.7
+    # chain.
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7, same tikv-client-only chain as RUSTSEC-2026-0104 (#543)." },
+
+    # MEDIUM. Uncontrolled recursion (stack exhaustion) in protobuf 2.28.0 <- prometheus
+    # 0.13.4 <- tikv-client 0.4.0. The default graph is unaffected: it resolves protobuf
+    # 3.7.2 (patched) via prometheus 0.14 <- opentelemetry-prometheus <- wyrd-telemetry.
+    # The vulnerable 2.28.0 is TiKV-only.
+    { id = "RUSTSEC-2024-0437", reason = "protobuf 2.28.0 via prometheus 0.13.4 <- tikv-client 0.4.0; the default graph resolves the patched protobuf 3.7.2 (#543)." },
+
+    # UNMAINTAINED. rustls-pemfile 1.0.4 <- tonic 0.10 <- tikv-client 0.4.0. Same abandoned
+    # rustls 0.21 chain; a maintenance notice, not a vulnerability. Not reported by
+    # Dependabot — `cargo deny` is the stricter wall here.
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile, unmaintained, same tikv-client-only rustls 0.21 chain (#543)." },
+
+    # UNSOUND. rand 0.7.3 <- fail 0.4 <- tikv-client 0.4.0. `thread_rng()` can construct an
+    # aliased mutable reference (UB) when a custom `log` logger calls into it during a
+    # ThreadRng reseed. Narrow to trigger, but real. The default graph is unaffected: it
+    # resolves the patched rand 0.8.6; the vulnerable 0.7.3 is TiKV-only, reached solely
+    # through `fail` (tikv-client's fault-injection crate). No fix is reachable — the same
+    # abandoned-upstream story as the five above it.
+    #
+    # This entry exists only because `unsound = "all"` is set above. cargo-deny's DEFAULT
+    # unsound scope is `workspace`, which never looks at transitive crates and so never
+    # raised this — which is why an earlier draft of this file wrongly recorded the advisory
+    # as "not checkable, no entry needed". It was always checkable; the wall was simply not
+    # looking at the part of the graph it lives in.
+    { id = "RUSTSEC-2026-0097", reason = "rand 0.7.3 via fail 0.4 <- tikv-client 0.4.0; unsound only under a custom log logger calling thread_rng during a reseed. Absent from the shipped graph, which resolves the patched rand 0.8.6. No fix reachable: tikv-client 0.4.0 is abandoned upstream (#543)." },
+]

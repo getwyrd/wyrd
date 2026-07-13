@@ -1483,29 +1483,72 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// Run `cargo deny check` — the machine-checked license + advisory wall
-/// (ADR-0003 §2). If cargo-deny is not installed locally, warn and skip; in CI
-/// (where `CI` is set and cargo-deny is installed) a missing binary is a hard
-/// failure so the wall is always enforced on every PR.
+/// Run the machine-checked dependency wall (ADR-0003 §2) — **both** graphs.
+///
+/// `cargo deny` audits the graph as resolved for the features it is invoked with, and the
+/// backend features (`fdb`, `tikv`) are off by default. So one invocation is not enough:
+///
+/// 1. `cargo deny check` — the DEFAULT graph, i.e. the artifact we ship. Licenses,
+///    advisories, bans, sources; zero tolerance, no backend exceptions (`deny.toml`).
+/// 2. `cargo deny --all-features --config deny-all-features.toml check advisories` — the
+///    OFF-BY-DEFAULT trees, which step 1 cannot see at all: neither `foundationdb` nor
+///    `tikv-client` resolves into the default graph. Without this, a new advisory in the
+///    abandoned `tikv-client` tree is caught by nothing (#543).
+///
+/// A separate config for step 2 on purpose: cargo-deny's `[advisories] ignore` entries are
+/// keyed by advisory ID alone and apply to whatever graph they are used with, so parking the
+/// tikv-client exceptions in `deny.toml` would let them suppress those same IDs if a future
+/// DEFAULT dependency ever pulled an affected version — holing the shipped-artifact wall.
+///
+/// Both run HERE rather than in the workflow YAML, so `cargo xtask ci` remains the complete
+/// local equivalent of the Rust gate (ADR-0009: CI is xtask-driven and runs the same checks
+/// locally). A YAML-only audit would pass on a contributor's laptop and fail only in CI.
+///
+/// Step 2 costs seconds: cargo-deny resolves `Cargo.lock` and compiles nothing, so auditing
+/// the optional trees needs none of their native toolchains (no `libfdb_c`, no cmake/protoc).
+///
+/// If cargo-deny is not installed locally, warn and skip; in CI (where `CI` is set) a missing
+/// binary is a hard failure, so the wall is always enforced on every PR.
 fn cargo_deny_check() -> Result<(), String> {
-    print_step(&["cargo", "deny", "check"]);
-    let status = Command::new("cargo")
-        .args(["deny", "check"])
-        .current_dir(workspace_root())
-        .status();
+    let invocations: [&[&str]; 2] = [
+        &["deny", "check"],
+        &[
+            "deny",
+            "--all-features",
+            "--config",
+            "deny-all-features.toml",
+            "check",
+            "advisories",
+        ],
+    ];
 
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("`cargo deny check` failed with {s}")),
-        Err(_) if is_ci() => Err("cargo-deny is not installed but is required in CI".to_string()),
-        Err(_) => {
-            eprintln!(
-                "warning: cargo-deny not installed; skipping the license/advisory \
-                 wall locally. Install it with `cargo install cargo-deny --locked`."
-            );
-            Ok(())
+    for args in invocations {
+        let mut printed = vec!["cargo"];
+        printed.extend_from_slice(args);
+        print_step(&printed);
+
+        let status = Command::new("cargo")
+            .args(args)
+            .current_dir(workspace_root())
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => return Err(format!("`cargo {}` failed with {s}", args.join(" "))),
+            Err(_) if is_ci() => {
+                return Err("cargo-deny is not installed but is required in CI".to_string());
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: cargo-deny not installed; skipping the license/advisory \
+                     wall locally. Install it with `cargo install cargo-deny --locked`."
+                );
+                return Ok(());
+            }
         }
     }
+
+    Ok(())
 }
 
 /// Run `cargo machete` — flag dependencies declared in a `Cargo.toml` but never
