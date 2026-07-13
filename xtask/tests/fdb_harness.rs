@@ -1199,3 +1199,73 @@ fn the_audit_policy_records_what_cargo_deny_cannot_see() {
          (upstream FoundationDB release notes)"
     );
 }
+
+/// #543: the shipped-artifact wall must carry NO exception for an off-by-default backend.
+///
+/// `cargo deny`'s `[advisories] ignore` entries are keyed by advisory ID alone — cargo-deny
+/// 0.20 accepts only `id` and `reason`, with no crate- or feature-scoping — so an entry
+/// applies to the WHOLE graph it is used with. A tikv-client exception parked in `deny.toml`
+/// would therefore also suppress that advisory if a future DEFAULT dependency ever pulled an
+/// affected version, silently holing the wall that guards what we ship.
+///
+/// So the tikv-client boundary lives in `deny-all-features.toml`, and this test is what stops
+/// a well-meaning "let's consolidate the two configs" from quietly undoing that.
+#[test]
+fn the_shipped_artifact_wall_carries_no_off_by_default_backend_exception() {
+    let deny = read("deny.toml");
+    let all_features = read("deny-all-features.toml");
+
+    // The six tikv-client advisories (#543). None may appear in the default wall.
+    for advisory in [
+        "RUSTSEC-2026-0104",
+        "RUSTSEC-2026-0099",
+        "RUSTSEC-2026-0098",
+        "RUSTSEC-2024-0437",
+        "RUSTSEC-2025-0134",
+        // Only raised because both configs set `unsound = "all"`; cargo-deny's default
+        // unsound scope (`workspace`) never looks at transitive crates like rand 0.7.3.
+        "RUSTSEC-2026-0097",
+    ] {
+        assert!(
+            !deny.contains(advisory),
+            "{advisory} reaches us only through tikv-client, behind the off-by-default `tikv` \
+             feature — it must NOT be ignored in deny.toml, which guards the DEFAULT (shipped) \
+             graph. cargo-deny ignores are global to the graph they run against, so this entry \
+             would also mask the advisory if a default dependency ever pulled an affected \
+             version. It belongs in deny-all-features.toml (#543)."
+        );
+        assert!(
+            all_features.contains(advisory),
+            "{advisory} must be recorded in deny-all-features.toml — that is the config the \
+             off-by-default backend trees are audited with (#543)"
+        );
+    }
+
+    // The all-features graph is a SUPERSET of the default one, so every ignore the default
+    // wall needs must also be present there, or `cargo xtask ci`'s second wall goes red.
+    // cargo-deny has no config `include`, so this is enforced here rather than by the tool.
+    assert!(
+        all_features.contains("RUSTSEC-2025-0141"),
+        "deny-all-features.toml must inherit deny.toml's bincode ignore: it audits a superset \
+         of the default graph, so an ignore missing here fails the gate"
+    );
+
+    // BOTH walls must audit unsoundness across the WHOLE graph. cargo-deny's default scope
+    // is `workspace` — our own crates only — which silently ignores every transitive
+    // unsoundness advisory. That default is what hid RUSTSEC-2026-0190 (`anyhow` <= 1.0.102,
+    // UB in `Error::downcast_mut()`) from the shipped-artifact wall, and RUSTSEC-2026-0097
+    // (rand 0.7.3) from the TiKV one. Dropping this back to the default would re-blind both
+    // walls without failing anything — hence a test.
+    for (name, cfg) in [
+        ("deny.toml", &deny),
+        ("deny-all-features.toml", &all_features),
+    ] {
+        assert!(
+            cfg.contains(r#"unsound = "all""#),
+            "{name} must set `unsound = \"all\"`: cargo-deny's default scope is `workspace`, \
+             which never raises a TRANSITIVE unsoundness advisory — and every crate we link is \
+             transitive, so the wall would be blind to exactly the class of bug it exists for \
+             (#543)"
+        );
+    }
+}

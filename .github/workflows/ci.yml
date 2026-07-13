@@ -107,6 +107,11 @@ jobs:
         with:
           tool: cargo-deny,cargo-machete
 
+      # Runs BOTH dependency walls (see xtask::cargo_deny_check): the default graph —
+      # the artifact we ship — and, via deny-all-features.toml, the off-by-default
+      # `fdb`/`tikv` trees, which the default graph cannot see at all (#543). Kept in
+      # xtask rather than as a YAML step so this stays the complete local equivalent
+      # of the gate (ADR-0009).
       - name: cargo xtask ci
         run: cargo xtask ci
 
