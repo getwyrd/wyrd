@@ -1672,11 +1672,16 @@ mod tests {
         calls
     }
 
+    // The feature list is matched EXACTLY (`--features <list> `, trailing space), not by
+    // `contains`: a bare `contains("--features tikv")` also matches "--features tikv,etcd",
+    // so it could not tell the two apart — and telling them apart is the whole point of the
+    // `tikv,etcd` row (the gateway's dispatch arm is `cfg(all(tikv, etcd))`). A guard that
+    // passes under both spellings guards nothing.
     fn is_feature_check(pkg: &'static str, feature: &'static str) -> impl Fn(&String) -> bool {
         move |c: &String| {
             c.starts_with("check ")
                 && c.contains(&format!("-p {pkg}"))
-                && c.contains(&format!("--features {feature}"))
+                && c.contains(&format!("--features {feature} "))
                 && c.contains("--tests")
         }
     }
@@ -1688,28 +1693,45 @@ mod tests {
     // unconditional flips a case red.
     #[test]
     fn ci_type_checks_feature_gated_metadata_scenario() {
-        let is_metadata_feature_check = is_feature_check("wyrd-metadata-tikv", "tikv");
-
-        // Toolchain present → run_ci INVOKES the metadata feature check, so the
+        // Toolchain present → run_ci INVOKES the metadata feature checks, so the
         // #[cfg(feature = "tikv")] Tier-1/Tier-2 scenario bodies (SymmetricPartition,
         // the PD oracle, the testkit-oracle wiring) are type-checked at Check.
+        //
+        // BOTH packages, not just the backend crate: the `Tikv` variant of
+        // `MetadataBackend` and its selection arms live in `crates/server/src/cli.rs`
+        // behind `#[cfg(feature = "tikv")]`, so a bar that checks only
+        // `wyrd-metadata-tikv` lets the CLI wiring rot. #443 retains that variant, so
+        // the anti-rot bar must compile it (this mirrors the `fdb` rows).
+        //
+        // And the SERVER row is `tikv,etcd`, not `tikv`: the S3 gateway's dispatch arm is
+        // `#[cfg(all(feature = "tikv", feature = "etcd"))]`, so `--features tikv` alone
+        // cfg's out the exact pairing the retained-fallback stack runs
+        // (`deploy/small-multi-node/`, FEATURES="tikv,etcd"). The feature strings are
+        // asserted EXACTLY here — `contains("--features tikv")` would also match
+        // "tikv,etcd" and so could not tell the two apart, which is a guard that cannot
+        // fail.
         let with_toolchain = recorded_invocations(&[xtask::TIKV_TOOLCHAIN_ENV]);
-        assert!(
-            with_toolchain.iter().any(&is_metadata_feature_check),
-            "run_ci must invoke `cargo check -p wyrd-metadata-tikv --features tikv --tests` \
-             when the TiKV toolchain is present, so the feature-gated metadata Tier scenario \
-             bodies are type-checked at Check: {with_toolchain:?}"
-        );
+        for (pkg, features) in [("wyrd-metadata-tikv", "tikv"), ("wyrd-server", "tikv,etcd")] {
+            let is_tikv_check = is_feature_check(pkg, features);
+            assert!(
+                with_toolchain.iter().any(&is_tikv_check),
+                "run_ci must invoke `cargo check -p {pkg} --features {features} --tests` when \
+                 the TiKV toolchain is present, so the feature-gated TiKV surface — including \
+                 the cli.rs selection arms AND the tikv×etcd gateway dispatch arm (#443's \
+                 retained fallback, the shape `deploy/small-multi-node/` actually runs) — is \
+                 type-checked at Check: {with_toolchain:?}"
+            );
 
-        // Gate honesty: toolchain absent (a laptop / PDCA worktree) → run_ci must
-        // NOT compile the pre-1.0 `tikv-client` tree — the container-free/offline
-        // CI invariant. Making the step unconditional flips this red.
-        let without_toolchain = recorded_invocations(&[]);
-        assert!(
-            !without_toolchain.iter().any(&is_metadata_feature_check),
-            "the default no-TiKV `cargo xtask ci` must not compile the tikv feature tree \
-             (WYRD_TIKV_TOOLCHAIN unset): {without_toolchain:?}"
-        );
+            // Gate honesty: toolchain absent (a laptop / PDCA worktree) → run_ci must
+            // NOT compile the pre-1.0 `tikv-client` tree — the container-free/offline
+            // CI invariant. Making either step unconditional flips this red.
+            let without_toolchain = recorded_invocations(&[]);
+            assert!(
+                !without_toolchain.iter().any(&is_tikv_check),
+                "the default no-TiKV `cargo xtask ci` must not compile the tikv feature tree \
+                 (WYRD_TIKV_TOOLCHAIN unset), pkg={pkg}: {without_toolchain:?}"
+            );
+        }
     }
 
     // ADR-0042 (#439): the same wiring assertion for the `fdb` rows, driven through the
@@ -1720,12 +1742,18 @@ mod tests {
     #[test]
     fn ci_type_checks_the_fdb_feature_on_the_fdb_toolchain_alone() {
         let fdb_only = recorded_invocations(&[xtask::FDB_TOOLCHAIN_ENV]);
-        for pkg in ["wyrd-metadata-fdb", "wyrd-server"] {
-            let is_fdb_check = is_feature_check(pkg, "fdb");
+        // The server row is `fdb,etcd`, not `fdb` — same reason as the tikv row: the S3
+        // gateway's dispatch arm is `#[cfg(all(feature = "fdb", feature = "etcd"))]`, and
+        // that pairing is what the CANONICAL production stack runs
+        // (`deploy/small-multi-node-fdb/`, FEATURES="fdb,etcd"). A plain `--features fdb`
+        // check left it compiled by no CI job at all.
+        for (pkg, features) in [("wyrd-metadata-fdb", "fdb"), ("wyrd-server", "fdb,etcd")] {
+            let is_fdb_check = is_feature_check(pkg, features);
             assert!(
                 fdb_only.iter().any(&is_fdb_check),
-                "run_ci must invoke `cargo check -p {pkg} --features fdb --tests` when the FDB \
-                 toolchain is declared, independently of WYRD_TIKV_TOOLCHAIN: {fdb_only:?}"
+                "run_ci must invoke `cargo check -p {pkg} --features {features} --tests` when \
+                 the FDB toolchain is declared, independently of WYRD_TIKV_TOOLCHAIN: \
+                 {fdb_only:?}"
             );
         }
         assert!(

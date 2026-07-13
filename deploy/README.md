@@ -26,12 +26,22 @@ metadata-backend tier, so it is outside this matrix.)
 **The single-zone pair, and which is canonical.** The two single-zone stacks are a named
 **pair**, not one "the" stack and one variant. `small-multi-node/` keeps its unqualified
 name and **is the TiKV peer of** `small-multi-node-fdb/`; `small-multi-node-fdb/` is the
-FoundationDB peer. `small-multi-node/` (TiKV) is the **currently canonical** single-zone
-stack; FoundationDB (`small-multi-node-fdb/`) becomes canonical once #442's fault battery
-records "go" on FDB (#443's retained-fallback posture). Both stay runnable throughout.
+FoundationDB peer. The **canonical** single-zone stack is `small-multi-node-fdb/`
+(FoundationDB): #442's fault + contention battery recorded **"go"** on the FDB driver
+(`docs/design/reviews/m4-fdb-go-no-go.md`), so FoundationDB is the production backend per
+ADR-0042 and the canonical stack flipped to it (#443). Both stay runnable.
 The rename of `small-multi-node/` → `small-multi-node-tikv/` is deferred (to avoid
 churning PR #457's landed paths); until it happens, this pairing is recorded here in prose
 so the unqualified `small-multi-node/` name is not read as "the" stack.
+
+> **TiKV is the retained fallback; active development is stood down (#443).** It is kept
+> in the tree, buildable and community-continuable — not removed — but FoundationDB is the
+> production backend (ADR-0042). Do not pick the TiKV stacks for a new production
+> deployment: the `tikv` feature pulls in `tikv-client` 0.4.0, which is abandoned upstream
+> and carries **known unpatched advisories in its TLS path** — including a live DoS in
+> certificate-revocation-list parsing (RUSTSEC-2026-0104, high). The boundary is recorded
+> in `deny-all-features.toml` (#543). The continuation backlog is the **Metadata Store TiKV** milestone,
+> open for anyone to pick up.
 
 ## `tikv-single-node/` — throwaway single-node TiKV (M4.1)
 
@@ -106,9 +116,12 @@ docker compose -f deploy/fdb-multi-replica/docker-compose.yml down -v
 ## `small-multi-node/` — the TiKV single-zone stack, one of the single-zone pair (M4.5)
 
 The **TiKV peer** of the single-zone pair (see the profile matrix above): `small-multi-node/`
-**is the TiKV peer of** `small-multi-node-fdb/`, and is the **currently canonical**
-single-zone stack until #442 records "go" on FoundationDB. A minimum-viable, canonical
-single-zone deployment for testing (M4.5, #256;
+**is the TiKV peer of** `small-multi-node-fdb/`. It is the **retained fallback**, not the
+canonical stack — #442 recorded "go" on FoundationDB, so `small-multi-node-fdb/` is canonical
+and active TiKV development is stood down (#443). This stack stays runnable and is still the
+right thing to bring up when working the TiKV continuation backlog; it is **not** the stack to
+pick for a new production deployment (see the stand-down note in the profile matrix above).
+A minimum-viable single-zone deployment for testing (M4.5, #256;
 proposal 0015 §"Deployment: TiKV/PD as a stateful, disk-affine, orchestrator-agnostic
 tier"; architecture §7.1's "Small multi-node" profile row). Every role at a real
 single-zone cardinality — no L2/L3/TiDB (ADR-0020 is out of scope until M9+):
@@ -192,9 +205,9 @@ with the metadata tier swapped: PD + TiKV are replaced by a 3-process Foundation
 (`fdb0..fdb2`, `configure new double ssd`), and every wyrd role that opens a metadata store
 opens `--metadata-backend fdb` instead of `--metadata-backend tikv` (the 3 custodians and 3
 gateways; the 9 D servers open no metadata backend, exactly as on the TiKV peer).
-`small-multi-node/` **is the TiKV peer of** `small-multi-node-fdb/`; `small-multi-node/`
-(TiKV) is the **currently canonical** single-zone stack, and this FDB stack becomes
-canonical once #442 records "go" (#443's retained-fallback posture). Two directories, not a
+`small-multi-node/` **is the TiKV peer of** `small-multi-node-fdb/`; this FDB stack is the
+**canonical** single-zone stack, since #442 recorded "go" on FoundationDB and #443 stood the
+TiKV backend down to a retained fallback. Two directories, not a
 compose override: the metadata tier swap is a whole service-set change, and the per-backend
 convention already uses one directory per backend profile.
 

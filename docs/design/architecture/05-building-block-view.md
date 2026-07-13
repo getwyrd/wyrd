@@ -65,7 +65,7 @@ one mutation there**; the other four components collaborate around it.
 
 | Actor | One-line role | What it is, precisely |
 |-------|---------------|-----------------------|
-| **Metadata store** *(the commit point)* | Holds the map and hosts the single atomic mutation that makes a write visible. | The linchpin. Inodes, dirents, chunk maps, the pending-chunk ledger, version counters. The atomicity guarantee — the project's reason to exist — lives in *one mutation here*, not in any other component. `redb` embedded / TiKV production, behind `MetadataStore`. |
+| **Metadata store** *(the commit point)* | Holds the map and hosts the single atomic mutation that makes a write visible. | The linchpin. Inodes, dirents, chunk maps, the pending-chunk ledger, version counters. The atomicity guarantee — the project's reason to exist — lives in *one mutation here*, not in any other component. `redb` embedded (dev) / **FoundationDB** production (ADR-0042), behind `MetadataStore`; TiKV is a retained fallback with development stood down (#443). |
 | **Client** *(the thick brain)* | Erasure-codes, writes fragments directly to D servers, issues the atomic commit, reconstructs on read. | Where the intelligence lives. It is the *only* component that understands what a *file* is: chunk → RS(k,m) encode → direct parallel fragment writes → atomic commit; on read, reconstruct from any *k* of *n*. Embedded in every L1 gateway. `client` crate, `reed-solomon-simd`. |
 | **D server** *(dumb storage)* | Stores and returns fragments by id, verifies checksums, reports health. | Deliberately stupid: no placement logic, no metadata, no erasure coding, no reconstruction. A disk with a gRPC interface and a checksum check. **One per disk** — each is an independent failure domain (ADR-0034). `dserver` crate, `ChunkStore` trait. |
 | **Custodian** *(background health)* | Keeps stored data healthy over time and emits durability telemetry. | Four jobs: **GC** (collect orphaned/failed-write garbage), **scrub** (re-verify checksums to catch bit-rot *before* it's needed), **reconstruct** (rebuild lost fragments when a D server dies), **rebalance** (drain hot/decommissioning servers). Reads and repairs against the metadata store and D servers. Emits the durability plane (ADR-0011). `custodian` crate. |
@@ -173,7 +173,7 @@ Where atomicity lives and where the bulk of correctness risk concentrates.
 
 | Component | Technology | Responsibility |
 |-----------|------------|----------------|
-| Metadata store | `redb` (embedded) / TiKV (prod), behind `MetadataStore` trait | Inodes, dirents, chunk maps, the pending-chunk GC ledger, version counters. Hosts the single atomic mutation that *is* the commit point. |
+| Metadata store | `redb` (embedded, dev) / **FoundationDB** (prod, ADR-0042), behind `MetadataStore` trait; TiKV retained as a stood-down fallback (#443) | Inodes, dirents, chunk maps, the pending-chunk GC ledger, version counters. Hosts the single atomic mutation that *is* the commit point. |
 | D servers | Rust, `dserver` crate; `ChunkStore` trait (local / filesystem / S3) | Store/retrieve EC fragments by chunk ID, verify checksums, report health. Deliberately dumb — no placement logic, no metadata. |
 | Custodians | Rust, `custodian` crate | GC (expired pending chunks, orphans), scrubbing (checksum verification → bit-rot detection), reconstruction (rebuild lost fragments from survivors), rebalancing. Emit durability telemetry. |
 | Client library | Rust, `client` crate; `reed-solomon-simd` | Chunk → erasure-code → direct parallel fragment writes → atomic commit. Small-file inlining. Append/CAS. Read reconstruction from any *k* of *n* fragments. |
@@ -187,7 +187,7 @@ Hierarchical: **inode + dirent**, not path-as-key.
 - `inode:<id>` → attributes, chunk map (or inline data for small files), state, version.
 - `dirent:<parent_id>/<name>` → child inode id.
 
-This makes rename a single dirent mutation (atomic under the same mechanism as a write) instead of a mass key rewrite, and makes cross-zone sharing expressible (a dirent pointing at an inode owned elsewhere). It is the strongest concrete driver of the TiKV-over-HBase choice, because file creation must atomically write both the inode and its dirent — a multi-key transaction. See section 6 and ADR-0008.
+This makes rename a single dirent mutation (atomic under the same mechanism as a write) instead of a mass key rewrite, and makes cross-zone sharing expressible (a dirent pointing at an inode owned elsewhere). It is the strongest concrete driver of the requirement that the metadata store offer an **atomic multi-key transaction**, because file creation must atomically write both the inode and its dirent. That requirement is what disqualified HBase-class stores and what every backend choice since has had to satisfy; the backend satisfying it in production is now FoundationDB (ADR-0042, superseding ADR-0008's TiKV). See section 6.
 
 #### The write protocol (the commit point)
 
@@ -229,4 +229,4 @@ The Colossus-style bootstrap recursion bottoms out here: etcd depends on nothing
 | Simulation testing | madsim / turmoil | `testkit` (ADR-0009) |
 | Composition / the binary | wires all concretes | `server` |
 
-The dependency rule (ADR-0010): implementations and consumers depend on `traits`, never on each other's concretes. Only `server` knows the concrete backends, which is what makes "swap redb for TiKV" or "in-memory for etcd" a composition change rather than a refactor.
+The dependency rule (ADR-0010): implementations and consumers depend on `traits`, never on each other's concretes. Only `server` knows the concrete backends, which is what makes "swap redb for FoundationDB" or "in-memory for etcd" a composition change rather than a refactor. The seam earned its keep in M4: swapping the production backend from TiKV to FoundationDB (ADR-0042) touched the `server` wiring and added a crate, and changed no consumer.

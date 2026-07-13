@@ -237,11 +237,40 @@ fn readme_profile_matrix_names_all_six_profiles() {
 
 #[test]
 fn readme_states_which_single_zone_stack_is_canonical() {
+    // #442 recorded "go" on FoundationDB, so the canonical single-zone stack has flipped
+    // (#443): `small-multi-node-fdb/` is canonical and `small-multi-node/` (TiKV) is the
+    // retained fallback. This guard pins the POST-flip posture. Before #443 it asserted
+    // only that the word "canonical" appeared somewhere, which both postures satisfied —
+    // a guard that cannot fail does not guard anything.
     let readme = read("deploy/README.md");
     assert!(
-        readme.contains("currently canonical"),
-        "deploy/README.md must state which small-multi-node setup is currently canonical \
-         (TiKV until #442 records go, FDB after)"
+        readme.contains("The **canonical** single-zone stack is `small-multi-node-fdb/`"),
+        "deploy/README.md must name `small-multi-node-fdb/` (FoundationDB) as the canonical \
+         single-zone stack — #442 recorded go and #443 flipped it"
+    );
+    assert!(
+        !readme.contains("currently canonical"),
+        "deploy/README.md still hedges with \"currently canonical\" — that phrasing dates \
+         from before #442's verdict, when TiKV was canonical \"for now\". The flip has \
+         happened; state it flatly"
+    );
+}
+
+#[test]
+fn readme_records_the_tikv_stand_down() {
+    // #443: TiKV is retained, not removed — but a reader must not be able to pick the TiKV
+    // stacks for production without meeting the two facts that make that a bad idea: active
+    // development is stood down, and the client carries unpatched advisories (#543).
+    let readme = read("deploy/README.md");
+    assert!(
+        readme.contains("retained fallback") && readme.contains("stood down"),
+        "deploy/README.md must describe TiKV as the retained fallback with development \
+         stood down (#443)"
+    );
+    assert!(
+        readme.contains("RUSTSEC-2026-0104"),
+        "deploy/README.md must name the live advisory a TiKV build carries, so \"retained \
+         fallback\" is not read as \"fine for production\" (#543)"
     );
 }
 

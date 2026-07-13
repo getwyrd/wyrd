@@ -1029,9 +1029,12 @@ fn feature_gated_checks_type_check_the_fdb_surface_when_the_fdb_toolchain_is_pre
     assert!(
         checks
             .iter()
-            .any(|row| is_check_of(row, "wyrd-server", "fdb")),
-        "the fdb toolchain must yield `cargo check -p wyrd-server --features fdb` — the \
-         server's backend-selection arms are `#[cfg(feature = \"fdb\")]` too: {checks:?}"
+            .any(|row| is_check_of(row, "wyrd-server", "fdb,etcd")),
+        "the fdb toolchain must yield `cargo check -p wyrd-server --features fdb,etcd` — the \
+         server's backend-selection arms are `#[cfg(feature = \"fdb\")]`, AND the S3 gateway's \
+         dispatch arm is `#[cfg(all(feature = \"fdb\", feature = \"etcd\"))]`, so a plain \
+         `--features fdb` check cfg's out the very combination the canonical production stack \
+         runs (`deploy/small-multi-node-fdb/` builds FEATURES=\"fdb,etcd\"): {checks:?}"
     );
     for row in &checks {
         assert!(
@@ -1071,6 +1074,17 @@ fn the_fdb_and_tikv_toolchain_gates_are_independent() {
             .iter()
             .any(|row| is_check_of(row, "wyrd-metadata-tikv", "tikv")),
         "the tikv toolchain must still yield its own row: {tikv_only:?}"
+    );
+    assert!(
+        tikv_only
+            .iter()
+            .any(|row| is_check_of(row, "wyrd-server", "tikv,etcd")),
+        "the tikv toolchain must yield `cargo check -p wyrd-server --features tikv,etcd` — the \
+         S3 gateway's dispatch arm is `#[cfg(all(feature = \"tikv\", feature = \"etcd\"))]`, so \
+         a `--features tikv` check alone cfg's out the exact combination the RETAINED FALLBACK \
+         stack runs (`deploy/small-multi-node/` builds FEATURES=\"tikv,etcd\" and its gateways \
+         run `--metadata-backend tikv --coordination-backend etcd`). The anti-rot bar would \
+         stay green while that combination rotted (#443): {tikv_only:?}"
     );
     assert!(
         !tikv_only.iter().any(|row| row.contains(&"fdb")),

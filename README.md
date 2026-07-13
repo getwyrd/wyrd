@@ -118,16 +118,28 @@ You can stand up the consolidated single-zone cluster on one machine and drive i
 with the `wyrd` gateway client mode — the binary fans each object's erasure-coded
 fragments across the cluster's networked D servers over gRPC. The bring-up
 fixtures under `deploy/` are organised as testing **profiles** (ADR-0043), each the
-minimal topology for a class of test; `deploy/small-multi-node/` is the full
+minimal topology for a class of test; `deploy/small-multi-node-fdb/` is the full
 single-zone profile and the one to poke by hand.
 
-Bring the stack up — a 3-node etcd + 3-node PD + 3-node TiKV + **9** D servers
+Bring the stack up — a 3-node etcd + a 3-process **FoundationDB** cluster (the
+production metadata backend, ADR-0042) + **9** D servers
 (one per failure domain, matching the default `rs(6,3)` = 9 fragments, any **k = 6**
 of which reconstruct the data) + custodians + S3 gateways:
 
 ```sh
-docker compose -f deploy/small-multi-node/docker-compose.yml up -d
+docker compose -f deploy/small-multi-node-fdb/docker-compose.yml up -d
+# a fresh FoundationDB cluster must be configured once before it will serve reads/writes
+docker compose -f deploy/small-multi-node-fdb/docker-compose.yml exec fdb0 \
+  fdbcli --exec "configure new double ssd"
 ```
+
+The first `up` builds the `wyrd:fdb` image (`--features fdb,etcd`), which links the
+FoundationDB client library — a multi-GB build the first time. See `deploy/README.md`
+for the full bring-up, the published ports, and teardown.
+
+> The TiKV peer of this stack (`deploy/small-multi-node/`) is still in the tree and
+> still runs, but TiKV is a **retained fallback with development stood down** (#443).
+> Use FoundationDB.
 
 Point the gateway client at the D servers' published endpoints. `--endpoints`
 switches `put`/`get` from the local-disk path to the **static-endpoints gateway
@@ -161,7 +173,7 @@ owns which fragments).
 Tear the cluster down (and drop its volumes) when finished:
 
 ```sh
-docker compose -f deploy/small-multi-node/docker-compose.yml down -v
+docker compose -f deploy/small-multi-node-fdb/docker-compose.yml down -v
 ```
 
 Notes and current limits:
@@ -173,12 +185,14 @@ Notes and current limits:
   work (and the registered address is not yet routable across containers, #458).
 - Metadata is held locally under `--data-dir`, so the `put` and `get` above must
   share it. Wiring the S3 gateway role itself over the cluster's shared backends
-  (TiKV metadata + D-server fanout) is tracked as #454 → #455.
+  (FoundationDB metadata + D-server fanout) is tracked as #454 → #455.
 - The other `deploy/` profiles are for automated tests, not hand-driving: the
-  single-node conformance fixtures (`tikv-single-node/`, `etcd-single-node/`), the
+  single-node conformance fixtures (`fdb-single-node/`, `etcd-single-node/`), the
   ephemeral integration fixture (`crates/chunkstore-grpc/tests/docker-compose.yml`,
   `cargo xtask integration`), and the fault-injection fixture
-  (`tikv-multi-replica/`). See ADR-0043 for which test class uses which.
+  (`fdb-multi-replica/`). The TiKV peers of those fixtures (`tikv-single-node/`,
+  `tikv-multi-replica/`) remain for the retained fallback (#443). See ADR-0043 for
+  which test class uses which.
 
 ## Security
 

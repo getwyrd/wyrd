@@ -80,6 +80,28 @@ pub fn feature_gated_checks(tikv: bool, fdb: bool) -> Vec<Vec<&'static str>> {
             "tikv",
             "--tests",
         ]);
+        // The backend crate alone is not the whole `tikv` surface: the `Tikv` variant of
+        // `MetadataBackend` and its selection arms in `crates/server/src/cli.rs` are all
+        // `#[cfg(feature = "tikv")]`, so checking only `wyrd-metadata-tikv` leaves the CLI
+        // wiring uncompiled and free to rot. #443 keeps that variant as part of the retained
+        // fallback, so the anti-rot bar has to cover it.
+        //
+        // `tikv,etcd`, NOT `tikv` alone — the pairing is the point. The S3 gateway's
+        // metadata×coordination dispatch arm is `#[cfg(all(feature = "tikv", feature =
+        // "etcd"))]` (cli.rs), so a `--features tikv` build cfg's it out entirely: the bar
+        // could stay green while that combination rotted. And it is not a hypothetical
+        // combination — it is exactly what the retained fallback stack builds
+        // (`deploy/small-multi-node/docker-compose.yml`, `FEATURES: "tikv,etcd"`, whose
+        // gateways run `--metadata-backend tikv --coordination-backend etcd`). Compiling the
+        // pair also compiles every `tikv`-only arm, so it is a superset, not a trade.
+        checks.push(vec![
+            "check",
+            "-p",
+            "wyrd-server",
+            "--features",
+            "tikv,etcd",
+            "--tests",
+        ]);
     }
     if fdb {
         checks.push(vec![
@@ -90,12 +112,16 @@ pub fn feature_gated_checks(tikv: bool, fdb: bool) -> Vec<Vec<&'static str>> {
             "fdb",
             "--tests",
         ]);
+        // `fdb,etcd` for the same reason as the tikv row above: the dispatch arm is
+        // `#[cfg(all(feature = "fdb", feature = "etcd"))]`, and `deploy/small-multi-node-fdb/`
+        // builds `FEATURES: "fdb,etcd"`. A plain `--features fdb` check left that arm — the
+        // one the CANONICAL production stack actually executes — compiled by no CI job at all.
         checks.push(vec![
             "check",
             "-p",
             "wyrd-server",
             "--features",
-            "fdb",
+            "fdb,etcd",
             "--tests",
         ]);
     }
