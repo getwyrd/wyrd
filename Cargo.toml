@@ -107,7 +107,7 @@ prost = "0.14"
 # ADR-0003 three-test audit + `deny.toml` allowlist call — is a **NEEDS-HUMAN** at
 # sign-off (INTEGRATION §4; research issue #260 tracks the pin + API-shape confirmation).
 tikv-client = "0.4"
-foundationdb = { version = "0.10", default-features = false, features = ["fdb-7_3"] }
+foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_3"] }
 # The production L5 Coordination backend's client (ADR-0006, proposal 0015
 # §"Deployment prerequisite", #365). Pinned here; consumed ONLY by
 # `wyrd-coordination-etcd` behind its OFF-by-default `etcd` feature, so the default
