@@ -127,3 +127,48 @@ pub fn feature_gated_checks(tikv: bool, fdb: bool) -> Vec<Vec<&'static str>> {
     }
     checks
 }
+
+/// The **dependency wall** (ADR-0003 §2), as the three `cargo deny` invocations
+/// [`cargo_deny_check`](../main.rs) makes — lifted here so a test can assert the wall's SHAPE,
+/// not just that some deny command ran.
+///
+/// One invocation is not enough, because `cargo deny` audits the graph as resolved for the
+/// features it is given, and both backend features are off by default:
+///
+/// 1. the DEFAULT graph — the artifact we ship. Everything, zero tolerance, no backend
+///    exceptions.
+/// 2. the OFF-BY-DEFAULT trees' ADVISORIES, from a separate config whose `ignore` entries must
+///    never reach the shipped wall (#543): an advisory ignore SUPPRESSES, and cargo-deny keys
+///    it by ID alone, so parked in `deny.toml` it would also mask that ID if a future default
+///    dependency pulled an affected version.
+/// 3. the same trees' LICENCES / bans / sources, from `deny.toml`'s policy (#547). ADR-0003 §2
+///    judges *linked* crates, and a `--features fdb` / `--features tikv` build links crates the
+///    default graph never sees — so without this an AGPL/BSL dependency could enter either
+///    optional tree and pass CI.
+///
+/// Steps 2 and 3 use different configs, and that is NOT duplication: an advisory `ignore`
+/// suppresses (so it must be quarantined), while a licence `allow` is an allowlist (so applying
+/// it to a wider graph can only reject MORE). The ADR-0003 allowlist therefore stays
+/// single-source in `deny.toml`. Two allowlists would drift, and a drifted licence wall is
+/// worse than one wall.
+pub fn dependency_wall_invocations() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["deny", "check"],
+        vec![
+            "deny",
+            "--all-features",
+            "--config",
+            "deny-all-features.toml",
+            "check",
+            "advisories",
+        ],
+        vec![
+            "deny",
+            "--all-features",
+            "check",
+            "licenses",
+            "bans",
+            "sources",
+        ],
+    ]
+}
