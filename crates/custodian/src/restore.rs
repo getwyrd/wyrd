@@ -42,6 +42,24 @@
 //! enumerates them and surfaces each on the durability seam, so a restore's true cost is
 //! *known* rather than discovered.
 //!
+//! ## 3. Bytes the restored map can no longer reach
+//!
+//! The subtlest of the three, and the only one where **nothing is lost and the chunk is still
+//! down**. A repair or rebalance that ran after *V* rebuilt a fragment onto a **new** D server
+//! and repointed `placement[index]` at it. The restore rewinds the *map* to the old server —
+//! while the *bytes* stay on the new one.
+//!
+//! Nothing scans for them. Both the read path ([`wyrd_core::read`]) and the repair loop
+//! ([`crate::reconstruction`]) fetch a fragment from the D server the **placement names**, and
+//! count it missing anywhere else. So those bytes are on disk, intact, and unreachable: reads
+//! fail, and reconstruction cannot even rebuild around them.
+//!
+//! This pass separates that from real loss, in both directions, because conflating them is
+//! harmful either way. Marking such a fragment would hand the **only surviving copy** to GC and
+//! turn a stale pointer into permanent data loss. Counting it as available would report a chunk
+//! as **healthy while every read of it fails**. So it is kept (never marked), and its chunk is
+//! reported as *misplaced* — recoverable by fixing the **placement**, never as *dangling*.
+//!
 //! # The safety gate, unchanged
 //!
 //! Marking is the front half of a deletion, so the invariant [`crate::gc`] is built around
@@ -98,22 +116,36 @@ pub struct RestoreReport {
     /// rebalance after the restore point wrote them to a new D server and repointed the
     /// placement, and the restore rewound the map but not the bytes. These are the **only
     /// surviving copy**, so they are never marked: deleting them would turn a stale placement
-    /// (repairable) into real data loss. The chunk is fine; the map is out of date, and the
-    /// repair loop repoints it.
+    /// (repairable) into real data loss.
+    ///
+    /// They are **not readable**, either: the read path and the repair loop both resolve
+    /// fragments strictly through the placement (see [`reconcile_after_restore`]'s pass 3), so
+    /// bytes sitting anywhere else are bytes nothing will fetch. Kept, reported — and a chunk
+    /// left below `k` by them lands in [`RestoreReport::misplaced`], never in
+    /// [`RestoreReport::under_replicated`].
     pub displaced_kept: usize,
-    /// Committed chunks with **fewer than `k` fragments present**: unreadable, and
-    /// unreconstructible. A restore resurrected the map after the bytes were reclaimed.
+    /// Committed chunks with **fewer than `k` fragments anywhere in the fleet**: unreadable,
+    /// and unreconstructible. A restore resurrected the map after the bytes were reclaimed.
     /// **These files are lost** — the pass reports them, it cannot recover them.
     pub dangling: Vec<ChunkId>,
-    /// Committed chunks missing fragments but still holding **at least `k`**: readable, and
-    /// the reconstruction loop will rebuild them. Reported for visibility, not for action.
+    /// Committed chunks whose bytes **exist** but sit where the restored map does not look:
+    /// fewer than `k` fragments at the D servers the placement names, yet at least `k` present
+    /// across the fleet. Reads fail and the repair loop cannot rebuild them — both fetch by
+    /// placement — so these chunks are **down**. But nothing is lost: the *placement* is stale,
+    /// not the data. Recoverable, and never to be confused with [`RestoreReport::dangling`].
+    pub misplaced: Vec<ChunkId>,
+    /// Committed chunks missing fragments but still holding **at least `k` at their placement**:
+    /// readable, and the reconstruction loop will rebuild them. Reported for visibility.
     pub under_replicated: Vec<ChunkId>,
 }
 
 impl RestoreReport {
     /// Did the pass find anything an operator must act on or absorb?
     pub fn is_clean(&self) -> bool {
-        self.stranded_marked == 0 && self.dangling.is_empty() && self.under_replicated.is_empty()
+        self.stranded_marked == 0
+            && self.dangling.is_empty()
+            && self.misplaced.is_empty()
+            && self.under_replicated.is_empty()
     }
 }
 
@@ -270,24 +302,55 @@ pub async fn reconcile_after_restore(
     // The set of fragments whose bytes exist SOMEWHERE, regardless of which server holds them.
     let present_anywhere: HashSet<FragmentId> = present.iter().map(|&(_d, f)| f).collect();
 
-    // Pass 3 — the metadata's view: what the map points at that is no longer anywhere.
+    // Pass 3 — the metadata's view. TWO questions, never conflated: can the restored map still
+    // READ this chunk, and do its bytes still EXIST? A restore can break the first without
+    // breaking the second, and answering only one of them is a lie in one direction or the
+    // other (both spelled out below).
     for (chunk, expected) in committed_chunks(ctx.meta).await? {
-        // Count a fragment as AVAILABLE if its bytes exist ANYWHERE in the fleet — not only at
-        // the D server the restored (and possibly stale) placement names. A fragment a repair
-        // moved after the restore point sits at the new server while the rewound map still
-        // names the old one; counting strictly by placement would call those bytes missing and
-        // report a perfectly recoverable chunk as DANGLING — data lost. A false "your data is
-        // gone" is the worst thing this command can say, so availability is counted generously
-        // and staleness is reported separately (`displaced_kept`).
-        let available = expected
+        // READABLE is "present at the D server the committed placement NAMES" — nothing weaker.
+        // Both consumers of a placement resolve it strictly, and neither scans the fleet:
+        //
+        //   * the read path fetches `get_fragment_at(fragment_dserver(chunk, i), ..)`
+        //     (`wyrd_core::read`); and
+        //   * reconstruction's `assess` walks `placement` and does `stores.get(&dserver)`
+        //     (`crate::reconstruction`), counting a fragment found anywhere else as MISSING.
+        //
+        // So a DISPLACED fragment — on disk, but not where the rewound map looks — is unreadable
+        // AND unusable by the repair loop. Counting it as available would report a chunk as
+        // healthy while every read of it fails, and would let the command exit 0 over a chunk
+        // that is down. A false all-clear is not a kinder error than a false alarm.
+        let placed = expected
+            .frags
+            .iter()
+            .filter(|&&(dserver, frag)| present.contains(&(dserver, frag)))
+            .count();
+
+        // ...but bytes that exist SOMEWHERE are not LOST, and "your data is gone" is the worst
+        // thing this command can say. A repair after the restore point moved a fragment and
+        // repointed the placement; the restore rewound the map, not the bytes. So LOSS is judged
+        // across the whole fleet — and unreachability is reported as its own, recoverable state
+        // rather than being rounded up into data loss or down into health.
+        let anywhere = expected
             .frags
             .iter()
             .filter(|&&(_dserver, frag)| present_anywhere.contains(&frag))
             .count();
-        if available < usize::from(expected.k) {
+
+        let k = usize::from(expected.k);
+        if anywhere < k {
+            // Fewer than k fragments exist AT ALL: nothing to rebuild from. Lost.
             report.dangling.push(chunk);
-            emit_dangling(chunk, available, expected.k, expected.frags.len());
-        } else if available < expected.frags.len() {
+            emit_dangling(chunk, anywhere, expected.k, expected.frags.len());
+        } else if placed < k {
+            // Every byte is here — just not where the map points. Reads fail, and the repair
+            // loop cannot rebuild from fragments it will never fetch. The chunk is DOWN, and
+            // recovering it means fixing the PLACEMENT, not the data. Reported loudly, and
+            // never as loss.
+            report.misplaced.push(chunk);
+            emit_misplaced(chunk, placed, anywhere, expected.k, expected.frags.len());
+        } else if placed < expected.frags.len() {
+            // At least k readable at the placement: the repair loop rebuilds the rest from
+            // exactly the fragments it can actually fetch.
             report.under_replicated.push(chunk);
         }
     }
@@ -395,6 +458,30 @@ fn emit_dangling(chunk: ChunkId, available: usize, k: u16, n: usize) {
     );
 }
 
+/// A committed chunk whose bytes all still exist, but fewer than `k` of them sit where the
+/// restored map looks. The read path and the repair loop both resolve fragments strictly by
+/// placement, so this chunk is unreadable *and* unrebuildable — while nothing has been lost.
+/// Deliberately NOT [`emit_dangling`]: telling an operator their data is gone when it is sitting
+/// on a D server one hop away would send them to a backup they do not need.
+fn emit_misplaced(chunk: ChunkId, placed: usize, anywhere: usize, k: u16, n: usize) {
+    tracing::error!(monotonic_counter.restore_misplaced_chunks = 1_u64);
+    tracing::error!(
+        target: "wyrd.custodian.restore.audit",
+        action = "misplaced",
+        chunk = %wyrd_traits::chunk_hex(chunk),
+        placed,
+        anywhere,
+        required = k,
+        total = n,
+        "post-restore: committed chunk has fewer than k fragments AT THE PLACEMENT the restored \
+         map names, though at least k exist elsewhere in the fleet. Reads resolve fragments by \
+         placement and will FAIL, and the repair loop fetches by placement too, so it cannot \
+         rebuild this chunk either. The data is NOT lost — the PLACEMENT is stale. Restage the \
+         displaced fragments onto the D servers the map names (or repoint the placement at where \
+         the bytes actually are), then re-run this pass",
+    );
+}
+
 /// A fragment the restored map still needs, found somewhere the map does not name — and found
 /// NOWHERE the map does name. The bytes moved after the restore point (a repair/rebalance
 /// repointed `placement[index]`), and the restore rewound the map beneath them. Never marked:
@@ -425,6 +512,7 @@ fn emit_summary(report: &RestoreReport) {
         pending_skipped = report.pending_skipped,
         displaced_kept = report.displaced_kept,
         dangling = report.dangling.len(),
+        misplaced = report.misplaced.len(),
         under_replicated = report.under_replicated.len(),
         "post-restore reconciliation complete",
     );

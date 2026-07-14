@@ -984,14 +984,17 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             .await?;
             eprintln!(
                 "wyrd custodian: post-restore reconciliation complete — {} stranded fragment(s) \
-                 marked collectable ({} already marked, {} left to a pending lease); {} chunk(s) \
-                 DANGLING (unreadable AND unreconstructible — the restore resurrected maps whose \
-                 bytes were already reclaimed), {} under-replicated (the repair loop rebuilds \
-                 these).",
+                 marked collectable ({} already marked, {} left to a pending lease, {} displaced \
+                 and kept); {} chunk(s) DANGLING (unreadable AND unreconstructible — the restore \
+                 resurrected maps whose bytes were already reclaimed), {} MISPLACED (bytes \
+                 present but not where the restored map looks — unreadable until the placement is \
+                 fixed), {} under-replicated (the repair loop rebuilds these).",
                 report.stranded_marked,
                 report.already_marked,
                 report.pending_skipped,
+                report.displaced_kept,
                 report.dangling.len(),
+                report.misplaced.len(),
                 report.under_replicated.len(),
             );
             if !report.dangling.is_empty() {
@@ -1001,10 +1004,23 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
                      them. See the audit log for each chunk id.",
                     report.dangling.len()
                 );
-                // EXIT NON-ZERO. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green: a
-                // restore script checking the status code would record a run that LOST DATA as a
-                // healthy one, which is the single worst thing this command could do. The pass
-                // itself succeeded; the restore did not.
+            }
+            if !report.misplaced.is_empty() {
+                eprintln!(
+                    "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are UNREADABLE but NOT lost. Their \
+                     fragments are on D servers the restored placement does not name (a repair \
+                     moved them after the restore point). Reads and the repair loop both fetch by \
+                     placement, so neither will find them. Restage those fragments onto the placed \
+                     D servers — or repoint the placement — then re-run this pass. Do NOT go to a \
+                     backup: the data is here. See the audit log for each chunk id.",
+                    report.misplaced.len()
+                );
+            }
+            // EXIT NON-ZERO on either. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green: a
+            // restore script checking the status code would record a run that lost data — or one
+            // whose chunks cannot be read — as a healthy one, which is the single worst thing this
+            // command could do. The pass itself succeeded; the restore did not.
+            if !report.dangling.is_empty() || !report.misplaced.is_empty() {
                 return Ok::<ExitCode, BoxError>(ExitCode::FAILURE);
             }
             return Ok::<ExitCode, BoxError>(ExitCode::SUCCESS);

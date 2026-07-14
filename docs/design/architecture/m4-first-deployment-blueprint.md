@@ -578,8 +578,31 @@ fdbbackup start -d <new-independent-storage-URL> -z -s 3600
 #    Verify it actually became restorable before you call the incident closed:
 fdbbackup describe -d <new-URL> -C /etc/foundationdb/fdb.cluster   # expect Restorable: true
 
-# 7. Resume writers, then run a scrub pass (see below — the restore leaves the fragment
-#    tier at a different point in time, and that needs reconciling).
+# 7. RECONCILE THE FRAGMENT TIER — with the writers STILL STOPPED. The metadata went back to
+#    $GOOD; the D servers did not. The two tiers now disagree, and neither fixes itself: the
+#    GC reclaims only on EVIDENCE of an elapsed grace deadline, and the restore erased that
+#    evidence along with the chunk maps (see below). This pass supplies it. It MARKS; it
+#    never deletes. Writers must still be stopped — the pass reads absence as meaning
+#    something, and a concurrent write makes absence a lie.
+wyrd custodian --reconcile-after-restore --metadata-backend fdb \
+    --endpoints <EVERY D SERVER> --ids <EVERY ID>
+
+#    Pass the COMPLETE fleet, not the reachable subset: a D server you leave out looks like
+#    missing fragments, and the pass would report LIVE DATA AS LOST. It refuses to run on a
+#    partial fleet rather than guess.
+#
+#    It exits NON-ZERO if the restore cost you anything, and distinguishes two very
+#    different bills — read which one before you act:
+#      DANGLING  — fewer than k fragments exist ANYWHERE: the file is LOST. You restored past
+#                  a delete, and GC had already taken the bytes. Nothing can rebuild it.
+#      MISPLACED — the bytes EXIST, but not where the restored map points: a repair moved
+#                  them after $GOOD and the restore rewound the map beneath them. Reads fail
+#                  and the repair loop cannot rebuild these either — both resolve fragments
+#                  strictly through the placement. This is NOT data loss. Do not reach for
+#                  an older backup: restage those fragments onto the D servers the map names
+#                  (the audit log gives each chunk id), then re-run the pass.
+
+# 8. Resume writers, then run a scrub pass (see below).
 ```
 
 ```
@@ -635,8 +658,20 @@ different points in time, and that mismatch is the sharpest edge in this whole p
   fragment with no surviving record hits the reconciler's final branch — *"no evidence the
   grace window elapsed — conservatively keep it"* — and is **retained indefinitely**. That
   is fail-safe (it never deletes live data) but it means **the space leaks until someone
-  reclaims it.** There is no post-restore reconciliation pass today; it needs one (**#551**),
-  and until it exists the cleanup is manual.
+  reclaims it.** `wyrd custodian --reconcile-after-restore` (step 7 above, **#551**) is what
+  supplies the missing evidence: it marks those fragments so the *existing* GC reclaims them
+  on its *existing* grace window. It marks; it never deletes. Run it after every restore —
+  skip it and the leak is permanent, because nothing else will ever mark them.
+
+- **Fragments a repair MOVED after *V*** are the case to understand before you panic. A
+  post-*V* repair or rebalance rebuilt a fragment onto a new D server and repointed the
+  placement; the restore rewinds the *map* to the old server while the *bytes* stay on the
+  new one. Nothing scans for them — the read path and the repair loop both fetch a fragment
+  from the D server the **placement names** — so those bytes are on disk, intact, and
+  unreachable. The pass reports the affected chunks as **MISPLACED**, deliberately *not* as
+  lost: the data is there, the *placement* is stale. Restage them (or repoint the placement)
+  and re-run the pass. Going to an older backup here would be the wrong move, and an
+  expensive one.
 
 - **The inode allocator rewinds with everything else** (`meta:next_inode` lives *in* the
   metadata), so post-restore writes hand out inode numbers that post-*V* files used. That is
@@ -697,7 +732,10 @@ one snapshot plus one interval of logs, and monitor the destination's free space
   production move (it keeps the damaged cluster intact for a second attempt), so it is the
   first thing to drill next.
 - **A full single-zone restore** — the drill restored the metadata tier alone, not the stack.
-- **The post-restore fragment reconciliation** (#551) — it does not exist yet.
+- **The post-restore fragment reconciliation** (#551) — the pass now exists
+  (`wyrd custodian --reconcile-after-restore`, step 7) and is covered by tests, but it has
+  never been run against a **real** FDB restore: the drill above predates it. Its safety
+  rules — a complete fleet, writers stopped — are exactly the ones a drill would stress.
 
 Treat restore as fallible and **re-drill it on the real topology** before relying on it: a
 backup you have never restored is a hypothesis, not a backup.
@@ -1198,8 +1236,10 @@ processes are running" and "it is actually production-durable."
                   -z it is a one-shot; a dead agent still reports a healthy backup).
                   Know the restore order: etcd → metadata → re-replicate from
                   survivors — and that a restore leaves the fragment tier at a
-                  different point in time (#551). See "The FoundationDB backup
-                  runbook". M4 is single-zone, so this is your only DR until M9.
+                  different point in time, so it ends with `wyrd custodian
+                  --reconcile-after-restore` over the COMPLETE fleet, writers still
+                  stopped (#551). See "The FoundationDB backup runbook". M4 is
+                  single-zone, so this is your only DR until M9.
 7. Promote:       anything surprising in steps 1–6 → a seeded DST regression.
 ```
 

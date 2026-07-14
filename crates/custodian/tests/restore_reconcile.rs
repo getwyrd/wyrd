@@ -142,6 +142,25 @@ async fn commit_chunk(
         .unwrap();
 }
 
+/// Commit an inode holding one **single-fragment** (`EcScheme::None`) chunk on `dserver`.
+/// No redundancy: the lone fragment IS the data, and `k` is 1.
+async fn commit_single_chunk(meta: &MemMeta, inode: InodeId, chunk: ChunkId, dserver: DServerId) {
+    let record = InodeRecord {
+        size: 5,
+        version: 1,
+        state: InodeState::Committed,
+        chunk_map: vec![ChunkRef {
+            id: chunk,
+            scheme: EcScheme::None,
+            len: 5,
+            placement: vec![dserver],
+        }],
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
+        .await
+        .unwrap();
+}
+
 /// The fragments of `chunk` as placed on `placement` (index i → placement[i]).
 fn placed(chunk: ChunkId, placement: &[DServerId]) -> Vec<(DServerId, FragmentId)> {
     placement
@@ -571,6 +590,19 @@ async fn the_only_copy_of_a_moved_fragment_is_never_marked() {
         "every fragment's bytes exist (fragment 0 merely sits on d1 rather than d0) — reporting \
          this chunk as DANGLING would tell an operator their recoverable data is gone: {report:?}"
     );
+    // It IS still degraded, though, and the report must say which kind. Fragment 1 sits at its
+    // placement, and k=1, so the chunk still READS — the repair loop rebuilds fragment 0 back
+    // onto d0 from it. That is under-replication, not an operator's problem.
+    assert_eq!(
+        report.under_replicated,
+        vec![55],
+        "fragment 0 is unreachable at its placement, so the chunk is degraded — silently calling \
+         it healthy would hide a chunk running without redundancy: {report:?}"
+    );
+    assert!(
+        report.misplaced.is_empty(),
+        "k=1 fragment still reads at its placement, so this needs no human: {report:?}"
+    );
 }
 
 /// The other half of the same rule: when the map's server DOES still hold the fragment, a copy
@@ -613,4 +645,152 @@ async fn a_stale_duplicate_is_marked_when_the_canonical_copy_survives() {
             .is_none(),
         "the canonical copy must never be marked"
     );
+}
+
+// ---- ...and the MIRROR of that trap: displaced bytes are not READABLE bytes ----
+
+/// THE HOLLOW GREEN codex caught on the second pass — the exact mistake the fix above invites.
+/// Having learned "don't call displaced bytes lost", the tempting next step is to count a
+/// fragment as available wherever it sits. That is just as wrong, in the opposite direction.
+///
+/// NOTHING SCANS THE FLEET. The read path fetches `get_fragment_at(fragment_dserver(chunk, i))`
+/// (`wyrd_core::read`), and reconstruction's `assess` walks `placement` and does
+/// `stores.get(&dserver)` (`crate::reconstruction`) — a fragment found anywhere else is counted
+/// MISSING by both. So a displaced fragment is unreadable AND unusable by the repair loop.
+///
+/// This is the sharpest case, and it is codex's own: a single-fragment chunk placed on d0, its
+/// bytes sitting only on d1. Counting "present anywhere" makes it look PERFECT — `available == k
+/// == n`, no dangling, not even under-replicated — so the command exits 0 and the restore script
+/// records a clean run, while every read of that file fails.
+#[tokio::test]
+async fn a_single_fragment_chunk_whose_bytes_moved_is_reported_misplaced_not_healthy() {
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+    let d1 = MemDServer::default();
+
+    // The RESTORED map places the lone fragment on d0...
+    commit_single_chunk(&meta, 1, 99, 0).await;
+    // ...but the bytes are on d1 (a rebalance moved them after the restore point).
+    d1.put(frag(99, 0)).await;
+
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 1_000,
+    };
+
+    let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+    assert_eq!(
+        report.misplaced,
+        vec![99],
+        "the read path resolves this fragment strictly through the placement (d0), which does \
+         NOT hold it — the chunk is UNREADABLE. Counting it available because the bytes exist \
+         somewhere reports a broken chunk as healthy and exits 0 over a file that 404s: {report:?}"
+    );
+    assert!(
+        report.dangling.is_empty(),
+        "...and yet it is NOT lost: the bytes are one hop away on d1. Reporting it as DANGLING \
+         would send an operator to a backup they do not need: {report:?}"
+    );
+    assert!(
+        !report.is_clean(),
+        "a chunk nobody can read must never let this command report a clean restore — the CLI \
+         exits on `is_clean`, and a hollow green is the worst thing it can print: {report:?}"
+    );
+    // ...and the displaced bytes are still kept, never marked: they are the only copy.
+    assert_eq!(report.displaced_kept, 1, "{report:?}");
+    assert_eq!(report.stranded_marked, 0, "{report:?}");
+}
+
+/// The same lie, one step subtler: enough fragments exist across the fleet to clear `k`, but not
+/// enough sit where the map looks. The repair loop cannot save this chunk — `assess` fetches by
+/// placement, so it sees fewer than `k` survivors and cannot rebuild — which makes
+/// "under-replicated" (i.e. *the repair loop will handle it*) an actively misleading verdict.
+#[tokio::test]
+async fn a_chunk_below_k_at_its_placement_is_misplaced_not_under_replicated() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+
+    // RS(2,1): k=2 of n=3, placed 0→d0, 1→d1, 2→d2.
+    commit_chunk(&meta, 1, 111, 2, 1, vec![0, 1, 2]).await;
+    d1.put(frag(111, 1)).await; // canonical, present
+    d2.put(frag(111, 0)).await; // DISPLACED: the map says d0, the bytes are on d2
+                                // fragment 2 is genuinely gone.
+
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1), (2, &d2)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 1_000,
+    };
+
+    let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+    assert_eq!(
+        report.misplaced,
+        vec![111],
+        "only ONE of the two fragments needed (k=2) sits at its placement — the other is on d2, \
+         where neither a read nor `assess` will ever look. The chunk cannot be read and cannot be \
+         rebuilt: {report:?}"
+    );
+    assert!(
+        report.under_replicated.is_empty(),
+        "calling this under-replicated says 'the repair loop rebuilds it' — and the repair loop \
+         CANNOT: it fetches by placement, sees 1 survivor against k=2, and gives up. The operator \
+         would wait for a repair that is never coming: {report:?}"
+    );
+    assert!(
+        report.dangling.is_empty(),
+        "and it is still not LOST — 2 fragments' bytes exist, which is k. The placement is what \
+         is broken, not the data: {report:?}"
+    );
+}
+
+/// The boundary that keeps the new state honest: a displaced fragment must NOT be escalated to
+/// `misplaced` when the chunk is still readable without it. Here `k` fragments remain at their
+/// placement, so reads succeed and the repair loop genuinely does rebuild the rest — from the
+/// fragments it can actually fetch. Under-replicated, exactly as before.
+#[tokio::test]
+async fn a_displaced_fragment_is_only_under_replicated_while_k_survive_at_the_placement() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+
+    // RS(2,1): k=2 of n=3. Fragments 1 and 2 sit at their placement — that is k, so the chunk
+    // reads and rebuilds. Fragment 0's bytes were moved to d2 by a post-restore repair.
+    commit_chunk(&meta, 1, 122, 2, 1, vec![0, 1, 2]).await;
+    d1.put(frag(122, 1)).await;
+    d2.put(frag(122, 2)).await;
+    d2.put(frag(122, 0)).await; // displaced, and not needed to read
+
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1), (2, &d2)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 1_000,
+    };
+
+    let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+    assert_eq!(
+        report.under_replicated,
+        vec![122],
+        "k=2 fragments are readable at their placement, so this chunk is fine and the repair loop \
+         rebuilds fragment 0 from them — escalating it to MISPLACED would cry wolf over a chunk \
+         that needs no operator at all: {report:?}"
+    );
+    assert!(report.misplaced.is_empty(), "{report:?}");
+    assert!(report.dangling.is_empty(), "{report:?}");
+    // The displaced copy is still the only copy of fragment 0, so it is still never marked.
+    assert_eq!(report.displaced_kept, 1, "{report:?}");
+    assert_eq!(report.stranded_marked, 0, "{report:?}");
 }
