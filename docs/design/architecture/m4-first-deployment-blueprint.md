@@ -584,8 +584,13 @@ fdbbackup describe -d <new-URL> -C /etc/foundationdb/fdb.cluster   # expect Rest
 #    evidence along with the chunk maps (see below). This pass supplies it. It MARKS; it
 #    never deletes. Writers must still be stopped — the pass reads absence as meaning
 #    something, and a concurrent write makes absence a lie.
+#    Topology is NEVER fabricated from argument order: --ids and --failure-domains are both
+#    required, one entry per endpoint, matching each D server's own --id / --failure-domain.
+#    Omit either and the command exits with an argument error before it sweeps anything.
 wyrd custodian --reconcile-after-restore --metadata-backend fdb \
-    --endpoints <EVERY D SERVER> --ids <EVERY ID>
+    --endpoints http://d0:50051,http://d1:50051,http://d2:50051 \
+    --ids 0,1,2 \
+    --failure-domains rack-a,rack-b,rack-c
 
 #    Pass the COMPLETE fleet, not the reachable subset: a D server you leave out looks like
 #    missing fragments, and the pass would report LIVE DATA AS LOST. It refuses to run on a
