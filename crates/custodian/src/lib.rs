@@ -27,6 +27,7 @@ pub mod leadership;
 pub mod rebalance;
 pub mod reconciliation;
 pub mod reconstruction;
+pub mod restore;
 pub mod scrub;
 
 pub use backfill::BackfillContext;
@@ -39,6 +40,7 @@ pub use leadership::{Custodian, FenceError, FencedZone};
 pub use rebalance::RebalanceContext;
 pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
 pub use reconstruction::{repair_priority, ReconstructionContext};
+pub use restore::{reconcile_after_restore, RestoreReport};
 pub use scrub::ScrubContext;
 // The durability-plane telemetry seam now lives in the shared `wyrd-telemetry` crate
 // (observability floor, proposal 0010 item 1); re-exported so M3 consumers that name

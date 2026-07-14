@@ -77,8 +77,8 @@ use crate::logging::{self, LogConfig};
 use tracing_subscriber::Registry;
 use wyrd_core::placement::Topology;
 use wyrd_custodian::{
-    reconcile_step, Custodian, FencedZone, GcContext, RebalanceContext, ReconcileError, Reconciled,
-    ReconstructionContext, ScrubContext,
+    reconcile_after_restore, reconcile_step, Custodian, FencedZone, GcContext, RebalanceContext,
+    ReconcileError, Reconciled, ReconstructionContext, RestoreReport, ScrubContext,
 };
 use wyrd_telemetry::DurabilityTelemetry;
 use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
@@ -320,6 +320,42 @@ impl CustodianService {
         )
         .with_subscriber(self.dispatch.clone())
         .await
+    }
+
+    /// One **post-restore reconciliation** pass over the configured fleet (#551) — the
+    /// operator command run after a metadata restore, with the writers stopped.
+    ///
+    /// A restore rewinds the metadata while the D servers stay at "now", and `gc` reclaims a
+    /// fragment only on EVIDENCE of an elapsed grace deadline — an `orphan:` record or an
+    /// expired `pending:` lease — both of which lived in the metadata the restore erased. So
+    /// post-restore strays are unreferenced *and* evidence-free, and GC keeps them forever.
+    /// This pass supplies the missing evidence, and reports the chunks whose bytes were
+    /// already reclaimed before the restore resurrected their maps.
+    ///
+    /// Runs through the role's dispatch, so its audit lines — the per-fragment marks and the
+    /// `DANGLING` operator signal above all — land on the same telemetry surface as the loops.
+    ///
+    /// **Marks; never deletes.** GC does the reclaiming, on its own grace window, later.
+    pub async fn reconcile_after_restore_pass(
+        &self,
+        meta: &dyn MetadataStore,
+        configured: &[ConfiguredDServer],
+        grace_window_millis: u64,
+        now_millis: u64,
+    ) -> Result<RestoreReport, BoxError> {
+        let fleet: Vec<(DServerId, &dyn ChunkStore)> = configured
+            .iter()
+            .map(|d| (d.id, d.store.as_ref()))
+            .collect();
+        let gc = GcContext {
+            meta,
+            fleet: &fleet,
+            grace_window_millis,
+        };
+        let report = reconcile_after_restore(&gc, now_millis)
+            .with_subscriber(self.dispatch.clone())
+            .await?;
+        Ok(report)
     }
 
     /// The deployable **reconstruction run loop** — the spine the `wyrd custodian` binary

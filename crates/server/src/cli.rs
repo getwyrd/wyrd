@@ -38,6 +38,7 @@ use crate::custodian::{connect_fleet, ConfiguredDServer, CustodianService, DServ
 use crate::dserver::{self, DServer};
 use crate::logging::{self, LogConfig};
 use crate::{Gateway, DEFAULT_DURABILITY};
+use wyrd_custodian::RestoreReport;
 use wyrd_gateway_s3 as s3;
 
 /// Default endpoint the `d-server` role binds and advertises.
@@ -65,6 +66,21 @@ const DEFAULT_CHUNK_SIZE: usize = 1 << 20;
 // releases the pending ledger; a fixed time keeps runs reproducible.
 const NOW_MILLIS: u64 = 0;
 const LEASE_TTL_MILLIS: u64 = 60_000;
+
+/// The reader-safe grace window the post-restore pass (#551) stamps onto the fragments it
+/// marks: how long a marked-collectable fragment must survive before GC may reclaim its bytes.
+///
+/// **Derived, not invented.** `GcContext::grace_window_millis` is documented as coming from
+/// reader version-hold / lease semantics — never a magic constant — so this reuses the one
+/// timescale the system already trusts for exactly this purpose: the pending-ledger lease TTL
+/// ([`LEASE_TTL_MILLIS`]), which GC itself already treats as sufficient grace for a crashed
+/// write's garbage. A fragment stranded by a restore is the same kind of garbage on the same
+/// kind of deadline.
+///
+/// The principled derivation from reader version-holds is #554's job — the issue that also
+/// has to make GC actually *run* in the deployed role. Until then this is the honest floor:
+/// no shorter than the grace the write path already relies on.
+const RESTORE_GRACE_WINDOW_MILLIS: u64 = LEASE_TTL_MILLIS;
 
 // Bounded retry-with-backoff for [`alloc_inode`] (proposal 0015 §"Composition,
 // not refactor" item 3). Over embedded redb a conflicting commit is a sub-µs
@@ -332,7 +348,11 @@ fn usage() {
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
-    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…]");
+    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore]");
+    eprintln!("      --reconcile-after-restore runs ONE post-restore reconciliation pass and exits (#551): after");
+    eprintln!("      restoring metadata from a backup, with the writers STOPPED. It marks fragments the restore");
+    eprintln!("      stranded so GC can reclaim them, and reports chunks whose bytes were already reclaimed before");
+    eprintln!("      the restore resurrected their maps. It marks; it never deletes.");
     eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd demo");
     eprintln!();
@@ -747,6 +767,9 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
     // rebuilt fragment can never be re-placed onto a survivor's real failure domain.
     let ids = parse_u64_list(parsed.flag("ids"))?;
     let domains = parse_str_list(parsed.flag("failure-domains"));
+    // The #551 one-shot: read here, with the other flags, so `parsed` is not borrowed across
+    // the `async move` that owns the rest of the role.
+    let reconcile_after_restore = parsed.flag("reconcile-after-restore").is_some();
 
     let runtime = tokio_runtime()?;
     runtime.block_on(async move {
@@ -816,11 +839,23 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
         let clock = wall_clock_millis;
 
         let Some(endpoints) = endpoints else {
+            if reconcile_after_restore {
+                // Exiting 0 here would be the worst outcome: the operator ran the one-shot as
+                // the runbook told them to, saw success, and reconciled NOTHING — every
+                // fragment the restore stranded stays stranded, silently.
+                return Err::<ExitCode, BoxError>(
+                    "wyrd custodian --reconcile-after-restore: no --endpoints. The pass sweeps \
+                     the D-server fleet, so it cannot run without one — and exiting successfully \
+                     while reconciling nothing would leave every post-restore stray stranded. \
+                     Pass --endpoints/--ids/--failure-domains for the WHOLE fleet."
+                        .into(),
+                );
+            }
             eprintln!(
                 "wyrd custodian: no --endpoints; nothing to reconstruct. Wire --endpoints to \
                  the D-server fleet to run the reconstruction plane."
             );
-            return Ok::<(), BoxError>(());
+            return Ok::<ExitCode, BoxError>(ExitCode::SUCCESS);
         };
 
         // Assemble the fleet through the injectable connector seam ([`connect_fleet`]): it
@@ -860,6 +895,137 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             endpoints.len()
         );
 
+        // POST-RESTORE RECONCILIATION (#551) — an explicit one-shot, never a loop step.
+        //
+        // It REQUIRES THE WHOLE FLEET, and this is the difference between it and every other
+        // custodian pass. `connect_fleet` deliberately starts DEGRADED — it drops a D server
+        // that is unreachable at startup, so the repair loop reads *around* a down box rather
+        // than refusing to run. For this pass that behaviour is not merely unhelpful, it is
+        // dangerous in both directions: a fragment on an unreachable server is invisible, so
+        // its chunk looks short of fragments and could be reported **DANGLING — data lost**
+        // when the bytes are sitting safe on a box that was merely rebooting; and the strays
+        // on that box are never marked, so the leak this pass exists to close silently
+        // persists on exactly the server nobody looked at. A partial view cannot distinguish
+        // "the fragment is gone" from "the server is down", and this command's whole job is to
+        // make that distinction. So: all or nothing.
+        //
+        // Marking a fragment collectable is the front half of deleting it, and the rule that
+        // would trigger this automatically ("the metadata version went backwards") also fires
+        // on a MISCONFIGURED cluster — an empty or wrong metadata store — where it would
+        // cheerfully mark every fragment in the fleet. The blast radius of a false positive is
+        // the whole cluster, so the trigger is a human who knows a restore happened.
+        if reconcile_after_restore {
+            // Stable ids must be UNIQUE, and nothing else checks this: `require_aligned_topology`
+            // validates the LENGTHS of --ids/--failure-domains against --endpoints, not that the
+            // ids differ. Everything downstream keys fragments by `(DServerId, FragmentId)`, so a
+            // duplicated id silently fuses two physical servers into one: box B's fragments would
+            // answer for box A's, a placement could look satisfied by bytes on the wrong machine,
+            // and this pass — which marks for deletion — would draw its conclusions from a fleet
+            // that does not exist. Refuse.
+            // Duplicate ENDPOINTS are the same hazard wearing the other hat, and this one can
+            // DELETE LIVE DATA. List one physical box twice under two different ids and its
+            // fragments answer to both: a fragment the placement references as (A, frag) is
+            // protected, while the very same bytes, seen as (B, frag), are unreferenced — so
+            // this pass marks them, and a later GC sweep through the duplicate reaches them as B
+            // and deletes them. Protection is keyed by (DServerId, FragmentId); a box with two
+            // identities defeats it.
+            let unique_endpoints: std::collections::HashSet<&String> = endpoints.iter().collect();
+            if unique_endpoints.len() != endpoints.len() {
+                return Err::<ExitCode, BoxError>(
+                    format!(
+                        "wyrd custodian --reconcile-after-restore: --endpoints contains duplicates \
+                         ({} unique of {} given). The same D server under two ids answers to both, \
+                         so a LIVE fragment protected under one id is unreferenced under the other \
+                         — this pass would mark it and GC would DELETE IT. List each D server once.",
+                        unique_endpoints.len(),
+                        endpoints.len(),
+                    )
+                    .into(),
+                );
+            }
+            let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
+            if unique.len() != ids.len() {
+                return Err::<ExitCode, BoxError>(
+                    format!(
+                        "wyrd custodian --reconcile-after-restore: --ids contains duplicates \
+                         ({} unique of {} given). Fragments are keyed by (d-server id, fragment), \
+                         so a duplicated id fuses two servers into one and this pass would mark \
+                         and report against a fleet that does not exist. Give each D server its \
+                         own stable id.",
+                        unique.len(),
+                        ids.len(),
+                    )
+                    .into(),
+                );
+            }
+            if configured.len() != endpoints.len() {
+                return Err::<ExitCode, BoxError>(
+                    format!(
+                        "wyrd custodian --reconcile-after-restore: only {} of {} configured D \
+                         server(s) are reachable. This pass REFUSES to run on a partial fleet: a \
+                         fragment on an unreachable server is indistinguishable from a fragment \
+                         that is gone, so it would report live chunks as DANGLING (data lost) and \
+                         leave that server's stranded fragments unmarked. Bring the whole fleet \
+                         up and re-run.",
+                        configured.len(),
+                        endpoints.len(),
+                    )
+                    .into(),
+                );
+            }
+            let report = run_restore_reconcile_over_backend(
+                backend,
+                data_dir,
+                &service,
+                &configured,
+                RESTORE_GRACE_WINDOW_MILLIS,
+                wall_clock_millis(),
+            )
+            .await?;
+            eprintln!(
+                "wyrd custodian: post-restore reconciliation complete — {} stranded fragment(s) \
+                 marked collectable ({} already marked, {} left to a pending lease, {} displaced \
+                 and kept); {} chunk(s) DANGLING (unreadable AND unreconstructible — the restore \
+                 resurrected maps whose bytes were already reclaimed), {} MISPLACED (bytes \
+                 present but not where the restored map looks — unreadable until the placement is \
+                 fixed), {} under-replicated (the repair loop rebuilds these).",
+                report.stranded_marked,
+                report.already_marked,
+                report.pending_skipped,
+                report.displaced_kept,
+                report.dangling.len(),
+                report.misplaced.len(),
+                report.under_replicated.len(),
+            );
+            if !report.dangling.is_empty() {
+                eprintln!(
+                    "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are LOST. Restoring past a delete \
+                     resurrects the map after GC took the bytes; no reconstruction can rebuild \
+                     them. See the audit log for each chunk id.",
+                    report.dangling.len()
+                );
+            }
+            if !report.misplaced.is_empty() {
+                eprintln!(
+                    "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are UNREADABLE but NOT lost. Their \
+                     fragments are on D servers the restored placement does not name (a repair \
+                     moved them after the restore point). Reads and the repair loop both fetch by \
+                     placement, so neither will find them. Restage those fragments onto the placed \
+                     D servers — or repoint the placement — then re-run this pass. Do NOT go to a \
+                     backup: the data is here. See the audit log for each chunk id.",
+                    report.misplaced.len()
+                );
+            }
+            // EXIT NON-ZERO on either. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green: a
+            // restore script checking the status code would record a run that lost data — or one
+            // whose chunks cannot be read — as a healthy one, which is the single worst thing this
+            // command could do. The pass itself succeeded; the restore did not.
+            if !report.dangling.is_empty() || !report.misplaced.is_empty() {
+                return Ok::<ExitCode, BoxError>(ExitCode::FAILURE);
+            }
+            return Ok::<ExitCode, BoxError>(ExitCode::SUCCESS);
+        }
+
         // Open the SAME metadata store the cluster wrote to (redb dev / TiKV prod) and run
         // the leader-elected reconstruction loop through the telemetry handle.
         run_reconstruction_over_backend(
@@ -874,9 +1040,46 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             shutdown,
         )
         .await?;
-        Ok::<(), BoxError>(())
-    })?;
-    Ok(ExitCode::SUCCESS)
+        Ok::<ExitCode, BoxError>(ExitCode::SUCCESS)
+    })
+}
+
+/// Open the SAME metadata store the cluster wrote to and run ONE post-restore reconciliation
+/// pass over it (#551) — the backend dispatch of the `--reconcile-after-restore` one-shot.
+///
+/// Mirrors [`run_reconstruction_over_backend`]: the backend match is the only thing that
+/// differs per store, and the pass itself is backend-agnostic (it works over the
+/// `MetadataStore` / `ChunkStore` seams, as every custodian loop does).
+pub async fn run_restore_reconcile_over_backend(
+    backend: MetadataBackend,
+    data_dir: &str,
+    service: &CustodianService,
+    configured: &[ConfiguredDServer],
+    grace_window_millis: u64,
+    now_millis: u64,
+) -> Result<RestoreReport, BoxError> {
+    match backend {
+        MetadataBackend::Redb => {
+            let meta = open_local_meta_redb(data_dir)?;
+            service
+                .reconcile_after_restore_pass(&meta, configured, grace_window_millis, now_millis)
+                .await
+        }
+        #[cfg(feature = "tikv")]
+        MetadataBackend::Tikv => {
+            let meta = open_tikv_meta().await?;
+            service
+                .reconcile_after_restore_pass(&meta, configured, grace_window_millis, now_millis)
+                .await
+        }
+        #[cfg(feature = "fdb")]
+        MetadataBackend::Fdb => {
+            let meta = open_fdb_meta().await?;
+            service
+                .reconcile_after_restore_pass(&meta, configured, grace_window_millis, now_millis)
+                .await
+        }
+    }
 }
 
 /// Open the metadata store the cluster wrote to for the configured `backend` and run the
@@ -1722,7 +1925,15 @@ fn cluster_get(
     })
 }
 
-/// Positional arguments plus `--flag value` pairs.
+/// The flags that take **no value** — `--flag`, not `--flag value`.
+///
+/// An allowlist, deliberately, rather than "a flag whose next token starts with `--` is a
+/// boolean": that inference would also make a *dangling* value flag (`wyrd demo --log-level`)
+/// silently parse as `true` instead of failing, which is precisely the hole the #531 guard
+/// test exists to keep shut. A flag is valueless only if it says so here.
+const VALUELESS_FLAGS: &[&str] = ["reconcile-after-restore"].as_slice();
+
+/// Positional arguments plus `--flag value` pairs (and the valueless flags above).
 struct ParsedArgs {
     positionals: Vec<String>,
     flags: HashMap<String, String>,
@@ -1735,6 +1946,11 @@ impl ParsedArgs {
         let mut i = 0;
         while i < args.len() {
             if let Some(name) = args[i].strip_prefix("--") {
+                if VALUELESS_FLAGS.contains(&name) {
+                    flags.insert(name.to_string(), "true".to_string());
+                    i += 1;
+                    continue;
+                }
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| format!("flag `--{name}` needs a value"))?;
@@ -1760,6 +1976,49 @@ impl ParsedArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The #551 one-shot is a VALUELESS flag — and adding it must not weaken the guard that a
+    /// dangling VALUE flag still fails (#531). Both halves, because the tempting shortcut
+    /// ("a flag whose next token is missing or starts with `--` is a boolean") would silently
+    /// turn `wyrd demo --log-level` into `log-level=true` and reopen exactly that hole.
+    #[test]
+    fn the_restore_one_shot_is_valueless_but_value_flags_still_demand_a_value() {
+        let args: Vec<String> = ["--zone", "z", "--reconcile-after-restore"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = ParsedArgs::parse(&args).expect("a valueless flag must parse without a value");
+        assert!(
+            parsed.flag("reconcile-after-restore").is_some(),
+            "--reconcile-after-restore must be recognised with no value"
+        );
+        assert_eq!(
+            parsed.flag("zone"),
+            Some("z"),
+            "value flags still take values"
+        );
+
+        // ...and the flag ORDER must not matter: valueless flag first, value flag after.
+        let args: Vec<String> = ["--reconcile-after-restore", "--zone", "z"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed =
+            ParsedArgs::parse(&args).expect("valueless flag must not swallow the next flag");
+        assert!(parsed.flag("reconcile-after-restore").is_some());
+        assert_eq!(
+            parsed.flag("zone"),
+            Some("z"),
+            "the valueless flag must not consume `--zone` as its value"
+        );
+
+        // The #531 guard, unchanged: a VALUE flag with no value is still an error.
+        let dangling: Vec<String> = vec!["--log-level".to_string()];
+        assert!(
+            ParsedArgs::parse(&dangling).is_err(),
+            "a dangling value flag must still FAIL — inferring `true` here is the hole #531 closed"
+        );
+    }
 
     /// **A dangling log flag fails at startup, on EVERY subcommand — `demo` included**
     /// (#531 review).
