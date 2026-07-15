@@ -57,6 +57,10 @@
 //!   `cli::cmd_custodian` entry on the run-loop path (no `--reconcile-after-restore`) and assert it
 //!   REFUSES before dialing. RED on base (the run-loop path had no refusal, so the fused fleet
 //!   reached connect_fleet); GREEN with the hoisted refusal.
+//! * [`deployed_run_loop_refuses_a_value_after_the_valueless_gc_flag`] — the Codex P2 hole in the
+//!   valueless parse: `--gc-expired-pending false` reads as the flag PRESENT plus an ignored
+//!   positional, arming the unsafe sweep the caller tried to disable. The entry refuses any stray
+//!   positional (the command has no positional grammar) before it arms anything.
 //!
 //! RED SHAPE (honest): closing the startup-partial hole REQUIRES the operator fleet size at the
 //! run-loop entry, so `run_reconstruction_until` gains an `operator_fleet_size` parameter (the
@@ -1060,4 +1064,32 @@ fn deployed_run_loop_refuses_duplicate_ids() {
              the duplicate id up front"
         ),
     }
+}
+
+#[test]
+fn deployed_run_loop_refuses_a_value_after_the_valueless_gc_flag() {
+    // `--gc-expired-pending false`: the operator (or a wrapper rendering booleans) is trying to
+    // DISABLE the unsafe sweep, but the valueless-flag parse reads the flag as PRESENT and leaves
+    // `false` as an ignored positional — arming exactly the mode being refused. `wyrd custodian`
+    // has no positional grammar, so the entry must reject any stray token outright, before it
+    // arms anything.
+    let args: Vec<String> = [
+        "--metadata-backend",
+        "redb",
+        "--gc-expired-pending",
+        "false",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    let err = wyrd_server::cli::cmd_custodian(&args).expect_err(
+        "cmd_custodian ACCEPTED a value after the valueless --gc-expired-pending flag — \
+         `--gc-expired-pending false` would silently ARM the expired-pending sweep",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unexpected positional argument `false`"),
+        "the refusal must name the stray token so the operator sees what was ignored; got: {msg}"
+    );
 }

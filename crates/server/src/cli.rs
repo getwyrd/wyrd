@@ -763,6 +763,21 @@ const DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// exercised through the real entry point, so a regression there cannot slip past green gates).
 pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
     let parsed = ParsedArgs::parse(args)?;
+    // `wyrd custodian` has NO positional grammar — every input is a flag — so a stray
+    // positional is always an operator error, and one shape of it is dangerous: rendering a
+    // valueless flag WITH a value (`--gc-expired-pending false`) parses as the flag PRESENT
+    // plus an ignored positional `false`, silently ARMING the expired-pending sweep the
+    // caller was explicitly trying to disable (Codex P2 on #559). Refuse every stray token
+    // loudly, before anything else runs, rather than ignore it.
+    if let Some(stray) = parsed.positional(0) {
+        return Err(format!(
+            "wyrd custodian: unexpected positional argument `{stray}`. This command takes \
+             flags only — a value after a valueless flag (e.g. `--gc-expired-pending false`) \
+             does NOT disable it; it would parse as the flag SET plus a stray token. Omit \
+             --gc-expired-pending to leave expired-pending GC off, or pass it alone to arm it."
+        )
+        .into());
+    }
     let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
     let zone_name = parsed.flag("zone").unwrap_or(DEFAULT_CUSTODIAN_ZONE);
     let interval = Duration::from_secs(parse_u64_flag(
