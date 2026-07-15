@@ -112,7 +112,7 @@ async fn redb_overwrite_cas_classifies_the_stale_writer_as_conflict() {
     let v0 = write::plan_write(b"v0", CHUNK, RS, ids_from(1)).unwrap();
     write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
     write::write_fragments(&*chunks, &v0).await.unwrap();
-    write::commit_create(&*meta, 0, "obj", 1, &v0)
+    write::commit_create(&*meta, 0, "obj", 1, &v0, 0)
         .await
         .unwrap();
     write::release(&*meta, &v0).await.unwrap();

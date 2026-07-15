@@ -171,7 +171,7 @@ fn crash_between_commit_and_release_leaves_entries_the_sweep_reclaims() {
 
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
-        let outcome = write::commit_create(&meta, ROOT, "file", 1, &plan)
+        let outcome = write::commit_create(&meta, ROOT, "file", 1, &plan, NOW)
             .await
             .unwrap();
         assert_eq!(outcome, CommitOutcome::Committed);
@@ -275,10 +275,10 @@ fn concurrent_create_of_the_same_name_has_one_winner() {
         write::intent(&meta, &plan_b, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan_b).await.unwrap();
 
-        let a = write::commit_create(&meta, ROOT, "same", 10, &plan_a)
+        let a = write::commit_create(&meta, ROOT, "same", 10, &plan_a, NOW)
             .await
             .unwrap();
-        let b = write::commit_create(&meta, ROOT, "same", 11, &plan_b)
+        let b = write::commit_create(&meta, ROOT, "same", 11, &plan_b, NOW)
             .await
             .unwrap();
         assert_eq!(a, CommitOutcome::Committed);

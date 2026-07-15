@@ -146,10 +146,14 @@ fn exactly_one_overwrite_wins_under_rs() {
             .unwrap();
             let prior = read::read_inode(&meta, 1).await.unwrap().unwrap();
 
-            // Two writers stage new RS versions and race to commit.
+            // Two writers stage new RS versions and race to commit. Each runs the Intent phase
+            // first so its chunks hold a live pending lease at the commit — phase 3 is now
+            // lease-conditional (issue #490).
             let plan_a = write::plan_write(b"winner", CHUNK, RS, ids_from(sim.gen())).unwrap();
             let plan_b = write::plan_write(b"loser!", CHUNK, RS, ids_from(sim.gen())).unwrap();
+            write::intent(&meta, &plan_a, NOW + TTL).await.unwrap();
             write::write_fragments(&chunks, &plan_a).await.unwrap();
+            write::intent(&meta, &plan_b, NOW + TTL).await.unwrap();
             write::write_fragments(&chunks, &plan_b).await.unwrap();
 
             let a = write::commit_overwrite(&meta, 1, &prior, &plan_a, 0)

@@ -58,7 +58,7 @@ async fn put_new(
     write::intent(meta, &plan, NOW + TTL).await.unwrap();
     write::write_fragments(chunks, &plan).await.unwrap();
     assert_eq!(
-        write::commit_create(meta, 0, name, id, &plan)
+        write::commit_create(meta, 0, name, id, &plan, NOW)
             .await
             .unwrap(),
         CommitOutcome::Committed
@@ -163,7 +163,7 @@ fn crash_is_atomic(scheme: EcScheme, seed: u64) {
         let plan = write::plan_write(&data, CHUNK, scheme, ids_from(0x10)).unwrap();
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
-        write::commit_create(&meta, 0, "obj", 1, &plan)
+        write::commit_create(&meta, 0, "obj", 1, &plan, NOW)
             .await
             .unwrap();
         // --- crash: no release ---

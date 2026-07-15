@@ -240,7 +240,7 @@ async fn parallel_write_durability_over_network() {
         let chunk_id = plan.chunks[0].id;
         write::intent(&meta, &plan, LEASE_EXPIRY).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
-        write::commit_create(&meta, 0, "obj", 1, &plan)
+        write::commit_create(&meta, 0, "obj", 1, &plan, 0)
             .await
             .unwrap();
         write::release(&meta, &plan).await.unwrap();
@@ -458,7 +458,7 @@ async fn exactly_one_concurrent_writer_wins_over_network() {
         let v0 = write::plan_write(b"v0", 4, RS, ids_from(1)).unwrap();
         write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
         write::write_fragments(&*chunks, &v0).await.unwrap();
-        write::commit_create(&*meta, 0, "obj", 1, &v0)
+        write::commit_create(&*meta, 0, "obj", 1, &v0, 0)
             .await
             .unwrap();
         write::release(&*meta, &v0).await.unwrap();

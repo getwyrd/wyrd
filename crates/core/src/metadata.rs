@@ -302,6 +302,46 @@ pub async fn create(
     store.commit(batch).await
 }
 
+/// Like [`create`], but the inode + dirent are published only if every chunk in
+/// `pending_chunks` still holds a **live, unexpired** `pending:<id>` lease at `now_millis`,
+/// enforced **atomically** with the create (issue #490). This is phase 3 of a **streaming**
+/// write: an early chunk's fragments are protected from the custodian GC only by their pending
+/// lease until the commit publishes the inode, so a commit that outran the lease (a stall past
+/// the TTL after the last chunk, or between `stream_write_data` returning and the caller
+/// driving this commit) must fail closed rather than publish an object over bytes the GC may
+/// reclaim.
+///
+/// The per-chunk `require(pending_key, read-back-value)` preconditions ride in the **same**
+/// [`WriteBatch`] as the create ([`live_lease_guards`]), so a sweep that reclaims a lease
+/// between the read-back and the commit yields [`CommitOutcome::Conflict`], never a publish;
+/// an already-absent or already-lapsed lease refuses up front with the same `Conflict`.
+/// [`create`] is this with no leases to guard.
+pub async fn create_leased(
+    store: &impl MetadataStore,
+    parent: InodeId,
+    name: &str,
+    id: InodeId,
+    record: &InodeRecord,
+    pending_chunks: &[ChunkId],
+    now_millis: u64,
+) -> Result<CommitOutcome> {
+    let Some(guards) = live_lease_guards(store, pending_chunks, now_millis).await? else {
+        return Ok(CommitOutcome::Conflict);
+    };
+    let mut batch = WriteBatch::new()
+        .require_absent(inode_key(id))
+        .require_absent(dirent_key(parent, name))
+        .put(inode_key(id), encode(record))
+        .put(
+            dirent_key(parent, name),
+            encode(&DirentRecord { inode: id }),
+        );
+    for (key, value) in guards {
+        batch = batch.require(key, value);
+    }
+    store.commit(batch).await
+}
+
 /// Rename: move a name binding in a single dirent mutation. The inode is
 /// untouched. Fails with [`CommitOutcome::Conflict`] if the source moved
 /// concurrently or the target name is taken; returns `Conflict` if the source
@@ -489,6 +529,63 @@ pub async fn commit_chunk_map_superseding(
     store.commit(batch).await
 }
 
+/// Like [`commit_chunk_map_superseding`], but the overwrite CAS lands only if every chunk in
+/// `pending_chunks` still holds a **live, unexpired** `pending:<id>` lease at `now_millis`,
+/// enforced **atomically** with the inode CAS and the prior fragments' orphaning (issue #490).
+/// This is phase 3 of a **streaming overwrite**: the new version's chunks are protected from
+/// the custodian GC only by their pending leases until this commit publishes them, so a commit
+/// that outran a lease (a stall past the TTL after the last chunk, or between
+/// `stream_write_data` returning and the caller driving this commit) must fail closed rather
+/// than publish an object over bytes the GC may reclaim.
+///
+/// The per-chunk `require(pending_key, read-back-value)` preconditions ride in the **same**
+/// [`WriteBatch`] as the CAS and every `orphan:` record ([`live_lease_guards`]), so a sweep
+/// that reclaims a lease between the read-back and the commit yields [`CommitOutcome::Conflict`]
+/// — never a publish, and never a stranded orphan record — and an already-absent or
+/// already-lapsed lease refuses up front with the same `Conflict`.
+/// [`commit_chunk_map_superseding`] is this with no leases to guard.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_chunk_map_superseding_leased(
+    store: &impl MetadataStore,
+    id: InodeId,
+    prior: &InodeRecord,
+    chunk_map: Vec<ChunkRef>,
+    size: u64,
+    orphaned_at_millis: u64,
+    pending_chunks: &[ChunkId],
+    now_millis: u64,
+) -> Result<CommitOutcome> {
+    let Some(guards) = live_lease_guards(store, pending_chunks, now_millis).await? else {
+        return Ok(CommitOutcome::Conflict);
+    };
+    let next = InodeRecord {
+        size,
+        chunk_map,
+        state: InodeState::Committed,
+        version: prior.version + 1,
+    };
+    let key = inode_key(id);
+    let mut batch = WriteBatch::new()
+        .require(key.clone(), encode(prior))
+        .put(key, encode(&next));
+    for chunk in &prior.chunk_map {
+        for (index, dserver) in chunk.fragments() {
+            let frag = FragmentId {
+                chunk: chunk.id,
+                index,
+            };
+            batch = batch.put(
+                orphan_key(dserver, frag),
+                orphaned_at_millis.to_string().into_bytes(),
+            );
+        }
+    }
+    for (pk, pv) in guards {
+        batch = batch.require(pk, pv);
+    }
+    store.commit(batch).await
+}
+
 /// Write a pending-chunk ledger entry (the Intent phase of the write protocol).
 pub async fn put_pending(
     store: &impl MetadataStore,
@@ -512,19 +609,38 @@ pub async fn sweep_pending(
     store.commit(batch).await
 }
 
-/// **Renew** the pending-ledger lease on every chunk in `chunks` to `entry` in one atomic
-/// batch. The streaming write path calls this as an upload progresses so an already-written
-/// but not-yet-committed chunk's lease never lapses before the final commit: until the
-/// commit publishes the inode, an in-flight chunk's fragments are protected from the
-/// custodian **GC** only by its unexpired pending lease (they are in no committed chunk map,
-/// so GC's reference set does not cover them). A single start-of-upload deadline let a slow
-/// upload run past it and the GC would reclaim the early chunks as expired garbage before
-/// the commit — publishing an object with missing fragments (issue #364 durability finding
-/// 2, `write::stream_write_data`). A plain overwrite of each `pending:<id>` entry, so it is
-/// idempotent; an empty slice is a no-op.
+/// **Renew** the pending-ledger lease on every chunk in `chunks` to `entry` in one atomic,
+/// **conditional** batch. The streaming write path calls this as an upload progresses so an
+/// already-written but not-yet-committed chunk's lease never lapses before the final commit:
+/// until the commit publishes the inode, an in-flight chunk's fragments are protected from
+/// the custodian **GC** only by its unexpired pending lease (they are in no committed chunk
+/// map, so GC's reference set does not cover them). A single start-of-upload deadline let a
+/// slow upload run past it and the GC would reclaim the early chunks as expired garbage
+/// before the commit — publishing an object with missing fragments (issue #364 durability
+/// finding 2, `write::stream_write_data`).
+///
+/// Renewal may only **extend** a lease that still exists and has not lapsed — it must never
+/// re-create authority the sweep already revoked (issue #490). A *blind* overwrite of each
+/// `pending:<id>` entry resurrected a chunk whose lease had already lapsed and been swept
+/// mid-upload, and the upload then committed an inode pointing at bytes the GC was free to
+/// reclaim. So each entry is read back and the renewal **refuses** — returning
+/// [`CommitOutcome::Conflict`], nothing written — when a chunk's entry is either:
+///  * **absent** — a sweep reclaimed it ([`sweep_expired_leases`]), or
+///  * present but its recorded `lease_expiry_millis` is **`<= now_millis`** — lapsed but not
+///    yet reaped (renewing it would resurrect revoked authority, `write.rs:417-418`). The
+///    `<=` boundary is the sweep's own reap condition (`write.rs:572`): both lease consumers
+///    agree a lease is dead at `expiry <= now`, so a renewal at exactly the deadline (`now ==
+///    expiry`) is renewing a lease the reaper is already entitled to take.
+///
+/// The check and the write are ONE batch: for every chunk it pairs
+/// `require(pending_key, current-value)` with `put(pending_key, entry)`, so a sweep that
+/// deletes an entry **between** the read-back and the commit turns the precondition false and
+/// the whole batch is `Conflict` — a read-verify-then-blind-put in two commits could not
+/// close that interleave. An empty slice is a no-op.
 pub async fn renew_pending(
     store: &impl MetadataStore,
     chunks: &[ChunkId],
+    now_millis: u64,
     entry: &PendingEntry,
 ) -> Result<CommitOutcome> {
     if chunks.is_empty() {
@@ -532,9 +648,55 @@ pub async fn renew_pending(
     }
     let mut batch = WriteBatch::new();
     for &chunk in chunks {
-        batch = batch.put(pending_key(chunk), encode(entry));
+        let key = pending_key(chunk);
+        let current = match store.get(&key).await? {
+            // Swept out from under the upload — refuse rather than resurrect.
+            None => return Ok(CommitOutcome::Conflict),
+            Some(bytes) => bytes,
+        };
+        let existing: PendingEntry = decode(&current)?;
+        if existing.lease_expiry_millis <= now_millis {
+            // Lapsed but not yet reaped — renewing it would revive revoked authority.
+            return Ok(CommitOutcome::Conflict);
+        }
+        batch = batch.require(key.clone(), current).put(key, encode(entry));
     }
     store.commit(batch).await
+}
+
+/// Read back the `pending:<id>` ledger entry of every chunk in `chunks` and, when all are
+/// still **live**, return the compare-and-set preconditions that pin each key to the exact
+/// bytes just read. This is the lease-conditional guard the phase-3 committers thread into the
+/// **same** [`WriteBatch`] as the inode create/CAS (issue #490): a racing custodian sweep that
+/// deletes an entry **between** this read-back and the commit turns its precondition false, so
+/// the whole batch is [`CommitOutcome::Conflict`] — the object is never published over
+/// fragments the GC is free to reclaim.
+///
+/// Returns `Ok(None)` — the commit must **refuse, fail-closed** — as soon as any chunk's entry
+/// is either **absent** (already reaped by [`sweep_expired_leases`]) or present but **lapsed**
+/// (`lease_expiry_millis <= now_millis`, the sweep's own reap boundary, `write.rs:572`): a
+/// lapsed lease is dead authority and GC reclaims its bytes keyed on expiry even while the
+/// entry is still present (`crates/custodian/src/gc.rs:142-144`). An empty slice yields
+/// `Ok(Some(vec![]))` — no leases to guard, so [`create`] / [`commit_chunk_map_superseding`]
+/// (their unconditional counterparts) delegate through here unchanged.
+async fn live_lease_guards(
+    store: &impl MetadataStore,
+    chunks: &[ChunkId],
+    now_millis: u64,
+) -> Result<Option<Vec<(Vec<u8>, Bytes)>>> {
+    let mut guards = Vec::with_capacity(chunks.len());
+    for &chunk in chunks {
+        let key = pending_key(chunk);
+        let Some(current) = store.get(&key).await? else {
+            return Ok(None);
+        };
+        let entry: PendingEntry = decode(&current)?;
+        if entry.lease_expiry_millis <= now_millis {
+            return Ok(None);
+        }
+        guards.push((key, current));
+    }
+    Ok(Some(guards))
 }
 
 /// Parse the inode id out of an `inode:<id>` key (the inverse of [`inode_key`]).
