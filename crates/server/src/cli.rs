@@ -62,24 +62,38 @@ const ROOT: u64 = 0;
 const NEXT_INODE_KEY: &[u8] = b"meta:next_inode";
 const DEFAULT_DATA_DIR: &str = "wyrd-data";
 const DEFAULT_CHUNK_SIZE: usize = 1 << 20;
-// The CLI runs no custodian sweep, so lease expiry is moot once the commit
-// releases the pending ledger; a fixed time keeps runs reproducible.
+// `wyrd put` itself runs no custodian sweep, so its OWN lease expiry is moot once the
+// commit releases the pending ledger, and a fixed logical time keeps `put` runs
+// reproducible. CAVEAT (#554): this is no longer true once a DEPLOYED custodian shares
+// the same metadata backend. Stamped at logical zero, an in-flight `wyrd put`'s pending
+// lease (`lease_expiry = NOW_MILLIS + LEASE_TTL_MILLIS = 60_000`) reads as ALREADY
+// EXPIRED against the deployed custodian's wall clock, so the deployed GC pass would treat
+// the still-in-flight write's fan-out as collectable garbage. That lease-liveness gap is
+// SURFACED (not closed) by this bundle — see `custodian.rs` `GC_GRACE_WINDOW_MILLIS` and
+// the build-notes NEEDS-HUMAN; closing it (CLI wall-clock stamp, gateway lease renewal, or
+// a commit-time lease-liveness check) is a cross-cutting decision that overlaps #490.
 const NOW_MILLIS: u64 = 0;
-const LEASE_TTL_MILLIS: u64 = 60_000;
+pub(crate) const LEASE_TTL_MILLIS: u64 = 60_000;
 
 /// The reader-safe grace window the post-restore pass (#551) stamps onto the fragments it
 /// marks: how long a marked-collectable fragment must survive before GC may reclaim its bytes.
 ///
-/// **Derived, not invented.** `GcContext::grace_window_millis` is documented as coming from
-/// reader version-hold / lease semantics — never a magic constant — so this reuses the one
-/// timescale the system already trusts for exactly this purpose: the pending-ledger lease TTL
-/// ([`LEASE_TTL_MILLIS`]), which GC itself already treats as sufficient grace for a crashed
-/// write's garbage. A fragment stranded by a restore is the same kind of garbage on the same
-/// kind of deadline.
+/// **Derived, not invented — a conservative FLOOR, not a proven reader-safety bound.**
+/// `GcContext::grace_window_millis` is documented as coming from reader version-hold / lease
+/// semantics — never a magic constant. The system trusts TWO pending-lease timescales, not
+/// one: the CLI stamps a 60 s lease ([`LEASE_TTL_MILLIS`]) and the production gateway a 30 s
+/// lease (`DEFAULT_LEASE_TTL_MILLIS`, `lib.rs:49`). This reuses the LONGER of the two, so the
+/// grace is no shorter than the window GC itself already treats as sufficient for either
+/// producer's crashed-write garbage. A fragment stranded by a restore is the same kind of
+/// garbage on the same kind of deadline.
 ///
-/// The principled derivation from reader version-holds is #554's job — the issue that also
-/// has to make GC actually *run* in the deployed role. Until then this is the honest floor:
-/// no shorter than the grace the write path already relies on.
+/// The deployed GC pass shares this derivation exactly ([`crate::custodian::GC_GRACE_WINDOW_MILLIS`],
+/// wired by #554 — the run loop now actually reclaims). A principled bound derived from a reader
+/// version-hold / maximum-read-duration mechanism is a *separate* work item: the checkout has no
+/// such mechanism yet, so no value can be *proven* reader-safe here (proposal `0005:585-586` calls
+/// the exact value "a measurement question" — the maintainer's call, flagged at sign-off). Until
+/// that mechanism exists this is the honest floor: no shorter than the grace the write path
+/// already relies on.
 const RESTORE_GRACE_WINDOW_MILLIS: u64 = LEASE_TTL_MILLIS;
 
 // Bounded retry-with-backoff for [`alloc_inode`] (proposal 0015 §"Composition,
@@ -858,6 +872,48 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             return Ok::<ExitCode, BoxError>(ExitCode::SUCCESS);
         };
 
+        // FLEET IDENTITY MUST BE UNIQUE — refuse duplicate --endpoints / --ids on EVERY path,
+        // not only `--reconcile-after-restore`. Everything downstream keys fragments by
+        // `(DServerId, FragmentId)`, and `require_aligned_topology` only validates the LENGTHS of
+        // --ids/--failure-domains against --endpoints, never that they differ. Two identities for
+        // one physical box (a duplicated endpoint, or two ids pointing at the same server) fuse it
+        // into a phantom fleet: box B answers for box A's fragments, a placement can look satisfied
+        // by bytes on the wrong machine, and the repair loop can displace a fragment between the two
+        // ids naming the same box. This used to be checked ONLY inside the restore one-shot
+        // (`if reconcile_after_restore`), but #554 makes the DEPLOYED RUN LOOP delete data too: its
+        // GC pass reclaims unreferenced fragments, and the whole-fleet gate counts a duplicate on
+        // both sides so it still fires — a LIVE fragment protected as (A, frag) is unreferenced seen
+        // as (B, frag), so GC would DELETE IT. Protection is keyed by (DServerId, FragmentId); a box
+        // with two identities defeats it. So this refusal is hoisted here to guard both paths.
+        let unique_endpoints: std::collections::HashSet<&String> = endpoints.iter().collect();
+        if unique_endpoints.len() != endpoints.len() {
+            return Err::<ExitCode, BoxError>(
+                format!(
+                    "wyrd custodian: --endpoints contains duplicates ({} unique of {} given). The \
+                     same D server under two identities answers to both, so a LIVE fragment \
+                     protected under one is unreferenced under the other — the reconstruction loop \
+                     could displace it and the GC pass would DELETE IT. List each D server once.",
+                    unique_endpoints.len(),
+                    endpoints.len(),
+                )
+                .into(),
+            );
+        }
+        let unique_ids: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        if unique_ids.len() != ids.len() {
+            return Err::<ExitCode, BoxError>(
+                format!(
+                    "wyrd custodian: --ids contains duplicates ({} unique of {} given). Fragments \
+                     are keyed by (d-server id, fragment), so a duplicated id fuses two servers into \
+                     one — the loop would reconstruct, report, and GC against a fleet that does not \
+                     exist. Give each D server its own stable id.",
+                    unique_ids.len(),
+                    ids.len(),
+                )
+                .into(),
+            );
+        }
+
         // Assemble the fleet through the injectable connector seam ([`connect_fleet`]): it
         // REJECTS missing / mismatched topology (never fabricated), dials each endpoint WITH
         // A TIMEOUT (so a paused / partitioned peer fails transiently instead of hanging the
@@ -915,49 +971,11 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
         // cheerfully mark every fragment in the fleet. The blast radius of a false positive is
         // the whole cluster, so the trigger is a human who knows a restore happened.
         if reconcile_after_restore {
-            // Stable ids must be UNIQUE, and nothing else checks this: `require_aligned_topology`
-            // validates the LENGTHS of --ids/--failure-domains against --endpoints, not that the
-            // ids differ. Everything downstream keys fragments by `(DServerId, FragmentId)`, so a
-            // duplicated id silently fuses two physical servers into one: box B's fragments would
-            // answer for box A's, a placement could look satisfied by bytes on the wrong machine,
-            // and this pass — which marks for deletion — would draw its conclusions from a fleet
-            // that does not exist. Refuse.
-            // Duplicate ENDPOINTS are the same hazard wearing the other hat, and this one can
-            // DELETE LIVE DATA. List one physical box twice under two different ids and its
-            // fragments answer to both: a fragment the placement references as (A, frag) is
-            // protected, while the very same bytes, seen as (B, frag), are unreferenced — so
-            // this pass marks them, and a later GC sweep through the duplicate reaches them as B
-            // and deletes them. Protection is keyed by (DServerId, FragmentId); a box with two
-            // identities defeats it.
-            let unique_endpoints: std::collections::HashSet<&String> = endpoints.iter().collect();
-            if unique_endpoints.len() != endpoints.len() {
-                return Err::<ExitCode, BoxError>(
-                    format!(
-                        "wyrd custodian --reconcile-after-restore: --endpoints contains duplicates \
-                         ({} unique of {} given). The same D server under two ids answers to both, \
-                         so a LIVE fragment protected under one id is unreferenced under the other \
-                         — this pass would mark it and GC would DELETE IT. List each D server once.",
-                        unique_endpoints.len(),
-                        endpoints.len(),
-                    )
-                    .into(),
-                );
-            }
-            let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
-            if unique.len() != ids.len() {
-                return Err::<ExitCode, BoxError>(
-                    format!(
-                        "wyrd custodian --reconcile-after-restore: --ids contains duplicates \
-                         ({} unique of {} given). Fragments are keyed by (d-server id, fragment), \
-                         so a duplicated id fuses two servers into one and this pass would mark \
-                         and report against a fleet that does not exist. Give each D server its \
-                         own stable id.",
-                        unique.len(),
-                        ids.len(),
-                    )
-                    .into(),
-                );
-            }
+            // Duplicate --endpoints / --ids are refused earlier on EVERY path (fleet identity
+            // must be unique — see the hoisted refusal above `connect_fleet`), so by here the
+            // fleet identities are already distinct. The remaining refusal is this pass's own:
+            // it also demands the WHOLE fleet be reachable, which the deployed run loop does NOT
+            // (the loop reads around a down box; its GC pass gates on `operator_fleet_size`).
             if configured.len() != endpoints.len() {
                 return Err::<ExitCode, BoxError>(
                     format!(
@@ -1035,6 +1053,11 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             &zone,
             &custodian,
             &configured,
+            // The OPERATOR-configured fleet size (every `--endpoints` peer), NOT `configured.len()`
+            // — `connect_fleet` starts degraded and may have dropped a startup-unreachable peer, so
+            // `configured` can already be short. The GC pass gates on seeing the whole operator
+            // fleet (`run_reconstruction_until`), so it must be told what "whole" is (#554).
+            endpoints.len(),
             interval,
             clock,
             shutdown,
@@ -1090,6 +1113,10 @@ pub async fn run_restore_reconcile_over_backend(
 /// the day-one under-replicated gauge reading a permanent healthy zero (iteration-3
 /// rejection). The `tikv` arm is `#[cfg]`-gated out of the default build exactly as
 /// `cmd_put` / `cmd_get`.
+///
+/// `operator_fleet_size` is the operator-configured endpoint count (`--endpoints`), threaded
+/// down to the run loop so its GC pass can gate on seeing the WHOLE fleet — `configured` may be
+/// shorter after `connect_fleet`'s start-degraded drop, and only GC needs the difference (#554).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_reconstruction_over_backend<Fut, Clock>(
     backend: MetadataBackend,
@@ -1098,6 +1125,7 @@ pub async fn run_reconstruction_over_backend<Fut, Clock>(
     zone: &FencedZone,
     custodian: &Custodian,
     configured: &[ConfiguredDServer],
+    operator_fleet_size: usize,
     interval: Duration,
     clock: Clock,
     shutdown: Fut,
@@ -1111,7 +1139,14 @@ where
             let meta = open_local_meta_redb(data_dir)?;
             service
                 .run_reconstruction_until(
-                    zone, custodian, &meta, configured, interval, clock, shutdown,
+                    zone,
+                    custodian,
+                    &meta,
+                    configured,
+                    operator_fleet_size,
+                    interval,
+                    clock,
+                    shutdown,
                 )
                 .await?;
         }
@@ -1120,7 +1155,14 @@ where
             let meta = open_tikv_meta().await?;
             service
                 .run_reconstruction_until(
-                    zone, custodian, &meta, configured, interval, clock, shutdown,
+                    zone,
+                    custodian,
+                    &meta,
+                    configured,
+                    operator_fleet_size,
+                    interval,
+                    clock,
+                    shutdown,
                 )
                 .await?;
         }
@@ -1129,7 +1171,14 @@ where
             let meta = open_fdb_meta().await?;
             service
                 .run_reconstruction_until(
-                    zone, custodian, &meta, configured, interval, clock, shutdown,
+                    zone,
+                    custodian,
+                    &meta,
+                    configured,
+                    operator_fleet_size,
+                    interval,
+                    clock,
+                    shutdown,
                 )
                 .await?;
         }

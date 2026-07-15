@@ -185,6 +185,7 @@ async fn one_custodian_pass(
         &zone,
         &custodian,
         configured,
+        configured.len(),
         Duration::from_secs(3600),
         move || clock,
         async { tokio::time::sleep(Duration::from_millis(60)).await },

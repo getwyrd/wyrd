@@ -83,6 +83,32 @@ use wyrd_custodian::{
 use wyrd_telemetry::DurabilityTelemetry;
 use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
 
+/// The reader-safe grace window the **deployed GC pass** honours: how long an orphaned
+/// fragment must outlive its recorded `orphaned_at` deadline before the run loop reclaims
+/// its bytes.
+///
+/// **Derived, not invented — a conservative FLOOR, not a proven reader-safety bound.**
+/// `GcContext::grace_window_millis` is documented as coming from reader version-hold /
+/// lease semantics, never a magic constant (`gc.rs:57-71`; proposal `0005:585-586`). The
+/// checkout has no reader version-hold / maximum-read-duration mechanism yet, so no
+/// derivation can *prove* a value reader-safe here — building that bound is a separate work
+/// item this bundle does not attempt.
+///
+/// The system trusts TWO pending-lease timescales, not one: the CLI stamps a 60 s lease
+/// ([`crate::cli::LEASE_TTL_MILLIS`]) and the production gateway a 30 s lease
+/// (`DEFAULT_LEASE_TTL_MILLIS`, `lib.rs:49`). This reuses the LONGER of the two — the same
+/// value the shipped post-restore pass derives (`RESTORE_GRACE_WINDOW_MILLIS =
+/// LEASE_TTL_MILLIS`, `cli.rs:68-83`) — so the deployed floor is no shorter than the grace
+/// the write path already relies on for either producer. The exact deployed value is a
+/// measurement question for the maintainer (`0005:585-586`) — see the build-notes
+/// NEEDS-HUMAN sign-off item.
+///
+/// NOTE: this window gates the ORPHAN input only (`gc.rs:136`). GC's expired-pending input
+/// treats the lease TTL itself as its grace (`gc.rs:142-144`); the safety of collecting
+/// that input against still-in-flight writers is the routed-back lease-liveness concern
+/// recorded in build-notes, not something this constant closes.
+const GC_GRACE_WINDOW_MILLIS: u64 = crate::cli::LEASE_TTL_MILLIS;
+
 /// A configured D-server the role was told to maintain over: its stable [`DServerId`],
 /// its opaque failure-domain label, and the connected [`ChunkStore`] client. The role
 /// probes each one's reachability every pass ([`live_reconstruction_view`]) and hands the
@@ -364,8 +390,8 @@ impl CustodianService {
     /// 1. derives the LIVE reconstruction view ([`live_reconstruction_view`]) — dropping
     ///    any D-server that fails its reachability probe, so a killed server is read
     ///    *around* rather than crashing the pass;
-    /// 2. runs two fenced [`Self::reconcile_pass`] calls — first a **best-effort scrub** of
-    ///    the live fleet to DERIVE this store's repair obligations from the committed
+    /// 2. runs up to three fenced [`Self::reconcile_pass`] calls — first a **best-effort
+    ///    scrub** of the live fleet to DERIVE this store's repair obligations from the committed
     ///    (gateway-written) placement ([`wyrd_custodian::scrub`] enqueues any referenced
     ///    fragment it finds absent/corrupt), then a **reconstruction** pass that assesses and
     ///    repairs those obligations (the durability metrics land on this role's export
@@ -374,7 +400,31 @@ impl CustodianService {
     ///    here is what closes the write→durability loop: without the scrub half the loop would
     ///    only drain obligations some *other* producer enqueued, so a custodian opened over
     ///    the store a gateway wrote would compute NO repair work from the placement — the
-    ///    "empty store sees zero repair" symptom (#455);
+    ///    "empty store sees zero repair" symptom (#455). Finally, when the loop can see the
+    ///    **WHOLE operator-configured fleet** this pass — every one of the `operator_fleet_size`
+    ///    endpoints the operator wired, connected AND reachable — a **garbage-collection** pass
+    ///    ([`wyrd_custodian::gc`]) reclaims the bytes of fragments a delete/overwrite orphaned
+    ///    once their recorded reader-safe grace deadline elapsed. GC is the ONLY collector of
+    ///    those bytes, so without this pass every delete/overwrite leaks its displaced fragments
+    ///    forever (#554). GC is DEFERRED whenever ANY configured server is missing from the live
+    ///    view — whether it never connected at startup (`connect_fleet` starts DEGRADED, dropping
+    ///    a startup-unreachable peer, so `configured` itself can be short of the operator fleet)
+    ///    or it dropped its reachability probe this pass: GC's expired-pending input retires
+    ///    CHUNK-WIDE evidence, so sweeping a partial fleet could retire the sole record for a
+    ///    fragment a missing server still holds and strand it forever once that server returns.
+    ///    The gate is therefore `live_fleet.len() == operator_fleet_size` (not merely
+    ///    `unreachable.is_empty()`, which only sees servers that dropped AFTER a successful
+    ///    startup connect — the #554-iteration-2 startup-partial hazard). Deferring preserves
+    ///    every orphan/pending record for a later whole-fleet pass, so a skipped server's garbage
+    ///    is reaped once the fleet is whole and "skipped" is never mistaken for "collected".
+    ///
+    ///    TRADE-OFF (maintainer-visible, #554 §6): this gate is conservative in the pause
+    ///    direction — ANY single configured D-server that is unreachable OR decommissioned but
+    ///    still listed in `--endpoints` pauses ALL reclamation, fleet-wide, for as long as it is
+    ///    absent. That is deliberate: a false "collected" is a permanent, silent byte leak,
+    ///    whereas a paused reclaim is recovered in full on the next whole-fleet pass. Relaxing it
+    ///    to reclaim orphans over the reachable subset needs GC to preserve pending evidence
+    ///    per-server (the routed-back lease-liveness / #490 work), which this bundle does not do;
     /// 3. **survives** a per-pass store fault — a [`ReconcileError::Store`] (a server that
     ///    died *after* the probe, a transient metadata blip) is logged to stderr and the loop
     ///    continues. Crucially, a scrub-pass fault is isolated from reconstruction: it is
@@ -386,6 +436,14 @@ impl CustodianService {
     /// This is the production wiring the day-one runbook exercises: kill a D-server, watch
     /// the under-replicated gauge rise then return to zero, through a role that does not
     /// exit on the kill. `now_millis` is advanced by the caller's wall `clock`.
+    ///
+    /// `operator_fleet_size` is the number of D-server endpoints the OPERATOR wired
+    /// (`--endpoints`), which the caller must pass separately from `configured`: `connect_fleet`
+    /// starts degraded and may hand this loop a `configured` slice SHORTER than the operator
+    /// fleet (a peer down at startup is dropped), and only GC needs to know the difference — it
+    /// gates on seeing every operator endpoint, exactly as the #551 restore pass refuses a
+    /// partial fleet (`cli.rs:961-975`). The reconstruction/scrub passes are unaffected (they
+    /// read around any absent peer, by design).
     #[allow(clippy::too_many_arguments)]
     pub async fn run_reconstruction_until<Fut, Clock>(
         &self,
@@ -393,6 +451,7 @@ impl CustodianService {
         custodian: &Custodian,
         meta: &dyn MetadataStore,
         configured: &[ConfiguredDServer],
+        operator_fleet_size: usize,
         interval: Duration,
         mut clock: Clock,
         shutdown: Fut,
@@ -467,6 +526,92 @@ impl CustodianService {
                         "wyrd custodian: reconstruction pass failed (retrying next interval): {e}"
                     );
                 }
+            }
+            // GARBAGE-COLLECTION pass — reclaim the bytes of fragments a delete
+            // (`metadata::unlink`) or overwrite left unreferenced, once their recorded
+            // reader-safe grace deadline has elapsed. GC is the ONLY collector of those bytes;
+            // the write path deliberately marks-not-deletes so a reader inside the grace window
+            // is never torn (`metadata.rs:350-368`). Without this pass the deployed role never
+            // reclaims anything and every delete/overwrite leaks its displaced bytes forever
+            // (#554).
+            //
+            // FLEET-VIEW SAFETY (#554 iteration-1 C3/C5/T3 + iteration-2 startup-partial
+            // correction): GC runs ONLY when the loop can see the WHOLE operator-configured fleet
+            // this pass — `fleet.len() == operator_fleet_size`. GC's expired-pending input retires
+            // CHUNK-WIDE evidence — it deletes the `pending:` ledger entry for every chunk it
+            // swept a copy of (`gc.rs:155-167`) — so sweeping a PARTIAL fleet could retire the
+            // sole evidence for a fragment a MISSING server still holds, stranding it forever once
+            // that server returns.
+            //
+            // The gate is `fleet.len() == operator_fleet_size`, NOT `unreachable.is_empty()`. The
+            // latter (iteration-2's gate) is defeated at STARTUP: `connect_fleet` starts degraded
+            // and silently drops a peer that is unreachable when the custodian boots
+            // (`custodian.rs` `connect_fleet`; `cli.rs`), so `configured` is ALREADY short of the
+            // operator fleet and `live_reconstruction_view(configured)` returns an empty
+            // `unreachable` — the first GC pass would then retire chunk-wide `pending:` evidence
+            // for a fragment the never-connected server still holds, the exact permanent leak the
+            // GC deferral exists to prevent (iteration-2 rejection). Gating on the operator fleet
+            // size closes BOTH holes at once: a startup-omitted server (never in `configured`) and
+            // a runtime-unreachable server (dropped this pass) both make `fleet.len()` fall short.
+            // Since `fleet ⊆ configured` and `configured.len() ≤ operator_fleet_size`,
+            // `fleet.len() == operator_fleet_size` holds IFF every operator endpoint is connected
+            // AND reachable this pass. This mirrors the #551 restore pass, which refuses a partial
+            // fleet by comparing `configured.len()` against the operator endpoint count
+            // (`cli.rs:961-975`).
+            //
+            // Deferring preserves every orphan/pending record untouched, so a missing server's
+            // garbage is reaped on a later whole-fleet pass and "skipped" is never mistaken for
+            // "collected". Conservative in the pause direction (see the run-loop doc trade-off):
+            // any single absent/decommissioned-but-configured server pauses ALL reclamation until
+            // the fleet is whole, but a paused reclaim is fully recovered whereas a false
+            // "collected" is a permanent silent leak.
+            //
+            // A DISTINCT fenced pass, not folded into scrub/reconstruction: `reconcile_step`
+            // runs GC FIRST within a combined pass and short-circuits on the first `?`, so
+            // folding GC in would let a GC store fault suppress scrub/reconstruction for the
+            // interval and be mislabelled — the fault-isolation rule that split scrub from
+            // reconstruction (Codex #461). Isolated here, a GC store fault degrades ONLY GC.
+            //
+            // Ordered LAST, after reconstruction committed any placement rewrite: the passes run
+            // sequentially (no concurrency) and GC gates every reclaim on the freshly-committed
+            // reference set (`gc::referenced_fragments` never reclaims a referenced fragment), so
+            // it can neither race nor reclaim a fragment reconstruction just re-placed. The grace
+            // window is DERIVED inside the role from the lease TTL ([`GC_GRACE_WINDOW_MILLIS`]) —
+            // never a magic constant — exactly as the post-restore pass derives it
+            // (`cli.rs:68-83`).
+            if fleet.len() == operator_fleet_size {
+                let gc_ctx = GcContext {
+                    meta,
+                    fleet: &fleet,
+                    grace_window_millis: GC_GRACE_WINDOW_MILLIS,
+                };
+                match self
+                    .reconcile_pass(zone, custodian, Some(&gc_ctx), None, None, None, clock())
+                    .await
+                {
+                    Ok(_) => {}
+                    // A superseded term must stop reconciling — continuing would be an
+                    // unfenced actor.
+                    Err(e @ ReconcileError::Fenced(_)) => return Err(e),
+                    // A transient store fault degrades ONLY this GC pass (scrub and
+                    // reconstruction already ran): log and retry the reclaim next interval.
+                    Err(ReconcileError::Store(e)) => {
+                        eprintln!(
+                            "wyrd custodian: gc pass degraded (bytes reclaimed next interval): {e}"
+                        );
+                    }
+                }
+            } else {
+                // Defer GC: the loop cannot see the whole operator fleet this pass (a server is
+                // unreachable now, or never connected at startup), so sweeping could retire
+                // chunk-wide pending evidence for a fragment a missing server still holds. All
+                // evidence is preserved for the next whole-fleet pass.
+                eprintln!(
+                    "wyrd custodian: gc pass deferred ({} of {} operator-configured d-server(s) \
+                     visible; evidence preserved, reclaimed on a later whole-fleet pass)",
+                    fleet.len(),
+                    operator_fleet_size,
+                );
             }
             tokio::select! {
                 _ = &mut shutdown => return Ok(()),
