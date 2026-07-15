@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_chunk_format::{encode, FragmentHeader};
 use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeRecord, InodeState};
+use wyrd_core::write::encode_ec_fragment;
 use wyrd_core::{erasure, read, repair};
 use wyrd_traits::{
     BlockReadFault, ChunkId, ChunkStore, CommitOutcome, FragmentId, Health, MetadataStore,
@@ -206,6 +207,9 @@ async fn ec_read_around_block_fault_still_enqueues_repair_with_non_corruption_re
     assert_eq!(shards.len(), 3);
 
     let inner = MemChunks::default();
+    // Stamp each shard's FULL v1 identity (RS scheme type, k/m, and its index) exactly
+    // as the write fan-out does — the read path verifies the whole header EC tuple
+    // against the committed scheme (#430), not the chunk id alone.
     for (index, shard) in shards.iter().enumerate() {
         inner
             .put_fragment(
@@ -213,7 +217,7 @@ async fn ec_read_around_block_fault_still_enqueues_repair_with_non_corruption_re
                     chunk: chunk_id,
                     index: index as u16,
                 },
-                fragment(chunk_id, shard),
+                encode_ec_fragment(chunk_id, index as u16, k, m, shard),
             )
             .await
             .unwrap();
