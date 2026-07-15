@@ -238,8 +238,21 @@ async fn read_chunk(
                     corrupt.push(chunk.id);
                     return Err(e);
                 }
-                // A transient / non-integrity error: propagate it so the caller's
-                // retry policy decides — do NOT record as a corruption finding.
+                // A permanent block-layer read fault (`wyrd_traits::is_block_read_fault`,
+                // `traits/src/lib.rs:339`). With no redundancy there is nothing to read
+                // around, so the read itself must fail — but the damage is exactly as
+                // permanent as in the RS arm below: record the chunk as a durable repair
+                // obligation before surfacing the error, mirroring the integrity-fault
+                // arm above, so reconstruction still receives the queued obligation and
+                // can surface the chunk as unrepairable rather than the damage being
+                // forgotten with the failed read.
+                Err(e) if wyrd_traits::is_block_read_fault(e.as_ref()) => {
+                    block_fault.push(chunk.id);
+                    return Err(e);
+                }
+                // A transient / non-integrity, non-block-fault error: propagate it so
+                // the caller's retry policy decides — do NOT record as a corruption
+                // finding.
                 Err(e) => return Err(e),
             };
             match decode(&fragment) {
