@@ -69,6 +69,38 @@ pub struct GcContext<'a> {
     pub fleet: &'a [(DServerId, &'a dyn ChunkStore)],
     /// The reader-safe grace window (logical millis) an orphan must outlive.
     pub grace_window_millis: u64,
+    /// Whether input (1) — expired pending-lease garbage — may be reclaimed this
+    /// pass. See [`ExpiredPendingPolicy`] for why a deployed caller must defer it.
+    pub expired_pending: ExpiredPendingPolicy,
+}
+
+/// Policy for GC input (1): the bytes a crashed write fan-out left under an expired
+/// `pending:` lease.
+///
+/// "Expired" is only as trustworthy as the lease **stamp**. GC classifies with the
+/// caller's `now_millis`, so reclaiming on an expired lease is sound ONLY when every
+/// producer that stamps `pending:` leases shares that clock. The CLI write path does
+/// not: it stamps leases from a fixed logical clock (`cli.rs` `NOW_MILLIS = 0`, so
+/// `lease_expiry = 60_000` — one minute past the Unix epoch), which a wall-clocked
+/// deployed pass reads as expired **while the write is still in flight**. Sweeping it
+/// deletes the mid-flight fan-out and lets the writer commit a chunk map over missing
+/// bytes — silent data loss on a shared write-taking backend (#557). Until every
+/// producer stamps live leases (the #490 lease-liveness work), a deployed pass must
+/// [`Self::Defer`]; [`Self::Reclaim`] is for callers that control every lease stamp
+/// (the in-process test/DST wiring) or a backend attested to be taking no writes.
+///
+/// Input (2) — orphaned fragments — is unaffected: an orphan record is written by the
+/// delete/repair path only AFTER the referencing commit is gone, so its fragment is
+/// unreferenced no matter whose clock stamped it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiredPendingPolicy {
+    /// Reclaim expired-lease garbage. Sound only when every `pending:` stamp shares
+    /// the reconciler's clock — or the backend is attested write-free.
+    Reclaim,
+    /// Keep every `pending:` entry and the fragments under it untouched this pass —
+    /// deferred, never mistaken for collected. A later pass under a live-lease regime
+    /// reclaims them.
+    Defer,
 }
 
 /// Record that `frag` on `dserver` became **orphaned** at `orphaned_at_millis` — the
@@ -107,8 +139,14 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
         emit_malformed(chunk, m.expected, m.actual);
     }
     // Input (1): chunks whose pending lease has expired — their fan-out garbage is
-    // collectable (the lease TTL already encodes the crashed-write grace).
-    let expired_pending = expired_pending_chunks(ctx.meta, now_millis).await?;
+    // collectable (the lease TTL already encodes the crashed-write grace). GATED on the
+    // caller's policy: a deployed pass cannot trust "expired" while any producer stamps
+    // logical-clock leases (#557 / #490 — see [`ExpiredPendingPolicy`]), so under `Defer`
+    // this input is empty and every `pending:` entry and its fragments survive untouched.
+    let expired_pending = match ctx.expired_pending {
+        ExpiredPendingPolicy::Reclaim => expired_pending_chunks(ctx.meta, now_millis).await?,
+        ExpiredPendingPolicy::Defer => HashSet::new(),
+    };
     // Input (2): orphaned fragments and the instant each was stranded.
     let orphaned_at = orphan_leases(ctx.meta).await?;
 

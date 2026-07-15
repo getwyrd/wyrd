@@ -35,7 +35,7 @@ pub use desired_state::{
     clear_lifecycle, draining_servers, reconciliation_status, set_lifecycle, DServerLifecycle,
     ReconciliationStatus,
 };
-pub use gc::{mark_orphaned, GcContext};
+pub use gc::{mark_orphaned, ExpiredPendingPolicy, GcContext};
 pub use leadership::{Custodian, FenceError, FencedZone};
 pub use rebalance::RebalanceContext;
 pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};

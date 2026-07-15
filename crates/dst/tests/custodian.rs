@@ -70,8 +70,8 @@ use wyrd_core::read::{read_object, read_object_from};
 use wyrd_core::repair;
 use wyrd_core::write::write_new_object_placed;
 use wyrd_custodian::{
-    mark_orphaned, reconcile_step, Custodian, FencedZone, GcContext, Reconciled,
-    ReconstructionContext, ScrubContext,
+    mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
+    Reconciled, ReconstructionContext, ScrubContext,
 };
 // The DST determinism barrier preamble (ADR-0035): declaring every campaign property
 // through this macro installs the permissive global `tracing` default unbypassably.
@@ -876,6 +876,7 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: grace,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)

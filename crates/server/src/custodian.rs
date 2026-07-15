@@ -77,8 +77,9 @@ use crate::logging::{self, LogConfig};
 use tracing_subscriber::Registry;
 use wyrd_core::placement::Topology;
 use wyrd_custodian::{
-    reconcile_after_restore, reconcile_step, Custodian, FencedZone, GcContext, RebalanceContext,
-    ReconcileError, Reconciled, ReconstructionContext, RestoreReport, ScrubContext,
+    reconcile_after_restore, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone,
+    GcContext, RebalanceContext, ReconcileError, Reconciled, ReconstructionContext, RestoreReport,
+    ScrubContext,
 };
 use wyrd_telemetry::DurabilityTelemetry;
 use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
@@ -104,9 +105,12 @@ use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
 /// NEEDS-HUMAN sign-off item.
 ///
 /// NOTE: this window gates the ORPHAN input only (`gc.rs:136`). GC's expired-pending input
-/// treats the lease TTL itself as its grace (`gc.rs:142-144`); the safety of collecting
-/// that input against still-in-flight writers is the routed-back lease-liveness concern
-/// recorded in build-notes, not something this constant closes.
+/// treats the lease TTL itself as its grace (`gc.rs:142-144`) — a grace that is only real
+/// if the lease was stamped from a live clock, which the CLI write path's is not
+/// (`cli.rs` `NOW_MILLIS = 0`). The deployed loop therefore runs that input under
+/// [`ExpiredPendingPolicy::Defer`] unless the operator passes `--gc-expired-pending`
+/// (attesting the backend takes no writes); arming it by default awaits the #490
+/// lease-liveness work (#557).
 const GC_GRACE_WINDOW_MILLIS: u64 = crate::cli::LEASE_TTL_MILLIS;
 
 /// A configured D-server the role was told to maintain over: its stable [`DServerId`],
@@ -377,6 +381,10 @@ impl CustodianService {
             meta,
             fleet: &fleet,
             grace_window_millis,
+            // Inert here — the restore pass MARKS and never reclaims (it reads only
+            // `meta`/`fleet`), so no expired-pending sweep can arm through it. `Defer` is
+            // the honest value for an operator-facing entry.
+            expired_pending: ExpiredPendingPolicy::Defer,
         };
         let report = reconcile_after_restore(&gc, now_millis)
             .with_subscriber(self.dispatch.clone())
@@ -444,6 +452,15 @@ impl CustodianService {
     /// gates on seeing every operator endpoint, exactly as the #551 restore pass refuses a
     /// partial fleet (`cli.rs:961-975`). The reconstruction/scrub passes are unaffected (they
     /// read around any absent peer, by design).
+    ///
+    /// `expired_pending` is GC's policy for its expired-lease input
+    /// ([`ExpiredPendingPolicy`]): the deployed default is `Defer`, because a lease the CLI
+    /// stamped from its fixed logical clock reads as expired against this loop's wall clock
+    /// while the write is still in flight — reclaiming on it deletes a mid-flight fan-out and
+    /// lets the writer commit over missing bytes (#557). `Reclaim` is armed only by the
+    /// operator's explicit `--gc-expired-pending` attestation (no writers on this backend)
+    /// until the #490 lease-liveness work makes every stamp live. Orphan reclamation — the
+    /// #554 headline — is unaffected either way.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_reconstruction_until<Fut, Clock>(
         &self,
@@ -452,6 +469,7 @@ impl CustodianService {
         meta: &dyn MetadataStore,
         configured: &[ConfiguredDServer],
         operator_fleet_size: usize,
+        expired_pending: ExpiredPendingPolicy,
         interval: Duration,
         mut clock: Clock,
         shutdown: Fut,
@@ -584,6 +602,9 @@ impl CustodianService {
                     meta,
                     fleet: &fleet,
                     grace_window_millis: GC_GRACE_WINDOW_MILLIS,
+                    // `Defer` unless the operator armed `--gc-expired-pending`: "expired" is
+                    // untrustworthy while any producer stamps logical-clock leases (#557).
+                    expired_pending,
                 };
                 match self
                     .reconcile_pass(zone, custodian, Some(&gc_ctx), None, None, None, clock())

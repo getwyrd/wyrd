@@ -58,7 +58,7 @@ use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, repair};
-use wyrd_custodian::{Custodian, FencedZone};
+use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_server::cli::{
     connect_fanout, open_cluster_meta, require_aligned_topology, run_reconstruction_over_backend,
@@ -186,6 +186,7 @@ async fn one_custodian_pass(
         &custodian,
         configured,
         configured.len(),
+        ExpiredPendingPolicy::Defer,
         Duration::from_secs(3600),
         move || clock,
         async { tokio::time::sleep(Duration::from_millis(60)).await },

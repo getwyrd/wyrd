@@ -27,7 +27,7 @@ use wyrd_chunkstore_grpc::{FanoutChunkStore, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::{read, write};
-use wyrd_custodian::{Custodian, FencedZone};
+use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig};
 use wyrd_traits::{
@@ -67,11 +67,13 @@ const DEFAULT_CHUNK_SIZE: usize = 1 << 20;
 // reproducible. CAVEAT (#554): this is no longer true once a DEPLOYED custodian shares
 // the same metadata backend. Stamped at logical zero, an in-flight `wyrd put`'s pending
 // lease (`lease_expiry = NOW_MILLIS + LEASE_TTL_MILLIS = 60_000`) reads as ALREADY
-// EXPIRED against the deployed custodian's wall clock, so the deployed GC pass would treat
-// the still-in-flight write's fan-out as collectable garbage. That lease-liveness gap is
-// SURFACED (not closed) by this bundle — see `custodian.rs` `GC_GRACE_WINDOW_MILLIS` and
-// the build-notes NEEDS-HUMAN; closing it (CLI wall-clock stamp, gateway lease renewal, or
-// a commit-time lease-liveness check) is a cross-cutting decision that overlaps #490.
+// EXPIRED against the deployed custodian's wall clock, so a wall-clocked GC pass would
+// treat the still-in-flight write's fan-out as collectable garbage. That is why the
+// deployed GC pass runs its expired-pending input under `ExpiredPendingPolicy::Defer`
+// unless the operator arms `--gc-expired-pending` (see [`cmd_custodian`]) — the GATE that
+// keeps this stamp from becoming data loss until the lease-liveness gap is CLOSED (a CLI
+// wall-clock stamp, gateway lease renewal, or a commit-time lease-liveness check — the
+// cross-cutting #490 design space; the default-arming follow-up is #557).
 const NOW_MILLIS: u64 = 0;
 pub(crate) const LEASE_TTL_MILLIS: u64 = 60_000;
 
@@ -362,11 +364,16 @@ fn usage() {
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
-    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore]");
+    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore] [--gc-expired-pending]");
     eprintln!("      --reconcile-after-restore runs ONE post-restore reconciliation pass and exits (#551): after");
     eprintln!("      restoring metadata from a backup, with the writers STOPPED. It marks fragments the restore");
     eprintln!("      stranded so GC can reclaim them, and reports chunks whose bytes were already reclaimed before");
     eprintln!("      the restore resurrected their maps. It marks; it never deletes.");
+    eprintln!("      --gc-expired-pending additionally lets the GC pass reclaim expired pending-lease garbage");
+    eprintln!("      (a crashed write's fan-out). UNSAFE while ANY writer is running against this metadata");
+    eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
+    eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
+    eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
     eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd]");
     eprintln!("  wyrd demo");
     eprintln!();
@@ -784,6 +791,22 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
     // The #551 one-shot: read here, with the other flags, so `parsed` is not borrowed across
     // the `async move` that owns the rest of the role.
     let reconcile_after_restore = parsed.flag("reconcile-after-restore").is_some();
+    // GC's expired-pending input is OFF unless the operator arms it. The input's grace is
+    // the lease TTL itself, and a lease is only trustworthy if it was stamped from a live
+    // clock — the CLI write path stamps `pending:` leases from a fixed logical clock
+    // ([`NOW_MILLIS`] = 0), so against this role's wall clock an in-flight `wyrd put`'s
+    // lease reads as expired the moment it is written. Swept, the write's fan-out is
+    // deleted mid-flight and the writer then commits a chunk map over missing bytes —
+    // silent data loss on a shared write-taking backend (#557). Passing this flag is the
+    // operator's attestation that NO writer is running against this metadata backend
+    // (e.g. reaping crashed-write garbage during a maintenance window). Arming it by
+    // default awaits the #490 lease-liveness work. Orphan reclamation (deletes /
+    // overwrites — the #554 headline) runs either way.
+    let expired_pending = if parsed.flag("gc-expired-pending").is_some() {
+        ExpiredPendingPolicy::Reclaim
+    } else {
+        ExpiredPendingPolicy::Defer
+    };
 
     let runtime = tokio_runtime()?;
     runtime.block_on(async move {
@@ -1058,6 +1081,7 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             // `configured` can already be short. The GC pass gates on seeing the whole operator
             // fleet (`run_reconstruction_until`), so it must be told what "whole" is (#554).
             endpoints.len(),
+            expired_pending,
             interval,
             clock,
             shutdown,
@@ -1117,6 +1141,8 @@ pub async fn run_restore_reconcile_over_backend(
 /// `operator_fleet_size` is the operator-configured endpoint count (`--endpoints`), threaded
 /// down to the run loop so its GC pass can gate on seeing the WHOLE fleet — `configured` may be
 /// shorter after `connect_fleet`'s start-degraded drop, and only GC needs the difference (#554).
+/// `expired_pending` is the operator's `--gc-expired-pending` decision, threaded to the same
+/// pass (see [`cmd_custodian`]'s flag parse for why it defaults to `Defer`).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_reconstruction_over_backend<Fut, Clock>(
     backend: MetadataBackend,
@@ -1126,6 +1152,7 @@ pub async fn run_reconstruction_over_backend<Fut, Clock>(
     custodian: &Custodian,
     configured: &[ConfiguredDServer],
     operator_fleet_size: usize,
+    expired_pending: ExpiredPendingPolicy,
     interval: Duration,
     clock: Clock,
     shutdown: Fut,
@@ -1144,6 +1171,7 @@ where
                     &meta,
                     configured,
                     operator_fleet_size,
+                    expired_pending,
                     interval,
                     clock,
                     shutdown,
@@ -1160,6 +1188,7 @@ where
                     &meta,
                     configured,
                     operator_fleet_size,
+                    expired_pending,
                     interval,
                     clock,
                     shutdown,
@@ -1176,6 +1205,7 @@ where
                     &meta,
                     configured,
                     operator_fleet_size,
+                    expired_pending,
                     interval,
                     clock,
                     shutdown,
@@ -1980,7 +2010,7 @@ fn cluster_get(
 /// boolean": that inference would also make a *dangling* value flag (`wyrd demo --log-level`)
 /// silently parse as `true` instead of failing, which is precisely the hole the #531 guard
 /// test exists to keep shut. A flag is valueless only if it says so here.
-const VALUELESS_FLAGS: &[&str] = ["reconcile-after-restore"].as_slice();
+const VALUELESS_FLAGS: &[&str] = ["reconcile-after-restore", "gc-expired-pending"].as_slice();
 
 /// Positional arguments plus `--flag value` pairs (and the valueless flags above).
 struct ParsedArgs {
@@ -2040,6 +2070,21 @@ mod tests {
         assert!(
             parsed.flag("reconcile-after-restore").is_some(),
             "--reconcile-after-restore must be recognised with no value"
+        );
+        // The #557 gate's arming flag is valueless too — and absent means absent, which is what
+        // `cmd_custodian` maps to `ExpiredPendingPolicy::Defer`.
+        assert!(
+            parsed.flag("gc-expired-pending").is_none(),
+            "--gc-expired-pending must not be conjured from arguments that never passed it"
+        );
+        let armed: Vec<String> = ["--gc-expired-pending"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let armed = ParsedArgs::parse(&armed).expect("--gc-expired-pending parses without a value");
+        assert!(
+            armed.flag("gc-expired-pending").is_some(),
+            "--gc-expired-pending must be recognised with no value"
         );
         assert_eq!(
             parsed.flag("zone"),

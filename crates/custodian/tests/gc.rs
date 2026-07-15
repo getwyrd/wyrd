@@ -31,7 +31,10 @@ use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
-use wyrd_custodian::{mark_orphaned, reconcile_step, Custodian, FencedZone, GcContext, Reconciled};
+use wyrd_custodian::{
+    mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
+    Reconciled,
+};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
     WriteBatch,
@@ -201,6 +204,7 @@ async fn reclaims_expired_lease_byte_and_orphan_through_reconcile_step() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     // now = 200: past the lease (100) and past the orphan window (0 + 50).
@@ -266,6 +270,7 @@ async fn never_reclaims_a_referenced_fragment() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
@@ -339,6 +344,7 @@ async fn identity_fallback_none_empty_placement_protects_index0() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     // now = 1_000_000: far past the orphan grace. Only protection is the identity-
@@ -406,6 +412,7 @@ async fn identity_fallback_rs_empty_placement_protects_index_above_zero() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
@@ -473,6 +480,7 @@ async fn short_placement_vector_fallback_protects_fallback_index() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
@@ -534,6 +542,7 @@ async fn identity_fallback_rs_6_3_empty_placement_protects_an_inner_index() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
@@ -592,6 +601,7 @@ async fn short_placement_vector_rs_6_3_fallback_protects_fallback_index() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
@@ -675,6 +685,7 @@ async fn malformed_placement_gc_treats_chunk_as_fully_referenced() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     // now = 1_000_000: far past the orphan grace.
@@ -713,6 +724,7 @@ async fn honours_the_reader_safe_grace_window() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     // WITHIN the window (now = 120 < 150): not reclaimed, and a reader holding the

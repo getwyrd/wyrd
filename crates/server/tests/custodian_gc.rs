@@ -24,10 +24,16 @@
 //! * [`deployed_role_keeps_orphaned_bytes_within_the_grace_window`] — the reader-safe half: with
 //!   the clock still INSIDE the grace window the same loop reclaims nothing (no premature
 //!   collection). Green on base and with the fix — it pins the no-reclaim-before guarantee.
-//! * [`deployed_role_reclaims_expired_pending_lease_garbage`] — GC's SECOND input: the bytes a
-//!   crashed write fan-out left under an expired `pending:` lease are reclaimed through the
-//!   deployed loop (brief: "expired pending leases are likewise GC's input"). Pins that the
-//!   deployed role honours the pending input, not only delete-orphans.
+//! * [`armed_deployed_role_reclaims_expired_pending_lease_garbage`] — GC's SECOND input: the
+//!   bytes a crashed write fan-out left under an expired `pending:` lease are reclaimed through
+//!   the deployed loop (brief: "expired pending leases are likewise GC's input") — but ONLY under
+//!   the operator's `--gc-expired-pending` attestation, because "expired" cannot be trusted
+//!   while any producer stamps logical-clock leases.
+//! * [`deployed_role_defers_expired_pending_garbage_by_default`] — the #557 GATE: without
+//!   `--gc-expired-pending` the deployed role defers every `pending:` entry however expired it
+//!   looks, so a CLI lease stamped at logical zero (`cli.rs` `NOW_MILLIS = 0`) can never have its
+//!   still-in-flight fan-out swept by a wall-clocked pass. Fails if the deployed default ever
+//!   regresses to reclaiming.
 //! * [`deployed_role_defers_gc_and_preserves_a_skipped_servers_evidence`] — the FLEET-VIEW
 //!   safety property (iteration-1 C3/C5/T3 correction): with one server unreachable during a GC
 //!   pass the deployed role DEFERS GC and leaves the skipped server's orphan record + fragment
@@ -75,7 +81,7 @@ use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{self, orphan_key, pending_key, EcScheme, InodeId, PendingEntry};
 use wyrd_core::placement::Topology;
 use wyrd_core::write::write_new_object_placed;
-use wyrd_custodian::{Custodian, FencedZone};
+use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone};
 use wyrd_server::custodian::{ConfiguredDServer, CustodianService};
 use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig};
 use wyrd_traits::{
@@ -378,12 +384,35 @@ fn four_servers() -> (
 }
 
 /// Drive the REAL production run loop over the fleet with a fixed logical clock, for a short
-/// window (a handful of passes), then shut down — the exact wiring `cli::cmd_custodian` runs.
-/// The operator fleet size is the number of servers handed in (a WHOLE, fully-connected fleet);
+/// window (a handful of passes), then shut down — the exact wiring `cli::cmd_custodian` runs
+/// with NO extra flags: the expired-pending input stays [`ExpiredPendingPolicy::Defer`]red
+/// (the deployed default — see `cmd_custodian`'s `--gc-expired-pending` parse). The operator
+/// fleet size is the number of servers handed in (a WHOLE, fully-connected fleet);
 /// [`drive_deployed_loop_operator`] drives the startup-partial case where the operator wired more
 /// endpoints than the loop can see.
 async fn drive_deployed_loop(meta: &MemMeta, servers: &[ConfiguredDServer], now_millis: u64) {
-    drive_deployed_loop_operator(meta, servers, servers.len(), now_millis).await;
+    drive_deployed_loop_operator(
+        meta,
+        servers,
+        servers.len(),
+        ExpiredPendingPolicy::Defer,
+        now_millis,
+    )
+    .await;
+}
+
+/// [`drive_deployed_loop`], but as `wyrd custodian --gc-expired-pending` wires it: the operator
+/// has attested the backend takes no writes, so GC's expired-pending input is ARMED
+/// ([`ExpiredPendingPolicy::Reclaim`]).
+async fn drive_deployed_loop_armed(meta: &MemMeta, servers: &[ConfiguredDServer], now_millis: u64) {
+    drive_deployed_loop_operator(
+        meta,
+        servers,
+        servers.len(),
+        ExpiredPendingPolicy::Reclaim,
+        now_millis,
+    )
+    .await;
 }
 
 /// Drive the REAL production run loop with the operator-configured fleet size passed EXPLICITLY,
@@ -392,10 +421,13 @@ async fn drive_deployed_loop(meta: &MemMeta, servers: &[ConfiguredDServer], now_
 /// exact input path `cmd_custodian` produces: `run_reconstruction_over_backend` hands the loop the
 /// degraded `configured` slice plus `endpoints.len()` (the operator count). The loop's GC pass
 /// must gate on the operator count, never on `servers.len()` (#554 iteration-2 correction).
+/// `expired_pending` is the operator's `--gc-expired-pending` decision, exactly as `cmd_custodian`
+/// threads it.
 async fn drive_deployed_loop_operator(
     meta: &MemMeta,
     servers: &[ConfiguredDServer],
     operator_fleet_size: usize,
+    expired_pending: ExpiredPendingPolicy,
     now_millis: u64,
 ) {
     let coord = MemCoordination::new();
@@ -410,6 +442,7 @@ async fn drive_deployed_loop_operator(
             meta,
             servers,
             operator_fleet_size,
+            expired_pending,
             Duration::from_millis(10),
             move || now_millis,
             shutdown,
@@ -537,13 +570,16 @@ async fn deployed_role_keeps_orphaned_bytes_within_the_grace_window() {
 // ---- the deployed role reclaims GC's SECOND input: expired pending-lease garbage ----
 
 #[tokio::test]
-async fn deployed_role_reclaims_expired_pending_lease_garbage() {
+async fn armed_deployed_role_reclaims_expired_pending_lease_garbage() {
     // The bytes a crashed write fan-out leaves are collectable via the pending ledger, not the
     // orphan ledger: a `pending:<chunk>` lease with no committed inode. Once the lease expires,
-    // GC reclaims the leased fragments (`gc.rs:109-146`). This pins that the deployed loop honours
-    // that input, not only delete-orphans — the brief's "expired pending leases are likewise GC's
-    // input". (The lease here is genuinely abandoned; the SAFETY of collecting a lease that only
-    // *looks* expired against a live writer's clock is the routed-back lease-liveness concern.)
+    // GC reclaims the leased fragments (`gc.rs`). This pins that the deployed loop honours that
+    // input, not only delete-orphans — the brief's "expired pending leases are likewise GC's
+    // input". The lease here is genuinely abandoned, which the role cannot verify — "expired" is
+    // untrustworthy while any producer stamps logical-clock leases (#557) — so this input runs
+    // ONLY under the operator's `--gc-expired-pending` attestation that no writer is live:
+    // the loop is driven ARMED. The deployed DEFAULT defers it —
+    // [`deployed_role_defers_expired_pending_garbage_by_default`].
     const LEASED_CHUNK: ChunkId = 0x0AB1_DEAD;
     const LEASE_EXPIRY: u64 = 500;
 
@@ -590,13 +626,14 @@ async fn deployed_role_reclaims_expired_pending_lease_garbage() {
         (3, "D", dyn_store(&d3)),
     ]);
 
-    // Drive the deployed loop with the clock PAST the lease expiry: the lease is expired, so its
-    // leased fan-out bytes are collectable. RED on base (the loop never runs GC); GREEN with the fix.
-    drive_deployed_loop(&meta, &servers, LEASE_EXPIRY + 1).await;
+    // Drive the deployed loop ARMED with the clock PAST the lease expiry: the lease is expired,
+    // so its leased fan-out bytes are collectable. RED on base (the loop never runs GC); GREEN
+    // with the fix.
+    drive_deployed_loop_armed(&meta, &servers, LEASE_EXPIRY + 1).await;
 
     assert!(
         !present(&d0, LEASED_CHUNK, 0).await && !present(&d1, LEASED_CHUNK, 1).await,
-        "the deployed GC pass reclaimed the expired pending-lease garbage (RED on base: no GC runs)"
+        "the armed GC pass reclaimed the expired pending-lease garbage (RED on base: no GC runs)"
     );
     assert!(
         meta.get(&pending_key(LEASED_CHUNK))
@@ -604,6 +641,83 @@ async fn deployed_role_reclaims_expired_pending_lease_garbage() {
             .unwrap()
             .is_none(),
         "the swept pending-ledger entry is retired once its leased bytes are reclaimed"
+    );
+}
+
+// ---- the deployed DEFAULT never trusts "expired": pending garbage is deferred, not swept ----
+
+#[tokio::test]
+async fn deployed_role_defers_expired_pending_garbage_by_default() {
+    // The #557 mid-flight hazard, pinned as a GATE rather than a doc warning: the CLI write path
+    // stamps `pending:` leases from a fixed logical clock (`cli.rs` `NOW_MILLIS = 0`, so
+    // `lease_expiry = LEASE_TTL_MILLIS`), and against the deployed role's wall clock that lease
+    // reads as expired WHILE THE WRITE IS STILL IN FLIGHT. Swept, the fan-out is deleted and the
+    // writer then commits a chunk map over missing bytes. So without `--gc-expired-pending` the
+    // deployed role must treat every `pending:` entry — however expired it looks — as DEFERRED:
+    // fragments and the lease survive untouched. This is exactly that in-flight shape: a lease
+    // stamped at logical zero, a custodian clock far past it. Fails if the deployed default ever
+    // regresses to `Reclaim`.
+    const LEASED_CHUNK: ChunkId = 0x0AB1_F11E;
+    // The CLI's stamp: `NOW_MILLIS (0) + LEASE_TTL_MILLIS` — one minute past the Unix epoch.
+    const LOGICAL_ZERO_LEASE_EXPIRY: u64 = 60_000;
+    // A deployed custodian's wall clock: some 2026 instant, eons past the logical-zero expiry.
+    const WALL_CLOCK_NOW: u64 = 1_780_000_000_000;
+
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = four_servers();
+
+    // The mid-flight fan-out: fragments landed, no inode committed yet, lease live from the
+    // writer's point of view.
+    d0.put_fragment(
+        FragmentId {
+            chunk: LEASED_CHUNK,
+            index: 0,
+        },
+        Bytes::from_static(b"in-flight fan-out fragment 0"),
+    )
+    .await
+    .unwrap();
+    d1.put_fragment(
+        FragmentId {
+            chunk: LEASED_CHUNK,
+            index: 1,
+        },
+        Bytes::from_static(b"in-flight fan-out fragment 1"),
+    )
+    .await
+    .unwrap();
+    meta.commit(WriteBatch::new().put(
+        pending_key(LEASED_CHUNK),
+        metadata::encode(&PendingEntry {
+            lease_expiry_millis: LOGICAL_ZERO_LEASE_EXPIRY,
+        }),
+    ))
+    .await
+    .unwrap();
+
+    let servers = configured([
+        (0, "A", dyn_store(&d0)),
+        (1, "B", dyn_store(&d1)),
+        (2, "C", dyn_store(&d2)),
+        (3, "D", dyn_store(&d3)),
+    ]);
+
+    // The DEFAULT deployed loop (no --gc-expired-pending), whole fleet visible, clock far past
+    // the stamped expiry — the exact shape that must NOT be trusted.
+    drive_deployed_loop(&meta, &servers, WALL_CLOCK_NOW).await;
+
+    assert!(
+        present(&d0, LEASED_CHUNK, 0).await && present(&d1, LEASED_CHUNK, 1).await,
+        "the deployed default DEFERS expired-pending garbage: a logical-zero-stamped lease reads \
+         as expired against the wall clock while its write is still in flight, so sweeping it \
+         would delete a mid-flight fan-out (#557)"
+    );
+    assert!(
+        meta.get(&pending_key(LEASED_CHUNK))
+            .await
+            .unwrap()
+            .is_some(),
+        "the pending lease survives untouched — deferred is never mistaken for collected"
     );
 }
 
@@ -793,7 +907,16 @@ async fn deployed_role_defers_gc_when_the_operator_fleet_is_startup_partial() {
     const OPERATOR_FLEET_SIZE: usize = 3;
     let partial = build(&[(0, "A", &d0), (1, "B", &d1)]);
     let past_expiry = LEASE_EXPIRY + 1;
-    drive_deployed_loop_operator(&meta, &partial, OPERATOR_FLEET_SIZE, past_expiry).await;
+    // ARMED (`--gc-expired-pending`): the fleet gate must hold even when the operator has
+    // attested the pending input safe — arming is no license to sweep a partial fleet.
+    drive_deployed_loop_operator(
+        &meta,
+        &partial,
+        OPERATOR_FLEET_SIZE,
+        ExpiredPendingPolicy::Reclaim,
+        past_expiry,
+    )
+    .await;
 
     // GC DEFERRED: nothing reclaimed on ANY server, and the chunk-wide pending evidence survives —
     // so the fragment on the still-absent server 2 is still reclaimable on a later whole-fleet pass.
@@ -818,7 +941,14 @@ async fn deployed_role_defers_gc_when_the_operator_fleet_is_startup_partial() {
     // Server 2 comes back: the operator now sees its WHOLE fleet (3 == 3). GC runs and reclaims the
     // whole chunk's garbage, retiring the pending entry only now that every copy was swept.
     let whole = build(&[(0, "A", &d0), (1, "B", &d1), (2, "C", &d2)]);
-    drive_deployed_loop_operator(&meta, &whole, OPERATOR_FLEET_SIZE, past_expiry).await;
+    drive_deployed_loop_operator(
+        &meta,
+        &whole,
+        OPERATOR_FLEET_SIZE,
+        ExpiredPendingPolicy::Reclaim,
+        past_expiry,
+    )
+    .await;
 
     assert!(
         !present(&d0, LEASED_CHUNK, 0).await

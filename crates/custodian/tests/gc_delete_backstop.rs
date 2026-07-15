@@ -29,7 +29,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
-use wyrd_custodian::{reconcile_step, Custodian, FencedZone, GcContext, Reconciled};
+use wyrd_custodian::{
+    reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext, Reconciled,
+};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
     WriteBatch,
@@ -164,6 +166,7 @@ async fn delete_orphans_fragment_reclaimed_by_gc_from_the_placed_dserver() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 200)
@@ -258,6 +261,7 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
     let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 200)
         .await

@@ -22,7 +22,8 @@ use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
 use wyrd_custodian::{
-    mark_orphaned, reconcile_after_restore, reconcile_step, Custodian, FencedZone, GcContext,
+    mark_orphaned, reconcile_after_restore, reconcile_step, Custodian, ExpiredPendingPolicy,
+    FencedZone, GcContext,
 };
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
@@ -190,6 +191,7 @@ async fn a_stranded_fragment_is_marked_so_gc_can_finally_reclaim_it() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -232,6 +234,7 @@ async fn a_referenced_fragment_is_never_marked() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -270,6 +273,7 @@ async fn re_running_does_not_reset_an_existing_grace_clock() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -308,6 +312,7 @@ async fn an_in_flight_pending_chunk_is_left_to_gc() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -344,6 +349,7 @@ async fn a_chunk_below_k_surviving_fragments_is_reported_dangling() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -382,6 +388,7 @@ async fn a_chunk_still_at_k_is_under_replicated_not_dangling() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -423,6 +430,7 @@ async fn without_the_pass_a_stranded_fragment_leaks_forever() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
     let coord = MemCoordination::new();
     let (zone, leader) = elect(&coord).await;
@@ -456,6 +464,7 @@ async fn after_the_pass_gc_reclaims_the_stranded_fragment() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     // The operator runs the pass after the restore. It MARKS; it deletes nothing.
@@ -511,6 +520,7 @@ async fn every_stray_is_marked_across_batch_boundaries_including_the_tail() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -562,6 +572,7 @@ async fn the_only_copy_of_a_moved_fragment_is_never_marked() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -627,6 +638,7 @@ async fn a_stale_duplicate_is_marked_when_the_canonical_copy_survives() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -678,6 +690,7 @@ async fn a_single_fragment_chunk_whose_bytes_moved_is_reported_misplaced_not_hea
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -728,6 +741,7 @@ async fn a_chunk_below_k_at_its_placement_is_misplaced_not_under_replicated() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
@@ -777,6 +791,7 @@ async fn a_displaced_fragment_is_only_under_replicated_while_k_survive_at_the_pl
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
