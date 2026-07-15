@@ -64,10 +64,21 @@ pub fn header_matches_identity(
         return false;
     }
     match scheme {
-        // A single-copy (`none`) chunk: one fragment at index 0, no erasure coding
-        // (the header a `none`/`replication(1)` writer stamps, `write.rs:133`).
+        // A single-copy (`none`) chunk: one fragment at the expected index, no erasure
+        // coding. TWO v1 code points legitimately stamp single-copy data: `none` (what
+        // this repo's writer stamps, `write.rs:133`) and `replication` — the format spec
+        // defines both with `ec_k = 1, ec_m = 0` (chunk-format v1 §header, and the
+        // `replication-fragment` conformance vector), the CLI already parses
+        // `replication(1)` as `EcScheme::None` (`cli.rs:378-380`), and the spec's
+        // mixed-era rule says a reader MUST honour the scheme the fragment records.
+        // Rejecting `replication` here would make spec-valid single-copy data unreadable
+        // and have scrub enqueue it as corrupt forever (Codex, PR #564).
         EcScheme::None => {
-            header.ec_scheme_type == EcSchemeType::None && header.ec_k == 1 && header.ec_m == 0
+            matches!(
+                header.ec_scheme_type,
+                EcSchemeType::None | EcSchemeType::Replication
+            ) && header.ec_k == 1
+                && header.ec_m == 0
         }
         // A Reed-Solomon chunk: the header must name the SAME `k`/`m` stripe geometry
         // the committed `ChunkRef.scheme` records, so a shard from a differently-coded
@@ -218,6 +229,48 @@ mod tests {
             Some(payload.as_slice()),
             "the MATCHING RS(3,1) geometry admits the same fragment — proving the k/m \
              compare, not the scheme type alone, is what gates it"
+        );
+    }
+
+    /// The v1 format defines TWO single-copy code points — `none` (0) and `replication`
+    /// (1), both with `ec_k = 1, ec_m = 0` (chunk-format spec v1 §header; the
+    /// `replication-fragment` conformance vector) — and the CLI parses `replication(1)`
+    /// as `EcScheme::None`. A spec-conforming replication(1) fragment whose chunk id and
+    /// index match MUST be admitted under a committed `EcScheme::None`, exactly like a
+    /// `none`-stamped one; a replication header with a non-single-copy tuple must not.
+    #[test]
+    fn replication_single_copy_fragment_is_admitted_under_scheme_none() {
+        let chunk: ChunkId = 0xABCD;
+        let payload = b"a single copy stamped with the replication code point";
+        let mut header = FragmentHeader::new_v1(chunk, payload.len() as u64);
+        header.ec_scheme_type = EcSchemeType::Replication;
+        header.ec_k = 1;
+        header.ec_m = 0;
+        let bytes = encode(&header, payload);
+        let at0 = FragmentId { chunk, index: 0 };
+
+        assert_eq!(
+            intact_shard(&bytes, at0, EcScheme::None).as_deref(),
+            Some(payload.as_slice()),
+            "a replication(1) header (k=1, m=0) proves single-copy identity under \
+             EcScheme::None — the mixed-era/interoperable code point stays readable"
+        );
+        assert!(
+            fragment_intact(&bytes, at0, EcScheme::None),
+            "the shared verify admits the same replication(1) fragment"
+        );
+
+        // A replication header whose tuple is NOT single-copy stays rejected: the
+        // scheme-type widening admits exactly k=1/m=0, nothing else.
+        let mut multi = FragmentHeader::new_v1(chunk, payload.len() as u64);
+        multi.ec_scheme_type = EcSchemeType::Replication;
+        multi.ec_k = 1;
+        multi.ec_m = 2;
+        let multi_bytes = encode(&multi, payload);
+        assert_eq!(
+            intact_shard(&multi_bytes, at0, EcScheme::None),
+            None,
+            "a replication header with a non-single-copy tuple (m != 0) is rejected"
         );
     }
 }
