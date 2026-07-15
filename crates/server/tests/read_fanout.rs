@@ -179,7 +179,7 @@ async fn write_rs(
         data,
         CHUNK,
         RS,
-        NOW,
+        || NOW,
         TTL,
         ids_from(0x10),
     )

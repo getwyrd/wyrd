@@ -264,7 +264,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -881,7 +881,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
         data.len(),
         EcScheme::ReedSolomon { k: 6, m: 3 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -1371,7 +1371,7 @@ async fn write_rs_2_1_as(
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || chunk_id,
     )

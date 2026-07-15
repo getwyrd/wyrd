@@ -319,10 +319,15 @@ pub async fn release(meta: &impl MetadataStore, plan: &WritePlan) -> Result<()> 
     Ok(())
 }
 
-/// Write a brand-new object end to end (the four phases in order). `now_millis`
-/// stamps the lease and `lease_ttl_millis` is its lifetime. The ledger is
-/// released only on a winning commit; a losing commit leaves leased garbage for
-/// the sweep.
+/// Write a brand-new object end to end (the four phases in order). `now_fn` is the
+/// caller's clock (a closure, exactly as [`stream_write_data`] takes one): it is read
+/// once to stamp the lease (expiring `lease_ttl_millis` later) and read AGAIN at the
+/// commit point, so the lease-conditional create (issue #490) is evaluated against the
+/// commit's own instant. A single fixed instant would make the guard a tautology —
+/// `lease_expiry = t + ttl` compared against the same `t` can never read as lapsed, no
+/// matter how long the data phase or the caller stalled, and the helper would publish
+/// over bytes the custodian GC is already free to reclaim. The ledger is released only
+/// on a winning commit; a losing commit leaves leased garbage for the sweep.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_new_object(
     meta: &impl MetadataStore,
@@ -333,14 +338,14 @@ pub async fn write_new_object(
     data: &[u8],
     chunk_size: usize,
     scheme: EcScheme,
-    now_millis: u64,
+    mut now_fn: impl FnMut() -> u64,
     lease_ttl_millis: u64,
     next_id: impl FnMut() -> ChunkId,
 ) -> Result<CommitOutcome> {
     let plan = plan_write(data, chunk_size, scheme, next_id)?;
-    intent(meta, &plan, now_millis + lease_ttl_millis).await?;
+    intent(meta, &plan, now_fn() + lease_ttl_millis).await?;
     write_fragments(chunks, &plan).await?;
-    let outcome = commit_create(meta, parent, name, inode_id, &plan, now_millis).await?;
+    let outcome = commit_create(meta, parent, name, inode_id, &plan, now_fn()).await?;
     if outcome == CommitOutcome::Committed {
         release(meta, &plan).await?;
     }
@@ -356,6 +361,9 @@ pub async fn write_new_object(
 /// (`0005:510-513`). Errors with the selector's [`SelectorError`] (surfaced through
 /// the boxed `Result`) when the topology offers fewer than `n` distinct domains —
 /// the write fails closed rather than collide domains.
+///
+/// `now_fn` is read twice — lease stamp, then commit instant — for the same
+/// lease-liveness reason as [`write_new_object`].
 #[allow(clippy::too_many_arguments)]
 pub async fn write_new_object_placed(
     meta: &impl MetadataStore,
@@ -367,15 +375,15 @@ pub async fn write_new_object_placed(
     chunk_size: usize,
     scheme: EcScheme,
     topology: &Topology,
-    now_millis: u64,
+    mut now_fn: impl FnMut() -> u64,
     lease_ttl_millis: u64,
     next_id: impl FnMut() -> ChunkId,
 ) -> Result<CommitOutcome> {
     let mut plan = plan_write(data, chunk_size, scheme, next_id)?;
     plan.place(topology)?;
-    intent(meta, &plan, now_millis + lease_ttl_millis).await?;
+    intent(meta, &plan, now_fn() + lease_ttl_millis).await?;
     write_fragments(chunks, &plan).await?;
-    let outcome = commit_create(meta, parent, name, inode_id, &plan, now_millis).await?;
+    let outcome = commit_create(meta, parent, name, inode_id, &plan, now_fn()).await?;
     if outcome == CommitOutcome::Committed {
         release(meta, &plan).await?;
     }

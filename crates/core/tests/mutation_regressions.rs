@@ -141,7 +141,7 @@ async fn write_new_object_releases_pending_on_commit() {
         b"a freshly written object",
         CHUNK,
         EcScheme::ReedSolomon { k: 2, m: 1 },
-        1_000,
+        || 1_000,
         5_000,
         || {
             next += 1;
@@ -182,7 +182,7 @@ async fn write_new_object_placed_releases_pending_on_commit() {
         CHUNK,
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        1_000,
+        || 1_000,
         5_000,
         || {
             next += 1;

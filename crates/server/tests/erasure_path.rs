@@ -68,7 +68,7 @@ fn rs_put_stages_n_fragments_and_reads_back_byte_identical() {
             data,
             CHUNK,
             RS,
-            NOW,
+            || NOW,
             TTL,
             ids_from(0x10),
         )
@@ -138,7 +138,7 @@ fn exactly_one_overwrite_wins_under_rs() {
                 b"v1",
                 CHUNK,
                 RS,
-                NOW,
+                || NOW,
                 TTL,
                 ids_from(sim.gen()),
             )
@@ -231,7 +231,7 @@ async fn put_rs(meta: &RedbMetadataStore, chunks: &FsChunkStore, data: &[u8]) ->
         data,
         CHUNK,
         RS,
-        NOW,
+        || NOW,
         TTL,
         ids_from(0x10),
     )

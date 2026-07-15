@@ -73,7 +73,7 @@ async fn publish_initial(
         ORIGINAL,
         CHUNK,
         EcScheme::None,
-        0,
+        || 0,
         TTL,
         ids_from(100),
     )

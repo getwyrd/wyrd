@@ -298,7 +298,7 @@ async fn k_of_n_read_survives_dropped_fetches() {
             payload,
             CHUNK,
             RS,
-            0,
+            || 0,
             LEASE_EXPIRY,
             ids_from(1),
         )
@@ -356,7 +356,7 @@ async fn corrupt_fragment_is_read_around() {
             payload,
             CHUNK,
             RS,
-            0,
+            || 0,
             LEASE_EXPIRY,
             ids_from(1),
         )

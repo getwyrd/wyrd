@@ -79,7 +79,7 @@ fn write_produces_an_atomically_committed_readable_file() {
             data,
             CHUNK,
             EcScheme::None,
-            NOW,
+            || NOW,
             TTL,
             ids_from(0x10),
         )
@@ -213,7 +213,7 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
                 b"v1",
                 CHUNK,
                 EcScheme::None,
-                NOW,
+                || NOW,
                 TTL,
                 ids_from(sim.gen()),
             )

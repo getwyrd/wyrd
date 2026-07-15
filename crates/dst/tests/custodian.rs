@@ -481,7 +481,7 @@ async fn write_rs_2_1(meta: &impl MetadataStore, fleet: &Fleet<'_>) -> Vec<u8> {
             m: M as u8,
         },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )

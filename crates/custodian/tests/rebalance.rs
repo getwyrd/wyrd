@@ -276,7 +276,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -579,7 +579,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
         data.len(),
         EcScheme::ReedSolomon { k: 6, m: 3 },
         topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -818,7 +818,7 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -1158,7 +1158,7 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )

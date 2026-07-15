@@ -388,7 +388,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) {
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -500,7 +500,7 @@ async fn write_rs_2_1_as(
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || chunk_id,
     )
@@ -1246,7 +1246,7 @@ async fn gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path() {
             data.len(),
             EcScheme::ReedSolomon { k: 2, m: 1 },
             &topo,
-            0,
+            || 0,
             1_000,
             || CHUNK,
         )
