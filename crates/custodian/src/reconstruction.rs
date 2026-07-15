@@ -382,7 +382,7 @@ async fn assess(
         };
         // VERIFY: a present fragment must decode cleanly AND prove the FULL identity
         // this slot expects — chunk id, `ec_fragment_index`, and the committed EC tuple;
-        // a checksum-failing, misplaced, or mis-encoded fragment is excluded (never
+        // a checksum-failing, misplaced, or misencoded fragment is excluded (never
         // decoded) and treated as missing (`0005:275`). `repair::intact_shard` is the
         // shared verify, so `custodian` recovers the shard without a chunk-format
         // dependency.

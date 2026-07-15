@@ -49,7 +49,7 @@ pub fn parse_repair_key(key: &[u8]) -> Option<ChunkId> {
 ///
 /// Verification is "against the chunk map", not against half of it (`0005:262-267`): a
 /// valid same-chunk shard for the WRONG index — or a fragment whose header EC tuple
-/// disagrees with the committed scheme — is a misplaced / mis-encoded fragment and must
+/// disagrees with the committed scheme — is a misplaced / misencoded fragment and must
 /// be rejected before it is ever fed to the decoder under the requested index. The
 /// store-level precedent is `FsChunkStore::verify` (chunk **and** index,
 /// `crates/chunkstore-fs/src/lib.rs:117-130`); this widens it with the committed EC
@@ -85,7 +85,7 @@ pub fn header_matches_identity(
 /// when the bytes decode cleanly (header + payload crc32c verified by
 /// [`wyrd_chunk_format::decode`]) **and** the decoded header proves the FULL identity
 /// ([`header_matches_identity`] — chunk id, `ec_fragment_index`, and the RS EC tuple).
-/// A `false` is bit rot / a misplaced / mis-encoded fragment: it must be **excluded**
+/// A `false` is bit rot / a misplaced / misencoded fragment: it must be **excluded**
 /// from the decoder and its `expected.chunk` enqueued for reconstruction
 /// ([`enqueue_repair`]) — the load-bearing invariant (`0005:262-267`, `0005:174-176`).
 ///
@@ -102,7 +102,7 @@ pub fn fragment_intact(bytes: &[u8], expected: FragmentId, scheme: EcScheme) -> 
 /// Decode a survivor fragment to its **shard payload** iff it is intact and is the
 /// fragment the committed chunk map expects at `expected` under `scheme` — the gather
 /// step of the **reconstruction** custodian (`0005:275`). Returns `None` for a missing,
-/// checksum-failing, misplaced, or mis-encoded fragment (full-identity check via
+/// checksum-failing, misplaced, or misencoded fragment (full-identity check via
 /// [`header_matches_identity`]), which is then **excluded** from the decoder (never fed
 /// to it) and rebuilt around.
 ///
@@ -156,7 +156,7 @@ mod tests {
     /// proves the FULL identity the chunk map expects: chunk id, `ec_fragment_index`,
     /// and the EC tuple. A checksum-valid fragment of the SAME chunk at the WRONG index,
     /// or whose header EC tuple disagrees with the committed scheme, is a misplaced /
-    /// mis-encoded shard and must be rejected (`None`), never fed to the decoder
+    /// misencoded shard and must be rejected (`None`), never fed to the decoder
     /// (`0005:262-267`).
     #[test]
     fn intact_shard_accepts_the_expected_fragment_and_rejects_wrong_identity() {

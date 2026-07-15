@@ -239,7 +239,7 @@ async fn read_chunk(
                     Ok(decoded.payload)
                 }
                 Ok(_) => {
-                    // A misplaced / mis-encoded single fragment: it decodes cleanly but
+                    // A misplaced / misencoded single fragment: it decodes cleanly but
                     // its header does not prove the requested identity (a DIFFERENT
                     // chunk id, a wrong ec_fragment_index, or an EC tuple disagreeing
                     // with the committed scheme — a misrouted / placement-confused
@@ -344,7 +344,7 @@ async fn read_chunk(
                             // A present fragment that fails its checksum (decode `Err`) or
                             // whose header does not prove the requested identity (foreign
                             // `chunk_id`, wrong `ec_fragment_index`, or a disagreeing EC
-                            // tuple) is bit rot / a misplaced / mis-encoded fragment:
+                            // tuple) is bit rot / a misplaced / misencoded fragment:
                             // excluded from the decoder (read around) AND its chunk
                             // recorded as a repair obligation, never silently absorbed
                             // (`0005:174-176`, `0005:262-264`).

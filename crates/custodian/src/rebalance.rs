@@ -257,7 +257,7 @@ async fn evacuate_chunk(
             return Ok(EvacOutcome::Aborted);
         };
         // Only an INTACT fragment is moved. A missing / checksum-failing / misplaced /
-        // mis-encoded fragment is a loss for the reconstruction loop, not a clean drain
+        // misencoded fragment is a loss for the reconstruction loop, not a clean drain
         // move — never propagate it. Verify the FULL identity (chunk id + index + the
         // committed EC tuple) against the chunk map, not the `chunk_id` alone.
         let Some(bytes) = source_store.get_fragment(frag).await? else {
