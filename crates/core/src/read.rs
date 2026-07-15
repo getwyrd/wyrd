@@ -256,18 +256,26 @@ async fn read_chunk(
                 Err(e) => return Err(e),
             };
             match decode(&fragment) {
-                // Admit the fragment only if it decodes cleanly AND its header names
-                // the chunk being read — the same gate the shared verify enforces
-                // (`repair::fragment_intact`, `repair.rs`). This is the inline decode
-                // that verify is documented to mirror (`0005:262-267`, `0005:174-176`).
-                Ok(decoded) if decoded.header.chunk_id == chunk.id => Ok(decoded.payload),
+                // Admit the fragment only if it decodes cleanly AND its header proves
+                // the FULL identity the chunk map expects — chunk id, ec_fragment_index,
+                // and the EC tuple — the same gate the shared verify enforces
+                // (`repair::header_matches_identity` / `repair::fragment_intact`,
+                // `repair.rs`). This is the inline decode that verify mirrors
+                // (`0005:262-267`, `0005:174-176`).
+                Ok(decoded)
+                    if repair::header_matches_identity(&decoded.header, frag_id, chunk.scheme) =>
+                {
+                    Ok(decoded.payload)
+                }
                 Ok(_) => {
-                    // A misplaced-but-intact single fragment: it decodes cleanly but
-                    // its header names a DIFFERENT chunk (a misrouted / placement-
-                    // confused fragment). Never return its foreign bytes as this
-                    // chunk; record the chunk as a durable repair obligation and
-                    // surface a missing-fragment error — this chunk has no usable
-                    // fragment here, exactly as scrub/reconstruction exclude it.
+                    // A misplaced / misencoded single fragment: it decodes cleanly but
+                    // its header does not prove the requested identity (a DIFFERENT
+                    // chunk id, a wrong ec_fragment_index, or an EC tuple disagreeing
+                    // with the committed scheme — a misrouted / placement-confused
+                    // fragment). Never return its foreign bytes as this chunk; record
+                    // the chunk as a durable repair obligation and surface a
+                    // missing-fragment error — this chunk has no usable fragment here,
+                    // exactly as scrub/reconstruction exclude it.
                     corrupt.push(chunk.id);
                     Err(ReadError::MissingFragment { chunk_id: chunk.id }.into())
                 }
@@ -341,11 +349,20 @@ async fn read_chunk(
                     Ok(Some(fragment)) => {
                         match decode(&fragment) {
                             // Admit a survivor only if it decodes cleanly AND its header
-                            // names this chunk — the same gate `repair::intact_shard`
-                            // applies in reconstruction (`0005:262-267`). A misplaced-but-
-                            // intact fragment (valid checksum, foreign `chunk_id`) is
-                            // excluded from the decoder, never fed as a shard at `index`.
-                            Ok(decoded) if decoded.header.chunk_id == chunk.id => {
+                            // proves the FULL identity this slot expects — chunk id,
+                            // ec_fragment_index, and the EC tuple — the same gate
+                            // `repair::intact_shard` applies in reconstruction
+                            // (`0005:262-267`). A valid same-chunk shard for the WRONG
+                            // index, or one whose EC tuple disagrees with the committed
+                            // scheme, is excluded from the decoder — NEVER fed as a shard
+                            // at `index`, where it would be wrong reconstruction input.
+                            Ok(decoded)
+                                if repair::header_matches_identity(
+                                    &decoded.header,
+                                    frag,
+                                    chunk.scheme,
+                                ) =>
+                            {
                                 shards.push((index as usize, decoded.payload));
                                 if shards.len() == k {
                                     // `k` verified: drop the outstanding fetches, which
@@ -354,18 +371,25 @@ async fn read_chunk(
                                 }
                             }
                             // A present fragment that fails its checksum (decode `Err`) or
-                            // names a different chunk (misplaced) is bit rot / a misrouted
-                            // fragment: excluded from the decoder (read around) AND its
-                            // chunk recorded as a repair obligation, never silently
-                            // absorbed (`0005:174-176`, `0005:262-264`).
+                            // whose header does not prove the requested identity (foreign
+                            // `chunk_id`, wrong `ec_fragment_index`, or a disagreeing EC
+                            // tuple) is bit rot / a misplaced / misencoded fragment:
+                            // excluded from the decoder (read around) AND its chunk
+                            // recorded as a repair obligation, never silently absorbed
+                            // (`0005:174-176`, `0005:262-264`).
                             Ok(decoded) => {
                                 emit_fragment_fault(
                                     FaultClass::Misplaced,
                                     dserver,
                                     frag,
                                     format_args!(
-                                        "fragment decodes but its header names chunk {}",
-                                        wyrd_traits::chunk_hex(decoded.header.chunk_id)
+                                        "fragment decodes but its header identity \
+                                         (chunk {}, index {}) does not match the requested \
+                                         chunk {} index {}",
+                                        wyrd_traits::chunk_hex(decoded.header.chunk_id),
+                                        decoded.header.ec_fragment_index,
+                                        wyrd_traits::chunk_hex(chunk.id),
+                                        index,
                                     ),
                                 );
                                 corrupt.push(chunk.id);

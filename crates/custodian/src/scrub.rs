@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 
+use wyrd_core::metadata::EcScheme;
 use wyrd_core::repair;
 use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result};
 
@@ -91,9 +92,14 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
     // fetch" arm. Asking each placed D server directly for exactly the fragments the
     // chunk map says it holds closes that gap: a `get_fragment` that comes back
     // `Ok(None)` now means exactly what it says — no bytes for a fragment placed here.
-    let mut by_dserver: HashMap<DServerId, Vec<FragmentId>> = HashMap::new();
+    // Carry each referenced fragment's committed scheme alongside it, so the verify
+    // below checks the header's FULL identity (index + EC tuple) against the chunk map,
+    // not the `chunk_id` alone (`repair::fragment_intact`, `0005:262-267`).
+    let mut by_dserver: HashMap<DServerId, Vec<(FragmentId, EcScheme)>> = HashMap::new();
     for &(dserver, frag) in &referenced.placed {
-        by_dserver.entry(dserver).or_default().push(frag);
+        if let Some(&scheme) = referenced.schemes.get(&frag.chunk) {
+            by_dserver.entry(dserver).or_default().push((frag, scheme));
+        }
     }
 
     let mut changed = false;
@@ -101,7 +107,7 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
         let Some(frags) = by_dserver.get(&dserver) else {
             continue;
         };
-        for &frag in frags {
+        for &(frag, scheme) in frags {
             // Fetch the bytes named by the chunk map, then decide what the fetch told
             // us. A backend that does not verify on read (an in-memory fake) hands
             // back the raw bytes for scrub's own `fragment_intact` to check; a
@@ -115,8 +121,9 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
                     emit_scrubbed(dserver, frag);
 
                     // VERIFY the self-describing checksum against the committed chunk
-                    // map. `frag.chunk` is the id the chunk map references it under.
-                    if !repair::fragment_intact(&bytes, frag.chunk) {
+                    // map — the FULL identity `frag` (chunk id + index) and `scheme`
+                    // (the EC tuple) name, not the `chunk_id` alone.
+                    if !repair::fragment_intact(&bytes, frag, scheme) {
                         // CORRUPTION: exclude the failing fragment (never decode it)
                         // and enqueue its chunk on the shared repair queue.
                         emit_corruption(dserver, frag);

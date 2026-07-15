@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_chunk_format::{encode, FragmentHeader, CORE_HEADER_LEN};
 use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeRecord, InodeState};
+use wyrd_core::write::encode_ec_fragment;
 use wyrd_core::{erasure, read, repair};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, FragmentId, Health, IntegrityFault, MetadataStore,
@@ -200,12 +201,12 @@ async fn ec_read_excludes_corrupt_fragment_and_enqueues_for_repair() {
                     chunk: chunk_id,
                     index: index as u16,
                 },
-                fragment(chunk_id, shard),
+                encode_ec_fragment(chunk_id, index as u16, k, m, shard),
             )
             .await
             .unwrap();
     }
-    let mut rotten = fragment(chunk_id, &shards[0]).to_vec();
+    let mut rotten = encode_ec_fragment(chunk_id, 0, k, m, &shards[0]).to_vec();
     rotten[CORE_HEADER_LEN as usize] ^= 0xff;
     chunks
         .put_fragment(
@@ -404,7 +405,7 @@ async fn ec_read_enqueues_integrity_fault_shard_for_repair_and_reconstructs() {
                     chunk: chunk_id,
                     index: index as u16,
                 },
-                fragment(chunk_id, shard),
+                encode_ec_fragment(chunk_id, index as u16, k, m, shard),
             )
             .await
             .unwrap();
@@ -549,7 +550,7 @@ async fn ec_read_treats_a_misplaced_but_intact_fragment_as_absent() {
                 chunk: chunk_id,
                 index: 0,
             },
-            fragment(chunk_id, &shards[0]),
+            encode_ec_fragment(chunk_id, 0, k, m, &shards[0]),
         )
         .await
         .unwrap();
@@ -709,13 +710,13 @@ async fn a_corrupt_fragment_is_reported_with_its_index_and_its_placed_dserver() 
                     chunk: chunk_id,
                     index: index as u16,
                 },
-                fragment(chunk_id, shard),
+                encode_ec_fragment(chunk_id, index as u16, k, m, shard),
             )
             .await
             .unwrap();
     }
     // Rot fragment index 0 — which the placement puts on D-server 7.
-    let mut rotten = fragment(chunk_id, &shards[0]).to_vec();
+    let mut rotten = encode_ec_fragment(chunk_id, 0, k, m, &shards[0]).to_vec();
     rotten[CORE_HEADER_LEN as usize] ^= 0xff;
     chunks
         .put_fragment(
@@ -803,7 +804,7 @@ async fn a_transient_dserver_failure_is_no_longer_silent() {
                     chunk: chunk_id,
                     index: index as u16,
                 },
-                fragment(chunk_id, shard),
+                encode_ec_fragment(chunk_id, index as u16, k, m, shard),
             )
             .await
             .unwrap();
