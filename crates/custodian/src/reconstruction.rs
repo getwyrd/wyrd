@@ -380,13 +380,15 @@ async fn assess(
             },
             None => None,
         };
-        // VERIFY: a present fragment must decode cleanly AND name this chunk; a
-        // checksum-failing or misplaced fragment is excluded (never decoded) and
-        // treated as missing (`0005:275`). `repair::intact_shard` is the shared verify,
-        // so `custodian` recovers the shard without a chunk-format dependency.
+        // VERIFY: a present fragment must decode cleanly AND prove the FULL identity
+        // this slot expects — chunk id, `ec_fragment_index`, and the committed EC tuple;
+        // a checksum-failing, misplaced, or mis-encoded fragment is excluded (never
+        // decoded) and treated as missing (`0005:275`). `repair::intact_shard` is the
+        // shared verify, so `custodian` recovers the shard without a chunk-format
+        // dependency.
         match bytes
             .as_deref()
-            .and_then(|b| repair::intact_shard(b, chunk))
+            .and_then(|b| repair::intact_shard(b, frag, chunk_ref.scheme))
         {
             Some(shard) => {
                 survivors.push((index, shard));

@@ -636,7 +636,14 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         .expect("get fragment 0 from d0")
         .expect("fragment 0 must be present on d0");
     assert!(
-        repair::fragment_intact(&bytes0, CHUNK_ID),
+        repair::fragment_intact(
+            &bytes0,
+            frag0,
+            EcScheme::ReedSolomon {
+                k: K as u8,
+                m: M as u8
+            }
+        ),
         "fragment 0 on d0 must verify checksum"
     );
     intact += 1;
@@ -651,7 +658,14 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         .expect("get rebuilt fragment 1 from d3")
         .expect("rebuilt fragment 1 must be present on d3");
     assert!(
-        repair::fragment_intact(&bytes1, CHUNK_ID),
+        repair::fragment_intact(
+            &bytes1,
+            frag1_rebuilt,
+            EcScheme::ReedSolomon {
+                k: K as u8,
+                m: M as u8
+            }
+        ),
         "rebuilt fragment 1 on d3 must verify checksum"
     );
     intact += 1;
@@ -666,7 +680,14 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         .expect("get fragment 2 from d2")
         .expect("fragment 2 must be present on d2");
     assert!(
-        repair::fragment_intact(&bytes2, CHUNK_ID),
+        repair::fragment_intact(
+            &bytes2,
+            frag2,
+            EcScheme::ReedSolomon {
+                k: K as u8,
+                m: M as u8
+            }
+        ),
         "fragment 2 on d2 must verify checksum"
     );
     intact += 1;

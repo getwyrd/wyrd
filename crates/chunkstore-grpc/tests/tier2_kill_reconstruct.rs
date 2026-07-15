@@ -757,10 +757,16 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
             .unwrap_or_else(|e| {
                 panic!("get_fragment index {frag_index} from server {server_id}: {e}")
             });
-        match maybe_bytes
-            .as_deref()
-            .and_then(|bytes| repair::intact_shard(bytes, CHUNK))
-        {
+        match maybe_bytes.as_deref().and_then(|bytes| {
+            repair::intact_shard(
+                bytes,
+                frag_id,
+                EcScheme::ReedSolomon {
+                    k: K as u8,
+                    m: M as u8,
+                },
+            )
+        }) {
             Some(shard) => available.push((frag_index, shard)),
             // A placed fragment that is absent (`Ok(None)`) or fails its integrity
             // check is a repair FAILURE, not something to skip over.
