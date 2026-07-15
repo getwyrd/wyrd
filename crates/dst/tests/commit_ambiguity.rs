@@ -194,7 +194,7 @@ async fn ambiguous_cas_settles_over(meta: Arc<SimFdbMetadataStore>, observer: Ob
     let v0 = write::plan_write(b"v0", CHUNK, RS, ids_from(1)).unwrap();
     write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
     write::write_fragments(&*chunks, &v0).await.unwrap();
-    write::commit_create(&*meta, 0, "obj", 1, &v0)
+    write::commit_create(&*meta, 0, "obj", 1, &v0, 0)
         .await
         .unwrap();
     write::release(&*meta, &v0).await.unwrap();
@@ -617,7 +617,7 @@ async fn timed_out_commit_over(meta: Arc<SimFdbMetadataStore>, observer: Timeout
     let v0 = write::plan_write(b"v0", CHUNK, RS, ids_from(1)).unwrap();
     write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
     write::write_fragments(&*chunks, &v0).await.unwrap();
-    write::commit_create(&*meta, 0, "obj", 1, &v0)
+    write::commit_create(&*meta, 0, "obj", 1, &v0, 0)
         .await
         .unwrap();
     write::release(&*meta, &v0).await.unwrap();
@@ -749,7 +749,7 @@ async fn contended_cas_under_1031_over(
     let v0 = write::plan_write(b"v0", CHUNK, RS, ids_from(1)).unwrap();
     write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
     write::write_fragments(&*chunks, &v0).await.unwrap();
-    write::commit_create(&*meta, 0, "obj", 1, &v0)
+    write::commit_create(&*meta, 0, "obj", 1, &v0, 0)
         .await
         .unwrap();
     write::release(&*meta, &v0).await.unwrap();
@@ -929,7 +929,7 @@ async fn deferred_1031_settles_against_current_truth(meta: Arc<SimFdbMetadataSto
     let v0 = write::plan_write(b"v0", CHUNK, RS, ids_from(1)).unwrap();
     write::intent(&*meta, &v0, LEASE_EXPIRY).await.unwrap();
     write::write_fragments(&*chunks, &v0).await.unwrap();
-    write::commit_create(&*meta, 0, "obj", 1, &v0)
+    write::commit_create(&*meta, 0, "obj", 1, &v0, 0)
         .await
         .unwrap();
     write::release(&*meta, &v0).await.unwrap();

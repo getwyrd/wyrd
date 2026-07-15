@@ -79,7 +79,7 @@ fn write_produces_an_atomically_committed_readable_file() {
             data,
             CHUNK,
             EcScheme::None,
-            NOW,
+            || NOW,
             TTL,
             ids_from(0x10),
         )
@@ -171,7 +171,7 @@ fn crash_between_commit_and_release_leaves_entries_the_sweep_reclaims() {
 
         write::intent(&meta, &plan, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan).await.unwrap();
-        let outcome = write::commit_create(&meta, ROOT, "file", 1, &plan)
+        let outcome = write::commit_create(&meta, ROOT, "file", 1, &plan, NOW)
             .await
             .unwrap();
         assert_eq!(outcome, CommitOutcome::Committed);
@@ -213,7 +213,7 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
                 b"v1",
                 CHUNK,
                 EcScheme::None,
-                NOW,
+                || NOW,
                 TTL,
                 ids_from(sim.gen()),
             )
@@ -275,10 +275,10 @@ fn concurrent_create_of_the_same_name_has_one_winner() {
         write::intent(&meta, &plan_b, NOW + TTL).await.unwrap();
         write::write_fragments(&chunks, &plan_b).await.unwrap();
 
-        let a = write::commit_create(&meta, ROOT, "same", 10, &plan_a)
+        let a = write::commit_create(&meta, ROOT, "same", 10, &plan_a, NOW)
             .await
             .unwrap();
-        let b = write::commit_create(&meta, ROOT, "same", 11, &plan_b)
+        let b = write::commit_create(&meta, ROOT, "same", 11, &plan_b, NOW)
             .await
             .unwrap();
         assert_eq!(a, CommitOutcome::Committed);

@@ -140,8 +140,8 @@ async fn write_new_object_lease_expiry_is_now_plus_ttl() {
         b"a losing write",
         CHUNK,
         EcScheme::ReedSolomon { k: 2, m: 1 },
-        1_000, // now
-        5_000, // ttl
+        || 1_000, // now
+        5_000,    // ttl
         || {
             next += 1;
             next
@@ -183,8 +183,8 @@ async fn write_new_object_placed_lease_expiry_is_now_plus_ttl() {
         CHUNK,
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        2_000, // now
-        7_000, // ttl
+        || 2_000, // now
+        7_000,    // ttl
         || {
             next += 1;
             next

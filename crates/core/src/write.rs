@@ -244,12 +244,20 @@ pub async fn write_fragments(chunks: &impl PlacementChunkStore, plan: &WritePlan
 
 /// Phase 3 — Commit (new file): atomically create the inode (state `COMMITTED`,
 /// the chunk map, version 1) and its dirent. `Conflict` if the name exists.
+///
+/// The create is **lease-conditional** (issue #490): it publishes only if every chunk in the
+/// plan still holds a live, unexpired `pending:<id>` lease at `now_millis` — enforced in the
+/// same atomic batch as the create, so a commit that outran its leases (a stall past the TTL,
+/// or a lease a racing sweep reclaimed) fails closed with `Conflict` rather than publishing an
+/// object over fragments the custodian GC is free to reclaim. `now_millis` is the commit's own
+/// logical instant (the caller's clock at the commit point). See [`metadata::create_leased`].
 pub async fn commit_create(
     meta: &impl MetadataStore,
     parent: InodeId,
     name: &str,
     inode_id: InodeId,
     plan: &WritePlan,
+    now_millis: u64,
 ) -> Result<CommitOutcome> {
     let record = InodeRecord {
         size: plan.size,
@@ -257,7 +265,16 @@ pub async fn commit_create(
         state: InodeState::Committed,
         version: 1,
     };
-    metadata::create(meta, parent, name, inode_id, &record).await
+    metadata::create_leased(
+        meta,
+        parent,
+        name,
+        inode_id,
+        &record,
+        &plan.chunk_ids(),
+        now_millis,
+    )
+    .await
 }
 
 /// Phase 3 — Commit (overwrite): CAS the inode's chunk map + size onto `prior`,
@@ -267,7 +284,15 @@ pub async fn commit_create(
 /// in the *same atomic commit* (`orphaned_at` stamps the grace record) — the custodian GC
 /// reclaims them after the reader-safe grace window, so an overwrite neither leaks the old
 /// bytes (issue #364, PUT-overwrite reclaim) nor tears a concurrent reader of the prior
-/// version. See [`metadata::commit_chunk_map_superseding`].
+/// version. See [`metadata::commit_chunk_map_superseding_leased`].
+///
+/// The overwrite is **lease-conditional** (issue #490): it publishes the new chunk map only if
+/// every chunk in the plan still holds a live, unexpired `pending:<id>` lease — enforced in the
+/// same atomic batch as the CAS, so a commit that outran its leases (a stall past the TTL, or a
+/// lease a racing sweep reclaimed) fails closed with `Conflict` rather than publishing over
+/// fragments the custodian GC is free to reclaim. `orphaned_at_millis` **is** the commit's own
+/// logical instant, so it doubles as the `now` the lease check is evaluated against (obligation
+/// (e), issue #490); its one production caller passes `now_millis()` (`server/src/lib.rs:184`).
 pub async fn commit_overwrite(
     meta: &impl MetadataStore,
     inode_id: InodeId,
@@ -275,12 +300,14 @@ pub async fn commit_overwrite(
     plan: &WritePlan,
     orphaned_at_millis: u64,
 ) -> Result<CommitOutcome> {
-    metadata::commit_chunk_map_superseding(
+    metadata::commit_chunk_map_superseding_leased(
         meta,
         inode_id,
         prior,
         plan.chunk_refs(),
         plan.size,
+        orphaned_at_millis,
+        &plan.chunk_ids(),
         orphaned_at_millis,
     )
     .await
@@ -292,10 +319,15 @@ pub async fn release(meta: &impl MetadataStore, plan: &WritePlan) -> Result<()> 
     Ok(())
 }
 
-/// Write a brand-new object end to end (the four phases in order). `now_millis`
-/// stamps the lease and `lease_ttl_millis` is its lifetime. The ledger is
-/// released only on a winning commit; a losing commit leaves leased garbage for
-/// the sweep.
+/// Write a brand-new object end to end (the four phases in order). `now_fn` is the
+/// caller's clock (a closure, exactly as [`stream_write_data`] takes one): it is read
+/// once to stamp the lease (expiring `lease_ttl_millis` later) and read AGAIN at the
+/// commit point, so the lease-conditional create (issue #490) is evaluated against the
+/// commit's own instant. A single fixed instant would make the guard a tautology —
+/// `lease_expiry = t + ttl` compared against the same `t` can never read as lapsed, no
+/// matter how long the data phase or the caller stalled, and the helper would publish
+/// over bytes the custodian GC is already free to reclaim. The ledger is released only
+/// on a winning commit; a losing commit leaves leased garbage for the sweep.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_new_object(
     meta: &impl MetadataStore,
@@ -306,14 +338,14 @@ pub async fn write_new_object(
     data: &[u8],
     chunk_size: usize,
     scheme: EcScheme,
-    now_millis: u64,
+    mut now_fn: impl FnMut() -> u64,
     lease_ttl_millis: u64,
     next_id: impl FnMut() -> ChunkId,
 ) -> Result<CommitOutcome> {
     let plan = plan_write(data, chunk_size, scheme, next_id)?;
-    intent(meta, &plan, now_millis + lease_ttl_millis).await?;
+    intent(meta, &plan, now_fn() + lease_ttl_millis).await?;
     write_fragments(chunks, &plan).await?;
-    let outcome = commit_create(meta, parent, name, inode_id, &plan).await?;
+    let outcome = commit_create(meta, parent, name, inode_id, &plan, now_fn()).await?;
     if outcome == CommitOutcome::Committed {
         release(meta, &plan).await?;
     }
@@ -329,6 +361,9 @@ pub async fn write_new_object(
 /// (`0005:510-513`). Errors with the selector's [`SelectorError`] (surfaced through
 /// the boxed `Result`) when the topology offers fewer than `n` distinct domains —
 /// the write fails closed rather than collide domains.
+///
+/// `now_fn` is read twice — lease stamp, then commit instant — for the same
+/// lease-liveness reason as [`write_new_object`].
 #[allow(clippy::too_many_arguments)]
 pub async fn write_new_object_placed(
     meta: &impl MetadataStore,
@@ -340,15 +375,15 @@ pub async fn write_new_object_placed(
     chunk_size: usize,
     scheme: EcScheme,
     topology: &Topology,
-    now_millis: u64,
+    mut now_fn: impl FnMut() -> u64,
     lease_ttl_millis: u64,
     next_id: impl FnMut() -> ChunkId,
 ) -> Result<CommitOutcome> {
     let mut plan = plan_write(data, chunk_size, scheme, next_id)?;
     plan.place(topology)?;
-    intent(meta, &plan, now_millis + lease_ttl_millis).await?;
+    intent(meta, &plan, now_fn() + lease_ttl_millis).await?;
     write_fragments(chunks, &plan).await?;
-    let outcome = commit_create(meta, parent, name, inode_id, &plan).await?;
+    let outcome = commit_create(meta, parent, name, inode_id, &plan, now_fn()).await?;
     if outcome == CommitOutcome::Committed {
         release(meta, &plan).await?;
     }
@@ -429,14 +464,25 @@ async fn lease_write_chunk(
     renew_at: &mut u64,
 ) -> Result<PlannedChunk> {
     if !leased.is_empty() && now_millis >= *renew_at {
-        metadata::renew_pending(
+        // Renewal is CONDITIONAL: it refuses (Conflict) if an in-flight lease was swept or has
+        // already lapsed. A lapsed lease is dead — resurrecting it would let this upload commit
+        // an inode over fragments the GC is free to reclaim (issue #490). Abort the upload
+        // BEFORE the next chunk is written toward commit, rather than publish missing fragments.
+        let outcome = metadata::renew_pending(
             meta,
             leased,
+            now_millis,
             &PendingEntry {
                 lease_expiry_millis: now_millis + lease_ttl_millis,
             },
         )
         .await?;
+        if outcome != CommitOutcome::Committed {
+            return Err(WriteError::LeaseLapsed {
+                chunks: leased.clone(),
+            }
+            .into());
+        }
         *renew_at = now_millis + lease_ttl_millis / 2;
     }
     let planned = intent_and_write_chunk(
@@ -590,3 +636,36 @@ fn parse_pending_key(key: &[u8]) -> Option<ChunkId> {
         .parse()
         .ok()
 }
+
+/// Errors specific to the write path; surfaced through the trait's boxed error.
+#[derive(Debug)]
+pub enum WriteError {
+    /// A streaming upload's in-flight pending lease could not be **renewed** because it had
+    /// already lapsed — swept out from under the upload, or expired past its recorded deadline
+    /// (issue #490). A lapsed lease is dead authority; renewing it would resurrect protection
+    /// the custodian sweep already revoked and let the upload commit an inode over fragments the
+    /// GC is free to reclaim. The upload is aborted before its next chunk is written toward
+    /// commit, so nothing is published.
+    LeaseLapsed {
+        /// The in-flight chunk ids whose leases the renewal could not extend.
+        chunks: Vec<ChunkId>,
+    },
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::LeaseLapsed { chunks } => {
+                write!(
+                    f,
+                    "streaming upload aborted: an in-flight pending lease lapsed and could not \
+                     be renewed ({} in-flight chunk(s)); refusing to resurrect a swept lease and \
+                     publish missing fragments",
+                    chunks.len()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}

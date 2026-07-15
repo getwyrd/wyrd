@@ -155,7 +155,7 @@ fn write_records_placement_read_resolves_after_reopen() {
                 &payload,
                 CHUNK,
                 RS,
-                0,
+                || 0,
                 10_000,
                 || {
                     next += 1;

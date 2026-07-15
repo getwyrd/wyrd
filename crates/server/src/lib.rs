@@ -190,7 +190,7 @@ where
                 // so two active-active gateways seeded from the same baseline mint DISTINCT
                 // inodes and the create CAS resolves any dirent race cleanly (issue #477).
                 let inode_id = crate::cli::alloc_inode(&self.meta).await?;
-                write::commit_create(&self.meta, ROOT, key, inode_id, plan).await?
+                write::commit_create(&self.meta, ROOT, key, inode_id, plan, now_millis()).await?
             }
         };
         match outcome {

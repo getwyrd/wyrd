@@ -120,7 +120,7 @@ async fn rs_write_fans_out_to_distinct_d_servers_and_commits() {
         data,
         CHUNK,
         RS,
-        NOW,
+        || NOW,
         TTL,
         ids_from(0x10),
     )
@@ -182,7 +182,7 @@ async fn partial_fan_out_fails_closed_over_the_wire() {
         b"first object",
         CHUNK,
         RS,
-        NOW,
+        || NOW,
         TTL,
         ids_from(0x10),
     )
@@ -205,7 +205,7 @@ async fn partial_fan_out_fails_closed_over_the_wire() {
         b"second object",
         CHUNK,
         RS,
-        NOW,
+        || NOW,
         TTL,
         ids_from(0x20),
     )
