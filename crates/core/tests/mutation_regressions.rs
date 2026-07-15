@@ -11,7 +11,6 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use wyrd_chunk_format::{encode, FragmentHeader};
 use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
@@ -101,14 +100,6 @@ impl PlacementChunkStore for MemChunks {}
 
 // ---- helpers ----
 
-/// Wrap a shard's bytes in a valid, self-describing v1 fragment for `chunk`.
-fn fragment(chunk: ChunkId, payload: &[u8]) -> Bytes {
-    Bytes::from(encode(
-        &FragmentHeader::new_v1(chunk, payload.len() as u64),
-        payload,
-    ))
-}
-
 /// Commit a single-chunk inode into the metadata store.
 async fn commit_inode(meta: &MemMeta, inode: InodeId, chunk: ChunkRef, size: u64) {
     let record = InodeRecord {
@@ -141,7 +132,7 @@ async fn write_new_object_releases_pending_on_commit() {
         b"a freshly written object",
         CHUNK,
         EcScheme::ReedSolomon { k: 2, m: 1 },
-        1_000,
+        || 1_000,
         5_000,
         || {
             next += 1;
@@ -182,7 +173,7 @@ async fn write_new_object_placed_releases_pending_on_commit() {
         CHUNK,
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        1_000,
+        || 1_000,
         5_000,
         || {
             next += 1;
@@ -261,14 +252,16 @@ async fn read_with_fewer_than_k_fragments_reports_insufficient() {
     let shards = erasure::encode(k as usize, m as usize, data).unwrap();
     let chunk_id: ChunkId = 0xF11D;
 
-    // Store only ONE fragment (k - 1 = 1, fewer than k): unreconstructible.
+    // Store only ONE fragment (k - 1 = 1, fewer than k): unreconstructible. Stamp its
+    // FULL RS header identity (`encode_ec_fragment`) so the read path's full-identity
+    // check admits it — the point under test is the below-`k` guard, not identity.
     chunks
         .put_fragment(
             FragmentId {
                 chunk: chunk_id,
                 index: 0,
             },
-            fragment(chunk_id, &shards[0]),
+            write::encode_ec_fragment(chunk_id, 0, k, m, &shards[0]),
         )
         .await
         .unwrap();

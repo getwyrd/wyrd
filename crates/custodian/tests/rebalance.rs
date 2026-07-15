@@ -276,7 +276,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -431,7 +431,8 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
                 .await
                 .unwrap()
                 .expect("moved fragment present"),
-            CHUNK
+            frag(0),
+            EcScheme::None
         ),
         "the evacuated fragment verifies its checksum at its new home (server 1)"
     );
@@ -579,7 +580,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
         data.len(),
         EcScheme::ReedSolomon { k: 6, m: 3 },
         topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -674,7 +675,8 @@ async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() 
                 .await
                 .unwrap()
                 .expect("moved fragment present"),
-            CHUNK
+            frag(4),
+            EcScheme::ReedSolomon { k: 6, m: 3 }
         ),
         "the evacuated fragment verifies its checksum at its new home (server 9)"
     );
@@ -772,7 +774,8 @@ async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_
                 .await
                 .unwrap()
                 .expect("moved fragment present"),
-            CHUNK
+            frag(1),
+            EcScheme::ReedSolomon { k: 2, m: 1 }
         ),
         "the evacuated fragment verifies its checksum at its new home (server 3)"
     );
@@ -818,7 +821,7 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -1021,7 +1024,8 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
                 .await
                 .unwrap()
                 .expect("moved fragment 0 present"),
-            CHUNK
+            frag(0),
+            EcScheme::ReedSolomon { k: 2, m: 1 }
         ),
         "evacuated fragment 0 verifies at its new home (server 3)"
     );
@@ -1031,7 +1035,8 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
                 .await
                 .unwrap()
                 .expect("moved fragment 1 present"),
-            CHUNK
+            frag(1),
+            EcScheme::ReedSolomon { k: 2, m: 1 }
         ),
         "evacuated fragment 1 verifies at its new home (server 4)"
     );
@@ -1158,7 +1163,7 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )

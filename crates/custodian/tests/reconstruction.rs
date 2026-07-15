@@ -264,7 +264,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -380,7 +380,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
             .unwrap()
             .expect("fragment present after repair");
         assert!(
-            repair::fragment_intact(&bytes, CHUNK),
+            repair::fragment_intact(&bytes, frag(index), EcScheme::ReedSolomon { k: 2, m: 1 }),
             "fragment {index} verifies its checksum and belongs to the chunk"
         );
     }
@@ -455,7 +455,7 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
     // into the chunk — it was rebuilt from the survivors).
     let rebuilt = d1.get_fragment(frag(1)).await.unwrap().unwrap();
     assert!(
-        repair::fragment_intact(&rebuilt, CHUNK),
+        repair::fragment_intact(&rebuilt, frag(1), EcScheme::ReedSolomon { k: 2, m: 1 }),
         "the rebuilt fragment verifies its checksum"
     );
     assert_eq!(
@@ -881,7 +881,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
         data.len(),
         EcScheme::ReedSolomon { k: 6, m: 3 },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -1152,7 +1152,7 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
         .unwrap()
         .expect("the rebuilt fragment is present on its new server");
     assert!(
-        repair::fragment_intact(&rebuilt, CHUNK),
+        repair::fragment_intact(&rebuilt, frag(1), EcScheme::ReedSolomon { k: 2, m: 1 }),
         "the rebuilt fragment verifies its checksum and belongs to the chunk"
     );
 }
@@ -1371,7 +1371,7 @@ async fn write_rs_2_1_as(
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || chunk_id,
     )

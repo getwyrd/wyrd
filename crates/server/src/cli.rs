@@ -511,7 +511,13 @@ async fn local_store_put<M: MetadataStore>(
         data,
         chunk_size,
         durability,
-        NOW_MILLIS,
+        // Both clock reads return the CLI's fixed logical zero, so the commit-instant
+        // lease check is inert ON THIS PATH BY DESIGN: the logical-zero stamp is a
+        // recorded, NEEDS-HUMAN-flagged deferral (see NOW_MILLIS above) whose closure
+        // (a CLI wall-clock stamp) the maintainer declined on the #554/#559 review;
+        // the residual hazard is tracked (#557). The seam itself is fixed: any caller
+        // with a real clock gets a real commit-instant check.
+        || NOW_MILLIS,
         LEASE_TTL_MILLIS,
         next_id,
     )
@@ -1631,7 +1637,13 @@ pub async fn cluster_store_put<M: MetadataStore, C: PlacementChunkStore>(
         data,
         chunk_size,
         durability,
-        NOW_MILLIS,
+        // Both clock reads return the CLI's fixed logical zero, so the commit-instant
+        // lease check is inert ON THIS PATH BY DESIGN: the logical-zero stamp is a
+        // recorded, NEEDS-HUMAN-flagged deferral (see NOW_MILLIS above) whose closure
+        // (a CLI wall-clock stamp) the maintainer declined on the #554/#559 review;
+        // the residual hazard is tracked (#557). The seam itself is fixed: any caller
+        // with a real clock gets a real commit-instant check.
+        || NOW_MILLIS,
         LEASE_TTL_MILLIS,
         next_id,
     )

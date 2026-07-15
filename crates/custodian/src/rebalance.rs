@@ -256,12 +256,14 @@ async fn evacuate_chunk(
             // The source or selector target is outside the fleet view — cannot move.
             return Ok(EvacOutcome::Aborted);
         };
-        // Only an INTACT fragment is moved. A missing / checksum-failing fragment is a
-        // loss for the reconstruction loop, not a clean drain move — never propagate it.
+        // Only an INTACT fragment is moved. A missing / checksum-failing / misplaced /
+        // misencoded fragment is a loss for the reconstruction loop, not a clean drain
+        // move — never propagate it. Verify the FULL identity (chunk id + index + the
+        // committed EC tuple) against the chunk map, not the `chunk_id` alone.
         let Some(bytes) = source_store.get_fragment(frag).await? else {
             return Ok(EvacOutcome::Aborted);
         };
-        if !repair::fragment_intact(&bytes, plan.chunk_id) {
+        if !repair::fragment_intact(&bytes, frag, plan.prior.chunk_map[plan.chunk_index].scheme) {
             return Ok(EvacOutcome::Aborted);
         }
         target_store.put_fragment(frag, bytes).await?;

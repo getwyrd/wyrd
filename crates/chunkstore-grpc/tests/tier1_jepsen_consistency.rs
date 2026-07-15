@@ -1185,7 +1185,16 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             });
         if maybe_bytes
             .as_deref()
-            .and_then(|b| repair::intact_shard(b, CHUNK))
+            .and_then(|b| {
+                repair::intact_shard(
+                    b,
+                    frag_id,
+                    EcScheme::ReedSolomon {
+                        k: K as u8,
+                        m: M as u8,
+                    },
+                )
+            })
             .is_some()
         {
             readable_servers.push(server_id);
@@ -1217,10 +1226,16 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             .unwrap_or_else(|e| {
                 panic!("get_fragment index {frag_index} from server {server_id}: {e}")
             });
-        match maybe_bytes
-            .as_deref()
-            .and_then(|b| repair::intact_shard(b, CHUNK))
-        {
+        match maybe_bytes.as_deref().and_then(|b| {
+            repair::intact_shard(
+                b,
+                frag_id,
+                EcScheme::ReedSolomon {
+                    k: K as u8,
+                    m: M as u8,
+                },
+            )
+        }) {
             Some(shard) => available.push((frag_index, shard)),
             None => missing.push((frag_index, server_id)),
         }
@@ -1694,7 +1709,16 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             });
         if maybe_bytes
             .as_deref()
-            .and_then(|b| repair::intact_shard(b, CHUNK))
+            .and_then(|b| {
+                repair::intact_shard(
+                    b,
+                    frag_id,
+                    EcScheme::ReedSolomon {
+                        k: K as u8,
+                        m: M as u8,
+                    },
+                )
+            })
             .is_some()
         {
             readable_servers.push(server_id);
@@ -1722,10 +1746,16 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             .unwrap_or_else(|e| {
                 panic!("get_fragment index {frag_index} from server {server_id}: {e}")
             });
-        match maybe_bytes
-            .as_deref()
-            .and_then(|b| repair::intact_shard(b, CHUNK))
-        {
+        match maybe_bytes.as_deref().and_then(|b| {
+            repair::intact_shard(
+                b,
+                frag_id,
+                EcScheme::ReedSolomon {
+                    k: K as u8,
+                    m: M as u8,
+                },
+            )
+        }) {
             Some(shard) => available.push((frag_index, shard)),
             None => missing.push((frag_index, server_id)),
         }

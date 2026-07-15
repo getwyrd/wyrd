@@ -190,7 +190,7 @@ fn write_records_distinct_domain_placement_not_identity() {
             CHUNK,
             RS,
             &topo,
-            0,
+            || 0,
             10_000,
             || {
                 next += 1;

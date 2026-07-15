@@ -47,7 +47,7 @@ fn committed_file_reads_back_byte_identical() {
                 data,
                 CHUNK,
                 EcScheme::None,
-                NOW,
+                || NOW,
                 TTL,
                 ids_from(base),
             )
@@ -80,7 +80,7 @@ fn reader_sees_old_or_new_version_never_a_hybrid() {
             b"version one is here",
             CHUNK,
             EcScheme::None,
-            NOW,
+            || NOW,
             TTL,
             ids_from(0x100),
         )
@@ -136,7 +136,7 @@ fn checksum_mismatch_surfaces_as_an_error() {
             b"important data, do not corrupt",
             CHUNK,
             EcScheme::None,
-            NOW,
+            || NOW,
             TTL,
             ids_from(0x40),
         )

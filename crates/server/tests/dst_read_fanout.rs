@@ -246,7 +246,7 @@ async fn put(
             data,
             CHUNK,
             scheme,
-            NOW,
+            || NOW,
             TTL,
             ids_from(base),
         )

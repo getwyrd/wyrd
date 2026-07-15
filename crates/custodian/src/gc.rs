@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 // `crate::gc::orphan_key` unchanged.
 pub(crate) use wyrd_core::metadata::orphan_key;
 use wyrd_core::metadata::{
-    self, parse_orphan_key, InodeRecord, InodeState, MalformedPlacement, PendingEntry,
+    self, parse_orphan_key, EcScheme, InodeRecord, InodeState, MalformedPlacement, PendingEntry,
     ORPHAN_PREFIX,
 };
 use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
@@ -230,6 +230,12 @@ pub(crate) struct ReferenceSet {
     pub placed: HashSet<(DServerId, FragmentId)>,
     /// Chunk ids whose committed placement is malformed, each with its classification.
     pub malformed: HashMap<ChunkId, MalformedPlacement>,
+    /// The committed [`EcScheme`] of each validly-placed chunk, so a consumer verifying a
+    /// referenced fragment against the chunk map can check its header's FULL identity —
+    /// `ec_fragment_index` and the EC tuple, not the `chunk_id` alone
+    /// (`wyrd_core::repair::header_matches_identity`, the scrub/verify contract
+    /// `0005:262-267`).
+    pub schemes: HashMap<ChunkId, EcScheme>,
 }
 
 impl ReferenceSet {
@@ -245,6 +251,7 @@ impl ReferenceSet {
 pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<ReferenceSet> {
     let mut placed = HashSet::new();
     let mut malformed = HashMap::new();
+    let mut schemes = HashMap::new();
     for (_key, value) in meta.scan(b"inode:").await? {
         let record: InodeRecord = metadata::decode(&value)?;
         if record.state != InodeState::Committed {
@@ -271,6 +278,10 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
                             },
                         ));
                     }
+                    // Record the committed scheme so scrub can verify each referenced
+                    // fragment's full identity (index + EC tuple) against the chunk map,
+                    // not its `chunk_id` alone.
+                    schemes.insert(chunk.id, chunk.scheme);
                 }
                 Err(m) => {
                     malformed.insert(chunk.id, m);
@@ -278,7 +289,11 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
             }
         }
     }
-    Ok(ReferenceSet { placed, malformed })
+    Ok(ReferenceSet {
+        placed,
+        malformed,
+        schemes,
+    })
 }
 
 /// The chunk ids whose pending-ledger lease has expired as of `now_millis`.

@@ -326,7 +326,7 @@ async fn write_rs_2_1_as(
         data.len(),
         EcScheme::ReedSolomon { k: 2, m: 1 },
         &topo,
-        0,
+        || 0,
         1_000,
         || chunk_id,
     )

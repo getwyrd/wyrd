@@ -64,18 +64,22 @@ pub async fn read_object_from(
     // [`read_path`]) thread the store and feed the queue. Findings are still
     // computed (and dropped) here so this path's behaviour is otherwise unchanged.
     let mut corrupt = Vec::new();
-    read_object_collecting(chunks, inode, &mut corrupt).await
+    let mut block_fault = Vec::new();
+    read_object_collecting(chunks, inode, &mut corrupt, &mut block_fault).await
 }
 
 /// Reassemble an object's bytes, **collecting** the ids of chunks whose read had to
-/// exclude a checksum-failing fragment, so the caller can enqueue them for repair on
-/// the shared queue (`0005:174-176`). `corrupt` is appended to as the read proceeds —
-/// it carries the findings even when the read ultimately fails (a chunk below `k`
-/// survivors is still a durable repair obligation).
+/// exclude a checksum-failing fragment (`corrupt`) or a permanent block-layer read
+/// fault (`block_fault`), so the caller can enqueue them for repair on the shared
+/// queue (`0005:174-176`) with the appropriate `detected_by` reason. Both vecs are
+/// appended to as the read proceeds — they carry the findings even when the read
+/// ultimately fails (a chunk below `k` survivors is still a durable repair
+/// obligation).
 async fn read_object_collecting(
     chunks: &impl PlacementChunkStore,
     inode: &InodeRecord,
     corrupt: &mut Vec<ChunkId>,
+    block_fault: &mut Vec<ChunkId>,
 ) -> Result<Vec<u8>> {
     // `inode.size` is untrusted metadata (arbitrary `u64` from stored JSON, ADR-0002)
     // and must not size an allocation before that many bytes are actually backed by
@@ -86,7 +90,7 @@ async fn read_object_collecting(
     // size-proportional (or overflowing) allocation.
     let mut bytes = Vec::new();
     for chunk in &inode.chunk_map {
-        bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt).await?);
+        bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt, block_fault).await?);
     }
     if bytes.len() as u64 != inode.size {
         return Err(ReadError::SizeMismatch {
@@ -143,6 +147,13 @@ enum FaultClass {
     /// A verifying store surfaced corruption as a typed [`wyrd_traits::IntegrityFault`]
     /// instead of handing back bad bytes.
     IntegrityFault,
+    /// A permanent block-layer read fault (`wyrd_traits::is_block_read_fault` — a dead
+    /// sector / `dm-error`, or the seam type a networked backend reconstructs for one).
+    /// The device physically cannot return the bytes — retrying the same fetch cannot
+    /// help (`wyrd_traits::BlockReadFault`, `traits/src/lib.rs:164-199`) — but the bytes
+    /// were never even read, so this is **not** a checksum-corruption finding: it must
+    /// not bump the corruption counters, only its own.
+    BlockFault,
     /// Unreachable, timed out, or an RPC error — the D-server may be perfectly healthy a
     /// second later. **Not** a corruption finding.
     Transient,
@@ -155,6 +166,7 @@ impl FaultClass {
             Self::Misplaced => "misplaced",
             Self::Absent => "absent",
             Self::IntegrityFault => "integrity-fault",
+            Self::BlockFault => "block-fault",
             Self::Transient => "transient",
         }
     }
@@ -182,6 +194,9 @@ fn emit_fragment_fault(
         FaultClass::IntegrityFault => {
             tracing::warn!(monotonic_counter.read_fragment_integrity_fault = 1_u64)
         }
+        FaultClass::BlockFault => {
+            tracing::warn!(monotonic_counter.read_fragment_block_fault = 1_u64)
+        }
         FaultClass::Transient => tracing::warn!(monotonic_counter.read_fragment_transient = 1_u64),
     }
     tracing::warn!(
@@ -200,6 +215,7 @@ async fn read_chunk(
     chunks: &impl PlacementChunkStore,
     chunk: &ChunkRef,
     corrupt: &mut Vec<ChunkId>,
+    block_fault: &mut Vec<ChunkId>,
 ) -> Result<Vec<u8>> {
     match chunk.scheme {
         EcScheme::None => {
@@ -222,23 +238,44 @@ async fn read_chunk(
                     corrupt.push(chunk.id);
                     return Err(e);
                 }
-                // A transient / non-integrity error: propagate it so the caller's
-                // retry policy decides — do NOT record as a corruption finding.
+                // A permanent block-layer read fault (`wyrd_traits::is_block_read_fault`,
+                // `traits/src/lib.rs:339`). With no redundancy there is nothing to read
+                // around, so the read itself must fail — but the damage is exactly as
+                // permanent as in the RS arm below: record the chunk as a durable repair
+                // obligation before surfacing the error, mirroring the integrity-fault
+                // arm above, so reconstruction still receives the queued obligation and
+                // can surface the chunk as unrepairable rather than the damage being
+                // forgotten with the failed read.
+                Err(e) if wyrd_traits::is_block_read_fault(e.as_ref()) => {
+                    block_fault.push(chunk.id);
+                    return Err(e);
+                }
+                // A transient / non-integrity, non-block-fault error: propagate it so
+                // the caller's retry policy decides — do NOT record as a corruption
+                // finding.
                 Err(e) => return Err(e),
             };
             match decode(&fragment) {
-                // Admit the fragment only if it decodes cleanly AND its header names
-                // the chunk being read — the same gate the shared verify enforces
-                // (`repair::fragment_intact`, `repair.rs`). This is the inline decode
-                // that verify is documented to mirror (`0005:262-267`, `0005:174-176`).
-                Ok(decoded) if decoded.header.chunk_id == chunk.id => Ok(decoded.payload),
+                // Admit the fragment only if it decodes cleanly AND its header proves
+                // the FULL identity the chunk map expects — chunk id, ec_fragment_index,
+                // and the EC tuple — the same gate the shared verify enforces
+                // (`repair::header_matches_identity` / `repair::fragment_intact`,
+                // `repair.rs`). This is the inline decode that verify mirrors
+                // (`0005:262-267`, `0005:174-176`).
+                Ok(decoded)
+                    if repair::header_matches_identity(&decoded.header, frag_id, chunk.scheme) =>
+                {
+                    Ok(decoded.payload)
+                }
                 Ok(_) => {
-                    // A misplaced-but-intact single fragment: it decodes cleanly but
-                    // its header names a DIFFERENT chunk (a misrouted / placement-
-                    // confused fragment). Never return its foreign bytes as this
-                    // chunk; record the chunk as a durable repair obligation and
-                    // surface a missing-fragment error — this chunk has no usable
-                    // fragment here, exactly as scrub/reconstruction exclude it.
+                    // A misplaced / misencoded single fragment: it decodes cleanly but
+                    // its header does not prove the requested identity (a DIFFERENT
+                    // chunk id, a wrong ec_fragment_index, or an EC tuple disagreeing
+                    // with the committed scheme — a misrouted / placement-confused
+                    // fragment). Never return its foreign bytes as this chunk; record
+                    // the chunk as a durable repair obligation and surface a
+                    // missing-fragment error — this chunk has no usable fragment here,
+                    // exactly as scrub/reconstruction exclude it.
                     corrupt.push(chunk.id);
                     Err(ReadError::MissingFragment { chunk_id: chunk.id }.into())
                 }
@@ -312,11 +349,20 @@ async fn read_chunk(
                     Ok(Some(fragment)) => {
                         match decode(&fragment) {
                             // Admit a survivor only if it decodes cleanly AND its header
-                            // names this chunk — the same gate `repair::intact_shard`
-                            // applies in reconstruction (`0005:262-267`). A misplaced-but-
-                            // intact fragment (valid checksum, foreign `chunk_id`) is
-                            // excluded from the decoder, never fed as a shard at `index`.
-                            Ok(decoded) if decoded.header.chunk_id == chunk.id => {
+                            // proves the FULL identity this slot expects — chunk id,
+                            // ec_fragment_index, and the EC tuple — the same gate
+                            // `repair::intact_shard` applies in reconstruction
+                            // (`0005:262-267`). A valid same-chunk shard for the WRONG
+                            // index, or one whose EC tuple disagrees with the committed
+                            // scheme, is excluded from the decoder — NEVER fed as a shard
+                            // at `index`, where it would be wrong reconstruction input.
+                            Ok(decoded)
+                                if repair::header_matches_identity(
+                                    &decoded.header,
+                                    frag,
+                                    chunk.scheme,
+                                ) =>
+                            {
                                 shards.push((index as usize, decoded.payload));
                                 if shards.len() == k {
                                     // `k` verified: drop the outstanding fetches, which
@@ -325,18 +371,25 @@ async fn read_chunk(
                                 }
                             }
                             // A present fragment that fails its checksum (decode `Err`) or
-                            // names a different chunk (misplaced) is bit rot / a misrouted
-                            // fragment: excluded from the decoder (read around) AND its
-                            // chunk recorded as a repair obligation, never silently
-                            // absorbed (`0005:174-176`, `0005:262-264`).
+                            // whose header does not prove the requested identity (foreign
+                            // `chunk_id`, wrong `ec_fragment_index`, or a disagreeing EC
+                            // tuple) is bit rot / a misplaced / misencoded fragment:
+                            // excluded from the decoder (read around) AND its chunk
+                            // recorded as a repair obligation, never silently absorbed
+                            // (`0005:174-176`, `0005:262-264`).
                             Ok(decoded) => {
                                 emit_fragment_fault(
                                     FaultClass::Misplaced,
                                     dserver,
                                     frag,
                                     format_args!(
-                                        "fragment decodes but its header names chunk {}",
-                                        wyrd_traits::chunk_hex(decoded.header.chunk_id)
+                                        "fragment decodes but its header identity \
+                                         (chunk {}, index {}) does not match the requested \
+                                         chunk {} index {}",
+                                        wyrd_traits::chunk_hex(decoded.header.chunk_id),
+                                        decoded.header.ec_fragment_index,
+                                        wyrd_traits::chunk_hex(chunk.id),
+                                        index,
                                     ),
                                 );
                                 corrupt.push(chunk.id);
@@ -363,9 +416,27 @@ async fn read_chunk(
                         emit_fragment_fault(FaultClass::IntegrityFault, dserver, frag, &e);
                         corrupt.push(chunk.id);
                     }
-                    // A transient / non-integrity error: read around (treat as absent) — do
-                    // NOT record as a corruption finding (reclassifying non-integrity errors
-                    // is out of scope, and #431 owns the block-fault repair question).
+                    // A permanent block-layer read fault (`wyrd_traits::is_block_read_fault`,
+                    // `traits/src/lib.rs:339` — the single decision point for the closure of
+                    // "durable block damage", not re-derived here). `BlockReadFault` is
+                    // documented PERMANENT: the device physically could not return the bytes,
+                    // so retrying the same fetch cannot help (`traits/src/lib.rs:164-199`) —
+                    // and the custodian already classifies it as a permanent read fault on the
+                    // rebuild side (`custodian/src/reconstruction.rs:475`). #431 closes the
+                    // gap on the FOREGROUND side: read around it (never fed to the decoder,
+                    // same as every other excluded shard) AND land it on the SAME shared
+                    // repair queue scrub feeds (`0005:174-176`), with a distinct
+                    // `detected_by` reason so the durability audit trail can tell a dead
+                    // sector from a checksum failure. It is never bad bytes — nothing was
+                    // even read — so it must NOT bump the corruption-specific counters
+                    // (`FaultClass::Corrupt` / `IntegrityFault`); it gets its own.
+                    Err(e) if wyrd_traits::is_block_read_fault(e.as_ref()) => {
+                        emit_fragment_fault(FaultClass::BlockFault, dserver, frag, &e);
+                        block_fault.push(chunk.id);
+                    }
+                    // A transient / non-integrity, non-block-fault error: read around (treat
+                    // as absent) — do NOT record as a corruption finding (reclassifying any
+                    // OTHER non-integrity error, e.g. timeouts/unavailable, is out of scope).
                     //
                     // But SAY SO. This arm was `Err(_) => {}`: a D-server that is up but
                     // failing, timing out, or returning `Rpc(Status::internal(..))` on every
@@ -420,16 +491,25 @@ pub async fn read_object(
         return Ok(None);
     }
     // Read the object, collecting any chunk whose read excluded a checksum-failing
-    // fragment, then enqueue each onto the SAME repair queue scrub feeds
-    // (`0005:174-176`) — whether or not the read itself recovered. The enqueue runs
-    // before the read result is surfaced, so a read that fails below `k` survivors
-    // still leaves a durable repair obligation behind.
+    // fragment or a permanent block-layer read fault, then enqueue each onto the SAME
+    // repair queue scrub feeds (`0005:174-176`) — whether or not the read itself
+    // recovered. The enqueue runs before the read result is surfaced, so a read that
+    // fails below `k` survivors still leaves a durable repair obligation behind. The
+    // two findings are recorded with DIFFERENT `detected_by` reasons — block damage is
+    // not checksum corruption (`traits/src/lib.rs:164-199`) — but land on the same
+    // queue either way.
     let mut corrupt = Vec::new();
-    let result = read_object_collecting(chunks, &inode, &mut corrupt).await;
+    let mut block_fault = Vec::new();
+    let result = read_object_collecting(chunks, &inode, &mut corrupt, &mut block_fault).await;
     corrupt.sort_unstable();
     corrupt.dedup();
     for chunk in corrupt {
         repair::enqueue_repair(meta, chunk, "read").await?;
+    }
+    block_fault.sort_unstable();
+    block_fault.dedup();
+    for chunk in block_fault {
+        repair::enqueue_repair(meta, chunk, "read-block-fault").await?;
     }
     Ok(Some(result?))
 }
@@ -470,11 +550,17 @@ pub async fn read_chunk_verified(
     chunk: &ChunkRef,
 ) -> Result<Bytes> {
     let mut corrupt = Vec::new();
-    let result = read_chunk(chunks, chunk, &mut corrupt).await;
+    let mut block_fault = Vec::new();
+    let result = read_chunk(chunks, chunk, &mut corrupt, &mut block_fault).await;
     corrupt.sort_unstable();
     corrupt.dedup();
     for chunk_id in corrupt {
         repair::enqueue_repair(meta, chunk_id, "read").await?;
+    }
+    block_fault.sort_unstable();
+    block_fault.dedup();
+    for chunk_id in block_fault {
+        repair::enqueue_repair(meta, chunk_id, "read-block-fault").await?;
     }
     Ok(Bytes::from(result?))
 }
@@ -689,8 +775,14 @@ mod tests {
             placement: Vec::new(),
         };
         let mut corrupt = Vec::new();
-        let err = pollster::block_on(read_chunk(&EmptyChunks, &chunk, &mut corrupt))
-            .expect_err("a k == 0 stored scheme must be a typed error, not a panic");
+        let mut block_fault = Vec::new();
+        let err = pollster::block_on(read_chunk(
+            &EmptyChunks,
+            &chunk,
+            &mut corrupt,
+            &mut block_fault,
+        ))
+        .expect_err("a k == 0 stored scheme must be a typed error, not a panic");
         let read_err = err
             .downcast_ref::<ReadError>()
             .expect("expected a wyrd_core::read::ReadError");
@@ -729,8 +821,14 @@ mod tests {
             placement: Vec::new(),
         };
         let mut corrupt = Vec::new();
-        let err = pollster::block_on(read_chunk(&EmptyChunks, &chunk, &mut corrupt))
-            .expect_err("an m == 0 stored scheme must be a typed error, not silently accepted");
+        let mut block_fault = Vec::new();
+        let err = pollster::block_on(read_chunk(
+            &EmptyChunks,
+            &chunk,
+            &mut corrupt,
+            &mut block_fault,
+        ))
+        .expect_err("an m == 0 stored scheme must be a typed error, not silently accepted");
         let read_err = err
             .downcast_ref::<ReadError>()
             .expect("expected a wyrd_core::read::ReadError");

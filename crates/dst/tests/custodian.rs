@@ -481,7 +481,7 @@ async fn write_rs_2_1(meta: &impl MetadataStore, fleet: &Fleet<'_>) -> Vec<u8> {
             m: M as u8,
         },
         &topo,
-        0,
+        || 0,
         1_000,
         || CHUNK,
     )
@@ -530,7 +530,14 @@ async fn assert_full_redundancy(record: &InodeRecord, d: &[MemDServer; 4]) {
             .unwrap()
             .expect("fragment present after repair");
         assert!(
-            repair::fragment_intact(&bytes, CHUNK),
+            repair::fragment_intact(
+                &bytes,
+                frag(index as u16),
+                EcScheme::ReedSolomon {
+                    k: K as u8,
+                    m: M as u8
+                }
+            ),
             "fragment {index} verifies its checksum and belongs to the chunk"
         );
         domains.insert(domain_letter(server));
@@ -766,7 +773,14 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
         .unwrap()
         .unwrap();
     assert!(
-        repair::fragment_intact(&rebuilt, CHUNK),
+        repair::fragment_intact(
+            &rebuilt,
+            frag(victim),
+            EcScheme::ReedSolomon {
+                k: K as u8,
+                m: M as u8
+            }
+        ),
         "the rebuilt fragment verifies its checksum (the corrupt shard was never decoded)"
     );
     let record = read_inode(&meta).await;
