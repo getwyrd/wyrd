@@ -22,8 +22,8 @@ use tracing_subscriber::prelude::*;
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
 use wyrd_custodian::{
-    mark_orphaned, reconcile_step, Custodian, DurabilityTelemetry, ExporterConfig, FencedZone,
-    GcContext, Reconciled,
+    mark_orphaned, reconcile_step, Custodian, DurabilityTelemetry, ExpiredPendingPolicy,
+    ExporterConfig, FencedZone, GcContext, Reconciled,
 };
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
@@ -198,6 +198,7 @@ async fn emits_gc_actions_on_the_durability_seam() {
         meta: &meta,
         fleet: &fleet,
         grace_window_millis: 10,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
     // Wire the backend-agnostic durability seam (ADR-0012) and run GC under it.

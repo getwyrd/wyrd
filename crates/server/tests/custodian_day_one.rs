@@ -59,7 +59,9 @@ use wyrd_core::metadata::{self, EcScheme, InodeId, InodeRecord};
 use wyrd_core::placement::Topology;
 use wyrd_core::repair;
 use wyrd_core::write::write_new_object_placed;
-use wyrd_custodian::{Custodian, FencedZone, ReconcileError, Reconciled, ReconstructionContext};
+use wyrd_custodian::{
+    Custodian, ExpiredPendingPolicy, FencedZone, ReconcileError, Reconciled, ReconstructionContext,
+};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_server::cli::{
     require_aligned_topology, run_reconstruction_over_backend, MetadataBackend,
@@ -1054,6 +1056,8 @@ async fn run_loop_survives_a_dead_dserver_and_keeps_running() {
             &custodian,
             &meta,
             &servers,
+            servers.len(),
+            ExpiredPendingPolicy::Defer,
             Duration::from_millis(10),
             clock,
             shutdown,
@@ -1119,6 +1123,8 @@ async fn run_loop_logs_and_continues_on_a_store_fault() {
             &custodian,
             &meta,
             &servers,
+            servers.len(),
+            ExpiredPendingPolicy::Defer,
             Duration::from_millis(10),
             || 500,
             shutdown,
@@ -1177,6 +1183,8 @@ async fn run_loop_stops_when_fenced() {
             &deposed,
             &meta,
             &servers,
+            servers.len(),
+            ExpiredPendingPolicy::Defer,
             Duration::from_millis(10),
             || 500,
             shutdown,
@@ -1285,6 +1293,8 @@ async fn gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path() {
         &zone,
         &custodian,
         &servers,
+        servers.len(),
+        ExpiredPendingPolicy::Defer,
         one_pass,
         || 500,
         async { tokio::time::sleep(Duration::from_millis(60)).await },
@@ -1310,6 +1320,8 @@ async fn gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path() {
         &zone2,
         &custodian2,
         &servers,
+        servers.len(),
+        ExpiredPendingPolicy::Defer,
         one_pass,
         || 700,
         async { tokio::time::sleep(Duration::from_millis(60)).await },
@@ -1436,6 +1448,11 @@ async fn connect_fleet_starts_degraded_around_a_startup_down_peer_and_repairs() 
             &custodian,
             &meta,
             &servers,
+            // The OPERATOR wired 4 endpoints; `connect_fleet` dropped the startup-down peer, so
+            // `servers` holds only 3. GC gates on the operator fleet size (4), so it correctly
+            // DEFERS here — a startup-partial fleet must not sweep chunk-wide evidence (#554).
+            endpoints.len(),
+            ExpiredPendingPolicy::Defer,
             Duration::from_millis(10),
             clock,
             shutdown,
