@@ -1,0 +1,8 @@
+[{:process 0, :type :invoke, :f :txn, :value [[:w "k" 1]], :time 0}
+ {:process 0, :type :ok, :f :txn, :value [[:w "k" 1]], :time 10}
+ {:process 1, :type :invoke, :f :txn, :value [[:r "k" nil]], :time 12}
+ {:process 1, :type :ok, :f :txn, :value [[:r "k" 1]], :time 20}
+ {:process 0, :type :invoke, :f :txn, :value [[:w "k" 2]], :time 30}
+ {:process 0, :type :ok, :f :txn, :value [[:w "k" 2]], :time 40}
+ {:process 1, :type :invoke, :f :txn, :value [[:r "k" nil]], :time 50}
+ {:process 1, :type :ok, :f :txn, :value [[:r "k" 2]], :time 60}]

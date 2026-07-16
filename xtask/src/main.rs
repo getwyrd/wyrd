@@ -39,6 +39,21 @@
 //!   healed (the #442 gates). Privileged and opt-in (`WYRD_TIER1=1`), never part of `ci`;
 //!   the pure leg-enumeration / dispatch / oracle logic is unit-tested in `ci`. #408
 //!   composes the *checked* Elle-history workload under these same legs.
+//! - `consistency-run` — the #408 checked consistency run + public credibility artifact
+//!   (slice 5 of #329, ADR-0041): stand up `deploy/fdb-multi-replica`, drive the #406 checked
+//!   register overwrite (Elle-fed) + directory create (set) workload against it under a #407
+//!   nemesis leg (partition by default), export the Elle-EDN histories in the vocabulary
+//!   elle-cli 0.1.9 accepts (rw-register txn micro-ops / set integer elements) + a
+//!   machine-readable run summary carrying the leg's TYPED materialization evidence, gate on
+//!   non-vacuity over that summary (a genuinely concurrent history AND a materialized fault, or
+//!   the run is INCONCLUSIVE), obtain the verdict from the pinned checker contract (elle-cli,
+//!   off-Check — token-keyed: `true` pass / `false` fail / `:unknown` inconclusive), run the
+//!   two-model fixtures self-check, and render the report. Privileged and opt-in
+//!   (`WYRD_TIER1=1 cargo xtask consistency-run`), needs Docker, Java, and `$WYRD_ELLE_CLI_JAR`;
+//!   never part of `ci` (ADR-0041: no JVM in `cargo xtask ci`). The host-independent
+//!   orchestration plan / vacuity gate / invocation building / verdict parser / report renderer
+//!   / preflight are unit-tested in `ci` (`xtask::consistency_run`,
+//!   `xtask/tests/consistency_run_orchestration.rs`).
 //! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
 //!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
 //!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
@@ -74,6 +89,7 @@
 #![forbid(unsafe_code)]
 
 mod conformance;
+mod consistency_run_runner;
 mod faults;
 mod fdb_faults;
 mod kill_reconstruct;
@@ -98,6 +114,7 @@ fn main() -> ExitCode {
         Some("fdb-doctor") => run_fdb_doctor(),
         Some("fdb-metadata-tier1") => fdb_faults::run_fdb_metadata_tier1(),
         Some("metadata-nemesis") => fdb_faults::run_metadata_nemesis(),
+        Some("consistency-run") => consistency_run_runner::run_consistency_check(),
         Some("etcd-conformance") => run_etcd_conformance(),
         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("dist") => {
@@ -133,7 +150,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|etcd-conformance|deploy-small-multi-node|dist|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|consistency-run|etcd-conformance|deploy-small-multi-node|dist|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 

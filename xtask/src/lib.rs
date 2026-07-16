@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod consistency_run;
 pub mod deploy_guard;
 pub mod disk_faults;
 pub mod dist;

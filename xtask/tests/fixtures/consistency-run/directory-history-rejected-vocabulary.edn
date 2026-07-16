@@ -1,0 +1,2 @@
+[{:process 0, :type :invoke, :f :contains, :value ["alice" nil], :time 0}
+ {:process 0, :type :ok, :f :contains, :value ["alice" true], :time 10}]

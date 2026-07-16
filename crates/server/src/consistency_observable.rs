@@ -27,6 +27,24 @@
 //! (Elle/JVM, a privileged off-Check job per ADR-0041) and the real-cluster partition
 //! nemesis (#257) are later, separate slices this client is built to feed — driving them is
 //! out of scope here.
+//!
+//! # Every invoked op is recorded — a transport failure is an OBSERVATION, not a gap (#408)
+//!
+//! The whole point of driving this client under a real nemesis (#407) is that ops *fail*: a
+//! partitioned coordinator refuses/resets the connection, a paused process never answers. Such
+//! an op's effect is **indeterminate** — it may or may not have committed — which is precisely
+//! Jepsen/Elle's `:info`. So [`ObservableS3Client::put`]/[`get`]/[`delete`] record **every**
+//! invoked op into the [`History`], stamping [`INDETERMINATE_STATUS`] when the round trip never
+//! produced a status, and return the transport error *in addition to* (never instead of)
+//! recording it. Two failure modes this closes, both of which a checked history cannot survive:
+//! an op **omitted** from the history (the checker is handed a fabricated gap where a real
+//! indeterminate op raced the fault), and a caller reading "the status of the op I just drove"
+//! off the history's tail (`ops().last()`), which — when the op was never pushed — silently
+//! inherits the **previous** op's status and serializes an indeterminate op as a definite `:ok`.
+//! Callers never guess: each method **returns the [`OpRecord`] it recorded**.
+//!
+//! [`get`]: ObservableS3Client::get
+//! [`delete`]: ObservableS3Client::delete
 
 use std::net::SocketAddr;
 use std::time::SystemTime;
@@ -34,6 +52,56 @@ use std::time::SystemTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use wyrd_gateway_s3::sigv4::{format_amz_date, sign, Credentials};
+
+/// The **synthetic status** this client stamps on an op whose round trip produced no HTTP status
+/// at all — a connection refused/reset, a timeout, an unreadable response: exactly what a #407
+/// nemesis leg induces. It is the "synthetic-0 status" the checker substrate's INV-1 predicate
+/// already names (`consistency_workload::is_indeterminate`), so an op recorded with it serializes
+/// as `:info` ("may or may not have happened") and every local check skips it. Never a definite
+/// completion, and never — the #408 fix — a dropped op.
+pub const INDETERMINATE_STATUS: u16 = 0;
+
+/// An op whose round trip failed: it **was** recorded (stamped [`INDETERMINATE_STATUS`]) and this
+/// carries both that [`OpRecord`] and the underlying cause.
+///
+/// Why the record travels in the error: a workload driver under a nemesis treats a transport
+/// failure as *data* (an indeterminate op) and needs the very record the client recorded, while a
+/// caller driving a healthy wire wants the failure to be loud. Handing the record back here serves
+/// both without either re-reading it off the history's tail (`ops().last()`) — which is precisely
+/// how an op comes to inherit a neighbour's status — or re-deriving a "probably indeterminate"
+/// record of its own that could drift from what was actually recorded.
+#[derive(Debug)]
+pub struct OpFailed {
+    /// The op as recorded in the [`History`] — indeterminate, never omitted.
+    pub record: OpRecord,
+    /// Why the round trip failed (connection refused/reset, timeout, a torn response body).
+    pub cause: std::io::Error,
+}
+
+impl OpFailed {
+    /// Take the recorded op, discarding the cause — for a driver whose history *is* the point and
+    /// for which an indeterminate op is an ordinary observation, not an error to handle.
+    #[must_use]
+    pub fn into_record(self) -> OpRecord {
+        self.record
+    }
+}
+
+impl std::fmt::Display for OpFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{:?} on `{}` failed at the transport (recorded as indeterminate): {}",
+            self.record.kind, self.record.key, self.cause,
+        )
+    }
+}
+
+impl std::error::Error for OpFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 /// One register operation the observable can drive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,10 +170,20 @@ impl History {
     /// written version and a GET's read version) never regresses in real-time order — a GET
     /// must never observe an older version than one already committed/observed earlier for
     /// the same key (ADR-0041 decision 1: the commit-point CAS totally orders versions).
+    ///
+    /// An op stamped [`INDETERMINATE_STATUS`] is **skipped**: since #408 the client records the
+    /// ops whose round trip never produced a status (a partitioned PUT still carries the version
+    /// it *attempted*), and such a write may or may not have committed — so counting it as an
+    /// observed version would let a *correct* later read of the previous version read as a
+    /// regression. A check must never derive a definite claim from an indeterminate op, in either
+    /// direction: no fabricated violations, no fabricated certainty.
     pub fn versions_monotone_per_key(&self) -> bool {
         use std::collections::HashMap;
         let mut last_by_key: HashMap<&str, u64> = HashMap::new();
         for op in &self.ops {
+            if op.status == INDETERMINATE_STATUS {
+                continue;
+            }
             let Some(version) = op.version else {
                 continue;
             };
@@ -150,66 +228,131 @@ impl ObservableS3Client {
         }
     }
 
+    /// Push one recorded op onto the history and hand the caller back its [`OpRecord`], so a
+    /// caller never has to re-read "the op I just drove" off the history's tail (`ops().last()`),
+    /// which is what silently inherits a neighbour's status when a record is missing.
+    fn record(&mut self, record: OpRecord) -> OpRecord {
+        self.history.ops.push(record.clone());
+        record
+    }
+
     /// Drive an overwriting PUT of `key` carrying register version `version` (ADR-0041
     /// decision 1: an overwrite is a new inode version) — encoded as the object's own bytes
     /// (see module docs) so the plain PUT/GET floor doubles as the register's carried value.
-    /// Records the op (start/end/version/status) into the client's [`History`].
-    pub async fn put(&mut self, key: &str, version: u64) -> std::io::Result<()> {
+    ///
+    /// **Always records the op** and returns the [`OpRecord`] it recorded. A transport failure
+    /// records it with [`INDETERMINATE_STATUS`] — the write may or may not have committed, so it
+    /// is `:info`, never omitted (module docs) — and returns the error as well. The recorded
+    /// `version` is the version this PUT *attempted*, indeterminate or not: that is the write the
+    /// checker's `:invoke` micro-op states (`[:w key version]`), and a versionless write has no
+    /// representable `rw-register` encoding at all.
+    pub async fn put(&mut self, key: &str, version: u64) -> Result<OpRecord, OpFailed> {
         let path = self.object_path(key);
         let body = encode_version(version);
         let start = SystemTime::now();
-        let (status, _response_body) = self.send("PUT", &path, &body).await?;
+        let sent = self.send("PUT", &path, &body).await;
         let end = SystemTime::now();
-        self.history.ops.push(OpRecord {
-            kind: OpKind::Put,
-            key: key.to_string(),
-            version: Some(version),
-            status,
-            start,
-            end,
-        });
-        Ok(())
+        match sent {
+            Ok((status, _response_body)) => Ok(self.record(OpRecord {
+                kind: OpKind::Put,
+                key: key.to_string(),
+                version: Some(version),
+                status,
+                start,
+                end,
+            })),
+            Err(cause) => Err(OpFailed {
+                record: self.record(OpRecord {
+                    kind: OpKind::Put,
+                    key: key.to_string(),
+                    version: Some(version),
+                    status: INDETERMINATE_STATUS,
+                    start,
+                    end,
+                }),
+                cause,
+            }),
+        }
     }
 
-    /// Drive a GET of `key`, returning the currently committed register version (`None` if
-    /// absent — a 404). Records the op into the client's [`History`].
-    pub async fn get(&mut self, key: &str) -> std::io::Result<Option<u64>> {
+    /// Drive a GET of `key`. **Always records the op** and returns the [`OpRecord`] it recorded —
+    /// whose `version` is the currently committed register version (`None` if absent: a 404).
+    ///
+    /// A transport failure, or a 200 whose bytes do not decode to a version tag (a torn read),
+    /// records the op with [`INDETERMINATE_STATUS`] and `version: None` and returns the error:
+    /// what the read observed is unknown, so it is `:info`. Recording a torn read as a *definite*
+    /// 200-of-`nil` would claim the register was unwritten — a fabrication INV-1 forbids.
+    pub async fn get(&mut self, key: &str) -> Result<OpRecord, OpFailed> {
         let path = self.object_path(key);
         let start = SystemTime::now();
-        let (status, body) = self.send("GET", &path, &[]).await?;
-        let end = SystemTime::now();
-        let version = if status == 200 {
-            Some(decode_version(&body).map_err(std::io::Error::other)?)
-        } else {
-            None
+        let sent = self.send("GET", &path, &[]).await;
+        let decoded = match sent {
+            Ok((status, body)) => {
+                if status == 200 {
+                    match decode_version(&body) {
+                        Ok(v) => Ok((status, Some(v))),
+                        Err(e) => Err(std::io::Error::other(e)),
+                    }
+                } else {
+                    Ok((status, None))
+                }
+            }
+            Err(e) => Err(e),
         };
-        self.history.ops.push(OpRecord {
-            kind: OpKind::Get,
-            key: key.to_string(),
-            version,
-            status,
-            start,
-            end,
-        });
-        Ok(version)
+        let end = SystemTime::now();
+        match decoded {
+            Ok((status, version)) => Ok(self.record(OpRecord {
+                kind: OpKind::Get,
+                key: key.to_string(),
+                version,
+                status,
+                start,
+                end,
+            })),
+            Err(cause) => Err(OpFailed {
+                record: self.record(OpRecord {
+                    kind: OpKind::Get,
+                    key: key.to_string(),
+                    version: None,
+                    status: INDETERMINATE_STATUS,
+                    start,
+                    end,
+                }),
+                cause,
+            }),
+        }
     }
 
     /// Drive a DELETE of `key` (idempotent: succeeds whether or not the key was present).
-    /// Records the op into the client's [`History`].
-    pub async fn delete(&mut self, key: &str) -> std::io::Result<()> {
+    /// **Always records the op** and returns the [`OpRecord`] it recorded; a transport failure
+    /// records it with [`INDETERMINATE_STATUS`] (the delete may or may not have committed) and
+    /// returns the error as well.
+    pub async fn delete(&mut self, key: &str) -> Result<OpRecord, OpFailed> {
         let path = self.object_path(key);
         let start = SystemTime::now();
-        let (status, _response_body) = self.send("DELETE", &path, &[]).await?;
+        let sent = self.send("DELETE", &path, &[]).await;
         let end = SystemTime::now();
-        self.history.ops.push(OpRecord {
-            kind: OpKind::Delete,
-            key: key.to_string(),
-            version: None,
-            status,
-            start,
-            end,
-        });
-        Ok(())
+        match sent {
+            Ok((status, _response_body)) => Ok(self.record(OpRecord {
+                kind: OpKind::Delete,
+                key: key.to_string(),
+                version: None,
+                status,
+                start,
+                end,
+            })),
+            Err(cause) => Err(OpFailed {
+                record: self.record(OpRecord {
+                    kind: OpKind::Delete,
+                    key: key.to_string(),
+                    version: None,
+                    status: INDETERMINATE_STATUS,
+                    start,
+                    end,
+                }),
+                cause,
+            }),
+        }
     }
 
     /// The history recorded so far — the input a register-model linearizability checker
@@ -262,7 +405,7 @@ impl ObservableS3Client {
 
         let mut raw = Vec::new();
         stream.read_to_end(&mut raw).await?;
-        Ok(parse_response(&raw))
+        parse_response(&raw).map_err(std::io::Error::other)
     }
 }
 
@@ -283,51 +426,96 @@ fn decode_version(body: &[u8]) -> Result<u64, String> {
 }
 
 /// Split a raw HTTP/1.1 response into `(status, body)`, de-framing a chunked-transfer body
-/// should the wire surface ever fall back to it (mirrors `s3_http_wire.rs::parse_response`).
-fn parse_response(raw: &[u8]) -> (u16, Vec<u8>) {
+/// should the wire surface ever fall back to it (the framing mirrors
+/// `s3_http_wire.rs::parse_response`, but fallibly: that test helper may panic on a torn
+/// response because its peer is healthy by construction — here a peer that accepts the
+/// connection and then closes without a complete response is exactly what a nemesis
+/// induces, so a malformed response is an `Err` the caller records as `:info`, never a
+/// panic that aborts the workload task and drops the op from the history).
+fn parse_response(raw: &[u8]) -> Result<(u16, Vec<u8>), String> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .expect("response has a header terminator");
+        .ok_or("torn response: no header terminator (peer closed mid-response)")?;
     let head = String::from_utf8_lossy(&raw[..split]);
-    let status_line = head.lines().next().expect("status line");
+    let status_line = head.lines().next().ok_or("torn response: no status line")?;
     let status: u16 = status_line
         .split_whitespace()
         .nth(1)
-        .expect("status code")
+        .ok_or("torn response: status line carries no status code")?
         .parse()
-        .expect("numeric status");
+        .map_err(|_| "torn response: non-numeric status code")?;
     let raw_body = &raw[split + 4..];
     let is_chunked = head.lines().any(|l| {
         l.to_ascii_lowercase().starts_with("transfer-encoding:")
             && l.to_ascii_lowercase().contains("chunked")
     });
     let body = if is_chunked {
-        dechunk(raw_body)
+        dechunk(raw_body)?
     } else {
+        // Enforce the declared `content-length`: the gateway emits an exact length for every
+        // body it sends, so a body cut mid-transfer (a reset after the first byte of a `42`
+        // register value) must be an `Err` recorded as `:info` — accepting the prefix would
+        // decode as a DETERMINATE read of version `4`, a fabricated observation in the
+        // history handed to Elle (INV-1's exact prohibition).
+        let declared = head.lines().find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().to_string())
+        });
+        if let Some(value) = declared {
+            let declared: usize = value
+                .parse()
+                .map_err(|_| "torn response: non-numeric content-length")?;
+            if raw_body.len() != declared {
+                return Err(format!(
+                    "torn response: body carries {} of {declared} declared bytes (peer closed \
+                     mid-body)",
+                    raw_body.len(),
+                ));
+            }
+        }
         raw_body.to_vec()
     };
-    (status, body)
+    Ok((status, body))
 }
 
-/// Decode an HTTP/1.1 chunked-transfer-encoded body (mirrors `s3_http_wire.rs::dechunk`).
-fn dechunk(mut raw: &[u8]) -> Vec<u8> {
+/// Decode an HTTP/1.1 chunked-transfer-encoded body (mirrors `s3_http_wire.rs::dechunk`,
+/// fallibly — see [`parse_response`]).
+fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     loop {
         let line_end = raw
             .windows(2)
             .position(|w| w == b"\r\n")
-            .expect("chunk size line");
+            .ok_or("torn chunked body: no chunk size line")?;
         let size_str = String::from_utf8_lossy(&raw[..line_end]);
-        let size = usize::from_str_radix(size_str.trim(), 16).expect("hex chunk size");
+        let size = usize::from_str_radix(size_str.trim(), 16)
+            .map_err(|_| "torn chunked body: non-hex chunk size")?;
         raw = &raw[line_end + 2..];
         if size == 0 {
+            // The terminal `0` chunk must be closed by the trailer-section CRLF: a peer that
+            // resets after `0\r\n` sent a truncated message, not a complete one. The wire
+            // surface never sends trailer fields, so anything but the bare terminator is
+            // equally torn/unspoken protocol — an `Err`, never an accepted body.
+            if raw != b"\r\n" {
+                return Err("torn chunked body: missing the terminal trailer CRLF".to_string());
+            }
             break;
         }
+        if raw.len() < size + 2 {
+            return Err("torn chunked body: chunk shorter than its declared size".to_string());
+        }
+        if &raw[size..size + 2] != b"\r\n" {
+            return Err(
+                "torn chunked body: chunk data not closed by its CRLF delimiter".to_string(),
+            );
+        }
         out.extend_from_slice(&raw[..size]);
-        raw = &raw[size + 2..]; // skip the chunk's trailing CRLF
+        raw = &raw[size + 2..];
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -342,6 +530,87 @@ mod tests {
     #[test]
     fn decode_rejects_a_torn_value() {
         assert!(decode_version(b"not-a-number").is_err());
+    }
+
+    #[test]
+    fn a_torn_response_is_an_error_never_a_panic() {
+        // A peer that accepts the connection and then closes without a complete response —
+        // exactly the reset/torn-response shape a nemesis induces — must surface as `Err`
+        // so `send`'s caller records the op as `:info`. A panic here aborts the workload
+        // task and drops the invoked op from the history (the module's INV-1 prohibition).
+        assert!(
+            parse_response(b"").is_err(),
+            "empty response (peer closed on accept)"
+        );
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n").is_err(),
+            "headers truncated before the terminator"
+        );
+        assert!(
+            parse_response(b"garbage\r\n\r\n").is_err(),
+            "status line carries no numeric code"
+        );
+        assert!(
+            parse_response(b"HTTP/1.1 abc OK\r\n\r\n").is_err(),
+            "non-numeric status code"
+        );
+    }
+
+    #[test]
+    fn a_body_shorter_than_its_declared_content_length_is_an_error_never_a_prefix_read() {
+        // The fabrication this guards against: a `42` register value reset after its first
+        // byte would otherwise decode as a DETERMINATE 200 read of version `4` — a wrong
+        // observation in the history handed to Elle, not merely a lost one.
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n4").is_err(),
+            "body cut mid-transfer must be torn, not a shorter read"
+        );
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n420").is_err(),
+            "a body LONGER than declared is protocol garbage, not a longer read"
+        );
+        assert!(
+            parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: abc\r\n\r\n42").is_err(),
+            "a non-numeric content-length is torn, not ignorable"
+        );
+    }
+
+    #[test]
+    fn a_wellformed_response_still_parses() {
+        let (status, body) = parse_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n42")
+            .expect("a complete response parses");
+        assert_eq!((status, body.as_slice()), (200, b"42".as_slice()));
+    }
+
+    #[test]
+    fn a_torn_chunked_body_is_an_error_never_a_panic() {
+        let torn = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nff\r\nshort";
+        assert!(
+            parse_response(torn).is_err(),
+            "chunk shorter than its declared size"
+        );
+        let no_size = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nnothex";
+        assert!(parse_response(no_size).is_err(), "no chunk size line");
+        let reset_after_zero =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\n42\r\n0\r\n";
+        assert!(
+            parse_response(reset_after_zero).is_err(),
+            "a peer that resets after `0\\r\\n` but before the terminal trailer CRLF sent a \
+             truncated message, not a determinate body"
+        );
+        let bad_delimiter =
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\n42XX0\r\n\r\n";
+        assert!(
+            parse_response(bad_delimiter).is_err(),
+            "chunk data must be closed by its CRLF delimiter, not arbitrary bytes"
+        );
+        let ok = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\n42\r\n0\r\n\r\n";
+        assert_eq!(
+            parse_response(ok)
+                .expect("a well-formed chunked body de-frames")
+                .1,
+            b"42".to_vec()
+        );
     }
 
     #[test]
@@ -388,5 +657,52 @@ mod tests {
             ],
         };
         assert!(!history.versions_monotone_per_key());
+    }
+
+    #[test]
+    fn an_indeterminate_write_is_not_counted_as_an_observed_version() {
+        // Since #408 the client records the ops whose transport failed, and an indeterminate PUT
+        // still carries the version it ATTEMPTED. This history is entirely correct: the write of
+        // v5 may never have committed, so a later read of v1 is a perfectly good read — not a
+        // regression. Counting v5 as an observed version would fabricate a violation out of an op
+        // that may never have happened (the mirror image of fabricating certainty: INV-1 forbids
+        // deriving a definite claim from an indeterminate op in EITHER direction).
+        let now = SystemTime::now();
+        let op = |version, status| OpRecord {
+            kind: OpKind::Put,
+            key: "k".to_string(),
+            version: Some(version),
+            status,
+            start: now,
+            end: now,
+        };
+        let history = History {
+            ops: vec![
+                op(1, 200),
+                op(5, INDETERMINATE_STATUS),
+                OpRecord {
+                    kind: OpKind::Get,
+                    ..op(1, 200)
+                },
+            ],
+        };
+        assert!(
+            history.versions_monotone_per_key(),
+            "an indeterminate write must not make a correct later read read as a stale-read \
+             violation"
+        );
+
+        // The guard is scoped to indeterminacy, not blanket permissiveness: a DETERMINATE
+        // regression is still a violation.
+        let determinate_regression = History {
+            ops: vec![
+                op(5, 200),
+                OpRecord {
+                    kind: OpKind::Get,
+                    ..op(1, 200)
+                },
+            ],
+        };
+        assert!(!determinate_regression.versions_monotone_per_key());
     }
 }
