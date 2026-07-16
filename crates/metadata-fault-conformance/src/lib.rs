@@ -62,6 +62,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod nemesis;
+
 use std::time::Duration;
 
 use wyrd_testkit::{

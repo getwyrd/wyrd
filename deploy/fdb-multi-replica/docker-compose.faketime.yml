@@ -1,0 +1,47 @@
+# Clock-skew override for the M4 metadata **nemesis** (#407, slice 4 of #329) — the additive
+# deploy delta the skew leg needs (Design §3/§5). Applied ON TOP of `docker-compose.yml` for
+# exactly ONE fdbserver node (`fdb2`, the node `xtask metadata-nemesis` skews by default),
+# recreating it with a container-scoped fake clock:
+#
+#   docker compose \
+#     -f deploy/fdb-multi-replica/docker-compose.yml \
+#     -f deploy/fdb-multi-replica/docker-compose.faketime.yml \
+#     up -d --force-recreate fdb2
+#
+# and healed by recreating WITHOUT this file. The recreate is itself a restart-fault, so the
+# nemesis leg applies it in `apply()` (never `plan()`) and waits for the cluster to re-stabilize
+# BEFORE the measured workload window opens (the leg measures skew, never the restart).
+#
+# **The target node is pinned to `fdb2` on ALL three sides** (this override, the runner's
+# `WYRD_TIER1_SKEW_SERVICE`/`WYRD_TIER1_SKEW_CONTAINER`, and the in-container probe), so the
+# default run cannot skew one node and measure another — the runner resolves the container FROM
+# this service name, so override/recreate/probe cannot disagree.
+#
+# **Why `libfaketime`, and why container-scoped** (Alternatives considered). `date -s` /
+# CAP_SYS_TIME would mutate the shared kernel clock on the CI host in some runtimes and is not
+# per-process. `libfaketime` is per-container, reversible, and skews ONLY this node's clock —
+# never the harness/client process, so the #406 history's real-time order (stamped by the
+# harness, `crates/server/src/consistency_observable.rs:66-68`) stays trustworthy while the
+# system under test runs on a lying clock. A `docker exec fdb2 date +%s` probe inherits the
+# same fake clock, which IS the leg's materialization oracle (an in-container probe sharing the
+# target's exact preload/env), not an unrelated process.
+#
+# The stock `foundationdb/foundationdb:7.3.77` image (docker-compose.yml:97) has no custom
+# entrypoint; the faketime preload is provided as a bind-mount of the host's libfaketime shared
+# object (installed by the deploy delta — `apt-get install libfaketime`, then bind-mount its
+# `.so`). Override `FAKETIME` (default `+2h`) and `WYRD_TIER1_SKEW_SO` (the host path to the
+# preload) at run time; the node still advertises its own IP, so the cluster re-forms normally.
+
+services:
+  fdb2:
+    environment:
+      # Container-scoped libfaketime. `FAKETIME` is a STATIC per-leg offset (v1 has no dynamic
+      # mid-run control — out of scope); `+2h` clears any reasonable skew floor.
+      LD_PRELOAD: /usr/lib/faketime/libfaketime.so.1
+      FAKETIME: "${FAKETIME:-+2h}"
+      # Real-time (not monotonic) faketime, applied cluster-node-only.
+      FAKETIME_DONT_FAKE_MONOTONIC: "1"
+    volumes:
+      # Bind the host's libfaketime preload into the stock image (no custom entrypoint / image
+      # rebuild). `WYRD_TIER1_SKEW_SO` overrides the host path per environment.
+      - "${WYRD_TIER1_SKEW_SO:-/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1}:/usr/lib/faketime/libfaketime.so.1:ro"
