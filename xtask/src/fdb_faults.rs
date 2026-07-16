@@ -435,9 +435,10 @@ fn nemesis_netns_map() -> Result<String, String> {
 /// brief's sign-off open question — one witnessed `WYRD_TIER1=1` run of the three legs —
 /// satisfiable; #408 composes the *checked* workload under these same legs.
 ///
-/// Tears the stack down unconditionally (including on a panic), so a failed leg never leaves a
-/// cut / paused / skewed cluster behind — the same panic-safe teardown as
-/// [`run_fdb_metadata_tier1`].
+/// Tears the stack down unconditionally (including on a panic, and including a bring-up that
+/// fails after creating part of the stack — `compose up` runs inside the finalizer's scope), so
+/// neither a failed leg nor a half-created cluster is ever left behind — the panic-safe teardown
+/// of [`run_fdb_metadata_tier1`], extended to cover bring-up.
 pub fn run_metadata_nemesis() -> Result<(), String> {
     if std::env::var("WYRD_TIER1").as_deref() != Ok("1") {
         println!(
@@ -458,10 +459,16 @@ pub fn run_metadata_nemesis() -> Result<(), String> {
     }
 
     build_fault_agent()?;
-    compose(&["up", "-d"])?;
 
     let result = crate::finalize_panic_safe(
         || {
+            // Bring-up INSIDE the teardown scope: `docker compose up -d` can fail after
+            // creating part of the stack (one service starts, another refuses), and a `?`
+            // outside the finalizer would leak that partial cluster — contradicting the
+            // unconditional-teardown contract above and contaminating the next Tier-1 run
+            // (Codex P2 on #569). `down -v --remove-orphans` on a never-created stack is a
+            // harmless no-op, so covering bring-up costs nothing.
+            compose(&["up", "-d"])?;
             configure_database()?;
             let cluster_file = write_cluster_file()?;
             // Resolve the topology by STABLE COMPOSE NAME, never ephemeral id: the clock-skew leg
