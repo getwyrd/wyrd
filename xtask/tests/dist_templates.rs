@@ -225,6 +225,12 @@ fn install_sh_keeps_its_contract() {
         "systemctl daemon-reload",
         "--uninstall",
         "foundationdb-clients_@FDB_VERSION@-1_amd64.deb",
+        // A custom-prefix install must be uninstallable without re-typing the
+        // prefix: the install RECORDS it, the uninstall READS it (explicit
+        // --prefix overriding), else `--uninstall` would silently aim at
+        // /usr/local and keep the real binary.
+        "printf '%s\\n' \"$PREFIX\" >\"$CONFDIR/install-prefix\"",
+        "PREFIX=$(cat \"$CONFDIR/install-prefix\")",
     ] {
         assert!(sh.contains(required), "install.sh lost `{required}`");
     }

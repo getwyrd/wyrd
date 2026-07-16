@@ -57,6 +57,10 @@ sudo ./install.sh --uninstall            # keeps /etc/wyrd and /var/lib/wyrd
 sudo ./install.sh --uninstall --purge    # deletes config AND fragment data
 ```
 
+A custom `--prefix` install is found automatically: the installer records its
+prefix in `/etc/wyrd/install-prefix`, and `--uninstall` reads it (an explicit
+`--prefix` on the uninstall command overrides the record).
+
 ## Verify an install end-to-end
 
 Unit sanity without a cluster: `systemd-analyze verify

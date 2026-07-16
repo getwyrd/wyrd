@@ -16,6 +16,7 @@
 set -eu
 
 PREFIX=/usr/local
+PREFIX_SET=0
 UNINSTALL=0
 PURGE=0
 YES=0
@@ -25,6 +26,7 @@ while [ $# -gt 0 ]; do
         --prefix)
             [ $# -ge 2 ] || { echo "error: --prefix needs a value" >&2; exit 2; }
             PREFIX=$2
+            PREFIX_SET=1
             shift 2
             ;;
         --uninstall) UNINSTALL=1; shift ;;
@@ -41,12 +43,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-BINDIR=$PREFIX/bin
 UNITDIR=/etc/systemd/system
 CONFDIR=/etc/wyrd
 DATADIR=/var/lib/wyrd
 ROLES="d-server custodian s3"
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+# Uninstall must aim at the prefix the INSTALL used, not this run's default: the
+# install records its prefix in $CONFDIR/install-prefix, so a plain
+# `./install.sh --uninstall` removes a custom-prefix install too. An explicit
+# --prefix always wins (e.g. cleaning up a half-recorded state).
+if [ "$UNINSTALL" = 1 ] && [ "$PREFIX_SET" = 0 ] && [ -f "$CONFDIR/install-prefix" ]; then
+    PREFIX=$(cat "$CONFDIR/install-prefix")
+fi
+BINDIR=$PREFIX/bin
 
 # Validate the prefix BEFORE any mutation: refusing after the user/dirs/binary
 # were created would leave a partial install with no units. A newline cannot
@@ -127,6 +137,11 @@ install -m 0755 "$HERE/bin/wyrd" "$BINDIR/wyrd"
 
 install -d -m 0750 -o root -g wyrd "$CONFDIR"
 install -d -m 0750 -o wyrd -g wyrd "$DATADIR"
+# Record the prefix so a later `--uninstall` (from any tarball) aims at THIS
+# install's binary, not the default (kept by non-purge uninstalls with the rest
+# of $CONFDIR; a re-install with a different prefix overwrites it).
+printf '%s\n' "$PREFIX" >"$CONFDIR/install-prefix"
+chmod 0644 "$CONFDIR/install-prefix"
 
 for role in $ROLES; do
     # Examples are always refreshed; the LIVE config is created once and then
