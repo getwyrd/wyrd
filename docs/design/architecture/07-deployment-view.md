@@ -39,6 +39,8 @@ Kubernetes is *available but never required* (ADR-0010):
 
 What is shipped, in priority order: a single static binary (primary), an OCI image (same binary), a docker-compose (small multi-node), and later a Helm chart and operator (`deploy/`). **No code knows it is on Kubernetes** — peers are discovered through L5, never through orchestrator APIs. The system must come up identically whether launched by systemd, compose, or a Kubernetes pod.
 
+The first two of those are produced by one pipeline, `cargo xtask dist` (#570): it builds the production OCI image (`deploy/docker/wyrd/Dockerfile`, `fdb,etcd`) and extracts the binary out of it into an operator tarball — `bin/wyrd`, systemd units for the three long-running roles (`wyrd-d-server` / `wyrd-custodian` / `wyrd-s3`, hardened, config via `/etc/wyrd/<role>.env`), and an idempotent `install.sh` that installs but never enables (templates under `deploy/dist/`). The production-flavor tarball is dynamically linked by necessity (§7.6 — `fdb` is never static); "static binary (primary)" continues to describe the default dev flavor (ADR-0014). Releases are cut by tag through `.github/workflows/release.yml`, signed from the start per ADR-0030 (keyless cosign bundles + SLSA provenance attestations); a registry push for the image is a follow-up slice — the release attaches it as an OCI archive.
+
 ## 7.3 Failure domains
 
 Durability math depends on fragments landing in independent failure domains (rack, power, switch). The placement service (L2) and custodians (L4) enforce domain spread for the configured EC scheme. A leading-indicator capacity metric is per-failure-domain utilization: running out of room *in a specific domain* blocks new EC writes before total capacity is exhausted.

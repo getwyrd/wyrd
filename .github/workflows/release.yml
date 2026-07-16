@@ -1,0 +1,115 @@
+# Release pipeline (#570): on a v* tag, build the distribution artifacts with
+# `cargo xtask dist` — the operator tarball (binary + systemd units + install.sh,
+# `deploy/dist/`) and the OCI image (`deploy/docker/wyrd/Dockerfile`, #470) — smoke
+# the installer in a bookworm container, and attach everything to the GitHub Release.
+#
+# Built SIGNED FROM THE START (ADR-0030: "the release workflow is built signed from
+# the start rather than retrofitted"): every artifact gets a keyless-cosign blob
+# signature bundle (Sigstore, OIDC — no long-lived key) and a SLSA build-provenance
+# attestation; every action below is pinned by full commit SHA. The image is signed
+# as its exported OCI-archive blob — there is no registry push yet (a ghcr push,
+# signing the registry digest instead, is the follow-up slice).
+#
+# The tikv flavor is deliberately absent: TiKV development is stood down (#443) and
+# tikv-client carries an unpatched advisory quarantined by the dependency wall
+# (deny-all-features.toml, RUSTSEC-2026-0104, #543) — a shipped artifact must not
+# link it. When that boundary lifts, a second `cargo xtask dist --features tikv,etcd
+# --flavor tikv` invocation slots in here.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release and upload assets
+      id-token: write # keyless cosign (Sigstore OIDC) + provenance signing
+      attestations: write # actions/attest-build-provenance
+    steps:
+      # Full history + tags so `cargo xtask dist`'s `git describe` versioning works.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: shellcheck the installer
+        run: shellcheck deploy/dist/install.sh
+
+      # A docker-container buildx builder: the runner's default docker driver
+      # does not support the `type=oci` exporter the dist pipeline's
+      # `--oci-archive` output needs (the tag-triggered release would fail
+      # before signing). The dist build passes `--output type=docker` too, so
+      # the tagged image still lands in the daemon for extraction.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          use: true
+
+      - name: build distribution artifacts
+        run: cargo xtask dist --oci-archive
+
+      # The deferred half of xtask/tests/dist_templates.rs (which pins the template
+      # SHAPES container-free in `ci`): actually install the tarball in a clean
+      # bookworm container, verify the units parse, prove idempotence and uninstall.
+      - name: smoke the installer in a bookworm container
+        run: |
+          set -eu
+          tarball=$(ls target/dist/wyrd-*-x86_64-unknown-linux-gnu.tar.gz)
+          fdb_version=$(sed -n 's/^ARG FDB_VERSION=//p' deploy/docker/wyrd/Dockerfile | head -1)
+          docker run --rm -v "$PWD/target/dist:/dist:ro" debian:bookworm sh -eu -c "
+            apt-get update -qq >/dev/null
+            apt-get install -y -qq systemd curl >/dev/null
+            tar xzf /dist/$(basename "$tarball") -C /tmp
+            cd /tmp/wyrd-*
+            ./install.sh
+            systemd-analyze verify /etc/systemd/system/wyrd-*.service
+            # The binary loads libfdb_c at process start: install the exact pinned
+            # client, then the no-args invocation must print usage and exit non-zero.
+            curl -fsSLo /tmp/fdb.deb https://github.com/apple/foundationdb/releases/download/${fdb_version}/foundationdb-clients_${fdb_version}-1_amd64.deb
+            dpkg -i /tmp/fdb.deb >/dev/null
+            if /usr/local/bin/wyrd >/tmp/usage.txt 2>&1; then
+              echo 'wyrd with no arguments must exit non-zero'; exit 1
+            fi
+            grep -q 'usage:' /tmp/usage.txt
+            # Idempotence: a re-run upgrades without clobbering live config.
+            echo '# operator-owned' >>/etc/wyrd/d-server.env
+            ./install.sh
+            grep -q 'operator-owned' /etc/wyrd/d-server.env
+            # Uninstall removes the binary and units, keeps config and data.
+            ./install.sh --uninstall
+            test ! -e /usr/local/bin/wyrd
+            test ! -e /etc/systemd/system/wyrd-d-server.service
+            test -d /etc/wyrd
+          "
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: sign the artifacts (keyless cosign, Sigstore bundles)
+        run: |
+          set -eu
+          cd target/dist
+          for artifact in *.tar.gz SHA256SUMS; do
+            cosign sign-blob --yes --bundle "$artifact.sigstore.json" "$artifact"
+          done
+
+      - name: attest build provenance (SLSA)
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            target/dist/*.tar.gz
+            target/dist/SHA256SUMS
+
+      - name: attach artifacts to the GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "$GITHUB_REF_NAME" --verify-tag \
+            --title "wyrd $GITHUB_REF_NAME" \
+            --notes "See SHA256SUMS and the .sigstore.json bundles (keyless cosign) to verify; build provenance is attested via GitHub artifact attestations." \
+            target/dist/*.tar.gz target/dist/SHA256SUMS target/dist/*.sigstore.json

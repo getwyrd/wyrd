@@ -1,0 +1,48 @@
+# Wyrd D server — fragment storage, gRPC (one per host / failure domain).
+#
+# All per-host intent lives in /etc/wyrd/d-server.env (WYRD_D_SERVER_ARGS plus the
+# WYRD_* environment the binary reads natively); this unit is identical on every host.
+# @BINDIR@ is substituted by install.sh with the installed binary directory, so a
+# custom --prefix can never leave ExecStart pointing at a nonexistent path.
+#
+# Hardening note: MemoryDenyWriteExecute is deliberately absent in v1 — it is the
+# directive most likely to produce a mystery SIGSEGV under JIT-ish allocators; add it
+# after a soak period.
+
+[Unit]
+Description=Wyrd D server (fragment storage, gRPC)
+Documentation=https://github.com/getwyrd/wyrd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=wyrd
+Group=wyrd
+EnvironmentFile=/etc/wyrd/d-server.env
+# --data-dir defaults to ./wyrd-data (relative); pin it to the systemd-managed state
+# dir. A later --data-dir in WYRD_D_SERVER_ARGS overrides this pin (last flag wins).
+ExecStart="@BINDIR@/wyrd" d-server --data-dir ${STATE_DIRECTORY} $WYRD_D_SERVER_ARGS
+StateDirectory=wyrd/d-server
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -61,6 +61,15 @@
 //!   through L5" (gated on #365 + the runnable gateway/custodian roles).
 //! - `bench` — the tracked throughput benchmarks (EC micro-bench + the M2
 //!   aggregate D-server throughput bench). Tracked, not gated.
+//! - `dist` — the distribution-packaging pipeline (#570, ADR-0010's ship order):
+//!   build the production image (`deploy/docker/wyrd/Dockerfile`, `fdb,etcd`),
+//!   extract the binary, and assemble the operator tarball (binary plus the
+//!   systemd units, env examples, and install.sh from `deploy/dist/`) with
+//!   checksums; `--image` / `--oci-archive` keep/export the image, `--check`
+//!   validates the templates without building. Not part of `ci` (needs docker
+//!   and network, like `integration`); the pure decisions are unit-tested in
+//!   `ci` (`xtask/tests/dist_templates.rs`). Driven on tag push by
+//!   `.github/workflows/release.yml` (signed per ADR-0030).
 
 #![forbid(unsafe_code)]
 
@@ -91,6 +100,10 @@ fn main() -> ExitCode {
         Some("metadata-nemesis") => fdb_faults::run_metadata_nemesis(),
         Some("etcd-conformance") => run_etcd_conformance(),
         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
+        Some("dist") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            xtask::dist::run_dist(&rest)
+        }
         Some("disk-faults") => faults::run_disk_faults(),
         Some("jepsen") => faults::run_jepsen(),
         Some("kill-reconstruct") => faults::run_kill_reconstruct(),
@@ -120,7 +133,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|etcd-conformance|deploy-small-multi-node|dist|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 
