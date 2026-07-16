@@ -1,0 +1,49 @@
+# Wyrd S3 gateway — the stateless front door (safe to run active/active).
+#
+# Credentials (WYRD_S3_ACCESS_KEY / WYRD_S3_SECRET_KEY) come from the 0640
+# /etc/wyrd/s3.env, never from flags — keeps them out of `systemctl show` and
+# process listings. A LoadCredential= upgrade is noted as future work in README.
+#
+# All operator intent lives in /etc/wyrd/s3.env; @BINDIR@ is substituted by
+# install.sh. MemoryDenyWriteExecute deliberately absent in v1 (see d-server unit).
+
+[Unit]
+Description=Wyrd S3 gateway (stateless front door)
+Documentation=https://github.com/getwyrd/wyrd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=wyrd
+Group=wyrd
+EnvironmentFile=/etc/wyrd/s3.env
+# --data-dir pinned for redb dev/eval runs; unused by the fdb backend. A later
+# --data-dir in WYRD_S3_ARGS overrides it (last flag wins).
+ExecStart="@BINDIR@/wyrd" s3 --data-dir ${STATE_DIRECTORY} $WYRD_S3_ARGS
+StateDirectory=wyrd/s3
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+# FDB clients REWRITE the cluster file when coordinators change; ProtectSystem=strict
+# would refuse that. The '-' prefix keeps redb-only hosts (no such dir) valid.
+ReadWritePaths=-/etc/foundationdb
+
+[Install]
+WantedBy=multi-user.target

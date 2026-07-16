@@ -15,6 +15,7 @@
 
 pub mod deploy_guard;
 pub mod disk_faults;
+pub mod dist;
 pub mod fdb_doctor;
 pub mod metadata_faults;
 pub mod nemesis;

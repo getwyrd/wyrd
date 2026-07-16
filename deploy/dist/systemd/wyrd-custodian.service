@@ -1,0 +1,54 @@
+# Wyrd custodian — scrub / reconstruction / garbage collection.
+#
+# WARNING: run exactly ONE custodian per cluster. Against a distributed metadata
+# store (fdb/tikv) "single-active" is NOT enforced for you until the etcd
+# Coordination backend lands (#365) — two custodians both self-grant leadership.
+# Do not enable this unit on two hosts pointed at one cluster.
+#
+# Restart=on-failure deliberately matches the role's supervisor contract: the
+# custodian exits non-zero on a total fleet outage (restart and retry), and its
+# one-shot modes exit 0 (stay down).
+#
+# All operator intent lives in /etc/wyrd/custodian.env; @BINDIR@ is substituted by
+# install.sh. MemoryDenyWriteExecute deliberately absent in v1 (see d-server unit).
+
+[Unit]
+Description=Wyrd custodian (scrub/reconstruct/GC; run exactly ONE per cluster)
+Documentation=https://github.com/getwyrd/wyrd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=wyrd
+Group=wyrd
+EnvironmentFile=/etc/wyrd/custodian.env
+# --data-dir pinned for redb dev/eval runs; unused by the fdb backend. A later
+# --data-dir in WYRD_CUSTODIAN_ARGS overrides it (last flag wins).
+ExecStart="@BINDIR@/wyrd" custodian --data-dir ${STATE_DIRECTORY} $WYRD_CUSTODIAN_ARGS
+StateDirectory=wyrd/custodian
+Restart=on-failure
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+# FDB clients REWRITE the cluster file when coordinators change; ProtectSystem=strict
+# would refuse that. The '-' prefix keeps redb-only hosts (no such dir) valid.
+ReadWritePaths=-/etc/foundationdb
+
+[Install]
+WantedBy=multi-user.target

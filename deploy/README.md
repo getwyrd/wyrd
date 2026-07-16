@@ -5,6 +5,18 @@ structural guard that "makes it hard for orchestrator coupling to sneak into a
 component" — no crate imports an orchestrator API; peers are discovered through L5
 Coordination (proposal 0007 §"Deployment").
 
+## `dist/` — the operator distribution package (#570)
+
+The templates `cargo xtask dist` stages into the installable tarball: hardened
+systemd units for the three long-running roles (`wyrd-d-server`, `wyrd-custodian`,
+`wyrd-s3`), per-role `/etc/wyrd/<role>.env` examples mirroring the M4 blueprint's
+production invocations, and an idempotent `install.sh` (installs, never enables).
+The pipeline builds `deploy/docker/wyrd/`'s image (`fdb,etcd`) and extracts the
+binary from it, so tarball and image ship the identical binary; releases are cut
+by tag via `.github/workflows/release.yml`, signed per ADR-0030. See
+`dist/README.md` (the doc that ships inside the tarball) for the install
+walkthrough, and `xtask/tests/dist_templates.rs` for the pinned template contract.
+
 ## Profile matrix — the two metadata backends across the three ADR-0043 fixture tiers
 
 Wyrd's two production-candidate metadata backends — **TiKV** (the retained fallback,
