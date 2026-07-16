@@ -42,9 +42,10 @@ use wyrd_gateway_s3::{S3Config, S3Gateway};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_server::consistency_observable::{ObservableS3Client, OpKind, OpRecord};
 use wyrd_server::consistency_workload::{
-    consistency_verdict_dispatch, membership, ConsistencyVerdictDispatch, DirOpKind, DirRecord,
-    DirectoryHistory, Membership, MultiProcessHistory, ProcOp, ELLE_IN_GATE_CMD_VAR,
-    ELLE_OFF_CHECK_VERDICT_JOB,
+    compose_final_read, consistency_verdict_dispatch, delete_pool_key, membership,
+    ConsistencyVerdictDispatch, DirCreate, DirFinalRead, DirectoryHistory, Membership,
+    MultiProcessHistory, ProcOp, ELLE_IN_GATE_CMD_VAR, ELLE_OFF_CHECK_VERDICT_JOB,
+    REGISTER_OVERWRITE_POOL_KEY,
 };
 use wyrd_server::Gateway;
 
@@ -96,26 +97,27 @@ fn proc_op(
     }
 }
 
-fn dir_rec(op: DirOpKind, member: &str, status: u16, start: u64, end: u64) -> DirRecord {
-    DirRecord {
-        process: 0,
-        op,
-        member: member.to_string(),
+fn dir_create(process: usize, id: u64, status: u16, start: u64, end: u64) -> DirCreate {
+    DirCreate {
+        process,
+        id,
         status,
         start: at(start),
         end: at(end),
     }
 }
 
-// ─── (b) Elle-EDN serializer: byte-exact golden, indeterminate → :info (INV-1) ─────────
+// ─── (b) Elle-EDN serializer: byte-exact rw-register txn golden, indeterminate → :info ──
 
 #[test]
-fn register_serializer_emits_byte_exact_elle_edn_with_info_for_indeterminate() {
+fn register_serializer_emits_byte_exact_rw_register_txn_edn_with_info_for_indeterminate() {
     // A crafted 2-process register history: P0 overwrites the shared key (v1 determinate, v2
     // INDETERMINATE via a 500), P1 reads it (v1 determinate-present, then a determinate 404
-    // absent). The indeterminate PUT must serialize `:info` (never a definite `:ok`), and the
-    // determinate 404 read must serialize a definite `:ok` of `nil` — proving the completion-type
-    // arm distinguishes indeterminate from determinate-absent.
+    // absent). The vocabulary is the one elle-cli 0.1.9 ACCEPTS (verified at Plan; #408): every
+    // op is `:f :txn` with a micro-op `:value` — `[[:w key v]]` for a write, `[[:r key v]]` for a
+    // read — never the #406 scalar `:value` the real checker rejected. The indeterminate PUT must
+    // serialize `:info` (never a definite `:ok`), and the determinate 404 read a definite `:ok`
+    // reading `nil`.
     let history = MultiProcessHistory::from_ops(vec![
         proc_op(0, OpKind::Put, "k", Some(1), 200, 0, 10),
         proc_op(1, OpKind::Get, "k", Some(1), 200, 5, 15),
@@ -125,124 +127,126 @@ fn register_serializer_emits_byte_exact_elle_edn_with_info_for_indeterminate() {
 
     // The exact bytes (an EDN operation-history vector, one map per line). Written as a literal,
     // NOT recomputed with the serializer's own join, so a delimiter/field/order change is caught.
-    // Every register entry carries its `:key` so the checker can partition per register.
+    // The register key lives INSIDE the txn micro-op (elle partitions per key on it) — no :key.
     let expected = concat!(
-        "[{:process 0, :type :invoke, :f :write, :key \"k\", :value 1, :time 0}\n",
-        " {:process 1, :type :invoke, :f :read, :key \"k\", :value nil, :time 5}\n",
-        " {:process 0, :type :ok, :f :write, :key \"k\", :value 1, :time 10}\n",
-        " {:process 1, :type :ok, :f :read, :key \"k\", :value 1, :time 15}\n",
-        " {:process 0, :type :invoke, :f :write, :key \"k\", :value 2, :time 30}\n",
-        " {:process 0, :type :info, :f :write, :key \"k\", :value 2, :time 40}\n",
-        " {:process 1, :type :invoke, :f :read, :key \"k\", :value nil, :time 50}\n",
-        " {:process 1, :type :ok, :f :read, :key \"k\", :value nil, :time 60}]",
+        "[{:process 0, :type :invoke, :f :txn, :value [[:w \"k\" 1]], :time 0}\n",
+        " {:process 1, :type :invoke, :f :txn, :value [[:r \"k\" nil]], :time 5}\n",
+        " {:process 0, :type :ok, :f :txn, :value [[:w \"k\" 1]], :time 10}\n",
+        " {:process 1, :type :ok, :f :txn, :value [[:r \"k\" 1]], :time 15}\n",
+        " {:process 0, :type :invoke, :f :txn, :value [[:w \"k\" 2]], :time 30}\n",
+        " {:process 0, :type :info, :f :txn, :value [[:w \"k\" 2]], :time 40}\n",
+        " {:process 1, :type :invoke, :f :txn, :value [[:r \"k\" nil]], :time 50}\n",
+        " {:process 1, :type :ok, :f :txn, :value [[:r \"k\" nil]], :time 60}]",
     );
 
     assert_eq!(
         history.to_elle_edn(),
         expected,
-        "the register serializer must emit byte-exact Elle EDN, mapping the indeterminate PUT \
-         to :info (never a definite :ok) and the determinate 404 read to a definite :ok of nil"
+        "the register serializer must emit byte-exact rw-register txn Elle EDN, mapping the \
+         indeterminate PUT to :info (never a definite :ok) and the determinate 404 read to a \
+         definite :ok reading nil"
     );
-    // Guard rail on the load-bearing INV-1 byte: the indeterminate write is `:info`, and no
-    // definite `:ok` is fabricated for it.
+    // Guard rail on the load-bearing INV-1 byte: the indeterminate write is `:info`, not :ok.
     assert!(
         history
             .to_elle_edn()
-            .contains(":type :info, :f :write, :key \"k\", :value 2"),
+            .contains(":type :info, :f :txn, :value [[:w \"k\" 2]]"),
         "an indeterminate write must carry :info, not a fabricated definite outcome"
+    );
+    // A register write NEVER emits a nil-write micro-op — `[:w k nil]` was verified at Plan to
+    // make even a correct history come back `false`, so it must never appear.
+    assert!(
+        !history.to_elle_edn().contains(":w \"k\" nil"),
+        "a nil-write [:w k nil] is a checker-rejected fabrication and must never be emitted"
     );
 }
 
 // ─── (a) Register serializer keeps distinct keys distinct (no single-register collapse) ─
 
 #[test]
-fn register_serializer_tags_each_op_with_its_key() {
-    // A write of key `a` then a read of key `b`. With the key dropped these collapse into one
-    // register, and `PUT a=1 ; GET b=absent` looks like a lost read-your-write on a single
-    // register — a false verdict (or, the other way, a real per-key bug is masked). Each op must
-    // carry its own `:key`, so distinct keys stay distinct in the serialized history.
+fn register_serializer_tags_each_op_with_its_key_inside_the_micro_op() {
+    // A write of key `a` then a read of key `b`. The key lives inside the txn micro-op, so distinct
+    // keys stay distinct registers (elle partitions per key on the micro-op key) — a read of key
+    // `b` after a write of key `a` must not look like same-key traffic.
     let history = MultiProcessHistory::from_ops(vec![
         proc_op(0, OpKind::Put, "a", Some(1), 200, 0, 10),
         proc_op(1, OpKind::Get, "b", None, 404, 5, 15),
     ]);
     let edn = history.to_elle_edn();
     assert!(
-        edn.contains(":f :write, :key \"a\", :value 1"),
-        "the write of key `a` must be tagged :key \"a\"; got:\n{edn}"
+        edn.contains("[[:w \"a\" 1]]"),
+        "the write of key `a` must carry [[:w \"a\" 1]]; got:\n{edn}"
     );
     assert!(
-        edn.contains(":f :read, :key \"b\", :value nil"),
-        "the read of key `b` must be tagged :key \"b\"; got:\n{edn}"
-    );
-    assert!(
-        edn.contains(":key \"a\"") && edn.contains(":key \"b\""),
-        "distinct keys must remain distinct — the history must not collapse into one register"
+        edn.contains("[[:r \"b\" nil]]"),
+        "the read of key `b` must carry [[:r \"b\" nil]]; got:\n{edn}"
     );
 }
 
-// ─── (d) Directory-as-set serializer: indeterminate probe → :info, no fabricated false ─
+// ─── (b) A register DELETE has no rw-register encoding — panics, never a fabricated op ──
 
 #[test]
-fn directory_serializer_maps_indeterminate_probe_to_info_not_fabricated_absence() {
-    // create=PUT / delete=DELETE / membership=GET-probe (200 present / 404 absent). The probe
-    // of "bob" times out (503, indeterminate) — it must serialize `:info` with `["bob" nil]`,
-    // NEVER a fabricated `["bob" false]`.
-    let history = DirectoryHistory::from_records(vec![
-        dir_rec(DirOpKind::Create, "alice", 200, 0, 10),
-        dir_rec(DirOpKind::Probe, "alice", 200, 20, 30),
-        dir_rec(DirOpKind::Delete, "alice", 204, 40, 50),
-        dir_rec(DirOpKind::Probe, "alice", 404, 60, 70),
-        dir_rec(DirOpKind::Probe, "bob", 503, 80, 90),
-    ]);
+#[should_panic(expected = "no faithful rw-register")]
+fn register_serializer_panics_on_a_delete_never_fabricating_a_representation() {
+    // Design §2: register DELETE is excluded by pool construction, never per-op filtering. If a
+    // delete reaches the Elle-fed serializer it is a pool-construction bug — the serializer must
+    // hard-error rather than silently drop it or fabricate a nil-write.
+    let history =
+        MultiProcessHistory::from_ops(vec![proc_op(0, OpKind::Delete, "k", None, 204, 0, 10)]);
+    let _ = history.to_elle_edn();
+}
+
+// ─── (d) Directory-as-set serializer: `set` model — integer :add + composed :read ──────
+
+#[test]
+fn directory_serializer_emits_set_model_add_and_composed_read_with_integer_elements() {
+    // The `set` vocabulary elle-cli 0.1.9 accepts (verified at Plan): create → `:add` of a unique
+    // INTEGER element (a string element crashes the valid case to `:unknown`), plus ONE composed
+    // post-heal `:read` of the present set `#{ints}`. The v2 `:remove`/`:contains` vocabulary is
+    // gone (verified rejected). An INDETERMINATE create (503) is `:info`, and its uncertain
+    // element is NOT fabricated into the composed read.
+    let history = DirectoryHistory::from_set_run(
+        vec![
+            dir_create(0, 1, 200, 0, 10),
+            dir_create(1, 2, 200, 5, 15),
+            dir_create(0, 3, 503, 20, 30),
+        ],
+        Some(DirFinalRead {
+            process: 0,
+            present: vec![1, 2],
+            unresolved: Vec::new(),
+            start: at(40),
+            end: at(50),
+        }),
+    );
 
     let expected = concat!(
-        "[{:process 0, :type :invoke, :f :add, :value \"alice\", :time 0}\n",
-        " {:process 0, :type :ok, :f :add, :value \"alice\", :time 10}\n",
-        " {:process 0, :type :invoke, :f :contains, :value [\"alice\" nil], :time 20}\n",
-        " {:process 0, :type :ok, :f :contains, :value [\"alice\" true], :time 30}\n",
-        " {:process 0, :type :invoke, :f :remove, :value \"alice\", :time 40}\n",
-        " {:process 0, :type :ok, :f :remove, :value \"alice\", :time 50}\n",
-        " {:process 0, :type :invoke, :f :contains, :value [\"alice\" nil], :time 60}\n",
-        " {:process 0, :type :ok, :f :contains, :value [\"alice\" false], :time 70}\n",
-        " {:process 0, :type :invoke, :f :contains, :value [\"bob\" nil], :time 80}\n",
-        " {:process 0, :type :info, :f :contains, :value [\"bob\" nil], :time 90}]",
+        "[{:process 0, :type :invoke, :f :add, :value 1, :time 0}\n",
+        " {:process 1, :type :invoke, :f :add, :value 2, :time 5}\n",
+        " {:process 0, :type :ok, :f :add, :value 1, :time 10}\n",
+        " {:process 1, :type :ok, :f :add, :value 2, :time 15}\n",
+        " {:process 0, :type :invoke, :f :add, :value 3, :time 20}\n",
+        " {:process 0, :type :info, :f :add, :value 3, :time 30}\n",
+        " {:process 0, :type :invoke, :f :read, :value nil, :time 40}\n",
+        " {:process 0, :type :ok, :f :read, :value #{1 2}, :time 50}]",
     );
 
     assert_eq!(
         history.to_elle_edn(),
         expected,
-        "the directory serializer must map the indeterminate probe to :info with [member nil], \
-         never a fabricated [member false]"
+        "the directory serializer must emit the `set` model: integer :add ops + one composed \
+         :read of #{{present ints}}, indeterminate create → :info"
     );
-    assert!(
-        !history.to_elle_edn().contains("[\"bob\" false]"),
-        "an indeterminate membership probe must never fabricate a definite [member false]"
-    );
-}
-
-// ─── (d) Directory serializer escapes EDN-significant characters in member names ────────
-
-#[test]
-fn directory_serializer_escapes_special_characters_in_member_names() {
-    // Object names can contain EDN-significant characters — a quote, a backslash, a newline. The
-    // serializer must emit them as a valid escaped EDN string, never raw: a raw quote would close
-    // the string early (invalid checker input) and a raw backslash would change the parsed member.
-    let member = "a\"b\\c\nd";
-    let history = DirectoryHistory::from_records(vec![
-        dir_rec(DirOpKind::Create, member, 200, 0, 10),
-        dir_rec(DirOpKind::Probe, member, 200, 20, 30),
-    ]);
     let edn = history.to_elle_edn();
-
-    // Escaped form present: " → \" , \ → \\ , newline → \n.
+    // The checker-rejected v2 vocabulary must never appear.
     assert!(
-        edn.contains("\"a\\\"b\\\\c\\nd\""),
-        "the member must be emitted as a properly escaped EDN string; got:\n{edn}"
+        !edn.contains(":remove") && !edn.contains(":contains"),
+        "the set model must contain only :add/:read, never :remove/:contains: {edn}"
     );
-    // The raw, unescaped member (with a bare quote and a real newline) must never leak through.
+    // Elements are integers, never quoted strings.
     assert!(
-        !edn.contains(member),
-        "the raw unescaped member must never appear in the serialized EDN"
+        !edn.contains(":add, :value \""),
+        "set elements must be integers, never strings (a string crashes the checker): {edn}"
     );
 }
 
@@ -260,6 +264,191 @@ fn membership_derivation_never_coerces_unknown_to_absent() {
         membership(503),
         Membership::Absent,
         "an indeterminate probe must never be coerced to a definite absence"
+    );
+}
+
+// ─── (d2) The composed post-heal final read: an unknown member is never a silent absence ──
+
+/// The composed final read is a claim about the WHOLE set, so an unresolved member may not simply
+/// be dropped from it: in the `set` model an acknowledged `:add` missing from a definite `:ok`
+/// read is a **lost element**, and the real elle-cli returns `false` for exactly that shape (the
+/// committed `directory-history-known-bad.edn` fixture). Dropping an unknown probe would therefore
+/// fabricate a violation out of a question the sweep never got an answer to — INV-1 in the
+/// absence direction. It degrades the composed read to `:info` instead.
+#[test]
+fn an_unresolved_probe_degrades_the_composed_read_to_info_rather_than_omitting_the_member() {
+    // Member 1 probed present (200), member 2's probe FAILED (503 — what a nemesis induces), and
+    // member 3 probed genuinely absent (404).
+    let read = compose_final_read(0, &[(1, 200), (2, 503), (3, 404)], at(40), at(50));
+
+    assert_eq!(
+        read.present,
+        vec![1],
+        "only a determinate 200 proves presence"
+    );
+    assert_eq!(
+        read.unresolved,
+        vec![2],
+        "an indeterminate probe must be RECORDED as unresolved, never silently dropped — \
+         dropping it states a fabricated absence, which the `set` model reads as a lost element"
+    );
+    assert!(
+        !read.is_determinate(),
+        "a sweep with an unresolved member composed no definite set"
+    );
+
+    // …and the serializer must state that uncertainty, not paper over it.
+    let edn = DirectoryHistory::from_set_run(
+        vec![dir_create(0, 1, 200, 0, 10), dir_create(0, 2, 200, 5, 15)],
+        Some(read),
+    )
+    .to_elle_edn();
+    assert!(
+        edn.contains("{:process 0, :type :info, :f :read, :value nil, :time 50}"),
+        "an indeterminate composed read must complete :info with a nil value (verified against \
+         elle-cli 0.1.9: the model then returns `:unknown` ⇒ INCONCLUSIVE, never a vacuous \
+         pass): {edn}"
+    );
+    assert!(
+        !edn.contains(":type :ok, :f :read"),
+        "an indeterminate sweep must NEVER emit a definite :ok read — that claims the unresolved \
+         members are absent, i.e. a fabricated lost element: {edn}"
+    );
+}
+
+/// The dual, so the degrade cannot be "fixed" by making every read indeterminate: a sweep that
+/// resolved every member still emits a definite `:ok` read — including the genuinely **absent**
+/// (404) member, which is a real observation and must stay visible to the checker as a lost
+/// element. Suppressing that is how a real violation would get hidden.
+#[test]
+fn a_fully_resolved_sweep_composes_a_definite_read_that_still_exposes_a_lost_element() {
+    // Member 2 was created but probes 404: definitely gone.
+    let read = compose_final_read(0, &[(1, 200), (2, 404)], at(40), at(50));
+    assert!(read.is_determinate());
+    assert_eq!(read.present, vec![1]);
+    assert!(
+        read.unresolved.is_empty(),
+        "a determinate 404 is an OBSERVATION of absence, not an unresolved probe"
+    );
+
+    let edn = DirectoryHistory::from_set_run(
+        vec![dir_create(0, 1, 200, 0, 10), dir_create(0, 2, 200, 5, 15)],
+        Some(read),
+    )
+    .to_elle_edn();
+    assert!(
+        edn.contains("{:process 0, :type :ok, :f :read, :value #{1}, :time 50}"),
+        "a fully resolved sweep composes a definite :ok read whose set omits the definitely-absent \
+         member — the shape the real checker judges `false` as a lost element: {edn}"
+    );
+}
+
+/// The report's "history size" must count the **checked** history, not the sweep's raw probes: the
+/// whole universe sweep enters the EDN as ONE composed `:read`. Counting probes as ops overstates
+/// the checked directory history ~2x in the one field an outsider judges the run's weight by.
+#[test]
+fn directory_op_count_counts_the_composed_read_once_not_every_probe() {
+    let creates = vec![dir_create(0, 1, 200, 0, 10), dir_create(1, 2, 200, 5, 15)];
+    let swept = compose_final_read(0, &[(1, 200), (2, 200)], at(40), at(50));
+
+    let with_read = DirectoryHistory::from_set_run(creates.clone(), Some(swept));
+    assert_eq!(
+        with_read.op_count(),
+        3,
+        "2 creates + ONE composed read — never 2 creates + one probe per swept member"
+    );
+    assert_eq!(
+        DirectoryHistory::from_set_run(creates, None).op_count(),
+        2,
+        "an add-only history has no composed read to count"
+    );
+}
+
+// ─── (c0) Delete-pool construction: single writer per key (the INV-1 dual) ─────────────
+
+/// **The delete pool's keys must be single-writer-by-construction.** The version tag this workload
+/// writes is client-assigned, so it orders by *writer*, not by *commit* — and all three #406 checks
+/// judging this pool compare raw version tags on a key. With two writers on ONE key (e.g. disjoint
+/// version *bands*), a perfectly linearizable execution makes those checks report `false`, and the
+/// runner escalates that to "a real violation observed on the live cluster": a fabricated violation
+/// that would wreck the credibility artifact.
+///
+/// This pins the fix at its premise. `delete_pool_key` gives each process its own key, so this
+/// linearizable history — built with the SAME production key assignment the live scenario uses —
+/// must be judged clean by all three checks.
+#[test]
+fn delete_pool_keys_are_single_writer_per_key_so_version_tags_track_commit_order() {
+    // The keys are disjoint per process, and disjoint from the Elle-fed overwrite pool's key
+    // (which is what makes excluding the delete traffic from the register EDN sound at all).
+    assert_ne!(
+        delete_pool_key(0),
+        delete_pool_key(1),
+        "each delete-pool process must own its key: a shared key has multiple writers, and a \
+         client-assigned version tag then no longer tracks commit order"
+    );
+    assert_ne!(delete_pool_key(0), REGISTER_OVERWRITE_POOL_KEY);
+    assert_ne!(delete_pool_key(1), REGISTER_OVERWRITE_POOL_KEY);
+
+    // A linearizable interleaving of the pool's real traffic (PUT → read-your-write → DELETE →
+    // read-after-delete), two processes, on the production keys. p1's writes commit BETWEEN p0's —
+    // the interleaving that a shared key would misjudge.
+    let (k0, k1) = (delete_pool_key(0), delete_pool_key(1));
+    let history = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Put, &k0, Some(1), 200, 0, 10),
+        proc_op(1, OpKind::Put, &k1, Some(1), 200, 12, 20),
+        proc_op(1, OpKind::Get, &k1, Some(1), 200, 22, 30),
+        proc_op(0, OpKind::Put, &k0, Some(2), 200, 32, 40),
+        proc_op(0, OpKind::Get, &k0, Some(2), 200, 42, 50),
+        proc_op(1, OpKind::Delete, &k1, None, 204, 52, 60),
+        proc_op(1, OpKind::Get, &k1, None, 404, 62, 70),
+        proc_op(0, OpKind::Get, &k0, Some(2), 200, 72, 80),
+    ]);
+
+    assert!(
+        history.session_read_your_writes(),
+        "a linearizable single-writer-per-key delete pool must not violate read-your-writes"
+    );
+    assert!(
+        history.session_monotonic_reads(),
+        "a linearizable single-writer-per-key delete pool must not violate monotonic reads"
+    );
+    assert!(
+        history.reads_monotone_per_key(),
+        "a linearizable single-writer-per-key delete pool must not violate per-key read \
+         monotonicity"
+    );
+}
+
+/// The refutation that makes the test above load-bearing rather than decorative: the SAME
+/// linearizable execution, re-keyed onto ONE shared key with disjoint version bands (`p0: 1..`,
+/// `p1: 1_000_000..`), is reported as a violation by all three production checks. p0's `v=2`
+/// commits *after* p1's `v=1_000_001`, so a later read legitimately observes the smaller tag.
+///
+/// The checks are not wrong — they are #406's landed, INV-1-sound checks and stay untouched (the
+/// brief's scope). Their premise (tag order = commit order) is what a shared key breaks. This test
+/// documents the trap so nobody "simplifies" the pool back onto one key: if a future change makes
+/// `delete_pool_key` return a shared key, the test above goes red and this one explains why.
+#[test]
+fn a_shared_delete_pool_key_with_version_bands_would_fabricate_a_violation() {
+    const SHARED: &str = "checked-delete-register";
+    let banded = MultiProcessHistory::from_ops(vec![
+        proc_op(0, OpKind::Put, SHARED, Some(1), 200, 0, 10),
+        proc_op(1, OpKind::Put, SHARED, Some(1_000_001), 200, 12, 20),
+        proc_op(1, OpKind::Get, SHARED, Some(1_000_001), 200, 22, 30),
+        // p0's v=2 commits AFTER p1's v=1_000_001 — a newer commit carrying a SMALLER tag.
+        proc_op(0, OpKind::Put, SHARED, Some(2), 200, 32, 40),
+        proc_op(0, OpKind::Get, SHARED, Some(2), 200, 42, 50),
+        proc_op(1, OpKind::Get, SHARED, Some(2), 200, 52, 60),
+    ]);
+
+    assert!(
+        !banded.reads_monotone_per_key(),
+        "the shared-key banded shape must be exhibited as the trap it is: p1's read of the \
+         smaller-but-newer tag reads as a regression, so a CORRECT system is reported violating"
+    );
+    assert!(
+        !banded.session_read_your_writes(),
+        "p1 reads v=2 after its own v=1_000_001 write — a fabricated read-your-writes violation"
     );
 }
 

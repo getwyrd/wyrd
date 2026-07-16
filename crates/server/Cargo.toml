@@ -104,6 +104,12 @@ tower.workspace = true
 [dev-dependencies]
 wyrd-chunk-format.workspace = true
 wyrd-testkit.workspace = true
+# The #407 composable-nemesis lifecycle seam (`nemesis::{NemesisLeg, drive_leg, PartitionLeg,
+# ClockSkewLeg, ProcessPauseLeg}` + the typed `MaterializationEvidence`), consumed as-is by the
+# #408 live checked-consistency scenario (`tests/consistency_run_fdb.rs`, `fdb`-feature-gated).
+# Trait-only + `docker` shell-outs (no `libfdb_c` linkage of its own), so it is a normal
+# dev-dependency here — it does not widen the default build graph.
+wyrd-metadata-fault-conformance.workspace = true
 tempfile.workspace = true
 # `test-util` adds the `start_paused` virtual clock so the alloc_inode budget test
 # auto-advances through its backoff sleeps instead of waiting the real budget.

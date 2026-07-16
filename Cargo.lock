@@ -5194,6 +5194,7 @@ dependencies = [
  "wyrd-custodian",
  "wyrd-gateway-core",
  "wyrd-gateway-s3",
+ "wyrd-metadata-fault-conformance",
  "wyrd-metadata-fdb",
  "wyrd-metadata-redb",
  "wyrd-metadata-tikv",

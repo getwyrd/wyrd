@@ -10,14 +10,22 @@
 //! 2. a **concurrency witness** ([`MultiProcessHistory::is_genuinely_concurrent`]) that counts
 //!    an overlap ONLY when it constrains a single register (INV-2);
 //! 3. an **Elle-EDN serializer** ([`MultiProcessHistory::to_elle_edn`] /
-//!    [`DirectoryHistory::to_elle_edn`]) that maps every **indeterminate** wire outcome to
-//!    `:info`, never a definite `:ok`/`:fail` (INV-1);
+//!    [`DirectoryHistory::to_elle_edn`]) in the **vocabulary elle-cli 0.1.9 actually accepts**
+//!    (verified at Plan against the real jar, #408): the register history in the
+//!    `rw-register` **transaction-micro-op** form (`:f :txn`, `:value [[:w key v]]` /
+//!    `[[:r key v]]`) and the directory in the `set` model (`:add` of integer elements + one
+//!    composed `:read`); every **indeterminate** wire outcome maps to `:info`, never a definite
+//!    `:ok`/`:fail` (INV-1);
 //! 4. **session** read-your-writes + monotonic-read checks and a **per-key** read-monotonicity
 //!    check, all *sound* — an indeterminate op never establishes a definite obligation and is
 //!    never counted as a violation (INV-1);
-//! 5. a **directory-as-set** history ([`DirectoryHistory`]) — create=PUT / delete=DELETE /
-//!    membership=GET-probe (no rename, no wire `LIST`) — serialized to the checker's set op
-//!    form, with indeterminate probes mapped to `:info` (no fabricated `[member false]`);
+//! 5. a **directory-as-set** history ([`DirectoryHistory`]) in Elle's `set` vocabulary — create
+//!    `:add`s of unique **integer** elements during the fault window plus ONE composed post-heal
+//!    `:read` of the present set ([`compose_final_read`], Design §2); deletes and mid-run probes
+//!    run for the Wyrd-side counts but, by construction, never enter the set EDN
+//!    (`:remove`/`:contains` are checker-rejected — verified `:unknown` at Plan); an indeterminate
+//!    create is `:info`, and a sweep that cannot resolve every member degrades the composed read
+//!    to `:info` rather than omit the member from a definite `:ok` set;
 //! 6. a **verdict-dispatch** value ([`consistency_verdict_dispatch`]) that routes the Elle
 //!    verdict to the privileged off-Check job — representable + unit-tested, never a JVM
 //!    shell-out into `ci` (mirrors `xtask/src/metadata_faults.rs`).
@@ -28,11 +36,19 @@
 //! outcome (5xx / timeout / synthetic-0 status — see [`is_indeterminate`]) into a **definite**
 //! obligation, completion type, or membership claim. An indeterminate op is `:info` ("may or
 //! may not have happened"); a local check **SKIPS** it. Enforced across every arm: the register
-//! completion-type (see [`register_completion_keyword`]); the directory completion-type and its
-//! membership derivation (see [`membership`]); the RYW PUT/DELETE obligation arms and the RYW
+//! completion-type (see [`register_completion_keyword`]); the directory set-`:add` completion-type
+//! and the composed-read membership derivation (see [`membership`] and [`compose_final_read`] —
+//! an unresolved member degrades the composed read to `:info` instead of being silently dropped
+//! from a definite `:ok` set, which would state a fabricated **absence**); the RYW PUT/DELETE
+//! obligation arms and the RYW
 //! read side (see [`MultiProcessHistory::session_read_your_writes`]); and the monotonic-read
 //! checks (see [`MultiProcessHistory::session_monotonic_reads`] and
 //! [`MultiProcessHistory::reads_monotone_per_key`]).
+//!
+//! INV-1 has a **dual** the delete pool's construction turns on: no function may fabricate a
+//! definite *violation* either. The checks compare client-assigned version tags, which order by
+//! commit only when a key has ONE writer — so the pool keys are built single-writer-per-key
+//! ([`delete_pool_key`]) rather than the checks being loosened.
 //!
 //! **INV-2 (non-vacuity).** An overlap counts as genuine concurrency ONLY when it imposes an
 //! ordering constraint on **one** register — **same-key**, **read↔write**, across **distinct
@@ -56,6 +72,48 @@ use crate::consistency_observable::{History, OpKind, OpRecord};
 #[must_use]
 pub fn is_indeterminate(status: u16) -> bool {
     status == 0 || status >= 500
+}
+
+// ─── Pool construction (Design §2) — the keys, and why they are shaped this way ────────
+
+/// The **Elle-fed register overwrite pool**'s single shared key (Design §2). A shared key is
+/// correct *here* — and only here — because the pool has exactly **one writer**: the overwrite
+/// process assigns a unique, ascending version per write, and the concurrent reader only reads.
+/// It is the key the INV-2 concurrency witness and the `rw-register` verdict are claimed on.
+pub const REGISTER_OVERWRITE_POOL_KEY: &str = "checked-register";
+
+/// The **Wyrd-checked delete pool**'s key for `process` — **one writer per key, by
+/// construction** (Design §2).
+///
+/// # Why per-process keys, and not one shared key with disjoint version bands
+///
+/// The register version this workload writes is **client-assigned**
+/// ([`crate::consistency_observable::ObservableS3Client::put`] takes it as an argument) and a read
+/// observes the tag its writer chose. So a version tag orders by **writer**, not by **commit**.
+/// All three #406 checks that judge this pool
+/// ([`MultiProcessHistory::session_read_your_writes`],
+/// [`MultiProcessHistory::session_monotonic_reads`], [`MultiProcessHistory::reads_monotone_per_key`])
+/// compare raw version numbers on a key and assume tag order **is** commit order — which holds iff
+/// a key has a single writer.
+///
+/// Give two processes disjoint *bands* on one shared key (`p0: 1..`, `p1: 1_000_000..`) and that
+/// assumption breaks: the linearizable execution
+/// `p0 PUT v=1; p1 PUT v=1_000_001; p1 GET→1_000_001; p0 PUT v=2; p0 GET→2; p1 GET→2`
+/// commits `v=2` *after* `v=1_000_001`, so a later read legitimately observes the **smaller** tag
+/// and every one of the three checks reports `false` — a **fabricated violation** on a correct
+/// system, which the runner escalates to "a real violation observed on the live cluster". That is
+/// INV-1's prohibition in the other direction (fabricated certainty *of a fault*), and it would
+/// wreck the credibility artifact this issue exists to produce.
+///
+/// Disjoint keys remove the premise instead of patching the symptom: one writer per key ⇒ tag
+/// order = commit order ⇒ the checks are sound as landed, untouched (they stay out of scope).
+/// Cross-process traffic still exists **where a version comparison is actually sound** — the
+/// Elle-fed overwrite pool, where the real checker judges concurrency. Pinned at Check by
+/// `crates/server/tests/consistency_workload.rs`
+/// (`delete_pool_keys_are_single_writer_per_key_so_version_tags_track_commit_order`).
+#[must_use]
+pub fn delete_pool_key(process: usize) -> String {
+    format!("checked-delete-register-p{process}")
 }
 
 // ─── Multi-process history ────────────────────────────────────────────────────────────
@@ -308,18 +366,32 @@ impl MultiProcessHistory {
         reads_are_monotone(self.ops.iter())
     }
 
-    /// Serialize to **Elle's EDN operation-history format** — one `:invoke` entry at each op's
-    /// `start` and one completion (`:ok` / `:fail` / `:info`) at its `end`, the whole flat log
-    /// sorted by relative time. Every field the criterion names is present:
-    /// `:process` / `:type` / `:f` / `:value` / `:time`. INV-1: an **indeterminate** completion
-    /// is `:info` (never a definite `:ok`/`:fail`), see [`register_completion_keyword`].
+    /// Serialize to **Elle's EDN `rw-register` transaction-micro-op format** — the vocabulary
+    /// elle-cli 0.1.9 actually accepts (verified at Plan against the real jar; the #406 scalar
+    /// `:value` shape was rejected with "Don't know how to create ISeq from: java.lang.Long").
+    /// One `:invoke` entry at each op's `start` and one completion (`:ok` / `:fail` / `:info`) at
+    /// its `end`, the whole flat log sorted by relative time. Each entry is
+    /// `{:process P, :type T, :f :txn, :value [[<micro-op>]], :time N}` where the micro-op is
+    /// `[:w <key> <int>]` for a write and `[:r <key> <int-or-nil>]` for a read — the register key
+    /// lives **inside** the micro-op (elle partitions per key on it), so no separate `:key` field
+    /// is emitted. INV-1: an **indeterminate** completion is `:info` (never a definite
+    /// `:ok`/`:fail`), see [`register_completion_keyword`].
+    ///
+    /// **Exclusion by construction (Design §2), never per-op filtering.** The Elle-fed overwrite
+    /// pool is built PUT/GET-only: a register DELETE has no faithful `rw-register` encoding (a
+    /// nil-write `[:w k nil]` makes a *correct* history come back `false`; a 404-after-delete read
+    /// maps to `nil`, indistinguishable from unwritten), so deletes belong to the disjoint
+    /// Wyrd-checked delete pool and are **never** serialized here. Reaching this function with a
+    /// DELETE (or a versionless write) is a pool-construction bug, not something to silently drop —
+    /// it panics rather than emit a checker-rejected `[:w k nil]`.
     ///
     /// `:time` is nanoseconds relative to the earliest `start` in the history (Jepsen's
     /// test-relative clock), so the bytes are stable and small.
     ///
-    /// This in-gate serialization proves the serializer is **stable and well-shaped**; it does
-    /// NOT by itself prove real-Elle-parser acceptance — that is the deferred, off-Check
-    /// verdict leg (ADR-0041), over the SAME serialized history.
+    /// This in-gate serialization proves the serializer is **stable and well-shaped**; the
+    /// committed real-elle-cli-accepted golden fixtures (`xtask/tests/fixtures/consistency-run/`)
+    /// pin the vocabulary against the actual checker, and the deferred off-Check verdict leg
+    /// (ADR-0041) runs the real jar over the SAME serialized history.
     #[must_use]
     pub fn to_elle_edn(&self) -> String {
         if self.ops.is_empty() {
@@ -333,11 +405,22 @@ impl MultiProcessHistory {
             .unwrap_or(UNIX_EPOCH);
         let mut entries: Vec<Entry> = Vec::with_capacity(self.ops.len() * 2);
         for op in &self.ops {
-            let f = register_f(op.record.kind);
-            // Carry the register key on every entry — the checker partitions the history per key,
-            // so dropping it would collapse distinct keys into one register (INV-2 for the checker
-            // input). Object names can hold EDN-significant characters, so escape the key.
-            let key = edn_string(&op.record.key);
+            let key = &op.record.key;
+            let (invoke_value, completion_value) = match op.record.kind {
+                OpKind::Put => {
+                    let w = register_write_microop(key, op.record.version);
+                    (w.clone(), w)
+                }
+                OpKind::Get => (
+                    register_read_microop(key, None),
+                    register_read_microop(key, op.record.version),
+                ),
+                OpKind::Delete => panic!(
+                    "a register DELETE has no faithful rw-register (txn) encoding — the Elle-fed \
+                     overwrite pool must be constructed delete-free (Design §2); deletes belong to \
+                     the disjoint Wyrd-checked delete pool and are never serialized here"
+                ),
+            };
             entries.push(Entry {
                 time: rel_nanos(base, op.record.start),
                 process: op.process,
@@ -345,9 +428,9 @@ impl MultiProcessHistory {
                 rendered: render_entry(
                     op.process,
                     "invoke",
-                    f,
-                    Some(&key),
-                    &register_invoke_value(op.record.kind, op.record.version),
+                    "txn",
+                    None,
+                    &invoke_value,
                     rel_nanos(base, op.record.start),
                 ),
             });
@@ -358,9 +441,9 @@ impl MultiProcessHistory {
                 rendered: render_entry(
                     op.process,
                     register_completion_type(op.record.kind, op.record.status).keyword(),
-                    f,
-                    Some(&key),
-                    &register_completion_value(op.record.kind, op.record.version),
+                    "txn",
+                    None,
+                    &completion_value,
                     rel_nanos(base, op.record.end),
                 ),
             });
@@ -546,12 +629,12 @@ fn render_history(mut entries: Vec<Entry>) -> String {
     format!("[{}]", rendered.join("\n "))
 }
 
-/// Render one operation-history map: `{:process P, :type :T, :f :F, :value V, :time N}`.
-/// Render one operation-history entry. `key`, when present, is the register key this op targeted
-/// (already an escaped EDN string) — it MUST be carried so a multi-key history is not collapsed
-/// into a single register (a read of key `b` after a write of key `a` would otherwise look like
-/// same-key traffic and produce a false verdict). The directory serializer carries its member in
-/// `:value`, so it passes `None`.
+/// Render one operation-history map: `{:process P, :type :T, :f :F, :value V, :time N}`, with an
+/// optional `:key`. Both current serializers pass `key: None`: the register `rw-register` form
+/// carries its key **inside** the txn micro-op (`[:w key v]` / `[:r key v]`, where the checker
+/// partitions per key), and the `set` form carries its integer element in `:value` — so neither
+/// needs a separate `:key` field. The parameter is retained for callers that key a flat register
+/// entry directly.
 fn render_entry(
     process: usize,
     type_kw: &str,
@@ -604,30 +687,23 @@ fn edn_string(s: &str) -> String {
     out
 }
 
-fn register_f(kind: OpKind) -> &'static str {
-    match kind {
-        OpKind::Put => "write",
-        OpKind::Get => "read",
-        OpKind::Delete => "delete",
-    }
+/// The write micro-op `[[:w <key> <int>]]` (Design §3). A register write ALWAYS carries a
+/// version — the overwrite pool assigns a unique one per write — so a `None` version is a
+/// pool-construction bug: emitting `[:w k nil]` was verified at Plan to make even a *correct*
+/// history come back `false`, so this panics rather than fabricate the checker-rejected shape.
+fn register_write_microop(key: &str, version: Option<u64>) -> String {
+    let v = version.expect(
+        "a register write must carry a version — a nil-write [:w k nil] is a checker-rejected \
+         fabrication (Design §3); the overwrite pool assigns a unique version per write",
+    );
+    format!("[[:w {} {v}]]", edn_string(key))
 }
 
-/// The `:value` on the **invoke** entry: a write carries its intended version, a read/delete
-/// carries `nil` (the read result is unknown at invoke time).
-fn register_invoke_value(kind: OpKind, version: Option<u64>) -> String {
-    match kind {
-        OpKind::Put => edn_version(version),
-        OpKind::Get | OpKind::Delete => "nil".to_string(),
-    }
-}
-
-/// The `:value` on the **completion** entry: a write echoes its version, a read carries the
-/// version observed (`nil` if absent), a delete carries `nil`.
-fn register_completion_value(kind: OpKind, version: Option<u64>) -> String {
-    match kind {
-        OpKind::Put | OpKind::Get => edn_version(version),
-        OpKind::Delete => "nil".to_string(),
-    }
+/// The read micro-op `[[:r <key> <int-or-nil>]]` (Design §3): the invoke side passes `None`
+/// (`nil` — the result is unknown at invoke time), the completion side passes the observed
+/// version (`nil` for an absent/unwritten read).
+fn register_read_microop(key: &str, version: Option<u64>) -> String {
+    format!("[[:r {} {}]]", edn_string(key), edn_version(version))
 }
 
 /// The register completion `:type` **keyword** (without the leading colon) a `(kind, status)`
@@ -655,119 +731,12 @@ fn register_completion_type(kind: OpKind, status: u16) -> CompletionType {
     }
 }
 
-/// The directory completion `:type` **keyword** a `(op, status)` maps to — the directory
-/// analogue of [`register_completion_keyword`], so the INV-1 directory completion-type arm is
-/// directly assertable: an indeterminate probe MUST map to `"info"`.
-#[must_use]
-pub fn dir_completion_keyword(op: DirOpKind, status: u16) -> &'static str {
-    dir_completion_type(op, status).keyword()
-}
-
-// ─── Directory-as-set history ─────────────────────────────────────────────────────────
-
-/// A directory-as-set operation: create appends a member (a PUT under the prefix), delete
-/// removes it (a DELETE), and a membership probe (a GET-probe) asks whether one member is
-/// present. There is **no** rename and **no** wire `LIST` — the S3 wire floor is PUT/GET/DELETE
-/// only (`crates/gateway-s3/src/lib.rs:347`), so the set is modelled by single-member probes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DirOpKind {
-    /// Add a member to the set (create = PUT).
-    Create,
-    /// Remove a member from the set (delete = DELETE).
-    Delete,
-    /// Probe one member's presence (membership = GET-probe).
-    Probe,
-}
-
-/// One directory-as-set operation record, tagged with the client `:process` and its real-time
-/// span — the directory analogue of [`OpRecord`].
-#[derive(Debug, Clone)]
-pub struct DirRecord {
-    /// The client process id that observed this op.
-    pub process: usize,
-    /// Which set operation this records.
-    pub op: DirOpKind,
-    /// The member (object name under the prefix) the op targeted.
-    pub member: String,
-    /// The HTTP status the wire returned (200/204/404/…).
-    pub status: u16,
-    /// Real time just before the request began.
-    pub start: SystemTime,
-    /// Real time just after the response was fully read.
-    pub end: SystemTime,
-}
-
-/// A recorded directory-as-set history — the namespace-membership analogue of
-/// [`MultiProcessHistory`], serialized to the checker's set op form.
-#[derive(Debug, Default, Clone)]
-pub struct DirectoryHistory {
-    ops: Vec<DirRecord>,
-}
-
-impl DirectoryHistory {
-    /// Build a directory history from explicit records, preserving order.
-    #[must_use]
-    pub fn from_records(ops: Vec<DirRecord>) -> Self {
-        Self { ops }
-    }
-
-    /// The recorded set operations, in order.
-    #[must_use]
-    pub fn ops(&self) -> &[DirRecord] {
-        &self.ops
-    }
-
-    /// Serialize to the checker's **set op form** in Elle's EDN: create → `:add`, delete →
-    /// `:remove`, probe → `:contains` carrying `[member present?]`. INV-1: an **indeterminate**
-    /// probe is `:info` with `[member nil]` — a fabricated `[member false]` is never emitted
-    /// (see [`membership`]).
-    #[must_use]
-    pub fn to_elle_edn(&self) -> String {
-        if self.ops.is_empty() {
-            return "[]".to_string();
-        }
-        let base = self
-            .ops
-            .iter()
-            .map(|op| op.start)
-            .min()
-            .unwrap_or(UNIX_EPOCH);
-        let mut entries: Vec<Entry> = Vec::with_capacity(self.ops.len() * 2);
-        for op in &self.ops {
-            let f = dir_f(op.op);
-            entries.push(Entry {
-                time: rel_nanos(base, op.start),
-                process: op.process,
-                phase: Phase::Invoke,
-                rendered: render_entry(
-                    op.process,
-                    "invoke",
-                    f,
-                    None, // the set model carries its member in :value, not a separate :key
-                    &dir_invoke_value(op.op, &op.member),
-                    rel_nanos(base, op.start),
-                ),
-            });
-            entries.push(Entry {
-                time: rel_nanos(base, op.end),
-                process: op.process,
-                phase: Phase::Complete,
-                rendered: render_entry(
-                    op.process,
-                    dir_completion_type(op.op, op.status).keyword(),
-                    f,
-                    None, // see above
-                    &dir_completion_value(op.op, &op.member, op.status),
-                    rel_nanos(base, op.end),
-                ),
-            });
-        }
-        render_history(entries)
-    }
-}
+// ─── Directory-as-set history (Elle `set` model) ──────────────────────────────────────
 
 /// A directory member's derived presence from a membership-probe status (INV-1):
 /// `200 → Present`, `404 → Absent`, **everything else → Unknown** — never definitely-absent.
+/// Used to compose the post-heal final read (Design §2): only a determinate `Present` member
+/// enters the composed `:read` set; an `Unknown` probe never fabricates presence OR absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Membership {
     /// The member is present (a determinate 200 probe).
@@ -791,57 +760,275 @@ pub fn membership(status: u16) -> Membership {
     }
 }
 
-fn dir_f(op: DirOpKind) -> &'static str {
-    match op {
-        DirOpKind::Create => "add",
-        DirOpKind::Delete => "remove",
-        DirOpKind::Probe => "contains",
+/// One create in the directory **set** model (Design §2): an `add` of a unique **integer**
+/// element `id` during the fault window. The name↔id map lives in the run summary/report — Elle's
+/// `set` checker requires integer elements (verified at Plan: string elements crash the valid
+/// case to `:unknown`), so the wire object name never enters the EDN.
+#[derive(Debug, Clone, Copy)]
+pub struct DirCreate {
+    /// The client process id that issued the create.
+    pub process: usize,
+    /// The unique integer element added (the `:value` of the `:add`).
+    pub id: u64,
+    /// The HTTP status the create returned (200/204/5xx/…).
+    pub status: u16,
+    /// Real time just before the create began.
+    pub start: SystemTime,
+    /// Real time just after the create response was read.
+    pub end: SystemTime,
+}
+
+/// The single **composed post-heal full-set read** (Design §2, Jepsen's own final-read pattern):
+/// after heal + quiesce the scenario probes every member of the known universe sequentially and
+/// emits ONE `:read` of the whole present set — sound because the set is no longer mutating.
+/// `present` is the integer elements observed present (composed from determinate 200 probes via
+/// [`membership`]); a mid-run single-member probe can never compose an atomic set read, so only
+/// this one exists in the EDN.
+///
+/// # `unresolved` is what keeps the composed read honest (INV-1)
+///
+/// A composed `:ok` read is a claim about the **whole** set: "these elements are present and every
+/// other created element is *not*". So a member whose probe came back [`Membership::Unknown`]
+/// (5xx/timeout — exactly what a nemesis induces) cannot simply be left out of `present`: in the
+/// `set` model an acknowledged `:add` missing from a definite final read **is a lost element**, and
+/// the real checker returns `false` for it (verified — the committed
+/// `directory-history-known-bad.edn` fixture is precisely that shape). Silently omitting an unknown
+/// member would therefore fabricate a violation out of an unanswered question.
+///
+/// Unknown members are recorded here instead, which makes the composed read **indeterminate**
+/// ([`is_determinate`](Self::is_determinate)) and serializes it as `:info` with a `nil` value
+/// rather than a definite `:ok` — the same "may or may not have happened" the register side gives
+/// an indeterminate op. Verified against elle-cli 0.1.9: a `set` history whose final read is
+/// `:info` (or absent) comes back **`:unknown`**, not a vacuous `true` — so the honest degrade is
+/// enforced by the checker itself and lands the run in INCONCLUSIVE, never a silent pass.
+#[derive(Debug, Clone)]
+pub struct DirFinalRead {
+    /// The client process id that performed the composed final read.
+    pub process: usize,
+    /// The integer elements observed **present** (determinate 200 probes) in the sweep.
+    pub present: Vec<u64>,
+    /// The integer elements whose presence the sweep could **not** determine ([`Membership::Unknown`]
+    /// — every indeterminate status). Non-empty ⇒ the composed read is `:info`, never a definite
+    /// `:ok` that would read as "these members are absent".
+    pub unresolved: Vec<u64>,
+    /// The real time the composed sweep began.
+    pub start: SystemTime,
+    /// The real time the composed sweep completed.
+    pub end: SystemTime,
+}
+
+impl DirFinalRead {
+    /// Whether the sweep resolved **every** probed member, so the composed read is a definite
+    /// claim about the whole set (`:ok`). An unresolved member makes it `:info` (INV-1).
+    #[must_use]
+    pub fn is_determinate(&self) -> bool {
+        self.unresolved.is_empty()
     }
 }
 
-/// The `:value` on a directory **invoke**: a create/delete carries the member string; a probe
-/// carries `[member nil]` (the membership result is unknown at invoke time).
-fn dir_invoke_value(op: DirOpKind, member: &str) -> String {
-    match op {
-        DirOpKind::Create | DirOpKind::Delete => edn_string(member),
-        DirOpKind::Probe => format!("[{} nil]", edn_string(member)),
-    }
-}
-
-/// The `:value` on a directory **completion**: a create/delete echoes the member; a probe
-/// carries `[member present?]` where `present?` is `true`/`false`/`nil` per [`membership`] —
-/// an indeterminate probe is `[member nil]`, never `[member false]` (INV-1).
-fn dir_completion_value(op: DirOpKind, member: &str, status: u16) -> String {
-    match op {
-        DirOpKind::Create | DirOpKind::Delete => edn_string(member),
-        DirOpKind::Probe => {
-            let present = match membership(status) {
-                Membership::Present => "true",
-                Membership::Absent => "false",
-                Membership::Unknown => "nil",
-            };
-            format!("[{} {present}]", edn_string(member))
+/// **Compose the post-heal full-set read** from the swept universe (Design §2) — the decision half
+/// of the sweep, kept here in the library (rather than in the `fdb`-gated live scenario) so the
+/// rule below is exercised by an ordinary `cargo xtask ci` unit test instead of only on a
+/// privileged cluster. `probes` is the `(element id, probe status)` of every member of the known
+/// universe, in sweep order; the scenario does the I/O (and any re-probing) and hands the outcomes
+/// here.
+///
+/// The classification is [`membership`]'s, and each branch is a distinct claim (INV-1):
+/// * `Present` (determinate 200) — the element **is** in the set: it enters `present`.
+/// * `Absent` (determinate 404) — the element is **not** in the set: it is genuinely excluded. If
+///   its create was acknowledged, that is a real lost element and the checker MUST see it as one;
+///   this is the one exclusion that is an observation rather than an absence of one.
+/// * `Unknown` (anything else) — nothing was observed: it enters `unresolved`, degrading the whole
+///   composed read to `:info`. Omitting it from a definite `:ok` read would state "absent", which
+///   is a fabricated observation and, in the `set` model, a fabricated *violation*.
+#[must_use]
+pub fn compose_final_read(
+    process: usize,
+    probes: &[(u64, u16)],
+    start: SystemTime,
+    end: SystemTime,
+) -> DirFinalRead {
+    let mut present = Vec::new();
+    let mut unresolved = Vec::new();
+    for (id, status) in probes {
+        match membership(*status) {
+            Membership::Present => present.push(*id),
+            Membership::Absent => {}
+            Membership::Unknown => unresolved.push(*id),
         }
     }
+    DirFinalRead {
+        process,
+        present,
+        unresolved,
+        start,
+        end,
+    }
 }
 
-/// Map a directory op's wire status to its completion `:type` (INV-1): an **indeterminate**
-/// status is `:info`; a determinate membership response (probe 200/404) or a determinate
-/// mutation success is `:ok`; any other determinate status is `:fail`.
-fn dir_completion_type(op: DirOpKind, status: u16) -> CompletionType {
-    if is_indeterminate(status) {
-        return CompletionType::Info;
+/// A recorded directory-as-set history in Elle's **`set`** vocabulary — `:add` of integer
+/// elements plus ONE composed `:read` of the present set. Deletes and mid-run membership probes
+/// run for the Wyrd-side counts and the concurrency witness but, by construction (Design §2),
+/// **never** enter this history: the `set` checker knows only `:add`/`:read` (verified at Plan —
+/// `:remove`/`:contains` come back `:unknown`), so exclusion is at pool construction, never a
+/// per-op filter over a mixed history.
+#[derive(Debug, Default, Clone)]
+pub struct DirectoryHistory {
+    creates: Vec<DirCreate>,
+    final_read: Option<DirFinalRead>,
+}
+
+impl DirectoryHistory {
+    /// Build a set-model directory history from the create ops and the composed final read
+    /// (Design §2). Passing `None` for the final read yields an add-only history (the pre-heal
+    /// partial view a test may pin); the live run always supplies the composed read.
+    #[must_use]
+    pub fn from_set_run(creates: Vec<DirCreate>, final_read: Option<DirFinalRead>) -> Self {
+        Self {
+            creates,
+            final_read,
+        }
     }
-    let ok = match op {
-        DirOpKind::Create => is_success(status),
-        DirOpKind::Delete => is_success(status) || status == 404,
-        DirOpKind::Probe => status == 200 || status == 404,
-    };
-    if ok {
+
+    /// The recorded `:add` create ops, in order.
+    #[must_use]
+    pub fn creates(&self) -> &[DirCreate] {
+        &self.creates
+    }
+
+    /// The composed post-heal final read, if one was recorded.
+    #[must_use]
+    pub fn final_read(&self) -> Option<&DirFinalRead> {
+        self.final_read.as_ref()
+    }
+
+    /// Serialize to Elle's **`set`** vocabulary (Design §3, verified against elle-cli 0.1.9): a
+    /// `{:f :add, :value <int>}` invoke/completion pair per create (INV-1: an indeterminate create
+    /// is `:info`), then — if a composed read was recorded — ONE `{:f :read, :value #{<ints>}}`
+    /// completion carrying the present set. **Integer elements only**, no `:remove`/`:contains`.
+    #[must_use]
+    pub fn to_elle_edn(&self) -> String {
+        if self.creates.is_empty() && self.final_read.is_none() {
+            return "[]".to_string();
+        }
+        let base = self
+            .creates
+            .iter()
+            .map(|c| c.start)
+            .chain(self.final_read.iter().map(|r| r.start))
+            .min()
+            .unwrap_or(UNIX_EPOCH);
+        let mut entries: Vec<Entry> = Vec::with_capacity(self.creates.len() * 2 + 2);
+        for c in &self.creates {
+            let value = c.id.to_string();
+            entries.push(Entry {
+                time: rel_nanos(base, c.start),
+                process: c.process,
+                phase: Phase::Invoke,
+                rendered: render_entry(
+                    c.process,
+                    "invoke",
+                    "add",
+                    None,
+                    &value,
+                    rel_nanos(base, c.start),
+                ),
+            });
+            entries.push(Entry {
+                time: rel_nanos(base, c.end),
+                process: c.process,
+                phase: Phase::Complete,
+                rendered: render_entry(
+                    c.process,
+                    set_add_completion_type(c.status).keyword(),
+                    "add",
+                    None,
+                    &value,
+                    rel_nanos(base, c.end),
+                ),
+            });
+        }
+        if let Some(read) = &self.final_read {
+            entries.push(Entry {
+                time: rel_nanos(base, read.start),
+                process: read.process,
+                phase: Phase::Invoke,
+                rendered: render_entry(
+                    read.process,
+                    "invoke",
+                    "read",
+                    None,
+                    "nil",
+                    rel_nanos(base, read.start),
+                ),
+            });
+            // INV-1: a sweep that could not resolve every member observed no definite set, so the
+            // composed read completes `:info` with a `nil` value — never an `:ok` of the partial
+            // set, which would claim the unresolved members are ABSENT (a lost element in the
+            // `set` model, i.e. a fabricated violation). Verified against elle-cli 0.1.9: this
+            // makes the model return `:unknown` ⇒ INCONCLUSIVE, never a silent pass.
+            let (completion, value) = if read.is_determinate() {
+                ("ok", edn_int_set(&read.present))
+            } else {
+                ("info", "nil".to_string())
+            };
+            entries.push(Entry {
+                time: rel_nanos(base, read.end),
+                process: read.process,
+                phase: Phase::Complete,
+                rendered: render_entry(
+                    read.process,
+                    completion,
+                    "read",
+                    None,
+                    &value,
+                    rel_nanos(base, read.end),
+                ),
+            });
+        }
+        render_history(entries)
+    }
+
+    /// The number of **history ops** this directory history contains — the honest "history size"
+    /// for the report (Design §6): one op per create, plus ONE for the composed final read.
+    ///
+    /// This is deliberately not "creates + members swept". The post-heal sweep probes every member
+    /// of the universe, but those probes are the *raw material* of the composed read, not ops in
+    /// the checked history: they enter the EDN as a single `:read` entry. Counting them would
+    /// overstate the checked directory history by roughly 2x in the one field an outsider uses to
+    /// judge how much was actually checked — and the Success criterion is that the run "refuses to
+    /// overstate itself".
+    #[must_use]
+    pub fn op_count(&self) -> usize {
+        self.creates.len() + usize::from(self.final_read.is_some())
+    }
+}
+
+/// The `set`-model create completion `:type` (INV-1): an **indeterminate** status is `:info`
+/// (the create may or may not have added the element), a determinate success is `:ok`, any other
+/// determinate status is `:fail`.
+fn set_add_completion_type(status: u16) -> CompletionType {
+    if is_indeterminate(status) {
+        CompletionType::Info
+    } else if is_success(status) {
         CompletionType::Ok
     } else {
         CompletionType::Fail
     }
+}
+
+/// An EDN integer-set literal `#{<sorted ints>}` (Design §3 — the composed final read's value).
+/// Sorted and de-duplicated so the bytes are stable and the set carries each element once.
+fn edn_int_set(ids: &[u64]) -> String {
+    let mut sorted: Vec<u64> = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let joined = sorted
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("#{{{joined}}}")
 }
 
 // ─── Verdict-dispatch seam (mirrors xtask/src/metadata_faults.rs) ──────────────────────
