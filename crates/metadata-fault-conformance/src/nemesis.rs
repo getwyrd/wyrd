@@ -226,9 +226,9 @@ impl MaterializationEvidence for SkewEvidence {
     }
 }
 
-/// The nemesis leg lifecycle — the ONE importable seam (Design §1). A leg is `plan`ned, its
-/// fault `apply`ed, `confirm_materialized` builds the typed evidence, then it `heal`s and
-/// confirms it healed. [`drive_leg`] wraps a caller's workload around this and enforces the two
+/// The nemesis leg lifecycle — the ONE importable seam (Design §1). A leg is planned
+/// (`plan`), its fault applied (`apply`), `confirm_materialized` builds the typed evidence,
+/// then it heals (`heal`) and confirms it healed. [`drive_leg`] wraps a caller's workload around this and enforces the two
 /// #442 gates (materialized-or-inconclusive, complete-heal). #408 consumes this WITHOUT
 /// reopening the lifecycle logic.
 ///
