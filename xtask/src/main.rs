@@ -32,6 +32,13 @@
 //!   `xtask::fdb_doctor`'s (environment facts in, verdict out); `run_fdb_conformance`
 //!   *is* a call to `fdb_doctor::run_gated_conformance`, so the same client-library
 //!   row fails the job fast.
+//! - `metadata-nemesis` — the M4 composable-nemesis runner (#407, slice 4 of #329): stand
+//!   up `deploy/fdb-multi-replica` and drive the three nemesis legs (live-node network
+//!   partition / clock skew / process pause) through
+//!   `wyrd-metadata-fault-conformance::nemesis::drive_leg`, each proven materialized and
+//!   healed (the #442 gates). Privileged and opt-in (`WYRD_TIER1=1`), never part of `ci`;
+//!   the pure leg-enumeration / dispatch / oracle logic is unit-tested in `ci`. #408
+//!   composes the *checked* Elle-history workload under these same legs.
 //! - `etcd-conformance` — the L5 Coordination backend-swap proof (#365, proposal
 //!   0015 §"Deployment prerequisite"): bring up the throwaway single-node etcd under
 //!   `deploy/` and drive the shared `Coordination` conformance suite + cross-instance
@@ -81,6 +88,7 @@ fn main() -> ExitCode {
         Some("fdb-conformance") => run_fdb_conformance(),
         Some("fdb-doctor") => run_fdb_doctor(),
         Some("fdb-metadata-tier1") => fdb_faults::run_fdb_metadata_tier1(),
+        Some("metadata-nemesis") => fdb_faults::run_metadata_nemesis(),
         Some("etcd-conformance") => run_etcd_conformance(),
         Some("deploy-small-multi-node") => run_deploy_small_multi_node(),
         Some("disk-faults") => faults::run_disk_faults(),
@@ -112,7 +120,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|etcd-conformance|deploy-small-multi-node|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 
