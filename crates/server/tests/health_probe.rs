@@ -417,6 +417,76 @@ async fn the_default_empty_service_check_tracks_the_store() {
     let _ = handle.await;
 }
 
+/// A connected streaming `Health/Watch` client must not pin shutdown: tonic's graceful
+/// shutdown waits for in-flight RPCs, and a Watch stream stays open until its CLIENT
+/// hangs up — unbounded, that let one watcher hold the whole role past SIGTERM,
+/// blocking lease revocation (Codex P1 on #587). The role now bounds the probe
+/// surface's drain (`HEALTH_SHUTDOWN_GRACE`) and aborts a pinned stream. Red pre-fix:
+/// `serve` never returns while the watcher stays connected, so this test times out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connected_watch_stream_does_not_pin_shutdown() {
+    let (store, _dir) = fs_store();
+    let health = Arc::new(Mutex::new(HealthMode::Healthy));
+    let controllable = ControllableStore {
+        inner: store,
+        health,
+        entered: None,
+        gate: None,
+    };
+    let health_bind = reserve_addr().await;
+    let (_endpoint, shutdown, handle) = serve_controllable(
+        controllable,
+        AdmissionControl::default(),
+        health_bind,
+        Duration::from_millis(20),
+    )
+    .await;
+    let mut client = health_client(&format!("http://{health_bind}")).await;
+
+    // Open the standard streaming Watch and receive its first update, proving the
+    // stream is genuinely established and in flight — and KEEP it open.
+    let mut watch = client
+        .watch(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .expect("Watch RPC establishes")
+        .into_inner();
+    let first = tokio::time::timeout(Duration::from_secs(5), watch.message())
+        .await
+        .expect("first Watch update arrives")
+        .expect("stream healthy");
+    assert!(first.is_some(), "Watch delivers an initial status");
+
+    // Order shutdown WITH the watcher still connected. The role must complete within
+    // the data drain + the bounded probe grace — never hang on the pinned stream.
+    let _ = shutdown.send(());
+    let joined = tokio::time::timeout(Duration::from_secs(10), handle)
+        .await
+        .expect(
+            "serve() returns after shutdown despite a connected Health/Watch stream \
+             (an unbounded probe drain would pin the role past SIGTERM)",
+        );
+    joined
+        .expect("serve task joins")
+        .expect("serve exits cleanly at shutdown");
+}
+
+/// A zero refresh interval must refuse at CONFIGURATION time: `tokio::time::interval`
+/// panics on a zero period, and inside the spawned refresher that panic would silently
+/// kill the refresh loop — readiness stuck at fail-closed NOT_SERVING while the data
+/// plane keeps serving (Codex P2 on #587). The builder is where the misconfiguration
+/// exists, so the builder is where it surfaces.
+#[tokio::test]
+#[should_panic(expected = "health refresh interval must be non-zero")]
+async fn a_zero_refresh_interval_refuses_at_the_builder() {
+    let (store, _dir) = fs_store();
+    let _ = DServer::bind(store, "127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind")
+        .with_health_refresh_interval(Duration::ZERO);
+}
+
 /// Success criterion (c): the health check still answers — rather than being shed with
 /// `RESOURCE_EXHAUSTED` — while the data plane is saturated at its admission bound
 /// (`max_concurrent_requests` held by an in-flight data RPC), dialed on the configured

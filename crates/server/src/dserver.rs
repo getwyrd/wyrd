@@ -78,6 +78,15 @@ pub const DEFAULT_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 /// [`with_health_refresh_interval`](DServer::with_health_refresh_interval).
 pub const DEFAULT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 
+/// How long the probe surface may drain after the data plane has finished its own
+/// graceful shutdown, before it is aborted. A streaming `Health/Watch` RPC stays open
+/// until its CLIENT hangs up, and tonic's graceful shutdown waits for in-flight RPCs —
+/// so an unbounded wait would let one connected watcher pin the whole role past
+/// SIGTERM, blocking lease revocation (Codex P1 on #587). Probe streams carry no user
+/// data; cutting them at shutdown is the designed outcome. Generous enough for every
+/// unary `Check` in flight to answer.
+pub const HEALTH_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 /// Default **stable** address the `grpc.health.v1.Health` probe surface binds
 /// (proposal 0010 §"Scope boundary" item 7) — a fixed, documented port beside the
 /// data plane's default (`127.0.0.1:50051`), so a deployment supervisor has a
@@ -640,6 +649,17 @@ impl<S: ChunkStore + 'static> DServer<S> {
     /// tightens how quickly an unhealthy store's readiness flip becomes observable, at
     /// the cost of polling `health()` more often.
     pub fn with_health_refresh_interval(mut self, interval: Duration) -> Self {
+        // Refuse zero AT CONFIGURATION TIME: `tokio::time::interval` panics on a zero
+        // period, and that panic would land inside the spawned refresher task — killing
+        // it silently while the data plane keeps serving, so readiness would sit at its
+        // fail-closed initial NOT_SERVING forever with no diagnostic (Codex P2 on #587).
+        // A loud panic at the builder is the misconfiguration surfacing where it was made.
+        assert!(
+            !interval.is_zero(),
+            "health refresh interval must be non-zero: a zero period panics the readiness \
+             refresher task and leaves the probe stuck at NOT_SERVING while the data plane \
+             keeps serving"
+        );
         self.health_refresh_interval = interval;
         self
     }
@@ -875,8 +895,17 @@ impl<S: ChunkStore + 'static> DServer<S> {
         // probe is served it gets its OWN, unlayered `Server::builder()` — no admission
         // layers, nothing shared with the data-plane builder above — on the configured
         // `health_bind` address, so a probe answered there is never contended by, or shed
-        // behind, the data plane's admission bound. `join!` (not `select!`) waits for BOTH
-        // to drain rather than dropping the other the moment either finishes.
+        // behind, the data plane's admission bound.
+        //
+        // The probe surface's drain is BOUNDED, not joined unconditionally: the standard
+        // streaming `grpc.health.v1.Health/Watch` RPC stays open until its CLIENT hangs
+        // up, and tonic's graceful shutdown waits for in-flight RPCs — so a plain `join!`
+        // would let one connected watcher pin this whole role past SIGTERM, never reaching
+        // the lease revocation below (Codex P1 on #587). The data plane still drains
+        // gracefully first (its in-flight work is bounded by the request timeout layer);
+        // the health server then gets [`HEALTH_SHUTDOWN_GRACE`] to finish, after which it
+        // is aborted — a probe stream carries no user data, and a supervisor that ordered
+        // the shutdown is not owed a drained watch stream.
         let servers = async {
             match health_surface {
                 Some((health_listener, health_server)) => {
@@ -888,9 +917,38 @@ impl<S: ChunkStore + 'static> DServer<S> {
                                 let _ = health_shutdown_rx.changed().await;
                             },
                         );
-                    let (data_res, health_res) = tokio::join!(serve, health_serve);
-                    let data_res: Result<()> = data_res.map_err(Into::into);
-                    let health_res: Result<()> = health_res.map_err(Into::into);
+                    // Abort-on-drop, NOT a bare spawn: the outer `select!` below drops
+                    // this whole `servers` future when the lease-renewal arm wins (a
+                    // lost lease), and a detached task would keep the probe listener
+                    // alive indefinitely after `serve()` returned and revoked the lease.
+                    // The guard ties the task's lifetime to this future: dropped for any
+                    // reason ⇒ aborted.
+                    struct AbortOnDrop(
+                        tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>,
+                    );
+                    impl Drop for AbortOnDrop {
+                        fn drop(&mut self) {
+                            self.0.abort();
+                        }
+                    }
+                    let mut health_task = AbortOnDrop(tokio::spawn(health_serve));
+                    let data_res: Result<()> = serve.await.map_err(Into::into);
+                    let health_res: Result<()> =
+                        match tokio::time::timeout(HEALTH_SHUTDOWN_GRACE, &mut health_task.0).await
+                        {
+                            Ok(joined) => match joined {
+                                Ok(served) => served.map_err(Into::into),
+                                // The health task panicking is a real defect — surface it.
+                                Err(join_err) => Err(join_err.into()),
+                            },
+                            Err(_grace_elapsed) => {
+                                // A connected Watch stream is pinning the drain: cut it
+                                // loose (the guard's abort). Deliberately Ok — an aborted
+                                // probe stream at shutdown is the designed outcome, not a
+                                // serve failure.
+                                Ok(())
+                            }
+                        };
                     data_res?;
                     health_res
                 }
