@@ -363,7 +363,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
-    eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd] [--max-concurrent-requests N] [--request-timeout-secs N] [--otlp-endpoint URL]");
+    eprintln!("  wyrd d-server [--bind ADDR] [--health-bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd] [--max-concurrent-requests N] [--request-timeout-secs N] [--otlp-endpoint URL]");
     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore] [--gc-expired-pending]");
     eprintln!("      --reconcile-after-restore runs ONE post-restore reconciliation pass and exits (#551): after");
     eprintln!("      restoring metadata from a backup, with the writers STOPPED. It marks fragments the restore");
@@ -623,6 +623,18 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         .unwrap_or(DEFAULT_DSERVER_BIND)
         .parse()
         .map_err(|e| format!("d-server: invalid --bind address: {e}"))?;
+    // The stable, operator-configurable address the `grpc.health.v1.Health` probe
+    // surface binds (proposal 0010 item 7, issue #576) — a SEPARATE socket from `--bind`
+    // so the probe answers outside the data-plane admission layers, and a KNOWN address
+    // a deployment supervisor (systemd/k8s/LB) can dial rather than an ephemeral one it
+    // cannot discover. The deployable role ALWAYS enables the probe; unset ⇒ the stable
+    // `dserver::DEFAULT_HEALTH_BIND`.
+    let health_bind: SocketAddr = match parsed.flag("health-bind") {
+        Some(s) => s
+            .parse()
+            .map_err(|e| format!("d-server: invalid --health-bind address: {e}"))?,
+        None => dserver::DEFAULT_HEALTH_BIND,
+    };
     // The endpoint to REGISTER for discovery, decoupled from `bind` above (#458):
     // a routable DNS service name or NAT-mapped address, not necessarily a
     // `SocketAddr` `bind` could parse (a container's wildcard bind has no such
@@ -699,6 +711,7 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         let telemetry = DurabilityTelemetry::new(exporter)?;
         let params = DServerParams {
             bind,
+            health_bind,
             advertise_addr,
             dserver_id,
             failure_domain,
@@ -1363,6 +1376,10 @@ fn parse_str_list(raw: Option<&str>) -> Vec<String> {
 /// over the coordination concrete without a long argument list.
 struct DServerParams {
     bind: SocketAddr,
+    /// The stable, operator-configurable address the `grpc.health.v1.Health` probe
+    /// surface binds (proposal 0010 item 7) — a separate socket from `bind`, answered
+    /// outside the data-plane admission layers.
+    health_bind: SocketAddr,
     /// The endpoint to register for discovery, decoupled from `bind` (#458). `None`
     /// leaves the registered endpoint at the bound-address value (today's loopback
     /// behaviour); `Some` overrides it (a routable DNS name / NAT-mapped address).
@@ -1395,7 +1412,8 @@ where
     let mut server = DServer::bind(store, params.bind)
         .await?
         .with_identity(params.dserver_id, params.failure_domain)
-        .with_admission_control(params.admission);
+        .with_admission_control(params.admission)
+        .with_health_bind(params.health_bind);
     if let Some(advertise_addr) = params.advertise_addr {
         server = server.with_advertise_addr(advertise_addr);
     }
@@ -1403,9 +1421,12 @@ where
         server = server.with_metrics_dispatch(metrics);
     }
     eprintln!(
-        "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {})",
+        "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {}); \
+         grpc.health.v1 readiness/liveness probe on http://{}",
         server.endpoint(),
-        params.data_dir
+        params.data_dir,
+        // The role always configures a health bind (defaulted above), so this is `Some`.
+        params.health_bind,
     );
     let lease = server
         .register(&*coord, &params.group, params.lease_ttl)

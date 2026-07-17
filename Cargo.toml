@@ -158,6 +158,14 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # and madsim-tonic 0.6.0+0.14 (added in M2.6) tracks tonic 0.14 — so the
 # deterministic-simulation DST runs the *real* wire code, no in-sim fake (ADR-0009).
 tonic = "0.14"
+# The standard gRPC health-checking protocol (`grpc.health.v1`, proposal 0010
+# §"Scope boundary" item 7, issue #576): the d-server role's liveness/readiness probe
+# surface, reusing the standard proto rather than a bespoke service ("no bespoke
+# service" — 0010 §Crate touch-points), so any supervisor speaking `grpc.health.v1`
+# works. Version-matched to `tonic` (both `0.14`; `tonic-health` 0.14.6 depends on
+# `tonic` `0.14`). New dependency: ADR-0003 three-test audit + `deny.toml` allowlist
+# review is a NEEDS-HUMAN at sign-off (INTEGRATION §4).
+tonic-health = "0.14"
 # Tower middleware for the d-server's admission control (issue #205, architecture
 # §8.9 fail-closed-under-pressure). `tonic` already pulls `tower` transitively; we
 # depend on it directly to apply a SERVER-WIDE (shared-semaphore) concurrency bound
