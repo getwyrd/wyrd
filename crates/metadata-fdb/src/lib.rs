@@ -984,14 +984,36 @@ mod store {
     /// matters most. `Err(e)` here is never `Ok(Conflict)`: a blind batch that loses
     /// `MAX_ATTEMPTS` races in a row surfaces the loss rather than laundering it into an
     /// outcome a `?`-only caller would read as success.
-    #[derive(Debug, Clone, Copy)]
+    ///
+    /// **This is the backend's transient class** (#577), and FoundationDB itself is what
+    /// says so: this error exists *only* on the path where every one of the `MAX_ATTEMPTS`
+    /// failures was retryable by FDB's own `is_retryable()` predicate
+    /// ([`is_retryable`](FdbError::is_retryable), the gate on the retry loop below). So the
+    /// class needs no code taxonomy of ours to guess at — an exhausted budget of *retryable*
+    /// failures is "try again later" by construction. Its
+    /// [`source`](std::error::Error::source) is a synthetic
+    /// [`wyrd_traits::TransientFault`], which makes `wyrd_traits::classify` return
+    /// [`wyrd_traits::ErrorClass::Transient`] without any consumer-side change.
+    ///
+    /// The last `FdbError` stays reachable, and by **two** routes rather than one: the
+    /// public [`last`](Self::last) field reads it directly, and the source chain still
+    /// arrives at it one hop further down (`RetryBudgetExhausted` → `TransientFault` →
+    /// `FdbError`) — the walk `tests/timeout.rs:228`'s `fdb_code` helper already performs
+    /// for exactly this reason. What is *not* done is wrapping this type in a
+    /// `TransientFault`, which would push it off the top of the box and break the
+    /// `downcast_ref::<RetryBudgetExhausted>()` its callers rely on.
+    #[derive(Debug)]
     pub struct RetryBudgetExhausted {
         /// The store operation that ran out of retries (`"get"`, `"scan"`, `"blind commit"`).
         pub op: &'static str,
         /// How many attempts were made.
         pub attempts: u32,
-        /// The retryable error the final attempt failed with — also this error's `source()`.
+        /// The retryable error the final attempt failed with — read it here directly, or
+        /// walk this error's source chain to it.
         pub last: FdbError,
+        // Synthetic transient marker, carrying a copy of `last` as its own source, so the
+        // seam classifier reads the class off the type and the cause stays walkable.
+        transient: wyrd_traits::TransientFault,
     }
 
     impl fmt::Display for RetryBudgetExhausted {
@@ -999,8 +1021,8 @@ mod store {
             write!(
                 f,
                 "metadata {} exhausted {} attempts against FoundationDB; the last attempt \
-                 failed with FDB error {} ({}). The underlying FdbError is this error's \
-                 `source()`.",
+                 failed with FDB error {} ({}). The underlying FdbError is reachable as \
+                 `last`, and through this error's `source()` chain.",
                 self.op,
                 self.attempts,
                 self.last.code(),
@@ -1011,7 +1033,9 @@ mod store {
 
     impl std::error::Error for RetryBudgetExhausted {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(&self.last)
+            // The synthetic transient marker, whose own source is the last `FdbError`: the
+            // chain carries the class AND the cause, in that order.
+            Some(&self.transient)
         }
     }
 
@@ -1021,6 +1045,17 @@ mod store {
                 op,
                 attempts: MAX_ATTEMPTS,
                 last,
+                transient: wyrd_traits::TransientFault::with_source(
+                    format!(
+                        "FoundationDB failed `{op}` {MAX_ATTEMPTS} times running, each with \
+                         an error it declares retryable (last: {}); a later attempt may well \
+                         succeed",
+                        last.code()
+                    ),
+                    // `FdbError` is `Copy`, so the cause is carried here as well as in
+                    // `last` — nothing is moved away from the caller.
+                    last,
+                ),
             }
         }
     }
@@ -1958,13 +1993,26 @@ mod store {
             }
         }
 
+        /// The FDB error code carried anywhere in `err`'s source chain. The chain gained a
+        /// hop with #577 (`RetryBudgetExhausted` → `TransientFault` → `FdbError`), so the
+        /// cause is found by walking — exactly what `tests/timeout.rs:228`'s `fdb_code`
+        /// helper already did, and the reason it did.
+        fn fdb_code_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<i32> {
+            let mut cursor = Some(err);
+            while let Some(current) = cursor {
+                if let Some(fdb) = current.downcast_ref::<FdbError>() {
+                    return Some(fdb.code());
+                }
+                cursor = current.source();
+            }
+            None
+        }
+
         /// The exhaustion error keeps the **cause** reachable. A `String`-backed
         /// "exhausted 5 attempts" would destroy the very distinction this crate promises its
         /// callers: transient `1007 transaction_too_old` vs permanent `2103 value_too_large`.
         #[tokio::test]
         async fn an_exhausted_retry_budget_carries_the_last_fdb_error_as_its_source() {
-            use std::error::Error as _;
-
             let failures = vec![TRANSACTION_TOO_OLD; MAX_ATTEMPTS as usize];
             let mut target = ScriptedCommit::failing_with(&failures);
             let err = blind_commit_loop(&mut target)
@@ -1976,18 +2024,55 @@ mod store {
                 .expect("exhaustion must be a typed error, not a formatted String");
             assert_eq!(exhausted.op, "blind commit");
             assert_eq!(exhausted.attempts, MAX_ATTEMPTS);
+            // Route one: the cause, read straight off the typed error.
             assert_eq!(exhausted.last.code(), TRANSACTION_TOO_OLD);
-
-            let source = exhausted
-                .source()
-                .expect("the last FdbError is the exhaustion error's source");
+            // Route two: the cause, found by walking the chain.
             assert_eq!(
-                source
-                    .downcast_ref::<FdbError>()
-                    .expect("the source downcasts to the FdbError that caused it")
-                    .code(),
-                TRANSACTION_TOO_OLD,
+                fdb_code_in_chain(exhausted),
+                Some(TRANSACTION_TOO_OLD),
                 "a caller must be able to tell a transient 1007 from a permanent 2103",
+            );
+        }
+
+        /// #577 — this backend's **transient** production. FDB itself declared each of the
+        /// `MAX_ATTEMPTS` failures retryable (that is the retry loop's own gate), so an
+        /// exhausted budget of them is the try-again class by construction — no FDB error-code
+        /// taxonomy of ours is guessed at.
+        #[tokio::test]
+        async fn an_exhausted_retry_budget_classifies_transient_at_the_seam() {
+            let failures = vec![TRANSACTION_TOO_OLD; MAX_ATTEMPTS as usize];
+            let mut target = ScriptedCommit::failing_with(&failures);
+            let err = blind_commit_loop(&mut target)
+                .await
+                .expect_err("an exhausted blind commit is Err");
+
+            assert_eq!(
+                wyrd_traits::classify(err.as_ref()),
+                wyrd_traits::ErrorClass::Transient,
+                "retryable failures that ran out of budget are transient, not terminal — a \
+                 caller that gives up permanently on them abandons a healthy cluster"
+            );
+            assert!(!wyrd_traits::classify(err.as_ref()).is_terminal());
+            // …and it is emphatically not an undetermined commit: the batch was blind and
+            // every attempt failed with a definite not-committed error.
+            assert_ne!(
+                wyrd_traits::classify(err.as_ref()),
+                wyrd_traits::ErrorClass::Indeterminate,
+            );
+        }
+
+        /// An undetermined commit keeps its own class across the same seam — it must never
+        /// be flattened into the transient/terminal binary, whatever this crate does with
+        /// its other errors.
+        #[tokio::test]
+        async fn an_unknown_commit_result_stays_indeterminate_at_the_seam() {
+            let err: BoxError = Box::new(classify::commit_unknown_result(
+                classify::COMMIT_UNKNOWN_RESULT,
+            ));
+            assert_eq!(
+                wyrd_traits::classify(err.as_ref()),
+                wyrd_traits::ErrorClass::Indeterminate,
+                "1021 is neither transient (never retry it) nor terminal (it may have landed)"
             );
         }
 

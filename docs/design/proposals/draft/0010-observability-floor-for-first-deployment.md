@@ -277,6 +277,31 @@ targets the final shape, or land it after M4's backend and adapt. Cheap to decid
 expensive to discover at merge. PRs 1–2 and 4–7 are disjoint from M4's metadata
 surface and parallelize freely.
 
+**Decision (ratified 2026-07-04, #366 keystone sign-off — PDCA bundle §10 / iteration-7
+ratification; recorded here per the graduation criterion below).** They do churn the same
+seam, and the collision was resolved the second way: **#255 (the TiKV backend) merged
+first, and the typed-error enum lands _after_ M4, adapting the TiKV backend to the new
+variants** rather than M4 targeting an enum that did not yet exist. Do not re-litigate.
+
+What that meant in practice, when PR 3 landed as issue #577 with M4 complete (PR #489
+merged):
+
+- The seam addition is **additive** — a `TransientFault` seam type plus an `ErrorClass`
+  value and one `classify` chain-walker (`crates/traits/src/lib.rs`), extending the
+  `IntegrityFault` precedent. No trait signature changed, so the backends M4 landed kept
+  compiling; adapting them was *producing* the new class, not being rewritten by it.
+- Each backend was adapted **at the error type it already had**, not at the trait: TiKV's
+  `deadline::OperationTimedOut` and FoundationDB's `store::RetryBudgetExhausted` each gained
+  a synthetic `TransientFault` in their source chain (the `BlockReadFault` pattern). Landing
+  the enum first would not have avoided this work — it is per-backend either way — which is
+  the retrospective evidence that the "adapt after" branch cost nothing the "enum first"
+  branch would have saved.
+- The direction of the ripple was the deciding factor and is worth recording for the next
+  such collision: an *additive* seam change ripples into backends as **new production
+  sites**, which a backend can grow at any time; a backend swap ripples into the seam as
+  **contract change**, which every other backend must then match. The additive side is the
+  one that can safely go second.
+
 ## Alternatives considered
 
 - **Fold this into [proposal 0008][p8] and build it all together.** Rejected for
@@ -343,8 +368,9 @@ surface and parallelize freely.
 
 - **Shared `telemetry` crate vs keep in `custodian`** — lean: extract (the
   second/third consumer now exists, [ADR-0016][a16]); confirm at PR 1.
-- **Typed-error/M4 sequencing** — the gating decision above; resolve before
-  parallelizing PR 3 with M4.
+- ~~**Typed-error/M4 sequencing** — the gating decision above; resolve before
+  parallelizing PR 3 with M4.~~ **Resolved** (2026-07-04): TiKV merged first, the enum
+  lands after M4 and adapts the backends. Recorded in §"Sequencing note" above.
 - **Cross-plane request↔durability correlation** — the genuinely novel design
   question this floor *defers*: joining a request to the repair its fragment triggers
   later, in a different process, with no live span to carry — requires durability

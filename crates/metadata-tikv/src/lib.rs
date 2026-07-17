@@ -217,12 +217,46 @@ pub mod deadline {
     /// is by construction an *unknown result* (the commit may still land), so it surfaces
     /// as `wyrd_traits::CommitUnknownResult` instead — the same call the FDB driver makes
     /// for its `1031 transaction_timed_out`.
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    ///
+    /// **This is the backend's transient class** (#577). "Definite failure" and "terminal"
+    /// are different claims, and conflating them is the trap here: nothing was written
+    /// (definite), *and* the PD may answer perfectly well a second later (transient) — an
+    /// unreachable or stalled cluster is the textbook "try again". So its
+    /// [`source`](std::error::Error::source) exposes a synthetic
+    /// [`wyrd_traits::TransientFault`], which makes `wyrd_traits::classify` return
+    /// [`wyrd_traits::ErrorClass::Transient`] for it without any consumer-side change.
+    ///
+    /// That indirection — rather than *wrapping* this type in a `TransientFault` — is
+    /// deliberate, and it is the [`wyrd_traits::BlockReadFault`] pattern (a synthetic
+    /// `EIO` in its own chain, `traits/src/lib.rs:169-172`). Wrapping would move this type
+    /// off the top of the box and silently break every `downcast_ref::<OperationTimedOut>()`
+    /// — including `tests/deadline.rs:118`'s assertion that a timed-out *commit* is **not**
+    /// one of these, which would then pass for entirely the wrong reason.
+    #[derive(Debug)]
     pub struct OperationTimedOut {
         /// The operation that ran out of time (`"get"`, `"scan"`, `"connect"`).
         pub op: &'static str,
         /// The deadline it exceeded.
         pub after_ms: u64,
+        // Synthetic transient marker exposed via `source()` so the seam classifier
+        // (`wyrd_traits::classify`) reads the class off the type rather than the string.
+        transient: wyrd_traits::TransientFault,
+    }
+
+    impl OperationTimedOut {
+        /// The deadline error for `op`, abandoned after `after_ms` — the single
+        /// construction point, so the synthetic transient marker can never be forgotten.
+        #[must_use]
+        pub fn new(op: &'static str, after_ms: u64) -> Self {
+            Self {
+                op,
+                after_ms,
+                transient: wyrd_traits::TransientFault::new(format!(
+                    "the TiKV cluster did not answer `{op}` within {after_ms} ms; it may \
+                     answer a later attempt"
+                )),
+            }
+        }
     }
 
     impl fmt::Display for OperationTimedOut {
@@ -238,7 +272,13 @@ pub mod deadline {
         }
     }
 
-    impl std::error::Error for OperationTimedOut {}
+    impl std::error::Error for OperationTimedOut {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            // Expose the synthetic transient marker so `wyrd_traits::classify` classifies
+            // an abandoned operation as the seam's transient class.
+            Some(&self.transient)
+        }
+    }
 
     #[cfg(test)]
     mod tests {
@@ -292,15 +332,62 @@ pub mod deadline {
 
         #[test]
         fn the_timeout_error_tells_an_operator_nothing_was_written() {
-            let msg = OperationTimedOut {
-                op: "get",
-                after_ms: 50_000,
-            }
-            .to_string();
+            let msg = OperationTimedOut::new("get", 50_000).to_string();
             assert!(msg.contains("get"), "names the operation: {msg}");
             assert!(
                 msg.contains("Nothing was written"),
                 "a read deadline is a definite failure: {msg}"
+            );
+        }
+
+        /// #577 — this backend's **transient** production, pinned where it can actually be
+        /// run: the `deadline` module is free of any `tikv-client` dependency, so this is
+        /// exercised by every `cargo xtask ci`, on a machine with no TiKV and with the
+        /// `tikv` feature off. The feature-gated `store` only *calls* this constructor.
+        #[test]
+        fn an_abandoned_operation_classifies_transient_at_the_seam() {
+            let err = OperationTimedOut::new("get", 50_000);
+            assert_eq!(
+                wyrd_traits::classify(&err),
+                wyrd_traits::ErrorClass::Transient,
+                "an unreachable/stalled PD is the try-again class: the cluster may answer \
+                 a later attempt, and a caller must be able to tell that from data loss"
+            );
+            assert!(!wyrd_traits::classify(&err).is_terminal());
+        }
+
+        /// "Nothing was written" (definite) and "terminal" (retry cannot help) are
+        /// different claims, and this backend makes the first without the second. Both
+        /// halves are asserted together because it is exactly their conflation that would
+        /// misclassify an unreachable cluster as permanent.
+        #[test]
+        fn a_definite_failure_is_still_transient_and_never_an_unknown_result() {
+            let err = OperationTimedOut::new("scan", 100);
+            assert!(wyrd_traits::classify(&err).is_transient());
+            assert_ne!(
+                wyrd_traits::classify(&err),
+                wyrd_traits::ErrorClass::Indeterminate,
+                "a read mutates nothing, so its deadline is never an unknown result — that \
+                 is the commit path's class (`CommitUnknownResult`)"
+            );
+        }
+
+        /// The precedent's load-bearing half: classifying the fault must not push
+        /// `OperationTimedOut` off the top of the box, because consumers downcast it there
+        /// — including `tests/deadline.rs:118`, which asserts a timed-out *commit* is NOT
+        /// one, an assertion that would pass vacuously if this type were wrapped.
+        #[test]
+        fn the_typed_error_stays_the_top_level_error_a_caller_downcasts() {
+            let boxed: wyrd_traits::BoxError = Box::new(OperationTimedOut::new("get", 10));
+            let timed_out = boxed
+                .downcast_ref::<OperationTimedOut>()
+                .expect("the deadline error must stay downcastable at the top level");
+            assert_eq!(timed_out.op, "get");
+            assert_eq!(timed_out.after_ms, 10);
+            assert_eq!(
+                wyrd_traits::classify(boxed.as_ref()),
+                wyrd_traits::ErrorClass::Transient,
+                "…and carry its class at the same time"
             );
         }
     }
@@ -673,8 +760,10 @@ mod store {
     ///
     /// For a **read** (`get`, `scan`) and for `connect`, a deadline is a definite failure —
     /// nothing was written, nothing is in doubt — so it surfaces as the typed
-    /// [`OperationTimedOut`]. `commit` does NOT use this: a timed-out commit is by
-    /// construction an *unknown result*, so it has its own arm below.
+    /// [`OperationTimedOut`], which carries the seam's **transient** class (#577: definite
+    /// is not the same as terminal — the cluster may answer a later attempt). `commit` does
+    /// NOT use this: a timed-out commit is by construction an *unknown result*, so it has
+    /// its own arm below.
     async fn under_deadline<T>(
         op: &'static str,
         deadline: Duration,
@@ -682,11 +771,13 @@ mod store {
     ) -> Result<T> {
         match tokio::time::timeout(deadline, fut).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(BoxError::from(OperationTimedOut {
-                op,
+            Err(_elapsed) => {
+                // The attribute sits on a `let` STATEMENT, not on an expression in argument
+                // position: statement attributes are stable, expression attributes are not.
                 #[allow(clippy::cast_possible_truncation)] // the deadline is milliseconds
-                after_ms: deadline.as_millis() as u64,
-            })),
+                let after_ms = deadline.as_millis() as u64;
+                Err(BoxError::from(OperationTimedOut::new(op, after_ms)))
+            }
         }
     }
 
