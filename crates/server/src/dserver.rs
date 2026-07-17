@@ -638,6 +638,18 @@ impl<S: ChunkStore + 'static> DServer<S> {
     /// because the probe surface is not registered for discovery, so it needs no
     /// pre-serve `local_addr`).
     pub fn with_health_bind(mut self, health_bind: SocketAddr) -> Self {
+        // Refuse port zero AT CONFIGURATION TIME: the probe surface exists to give a
+        // supervisor a KNOWN address, and `:0` asks the OS for a port nothing exposes —
+        // `health_bind()` and the startup log would keep reporting the configured `:0`
+        // while the real listener sits on a port no supervisor can discover (Codex P2 on
+        // #587). The CLI refuses the same input with an `Err` (`cli.rs`
+        // `resolve_health_bind`); this assert is the library-misuse backstop.
+        assert!(
+            health_bind.port() != 0,
+            "health probe bind must use a concrete port: the probe exists to give \
+             supervisors a KNOWN address, and an OS-assigned ephemeral port is exposed \
+             nowhere"
+        );
         self.health_bind = Some(health_bind);
         self
     }

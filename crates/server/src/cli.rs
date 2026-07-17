@@ -180,13 +180,51 @@ fn default_health_bind(data_bind: SocketAddr) -> SocketAddr {
     SocketAddr::new(data_bind.ip(), dserver::DEFAULT_HEALTH_BIND.port())
 }
 
-/// Resolve the probe bind from the optional `--health-bind` flag and the data `--bind`,
-/// REFUSING a collision: the probe needs its own socket (it answers outside the data
-/// plane's admission layers), and two listeners on one address fail at bind time with a
-/// bare `EADDRINUSE` long after parse. The collision arises legitimately — a data bind
-/// on the stable probe port (`--bind 10.0.1.7:50052`, no `--health-bind`) derives the
-/// identical address (Codex P2 on #587) — so the refusal names the fix. Pure;
+/// Whether two listener addresses CERTAINLY cannot coexist on one host: the same port
+/// with equal IPs, or the same port where a same-family wildcard covers the other side
+/// — a wildcard listener occupies its port on every interface of its family, so
+/// `--bind 0.0.0.0:50051` with `--health-bind 127.0.0.1:50051` fails at the second
+/// bind despite unequal addresses (Codex P2 on #587). Only mechanical certainties
+/// refuse here: cross-family pairs are never a certain collision (an IPv4 wildcard
+/// cannot cover an IPv6 listener, and even `[::]` vs IPv4 depends on the socket's
+/// `IPV6_V6ONLY` — see [`dual_stack_overlap_risk`]). Pure; unit-tested below.
+fn binds_collide(a: SocketAddr, b: SocketAddr) -> bool {
+    if a.port() != b.port() {
+        return false;
+    }
+    // Equality must keep IPv6 scope IDs: `[fe80::1%2]` and `[fe80::1%3]` are the same
+    // Ipv6Addr on DIFFERENT interfaces and coexist happily — `.ip()` alone would
+    // declare a false certain collision (Codex P2 on #587).
+    let same_addr = match (a, b) {
+        (SocketAddr::V6(x), SocketAddr::V6(y)) => x.ip() == y.ip() && x.scope_id() == y.scope_id(),
+        _ => a.ip() == b.ip(),
+    };
+    if same_addr {
+        return true;
+    }
+    a.is_ipv4() == b.is_ipv4() && (a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// Whether a probe/data pair MAY collide depending on the host's dual-stack posture:
+/// the IPv6 wildcard `[::]` against an IPv4 address on the same port. Linux binds
+/// `[::]` dual-stack by default (`net.ipv6.bindv6only=0`), grabbing the IPv4 port too
+/// — but `bindv6only=1` (and some platforms' defaults) keeps them separate, so this is
+/// NOT a parse-time certainty either way (Codex P2 on #587, both directions). The CLI
+/// warns and lets the actual bind adjudicate: on a dual-stack host the second bind
+/// fails fast with the warning already on screen naming the sysctl. Pure;
 /// unit-tested below.
+fn dual_stack_overlap_risk(a: SocketAddr, b: SocketAddr) -> bool {
+    let v6_wildcard = |addr: SocketAddr| addr.is_ipv6() && addr.ip().is_unspecified();
+    a.port() == b.port() && a.is_ipv4() != b.is_ipv4() && (v6_wildcard(a) || v6_wildcard(b))
+}
+
+/// Resolve the probe bind from the optional `--health-bind` flag and the data `--bind`,
+/// REFUSING what cannot work: a `:0` probe port (an OS-assigned port nothing exposes),
+/// and any [`binds_collide`] overlap with the data listener — both would otherwise
+/// surface long after parse, as an undiscoverable probe or a bare `EADDRINUSE` from the
+/// second bind. The overlap arises legitimately — a data bind on the stable probe port
+/// (`--bind 10.0.1.7:50052`, no `--health-bind`) derives the identical address (Codex
+/// P2 on #587) — so the refusals name the fix. Pure; unit-tested below.
 fn resolve_health_bind(
     explicit: Option<&str>,
     data_bind: SocketAddr,
@@ -197,17 +235,37 @@ fn resolve_health_bind(
             .map_err(|e| format!("d-server: invalid --health-bind address: {e}"))?,
         None => default_health_bind(data_bind),
     };
-    if health_bind == data_bind {
+    // Port zero would bind an OS-assigned ephemeral port that nothing exposes — the
+    // startup log and `health_bind()` keep reporting `:0` while the real listener sits
+    // where no supervisor can discover it. The probe exists to be a KNOWN address.
+    if health_bind.port() == 0 {
+        return Err(
+            "d-server: --health-bind must use a concrete port, not 0: an OS-assigned \
+             ephemeral probe port is exposed nowhere, so no supervisor could ever find it"
+                .to_string(),
+        );
+    }
+    if binds_collide(health_bind, data_bind) {
         return Err(format!(
-            "d-server: the health probe would bind {health_bind}, the same address as --bind. \
-             The probe surface needs its own socket (it answers outside the data plane's \
-             admission layers); pass --health-bind with a different port{}",
+            "d-server: the health probe would bind {health_bind}, which collides with --bind \
+             {data_bind} (same port; a wildcard listener occupies the port on every \
+             interface). The probe surface needs its own socket (it answers outside the \
+             data plane's admission layers); pass --health-bind with a different port{}",
             if explicit.is_none() {
                 " (the default derives --bind's interface at the stable probe port)"
             } else {
                 ""
             }
         ));
+    }
+    if dual_stack_overlap_risk(health_bind, data_bind) {
+        eprintln!(
+            "d-server: WARNING: --health-bind {health_bind} and --bind {data_bind} share a \
+             port across IP families with an IPv6 wildcard. On a dual-stack host (Linux \
+             default, net.ipv6.bindv6only=0) the [::] listener also occupies the IPv4 \
+             port, so the second bind will fail; if that happens, give the probe its own \
+             port or set an explicit interface."
+        );
     }
     Ok(health_bind)
 }
@@ -2242,7 +2300,7 @@ mod tests {
         // Derived collision: data plane parked on the stable probe port.
         let err = resolve_health_bind(None, "10.0.1.7:50052".parse().unwrap())
             .expect_err("a derived collision must refuse");
-        assert!(err.contains("--health-bind") && err.contains("same address"));
+        assert!(err.contains("--health-bind") && err.contains("collides with --bind"));
         // Explicit collision.
         resolve_health_bind(Some("10.0.1.7:50051"), "10.0.1.7:50051".parse().unwrap())
             .expect_err("an explicit collision must refuse");
@@ -2256,6 +2314,75 @@ mod tests {
             resolve_health_bind(Some("10.0.1.7:9000"), "10.0.1.7:50051".parse().unwrap()).unwrap(),
             "10.0.1.7:9000".parse().unwrap()
         );
+    }
+
+    /// The collision guard must see through wildcards: a wildcard listener occupies its
+    /// port on EVERY interface, so `--bind 0.0.0.0:50051 --health-bind 127.0.0.1:50051`
+    /// fails at the second bind despite unequal addresses (Codex P2 on #587) — in either
+    /// direction. Distinct concrete IPs on one port coexist and must stay accepted.
+    #[test]
+    fn wildcard_probe_data_overlaps_refuse_and_distinct_ips_coexist() {
+        // Wildcard data listener vs loopback probe, same port: refused.
+        resolve_health_bind(Some("127.0.0.1:50051"), "0.0.0.0:50051".parse().unwrap())
+            .expect_err("a wildcard data bind occupies the probe's port on every interface");
+        // The mirror image: wildcard probe vs concrete data bind, same port.
+        resolve_health_bind(Some("0.0.0.0:50051"), "10.0.1.7:50051".parse().unwrap())
+            .expect_err("a wildcard probe bind would collide with the data listener");
+        // Distinct concrete IPs on one port genuinely coexist: accepted.
+        assert_eq!(
+            resolve_health_bind(Some("10.0.1.8:50051"), "10.0.1.7:50051".parse().unwrap()).unwrap(),
+            "10.0.1.8:50051".parse().unwrap()
+        );
+        // Families are distinguished: an IPv4 wildcard never covers an IPv6 listener,
+        // so 0.0.0.0 + [::1] on one port coexist...
+        assert_eq!(
+            resolve_health_bind(Some("[::1]:50051"), "0.0.0.0:50051".parse().unwrap()).unwrap(),
+            "[::1]:50051".parse().unwrap()
+        );
+        // ...and the [::]-vs-IPv4 pair is NOT refused at parse — whether it collides
+        // depends on the host's IPV6_V6ONLY posture, so the CLI warns and lets the
+        // actual bind adjudicate. The risk predicate itself is pinned separately.
+        assert!(
+            resolve_health_bind(Some("127.0.0.1:50051"), "[::]:50051".parse().unwrap()).is_ok(),
+            "a platform-dependent overlap must not hard-refuse at parse"
+        );
+    }
+
+    /// The dual-stack risk predicate: fires only for an IPv6 wildcard sharing a port
+    /// across families (either direction) — the one pair whose collision depends on
+    /// the host's `IPV6_V6ONLY` posture and therefore WARNS instead of refusing.
+    #[test]
+    fn dual_stack_overlap_risk_fires_only_for_the_v6_wildcard_cross_family() {
+        let risk =
+            |a: &str, b: &str| dual_stack_overlap_risk(a.parse().unwrap(), b.parse().unwrap());
+        assert!(risk("[::]:50051", "127.0.0.1:50051"));
+        assert!(risk("10.0.1.7:50051", "[::]:50051"));
+        // A concrete v6 address, a v4 wildcard, or distinct ports: no dual-stack risk.
+        assert!(!risk("[::1]:50051", "0.0.0.0:50051"));
+        assert!(!risk("0.0.0.0:50051", "[::1]:50051"));
+        assert!(!risk("[::]:50052", "127.0.0.1:50051"));
+        // Same-family pairs are binds_collide's business, not this predicate's.
+        assert!(!risk("0.0.0.0:50051", "127.0.0.1:50051"));
+    }
+
+    /// Scoped link-local IPv6 addresses collide only when the SCOPE matches too:
+    /// `[fe80::1%2]` and `[fe80::1%3]` are one `Ipv6Addr` on two different interfaces
+    /// and coexist — comparing `.ip()` alone would declare a false certain collision.
+    #[test]
+    fn scoped_ipv6_binds_collide_only_within_one_scope() {
+        let collide = |a: &str, b: &str| binds_collide(a.parse().unwrap(), b.parse().unwrap());
+        assert!(!collide("[fe80::1%2]:50051", "[fe80::1%3]:50051"));
+        assert!(collide("[fe80::1%2]:50051", "[fe80::1%2]:50051"));
+    }
+
+    /// A `:0` probe port binds an OS-assigned ephemeral port that nothing exposes — the
+    /// startup log and `health_bind()` keep reporting `:0` while the real listener sits
+    /// where no supervisor can discover it (Codex P2 on #587). Refused at parse.
+    #[test]
+    fn an_ephemeral_probe_port_refuses_at_parse() {
+        let err = resolve_health_bind(Some("127.0.0.1:0"), "127.0.0.1:50051".parse().unwrap())
+            .expect_err("port 0 must refuse — an undiscoverable probe defeats its purpose");
+        assert!(err.contains("concrete port"));
     }
 
     /// The #551 one-shot is a VALUELESS flag — and adding it must not weaken the guard that a

@@ -487,6 +487,19 @@ async fn a_zero_refresh_interval_refuses_at_the_builder() {
         .with_health_refresh_interval(Duration::ZERO);
 }
 
+/// The library backstop for the CLI's `:0` refusal: `with_health_bind` on an ephemeral
+/// port would bind where nothing can discover it — `health_bind()` and the startup log
+/// keep reporting `:0` (Codex P2 on #587). The builder refuses loudly.
+#[tokio::test]
+#[should_panic(expected = "concrete port")]
+async fn an_ephemeral_health_bind_refuses_at_the_builder() {
+    let (store, _dir) = fs_store();
+    let _ = DServer::bind(store, "127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind")
+        .with_health_bind("127.0.0.1:0".parse().unwrap());
+}
+
 /// Success criterion (c): the health check still answers — rather than being shed with
 /// `RESOURCE_EXHAUSTED` — while the data plane is saturated at its admission bound
 /// (`max_concurrent_requests` held by an in-flight data RPC), dialed on the configured
