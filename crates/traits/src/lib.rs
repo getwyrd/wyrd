@@ -352,6 +352,203 @@ pub fn is_block_read_fault(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// A **transient** fault: the call failed for a reason that **may not hold a moment
+/// later** — the peer was unreachable, a deadline expired, the backend was busy or
+/// shedding load. Unlike [`IntegrityFault`], [`BlockReadFault`] and [`ScanCapExceeded`]
+/// — for all of which *retrying the same call cannot help* — retrying this one may
+/// simply succeed.
+///
+/// It lives in the seam crate for the reason [`IntegrityFault`] does (ADR-0010): **every**
+/// backend raises the *same* type for the class, so one [`classify`] call answers "is this
+/// worth retrying?" without the caller knowing which store it holds. Before it, everything
+/// that was not one of the four *specific* typed faults crossed the seam as an opaque
+/// `BoxError` string, and "the network dropped" was indistinguishable from "the config is
+/// wrong" (proposal 0010 §Motivation, "Errors are opaque").
+///
+/// It **wraps rather than replaces** the backend's own error. The producing backend's
+/// concrete error stays reachable through [`source`](std::error::Error::source) — the gRPC
+/// client keeps its `TransportError`, so a caller that wants the wire `Status` still finds
+/// it by walking the chain — while the *class* is now carried by a **type** instead of
+/// being re-derived from a string at each consumer. That is exactly [`BlockReadFault`]'s
+/// trick (a seam type in the chain that a chain-walking classifier finds), applied to the
+/// one class the seam could not previously name.
+#[derive(Debug)]
+pub struct TransientFault {
+    /// Why this fault is transient — the producing backend's own account, for the
+    /// operator-facing audit trail.
+    pub detail: String,
+    source: Option<BoxError>,
+}
+
+impl TransientFault {
+    /// A transient fault with no underlying error to carry.
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            source: None,
+        }
+    }
+
+    /// A transient fault wrapping the backend's own `source`, which stays reachable via
+    /// [`source`](std::error::Error::source) — so naming the *class* never costs the
+    /// detail the backend already had.
+    pub fn with_source(detail: impl Into<String>, source: impl Into<BoxError>) -> Self {
+        Self {
+            detail: detail.into(),
+            source: Some(source.into()),
+        }
+    }
+}
+
+impl fmt::Display for TransientFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "transient fault (a retry may succeed): {}", self.detail)?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for TransientFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_deref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// The **failure class** of an error crossing the trait seam: not *what* went wrong (the
+/// specific typed faults above already say that) but **how a caller must read it** —
+/// independent of which backend produced it.
+///
+/// This is the seam's half of "why did this request fail" (proposal 0010 §"Scope boundary"
+/// item 6). The class is a *value*, not a set of boolean predicates, deliberately: it has
+/// a **stable, bounded label form** ([`as_str`](Self::as_str)) over a **closed** set
+/// ([`ALL`](Self::ALL)), so a consumer can key an error counter by it and pre-register
+/// every series (issue #575) rather than discovering a label the first time something
+/// breaks.
+///
+/// **The partition is not binary, and that is load-bearing.** A third outcome exists
+/// because [`CommitUnknownResult`] is genuinely neither: retrying is *forbidden* (a
+/// [`WriteBatch`] is not guaranteed idempotent) yet the write may still land, so calling
+/// it "terminal" would tell a caller "nothing happened" when something may have. It gets
+/// [`Indeterminate`](Self::Indeterminate) and is never collapsed into the binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ErrorClass {
+    /// **Retrying may succeed**: unreachable, timed out, or busy — a [`TransientFault`].
+    Transient,
+    /// **Retrying cannot help**: a permanent store error, invalid config, a
+    /// [`BlockReadFault`] (the device physically cannot return the bytes), a
+    /// [`ScanCapExceeded`] — *and* every error the seam cannot otherwise classify, which
+    /// is the fail-safe default (see [`classify`]).
+    Terminal,
+    /// **Stored data is corrupt** — an [`IntegrityFault`]. A **terminal** class
+    /// ([`is_terminal`](Self::is_terminal) is true for it: retrying the same fetch cannot
+    /// help), kept *distinct* because its consumer obligation is distinct: corruption is a
+    /// durable **repair obligation** (reconstruct the chunk, emit a corruption finding),
+    /// which no other terminal fault carries.
+    Integrity,
+    /// **The outcome is unknown** — a [`CommitUnknownResult`]: the batch may or may not
+    /// have been applied. Neither transient (it must not be retried) nor terminal (it may
+    /// have succeeded); the caller's only remedy is to re-read.
+    Indeterminate,
+}
+
+impl ErrorClass {
+    /// Every class, in a stable order — the **bounded label space** a consumer enumerates
+    /// up front (issue #575's error-by-class counter pre-registers one series per class; a
+    /// counter that only learns a label when the fault first fires reports nothing at all
+    /// until something breaks).
+    pub const ALL: [ErrorClass; 4] = [
+        ErrorClass::Transient,
+        ErrorClass::Terminal,
+        ErrorClass::Integrity,
+        ErrorClass::Indeterminate,
+    ];
+
+    /// The class's **stable** label — lowercase, single-word, and part of the contract:
+    /// it keys metric series and appears in operator-facing logs, so renaming one breaks
+    /// every dashboard and alert built on it. New classes may be added; these spellings do
+    /// not change.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorClass::Transient => "transient",
+            ErrorClass::Terminal => "terminal",
+            ErrorClass::Integrity => "integrity",
+            ErrorClass::Indeterminate => "indeterminate",
+        }
+    }
+
+    /// Whether retrying the same call could plausibly succeed. This is the **only**
+    /// predicate a retry policy may act on: [`Indeterminate`](Self::Indeterminate) is not
+    /// terminal, but it must not be retried either, so `!is_terminal()` is *not* a licence
+    /// to retry.
+    #[must_use]
+    pub fn is_transient(self) -> bool {
+        matches!(self, ErrorClass::Transient)
+    }
+
+    /// Whether retrying cannot help — true for [`Terminal`](Self::Terminal) **and**
+    /// [`Integrity`](Self::Integrity), which is a terminal class that stays distinct.
+    /// False for [`Indeterminate`](Self::Indeterminate), whose outcome is not known to be
+    /// a failure at all.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, ErrorClass::Terminal | ErrorClass::Integrity)
+    }
+}
+
+impl fmt::Display for ErrorClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The [`ErrorClass`] of `err` — the seam-level classifier that turns any error crossing
+/// the seam into a class a caller can branch on, generalizing [`is_integrity_fault`] from
+/// one fault to the whole surface.
+///
+/// Like the predicates it generalizes it walks [`source`](std::error::Error::source), so a
+/// backend may wrap a seam fault in its own error and still be classified; the
+/// **outermost** seam type it recognises wins, since that is the producer's most specific
+/// statement about the failure.
+///
+/// The mapping (proposal 0010 §Design, fixed there so no backend guesses):
+///
+/// | error                    | class                          |
+/// |--------------------------|--------------------------------|
+/// | [`TransientFault`]       | [`Transient`](ErrorClass::Transient)         |
+/// | [`IntegrityFault`]       | [`Integrity`](ErrorClass::Integrity) (terminal, distinct) |
+/// | [`CommitUnknownResult`]  | [`Indeterminate`](ErrorClass::Indeterminate) |
+/// | [`BlockReadFault`] / a raw `EIO` ([`is_block_read_fault`]) | [`Terminal`](ErrorClass::Terminal) |
+/// | [`ScanCapExceeded`]      | [`Terminal`](ErrorClass::Terminal)           |
+/// | anything else            | [`Terminal`](ErrorClass::Terminal)           |
+///
+/// The last four rows are one arm — the **fail-safe default** — rather than four explicit
+/// checks that would return what the default already returns. That default is the whole
+/// safety argument: retry logic must act only on a *known-transient* signal, because
+/// defaulting the unknown to transient turns every unrecognised fault into a retry storm
+/// against a backend that will never answer differently. Each row is pinned by a unit test
+/// below, so the mapping is binding even where it is not spelled out in code.
+pub fn classify(err: &(dyn std::error::Error + 'static)) -> ErrorClass {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if e.is::<IntegrityFault>() {
+            return ErrorClass::Integrity;
+        }
+        if e.is::<CommitUnknownResult>() {
+            return ErrorClass::Indeterminate;
+        }
+        if e.is::<TransientFault>() {
+            return ErrorClass::Transient;
+        }
+        next = e.source();
+    }
+    ErrorClass::Terminal
+}
+
 /// A coarse health signal a backend reports about itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
@@ -770,4 +967,177 @@ pub struct Leadership {
 pub struct LockGuard {
     /// The fencing token for this lock acquisition.
     pub token: FencingToken,
+}
+
+#[cfg(test)]
+mod error_class_tests {
+    use super::*;
+
+    fn frag() -> FragmentId {
+        FragmentId { chunk: 7, index: 0 }
+    }
+
+    /// A backend error that wraps another — the shape every `classify` claim about
+    /// source-chain walking rests on.
+    #[derive(Debug)]
+    struct Wrapper(BoxError);
+
+    impl fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a backend wrapped: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(self.0.as_ref())
+        }
+    }
+
+    /// The row of the mapping table that only a *type* can carry: a transient fault
+    /// classifies `Transient` — the class the seam previously had no way to express, so
+    /// every unreachable/timed-out/busy failure arrived as an opaque string.
+    #[test]
+    fn a_transient_fault_classifies_transient() {
+        let err = TransientFault::new("the D server did not answer");
+        assert_eq!(classify(&err), ErrorClass::Transient);
+        assert!(classify(&err).is_transient());
+        assert!(!classify(&err).is_terminal());
+    }
+
+    /// `IntegrityFault` stays a **distinct** class AND is terminal — both halves, because
+    /// collapsing it into `Terminal` would lose the repair obligation, and calling it
+    /// non-terminal would invite a retry of bytes that can never verify.
+    #[test]
+    fn an_integrity_fault_classifies_integrity_and_is_terminal() {
+        let err = IntegrityFault {
+            id: frag(),
+            detail: "checksum mismatch".into(),
+        };
+        assert_eq!(classify(&err), ErrorClass::Integrity);
+        assert!(classify(&err).is_terminal());
+        assert!(!classify(&err).is_transient());
+    }
+
+    /// `CommitUnknownResult` is carried as its own outcome and **never** collapsed into
+    /// the binary partition: it is neither transient (it must not be retried) nor terminal
+    /// (the batch may still have landed).
+    #[test]
+    fn an_unknown_commit_result_is_indeterminate_and_neither_half_of_the_binary() {
+        let err = CommitUnknownResult {
+            backend: "foundationdb",
+            code: Some(1021),
+            detail: "commit_unknown_result".into(),
+            may_still_commit: false,
+        };
+        assert_eq!(classify(&err), ErrorClass::Indeterminate);
+        assert!(!classify(&err).is_transient(), "it must never be retried");
+        assert!(
+            !classify(&err).is_terminal(),
+            "it must never be reported as a definite failure — the write may have landed"
+        );
+    }
+
+    /// The `Terminal` rows of the mapping table that reach the answer through the fail-safe
+    /// default rather than an explicit arm. They are pinned here precisely *because* they
+    /// are not spelled out in `classify`'s body.
+    #[test]
+    fn the_permanent_faults_classify_terminal() {
+        let block = BlockReadFault::new(frag(), "dead sector");
+        assert_eq!(classify(&block), ErrorClass::Terminal);
+
+        let raw_eio = std::io::Error::from_raw_os_error(5);
+        assert_eq!(classify(&raw_eio), ErrorClass::Terminal);
+
+        let cap = ScanCapExceeded {
+            cap: SCAN_CAP,
+            prefix: b"inode:".to_vec(),
+        };
+        assert_eq!(classify(&cap), ErrorClass::Terminal);
+    }
+
+    /// The safety property: an error the seam does not recognise defaults to **terminal**,
+    /// never transient. A default-transient would turn every unknown fault into a retry
+    /// storm against a backend that will never answer differently.
+    #[test]
+    fn an_unclassifiable_error_defaults_to_terminal_not_transient() {
+        let err = std::io::Error::other("something nobody has typed yet");
+        assert_eq!(classify(&err), ErrorClass::Terminal);
+        assert!(!classify(&err).is_transient());
+    }
+
+    /// A backend may wrap a seam fault in its own error and still be classified — the
+    /// property that lets a producer add context without destroying the class.
+    #[test]
+    fn classification_walks_the_source_chain() {
+        let wrapped = Wrapper(Box::new(TransientFault::new("PD unreachable")));
+        assert_eq!(classify(&wrapped), ErrorClass::Transient);
+
+        let wrapped = Wrapper(Box::new(IntegrityFault {
+            id: frag(),
+            detail: "bit rot".into(),
+        }));
+        assert_eq!(classify(&wrapped), ErrorClass::Integrity);
+    }
+
+    /// Wrapping must not cost the backend its own detail: the wrapped error stays
+    /// reachable, so a caller that wants the concrete fault still finds it.
+    #[test]
+    fn a_transient_fault_keeps_its_source_reachable() {
+        let err = TransientFault::with_source(
+            "the request deadline expired",
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+        );
+        let source = std::error::Error::source(&err).expect("the wrapped error is the source");
+        assert!(
+            source.downcast_ref::<std::io::Error>().is_some(),
+            "the producing backend's own error must survive classification"
+        );
+        assert!(
+            err.to_string().contains("the request deadline expired"),
+            "the class and the detail both reach an operator: {err}"
+        );
+    }
+
+    /// The label form issue #575's error counter keys on: stable, bounded, and total over
+    /// `ALL` — every class has a distinct label, and `ALL` really does enumerate them.
+    #[test]
+    fn the_label_space_is_stable_bounded_and_distinct() {
+        assert_eq!(ErrorClass::Transient.as_str(), "transient");
+        assert_eq!(ErrorClass::Terminal.as_str(), "terminal");
+        assert_eq!(ErrorClass::Integrity.as_str(), "integrity");
+        assert_eq!(ErrorClass::Indeterminate.as_str(), "indeterminate");
+
+        let mut labels: Vec<&str> = ErrorClass::ALL.iter().map(|c| c.as_str()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            ErrorClass::ALL.len(),
+            "each class needs its own label, or a counter keyed by it merges two classes"
+        );
+        // `Display` and `as_str` must not drift apart — both are operator-facing.
+        for class in ErrorClass::ALL {
+            assert_eq!(class.to_string(), class.as_str());
+        }
+    }
+
+    /// Exactly one of the two dispositions holds for every class, and `Indeterminate`
+    /// holds neither — the property that stops `!is_terminal()` being read as "safe to
+    /// retry".
+    #[test]
+    fn the_dispositions_partition_the_class_space_correctly() {
+        for class in ErrorClass::ALL {
+            assert!(
+                !(class.is_transient() && class.is_terminal()),
+                "{class} cannot be both"
+            );
+        }
+        assert!(ErrorClass::ALL.iter().any(|c| c.is_transient()));
+        assert!(ErrorClass::Integrity.is_terminal(), "integrity is terminal");
+        assert!(
+            !ErrorClass::Indeterminate.is_transient() && !ErrorClass::Indeterminate.is_terminal(),
+            "an undetermined commit is neither — that is why the partition is not binary"
+        );
+    }
 }
