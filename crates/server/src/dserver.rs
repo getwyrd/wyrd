@@ -937,8 +937,19 @@ impl<S: ChunkStore + 'static> DServer<S> {
             Some(health_bind) => {
                 // Bind the probe socket on the operator-configured, stable address — a
                 // discoverable address a supervisor can dial, not an OS-assigned ephemeral
-                // port.
-                let health_listener = TcpListener::bind(health_bind).await?;
+                // port. REVOKE THE LEASE on failure (e.g. the probe port is already in
+                // use): the caller registered the data endpoint immediately before calling
+                // `serve` (`cli.rs` `run_d_server`), so a bare `?` here would leave
+                // discovery advertising a server whose listeners are dropped until the
+                // lease expires — a phantom endpoint (Codex P1 on #587). The data listener
+                // is already bound (in `bind`), so only this bind can still fail post-register.
+                let health_listener = match TcpListener::bind(health_bind).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        let _ = coord.revoke(lease).await;
+                        return Err(e.into());
+                    }
+                };
                 // `health_reporter()` returns the write side (`HealthReporter`) linked to
                 // the gRPC `HealthServer`. The store-derived readiness is published on BOTH
                 // statuses a prober can ask for: the overall empty-name "" service — what

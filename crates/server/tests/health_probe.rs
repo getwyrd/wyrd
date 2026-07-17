@@ -44,7 +44,7 @@ use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_chunkstore_grpc::{ChunkStoreServer, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_server::dserver::{AdmissionControl, DServer, DSERVER_GROUP};
-use wyrd_traits::{ChunkId, ChunkStore, FragmentId, Health, Result};
+use wyrd_traits::{ChunkId, ChunkStore, Coordination, FragmentId, Health, Result};
 
 fn fid(chunk: ChunkId, index: u16) -> FragmentId {
     FragmentId { chunk, index }
@@ -724,6 +724,63 @@ async fn checks_still_answer_with_watch_streams_held_open() {
     drop(watchers);
     let _ = shutdown.send(());
     let _ = handle.await;
+}
+
+/// A health-bind failure after the caller registered must not leave a phantom
+/// endpoint in discovery: `run_d_server` registers the data endpoint immediately
+/// before calling `serve`, so if the probe port is already occupied, `serve` must
+/// revoke the lease before returning rather than let discovery advertise a server
+/// whose listeners are dropped until the lease expires (Codex P1 on #587).
+#[tokio::test]
+async fn a_health_bind_failure_revokes_the_registration() {
+    let (store, _dir) = fs_store();
+    let controllable = ControllableStore {
+        inner: store,
+        health: Arc::new(Mutex::new(HealthMode::Healthy)),
+        entered: None,
+        gate: None,
+    };
+
+    // Occupy the probe port so `serve`'s health bind fails.
+    let occupied = reserve_addr().await;
+    let _blocker = tokio::net::TcpListener::bind(occupied)
+        .await
+        .expect("hold the probe port");
+
+    let coord = Arc::new(MemCoordination::new());
+    let server = DServer::bind(controllable, "127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind")
+        .with_health_bind(occupied);
+    let lease = server
+        .register(&*coord, DSERVER_GROUP, Duration::from_secs(3600))
+        .await
+        .expect("register");
+    // Registered: discovery sees exactly this endpoint.
+    assert_eq!(
+        coord.discover(DSERVER_GROUP).await.unwrap().len(),
+        1,
+        "the data endpoint is registered before serve()"
+    );
+
+    let shutdown = async {};
+    let err = server
+        .serve(coord.clone(), lease, Duration::from_secs(3600), shutdown)
+        .await
+        .expect_err("serve fails when the health port is occupied");
+    assert!(
+        err.to_string().to_lowercase().contains("address")
+            || err.to_string().to_lowercase().contains("in use"),
+        "the failure is the health bind, not something else: {err}"
+    );
+
+    // The lease was revoked on the way out — discovery no longer advertises a
+    // server whose listeners are gone.
+    assert_eq!(
+        coord.discover(DSERVER_GROUP).await.unwrap().len(),
+        0,
+        "a health-bind failure must revoke the registration, not leave a phantom endpoint"
+    );
 }
 
 /// The library backstop for the CLI's `:0` refusal: `with_health_bind` on an ephemeral
