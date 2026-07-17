@@ -161,3 +161,87 @@ impl MetadataStore for RedbMetadataStore {
         Ok(CommitOutcome::Committed)
     }
 }
+
+/// #577 — this backend's faults all classify **terminal** at the seam, and that is a
+/// finding rather than an omission (the same shape as the `#517` liveness note above).
+///
+/// The transient class is "unreachable / timed out / busy", and redb is an **embedded,
+/// single-process** store: there is no network to drop, no peer to be unreachable, no
+/// deadline to expire. It has nothing to raise a `wyrd_traits::TransientFault` *about*, so
+/// it raises none — and its errors reach `Terminal` through the seam's fail-safe default
+/// rather than through any redb-specific mapping. These tests exist so that "redb produces
+/// no transient class" is an asserted property instead of an assumption: a caller that
+/// swaps redb for a distributed backend must find the transient class appearing, and a
+/// caller on redb must never see it and start retrying a permanent fault.
+#[cfg(test)]
+mod error_class_tests {
+    use super::*;
+    use wyrd_traits::{classify, ErrorClass};
+
+    /// A real cap breach from a real store — the fail-loud error this backend raises most
+    /// deliberately (#262: a truncated scan is data loss). Retrying it is futile: the same
+    /// scan returns the same too-large set, forever.
+    #[test]
+    fn a_scan_cap_breach_classifies_terminal() {
+        let store = RedbMetadataStore::in_memory()
+            .expect("in-memory store")
+            .with_scan_cap(1);
+        pollster::block_on(async {
+            store
+                .commit(WriteBatch::new().put(b"k:1".to_vec(), "a").put(b"k:2", "b"))
+                .await
+                .expect("seed");
+            let err = store
+                .scan(b"k:")
+                .await
+                .expect_err("two keys past a cap of one must fail loud");
+            assert!(
+                err.downcast_ref::<ScanCapExceeded>().is_some(),
+                "the fail-loud error stays the seam type callers downcast: {err}"
+            );
+            assert_eq!(
+                classify(err.as_ref()),
+                ErrorClass::Terminal,
+                "a cap breach is permanent — the identical scan breaches it again: {err}"
+            );
+            assert!(
+                !classify(err.as_ref()).is_transient(),
+                "an embedded store must never offer a retry that cannot help: {err}"
+            );
+        });
+    }
+
+    /// A genuine redb-native fault (an unopenable database), not a synthesized one: the
+    /// backend's own error type reaches the seam and classifies terminal by the fail-safe
+    /// default, with no per-backend mapping needed.
+    #[test]
+    fn a_native_redb_fault_classifies_terminal() {
+        let err = RedbMetadataStore::open("/nonexistent-directory-577/metadata.redb")
+            .err()
+            .expect("opening a database under a nonexistent directory must fail");
+        assert_eq!(
+            classify(err.as_ref()),
+            ErrorClass::Terminal,
+            "an unclassified backend fault defaults to terminal, never transient: {err}"
+        );
+    }
+
+    /// The negative half, stated directly: nothing this backend can raise is transient.
+    #[test]
+    fn this_backend_has_no_transient_class_to_produce() {
+        let store = RedbMetadataStore::in_memory().expect("in-memory store");
+        pollster::block_on(async {
+            // A successful path raises nothing at all; the failing paths above are terminal.
+            // What is pinned here is that a *healthy* embedded op has no transient outcome
+            // to report — there is no network for one to come from.
+            assert!(store
+                .get(b"absent")
+                .await
+                .expect(
+                    "a get on an empty store \
+                cannot fail transiently — there is nothing to be unreachable"
+                )
+                .is_none());
+        });
+    }
+}

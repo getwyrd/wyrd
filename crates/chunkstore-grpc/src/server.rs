@@ -15,6 +15,24 @@ use wyrd_traits::ChunkStore;
 
 use crate::conv;
 
+/// The wire status for a store error that is not one of `get_fragment`'s two *permanent*
+/// fault categories — the outbound half of the seam's class mapping.
+///
+/// A **transient** store fault (`wyrd_traits::ErrorClass::Transient`: the store behind this
+/// D server was itself unreachable, timed out, or busy) rides `UNAVAILABLE`, which the
+/// client reconstructs as a `wyrd_traits::TransientFault` — the same trick `DATA_LOSS`
+/// plays for `IntegrityFault`, using an existing status convention rather than a proto
+/// change (proposal 0010 §Backward compatibility). Everything else stays `INTERNAL` and
+/// classifies terminal by the seam's fail-safe default: unchanged behaviour for every
+/// error whose class the store did not name.
+fn transient_or_internal(e: &wyrd_traits::BoxError) -> Status {
+    if wyrd_traits::classify(e.as_ref()).is_transient() {
+        Status::new(Code::Unavailable, e.to_string())
+    } else {
+        Status::internal(e.to_string())
+    }
+}
+
 /// Serves an injected `S: ChunkStore` over the gRPC `ChunkStore` contract.
 ///
 /// `S` is held behind an [`Arc`] because tonic dispatches each request against
@@ -63,7 +81,7 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
                 if wyrd_traits::is_integrity_fault(e.as_ref()) {
                     Status::invalid_argument(e.to_string())
                 } else {
-                    Status::internal(e.to_string())
+                    transient_or_internal(&e)
                 }
             })?;
         Ok(Response::new(FragmentPutResponse {}))
@@ -87,15 +105,20 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
         //                        `EIO` / dead sector); the client reconstructs a
         //                        `BlockReadFault` → read-around, scrub does NOT emit
         //                        corruption (the local/fs `EIO` path, `scrub.rs:108`).
-        //  INTERNAL            — any other server-side failure; stays `TransportError`
-        //                        (the retry-policy's transient classification).
+        //  UNAVAILABLE         — a transient fault the hosted store itself named
+        //                        (`wyrd_traits::ErrorClass::Transient`); the client
+        //                        reconstructs a `TransientFault` → the retry policy may
+        //                        act on it, because it is a KNOWN-transient signal.
+        //  INTERNAL            — any other server-side failure; stays `TransportError`,
+        //                        and classifies terminal by the seam's fail-safe default
+        //                        (an unrecognised fault must not invite a retry storm).
         let fragment = self.inner.get_fragment(id).await.map_err(|e| {
             if wyrd_traits::is_integrity_fault(e.as_ref()) {
                 Status::new(Code::DataLoss, e.to_string())
             } else if wyrd_traits::is_block_read_fault(e.as_ref()) {
                 Status::new(Code::FailedPrecondition, e.to_string())
             } else {
-                Status::internal(e.to_string())
+                transient_or_internal(&e)
             }
         })?;
         // `None` travels as an absent field, not a NOT_FOUND status — the
@@ -113,7 +136,7 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
             .inner
             .list_fragments()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| transient_or_internal(&e))?;
         Ok(Response::new(FragmentListResponse {
             ids: ids.into_iter().map(conv::to_wire_fragment_id).collect(),
         }))
@@ -129,7 +152,7 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
         self.inner
             .delete_fragment(id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| transient_or_internal(&e))?;
         Ok(Response::new(FragmentDeleteResponse {}))
     }
 
@@ -141,7 +164,7 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
             .inner
             .health()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| transient_or_internal(&e))?;
         Ok(Response::new(HealthResponse {
             status: conv::to_wire_health(health) as i32,
         }))

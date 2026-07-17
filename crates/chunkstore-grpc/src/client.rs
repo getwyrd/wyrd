@@ -11,14 +11,99 @@ use wyrd_proto::v0::{
     HealthRequest,
 };
 use wyrd_traits::{
-    BlockReadFault, BoxError, ChunkStore, FragmentId, Health, IntegrityFault, Result,
+    BlockReadFault, BoxError, ChunkStore, ErrorClass, FragmentId, Health, IntegrityFault, Result,
+    TransientFault,
 };
 
 use crate::conv;
 use crate::error::TransportError;
 
-/// Classify a `get_fragment` error status into one of three mutually
-/// distinguishable fault categories (the seam contract, `wyrd_traits` / ADR-0010):
+/// The seam [`ErrorClass`] a gRPC status `code` reconstructs to, client-side.
+///
+/// The class rides the **existing** status conventions — no proto change (proposal 0010
+/// §"Scope boundary" item 6, §Backward compatibility) — so this is the one place that says
+/// which codes the wire's vocabulary maps onto which seam class.
+///
+/// [`Transient`](ErrorClass::Transient) is exactly proposal 0010's trio — unreachable,
+/// timed out, busy — spelled in the codes this stack **actually** produces, which is not
+/// the same as the codes one would guess:
+///
+/// * `UNAVAILABLE` — *unreachable*. tonic maps a failure to connect to `UNAVAILABLE`
+///   itself (`tonic-0.14.6/src/status.rs:652-656`, citing the gRPC spec: "most likely a
+///   transient condition that can be corrected if retried with a backoff").
+/// * `CANCELLED` — *timed out*, counter-intuitively. tonic renders an expired channel
+///   deadline as `Status::cancelled("Timeout expired")`
+///   (`tonic-0.14.6/src/status.rs:644-646`), **not** as `DEADLINE_EXCEEDED`, and the
+///   d-server's admission-control request-timeout cut arrives as `CANCELLED` or
+///   `DEADLINE_EXCEEDED` (`crates/server/tests/dserver.rs:381`). Excluding it on the
+///   textbook reading of `CANCELLED` ("the caller gave up") would make the seam's
+///   transient class miss the timeout case altogether — the very case proposal 0010 names.
+/// * `DEADLINE_EXCEEDED` — *timed out*, the spelling a server-set deadline uses.
+/// * `RESOURCE_EXHAUSTED` — *busy*: the D server's admission control sheds load with it
+///   (`crates/server/tests/dserver.rs:319`).
+///
+/// `DATA_LOSS` → [`Integrity`](ErrorClass::Integrity), the precedent this generalizes.
+/// Everything else → [`Terminal`](ErrorClass::Terminal), the **fail-safe** default —
+/// including `ABORTED`, a concurrency conflict whose retry (if any) belongs to the layer
+/// that owns the precondition, never to a transport retry loop.
+fn class_of(code: Code) -> ErrorClass {
+    match code {
+        Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded | Code::ResourceExhausted => {
+            ErrorClass::Transient
+        }
+        Code::DataLoss => ErrorClass::Integrity,
+        _ => ErrorClass::Terminal,
+    }
+}
+
+/// Box a wire [`Status`] as the seam's error, preserving **both** the transport detail and
+/// the seam class.
+///
+/// A known-transient status is wrapped in a [`TransientFault`] — the seam type that makes
+/// "try again" survive the wire, reconstructed client-side exactly as `DATA_LOSS` already
+/// reconstructs an [`IntegrityFault`]. The [`TransportError`] becomes its
+/// [`source`](std::error::Error::source), so it stays reachable by a chain-walking
+/// downcast and nothing that the class costs is detail: the wire `Status`, its code and
+/// its message all survive underneath.
+///
+/// Every other status keeps boxing a bare [`TransportError`] — unchanged behaviour, and it
+/// classifies [`Terminal`](ErrorClass::Terminal) through `classify`'s fail-safe default.
+fn transport_error(status: Status) -> BoxError {
+    if class_of(status.code()).is_transient() {
+        let detail = format!(
+            "the D server answered {:?}: {}",
+            status.code(),
+            status.message()
+        );
+        Box::new(TransientFault::with_source(
+            detail,
+            TransportError::from(status),
+        ))
+    } else {
+        Box::new(TransportError::from(status))
+    }
+}
+
+/// A channel that could not be **dialed** is unreachable — the seam's transient class by
+/// definition (proposal 0010: transient covers unreachable / timed out / busy). No status
+/// crosses the wire to carry the class (no server ever answered), so the client names it
+/// here instead, keeping the [`TransportError::Connect`] as the source.
+///
+/// This is the *dial* only. A **malformed endpoint** is rejected by `Endpoint::try_from`
+/// through the same `tonic::transport::Error` type, and it is emphatically not transient:
+/// it is invalid config, which proposal 0010 names terminal, and no amount of retrying
+/// fixes a URI. That site keeps boxing a bare [`TransportError::Connect`] and takes the
+/// fail-safe terminal default — which is why this helper is not simply applied to every
+/// `transport::Error` the connect path can raise.
+fn dial_error(e: tonic::transport::Error) -> BoxError {
+    Box::new(TransientFault::with_source(
+        "the D-server endpoint could not be dialed",
+        TransportError::Connect(e),
+    ))
+}
+
+/// Classify a `get_fragment` error status into one of four mutually distinguishable fault
+/// categories (the seam contract, `wyrd_traits` / ADR-0010):
 ///
 /// * `DATA_LOSS` → [`IntegrityFault`]: stored-data corruption the D server
 ///   detected on read (bit rot / a misplaced fragment). Consumer: repair-and-
@@ -29,8 +114,12 @@ use crate::error::TransportError;
 ///   (permanent, no retry), do NOT emit a corruption finding — the same branch
 ///   a local `EIO` takes at `scrub.rs:108` (`Err(e) => return Err(e)`).
 ///
-/// * everything else → [`TransportError`]: transient or generic rpc fault.
-///   Consumer: the retry policy decides.
+/// * a known-transient status → [`TransientFault`] wrapping the [`TransportError`]: the D
+///   server is unreachable, slow, or shedding load. Consumer: the retry policy may act on
+///   it, because it is a *known*-transient signal rather than an unclassified one.
+///
+/// * everything else → [`TransportError`]: a generic rpc fault, which classifies
+///   [`Terminal`](ErrorClass::Terminal) by the fail-safe default.
 fn classify_get_status(id: FragmentId, status: Status) -> BoxError {
     match status.code() {
         Code::DataLoss => Box::new(IntegrityFault {
@@ -38,7 +127,7 @@ fn classify_get_status(id: FragmentId, status: Status) -> BoxError {
             detail: status.message().to_string(),
         }),
         Code::FailedPrecondition => Box::new(BlockReadFault::new(id, status.message())),
-        _ => Box::new(TransportError::from(status)),
+        _ => transport_error(status),
     }
 }
 
@@ -60,7 +149,7 @@ impl GrpcChunkStore {
             .map_err(TransportError::Connect)?
             .connect()
             .await
-            .map_err(TransportError::Connect)?;
+            .map_err(dial_error)?;
         Ok(Self::new(channel))
     }
 
@@ -71,10 +160,12 @@ impl GrpcChunkStore {
     /// stopped responding mid-call — a `docker pause`d node or an injected network
     /// partition that leaves the connection established but the peer silent — would hang
     /// the future indefinitely. With a timeout, such a request instead fails with a
-    /// transient `DEADLINE_EXCEEDED` [`Status`] (classified as a retryable
-    /// [`TransportError`], not an [`IntegrityFault`]), so a caller — e.g. the custodian
-    /// reconstruction path driven by the Tier-1 consistency scenario — observes an
-    /// *alive-but-unreachable* node and aborts the repair before commit rather than
+    /// transient [`Status`] — `CANCELLED`, which is how tonic renders an expired channel
+    /// deadline (`tonic-0.14.6/src/status.rs:644-646`; **not** `DEADLINE_EXCEEDED`, as
+    /// this note claimed before #577 checked it) — classified as the seam's
+    /// [`ErrorClass::Transient`] and never an [`IntegrityFault`]. So a caller — e.g. the
+    /// custodian reconstruction path driven by the Tier-1 consistency scenario — observes
+    /// an *alive-but-unreachable* node and aborts the repair before commit rather than
     /// stalling.
     pub async fn connect_with_timeout(
         endpoint: impl Into<String>,
@@ -86,7 +177,7 @@ impl GrpcChunkStore {
             .connect_timeout(timeout)
             .connect()
             .await
-            .map_err(TransportError::Connect)?;
+            .map_err(dial_error)?;
         Ok(Self::new(channel))
     }
 
@@ -110,7 +201,7 @@ impl ChunkStore for GrpcChunkStore {
         client
             .put_fragment(Request::new(request))
             .await
-            .map_err(TransportError::from)?;
+            .map_err(transport_error)?;
         Ok(())
     }
 
@@ -133,7 +224,7 @@ impl ChunkStore for GrpcChunkStore {
         let response = client
             .list_fragments(Request::new(FragmentListRequest {}))
             .await
-            .map_err(TransportError::from)?;
+            .map_err(transport_error)?;
         response
             .into_inner()
             .ids
@@ -150,7 +241,7 @@ impl ChunkStore for GrpcChunkStore {
         client
             .delete_fragment(Request::new(request))
             .await
-            .map_err(TransportError::from)?;
+            .map_err(transport_error)?;
         Ok(())
     }
 
@@ -159,7 +250,7 @@ impl ChunkStore for GrpcChunkStore {
         let response = client
             .health(Request::new(HealthRequest {}))
             .await
-            .map_err(TransportError::from)?;
+            .map_err(transport_error)?;
         Ok(conv::from_wire_health(response.into_inner().status)?)
     }
 }
