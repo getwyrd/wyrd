@@ -166,13 +166,39 @@ async fn serve_controllable(
     oneshot::Sender<()>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
+    // A large-but-valid health bound (tokio's Semaphore rejects `usize::MAX`): the
+    // default-envelope tests never mean to hit it.
+    serve_controllable_bounded(
+        store,
+        admission,
+        health_bind,
+        health_refresh_interval,
+        1 << 20,
+    )
+    .await
+}
+
+/// As [`serve_controllable`], with the probe surface's concurrency bound set
+/// explicitly so a test can saturate it with a handful of held-open streams.
+async fn serve_controllable_bounded(
+    store: ControllableStore,
+    admission: AdmissionControl,
+    health_bind: SocketAddr,
+    health_refresh_interval: Duration,
+    health_max_concurrent_requests: usize,
+) -> (
+    String,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
     let coord = Arc::new(MemCoordination::new());
     let server = DServer::bind(store, "127.0.0.1:0".parse().unwrap())
         .await
         .expect("bind")
         .with_admission_control(admission)
         .with_health_bind(health_bind)
-        .with_health_refresh_interval(health_refresh_interval);
+        .with_health_refresh_interval(health_refresh_interval)
+        .with_health_max_concurrent_requests(health_max_concurrent_requests);
     // The server binds the probe exactly where we configured it — assert the knob is
     // honoured before serving, so the address we dial below is unambiguously the
     // configured one.
@@ -542,6 +568,160 @@ async fn a_hanging_health_probe_fails_closed_within_a_bounded_wait() {
     )
     .await;
 
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// The probe surface's concurrency bound counts ESTABLISHED `Health/Watch` streams,
+/// not just the instant they open — the permit rides the response body for the whole
+/// stream lifetime (Codex P1 on #587: tower's own limit frees the permit at Response
+/// time, so long-lived watches would escape it and a public probe port could be held
+/// open unbounded). Past the bound, a new RPC is shed with RESOURCE_EXHAUSTED. Uses a
+/// tiny bound via a short helper below so the test needn't open the production 16.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn established_watch_streams_count_against_the_probe_bound() {
+    let (store, _dir) = fs_store();
+    let health = Arc::new(Mutex::new(HealthMode::Healthy));
+    let controllable = ControllableStore {
+        inner: store,
+        health,
+        entered: None,
+        gate: None,
+    };
+    let health_bind = reserve_addr().await;
+    // A deliberately TINY bound so a handful of held-open watches saturate it.
+    let (_endpoint, shutdown, handle) = serve_controllable_bounded(
+        controllable,
+        AdmissionControl::default(),
+        health_bind,
+        Duration::from_millis(20),
+        2,
+    )
+    .await;
+
+    // Hold the bound's worth of Watch streams open — each retains a permit for its
+    // lifetime, so the surface is now at capacity.
+    let mut held = Vec::new();
+    for _ in 0..2 {
+        let mut client = health_client(&format!("http://{health_bind}")).await;
+        let mut stream = client
+            .watch(HealthCheckRequest {
+                service: String::new(),
+            })
+            .await
+            .expect("Watch establishes")
+            .into_inner();
+        // Await the first update so the stream is genuinely in flight (permit held).
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("watch delivers")
+            .expect("healthy");
+        held.push((client, stream));
+    }
+
+    // A further RPC must now be SHED (RESOURCE_EXHAUSTED) — the held watches occupy the
+    // whole bound. Red pre-fix: tower freed each permit at Response time, so the bound
+    // never counted the established streams and this Check would succeed.
+    let mut client = health_client(&format!("http://{health_bind}")).await;
+    let status = client
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .err()
+        .map(|s| s.code());
+    assert_eq!(
+        status,
+        Some(tonic::Code::ResourceExhausted),
+        "a Check past the bound must be shed while the watches hold their permits"
+    );
+
+    // Drop one watcher — its stream closes and its permit frees — after which a Check
+    // succeeds again. Tolerate a brief ResourceExhausted window while the server
+    // observes the closed stream and drops its permit-holding body.
+    held.pop();
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match client
+                .check(HealthCheckRequest {
+                    service: String::new(),
+                })
+                .await
+            {
+                Ok(resp) => break resp.into_inner(),
+                Err(status) => {
+                    assert_eq!(
+                        status.code(),
+                        tonic::Code::ResourceExhausted,
+                        "the only tolerated error while a permit frees is a shed"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("a Check succeeds once a held watcher's permit is released");
+    assert_eq!(recovered.status, WireServingStatus::Serving as i32);
+
+    drop(held);
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// The probe surface carries its OWN small admission envelope (Codex P1 on #587: a
+/// publicly reachable probe bind must not be an unbounded DoS vector) — and that
+/// envelope must not break normal probing: with several long-lived `Watch` streams
+/// held open (a fleet of supervisors), a unary `Check` still answers within bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checks_still_answer_with_watch_streams_held_open() {
+    let (store, _dir) = fs_store();
+    let health = Arc::new(Mutex::new(HealthMode::Healthy));
+    let controllable = ControllableStore {
+        inner: store,
+        health,
+        entered: None,
+        gate: None,
+    };
+    let health_bind = reserve_addr().await;
+    let (_endpoint, shutdown, handle) = serve_controllable(
+        controllable,
+        AdmissionControl::default(),
+        health_bind,
+        Duration::from_millis(20),
+    )
+    .await;
+
+    // Hold several Watch streams open concurrently — each is a long-lived RPC.
+    let mut watchers = Vec::new();
+    for _ in 0..4 {
+        let mut client = health_client(&format!("http://{health_bind}")).await;
+        let mut stream = client
+            .watch(HealthCheckRequest {
+                service: String::new(),
+            })
+            .await
+            .expect("Watch establishes")
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("watch delivers")
+            .expect("stream healthy");
+        assert!(first.is_some());
+        watchers.push((client, stream));
+    }
+
+    // A plain Check still answers within bound alongside the held-open watchers.
+    let mut client = health_client(&format!("http://{health_bind}")).await;
+    wait_for_check(
+        &mut client,
+        "",
+        WireServingStatus::Serving,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    drop(watchers);
     let _ = shutdown.send(());
     let _ = handle.await;
 }

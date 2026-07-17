@@ -87,6 +87,29 @@ pub const DEFAULT_HEALTH_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 /// unary `Check` in flight to answer.
 pub const HEALTH_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// The probe surface's OWN admission bound: concurrent in-flight health RPCs admitted
+/// across all probe connections before the excess is shed. The probe transport is
+/// deliberately outside the DATA plane's admission budget (a probe must answer through
+/// an overloaded data plane), but "outside that budget" must not mean UNBOUNDED — on a
+/// publicly reachable probe bind, unauthenticated clients could otherwise open
+/// arbitrarily many RPCs until probe traffic starves the process (Codex P1 on #587).
+/// Sized for supervisors, not workloads: a handful of probers at a few RPCs each.
+pub const HEALTH_MAX_CONCURRENT_REQUESTS: usize = 16;
+
+/// Per-connection HTTP/2 stream cap on the probe surface — bounds the `Health/Watch`
+/// fan-in a single prober connection can hold open (the h2 default is effectively
+/// unbounded). Watch streams are long-lived by design; a supervisor needs one or two.
+pub const HEALTH_MAX_CONCURRENT_STREAMS: u32 = 16;
+
+/// Hard ceiling on producing one health RPC's response HEAD — the unary `Check`, and
+/// the head of a `Watch` stream (an established Watch stream then lives on unaffected,
+/// its permit freed when the client closes it). Applied inside
+/// [`HealthConcurrencyLayer`] around head production only, so a handler that stalls
+/// before its head cannot hold its concurrency permit forever and shed legitimate
+/// probes (Codex P2 on #587) — deliberately not tonic's builder `.timeout()`, which
+/// can also cut a long-lived Watch stream.
+pub const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Default **stable** address the `grpc.health.v1.Health` probe surface binds
 /// (proposal 0010 §"Scope boundary" item 7) — a fixed, documented port beside the
 /// data plane's default (`127.0.0.1:50051`), so a deployment supervisor has a
@@ -425,6 +448,130 @@ where
 /// slot. An observer placed outside the limit could not tell an admitted request from one
 /// about to be shed, and would have to count both before retracting one — which is exactly
 /// how an in-flight gauge starts reporting load that was never accepted.
+/// A response body that holds a concurrency permit for the LIFETIME of the stream —
+/// released only when the body is fully drained or dropped (the stream closes), not
+/// when the response head is produced. This is the piece that makes the health
+/// surface's concurrency limit bind long-lived `Health/Watch` streams: tower's
+/// `GlobalConcurrencyLimitLayer` frees its permit as soon as the streaming `Response`
+/// is returned, so established watches would otherwise escape the bound and a public
+/// probe port could be held open by unbounded streams (Codex P1 on #587).
+struct PermitBody {
+    inner: tonic::body::Body,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl http_body::Body for PermitBody {
+    type Data = Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        // `tonic::body::Body` is `Unpin`, so projecting through `get_mut` is sound.
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Bounds concurrent in-flight RPCs on the health probe surface with a permit that
+/// each response STREAM retains until it closes ([`PermitBody`]) — so a `Health/Watch`
+/// held open counts against the bound, not just the instant it is opened. Over the
+/// limit, an RPC is shed with `RESOURCE_EXHAUSTED` (the same retryable "busy" the data
+/// plane's `LoadShedLayer` raises), never queued. Separate from the data plane's
+/// admission budget by construction (its own semaphore), so a probe never contends with
+/// data work; bounded so a public probe port is not a DoS vector (Codex P1 on #587).
+#[derive(Clone)]
+struct HealthConcurrencyLayer {
+    sema: Arc<tokio::sync::Semaphore>,
+}
+
+impl<S> Layer<S> for HealthConcurrencyLayer {
+    type Service = HealthConcurrency<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        HealthConcurrency {
+            inner,
+            sema: Arc::clone(&self.sema),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HealthConcurrency<S> {
+    inner: S,
+    sema: Arc<tokio::sync::Semaphore>,
+}
+
+impl<S> Service<tonic::codegen::http::Request<tonic::body::Body>> for HealthConcurrency<S>
+where
+    S: Service<
+            tonic::codegen::http::Request<tonic::body::Body>,
+            Response = tonic::codegen::http::Response<tonic::body::Body>,
+        > + Clone
+        + Send
+        + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = tonic::codegen::http::Response<tonic::body::Body>;
+    type Error = S::Error;
+    type Future =
+        Pin<Box<dyn Future<Output = std::result::Result<Self::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+        let sema = Arc::clone(&self.sema);
+        // Use the instance that was just `poll_ready`'d, and leave a fresh clone in its
+        // place (the standard tower clone-and-replace, so the readiness contract holds).
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        Box::pin(async move {
+            let Ok(permit) = Arc::clone(&sema).try_acquire_owned() else {
+                // At capacity: shed with RESOURCE_EXHAUSTED, exactly as the data plane's
+                // load-shed does, rather than queue an unbounded backlog.
+                let shed =
+                    tonic::Status::resource_exhausted("health probe surface at capacity; retry");
+                return Ok(shed.into_http());
+            };
+            // Bound HEAD PRODUCTION only (`HEALTH_REQUEST_TIMEOUT`): a handler that
+            // stalls before yielding its response head would otherwise hold this permit
+            // forever, and enough of them would exhaust the bound and permanently shed
+            // legitimate probes (Codex P2 on #587). On timeout we return BEFORE wrapping
+            // the body, so `permit` drops here and is released. Deliberately NOT tonic's
+            // builder `.timeout()`, which can also cut a long-lived `Health/Watch`
+            // stream: a Watch's head is produced promptly and its stream then lives on
+            // (its permit released when the CLIENT closes it, see `PermitBody`).
+            let response = match tokio::time::timeout(HEALTH_REQUEST_TIMEOUT, inner.call(req)).await
+            {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    let timed_out = tonic::Status::deadline_exceeded(
+                        "health probe did not produce a response within the deadline",
+                    );
+                    return Ok(timed_out.into_http());
+                }
+            };
+            let (parts, body) = response.into_parts();
+            let body = tonic::body::Body::new(PermitBody {
+                inner: body,
+                _permit: permit,
+            });
+            Ok(tonic::codegen::http::Response::from_parts(parts, body))
+        })
+    }
+}
+
 #[derive(Clone)]
 struct AdmissionObserver<S> {
     inner: S,
@@ -542,6 +689,11 @@ pub struct DServer<S> {
     health_bind: Option<SocketAddr>,
     /// Cadence of the readiness-refresh task — see [`DEFAULT_HEALTH_REFRESH_INTERVAL`].
     health_refresh_interval: Duration,
+    /// Concurrent in-flight RPCs the probe surface admits before shedding — see
+    /// [`HEALTH_MAX_CONCURRENT_REQUESTS`]. Bounds long-lived `Health/Watch` streams
+    /// (each retains its permit for the stream's lifetime), so a public probe port is
+    /// not an unbounded DoS vector.
+    health_max_concurrent_requests: usize,
 }
 
 impl<S: ChunkStore + 'static> DServer<S> {
@@ -565,6 +717,7 @@ impl<S: ChunkStore + 'static> DServer<S> {
             metrics: None,
             health_bind: None,
             health_refresh_interval: DEFAULT_HEALTH_REFRESH_INTERVAL,
+            health_max_concurrent_requests: HEALTH_MAX_CONCURRENT_REQUESTS,
         })
     }
 
@@ -683,6 +836,19 @@ impl<S: ChunkStore + 'static> DServer<S> {
         self
     }
 
+    /// Override the probe surface's concurrency bound (default
+    /// [`HEALTH_MAX_CONCURRENT_REQUESTS`]) — the number of concurrent in-flight health
+    /// RPCs, including held-open `Health/Watch` streams, admitted before shedding.
+    pub fn with_health_max_concurrent_requests(mut self, limit: usize) -> Self {
+        assert!(
+            limit != 0,
+            "health max concurrent requests must be non-zero: a zero bound sheds every \
+             probe, so no supervisor could ever read readiness"
+        );
+        self.health_max_concurrent_requests = limit;
+        self
+    }
+
     /// The dialable endpoint this server advertises (e.g. `http://127.0.0.1:50051`).
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -730,7 +896,7 @@ impl<S: ChunkStore + 'static> DServer<S> {
     /// serves), `Unhealthy` **and** `Err(_)` ⇒ NOT_SERVING (fail closed — a store that
     /// cannot even report its health must not read as ready), refreshed every
     /// [`with_health_refresh_interval`](DServer::with_health_refresh_interval). The
-    /// probe surface is served by its **own, unlayered** transport, so it stays
+    /// probe surface is served by its **own, separately bounded** transport, so it stays
     /// answerable even when the data plane is shedding at its admission bound (a probe
     /// shed as `RESOURCE_EXHAUSTED` would make supervisors restart an
     /// overloaded-but-healthy node). The store-derived status is published on **both**
@@ -756,6 +922,7 @@ impl<S: ChunkStore + 'static> DServer<S> {
         let store = Arc::new(self.store);
         let service = ChunkStoreService::from_arc(Arc::clone(&store));
         let admission = self.admission;
+        let health_max_concurrent_requests = self.health_max_concurrent_requests;
 
         // ---- the OPTIONAL health probe surface (observability floor, proposal 0010 item 7) ----
         //
@@ -763,7 +930,8 @@ impl<S: ChunkStore + 'static> DServer<S> {
         // `wyrd d-server --health-bind ADDR` flag) — the library building block serves no
         // probe by default, so several in-process servers are not forced onto one fixed
         // port, while the deployable role always enables it on a stable, known address a
-        // supervisor can dial. When served it is a SEPARATE, unlayered transport (below),
+        // supervisor can dial. When served it is a SEPARATE transport with its OWN small
+        // admission envelope (below),
         // so a probe answers *outside* the data-plane admission layers.
         let (health_surface, health_refresh_task) = match self.health_bind {
             Some(health_bind) => {
@@ -908,7 +1076,7 @@ impl<S: ChunkStore + 'static> DServer<S> {
             // health service is NOT added here: the readiness probe must answer *through*
             // an overloaded data plane (a probe shed as `RESOURCE_EXHAUSTED` makes a
             // supervisor restart an overloaded-but-healthy node), so it is served by its
-            // OWN, unlayered `Server::builder()` on `health_listener` below — genuinely
+            // OWN, separately bounded `Server::builder()` on `health_listener` below — genuinely
             // "outside that stack" by construction, no per-service escape hatch needed.
             .layer(LoadShedLayer::new())
             .layer(GlobalConcurrencyLimitLayer::new(
@@ -941,7 +1109,7 @@ impl<S: ChunkStore + 'static> DServer<S> {
             .serve_with_incoming_shutdown(TcpListenerStream::new(self.listener), data_shutdown);
 
         // Run the data server, and (when configured) the health probe, together. When the
-        // probe is served it gets its OWN, unlayered `Server::builder()` — no admission
+        // probe is served it gets its OWN, separately bounded `Server::builder()` — no admission
         // layers, nothing shared with the data-plane builder above — on the configured
         // `health_bind` address, so a probe answered there is never contended by, or shed
         // behind, the data plane's admission bound.
@@ -958,7 +1126,25 @@ impl<S: ChunkStore + 'static> DServer<S> {
         let servers = async {
             match health_surface {
                 Some((health_listener, health_server)) => {
+                    // The probe surface's OWN, SMALL admission envelope — separate
+                    // from (never contending with) the data plane's, but bounded: a
+                    // publicly reachable probe bind must not be an unbounded DoS vector
+                    // of long-lived Watch streams and sockets (Codex P1 on #587). Same
+                    // fail-closed layering as the data plane, sized for supervisors.
                     let health_serve = Server::builder()
+                        // Permit-holding concurrency bound: a permit is retained for
+                        // each RPC's whole lifetime — including a long-lived Watch
+                        // stream — so the surface is genuinely bounded, not just at the
+                        // instant a stream opens (see `HealthConcurrencyLayer`). Its own
+                        // semaphore, so the probe never contends with the data plane.
+                        .layer(HealthConcurrencyLayer {
+                            sema: Arc::new(tokio::sync::Semaphore::new(
+                                health_max_concurrent_requests,
+                            )),
+                        })
+                        .concurrency_limit_per_connection(health_max_concurrent_requests)
+                        .max_concurrent_streams(Some(HEALTH_MAX_CONCURRENT_STREAMS))
+                        .http2_keepalive_interval(Some(DEFAULT_HTTP2_KEEPALIVE_INTERVAL))
                         .add_service(health_server)
                         .serve_with_incoming_shutdown(
                             TcpListenerStream::new(health_listener),

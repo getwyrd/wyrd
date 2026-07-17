@@ -5188,6 +5188,7 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "futures-util",
+ "http-body 1.0.1",
  "pollster",
  "serde",
  "serde_json",

@@ -173,6 +173,10 @@ tonic-health = "0.14"
 # instead of exhausting runtime threads. Only the two middleware modules we use:
 # `limit` (GlobalConcurrencyLimitLayer) and `load-shed` (LoadShedLayer).
 tower = { version = "0.5", default-features = false, features = ["limit", "load-shed"] }
+# `http-body` names `Frame`/`SizeHint` for the health surface's permit-holding
+# response body (issue #576): a permit counted for a `Health/Watch` stream's whole
+# lifetime, which tower's concurrency limit does not do. Already in the graph via tonic.
+http-body = "1"
 # tonic 0.14 split the prost codec into its own runtime crate; the generated
 # service stubs reference `tonic_prost::ProstCodec`.
 tonic-prost = "0.14"
