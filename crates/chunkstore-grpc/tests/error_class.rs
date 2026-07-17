@@ -19,6 +19,13 @@
 //!
 //! What is asserted is the **class**, reconstructed client-side: `wyrd_traits::classify`
 //! returns a public class *value* with a stable label, not a bare boolean.
+//!
+//! One supplementary leg (#580) does use a store double — deliberately: the server's
+//! *outbound* transient mapping (`server.rs`'s `transient_or_internal`, the `UNAVAILABLE`
+//! arm) can only fire when the hosted store itself raises a transient fault, and no
+//! default-compiled store can (`FsChunkStore` has nothing transient to report). The #577
+//! "no doubles" constraint bound the binding-criterion producers above, not this
+//! supplementary coverage of a production arm no real store can reach in-tree.
 
 use std::time::Duration;
 
@@ -297,6 +304,91 @@ async fn transient_and_terminal_are_distinguishable_across_the_seam() {
     // The label form issue #575's error counter keys on — a class value, not a bool.
     assert_eq!(tc.as_str(), "integrity");
     assert_eq!(uc.as_str(), "transient");
+}
+
+/// **Transient, over the wire — the server-named flavour (#580).** The one transient leg
+/// the other two cannot cover: the *hosted store itself* raises a `TransientFault` (a
+/// proxied/chained D server whose own backend is briefly unreachable), the server's
+/// outbound mapping (`transient_or_internal`) sends it as `UNAVAILABLE`, and the client
+/// reconstructs the transient class — server→client class survival, which before this test
+/// only Integrity's `DATA_LOSS` round trip demonstrated.
+///
+/// The surviving mutation this pins (found by the #577 adversary review): change
+/// `transient_or_internal`'s transient arm to `Status::internal(..)` and the fault arrives
+/// as `INTERNAL` → a bare `TransportError` → the fail-safe **Terminal** class — a
+/// store-side transient silently stripped of its class at the far client. Both assertions
+/// below go red under that mutation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_named_transient_fault_classifies_transient_over_grpc() {
+    let (client, server) = serve(ChunkStoreService::new(BrieflyUnavailableStore)).await;
+
+    let err = client
+        .get_fragment(fid(5, 0))
+        .await
+        .expect_err("a store-side transient fault must surface as an error, not Ok(None)");
+
+    assert_eq!(
+        classify(err.as_ref()),
+        ErrorClass::Transient,
+        "a transient fault the store itself named must survive the wire as the transient \
+         class, not decay to the fail-safe terminal default; err = {err}"
+    );
+    // The class rode the status convention the mapping promises: UNAVAILABLE, not
+    // INTERNAL — asserted on the client's own reconstruction of the wire status.
+    assert!(
+        unavailable_in_chain(&err),
+        "the server must send a store-named transient as UNAVAILABLE; err = {err}"
+    );
+    // Naming the class cost no detail: the store's own words crossed the wire too.
+    assert!(
+        format!("{err}").contains("the backing store is briefly unreachable"),
+        "the store's detail must survive inside the status message; err = {err}"
+    );
+
+    server.kill().await;
+}
+
+/// Whether `err`'s source chain reaches a [`TransportError::Unavailable`] — i.e. the wire
+/// status the client actually received was `UNAVAILABLE`, not `INTERNAL`.
+fn unavailable_in_chain(err: &BoxError) -> bool {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
+    while let Some(e) = next {
+        if matches!(e.downcast_ref(), Some(TransportError::Unavailable(_))) {
+            return true;
+        }
+        next = e.source();
+    }
+    false
+}
+
+/// A store standing in for a chained/proxied D server whose own backend is briefly gone:
+/// `get_fragment` raises the seam's `TransientFault` directly. Only `get_fragment` is
+/// driven; the other methods are unreachable by construction.
+struct BrieflyUnavailableStore;
+
+#[async_trait::async_trait]
+impl ChunkStore for BrieflyUnavailableStore {
+    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> wyrd_traits::Result<()> {
+        unreachable!("this test only drives get_fragment")
+    }
+
+    async fn get_fragment(&self, _id: FragmentId) -> wyrd_traits::Result<Option<Bytes>> {
+        Err(Box::new(wyrd_traits::TransientFault::new(
+            "the backing store is briefly unreachable",
+        )))
+    }
+
+    async fn list_fragments(&self) -> wyrd_traits::Result<Vec<FragmentId>> {
+        unreachable!("this test only drives get_fragment")
+    }
+
+    async fn delete_fragment(&self, _id: FragmentId) -> wyrd_traits::Result<()> {
+        unreachable!("this test only drives get_fragment")
+    }
+
+    async fn health(&self) -> wyrd_traits::Result<wyrd_traits::Health> {
+        unreachable!("this test only drives get_fragment")
+    }
 }
 
 /// A store whose `get_fragment` never answers, so a request can only be ended by the
