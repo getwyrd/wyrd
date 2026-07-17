@@ -235,13 +235,30 @@ async fn serve_gated(
     (endpoint, tx, handle)
 }
 
-/// Pull the gRPC [`tonic::Code`] out of a `ChunkStore` boxed error — the
-/// `GrpcChunkStore` boxes a [`TransportError`] that carries the wire `Status`.
+/// The [`TransportError`] carrying the wire `Status`, found anywhere in `err`'s source
+/// chain.
+///
+/// The `GrpcChunkStore` boxes it directly for a terminal status, and *underneath* a
+/// `wyrd_traits::TransientFault` for a known-transient one — the seam class wraps the
+/// backend's error rather than replacing it (#577), so both the class and the transport
+/// detail survive. Both shed statuses this file asserts on (`RESOURCE_EXHAUSTED` /
+/// `UNAVAILABLE`, and the request-timeout cut's `CANCELLED` / `DEADLINE_EXCEEDED`) are
+/// transient, so this walks the chain — the same way `wyrd_traits::is_integrity_fault`
+/// finds a wrapped fault — rather than downcasting only the outermost error.
+fn transport_error(err: &wyrd_traits::BoxError) -> &TransportError {
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
+    while let Some(e) = next {
+        if let Some(te) = e.downcast_ref::<TransportError>() {
+            return te;
+        }
+        next = e.source();
+    }
+    panic!("a transport failure carries a TransportError in its chain; got: {err}");
+}
+
+/// Pull the gRPC [`tonic::Code`] out of a `ChunkStore` boxed error.
 fn status_code(err: &wyrd_traits::BoxError) -> Code {
-    let te = err
-        .downcast_ref::<TransportError>()
-        .expect("a transport failure carries a TransportError");
-    match te {
+    match transport_error(err) {
         TransportError::Unavailable(s) | TransportError::Timeout(s) | TransportError::Rpc(s) => {
             s.code()
         }

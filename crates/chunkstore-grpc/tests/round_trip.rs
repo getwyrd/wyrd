@@ -94,12 +94,24 @@ async fn put_get_health_round_trip_over_grpc() {
     server.abort();
 }
 
-/// The gRPC `Status::code` carried by a `ChunkStore` boxed error — the
-/// `GrpcChunkStore` boxes a [`TransportError`] wrapping the wire `Status`.
+/// The gRPC `Status::code` carried by a `ChunkStore` boxed error.
+///
+/// The `GrpcChunkStore` boxes a [`TransportError`] wrapping the wire `Status` — directly
+/// for a terminal status, and underneath a `wyrd_traits::TransientFault` for a
+/// known-transient one, since #577 made the seam's failure class wrap the backend's error
+/// rather than replace it. Walking the chain (the `wyrd_traits::is_integrity_fault` idiom)
+/// finds it either way.
 fn transport_status_code(err: &wyrd_traits::BoxError) -> Code {
-    let te = err
-        .downcast_ref::<TransportError>()
-        .expect("a transport failure carries a TransportError");
+    let mut next: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
+    let te = loop {
+        let e = next.unwrap_or_else(|| {
+            panic!("a transport failure carries a TransportError in its chain; got: {err}")
+        });
+        if let Some(te) = e.downcast_ref::<TransportError>() {
+            break te;
+        }
+        next = e.source();
+    };
     match te {
         TransportError::Unavailable(s) | TransportError::Timeout(s) | TransportError::Rpc(s) => {
             s.code()
