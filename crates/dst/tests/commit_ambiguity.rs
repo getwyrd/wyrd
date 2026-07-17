@@ -1040,3 +1040,72 @@ fn a_deferred_1031_batch_that_skips_the_resolver_clobbers_the_winner() {
         run_deferred_resolver(seed, FdbFidelity::DeferredResolverSkipped);
     }
 }
+
+// ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
+//
+// ANCHOR shape mirrors `custodian.rs:1343-1375` ONLY: a committed const plus the documented
+// one-line-append rule. The replay MECHANICS below are this file's own idiom — a plain
+// `#[test]` calling the seed-parameterized bodies directly per seed, exactly as
+// `the_settling_re_read_covers_both_halves_of_the_ambiguity_space` (`:355`) already does —
+// never custodian's macro/RNG machinery: this file has no `#[madsim::test]` sweep macro and
+// no `rand_chacha` dependency, and this anchor introduces neither.
+//
+// Provenance, stated honestly (ADR-0009 commits *bug-finding* seeds — never fabricate
+// provenance for a seed that never found anything): this initial fixed set is **NOT yet
+// bug-finding**. It is a deterministic replay set — chosen from within `0..AMBIGUITY_SWEEP_SEEDS`,
+// the same range the property tests above already sweep — that keeps this anchor live
+// (compiles, runs, asserts non-vacuously) and proves the append path, ahead of a real
+// checker-found anomaly. `.github/workflows/elle-register-verdict.yml`'s header documents the
+// promotion procedure that appends the first one: capture the scheduled run's uploaded
+// artifacts (EDN histories + run summary + checker output + report) -> minimize the failing
+// history by hand -> reproduce it deterministically inside this madsim harness (whichever of
+// the four bodies below matches the anomaly's shape) -> append the minimized seed as ONE new
+// line to `REGRESSION_SEEDS`, never reordering or removing an entry already committed here.
+const REGRESSION_SEEDS: &[u64] = &[0, 1, 2, 3];
+
+/// The committed seeds replay through all four metadata-ambiguity property bodies, each in
+/// its FAITHFUL configuration (the real `FdbFidelity::CommitUnknownResult` store and the
+/// correct/non-violating observer — never the violating twins the demonstrated-red tests
+/// above use), with the same per-seed anti-vacuity counters those bodies' own sweeps assert
+/// (`:332-333` / `:878-881`'s `ambiguous_conditional_commits >= 1` shape; `:479-483`'s
+/// `ambiguous_blind_commits == 1`), so a seed that never actually activates a leg's fault
+/// path cannot replay green silently.
+#[test]
+fn committed_regression_seeds_stay_green() {
+    for &seed in REGRESSION_SEEDS {
+        // Leg 1 (`run_cas_ambiguity`, `:318`): the 1021 nemesis must strike the version CAS.
+        let cas = run_cas_ambiguity(
+            seed,
+            FdbFidelity::CommitUnknownResult,
+            Observer::SettlingReRead,
+        );
+        assert!(
+            cas.ambiguous_conditional_commits >= 1,
+            "seed {seed}: the 1021 nemesis never struck the version CAS — this seed would \
+             replay leg 1 of the anchor green vacuously"
+        );
+
+        // Leg 2 (`run_blind_ambiguity`, `:523`): the blind Intent put must come back
+        // ambiguous. `ambiguous_pending_put_over` itself asserts this unconditionally
+        // (`:479-483`), so a seed that never triggers it panics inside the call.
+        let blind = run_blind_ambiguity(seed, BlindObserver::SettlingReRead);
+        assert_eq!(
+            blind.ambiguous_blind_commits, 1,
+            "seed {seed}: the blind Intent put never came back ambiguous"
+        );
+
+        // Leg 3 (`run_timeout_ambiguity`, `:676`): `timed_out_commit_over` itself
+        // `expect_err`s the struck CAS (`:632-634`), so a seed that never triggers the 1031
+        // nemesis panics inside the call rather than replaying green silently.
+        let _ = run_timeout_ambiguity(seed, TimeoutObserver::AcceptsIndeterminacy);
+
+        // Leg 4 (`run_contended_1031`, `:854`): the 1031 nemesis must strike a contended CAS,
+        // the same per-seed counter the contended sweep asserts inside its loop (`:878-881`).
+        let contended = run_contended_1031(seed, ContendedObserver::SettleThenReRead);
+        assert!(
+            contended.ambiguous_conditional_commits >= 1,
+            "seed {seed}: the 1031 nemesis never struck a contended CAS — this seed would \
+             replay leg 4 of the anchor green vacuously"
+        );
+    }
+}

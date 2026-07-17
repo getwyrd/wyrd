@@ -3,8 +3,8 @@ name: report-nightly-failure
 # Nightly quality-verification failure reporter.
 #
 # The off-Check nightly quality jobs (tier1-disk-faults, tier2-kill-reconstruct,
-# integration-nightly, the mutants full sweep) run on a schedule and are NOT
-# required status checks, so a failure produces no merge signal — it can rot
+# integration-nightly, the mutants full sweep, elle-register-verdict) run on a schedule and
+# are NOT required status checks, so a failure produces no merge signal — it can rot
 # unnoticed until the next release. This workflow turns each nightly failure into
 # a tracked bug.
 #
@@ -30,6 +30,7 @@ on:
       - tier2-kill-reconstruct
       - integration-nightly
       - mutants
+      - elle-register-verdict
     types:
       - completed
 
