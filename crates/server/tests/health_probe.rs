@@ -10,6 +10,11 @@
 //!     asserted);
 //! (c) the health check still answers (not shed with `RESOURCE_EXHAUSTED`) while the
 //!     data plane is saturated at its admission bound.
+//! Plus the default-invocation pin: the EMPTY-service `Check` — what `grpcurl` /
+//! `grpc_health_probe` send when no service is named — tracks the store exactly like
+//! the named service ([`the_default_empty_service_check_tracks_the_store`]; Codex P1
+//! on #587: tonic-health defaults "" to SERVING, so an unmirrored empty status would
+//! report ready forever).
 //!
 //! **The probe is dialed on the OPERATOR-CONFIGURED health address** — the same
 //! `with_health_bind(..)` knob the `wyrd d-server --health-bind ADDR` flag plumbs
@@ -127,11 +132,13 @@ impl ChunkStore for ControllableStore {
     }
 }
 
-/// The `grpc.health.v1` service name the readiness status is keyed on — the
-/// `ChunkStoreServer`'s own registered name (`DServer::serve` sets readiness there,
-/// not on the empty-name overall/liveness service). `ChunkStoreServer<T>`'s
-/// `NamedService::NAME` does not depend on `T`, so any instantiation gives the same
-/// constant.
+/// The named `grpc.health.v1` service the readiness status is ALSO keyed on — the
+/// `ChunkStoreServer`'s own registered name. `DServer::serve` publishes the same
+/// store-derived status on this name AND the empty-name overall service (the default
+/// probe invocation) from one reading, so they can never disagree
+/// ([`the_default_empty_service_check_tracks_the_store`] pins the empty name).
+/// `ChunkStoreServer<T>`'s `NamedService::NAME` does not depend on `T`, so any
+/// instantiation gives the same constant.
 fn readiness_service_name() -> &'static str {
     <ChunkStoreServer<()> as NamedService>::NAME
 }
@@ -334,6 +341,74 @@ async fn check_reports_not_serving_once_unhealthy_or_erroring() {
         &mut client,
         name,
         WireServingStatus::NotServing,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
+}
+
+/// The DEFAULT probe invocation — a plain `Health/Check` with the EMPTY `service`
+/// field, what `grpcurl … grpc.health.v1.Health/Check` and `grpc_health_probe -addr …`
+/// send when no service is named, and what a generic supervisor dials — must track the
+/// store exactly like the named readiness service. tonic-health defaults the empty-name
+/// status to SERVING, so publishing only the named status would leave the documented
+/// invocation reporting ready forever, however unhealthy the store (Codex P1 on #587).
+/// Also pins the fail-closed flip and recovery through the empty name.
+#[tokio::test]
+async fn the_default_empty_service_check_tracks_the_store() {
+    let (store, _dir) = fs_store();
+    let health = Arc::new(Mutex::new(HealthMode::Healthy));
+    let controllable = ControllableStore {
+        inner: store,
+        health: Arc::clone(&health),
+        entered: None,
+        gate: None,
+    };
+    let health_bind = reserve_addr().await;
+    let (_endpoint, shutdown, handle) = serve_controllable(
+        controllable,
+        AdmissionControl::default(),
+        health_bind,
+        Duration::from_millis(20),
+    )
+    .await;
+    let mut client = health_client(&format!("http://{health_bind}")).await;
+
+    // The empty service name — the request the documented invocations actually send.
+    wait_for_check(
+        &mut client,
+        "",
+        WireServingStatus::Serving,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // An unhealthy store must flip the DEFAULT invocation too — this is the probe a
+    // supervisor acts on; red on the pre-fix build (the "" status stayed SERVING).
+    *health.lock().unwrap() = HealthMode::Unhealthy;
+    wait_for_check(
+        &mut client,
+        "",
+        WireServingStatus::NotServing,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // And it recovers, in step with the named service (one reading, two keys).
+    *health.lock().unwrap() = HealthMode::Healthy;
+    wait_for_check(
+        &mut client,
+        "",
+        WireServingStatus::Serving,
+        Duration::from_secs(5),
+    )
+    .await;
+    wait_for_check(
+        &mut client,
+        readiness_service_name(),
+        WireServingStatus::Serving,
         Duration::from_secs(5),
     )
     .await;

@@ -694,8 +694,11 @@ impl<S: ChunkStore + 'static> DServer<S> {
     /// probe surface is served by its **own, unlayered** transport, so it stays
     /// answerable even when the data plane is shedding at its admission bound (a probe
     /// shed as `RESOURCE_EXHAUSTED` would make supervisors restart an
-    /// overloaded-but-healthy node). The overall empty-name service is the liveness
-    /// signal (the process answers at all), left at tonic-health's serving default.
+    /// overloaded-but-healthy node). The store-derived status is published on **both**
+    /// the overall empty-name service (what a plain `Health/Check` with no `service`
+    /// field reads — the default for `grpcurl` and `grpc_health_probe`) and the
+    /// `ChunkStoreServer`'s registered name, from one reading, so they can never
+    /// disagree; liveness is simply the probe socket answering at all.
     pub async fn serve<Co>(
         self,
         coord: Arc<Co>,
@@ -730,14 +733,23 @@ impl<S: ChunkStore + 'static> DServer<S> {
                 // port.
                 let health_listener = TcpListener::bind(health_bind).await?;
                 // `health_reporter()` returns the write side (`HealthReporter`) linked to
-                // the gRPC `HealthServer`. The overall empty-name "" service is the LIVENESS
-                // signal, left at tonic-health's `Serving` default (that default already
-                // *is* "the process answers at all"). READINESS is a distinct, named status
-                // keyed on the `ChunkStoreServer`'s own registered name — set to
-                // `NotServing` here, before anything is served, so a probe landing before
-                // the first `health()` read reads fail-closed NOT_SERVING (not `NOT_FOUND`,
-                // what a never-registered name reads as).
+                // the gRPC `HealthServer`. The store-derived readiness is published on BOTH
+                // statuses a prober can ask for: the overall empty-name "" service — what
+                // the protocol's plain `Health/Check` (grpcurl with no `service` field,
+                // `grpc_health_probe` with no `-service`) reads, and what a generic
+                // supervisor dials by default — and the `ChunkStoreServer`'s own registered
+                // name, for per-service checks. Leaving "" at tonic-health's `Serving`
+                // default would make the DOCUMENTED probe invocation report ready forever,
+                // however unhealthy the store (Codex P1 on #587); liveness needs no status
+                // of its own — the probe socket answering at all is the liveness signal.
+                // Both are set `NotServing` here, before anything is served, so a probe
+                // landing before the first `health()` read reads fail-closed NOT_SERVING
+                // (not `NOT_FOUND`, what a never-registered name reads as; not the ""
+                // default `Serving`, which would be a false ready).
                 let (health_reporter, health_server) = tonic_health::server::health_reporter();
+                health_reporter
+                    .set_service_status("", ServingStatus::NotServing)
+                    .await;
                 health_reporter
                     .set_not_serving::<ChunkStoreServer<ChunkStoreService<S>>>()
                     .await;
@@ -759,6 +771,11 @@ impl<S: ChunkStore + 'static> DServer<S> {
                                 Ok(Health::Healthy | Health::Degraded) => ServingStatus::Serving,
                                 Ok(Health::Unhealthy) | Err(_) => ServingStatus::NotServing,
                             };
+                            // Publish to BOTH the empty-name overall service (the plain
+                            // `Health/Check` a default-configured prober sends) and the
+                            // named service — one reading, two keys, so they can never
+                            // disagree.
+                            reporter.set_service_status("", status).await;
                             reporter
                                 .set_service_status(
                                     <ChunkStoreServer<ChunkStoreService<S>> as NamedService>::NAME,
