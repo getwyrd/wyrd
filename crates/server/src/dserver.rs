@@ -803,24 +803,54 @@ impl<S: ChunkStore + 'static> DServer<S> {
                     let reporter = health_reporter.clone();
                     let interval = self.health_refresh_interval;
                     tokio::spawn(async move {
+                        // Publish one reading to BOTH statuses a prober can ask for — the
+                        // empty-name overall service (the plain `Health/Check` a
+                        // default-configured prober sends) and the named service — so
+                        // they can never disagree.
+                        let publish = |status: ServingStatus| {
+                            let reporter = reporter.clone();
+                            async move {
+                                reporter.set_service_status("", status).await;
+                                reporter
+                                    .set_service_status(
+                                        <ChunkStoreServer<ChunkStoreService<S>> as
+                                            NamedService>::NAME,
+                                        status,
+                                    )
+                                    .await;
+                            }
+                        };
                         let mut ticker = tokio::time::interval(interval);
                         loop {
                             ticker.tick().await;
-                            let status = match store.health().await {
-                                Ok(Health::Healthy | Health::Degraded) => ServingStatus::Serving,
-                                Ok(Health::Unhealthy) | Err(_) => ServingStatus::NotServing,
+                            // The probe read is BOUNDED by the refresh cadence: a
+                            // `health()` that HANGS (a stalled mount blocking a
+                            // filesystem metadata call) must fail closed on expiry, not
+                            // pin this loop with the last SERVING on display (Codex P2
+                            // on #587). And a timed-out probe is NOT abandoned for a
+                            // fresh one: dropping the future leaves its `spawn_blocking`
+                            // work running, so re-probing every interval would stack
+                            // stuck blocking tasks until tokio's blocking pool starves
+                            // the data plane's own filesystem calls (Codex P1 follow-on).
+                            // AT MOST ONE underlying probe is ever in flight — on expiry
+                            // the SAME future is kept and re-awaited, publishing
+                            // NOT_SERVING each interval until it resolves.
+                            let probe = store.health();
+                            tokio::pin!(probe);
+                            let status = loop {
+                                match tokio::time::timeout(interval, &mut probe).await {
+                                    Ok(Ok(Health::Healthy | Health::Degraded)) => {
+                                        break ServingStatus::Serving;
+                                    }
+                                    Ok(Ok(Health::Unhealthy)) | Ok(Err(_)) => {
+                                        break ServingStatus::NotServing;
+                                    }
+                                    Err(_still_in_flight) => {
+                                        publish(ServingStatus::NotServing).await;
+                                    }
+                                }
                             };
-                            // Publish to BOTH the empty-name overall service (the plain
-                            // `Health/Check` a default-configured prober sends) and the
-                            // named service — one reading, two keys, so they can never
-                            // disagree.
-                            reporter.set_service_status("", status).await;
-                            reporter
-                                .set_service_status(
-                                    <ChunkStoreServer<ChunkStoreService<S>> as NamedService>::NAME,
-                                    status,
-                                )
-                                .await;
+                            publish(status).await;
                         }
                     })
                 };

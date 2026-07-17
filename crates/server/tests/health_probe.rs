@@ -86,6 +86,10 @@ enum HealthMode {
     /// `health()` itself fails — the fail-closed case (Design, §"Mapping":
     /// "`Err(_)` from `health()` ⇒ NOT_SERVING").
     Erroring,
+    /// `health()` HANGS — never resolves (a stalled mount blocking a filesystem
+    /// metadata call). The refresher must fail closed on its bounded timeout, not
+    /// pin at the await with the last status visible forever.
+    Stalling,
 }
 
 /// A `ChunkStore` whose `health()` the test controls at runtime, and whose
@@ -124,10 +128,14 @@ impl ChunkStore for ControllableStore {
     }
 
     async fn health(&self) -> Result<Health> {
-        match *self.health.lock().unwrap() {
+        let mode = *self.health.lock().unwrap();
+        match mode {
             HealthMode::Healthy => Ok(Health::Healthy),
             HealthMode::Unhealthy => Ok(Health::Unhealthy),
             HealthMode::Erroring => Err("store cannot report its own health".into()),
+            // The lock guard is dropped before parking, so the test can still flip
+            // the mode while a probe hangs.
+            HealthMode::Stalling => std::future::pending().await,
         }
     }
 }
@@ -485,6 +493,57 @@ async fn a_zero_refresh_interval_refuses_at_the_builder() {
         .await
         .expect("bind")
         .with_health_refresh_interval(Duration::ZERO);
+}
+
+/// A `health()` that HANGS — a stalled mount blocking a filesystem metadata call —
+/// must read NOT_SERVING within a bounded wait, not leave the last SERVING visible
+/// indefinitely: the refresher bounds each probe read by the refresh cadence and fails
+/// closed on expiry (Codex P2 on #587). Red pre-fix: the refresh loop pins at the
+/// hung await, no tick ever fires again, and the status stays SERVING forever.
+#[tokio::test]
+async fn a_hanging_health_probe_fails_closed_within_a_bounded_wait() {
+    let (store, _dir) = fs_store();
+    let health = Arc::new(Mutex::new(HealthMode::Healthy));
+    let controllable = ControllableStore {
+        inner: store,
+        health: Arc::clone(&health),
+        entered: None,
+        gate: None,
+    };
+    let health_bind = reserve_addr().await;
+    let (_endpoint, shutdown, handle) = serve_controllable(
+        controllable,
+        AdmissionControl::default(),
+        health_bind,
+        Duration::from_millis(20),
+    )
+    .await;
+    let mut client = health_client(&format!("http://{health_bind}")).await;
+
+    // Converge to SERVING first, so the stall demonstrably OVERWRITES a healthy status
+    // rather than riding the fail-closed initial state.
+    wait_for_check(
+        &mut client,
+        readiness_service_name(),
+        WireServingStatus::Serving,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // The store's health() now hangs forever. Within a bounded wait the probe must
+    // flip to NOT_SERVING — the bounded per-read timeout firing, not the hung await
+    // pinning the loop with SERVING on display.
+    *health.lock().unwrap() = HealthMode::Stalling;
+    wait_for_check(
+        &mut client,
+        readiness_service_name(),
+        WireServingStatus::NotServing,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let _ = shutdown.send(());
+    let _ = handle.await;
 }
 
 /// The library backstop for the CLI's `:0` refusal: `with_health_bind` on an ephemeral
