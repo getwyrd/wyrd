@@ -14,8 +14,10 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -23,10 +25,12 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tower::limit::GlobalConcurrencyLimitLayer;
+use tower::load_shed::error::Overloaded;
 use tower::load_shed::LoadShedLayer;
+use tower::{Layer, Service};
 use wyrd_chunkstore_grpc::{ChunkStoreServer, ChunkStoreService};
 use wyrd_core::placement::Topology;
-use wyrd_traits::{ChunkStore, Coordination, DServerId, Lease, Result};
+use wyrd_traits::{BoxError, ChunkStore, Coordination, DServerId, Lease, Result};
 
 /// The discovery group under which D servers register their gRPC endpoints.
 pub const DSERVER_GROUP: &str = "chunkstore";
@@ -129,6 +133,318 @@ impl Default for AdmissionControl {
     }
 }
 
+// ---- the capacity plane (observability floor, proposal 0010 §"Scope boundary" item 5) ----
+//
+// The admission stack above decides, per request, whether the server takes the work. Until
+// now it did so **silently**: an over-limit request was shed with a `RESOURCE_EXHAUSTED` the
+// CLIENT saw and the server never recorded, so "are we shedding load?" — the first question
+// of any overload post-mortem — was answerable only from client-side evidence, if anyone had
+// kept it. These types make each admission decision an event on the shared telemetry seam.
+//
+// **Emission only.** Nothing here changes what is admitted, shed, or cut: every layer
+// forwards its inner service's outcome unaltered, and the `Server::builder()` options that
+// set the actual policy are untouched. The observers are *positioned* around the existing
+// stack rather than replacing any part of it.
+
+/// The capacity plane's shared state: where its metric events go, and the live count of
+/// admitted-and-not-yet-finished requests.
+///
+/// Cloned into every layer and (by tonic) per connection, so the in-flight count MUST be
+/// shared — an `Arc<AtomicI64>` — or each connection would report only its own share of a
+/// bound that is explicitly server-wide.
+#[derive(Clone)]
+struct CapacityPlane {
+    /// The role's metrics sink (`DurabilityTelemetry::metrics_dispatch()`, composed at the
+    /// `wyrd d-server` role entry). `None` ⇒ the ambient subscriber: the emission is
+    /// unconditional, only the SINK is a role's choice, so a library caller / an existing
+    /// test that never wires telemetry is unaffected.
+    dispatch: Option<tracing::Dispatch>,
+    /// The in-flight level. A `Mutex`, not an atomic, because the level and its *emission*
+    /// must move together — see [`CapacityPlane::record_in_flight`].
+    in_flight: Arc<Mutex<i64>>,
+}
+
+impl CapacityPlane {
+    fn new(dispatch: Option<tracing::Dispatch>) -> Self {
+        Self {
+            dispatch,
+            in_flight: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    /// Emit `f`'s metric events into the role's sink. Entering a dispatch is a thread-local
+    /// set for the closure's duration, so it is sound from any task — which is why the sink
+    /// is carried here rather than scoped around `serve`: tonic spawns a task per connection
+    /// (`tonic-0.14.6` `src/transport/server/mod.rs:925`) and a spawned task does not
+    /// inherit a scoped dispatch.
+    fn emit(&self, f: impl FnOnce()) {
+        match &self.dispatch {
+            Some(dispatch) => tracing::dispatcher::with_default(dispatch, f),
+            None => f(),
+        }
+    }
+
+    /// Raise every capacity series at **zero** before the server accepts anything, so a
+    /// dashboard reads "0 shed" rather than "no data" on a healthy server — the two are
+    /// indistinguishable for a counter that only appears once it first fires (the same
+    /// argument #577's `ErrorClass::ALL` makes for the request plane's class labels).
+    fn preregister(&self) {
+        self.emit(|| {
+            tracing::info!(monotonic_counter.capacity_requests_admitted = 0_u64);
+            tracing::info!(monotonic_counter.capacity_requests_shed = 0_u64);
+            tracing::info!(monotonic_counter.capacity_requests_timed_out = 0_u64);
+            tracing::info!(monotonic_counter.capacity_requests_cancelled = 0_u64);
+            tracing::info!(gauge.capacity_requests_in_flight = 0_i64);
+        });
+    }
+
+    /// Move the in-flight level by `delta`, run `also`, and report the new level — all
+    /// **atomically with respect to other emitters**.
+    ///
+    /// The lock spans the *emission*, not merely the arithmetic, and that is the whole point.
+    /// With a bare atomic the read and the record are two steps: two requests finishing
+    /// concurrently compute their levels (1, then 0) and can then emit them in the OPPOSITE
+    /// order, latching a last-value gauge at 1. The server is idle and the gauge says one
+    /// request is in flight — forever, or until the next request happens to move it. That is
+    /// exactly the "rises but never returns to zero" defect this signal exists to rule out,
+    /// and it is invisible to any test that drives one request at a time.
+    ///
+    /// The critical section is an integer update plus one or two `tracing` events — no I/O, no
+    /// await — taken twice per RPC, on a path that already acquires an admission semaphore,
+    /// parses HTTP/2, and touches a disk. A poisoned lock is recovered rather than propagated:
+    /// telemetry must not take a storage server down, and this runs inside a `Drop`, where a
+    /// panic during unwind would abort the process.
+    fn record_in_flight(&self, delta: i64, also: impl FnOnce()) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *in_flight += delta;
+        let level = *in_flight;
+        self.emit(|| {
+            also();
+            tracing::info!(gauge.capacity_requests_in_flight = level);
+        });
+    }
+
+    /// A request cleared the server-wide admission bound and is now in flight.
+    fn admitted(&self) {
+        self.record_in_flight(1, || {
+            tracing::info!(monotonic_counter.capacity_requests_admitted = 1_u64);
+        });
+    }
+
+    /// An admitted request left the stack (completed, cut, or cancelled) — it no longer
+    /// holds a slot.
+    fn finished(&self) {
+        self.record_in_flight(-1, || {});
+    }
+
+    /// A request was refused by the server-wide bound.
+    fn shed(&self) {
+        self.emit(|| tracing::info!(monotonic_counter.capacity_requests_shed = 1_u64));
+    }
+
+    /// An admitted request was cut before it produced a response: by the request timeout
+    /// (`timed_out`) or by its caller going away (`cancelled`). Kept as two series because
+    /// the operator response differs — a rising timeout rate is the SERVER failing to make
+    /// progress within its own deadline, while cancellations are clients leaving.
+    fn cut(&self, timed_out: bool) {
+        self.emit(|| {
+            if timed_out {
+                tracing::info!(monotonic_counter.capacity_requests_timed_out = 1_u64);
+            } else {
+                tracing::info!(monotonic_counter.capacity_requests_cancelled = 1_u64);
+            }
+        });
+    }
+}
+
+/// Decrements the in-flight count and reports how an admitted request ended — **whatever**
+/// ends it.
+///
+/// A guard, not a match arm, because the interesting ending is the one with no return value:
+/// tonic's request timeout is applied OUTSIDE this whole layer stack (`GrpcTimeout` wraps the
+/// user's `Server::layer` stack — `tonic-0.14.6` `src/transport/server/mod.rs:1234-1239`), so
+/// when the deadline fires it returns its own error and simply **drops** the inner future.
+/// The cut is therefore never observable as a `Poll::Ready(Err(..))` from in here; it is only
+/// observable as a drop.
+struct AdmissionGuard {
+    plane: CapacityPlane,
+    /// Stamped at `call` — which runs inside `GrpcTimeout::call`, and specifically *before*
+    /// it arms its own `sleep` (that struct literal evaluates `inner: self.inner.call(req)`
+    /// first). So this instant is never later than the deadline's start, and when the
+    /// deadline fires `elapsed >= request_timeout` holds — tokio's `sleep` is documented to
+    /// wait at least its duration, never less. That ordering is what makes the timeout /
+    /// cancellation split below exact rather than a guess about wall-clock.
+    started: Instant,
+    request_timeout: Duration,
+    completed: bool,
+}
+
+impl AdmissionGuard {
+    fn enter(plane: CapacityPlane, request_timeout: Duration) -> Self {
+        plane.admitted();
+        Self {
+            plane,
+            started: Instant::now(),
+            request_timeout,
+            completed: false,
+        }
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        self.plane.finished();
+        if !self.completed {
+            // Dropped without a response: the request was cut. It was cut by the SERVER's
+            // deadline iff it lived at least that long (see `started`). A shorter life means
+            // something else took it away — the client hung up, the connection died, or the
+            // client's own `grpc-timeout` header set a deadline tighter than ours, which
+            // tonic honours by taking the minimum. Attributing that to the server's request
+            // timeout would be a lie about whose deadline fired.
+            self.plane
+                .cut(self.started.elapsed() >= self.request_timeout);
+        }
+    }
+}
+
+/// Counts requests the **server-wide** bound refused.
+///
+/// It must sit OUTSIDE [`LoadShedLayer`] to see anything: load-shed is what turns the
+/// concurrency limit's backpressure into a rejection, so a shed request never reaches any
+/// layer below it. `tower`'s `Overloaded` error is that rejection, and it is forwarded
+/// unchanged — tonic still maps it to the same retryable `RESOURCE_EXHAUSTED` the client got
+/// before.
+///
+/// It observes only the server-wide shed, which is the bound `AdmissionControl` documents as
+/// binding and the one an operator tunes. The secondary *per-connection* cap is applied by
+/// tonic outside the user layer stack entirely, so its shed is not reachable from here.
+#[derive(Clone)]
+struct ShedObserver<S> {
+    inner: S,
+    plane: CapacityPlane,
+}
+
+#[derive(Clone)]
+struct ShedObserverLayer {
+    plane: CapacityPlane,
+}
+
+impl<S> Layer<S> for ShedObserverLayer {
+    type Service = ShedObserver<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ShedObserver {
+            inner,
+            plane: self.plane.clone(),
+        }
+    }
+}
+
+impl<S, R> Service<R> for ShedObserver<S>
+where
+    S: Service<R>,
+    S::Error: Into<BoxError>,
+    S::Future: Send + 'static,
+    S::Response: 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    // Boxed rather than a hand-written future: projecting a pinned inner future without a
+    // `pin-project` dependency would need `unsafe`, which this crate forbids. It costs one
+    // allocation per request on a path that already boxes per request inside tonic
+    // (`BoxCloneService`) and then does fragment I/O, and it changes no behaviour.
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        let plane = self.plane.clone();
+        let inner = self.inner.call(req);
+        Box::pin(async move {
+            match inner.await {
+                Ok(response) => Ok(response),
+                Err(err) => {
+                    let err: BoxError = err.into();
+                    if err.is::<Overloaded>() {
+                        plane.shed();
+                    }
+                    Err(err)
+                }
+            }
+        })
+    }
+}
+
+/// Reports admission, the in-flight level, and how each admitted request ended.
+///
+/// It must sit INSIDE [`GlobalConcurrencyLimitLayer`], and that placement is what makes
+/// "admitted" mean admitted: `tower`'s concurrency limit acquires its semaphore permit in
+/// `poll_ready` and only then calls inner, so reaching this layer's `call` *is* holding a
+/// slot. An observer placed outside the limit could not tell an admitted request from one
+/// about to be shed, and would have to count both before retracting one — which is exactly
+/// how an in-flight gauge starts reporting load that was never accepted.
+#[derive(Clone)]
+struct AdmissionObserver<S> {
+    inner: S,
+    plane: CapacityPlane,
+    request_timeout: Duration,
+}
+
+#[derive(Clone)]
+struct AdmissionObserverLayer {
+    plane: CapacityPlane,
+    request_timeout: Duration,
+}
+
+impl<S> Layer<S> for AdmissionObserverLayer {
+    type Service = AdmissionObserver<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AdmissionObserver {
+            inner,
+            plane: self.plane.clone(),
+            request_timeout: self.request_timeout,
+        }
+    }
+}
+
+impl<S, R> Service<R> for AdmissionObserver<S>
+where
+    S: Service<R>,
+    S::Future: Send + 'static,
+    S::Response: 'static,
+    S::Error: 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        // The guard is built HERE, not inside the async block, for two reasons. Its `started`
+        // must be stamped before `GrpcTimeout` arms its deadline (see `AdmissionGuard`), and
+        // moving it into the block means a future that is dropped without ever being polled
+        // still releases its in-flight slot — otherwise the gauge would leak upward and never
+        // return to zero.
+        let guard = AdmissionGuard::enter(self.plane.clone(), self.request_timeout);
+        let inner = self.inner.call(req);
+        Box::pin(async move {
+            let mut guard = guard;
+            let response = inner.await;
+            guard.completed = true;
+            response
+        })
+    }
+}
+
 /// What a D server publishes through `Coordination::register` (proposal 0005, "The
 /// placement record", `0005:194-196`): its **stable id**, its current dialable
 /// **endpoint**, and its opaque **failure-domain label**. Keyed on the stable id
@@ -174,6 +490,9 @@ pub struct DServer<S> {
     id: DServerId,
     failure_domain: String,
     admission: AdmissionControl,
+    /// The sink this server's **capacity-plane** signals are emitted into (proposal 0010
+    /// item 5) — see [`DServer::with_metrics_dispatch`].
+    metrics: Option<tracing::Dispatch>,
 }
 
 impl<S: ChunkStore + 'static> DServer<S> {
@@ -194,7 +513,26 @@ impl<S: ChunkStore + 'static> DServer<S> {
             id: 0,
             failure_domain: DEFAULT_FAILURE_DOMAIN.to_string(),
             admission: AdmissionControl::default(),
+            metrics: None,
         })
+    }
+
+    /// Emit this server's **capacity-plane** signals into `dispatch` (observability floor,
+    /// proposal 0010 §"Scope boundary" item 5): admitted / shed / timed-out / cancelled
+    /// events and the in-flight RPC gauge, raised around the existing admission stack.
+    ///
+    /// The dispatch is the role's metrics sink (`wyrd_telemetry::DurabilityTelemetry::
+    /// metrics_dispatch()`), composed at the `wyrd d-server` role entry (`cli::cmd_d_server`)
+    /// with the export surface chosen by `ExporterConfig` — so no telemetry backend is named
+    /// here (ADR-0012). It is carried rather than scoped because tonic serves each connection
+    /// on its own spawned task, which does not inherit a scoped dispatch.
+    ///
+    /// Unset, the signals are emitted into the ambient subscriber (today's behaviour). This
+    /// changes **no** admission behaviour either way: what is admitted and what is shed is
+    /// [`AdmissionControl`]'s business, and the observers only watch.
+    pub fn with_metrics_dispatch(mut self, dispatch: tracing::Dispatch) -> Self {
+        self.metrics = Some(dispatch);
+        self
     }
 
     /// Set this server's **stable id** and opaque **failure-domain label** — the
@@ -285,7 +623,20 @@ impl<S: ChunkStore + 'static> DServer<S> {
     {
         let service = ChunkStoreService::new(self.store);
         let admission = self.admission;
+        // The capacity plane (proposal 0010 item 5). Built once, outside the builder, so the
+        // in-flight count is shared by BOTH observers and by every per-connection clone of
+        // the layer stack — the gauge tracks the same server-wide population the admission
+        // bound does.
+        let plane = CapacityPlane::new(self.metrics);
+        plane.preregister();
         let serve = Server::builder()
+            // OBSERVE the shed (0010 item 5). Outermost, so it sees the `Overloaded`
+            // rejection the load-shed layer below raises — the shed that until now was
+            // visible ONLY as a client-side `RESOURCE_EXHAUSTED`. It forwards that error
+            // untouched; nothing about what gets shed moves.
+            .layer(ShedObserverLayer {
+                plane: plane.clone(),
+            })
             // Fail-closed admission, SERVER-WIDE (architecture §8.9). Applied via
             // `.layer()`, the layer stack is built once and *cloned* per connection,
             // so a `GlobalConcurrencyLimitLayer` (which holds one `Arc<Semaphore>`)
@@ -305,6 +656,14 @@ impl<S: ChunkStore + 'static> DServer<S> {
             .layer(GlobalConcurrencyLimitLayer::new(
                 admission.max_concurrent_requests,
             ))
+            // OBSERVE admission + the in-flight level (0010 item 5). INSIDE the concurrency
+            // limit, so it is reached only by a request that already holds a permit — which
+            // is what makes "admitted" mean admitted and keeps a shed request off the
+            // in-flight gauge entirely.
+            .layer(AdmissionObserverLayer {
+                plane: plane.clone(),
+                request_timeout: admission.request_timeout,
+            })
             // Secondary, per-connection caps: a single connection cannot monopolise
             // the budget, and `load_shed` makes its over-limit excess shed too. The
             // server-wide layer above is the binding fail-closed bound; these only

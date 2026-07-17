@@ -363,7 +363,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
-    eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
+    eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd] [--max-concurrent-requests N] [--request-timeout-secs N] [--otlp-endpoint URL]");
     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore] [--gc-expired-pending]");
     eprintln!("      --reconcile-after-restore runs ONE post-restore reconciliation pass and exits (#551): after");
     eprintln!("      restoring metadata from a backup, with the writers STOPPED. It marks fragments the restore");
@@ -374,7 +374,7 @@ fn usage() {
     eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
     eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
     eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  every command also accepts:");
@@ -666,6 +666,16 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         ..dserver::AdmissionControl::default()
     };
 
+    // The export surface, selected exactly as `cmd_custodian` selects its own
+    // (`cli.rs:797-802`): Prometheus always, plus OTLP push when `--otlp-endpoint` names a
+    // collector. No backend hardcoded (ADR-0012).
+    let exporter = match parsed.flag("otlp-endpoint") {
+        Some(endpoint) => ExporterConfig::Both {
+            otlp_endpoint: endpoint.to_string(),
+        },
+        None => ExporterConfig::Prometheus,
+    };
+
     let chunk_dir = Path::new(data_dir).join("chunks");
     let store = FsChunkStore::open(&chunk_dir)?;
 
@@ -680,19 +690,26 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let params = DServerParams {
-        bind,
-        advertise_addr,
-        dserver_id,
-        failure_domain,
-        admission,
-        group: group.to_string(),
-        lease_ttl,
-        renew_interval,
-        data_dir: data_dir.to_string(),
-    };
     runtime.block_on(async move {
-        match coordination {
+        // **The metrics provider this role was missing** — the item-3 enabler. `init_global`
+        // gives every role the LOG layers (#527); until now only `cmd_custodian` built a
+        // `DurabilityTelemetry`, so the d-server's admission decisions had nowhere to land
+        // even once instrumented. Built inside the runtime (the OTLP exporter's tonic
+        // transport is constructed there).
+        let telemetry = DurabilityTelemetry::new(exporter)?;
+        let params = DServerParams {
+            bind,
+            advertise_addr,
+            dserver_id,
+            failure_domain,
+            admission,
+            group: group.to_string(),
+            lease_ttl,
+            renew_interval,
+            data_dir: data_dir.to_string(),
+            metrics: Some(telemetry.metrics_dispatch()),
+        };
+        let served = match coordination {
             CoordinationBackend::Mem => {
                 run_d_server(Arc::new(MemCoordination::new()), store, params).await
             }
@@ -700,7 +717,11 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
             CoordinationBackend::Etcd => {
                 run_d_server(Arc::new(open_etcd_coordination().await?), store, params).await
             }
-        }
+        };
+        // Hold the handle for the role's whole life: it owns the export readers the
+        // capacity-plane metrics are exported through.
+        drop(telemetry);
+        served
     })?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1353,6 +1374,9 @@ struct DServerParams {
     lease_ttl: Duration,
     renew_interval: Duration,
     data_dir: String,
+    /// The role's metrics sink, which the capacity plane emits its admission signals into
+    /// (proposal 0010 item 5). `None` ⇒ the ambient subscriber (an in-process caller).
+    metrics: Option<tracing::Dispatch>,
 }
 
 /// Host the local filesystem `ChunkStore` over gRPC and register through the given
@@ -1374,6 +1398,9 @@ where
         .with_admission_control(params.admission);
     if let Some(advertise_addr) = params.advertise_addr {
         server = server.with_advertise_addr(advertise_addr);
+    }
+    if let Some(metrics) = params.metrics {
+        server = server.with_metrics_dispatch(metrics);
     }
     eprintln!(
         "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {})",
@@ -1744,8 +1771,27 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
         secret_access_key: secret_key,
     }];
 
+    // The export surface, selected exactly as `cmd_custodian` selects its own
+    // (`cli.rs:797-802`): a Prometheus registry is always wired (in-process read-back);
+    // `--otlp-endpoint` additionally pushes to a collector (the production path). No backend
+    // is hardcoded (ADR-0012) — the role picks, the emitting crates never name one.
+    let exporter = match parsed.flag("otlp-endpoint") {
+        Some(endpoint) => ExporterConfig::Both {
+            otlp_endpoint: endpoint.to_string(),
+        },
+        None => ExporterConfig::Prometheus,
+    };
+
     let runtime = tokio_runtime()?;
     runtime.block_on(async move {
+        // **The metrics provider this role was missing.** `init_global` (`cli.rs:358`)
+        // installs the LOG layers at every role entry (#527), but a metrics provider was
+        // wired only in `cmd_custodian` — so the S3 front door's instrumentation, however
+        // complete, emitted into a subscriber with no bridge and reported nothing. This is
+        // the item-3 enabler items 4-5 need to be observable at all. Built inside the runtime
+        // because the OTLP exporter's tonic transport is constructed there.
+        let telemetry = DurabilityTelemetry::new(exporter)?;
+        let metrics = telemetry.metrics_dispatch();
         let listener = tokio::net::TcpListener::bind(listen).await?;
         eprintln!(
             "wyrd s3: serving S3-compatible HTTP on {} (data-dir {data_dir})",
@@ -1771,7 +1817,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             dservers = endpoints.as_deref().map_or(0, <[String]>::len),
             "role started",
         );
-        serve_s3_role(
+        let served = serve_s3_role(
             backend,
             coordination,
             data_dir,
@@ -1779,8 +1825,14 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             credentials,
             region,
             listener,
+            Some(metrics),
         )
-        .await
+        .await;
+        // Hold the handle for the role's whole life: it owns the readers (the Prometheus
+        // registry and the OTLP `PeriodicReader`) that the emitted metrics are exported
+        // through.
+        drop(telemetry);
+        served
     })?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1800,6 +1852,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
 ///
 /// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
 /// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_s3_role(
     backend: MetadataBackend,
     coordination: CoordinationBackend,
@@ -1808,6 +1861,7 @@ pub async fn serve_s3_role(
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
+    metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError> {
     match endpoints {
         // Cluster front door: the chunk plane is the gRPC fan-out over the configured
@@ -1823,6 +1877,7 @@ pub async fn serve_s3_role(
                 credentials,
                 region,
                 listener,
+                metrics,
             )
             .await
         }
@@ -1838,6 +1893,7 @@ pub async fn serve_s3_role(
                 credentials,
                 region,
                 listener,
+                metrics,
             )
             .await
         }
@@ -1851,6 +1907,7 @@ pub async fn serve_s3_role(
 /// roles' single-axis matches are (`cluster_put` `cli.rs:1266`, `cmd_d_server`
 /// `cli.rs:530`), so the default build compiles only the redb + mem arm and the
 /// production `tikv` + `etcd` arms build under their respective cargo features.
+#[allow(clippy::too_many_arguments)]
 async fn serve_s3_dispatch<C>(
     backend: MetadataBackend,
     coordination: CoordinationBackend,
@@ -1859,6 +1916,7 @@ async fn serve_s3_dispatch<C>(
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
+    metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError>
 where
     C: PlacementChunkStore + Send + Sync + 'static,
@@ -1867,40 +1925,40 @@ where
         (MetadataBackend::Redb, CoordinationBackend::Mem) => {
             let meta = open_local_meta_redb(data_dir)?;
             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "tikv")]
         (MetadataBackend::Tikv, CoordinationBackend::Mem) => {
             let meta = open_tikv_meta().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "etcd")]
         (MetadataBackend::Redb, CoordinationBackend::Etcd) => {
             let meta = open_local_meta_redb(data_dir)?;
             let coord = open_etcd_coordination().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "tikv", feature = "etcd"))]
         (MetadataBackend::Tikv, CoordinationBackend::Etcd) => {
             let meta = open_tikv_meta().await?;
             let coord = open_etcd_coordination().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "fdb")]
         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
             let meta = open_fdb_meta().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "fdb", feature = "etcd"))]
         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
             let meta = open_fdb_meta().await?;
             let coord = open_etcd_coordination().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
     }
 }
@@ -1916,6 +1974,7 @@ pub async fn serve_s3<M, C, Co>(
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
+    metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError>
 where
     M: MetadataStore + Send + Sync + 'static,
@@ -1930,7 +1989,13 @@ where
     gateway.recover().await?;
     let mut config = s3::S3Config::new(credentials);
     config.region = region;
-    let server = s3::S3Gateway::new(gateway, config);
+    // The request plane's sink (observability floor, item 4 + the item-3 role wiring): the
+    // front door emits its RED metrics into the role's telemetry handle. `None` leaves them on
+    // the ambient subscriber -- the composition an in-process caller gets.
+    let mut server = s3::S3Gateway::new(gateway, config);
+    if let Some(metrics) = metrics {
+        server = server.with_metrics_dispatch(metrics);
+    }
     server.serve(listener).await?;
     Ok(())
 }

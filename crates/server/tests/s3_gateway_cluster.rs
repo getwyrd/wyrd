@@ -156,6 +156,9 @@ async fn s3_gateway_composed_over_cluster_backends_lands_fragments_on_dservers()
             credentials,
             REGION.to_string(),
             listener,
+            // This test asserts the CLUSTER composition, not the request plane: no metrics
+            // sink, so the RED events go to the ambient subscriber as before (#575).
+            None,
         )
         .await
     });
