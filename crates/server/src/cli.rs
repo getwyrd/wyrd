@@ -169,6 +169,49 @@ impl MetadataBackend {
 
 /// Resolve the metadata backend from config: the `--metadata-backend` flag wins,
 /// else the `WYRD_METADATA_BACKEND` env var, else the redb dev default.
+/// The health probe's DEFAULT bind when `--health-bind` is not given: `--bind`'s own
+/// interface at the stable probe port ([`dserver::DEFAULT_HEALTH_BIND`]'s port). The
+/// probe must be reachable from wherever data clients reach the server — a container
+/// binding data on `0.0.0.0` with a loopback-only probe reads connection-refused to
+/// every Docker port-forward / k8s gRPC probe / external LB (Codex P1 on #587) — while
+/// a loopback data bind keeps a loopback probe, so the derivation never exposes an
+/// interface the operator did not already choose. Pure; unit-tested below.
+fn default_health_bind(data_bind: SocketAddr) -> SocketAddr {
+    SocketAddr::new(data_bind.ip(), dserver::DEFAULT_HEALTH_BIND.port())
+}
+
+/// Resolve the probe bind from the optional `--health-bind` flag and the data `--bind`,
+/// REFUSING a collision: the probe needs its own socket (it answers outside the data
+/// plane's admission layers), and two listeners on one address fail at bind time with a
+/// bare `EADDRINUSE` long after parse. The collision arises legitimately — a data bind
+/// on the stable probe port (`--bind 10.0.1.7:50052`, no `--health-bind`) derives the
+/// identical address (Codex P2 on #587) — so the refusal names the fix. Pure;
+/// unit-tested below.
+fn resolve_health_bind(
+    explicit: Option<&str>,
+    data_bind: SocketAddr,
+) -> Result<SocketAddr, String> {
+    let health_bind = match explicit {
+        Some(s) => s
+            .parse()
+            .map_err(|e| format!("d-server: invalid --health-bind address: {e}"))?,
+        None => default_health_bind(data_bind),
+    };
+    if health_bind == data_bind {
+        return Err(format!(
+            "d-server: the health probe would bind {health_bind}, the same address as --bind. \
+             The probe surface needs its own socket (it answers outside the data plane's \
+             admission layers); pass --health-bind with a different port{}",
+            if explicit.is_none() {
+                " (the default derives --bind's interface at the stable probe port)"
+            } else {
+                ""
+            }
+        ));
+    }
+    Ok(health_bind)
+}
+
 fn resolve_backend(parsed: &ParsedArgs) -> Result<MetadataBackend, BoxError> {
     let value = match parsed.flag("metadata-backend") {
         Some(flag) => Some(flag.to_string()),
@@ -627,14 +670,14 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
     // surface binds (proposal 0010 item 7, issue #576) — a SEPARATE socket from `--bind`
     // so the probe answers outside the data-plane admission layers, and a KNOWN address
     // a deployment supervisor (systemd/k8s/LB) can dial rather than an ephemeral one it
-    // cannot discover. The deployable role ALWAYS enables the probe; unset ⇒ the stable
-    // `dserver::DEFAULT_HEALTH_BIND`.
-    let health_bind: SocketAddr = match parsed.flag("health-bind") {
-        Some(s) => s
-            .parse()
-            .map_err(|e| format!("d-server: invalid --health-bind address: {e}"))?,
-        None => dserver::DEFAULT_HEALTH_BIND,
-    };
+    // cannot discover. Unset, the default FOLLOWS `--bind`'s interface (at the stable
+    // probe port): a supervisor dials the probe from the SAME network position data
+    // clients dial from, so a container/pod that binds data on `0.0.0.0` must not get a
+    // probe hidden on container loopback — Docker port-forwards, k8s gRPC probes, and
+    // external LBs all connect to the pod IP and would read connection-refused (Codex P1
+    // on #587). A loopback data bind keeps a loopback probe: the derivation never
+    // exposes an interface the operator did not already choose.
+    let health_bind: SocketAddr = resolve_health_bind(parsed.flag("health-bind"), bind)?;
     // The endpoint to REGISTER for discovery, decoupled from `bind` above (#458):
     // a routable DNS service name or NAT-mapped address, not necessarily a
     // `SocketAddr` `bind` could parse (a container's wildcard bind has no such
@@ -2168,6 +2211,52 @@ impl ParsedArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe's default bind follows `--bind`'s interface at the stable probe port:
+    /// a wildcard data bind must yield a wildcard probe (a container-loopback probe is
+    /// unreachable by every supervisor that dials the pod IP — Codex P1 on #587), and a
+    /// loopback data bind must keep a loopback probe (the derivation never exposes an
+    /// interface the operator did not already choose).
+    #[test]
+    fn the_default_health_bind_follows_the_data_bind_interface() {
+        let wildcard = default_health_bind("0.0.0.0:50051".parse().unwrap());
+        assert_eq!(wildcard, "0.0.0.0:50052".parse().unwrap());
+        let loopback = default_health_bind("127.0.0.1:50051".parse().unwrap());
+        assert_eq!(loopback, "127.0.0.1:50052".parse().unwrap());
+        // The interface follows --bind; the PORT is the stable documented probe port —
+        // independent of the data port, so a nonstandard data port cannot collide.
+        let odd_port = default_health_bind("10.0.1.7:9000".parse().unwrap());
+        assert_eq!(odd_port, "10.0.1.7:50052".parse().unwrap());
+        // IPv6 data binds derive IPv6 probe binds.
+        let v6 = default_health_bind("[::]:50051".parse().unwrap());
+        assert_eq!(v6, "[::]:50052".parse().unwrap());
+    }
+
+    /// The probe may never silently share the data listener's socket: a data bind ON
+    /// the stable probe port derives an identical address (Codex P2 on #587), and an
+    /// explicit `--health-bind` equal to `--bind` is the same mistake spelled out —
+    /// both must refuse at parse with the fix named, not surface later as a bare
+    /// `EADDRINUSE` from the second bind.
+    #[test]
+    fn a_probe_data_address_collision_refuses_at_parse() {
+        // Derived collision: data plane parked on the stable probe port.
+        let err = resolve_health_bind(None, "10.0.1.7:50052".parse().unwrap())
+            .expect_err("a derived collision must refuse");
+        assert!(err.contains("--health-bind") && err.contains("same address"));
+        // Explicit collision.
+        resolve_health_bind(Some("10.0.1.7:50051"), "10.0.1.7:50051".parse().unwrap())
+            .expect_err("an explicit collision must refuse");
+        // The healthy paths still resolve: derived...
+        assert_eq!(
+            resolve_health_bind(None, "0.0.0.0:50051".parse().unwrap()).unwrap(),
+            "0.0.0.0:50052".parse().unwrap()
+        );
+        // ...and explicit.
+        assert_eq!(
+            resolve_health_bind(Some("10.0.1.7:9000"), "10.0.1.7:50051".parse().unwrap()).unwrap(),
+            "10.0.1.7:9000".parse().unwrap()
+        );
+    }
 
     /// The #551 one-shot is a VALUELESS flag — and adding it must not weaken the guard that a
     /// dangling VALUE flag still fails (#531). Both halves, because the tempting shortcut

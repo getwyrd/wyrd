@@ -95,6 +95,13 @@ pub const HEALTH_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// `wyrd d-server --health-bind ADDR` flag). It is a **separate** address from the
 /// data listener because the probe surface must answer *outside* the data-plane
 /// admission layers (see [`DServer::serve`]).
+///
+/// The loopback IP here matches the library/data-plane default posture only; the
+/// deployable `wyrd d-server` role does NOT use this address verbatim — with no
+/// `--health-bind` it derives the probe bind from `--bind`'s OWN interface at this
+/// constant's port (`cli.rs` `default_health_bind`), so a container binding data on
+/// `0.0.0.0` never gets a probe hidden on container loopback where no supervisor,
+/// port-forward, or k8s gRPC probe can reach it (Codex P1 on #587).
 pub const DEFAULT_HEALTH_BIND: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 50052));
 
