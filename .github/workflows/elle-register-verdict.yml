@@ -1,0 +1,152 @@
+name: elle-register-verdict
+
+# **The #408 checked consistency run's standing off-Check job** (#409, M4 slice 6 of #329;
+# ADR-0009's bug->DST-regression loop; ADR-0041 §Decision — the checker (JVM/Clojure) and any
+# container leg MUST run only in a privileged off-Check job and MUST NOT enter
+# `cargo xtask ci`).
+#
+# The Elle verdict dispatch (`crates/server/src/consistency_workload.rs`,
+# `consistency_verdict_dispatch` / `ELLE_OFF_CHECK_VERDICT_JOB`) names this job by ITS OWN
+# `name:`, and until this file existed the seat was empty: nothing ran the #408 checked
+# consistency run on a schedule, so a future regression that reintroduces a way to lose or
+# corrupt data would go unnoticed until the next manual run.
+# `xtask/tests/consistency_ci_job.rs` pins `name:` below equal to `ELLE_OFF_CHECK_VERDICT_JOB`
+# by READING that source file as text — never by importing `wyrd-server` into `xtask`.
+#
+# Thin per the repo's CI rule (ADR-0009 §CI: CI logic lives in `cargo xtask`, not YAML;
+# ADR-0016 single-sources automation in the xtask crate): this job is provisioning
+# (Docker/FDB-client/JVM/elle-cli, mirroring `fdb-conformance.yml`'s steps) plus ONE opt-in
+# invocation of the #408 runner, `WYRD_TIER1=1 cargo xtask consistency-run` — its opt-in /
+# hard-error / teardown discipline is #408's own and is never reopened here. That keeps the
+# unprivileged `cargo xtask ci` merge gate container-free and JVM-free.
+#
+# Gating policy (ADR-0016; the `tier1-jepsen.yml` / `fdb-conformance.yml` sibling shape): this
+# is NOT a required merge-gate status check — post-merge regression visibility, exactly like
+# every sibling nightly. Runs on a schedule + on demand only (no `pull_request`, no `push`): a
+# 3-node FDB cluster + a JVM checker is too expensive to run on every PR, and the scenario
+# body itself is already compiled/type-checked by `cargo xtask ci` (it is `#[ignore]`d there).
+#
+# The learning loop's OTHER end (ADR-0009 line 25; the `custodian.rs:1343`
+# committed-regression-seed precedent): a scheduled failure becomes exactly one tracked bug
+# via `report-nightly-failure.yml`'s watched-workflow list (the `elle-register-verdict` entry
+# added alongside this file). A checker-found anomaly is then minimized and promoted into a
+# PERMANENT DST regression by hand:
+#   1. pull this run's uploaded artifacts (below) — the EDN histories, the run summary, the
+#      checker's own output, and the rendered report;
+#   2. minimize the failing history to the smallest reproducing shape;
+#   3. reproduce it DETERMINISTICALLY inside the `crates/dst/tests/commit_ambiguity.rs` madsim
+#      harness, driving it through whichever of the existing metadata-ambiguity property
+#      bodies (`run_cas_ambiguity`, `run_blind_ambiguity`, `run_timeout_ambiguity`,
+#      `run_contended_1031`) matches the anomaly's shape, in its faithful configuration;
+#   4. append the minimized seed as ONE new line to that file's `REGRESSION_SEEDS` array —
+#      never reorder or remove an existing entry — so the default `dst` tier of
+#      `cargo xtask ci` replays it, as a permanent regression test, on every run forever after.
+
+on:
+  schedule:
+    # 07:00 UTC daily — distinct from tier1-jepsen (02:00), tier1-disk-faults (03:00),
+    # integration-nightly/mutants (04:00), tier2-kill-reconstruct (05:00), and
+    # fdb-conformance (06:00), so the container/JVM jobs never contend for a runner.
+    - cron: "0 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: elle-register-verdict-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  elle-register-verdict:
+    runs-on: ubuntu-latest
+    # Cold Rust build + a 3-node FDB cluster bring-up + the live #406/#407 scenario + two
+    # elle-cli invocations + the fixtures self-check, well under this (mirrors
+    # fdb-conformance.yml's 60-minute bound; #150 — no job drifts to GitHub's 6h default).
+    timeout-minutes: 60
+    env:
+      CI: "true"
+      # Opt in to the #408 checked consistency run.
+      WYRD_TIER1: "1"
+      # Pinned to the client package this job installs below and to the crate's `fdb-7_3`
+      # API feature (root Cargo.toml) — a client library from a different version never
+      # connects. Mirrors fdb-conformance.yml's FDB_VERSION pin.
+      FDB_VERSION: "7.3.77"
+      # The elle-cli standalone jar downloaded below. The report records the exact
+      # version/revision/sha256 read from the jar's own metadata (Design §3/§6).
+      WYRD_ELLE_CLI_JAR: /opt/elle-cli/elle-cli-0.1.9-standalone.jar
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest ships Docker with the compose plugin; confirm the daemon is reachable
+      # (the same step tier1-jepsen.yml and fdb-conformance.yml use).
+      - name: Docker info
+        run: docker info
+
+      # The `fdb` feature the live scenario runs under (crates/server/tests/consistency_run_fdb.rs)
+      # is a binding over the FoundationDB C client: `libfdb_c` must be present at BUILD time
+      # or the link fails. `fdbcli`, from the same package, is what the compose bring-up talks
+      # to. Verbatim fdb-conformance.yml step.
+      - name: Install the FoundationDB client package
+        run: |
+          set -euo pipefail
+          curl --fail --location --silent --show-error \
+            --output foundationdb-clients.deb \
+            "https://github.com/apple/foundationdb/releases/download/${FDB_VERSION}/foundationdb-clients_${FDB_VERSION}-1_amd64.deb"
+          sudo dpkg --install foundationdb-clients.deb
+          rm -f foundationdb-clients.deb
+          fdbcli --version
+
+      # elle-cli is a Clojure/JVM tool (ADR-0041's whole reason this checker stays off-Check).
+      - name: Install the JVM (elle-cli is Clojure/JVM)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The recognized checker itself — a checker we did not write, pinned by sha256 so a
+      # compromised or moved release asset cannot silently swap in a different verdict engine.
+      - name: Download elle-cli (the recognized checker)
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$(dirname "$WYRD_ELLE_CLI_JAR")"
+          sudo curl --fail --location --silent --show-error \
+            --output "$WYRD_ELLE_CLI_JAR" \
+            "https://github.com/ligurio/elle-cli/releases/download/0.1.9/elle-cli-0.1.9-standalone.jar"
+          echo "c9ba9b9fd32640e73d632cb5f15069c162ba6528a67f27a878767187c59f539a  $WYRD_ELLE_CLI_JAR" \
+            | sudo sha256sum -c -
+
+      # The whole job, per the CI rule: one opt-in invocation of the #408 runner. It stands up
+      # deploy/fdb-multi-replica, drives the #406 workload under the #407 partition leg,
+      # exports the Elle-EDN histories + run summary under target/consistency-run/, obtains
+      # the elle-cli verdicts, runs the fixtures self-check, renders the report, and tears the
+      # stack down unconditionally — all decision logic lives in `xtask::consistency_run` /
+      # `consistency_run_runner`, not here. `tee` only captures the checker's own stdout
+      # (elle-cli prints its verdict rather than writing a file) so it survives as an upload
+      # artifact below; it makes no decision.
+      - name: cargo xtask consistency-run
+        run: |
+          set -euo pipefail
+          mkdir -p target/consistency-run
+          cargo xtask consistency-run 2>&1 | tee target/consistency-run/console.log
+
+      # The anomaly raw material the promotion procedure above needs: the EDN histories, the
+      # machine-readable run summary, the checker's own output (console.log), and the rendered
+      # report — all written by the runner under target/consistency-run/
+      # (xtask/src/consistency_run_runner.rs `output_dir`). Uploaded on every run, not only on
+      # failure: a clean run's histories are exactly what a LATER anomalous run needs to diff
+      # against.
+      - name: Upload the checked-run artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: elle-register-verdict-run
+          path: target/consistency-run/
+          if-no-files-found: warn
+          retention-days: 90
