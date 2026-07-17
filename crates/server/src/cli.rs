@@ -177,7 +177,21 @@ impl MetadataBackend {
 /// a loopback data bind keeps a loopback probe, so the derivation never exposes an
 /// interface the operator did not already choose. Pure; unit-tested below.
 fn default_health_bind(data_bind: SocketAddr) -> SocketAddr {
-    SocketAddr::new(data_bind.ip(), dserver::DEFAULT_HEALTH_BIND.port())
+    match data_bind {
+        SocketAddr::V4(v4) => {
+            SocketAddr::new((*v4.ip()).into(), dserver::DEFAULT_HEALTH_BIND.port())
+        }
+        // Keep the V6 scope ID: for a link-local `--bind [fe80::1%2]:50051` the scope
+        // IS the interface — `SocketAddr::new` from the bare `IpAddr` would derive
+        // `[fe80::1]:50052`, which names no NIC and commonly fails to bind at all
+        // (Codex P2 on #587).
+        SocketAddr::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(
+            *v6.ip(),
+            dserver::DEFAULT_HEALTH_BIND.port(),
+            v6.flowinfo(),
+            v6.scope_id(),
+        )),
+    }
 }
 
 /// Whether two listener addresses CERTAINLY cannot coexist on one host: the same port
@@ -2288,6 +2302,14 @@ mod tests {
         // IPv6 data binds derive IPv6 probe binds.
         let v6 = default_health_bind("[::]:50051".parse().unwrap());
         assert_eq!(v6, "[::]:50052".parse().unwrap());
+        // A scoped link-local bind KEEPS its scope: the scope names the interface, and
+        // a derived `[fe80::1]:50052` without it commonly cannot bind at all.
+        let scoped = default_health_bind("[fe80::1%2]:50051".parse().unwrap());
+        assert_eq!(scoped, "[fe80::1%2]:50052".parse().unwrap());
+        match scoped {
+            std::net::SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 2),
+            std::net::SocketAddr::V4(_) => unreachable!("a v6 bind derives a v6 probe"),
+        }
     }
 
     /// The probe may never silently share the data listener's socket: a data bind ON
