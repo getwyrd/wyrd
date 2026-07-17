@@ -173,6 +173,13 @@ impl MetadataStore for RedbMetadataStore {
 /// no transient class" is an asserted property instead of an assumption: a caller that
 /// swaps redb for a distributed backend must find the transient class appearing, and a
 /// caller on redb must never see it and start retrying a permanent fault.
+///
+/// The negative half — *nothing this backend raises is transient* — is carried by the
+/// error tests themselves: each drives a real fault this backend actually produces and
+/// asserts it classifies terminal, never transient (#591). It is deliberately **not**
+/// stated as its own test over a success path: a `get` that returns `Ok` can never
+/// witness a classification, so such a test would pass vacuously no matter what the
+/// backend raised.
 #[cfg(test)]
 mod error_class_tests {
     use super::*;
@@ -224,24 +231,9 @@ mod error_class_tests {
             ErrorClass::Terminal,
             "an unclassified backend fault defaults to terminal, never transient: {err}"
         );
-    }
-
-    /// The negative half, stated directly: nothing this backend can raise is transient.
-    #[test]
-    fn this_backend_has_no_transient_class_to_produce() {
-        let store = RedbMetadataStore::in_memory().expect("in-memory store");
-        pollster::block_on(async {
-            // A successful path raises nothing at all; the failing paths above are terminal.
-            // What is pinned here is that a *healthy* embedded op has no transient outcome
-            // to report — there is no network for one to come from.
-            assert!(store
-                .get(b"absent")
-                .await
-                .expect(
-                    "a get on an empty store \
-                cannot fail transiently — there is nothing to be unreachable"
-                )
-                .is_none());
-        });
+        assert!(
+            !classify(err.as_ref()).is_transient(),
+            "an embedded store must never offer a retry that cannot help: {err}"
+        );
     }
 }
