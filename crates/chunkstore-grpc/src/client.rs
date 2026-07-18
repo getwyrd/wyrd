@@ -95,6 +95,19 @@ fn transport_error(status: Status) -> BoxError {
 /// fixes a URI. That site keeps boxing a bare [`TransportError::Connect`] and takes the
 /// fail-safe terminal default — which is why this helper is not simply applied to every
 /// `transport::Error` the connect path can raise.
+///
+/// A **DNS resolution failure** sits between those two lines and lands, decidedly, on the
+/// transient side (#582, settled at sign-off). A typo'd hostname (NXDOMAIN) *is* invalid
+/// config, and classifying it transient licenses retries against a name that will never
+/// resolve — but the same wire answer is produced by a resolver outage, stale negative
+/// caching, or the rollout window in which an orchestrator has not yet published a
+/// restarting peer's name, and those are exactly "unreachable, may be back a second
+/// later". The retry policy consuming this class (#575) is *bounded*, so the typo costs a
+/// few wasted redials before surfacing; the opposite misclassification would turn every
+/// rollout-window blip into a false permanent failure. Telling the two apart would mean
+/// matching resolver `io::Error` text inside tonic's opaque error chain — platform- and
+/// version-fragile — to move only the least costly of the two mistakes. Pinned by
+/// `tests/error_class.rs::a_dns_resolution_failure_classifies_transient_on_dial`.
 fn dial_error(e: tonic::transport::Error) -> BoxError {
     Box::new(TransientFault::with_source(
         "the D-server endpoint could not be dialed",

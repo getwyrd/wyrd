@@ -252,6 +252,46 @@ async fn a_genuine_request_timeout_classifies_transient_over_grpc() {
     drop(server);
 }
 
+/// **Transient, on the dial — the DNS flavour (#582, the settled policy).** A hostname
+/// that cannot resolve fails the dial itself: no server ever answers, no status crosses
+/// the wire, and the client names the class alone (`dial_error`). The pinned decision is
+/// that a dial-time DNS failure classifies **Transient** — the same wire answer is given
+/// by a typo'd name (never resolves) and by a resolver outage or a rollout-window blip
+/// (resolves a second later), and with #575's *bounded* retry budget the typo costs a few
+/// wasted redials while the opposite call would turn every blip into a false permanent
+/// failure. The rationale lives on `dial_error`'s doc; this test is the pin either
+/// direction of the policy must consciously flip.
+///
+/// `.invalid` is reserved to never resolve (RFC 2606), so the failure is genuine and not
+/// environment-dependent: whether the resolver answers NXDOMAIN promptly or is itself
+/// unreachable (the dial then fails on the bounded connect timeout instead), the dial
+/// fails and must classify transient — both paths go through `dial_error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dns_resolution_failure_classifies_transient_on_dial() {
+    let err = GrpcChunkStore::connect_with_timeout(
+        "http://no-such-host.invalid:50051",
+        Duration::from_secs(5),
+    )
+    .await
+    .err()
+    .expect("a name that can never resolve must fail the dial, not hand back a client");
+
+    assert_eq!(
+        classify(err.as_ref()),
+        ErrorClass::Transient,
+        "a dial-time DNS failure is the transient class (#582): the wire cannot \
+         distinguish a typo from a resolver blip, and only one of the two mistakes is \
+         bounded; err = {err}"
+    );
+    // The class wraps the dial detail rather than replacing it: the `TransportError`
+    // (and through it tonic's own connect error) stays reachable in the chain.
+    assert!(
+        transport_error_in_chain(&err),
+        "the producing TransportError::Connect must survive underneath the class; \
+         err = {err}"
+    );
+}
+
 /// Naming the class must not cost the detail the backend already had: the `TransportError`
 /// — and through it the wire `Status`, its code and its message — stays reachable in the
 /// source chain. A classification that threw the transport away would answer "why did it
