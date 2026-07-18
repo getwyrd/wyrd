@@ -726,6 +726,76 @@ async fn checks_still_answer_with_watch_streams_held_open() {
     let _ = handle.await;
 }
 
+/// On shutdown, readiness must flip to NOT_SERVING and reach watchers BEFORE the data
+/// plane drains — a load balancer watching the probe must stop routing here before this
+/// node stops accepting work (Codex P1 on #587). Observed as: a `Health/Watch` stream
+/// open across a shutdown receives a NOT_SERVING update (pre-fix the refresher kept
+/// publishing SERVING and the stream simply closed on drain, never signalling NOT_SERVING).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_publishes_not_serving_before_draining() {
+    let (store, _dir) = fs_store();
+    let controllable = ControllableStore {
+        inner: store,
+        health: Arc::new(Mutex::new(HealthMode::Healthy)),
+        entered: None,
+        gate: None,
+    };
+    let health_bind = reserve_addr().await;
+    let (_endpoint, shutdown, handle) = serve_controllable(
+        controllable,
+        AdmissionControl::default(),
+        health_bind,
+        Duration::from_millis(20),
+    )
+    .await;
+
+    // Open a Watch and read until it CONVERGES to SERVING — the stream's first frame may
+    // be the fail-closed initial NOT_SERVING before the refresher's first healthy publish,
+    // so wait for SERVING rather than asserting it is first.
+    let mut client = health_client(&format!("http://{health_bind}")).await;
+    let mut stream = client
+        .watch(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .expect("Watch establishes")
+        .into_inner();
+    let converged = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(Some(update)) = stream.message().await {
+            if update.status == WireServingStatus::Serving as i32 {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("the watch resolves within the bound");
+    assert!(
+        converged,
+        "a healthy store converges to SERVING on the watch"
+    );
+
+    // Fire shutdown while the watch is held open, then read updates until NOT_SERVING —
+    // it MUST arrive before the stream ends (readiness flips before the drain).
+    let _ = shutdown.send(());
+    let saw_not_serving = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Ok(Some(update)) = stream.message().await {
+            if update.status == WireServingStatus::NotServing as i32 {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("the watch resolves within the bound");
+    assert!(
+        saw_not_serving,
+        "the Watch stream must receive NOT_SERVING on shutdown, before the surface closes"
+    );
+
+    let _ = handle.await;
+}
+
 /// A health-bind failure after the caller registered must not leave a phantom
 /// endpoint in discovery: `run_d_server` registers the data endpoint immediately
 /// before calling `serve`, so if the probe port is already occupied, `serve` must

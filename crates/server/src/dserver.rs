@@ -924,6 +924,23 @@ impl<S: ChunkStore + 'static> DServer<S> {
         let admission = self.admission;
         let health_max_concurrent_requests = self.health_max_concurrent_requests;
 
+        // Fan the single `shutdown` future out so the data server and (when served) the
+        // health probe stop on the same signal — each owns a `serve_with_incoming_shutdown`
+        // call, and a bare `impl Future` can only be awaited once. A `watch` channel gives
+        // every receiver the same one-shot signal. Created BEFORE the probe surface so the
+        // readiness refresher can observe shutdown and flip NOT_SERVING first (below).
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        tokio::spawn(async move {
+            shutdown.await;
+            let _ = shutdown_tx.send(());
+        });
+        // READINESS-BEFORE-DRAIN handshake (Codex P1 on #587): on shutdown the refresher
+        // publishes NOT_SERVING on both health names, then fires this channel; the data
+        // (and health) drain wait on it before beginning, so a load balancer watching the
+        // probe stops routing here BEFORE the data plane stops accepting — never routed to
+        // a node that has already begun terminating.
+        let (readiness_marked_tx, readiness_marked_rx) = tokio::sync::watch::channel(());
+
         // ---- the OPTIONAL health probe surface (observability floor, proposal 0010 item 7) ----
         //
         // Served only when a bind address is configured (`with_health_bind` / the
@@ -933,7 +950,7 @@ impl<S: ChunkStore + 'static> DServer<S> {
         // supervisor can dial. When served it is a SEPARATE transport with its OWN small
         // admission envelope (below),
         // so a probe answers *outside* the data-plane admission layers.
-        let (health_surface, health_refresh_task) = match self.health_bind {
+        let (health_surface, health_refresh_task, readiness_marked) = match self.health_bind {
             Some(health_bind) => {
                 // Bind the probe socket on the operator-configured, stable address — a
                 // discoverable address a supervisor can dial, not an OS-assigned ephemeral
@@ -981,6 +998,8 @@ impl<S: ChunkStore + 'static> DServer<S> {
                     let store = Arc::clone(&store);
                     let reporter = health_reporter.clone();
                     let interval = self.health_refresh_interval;
+                    let mut shut = shutdown_rx.clone();
+                    let marked = readiness_marked_tx.clone();
                     tokio::spawn(async move {
                         // Publish one reading to BOTH statuses a prober can ask for — the
                         // empty-name overall service (the plain `Health/Check` a
@@ -999,9 +1018,21 @@ impl<S: ChunkStore + 'static> DServer<S> {
                                     .await;
                             }
                         };
+                        // On shutdown the two `select!`s below flip NOT_SERVING on both
+                        // health names and fire `marked` BEFORE the drains begin (Codex P1
+                        // on #587), then return — so no later tick republishes SERVING.
                         let mut ticker = tokio::time::interval(interval);
                         loop {
-                            ticker.tick().await;
+                            // Observe shutdown promptly, even between ticks.
+                            tokio::select! {
+                                biased;
+                                _ = shut.changed() => {
+                                    publish(ServingStatus::NotServing).await;
+                                    let _ = marked.send(());
+                                    return;
+                                }
+                                _ = ticker.tick() => {}
+                            }
                             // The probe read is BOUNDED by the refresh cadence: a
                             // `health()` that HANGS (a stalled mount blocking a
                             // filesystem metadata call) must fail closed on expiry, not
@@ -1013,19 +1044,30 @@ impl<S: ChunkStore + 'static> DServer<S> {
                             // the data plane's own filesystem calls (Codex P1 follow-on).
                             // AT MOST ONE underlying probe is ever in flight — on expiry
                             // the SAME future is kept and re-awaited, publishing
-                            // NOT_SERVING each interval until it resolves.
+                            // NOT_SERVING each interval until it resolves. A shutdown
+                            // arriving mid-probe still flips NOT_SERVING and stops.
                             let probe = store.health();
                             tokio::pin!(probe);
-                            let status = loop {
-                                match tokio::time::timeout(interval, &mut probe).await {
-                                    Ok(Ok(Health::Healthy | Health::Degraded)) => {
-                                        break ServingStatus::Serving;
-                                    }
-                                    Ok(Ok(Health::Unhealthy)) | Ok(Err(_)) => {
-                                        break ServingStatus::NotServing;
-                                    }
-                                    Err(_still_in_flight) => {
+                            let status = 'probe: loop {
+                                tokio::select! {
+                                    biased;
+                                    _ = shut.changed() => {
                                         publish(ServingStatus::NotServing).await;
+                                        let _ = marked.send(());
+                                        return;
+                                    }
+                                    read = tokio::time::timeout(interval, &mut probe) => {
+                                        match read {
+                                            Ok(Ok(Health::Healthy | Health::Degraded)) => {
+                                                break 'probe ServingStatus::Serving;
+                                            }
+                                            Ok(Ok(Health::Unhealthy)) | Ok(Err(_)) => {
+                                                break 'probe ServingStatus::NotServing;
+                                            }
+                                            Err(_still_in_flight) => {
+                                                publish(ServingStatus::NotServing).await;
+                                            }
+                                        }
                                     }
                                 }
                             };
@@ -1033,24 +1075,31 @@ impl<S: ChunkStore + 'static> DServer<S> {
                         }
                     })
                 };
-                (Some((health_listener, health_server)), Some(refresh_task))
+                (
+                    Some((health_listener, health_server)),
+                    Some(refresh_task),
+                    Some(readiness_marked_rx.clone()),
+                )
             }
-            None => (None, None),
+            None => (None, None, None),
         };
 
-        // Fan the single `shutdown` future out so the data server and (when served) the
-        // health probe stop on the same signal — each owns a `serve_with_incoming_shutdown`
-        // call, and a bare `impl Future` can only be awaited once. A `watch` channel fired
-        // exactly once gives every receiver the same one-shot signal.
-        let (shutdown_tx, mut data_shutdown_rx) = tokio::sync::watch::channel(());
-        let mut health_shutdown_rx = data_shutdown_rx.clone();
-        tokio::spawn(async move {
-            shutdown.await;
-            let _ = shutdown_tx.send(());
-        });
+        // The data drain waits for the shutdown signal, then for the refresher to have
+        // published NOT_SERVING (`readiness_marked`) — so the data plane never stops
+        // accepting before the probe says NOT_SERVING (Codex P1 on #587). Bounded by
+        // `HEALTH_SHUTDOWN_GRACE` so a wedged refresher can never block shutdown itself.
+        let mut data_shutdown_rx = shutdown_rx.clone();
+        let mut data_marked = readiness_marked.clone();
         let data_shutdown = async move {
             let _ = data_shutdown_rx.changed().await;
+            if let Some(marked) = data_marked.as_mut() {
+                let _ = tokio::time::timeout(HEALTH_SHUTDOWN_GRACE, marked.changed()).await;
+            }
         };
+        // The health surface drains on the same ordering, so an existing `Watch` stream
+        // is delivered the NOT_SERVING update before the probe server begins shutting down.
+        let mut health_shutdown_rx = shutdown_rx.clone();
+        let mut health_marked = readiness_marked.clone();
 
         // The capacity plane (proposal 0010 item 5). Built once, outside the builder, so the
         // in-flight count is shared by BOTH observers and by every per-connection clone of
@@ -1161,6 +1210,13 @@ impl<S: ChunkStore + 'static> DServer<S> {
                             TcpListenerStream::new(health_listener),
                             async move {
                                 let _ = health_shutdown_rx.changed().await;
+                                if let Some(marked) = health_marked.as_mut() {
+                                    let _ = tokio::time::timeout(
+                                        HEALTH_SHUTDOWN_GRACE,
+                                        marked.changed(),
+                                    )
+                                    .await;
+                                }
                             },
                         );
                     // Abort-on-drop, NOT a bare spawn: the outer `select!` below drops
