@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_core::metadata::{
-    self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
+    self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, ObjectMeta, PendingEntry,
 };
 use wyrd_core::placement::Topology;
 use wyrd_core::read::ReadError;
@@ -107,6 +107,7 @@ async fn commit_inode(meta: &MemMeta, inode: InodeId, chunk: ChunkRef, size: u64
         chunk_map: vec![chunk],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = meta
         .commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
@@ -309,6 +310,7 @@ async fn commit_chunk_map_bumps_version_by_one() {
         chunk_map: vec![],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     // Seed the prior record so the commit's CAS precondition matches.
     meta.commit(WriteBatch::new().put(metadata::inode_key(id), metadata::encode(&prior)))
@@ -325,5 +327,274 @@ async fn commit_chunk_map_bumps_version_by_one() {
     assert_eq!(
         next.version, 2,
         "commit_chunk_map writes version = prior.version + 1 (here 1 + 1)"
+    );
+}
+
+// === metadata.rs `commit_chunk_map` `..prior.clone()` — a reconstruction/backfill
+//     re-commit of the SAME content PRESERVES the object-metadata trio (ADR-0047):
+//     a placement-maintenance commit must not move Last-Modified or drop the
+//     ETag/content type. Guards the preservation `..prior.clone()` against silently
+//     regressing to `..Default::default()` (which still compiles but drops the trio to
+//     `None`). Every OTHER commit_chunk_map test seeds all-`None` metadata, so this
+//     invariant is otherwise VACUOUSLY true. =====================================
+
+#[tokio::test]
+async fn commit_chunk_map_preserves_object_metadata_across_a_repair() {
+    let meta = MemMeta::default();
+    let id: InodeId = 9;
+    // A published object carrying the full ADR-0047 metadata trio (the state a real
+    // create/overwrite leaves behind — never all-`None` for a published object).
+    let prior = InodeRecord {
+        size: 42,
+        chunk_map: vec![],
+        state: InodeState::Committed,
+        version: 3,
+        etag: Some("d1f2e3c4b5a60718".to_string()),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
+        modified: Some(1_700_000_000_123),
+    };
+    // Seed it so the reconstruction commit's CAS precondition matches.
+    meta.commit(WriteBatch::new().put(metadata::inode_key(id), metadata::encode(&prior)))
+        .await
+        .unwrap();
+
+    // A reconstruction/backfill re-commit: the SAME content (size unchanged), re-placed.
+    let outcome = metadata::commit_chunk_map(&meta, id, &prior, vec![], 42)
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+
+    let stored = meta.get(&metadata::inode_key(id)).await.unwrap().unwrap();
+    let next: InodeRecord = metadata::decode(&stored).unwrap();
+    assert_eq!(
+        next.version, 4,
+        "the repair commit bumped the version by one"
+    );
+    assert_eq!(
+        next.etag, prior.etag,
+        "a repair PRESERVES the ETag (ADR-0047): re-placing the same content does not \
+         republish it, so it mints no new change-token"
+    );
+    assert_eq!(
+        next.content_type, prior.content_type,
+        "a repair PRESERVES the stored content type"
+    );
+    assert_eq!(
+        next.modified, prior.modified,
+        "a repair must NOT move Last-Modified"
+    );
+}
+
+// === metadata.rs `InodeRecord` `skip_serializing_if` — decode→encode must be the
+//     IDENTITY on a legacy (pre-ADR-0047) record. Every CAS commit in metadata.rs
+//     compares `encode(prior)` byte-for-byte against the bytes still in the store
+//     (`require(key, encode(prior))`); without the skip, the trio decodes to `None`
+//     but re-encodes as `"etag":null,...`, which can never equal the stored legacy
+//     JSON — so every S3 overwrite and every backfill/reconstruction/rebalance of a
+//     pre-upgrade object returns `Conflict` forever. ==============================
+
+#[tokio::test]
+async fn a_legacy_record_without_metadata_fields_still_wins_its_cas_commits() {
+    let meta = MemMeta::default();
+    let id: InodeId = 13;
+    // The exact bytes a pre-ADR-0047 store holds: NO etag / content_type / modified
+    // keys. Hand-written, not produced by today's encoder — fidelity to what an old
+    // deployment actually stored is the point of the test.
+    let legacy: &[u8] = br#"{"size":42,"chunk_map":[],"state":"Committed","version":3}"#;
+    meta.commit(WriteBatch::new().put(metadata::inode_key(id), Bytes::from_static(legacy)))
+        .await
+        .unwrap();
+
+    let prior: InodeRecord = metadata::decode(legacy).unwrap();
+    assert_eq!(
+        (&prior.etag, &prior.content_type, &prior.modified),
+        (&None, &None, &None),
+        "a legacy record decodes with the whole metadata trio absent"
+    );
+    assert_eq!(
+        &metadata::encode(&prior)[..],
+        legacy,
+        "decode→encode is the identity on legacy bytes — the CAS precondition every \
+         commit builds from `prior` must equal what the store still holds"
+    );
+
+    // The S3 overwrite path (the first PUT over a pre-upgrade object after deploying
+    // the metadata model): the CAS must win against the legacy bytes.
+    let fresh = ObjectMeta {
+        etag: Some("cccccccccccccccc".to_string()),
+        content_type: Some("application/json".to_string()),
+        modified: Some(1_700_000_111_111),
+    };
+    let outcome = metadata::commit_chunk_map_superseding(&meta, id, &prior, vec![], 20, 0, &fresh)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed,
+        "an overwrite of a legacy record must commit, not Conflict forever"
+    );
+
+    // The maintenance path (backfill/reconstruction/rebalance re-commit) on a second
+    // legacy record: preservation via `..prior.clone()` must also win its CAS.
+    let repair_id: InodeId = 14;
+    meta.commit(WriteBatch::new().put(metadata::inode_key(repair_id), Bytes::from_static(legacy)))
+        .await
+        .unwrap();
+    let outcome = metadata::commit_chunk_map(&meta, repair_id, &prior, vec![], 42)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed,
+        "a repair re-commit of a legacy record must commit, not Conflict forever"
+    );
+    let stored = meta
+        .get(&metadata::inode_key(repair_id))
+        .await
+        .unwrap()
+        .unwrap();
+    let next: InodeRecord = metadata::decode(&stored).unwrap();
+    assert_eq!(
+        (&next.etag, &next.content_type, &next.modified),
+        (&None, &None, &None),
+        "the repair preserves the legacy record's absent metadata — it invents none"
+    );
+}
+
+// === metadata.rs:581 / :641 (`modified: meta.modified`) — a content OVERWRITE is a fresh
+//     publication (ADR-0047), so the superseding commit STAMPS the new publication time,
+//     never carries the prior version's forward. Distinct from the preservation invariant
+//     above: a repair keeps the old `modified`, an overwrite mints a new one. The wire
+//     overwrite test cannot pin this — its two PUTs land in the same wall-clock second, so
+//     regressing `meta.modified` to `prior.modified` still passes it. These unit tests seed a
+//     prior with a DISTINCT `modified` and assert the fresh one lands, killing the mutant on
+//     BOTH the plain (:581) and the leased (:641, the path the wire PUT drives) commits. ===
+
+#[tokio::test]
+async fn commit_chunk_map_superseding_stamps_a_fresh_modified() {
+    let meta = MemMeta::default();
+    let id: InodeId = 11;
+    // A prior publication carrying its OWN distinct metadata trio.
+    let prior = InodeRecord {
+        size: 10,
+        chunk_map: vec![],
+        state: InodeState::Committed,
+        version: 5,
+        etag: Some("aaaaaaaaaaaaaaaa".to_string()),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
+        modified: Some(1_700_000_000_000),
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(id), metadata::encode(&prior)))
+        .await
+        .unwrap();
+
+    // The overwrite publishes DIFFERENT content with a DISTINCT publication time.
+    let fresh = ObjectMeta {
+        etag: Some("bbbbbbbbbbbbbbbb".to_string()),
+        content_type: Some("application/json".to_string()),
+        modified: Some(1_700_000_999_999),
+    };
+    assert_ne!(
+        fresh.modified, prior.modified,
+        "the test is only meaningful if the fresh time differs from the prior one"
+    );
+
+    let outcome = metadata::commit_chunk_map_superseding(&meta, id, &prior, vec![], 20, 0, &fresh)
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+
+    let stored = meta.get(&metadata::inode_key(id)).await.unwrap().unwrap();
+    let next: InodeRecord = metadata::decode(&stored).unwrap();
+    assert_eq!(
+        next.modified, fresh.modified,
+        "an overwrite STAMPS the new publication time (ADR-0047), not the prior version's — \
+         guards `modified: meta.modified` against regressing to `prior.modified`"
+    );
+    assert_eq!(
+        next.etag, fresh.etag,
+        "the overwrite stamps the fresh ETag, not the prior one"
+    );
+    assert_eq!(
+        next.content_type, fresh.content_type,
+        "the overwrite stamps the fresh content type"
+    );
+}
+
+#[tokio::test]
+async fn commit_chunk_map_superseding_leased_stamps_a_fresh_modified() {
+    let meta = MemMeta::default();
+    let id: InodeId = 12;
+    let prior = InodeRecord {
+        size: 10,
+        chunk_map: vec![],
+        state: InodeState::Committed,
+        version: 2,
+        etag: Some("cccccccccccccccc".to_string()),
+        content_type: Some("text/plain; charset=utf-8".to_string()),
+        modified: Some(1_700_000_000_000),
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(id), metadata::encode(&prior)))
+        .await
+        .unwrap();
+
+    // The new version's chunk holds a LIVE pending lease (expires after `now`), so the leased
+    // overwrite CAS lands — this is the streaming-overwrite path the S3 wire PUT drives.
+    let new_chunk: ChunkId = 0x00C0_FFEE;
+    let now: u64 = 500;
+    metadata::put_pending(
+        &meta,
+        new_chunk,
+        &PendingEntry {
+            lease_expiry_millis: 1_000,
+        },
+    )
+    .await
+    .unwrap();
+
+    let fresh = ObjectMeta {
+        etag: Some("dddddddddddddddd".to_string()),
+        content_type: Some("application/json".to_string()),
+        modified: Some(1_700_000_999_999),
+    };
+    assert_ne!(
+        fresh.modified, prior.modified,
+        "the test is only meaningful if the fresh time differs from the prior one"
+    );
+
+    let outcome = metadata::commit_chunk_map_superseding_leased(
+        &meta,
+        id,
+        &prior,
+        vec![],
+        20,
+        0,
+        &[new_chunk],
+        now,
+        &fresh,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed,
+        "the live pending lease lets the leased overwrite land"
+    );
+
+    let stored = meta.get(&metadata::inode_key(id)).await.unwrap().unwrap();
+    let next: InodeRecord = metadata::decode(&stored).unwrap();
+    assert_eq!(
+        next.modified, fresh.modified,
+        "the LEASED overwrite (the path the wire PUT uses) stamps the fresh publication time — \
+         guards metadata.rs's `modified: meta.modified` at the leased commit against regressing \
+         to `prior.modified`"
+    );
+    assert_eq!(
+        next.etag, fresh.etag,
+        "the leased overwrite stamps the fresh ETag"
+    );
+    assert_eq!(
+        next.content_type, fresh.content_type,
+        "the leased overwrite stamps the fresh content type"
     );
 }

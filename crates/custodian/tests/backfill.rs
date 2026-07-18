@@ -184,6 +184,7 @@ async fn seed_committed(
         chunk_map: vec![],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     meta.commit(WriteBatch::new().put(metadata::inode_key(id), metadata::encode(&prior)))
         .await
@@ -348,6 +349,67 @@ async fn already_explicit_full_length_placement_is_left_untouched() {
         "no spurious commit / version bump"
     );
     assert_eq!(after.chunk_map[0].placement, vec![5, 6, 7]);
+}
+
+// ---- (d) ADR-0047: a backfill PRESERVES the object metadata (repair, not republish) ----
+
+/// A backfill identity-fill is placement maintenance on the SAME content, so it must
+/// PRESERVE the object metadata (ADR-0047): the ETag / content-type / Last-Modified trio
+/// survives the commit unchanged. This guards `backfill.rs`'s preservation `..record.clone()`
+/// against silently regressing to `..Default::default()` (which still compiles but drops
+/// the trio to `None`, so GET would serve `application/octet-stream` and no ETag for a
+/// repaired object). Every OTHER backfill test seeds all-`None` metadata (`..Default::default()`),
+/// so this invariant is otherwise VACUOUSLY true.
+#[tokio::test]
+async fn backfill_preserves_object_metadata_while_filling_placement() {
+    let meta = MemMeta::default();
+    let etag = "9a8b7c6d5e4f3021".to_string();
+    let content_type = "application/json".to_string();
+    let modified = 1_700_000_000_456_u64;
+    // A published object whose one chunk carries the pre-M3 EMPTY placement (so backfill
+    // fires) AND the full ADR-0047 metadata trio.
+    let chunk = rs_chunk(0xD0, 2, 1, vec![]); // ReedSolomon{k:2,m:1} -> fragment_count() == 3
+    let record = InodeRecord {
+        size: 5,
+        chunk_map: vec![chunk],
+        state: InodeState::Committed,
+        version: 2,
+        etag: Some(etag.clone()),
+        content_type: Some(content_type.clone()),
+        modified: Some(modified),
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(1), metadata::encode(&record)))
+        .await
+        .unwrap();
+
+    let ctx = BackfillContext { meta: &meta };
+    assert_eq!(
+        reconcile(&ctx).await.unwrap(),
+        Reconciled::Changed,
+        "the empty-placement chunk is backfilled (the commit under test fires)"
+    );
+
+    let after = read_inode(&meta, 1).await;
+    assert_eq!(
+        after.chunk_map[0].placement,
+        vec![0, 1, 2],
+        "the empty placement was filled to the full-length identity vector"
+    );
+    assert_eq!(
+        after.etag,
+        Some(etag),
+        "backfill PRESERVES the ETag (ADR-0047): a repair does not republish the content"
+    );
+    assert_eq!(
+        after.content_type,
+        Some(content_type),
+        "backfill PRESERVES the stored content type"
+    );
+    assert_eq!(
+        after.modified,
+        Some(modified),
+        "backfill must NOT move Last-Modified"
+    );
 }
 
 // The drain-to-zero observability leg (BINDING (c)) lives in its own test binary,

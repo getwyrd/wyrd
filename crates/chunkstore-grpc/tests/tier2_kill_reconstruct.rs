@@ -530,6 +530,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
         chunk_map: vec![chunk_ref],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let create_outcome = metadata::create(&meta, 0, "test-file", INODE_ID, &inode_record)
         .await

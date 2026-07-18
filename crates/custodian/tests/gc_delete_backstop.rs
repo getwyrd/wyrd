@@ -136,6 +136,7 @@ async fn delete_orphans_fragment_reclaimed_by_gc_from_the_placed_dserver() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let created = metadata::create(&meta, ROOT, "obj", 1, &record)
         .await
@@ -222,6 +223,7 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     assert_eq!(
         metadata::create(&meta, ROOT, "obj", 1, &v1).await.unwrap(),
@@ -244,9 +246,17 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
         len: 16,
         placement: vec![placed_dserver],
     }];
-    let outcome = commit_chunk_map_superseding(&meta, 1, &v1, new_map, 16, 0)
-        .await
-        .unwrap();
+    let outcome = commit_chunk_map_superseding(
+        &meta,
+        1,
+        &v1,
+        new_map,
+        16,
+        0,
+        &wyrd_core::metadata::ObjectMeta::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
 
     // Immediately after the overwrite both fragments are on disk: the prior one is orphaned

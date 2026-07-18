@@ -124,6 +124,10 @@ pub async fn reconcile(ctx: &BackfillContext<'_>) -> Result<Reconciled> {
             chunk_map: next_chunk_map,
             state: InodeState::Committed,
             version: record.version + 1,
+            // Backfill re-commits the SAME content (a repair), so it PRESERVES the object
+            // metadata (ADR-0047): a placement-maintenance commit must not move
+            // `Last-Modified` or drop the content type.
+            ..record.clone()
         };
         let inode_key = metadata::inode_key(inode_id);
         let batch = WriteBatch::new()

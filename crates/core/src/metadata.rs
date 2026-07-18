@@ -230,6 +230,27 @@ pub struct MalformedPlacement {
     pub actual: usize,
 }
 
+/// Object metadata surfaced on the wire beyond byte size (ADR-0047): the content
+/// `etag`, the client's declared `content_type`, and the content-publication time
+/// (`modified`). Set together at **content publication** (create / overwrite) and
+/// **preserved** across reconstruction/backfill commits, so a repair never moves
+/// `Last-Modified` or drops the content type. Every field is optional so a record
+/// written before this model — or by a path that has no value to record — degrades on
+/// the wire to the pre-metadata behaviour (no ETag, `application/octet-stream`) rather
+/// than to an error. `x-amz-meta-*` user metadata is deliberately not modelled here; the
+/// flat shape leaves room to add it later.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ObjectMeta {
+    /// The content digest as an opaque change-token: the lowercase-hex SHA-256 of the
+    /// object bytes (ADR-0047; **not** MD5). Rendered quoted on the wire as S3's `ETag`.
+    pub etag: Option<String>,
+    /// The `Content-Type` the writing client declared, round-tripped verbatim.
+    pub content_type: Option<String>,
+    /// Content-publication time in epoch milliseconds; rendered RFC-7231 IMF-fixdate
+    /// as `Last-Modified` on the wire.
+    pub modified: Option<u64>,
+}
+
 /// An inode: attributes, the ordered chunk map, state, and version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InodeRecord {
@@ -241,6 +262,33 @@ pub struct InodeRecord {
     pub state: InodeState,
     /// Monotonic per-inode version; the commit point bumps it under CAS.
     pub version: u64,
+    /// The content digest (opaque change-token), quoted as S3's `ETag` on the wire.
+    /// `Option` + `#[serde(default)]` for stored-record compatibility (ADR-0047): a
+    /// record written before this field decodes with `None`. Set only at content
+    /// publication; preserved across reconstruction/backfill.
+    ///
+    /// `skip_serializing_if` is **load-bearing**, not cosmetic: every CAS commit in
+    /// this module (`require(key, encode(prior))`) compares the RE-ENCODED prior
+    /// record byte-for-byte against the bytes still in the store. A legacy record
+    /// decodes these fields to `None`; serializing that as `"etag":null` could never
+    /// equal the stored legacy JSON, so every overwrite and every
+    /// backfill/reconstruction/rebalance of a pre-ADR-0047 object would return
+    /// `Conflict` forever. Skipping `None` makes decode→encode the identity on
+    /// legacy bytes, so the CAS sees exactly what the store holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    /// The client's declared `Content-Type`, round-tripped verbatim. `Option` +
+    /// `#[serde(default)]` for stored-record compatibility; falls back to
+    /// `application/octet-stream` on the wire when absent. `skip_serializing_if`:
+    /// see `etag` — required for the CAS round trip on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Content-publication time (epoch millis), rendered `Last-Modified` on the wire.
+    /// `Option` + `#[serde(default)]` for stored-record compatibility.
+    /// `skip_serializing_if`: see `etag` — required for the CAS round trip on legacy
+    /// records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified: Option<u64>,
 }
 
 impl InodeRecord {
@@ -251,7 +299,30 @@ impl InodeRecord {
             chunk_map: Vec::new(),
             state: InodeState::Pending,
             version: 1,
+            etag: None,
+            content_type: None,
+            modified: None,
         }
+    }
+
+    /// The object metadata carried on this record (ADR-0047), collected into an
+    /// [`ObjectMeta`] for the wire layer.
+    pub fn object_meta(&self) -> ObjectMeta {
+        ObjectMeta {
+            etag: self.etag.clone(),
+            content_type: self.content_type.clone(),
+            modified: self.modified,
+        }
+    }
+}
+
+impl Default for InodeRecord {
+    /// The empty inode ([`InodeRecord::new_empty`]) — so struct-update construction
+    /// (`InodeRecord { size, chunk_map, state, version, ..Default::default() }`) fills
+    /// the optional metadata fields with `None` at the many call sites that do not set
+    /// object metadata.
+    fn default() -> Self {
+        Self::new_empty()
     }
 }
 
@@ -470,6 +541,10 @@ pub async fn commit_chunk_map(
         chunk_map,
         state: InodeState::Committed,
         version: prior.version + 1,
+        // Reconstruction/backfill re-commits the SAME content, so it PRESERVES the
+        // publication metadata (ADR-0047): a repair must not move `Last-Modified` or
+        // drop the content type. Only the superseding commits below set new metadata.
+        ..prior.clone()
     };
     let key = inode_key(id);
     let batch = WriteBatch::new()
@@ -503,12 +578,19 @@ pub async fn commit_chunk_map_superseding(
     chunk_map: Vec<ChunkRef>,
     size: u64,
     orphaned_at_millis: u64,
+    meta: &ObjectMeta,
 ) -> Result<CommitOutcome> {
     let next = InodeRecord {
         size,
         chunk_map,
         state: InodeState::Committed,
         version: prior.version + 1,
+        // A content **overwrite** is a fresh publication (ADR-0047), so it stamps the new
+        // object metadata (digest / content type / publication time) rather than carrying
+        // the prior version's forward.
+        etag: meta.etag.clone(),
+        content_type: meta.content_type.clone(),
+        modified: meta.modified,
     };
     let key = inode_key(id);
     let mut batch = WriteBatch::new()
@@ -554,6 +636,7 @@ pub async fn commit_chunk_map_superseding_leased(
     orphaned_at_millis: u64,
     pending_chunks: &[ChunkId],
     now_millis: u64,
+    meta: &ObjectMeta,
 ) -> Result<CommitOutcome> {
     let Some(guards) = live_lease_guards(store, pending_chunks, now_millis).await? else {
         return Ok(CommitOutcome::Conflict);
@@ -563,6 +646,11 @@ pub async fn commit_chunk_map_superseding_leased(
         chunk_map,
         state: InodeState::Committed,
         version: prior.version + 1,
+        // A content **overwrite** is a fresh publication (ADR-0047): stamp the new object
+        // metadata rather than carrying the prior version's forward.
+        etag: meta.etag.clone(),
+        content_type: meta.content_type.clone(),
+        modified: meta.modified,
     };
     let key = inode_key(id);
     let mut batch = WriteBatch::new()

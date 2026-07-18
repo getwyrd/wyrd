@@ -832,6 +832,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
         chunk_map: vec![chunk_ref],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let create_outcome = metadata::create(&meta, 0, "test-file", INODE_ID, &inode_record)
         .await
@@ -1396,6 +1397,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
         chunk_map: vec![chunk_ref],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let create_outcome = metadata::create(&meta, 0, "test-file", INODE_ID, &inode_record)
         .await
