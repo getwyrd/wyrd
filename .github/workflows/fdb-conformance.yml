@@ -158,19 +158,25 @@ jobs:
       - name: cargo xtask fdb-conformance
         run: cargo xtask fdb-conformance
 
-      # `cargo xtask ci` shells out to `cargo-deny` and `cargo-machete`, and hard-fails
-      # under CI=true when either is absent (`run_ci` → `cargo_{machete,deny}_check`,
-      # xtask/src/main.rs). A fresh runner ships neither, so without this the whole-gate
-      # step below turns red at the license/unused-dep wall even after every FDB leg
-      # passed. Same prebuilt-binary action and tool list `ci.yml` installs before the
-      # same command — a fetch, not a from-source compile. Gated to the nightly/dispatch
-      # legs, the only ones that run the gate: the pull-request leg installs neither
-      # binary because it invokes neither.
-      - name: Install cargo-deny + cargo-machete
+      # `cargo xtask ci` shells out to `cargo-deny`, `cargo-machete`, and `typos`
+      # (#598), and hard-fails under CI=true when any is absent (`run_ci` →
+      # `cargo_{machete,deny}_check` / `typos_check`, xtask/src/main.rs). A fresh
+      # runner ships none of them, so without this the whole-gate step below turns
+      # red even after every FDB leg passed. Same prebuilt-binary action and tool
+      # list `ci.yml` installs before the same command — a fetch, not a from-source
+      # compile. Gated to the nightly/dispatch legs, the only ones that run the
+      # gate: the pull-request leg installs none because it invokes none.
+      - name: Install cargo-deny + cargo-machete + typos
         if: github.event_name != 'pull_request'
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-machete
+          tool: cargo-deny,cargo-machete,typos-cli
+
+      # The docs renderer deps `cargo xtask ci`'s docs gate needs (#598), same
+      # pinned versions as ci.yml / docs-check.yml.
+      - name: Install docs renderer deps
+        if: github.event_name != 'pull_request'
+        run: pip install "markdown-it-py[linkify]==3.0.0" "PyYAML==6.0.2"
 
       # The whole gate, with WYRD_FDB_TOOLCHAIN set — which is what makes
       # `xtask::feature_gated_checks` emit the same two `cargo check` rows from inside

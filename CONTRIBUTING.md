@@ -48,7 +48,10 @@ Before opening a pull request, run:
 cargo xtask ci
 ```
 
-This is the same gate that runs in CI.
+This is the same gate that runs in CI, including the prose gates (`typos` and
+the docs lint/render check); external tools it needs (`typos`,
+`cargo-machete`, `cargo-deny`, the docs renderer deps) are warn-and-skip when
+not installed locally, so install them for full parity.
 
 Optional Tier-2 integration tests:
 
