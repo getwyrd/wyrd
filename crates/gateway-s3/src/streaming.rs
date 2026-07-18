@@ -65,6 +65,18 @@ pub(crate) const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 /// yet caps a client that never sends the closing CRLF.
 const MAX_TRAILER_SIZE: usize = 8 * 1024;
 
+/// The decoder's whole rolling buffer is bounded. The parser never legitimately needs
+/// more than one maximal chunk (its data + CRLF) — or, in the trailer section,
+/// [`MAX_TRAILER_SIZE`] — resident at once (the buffer drains as it parses), so
+/// [`Decoder::fill`] refuses any transport frame that would grow `buf` past this cap
+/// (→ HTTP 400). This is the backstop the per-value bounds cannot provide: an endless
+/// chunk-header line that never sends its CRLF, or a huge trailer glued onto the same
+/// transport frame as the terminating chunk — bytes that cannot be charged to the
+/// trailer budget before the terminating header has even been parsed — would otherwise
+/// grow `buf` in the amount the transport delivers, unbounded by anything the parser
+/// checks (issue #364 carry-forward, iter-6 item 2; PR #595 review).
+const MAX_BUF_SIZE: usize = MAX_CHUNK_SIZE + MAX_TRAILER_SIZE;
+
 /// A refused / malformed `aws-chunked` streaming upload.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamingError {
@@ -206,6 +218,13 @@ where
 struct Decoder<S> {
     source: S,
     buf: Vec<u8>,
+    /// The unconsumed tail of a transport frame larger than the parser buffer's room
+    /// ([`MAX_BUF_SIZE`]): transport framing is independent of `aws-chunked` framing, so
+    /// one frame may legitimately carry many valid chunks. The tail is retained here —
+    /// a zero-copy [`Bytes`] slice of the transport's own allocation, never copied into
+    /// `buf` — and [`Self::fill`] tops `buf` up from it as the parser drains, keeping
+    /// `buf` bounded without refusing a valid coalesced upload (PR #595 review).
+    pending: Bytes,
     eof: bool,
     ctx: StreamingContext,
     /// The previous chunk's signature (seed for the first chunk) — the chunk chain. Also
@@ -235,6 +254,7 @@ where
         Self {
             source,
             buf: Vec::new(),
+            pending: Bytes::new(),
             eof: false,
             ctx,
             previous_signature,
@@ -244,15 +264,43 @@ where
         }
     }
 
-    /// Pull one more transport frame into `buf`. Returns whether more data arrived (`false`
-    /// once the inner stream is exhausted). A source error propagates unchanged.
-    async fn fill(&mut self) -> Result<bool> {
+    /// Top `buf` up with more body bytes — from the [`Self::pending`] tail of an earlier
+    /// oversized frame first, then from the next transport frame. Returns whether more
+    /// data arrived (`false` once both are exhausted). A source error propagates
+    /// unchanged.
+    ///
+    /// `cap` is the parser buffer's bound for the current parse context
+    /// ([`MAX_BUF_SIZE`] for the chunk phases; the trailer section's remaining budget in
+    /// [`Self::next_trailer_line`]). At most `cap - buf.len()` bytes are copied into
+    /// `buf`; a frame's excess is retained in `pending` (a zero-copy slice of the
+    /// transport's own allocation), so `buf` stays bounded while a legitimate coalesced
+    /// frame carrying many valid chunks still parses. Being called at all means the
+    /// parser cannot progress on what is resident — so if `buf` is already at `cap`,
+    /// a single parse unit exceeds its bound: refused (→ HTTP 400), `what` names the
+    /// bound in the error.
+    async fn fill_bounded(&mut self, cap: usize, what: &str) -> Result<bool> {
+        let room = cap.saturating_sub(self.buf.len());
+        if room == 0 {
+            return Err(framing(&format!(
+                "aws-chunked {what} exceeds the {cap}-byte bound"
+            )));
+        }
+        if !self.pending.is_empty() {
+            let take = room.min(self.pending.len());
+            self.buf.extend_from_slice(&self.pending[..take]);
+            self.pending = self.pending.slice(take..);
+            return Ok(true);
+        }
         if self.eof {
             return Ok(false);
         }
         match self.source.next().await {
             Some(Ok(bytes)) => {
-                self.buf.extend_from_slice(&bytes);
+                let take = room.min(bytes.len());
+                self.buf.extend_from_slice(&bytes[..take]);
+                if take < bytes.len() {
+                    self.pending = bytes.slice(take..);
+                }
                 Ok(true)
             }
             Some(Err(err)) => Err(err),
@@ -261,6 +309,12 @@ where
                 Ok(false)
             }
         }
+    }
+
+    /// [`Self::fill_bounded`] at the whole-buffer backstop ([`MAX_BUF_SIZE`]) — the chunk
+    /// phases' fill.
+    async fn fill(&mut self) -> Result<bool> {
+        self.fill_bounded(MAX_BUF_SIZE, "buffering").await
     }
 
     /// Parse and de-frame the next chunk. `Ok(Some(data))` for a data chunk, `Ok(None)` when
@@ -350,13 +404,22 @@ where
     }
 
     /// Read the next CRLF-terminated line of the trailer section. `Ok(None)` marks the
-    /// blank line that closes the block (already consumed). Bounded by [`MAX_TRAILER_SIZE`]
-    /// so a client that never sends the closing CRLF cannot force unbounded buffering — the
-    /// same discipline [`MAX_CHUNK_SIZE`] applies to a chunk's declared size (issue #364
-    /// carry-forward, iter-6 item 2).
-    async fn next_trailer_line(&mut self) -> Result<Option<Vec<u8>>> {
+    /// blank line that closes the block (already consumed). `consumed` is the running
+    /// byte total of the section: every line (with its CRLF) is charged against
+    /// [`MAX_TRAILER_SIZE`] **before** it is copied or drained, so neither a single
+    /// line whose CRLF arrived in the same transport frame nor many small lines in
+    /// aggregate can exceed the bound — an authenticated client cannot turn this path
+    /// into a memory-amplification lever, the same discipline [`MAX_CHUNK_SIZE`]
+    /// applies to a chunk's declared size (issue #364 carry-forward, iter-6 item 2).
+    async fn next_trailer_line(&mut self, consumed: &mut usize) -> Result<Option<Vec<u8>>> {
         loop {
             if let Some(pos) = find_crlf(&self.buf) {
+                *consumed = consumed.saturating_add(pos + 2);
+                if *consumed > MAX_TRAILER_SIZE {
+                    return Err(framing(&format!(
+                        "aws-chunked trailer section exceeds the {MAX_TRAILER_SIZE}-byte bound"
+                    )));
+                }
                 if pos == 0 {
                     self.buf.drain(..2);
                     return Ok(None);
@@ -365,12 +428,17 @@ where
                 self.buf.drain(..pos + 2);
                 return Ok(Some(line));
             }
-            if self.buf.len() > MAX_TRAILER_SIZE {
+            if consumed.saturating_add(self.buf.len()) > MAX_TRAILER_SIZE {
                 return Err(framing(&format!(
                     "aws-chunked trailer section exceeds the {MAX_TRAILER_SIZE}-byte bound"
                 )));
             }
-            if !self.fill().await? {
+            // Fill within the section's REMAINING budget: at most
+            // `MAX_TRAILER_SIZE - consumed` bytes may ever become resident for this
+            // section, and `fill_bounded` stashes a frame's excess in `pending`
+            // rather than buffering past the bound.
+            let budget = MAX_TRAILER_SIZE.saturating_sub(*consumed);
+            if !self.fill_bounded(budget, "trailer section").await? {
                 return Err(framing("body ended inside the aws-chunked trailer section"));
             }
         }
@@ -391,8 +459,11 @@ where
         let mut declared_value: Option<(String, Vec<u8>)> = None; // (name, decoded checksum)
         let mut canonical_line: Option<String> = None; // the exact `name:value\n` that was signed
         let mut trailer_signature: Option<String> = None;
+        // The section's cumulative byte budget — charged by `next_trailer_line`
+        // before any line is buffered out.
+        let mut consumed = 0usize;
 
-        while let Some(line) = self.next_trailer_line().await? {
+        while let Some(line) = self.next_trailer_line(&mut consumed).await? {
             let line = std::str::from_utf8(&line)
                 .map_err(|_| framing("non-UTF-8 aws-chunked trailer line"))?;
             let (name, value) = line
@@ -985,6 +1056,129 @@ mod tests {
             err.downcast_ref::<StreamingError>(),
             Some(StreamingError::Framing(_))
         ));
+    }
+
+    /// A single trailer line larger than [`MAX_TRAILER_SIZE`] whose CRLF arrives in the
+    /// SAME transport frame is refused BEFORE the line is buffered out: the bound must
+    /// bind on the line's own size, not only on a still-CRLF-less buffer — delivering
+    /// the whole body in one frame used to bypass the check entirely (PR #595 review).
+    #[tokio::test]
+    async fn an_oversized_trailer_line_with_its_crlf_already_buffered_is_refused() {
+        let ctx = aws_example_ctx_with_trailer(
+            false,
+            "x-amz-checksum-crc32",
+            checksum::ChecksumAlgorithm::Crc32,
+        );
+        let object = vec![b'z'; 100];
+        let mut framed = format!("{:x}\r\n", object.len()).into_bytes();
+        framed.extend_from_slice(&object);
+        framed.extend_from_slice(b"\r\n0\r\nx-amz-checksum-crc32:");
+        framed.extend_from_slice(&vec![b'A'; MAX_TRAILER_SIZE]);
+        framed.extend_from_slice(b"\r\n\r\n");
+        let whole = framed.len();
+        let err = decode_to_vec(framed, whole, ctx)
+            .await
+            .expect_err("an oversized trailer line in one frame must be refused");
+        match err.downcast_ref::<StreamingError>() {
+            Some(StreamingError::Framing(what)) => {
+                assert!(
+                    what.contains("bound"),
+                    "expected the size bound, got: {what}"
+                )
+            }
+            other => panic!("expected a Framing error, got {other:?}"),
+        }
+    }
+
+    /// Trailer lines that each fit under [`MAX_TRAILER_SIZE`] but exceed it in AGGREGATE
+    /// are refused — the bound is cumulative over the whole section, not per line, so a
+    /// client cannot stream an unbounded section as a sequence of under-bound lines
+    /// (PR #595 review). The bound trips in the reader, before the junk line could fail
+    /// any later semantic check.
+    #[tokio::test]
+    async fn trailer_lines_exceeding_the_bound_in_aggregate_are_refused() {
+        let ctx = aws_example_ctx_with_trailer(
+            false,
+            "x-amz-checksum-crc32",
+            checksum::ChecksumAlgorithm::Crc32,
+        );
+        let object = vec![b'z'; 100];
+        let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
+        running.update(&object);
+        let checksum_b64 = test_base64_encode(&running.finalize());
+        let mut framed = format!("{:x}\r\n", object.len()).into_bytes();
+        framed.extend_from_slice(&object);
+        framed.extend_from_slice(b"\r\n0\r\n");
+        framed.extend_from_slice(format!("x-amz-checksum-crc32:{checksum_b64}\r\n").as_bytes());
+        // Under the bound on its own; over it together with the line above.
+        framed.extend_from_slice(&vec![b'A'; MAX_TRAILER_SIZE - 20]);
+        framed.extend_from_slice(b"\r\n\r\n");
+        let err = decode_to_vec(framed, 64, ctx)
+            .await
+            .expect_err("an over-bound trailer section must be refused in aggregate");
+        match err.downcast_ref::<StreamingError>() {
+            Some(StreamingError::Framing(what)) => {
+                assert!(
+                    what.contains("bound"),
+                    "expected the size bound, got: {what}"
+                )
+            }
+            other => panic!("expected a Framing error, got {other:?}"),
+        }
+    }
+
+    /// Transport framing is independent of `aws-chunked` framing: a client/proxy may
+    /// coalesce a legitimate multi-chunk upload — larger than the parser buffer's own
+    /// bound — into ONE transport frame. The decoder must parse it incrementally from
+    /// the retained tail ([`Decoder::pending`]) rather than refuse it (PR #595 review).
+    #[tokio::test]
+    async fn a_coalesced_frame_larger_than_the_buffer_bound_still_decodes() {
+        let ctx = aws_example_ctx_with_trailer(
+            false,
+            "x-amz-checksum-crc32",
+            checksum::ChecksumAlgorithm::Crc32,
+        );
+        let object: Vec<u8> = (0..MAX_BUF_SIZE + MAX_CHUNK_SIZE)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
+        running.update(&object);
+        let checksum_b64 = test_base64_encode(&running.finalize());
+        let chunks: Vec<&[u8]> = object.chunks(MAX_CHUNK_SIZE).collect();
+        let framed = frame_trailer_body(&ctx, &chunks, "x-amz-checksum-crc32", &checksum_b64);
+        assert!(framed.len() > MAX_BUF_SIZE, "the frame must exceed the cap");
+        let whole = framed.len();
+        let decoded = decode_to_vec(framed, whole, ctx)
+            .await
+            .expect("a coalesced multi-chunk frame larger than the buffer bound decodes");
+        assert_eq!(decoded, object);
+    }
+
+    /// The whole-buffer backstop ([`MAX_BUF_SIZE`]): a chunk-header line that never sends
+    /// its CRLF is refused when the rolling buffer would exceed the cap — it must not grow
+    /// in whatever amount the transport keeps delivering (PR #595 review; issue #364
+    /// carry-forward, iter-6 item 2).
+    #[tokio::test]
+    async fn an_endless_header_line_is_refused_at_the_buffer_bound() {
+        let ctx = aws_example_ctx_with_trailer(
+            false,
+            "x-amz-checksum-crc32",
+            checksum::ChecksumAlgorithm::Crc32,
+        );
+        // No CRLF anywhere: the header-line loop keeps filling until the cap trips.
+        let framed = vec![b'f'; MAX_BUF_SIZE + 1024];
+        let err = decode_to_vec(framed, 1024 * 1024, ctx)
+            .await
+            .expect_err("an endless header line must be refused at the buffer bound");
+        match err.downcast_ref::<StreamingError>() {
+            Some(StreamingError::Framing(what)) => {
+                assert!(
+                    what.contains("bound"),
+                    "expected the buffer bound, got: {what}"
+                )
+            }
+            other => panic!("expected a Framing error, got {other:?}"),
+        }
     }
 
     /// A declared `x-amz-decoded-content-length` that does not match the actually-decoded
