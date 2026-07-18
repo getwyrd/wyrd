@@ -282,6 +282,10 @@ async fn evacuate_chunk(
         chunk_map: next_chunk_map,
         state: InodeState::Committed,
         version: plan.prior.version + 1,
+        // A rebalance re-places the SAME content, so it PRESERVES the object metadata
+        // (ADR-0047): a placement-maintenance commit must not move `Last-Modified` or drop
+        // the content type.
+        ..plan.prior.clone()
     };
     let inode_key = metadata::inode_key(plan.inode_id);
     let mut batch = WriteBatch::new()

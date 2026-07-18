@@ -137,6 +137,7 @@ async fn commit_chunk(
             len: 5,
             placement,
         }],
+        ..Default::default()
     };
     meta.commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
         .await
@@ -156,6 +157,7 @@ async fn commit_single_chunk(meta: &MemMeta, inode: InodeId, chunk: ChunkId, dse
             len: 5,
             placement: vec![dserver],
         }],
+        ..Default::default()
     };
     meta.commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
         .await

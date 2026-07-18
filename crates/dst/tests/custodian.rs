@@ -812,6 +812,7 @@ async fn commit_reference(meta: &MemMeta, dserver: DServerId) {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(meta, ROOT, "live", INODE, &record)
         .await

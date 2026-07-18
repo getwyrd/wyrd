@@ -129,6 +129,7 @@ async fn write_read_byte_identical_over_real_networked_dservers() {
         chunk_map: plan.chunk_refs(),
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let got = read::read_object_from(&store, &inode)
         .await

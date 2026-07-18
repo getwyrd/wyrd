@@ -313,6 +313,7 @@ async fn write_pre_m3_chunk(meta: &MemMeta, fleet: &Fleet<'_>, scheme: EcScheme)
         chunk_map: chunk_refs,
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(meta, ROOT, "obj", 1, &record)
         .await
@@ -444,6 +445,108 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
         read_object(&meta, &fleet, 1).await.unwrap(),
         Some(data),
         "the object still reads correctly after the evacuation"
+    );
+}
+
+// ---- ADR-0047: a rebalance PRESERVES object metadata (a re-placement, not a republish) ----
+
+/// Overwrite the committed inode `id` in place with a metadata-carrying version of the
+/// SAME content — the ADR-0047 publication trio a real create/overwrite leaves behind —
+/// via the same prior-record CAS the durability paths use. The chunk map (including its
+/// pre-M3 empty placement) is preserved, so the evacuation under test still fires. Returns
+/// the seeded trio for the preservation assertion; every OTHER test here seeds all-`None`
+/// metadata, which makes preservation vacuous.
+async fn stamp_object_meta(meta: &MemMeta, id: InodeId) -> (String, String, u64) {
+    let etag = "0badf00d0badf00d".to_string();
+    let content_type = "text/markdown; charset=utf-8".to_string();
+    let modified = 1_700_000_000_789_u64;
+    let prior = read_inode(meta).await;
+    let next = InodeRecord {
+        etag: Some(etag.clone()),
+        content_type: Some(content_type.clone()),
+        modified: Some(modified),
+        ..prior.clone()
+    };
+    let key = metadata::inode_key(id);
+    let outcome = meta
+        .commit(
+            WriteBatch::new()
+                .require(key.clone(), metadata::encode(&prior))
+                .put(key, metadata::encode(&next)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+    (etag, content_type, modified)
+}
+
+/// A rebalance re-places the SAME content, so its evacuation commit must PRESERVE the
+/// object metadata trio (ADR-0047): a placement-maintenance commit must not move
+/// Last-Modified or drop the ETag/content type. Guards `rebalance.rs`'s preservation
+/// `..plan.prior.clone()` against silently regressing to `..Default::default()` (which
+/// still compiles but drops the trio to `None`). Every other rebalance test seeds
+/// all-`None` metadata, so this invariant is otherwise VACUOUSLY true.
+#[tokio::test]
+async fn evacuation_preserves_object_metadata() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+    let topo = four_domains();
+    write_pre_m3_chunk(&meta, &fleet, EcScheme::None).await;
+    // Stamp the published object's ADR-0047 metadata (the write helper seeds none), keeping
+    // the pre-M3 empty placement so the evacuation still fires.
+    let (etag, content_type, modified) = stamp_object_meta(&meta, 1).await;
+
+    // The operator marks the identity-resolved server (0) draining.
+    set_lifecycle(&meta, 0, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+
+    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+    let ctx = RebalanceContext {
+        meta: &meta,
+        fleet: &dyn_fleet,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the pre-M3 chunk was evacuated off the draining server (the commit under test fires)"
+    );
+
+    let record = read_inode(&meta).await;
+    assert_eq!(
+        record.chunk_map[0].placement,
+        vec![1],
+        "the fragment was re-placed off the draining server (evacuation really happened)"
+    );
+    assert_eq!(
+        record.etag,
+        Some(etag),
+        "evacuation PRESERVES the ETag (ADR-0047): a re-placement does not republish content"
+    );
+    assert_eq!(
+        record.content_type,
+        Some(content_type),
+        "evacuation PRESERVES the stored content type"
+    );
+    assert_eq!(
+        record.modified,
+        Some(modified),
+        "evacuation must NOT move Last-Modified"
     );
 }
 

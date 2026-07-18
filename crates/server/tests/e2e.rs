@@ -65,6 +65,64 @@ fn gateway_composes_the_coordination_backend() {
     });
 }
 
+/// A **buffered** PUT is a content publication like any other (ADR-0047): it stamps
+/// the digest and the publication instant, so the S3 surface serves an ETag and
+/// Last-Modified for objects written through `Gateway::put_object` too — and a
+/// buffered OVERWRITE of a metadata-carrying object re-stamps rather than either
+/// serving the prior version's digest for the new bytes or silently dropping the
+/// trio (Codex review: the buffered path committed the plan's default all-`None`
+/// metadata). No content type is declared on this path, so `content_type` stays
+/// `None` and GET falls back to the S3 default.
+///
+/// `#[tokio::test]` (not `pollster`): `get_object_streaming` spawns its chunk-reader
+/// task onto the runtime.
+#[tokio::test]
+async fn buffered_put_stamps_publication_metadata() {
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+    use wyrd_gateway_core::ObjectGateway;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    let (gw, _dir) = gateway();
+    gw.put_object("obj", b"buffered bytes").await.unwrap();
+
+    let gw = Arc::new(gw);
+    let read = Arc::clone(&gw)
+        .get_object_streaming("obj")
+        .await
+        .unwrap()
+        .expect("the object just written reads back");
+    assert_eq!(
+        read.etag.as_deref(),
+        Some(hex(&Sha256::digest(b"buffered bytes")).as_str()),
+        "a buffered PUT stamps the content digest as the ETag (ADR-0047)"
+    );
+    assert!(
+        read.modified.is_some(),
+        "a buffered PUT stamps the publication time"
+    );
+    assert_eq!(
+        read.content_type, None,
+        "no content type is declared on the buffered path"
+    );
+
+    // A buffered overwrite is a FRESH publication: the digest tracks the new bytes.
+    gw.put_object("obj", b"replaced bytes").await.unwrap();
+    let read = Arc::clone(&gw)
+        .get_object_streaming("obj")
+        .await
+        .unwrap()
+        .expect("the overwritten object reads back");
+    assert_eq!(
+        read.etag.as_deref(),
+        Some(hex(&Sha256::digest(b"replaced bytes")).as_str()),
+        "a buffered overwrite re-stamps the ETag for the new content"
+    );
+}
+
 #[test]
 fn binary_runs_the_round_trip_in_one_process() {
     // `wyrd demo` is the in-memory PUT/GET round trip in one process.

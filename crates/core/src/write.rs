@@ -26,7 +26,9 @@ use wyrd_traits::{
 };
 
 use crate::erasure;
-use crate::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry};
+use crate::metadata::{
+    self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, ObjectMeta, PendingEntry,
+};
 use crate::placement::{select_distinct_domains, SelectorError, Topology};
 
 /// One planned chunk: its id, durability scheme, logical length, the encoded
@@ -58,6 +60,13 @@ pub struct WritePlan {
     pub chunks: Vec<PlannedChunk>,
     /// Total object length in bytes.
     pub size: u64,
+    /// The object metadata to commit **atomically with the chunk map** at content
+    /// publication (ADR-0047): the content digest / declared content type / publication
+    /// time. Chunking cannot know the ETag (the streaming digest is only final once the
+    /// body has streamed), so the composition root fills this after the data phase and
+    /// before the commit; a plan left with the default (all `None`) commits no metadata,
+    /// preserving the pre-metadata wire behaviour for callers that do not set it.
+    pub object_meta: ObjectMeta,
 }
 
 impl WritePlan {
@@ -180,6 +189,7 @@ pub fn plan_write(
     Ok(WritePlan {
         chunks,
         size: data.len() as u64,
+        object_meta: ObjectMeta::default(),
     })
 }
 
@@ -264,6 +274,12 @@ pub async fn commit_create(
         chunk_map: plan.chunk_refs(),
         state: InodeState::Committed,
         version: 1,
+        // A create is a content publication (ADR-0047): stamp the object metadata the
+        // composition root recorded on the plan (empty by default, so callers that do not
+        // set it commit no metadata and keep the pre-metadata wire behaviour).
+        etag: plan.object_meta.etag.clone(),
+        content_type: plan.object_meta.content_type.clone(),
+        modified: plan.object_meta.modified,
     };
     metadata::create_leased(
         meta,
@@ -309,6 +325,9 @@ pub async fn commit_overwrite(
         orphaned_at_millis,
         &plan.chunk_ids(),
         orphaned_at_millis,
+        // An overwrite is a fresh content publication (ADR-0047): stamp the plan's object
+        // metadata onto the new version.
+        &plan.object_meta,
     )
     .await
 }
@@ -598,6 +617,7 @@ where
     Ok(WritePlan {
         chunks: planned,
         size,
+        object_meta: ObjectMeta::default(),
     })
 }
 

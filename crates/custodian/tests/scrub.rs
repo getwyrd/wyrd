@@ -161,6 +161,7 @@ async fn commit_reference(
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(meta, ROOT, name, inode, &record)
         .await
@@ -177,6 +178,7 @@ async fn commit_chunk(meta: &MemMeta, inode: InodeId, name: &str, chunk_ref: Chu
         chunk_map: vec![chunk_ref],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(meta, ROOT, name, inode, &record)
         .await
@@ -960,6 +962,7 @@ async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
         }],
         state: InodeState::Pending,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(&meta, ROOT, "in-flight", 1, &record)
         .await

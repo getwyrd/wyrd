@@ -562,6 +562,15 @@ where
 
     match method {
         Method::PUT => {
+            // The client's declared `Content-Type`, round-tripped verbatim on GET (ADR-0047).
+            // Read from the request head BEFORE the body stream is consumed. `None` if the
+            // client sent none (or a non-ASCII value) — GET then falls back to
+            // `application/octet-stream`.
+            let content_type = parts
+                .headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|value| value.to_string());
             // The raw request-body byte stream (never buffered whole).
             let raw = Box::pin(
                 body.into_data_stream()
@@ -578,7 +587,12 @@ where
                     let decoded = streaming::decode(raw, ctx);
                     state
                         .gateway
-                        .put_object_streaming(&object_key, decoded, ContentHash::Unverified)
+                        .put_object_streaming(
+                            &object_key,
+                            decoded,
+                            ContentHash::Unverified,
+                            content_type,
+                        )
                         .await
                 }
                 // A single-shot **signed** body: stream it straight in; the running hash is
@@ -586,19 +600,30 @@ where
                 sigv4::PayloadHash::Signed(hex) => {
                     state
                         .gateway
-                        .put_object_streaming(&object_key, raw, ContentHash::Expected(hex))
+                        .put_object_streaming(
+                            &object_key,
+                            raw,
+                            ContentHash::Expected(hex),
+                            content_type,
+                        )
                         .await
                 }
                 // A deliberately-unsigned body: stream it in with no post-stream hash check.
                 sigv4::PayloadHash::Unsigned => {
                     state
                         .gateway
-                        .put_object_streaming(&object_key, raw, ContentHash::Unverified)
+                        .put_object_streaming(
+                            &object_key,
+                            raw,
+                            ContentHash::Unverified,
+                            content_type,
+                        )
                         .await
                 }
             };
             match result {
-                Ok(()) => empty_response(StatusCode::OK),
+                // Answer with the committed object's ETag (ADR-0047): S3 quotes the value.
+                Ok(etag) => put_object_response(&etag),
                 Err(err) => gateway_error_response(request_id, &err),
             }
         }
@@ -606,15 +631,45 @@ where
             .get_object_streaming(&object_key)
             .await
         {
-            Ok(Some(ObjectRead { size, stream })) => Response::builder()
-                .status(StatusCode::OK)
-                .header("content-type", "application/octet-stream")
-                // Declare the exact object length so a body truncated by a mid-stream fault
-                // (e.g. a fragment reclaimed by a racing DELETE) is a detectable short read,
-                // not a silent "complete" 200 (issue #364 carry-forward: GET fault framing).
-                .header("content-length", size.to_string())
-                .body(Body::from_stream(stream))
-                .expect("streaming response is always valid"),
+            Ok(Some(ObjectRead {
+                size,
+                stream,
+                etag,
+                content_type,
+                modified,
+            })) => {
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    // The stored content type, or the S3 default when none was recorded
+                    // (an old record, or a PUT that declared none) — and also when the
+                    // stored value is not a valid HTTP header value (ADR-0047). The seam
+                    // commits the client's declared type verbatim, so it may be any string;
+                    // an un-renderable one must degrade to the default, not panic the GET.
+                    .header("content-type", content_type_header(content_type.as_deref()))
+                    // Declare the exact object length so a body truncated by a mid-stream fault
+                    // (e.g. a fragment reclaimed by a racing DELETE) is a detectable short read,
+                    // not a silent "complete" 200 (issue #364 carry-forward: GET fault framing).
+                    .header("content-length", size.to_string());
+                // The ETag and Last-Modified are additive: a record predating the metadata
+                // model carries neither, so the headers are simply omitted (ADR-0047). A
+                // stored etag is committed by the write path and decoded liberally (ADR-0045),
+                // so a corrupt/out-of-band value may carry a non-header byte (e.g. CR/LF);
+                // `etag_header` degrades such a value to no header rather than panicking the
+                // GET — symmetric with `content_type_header` above.
+                if let Some(value) = etag.as_deref().and_then(etag_header) {
+                    builder = builder.header("etag", value);
+                }
+                // `http_date` declines (`None`) a timestamp past year 9999 — IMF-fixdate has a
+                // fixed 4-digit year, so such a value (reachable only via store corruption or
+                // an out-of-band edit, like the etag above) cannot be rendered as a valid
+                // `Last-Modified` and the header is omitted instead of sent malformed.
+                if let Some(value) = modified.and_then(http_date) {
+                    builder = builder.header("last-modified", value);
+                }
+                builder
+                    .body(Body::from_stream(stream))
+                    .expect("streaming response is always valid")
+            }
             Ok(None) => error_response(
                 request_id,
                 StatusCode::NOT_FOUND,
@@ -655,6 +710,128 @@ fn empty_response(status: StatusCode) -> Response {
     builder
         .body(Body::empty())
         .expect("static response is always valid")
+}
+
+/// The `200` a successful object PUT answers with (ADR-0047): a body-less response that
+/// declares its zero length (see [`empty_response`] for why the length is load-bearing)
+/// and carries the committed object's **ETag** — the content digest, S3-quoted — so a
+/// client can validate integrity and cache the object without a follow-up GET.
+///
+/// The seam types the ETag as an opaque `String`, so a NON-hex-digest implementation of
+/// [`ObjectGateway`] behind this wire layer could hand back a value that is not a valid
+/// HTTP header value; render it through [`etag_header`] — omitting the header rather than
+/// poisoning the builder and panicking the handler — symmetric with the GET arm.
+fn put_object_response(etag: &str) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("content-length", "0");
+    if let Some(value) = etag_header(etag) {
+        builder = builder.header("etag", value);
+    }
+    builder
+        .body(Body::empty())
+        .expect("static response is always valid")
+}
+
+/// S3 renders `ETag` as a **quoted** string (`"<hex>"`). The stored value is the opaque
+/// change-token (lowercase-hex SHA-256, ADR-0047); quoting is a wire concern applied
+/// identically on PUT and GET so the two agree.
+fn quote_etag(etag: &str) -> String {
+    format!("\"{etag}\"")
+}
+
+/// The `ETag` header value for a PUT or GET response, or `None` when the change-token
+/// cannot be rendered as a valid HTTP header value. The stored `etag` is committed by the
+/// write path (ADR-0047) and decoded **liberally** at the metadata boundary (ADR-0045), so
+/// a corrupt record or an out-of-band edit can leave a value carrying a non-header byte
+/// (e.g. CR/LF) — and on PUT, the seam types the committed ETag as an opaque `String` a
+/// non-digest [`ObjectGateway`] implementation could fill arbitrarily. Quoting such a
+/// value and setting it directly would make the whole response fail to build and panic the
+/// `.expect(...)` — on GET, denying **every** read of the object. So an un-renderable etag
+/// DEGRADES to no `ETag` header, symmetric with [`content_type_header`]; it never breaks
+/// the request. A well-formed digest — the only value this path ever mints — always
+/// renders, so this is a defence against stored corruption and foreign seam
+/// implementations, not the happy path.
+///
+/// Validity is the RFC 7232 §2.3 entity-tag grammar (`etagc`: `%x21 / %x23-7E /
+/// obs-text`), not merely "a valid header value": a stored tag containing `"` passes
+/// `HeaderValue`'s byte check but quotes to the malformed `"abc"def"`, which caches
+/// and strict clients may reject — a defeated degradation, sent on the wire instead
+/// of omitted.
+fn etag_header(etag: &str) -> Option<HeaderValue> {
+    let etagc = |b: u8| b == 0x21 || (0x23..=0x7E).contains(&b) || b >= 0x80;
+    if etag.bytes().all(etagc) {
+        HeaderValue::from_str(&quote_etag(etag)).ok()
+    } else {
+        None
+    }
+}
+
+/// The `Content-Type` header value for a GET response. The stored `content_type` is the
+/// client's declared type committed **verbatim** at the seam (ADR-0047), so it may be any
+/// string — including one that is not a valid HTTP header value (control bytes,
+/// non-visible-ASCII). Rendering such a value directly would make the whole GET response
+/// fail to build and panic the `.expect(...)` below, denying every read of the object. So
+/// an absent OR un-renderable type falls back to the S3 default `application/octet-stream`,
+/// exactly as an unrecorded type does — a malformed stored type degrades the content type,
+/// it never breaks the read.
+fn content_type_header(content_type: Option<&str>) -> HeaderValue {
+    content_type
+        .and_then(|value| HeaderValue::from_str(value).ok())
+        .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"))
+}
+
+/// Render `epoch_millis` as an RFC-7231 IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) for
+/// the `Last-Modified` header. Implemented in-tree (Howard Hinnant's civil-from-days) so no
+/// HTTP-date/chrono dependency is pulled in — a new dependency would be a human-only
+/// sign-off item (ADR-0003 audit + `deny.toml`), and the formatter is small.
+///
+/// Returns `None` past year 9999: IMF-fixdate's year is exactly four digits, so a later
+/// timestamp (metadata decoding accepts any `u64` — ADR-0045) has no valid rendering and
+/// the caller omits the header, symmetric with `etag_header` on a malformed stored etag.
+fn http_date(epoch_millis: u64) -> Option<String> {
+    const SECS_PER_DAY: u64 = 86_400;
+    let secs = epoch_millis / 1_000;
+    let days = (secs / SECS_PER_DAY) as i64;
+    let sod = secs % SECS_PER_DAY;
+    let (hour, minute, second) = (sod / 3_600, (sod % 3_600) / 60, sod % 60);
+    // 1970-01-01 was a Thursday; `days` is non-negative for any epoch time.
+    let weekday = (((days % 7) + 4) % 7) as usize;
+    let (year, month, day) = civil_from_days(days);
+    if year > 9_999 {
+        return None;
+    }
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    Some(format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        WEEKDAYS[weekday],
+        day,
+        MONTHS[(month - 1) as usize],
+        year,
+        hour,
+        minute,
+        second,
+    ))
+}
+
+/// Convert a day count since the Unix epoch (1970-01-01) into `(year, month, day)` —
+/// Howard Hinnant's `civil_from_days`, exact for the whole `u64`-millis range the wire
+/// carries. Used only by [`http_date`].
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 /// Percent-decode a path segment to its raw bytes and interpret them as UTF-8
@@ -1080,14 +1257,15 @@ mod tests {
                 _key: &str,
                 _source: S,
                 _expected: ContentHash,
-            ) -> wyrd_traits::Result<()>
+                _content_type: Option<String>,
+            ) -> wyrd_traits::Result<String>
             where
                 S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
                     + Send
                     + Unpin
                     + 'static,
             {
-                Ok(())
+                Ok(String::new())
             }
 
             async fn get_object_streaming(
@@ -1365,14 +1543,15 @@ mod tests {
             _key: &str,
             _source: S,
             _expected: ContentHash,
-        ) -> wyrd_traits::Result<()>
+            _content_type: Option<String>,
+        ) -> wyrd_traits::Result<String>
         where
             S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
                 + Send
                 + Unpin
                 + 'static,
         {
-            Ok(())
+            Ok(String::new())
         }
 
         async fn get_object_streaming(
@@ -1808,5 +1987,362 @@ mod tests {
             "signed header `&lt;x&gt;&amp;&quot;&apos;` absent"
         );
         assert_eq!(xml_escape("NoSuchKey"), "NoSuchKey");
+    }
+
+    #[test]
+    fn content_type_header_falls_back_when_the_stored_value_is_not_a_valid_header() {
+        // A well-formed stored type is rendered verbatim.
+        assert_eq!(
+            content_type_header(Some("text/plain; charset=utf-8")),
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        // No stored type -> the S3 default (an old record, or a PUT that declared none).
+        assert_eq!(
+            content_type_header(None),
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        // A stored type that is NOT a valid HTTP header value (control bytes / CRLF, which
+        // the seam commits verbatim and #504/#506 can pass through) degrades to the default
+        // instead of yielding an error the GET builder would `.expect(...)`-panic on.
+        assert_eq!(
+            content_type_header(Some("text/plain\r\ninjected: header")),
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        assert_eq!(
+            content_type_header(Some("bad\u{0}byte")),
+            HeaderValue::from_static("application/octet-stream"),
+        );
+    }
+
+    #[test]
+    fn etag_header_renders_only_well_formed_entity_tags() {
+        // The value this path actually mints — a lowercase-hex digest — renders quoted.
+        assert_eq!(
+            etag_header("0badc0de0badc0de"),
+            Some(HeaderValue::from_static("\"0badc0de0badc0de\"")),
+        );
+        // Not a valid HTTP header value (CR/LF) — degrades to no header.
+        assert_eq!(etag_header("0badc0de\r\ninjected: header"), None);
+        // A VALID header value that is not a valid entity-tag (RFC 7232 §2.3): an
+        // embedded `"` passes `HeaderValue`'s byte check but would quote to the
+        // malformed `"abc"def"` — strict clients and caches may reject the response,
+        // defeating the degradation. It must be omitted, not sent malformed.
+        assert_eq!(etag_header("abc\"def"), None);
+        // Spaces are header-valid but outside `etagc` too.
+        assert_eq!(etag_header("abc def"), None);
+    }
+
+    /// A gateway whose stored object carries a caller-chosen `content_type` and `etag` — used
+    /// to drive the real GET wire arm with a **malformed** stored value (ADR-0047: the seam
+    /// commits the client's declared type verbatim, and the stored etag is decoded liberally
+    /// per ADR-0045, so store corruption / out-of-band edits / #504/#506 can leave arbitrary
+    /// strings on either field).
+    struct StoredMetaGateway {
+        content_type: Option<String>,
+        etag: Option<String>,
+        modified: Option<u64>,
+    }
+
+    impl StoredMetaGateway {
+        /// The well-formed baseline — a valid stored etag, no content type, and an in-range
+        /// modified time — that each test then perturbs on exactly the field it exercises.
+        fn new() -> Self {
+            Self {
+                content_type: None,
+                etag: Some("0badc0de0badc0de".to_string()),
+                modified: Some(1_700_000_000_000),
+            }
+        }
+    }
+
+    impl ObjectGateway for StoredMetaGateway {
+        async fn put_object_streaming<S>(
+            &self,
+            _key: &str,
+            _source: S,
+            _expected: ContentHash,
+            _content_type: Option<String>,
+        ) -> wyrd_traits::Result<String>
+        where
+            S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
+                + Send
+                + Unpin
+                + 'static,
+        {
+            // The seam types the committed ETag as an opaque `String`; hand back whatever
+            // the test configured, exactly as a foreign `ObjectGateway` implementation may.
+            Ok(self.etag.clone().unwrap_or_default())
+        }
+
+        async fn get_object_streaming(
+            self: Arc<Self>,
+            _key: &str,
+        ) -> wyrd_traits::Result<Option<ObjectRead>> {
+            let body = bytes::Bytes::from_static(b"object-body");
+            Ok(Some(ObjectRead {
+                size: body.len() as u64,
+                stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+                etag: self.etag.clone(),
+                content_type: self.content_type.clone(),
+                modified: self.modified,
+            }))
+        }
+
+        async fn delete_object(&self, _key: &str) -> wyrd_traits::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// Drive a signed `method` request with `body` at `/bucket/key` through the REAL router
+    /// against `gateway`, returning the response. Shared by the malformed-metadata degradation
+    /// tests so each exercises the production dispatch → wire arm → response builder, not a
+    /// stand-in.
+    async fn signed_through_router(
+        gateway: Arc<StoredMetaGateway>,
+        method: &str,
+        body: &'static [u8],
+    ) -> Response {
+        use tower::ServiceExt;
+
+        let creds = crate::sigv4::Credentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+        };
+        let router = S3Gateway::new(gateway, S3Config::new(vec![creds.clone()])).router();
+
+        let host = "example.com";
+        let path = "/bucket/key";
+        let amz_date = crate::sigv4::format_amz_date(SystemTime::now());
+        let signed = crate::sigv4::sign(
+            method,
+            path,
+            "",
+            host,
+            &amz_date,
+            body,
+            &creds,
+            "us-east-1",
+            "s3",
+        );
+        router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", host)
+                    .header("authorization", signed.authorization)
+                    .header("x-amz-date", signed.amz_date)
+                    .header("x-amz-content-sha256", signed.content_sha256)
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("the router answers without panicking")
+    }
+
+    async fn signed_get_through_router(gateway: Arc<StoredMetaGateway>) -> Response {
+        signed_through_router(gateway, "GET", b"").await
+    }
+
+    /// A stored `content_type` that is NOT a valid HTTP header value must NOT panic a GET.
+    ///
+    /// Pre-hardening, the GET arm passed the stored string straight to
+    /// `.header("content-type", <bad>)`, which records an invalid-`HeaderValue` error that
+    /// only surfaces when the body is built — at `.expect("streaming response is always
+    /// valid")` — so **every** read of such an object panics the handler (a 500 at best, a
+    /// denied read for good). The seam commits the client's declared type verbatim
+    /// (ADR-0047) and #504/#506 call it next with arbitrary strings, so this is reachable
+    /// without any HTTP client (axum rejects a malformed *request* header, but a malformed
+    /// *stored* value never passes through axum).
+    ///
+    /// Driven through the REAL signed router dispatch → GET arm → response builder, so it
+    /// exercises the production `.expect(...)` path, not a stand-in. Post-hardening the GET
+    /// degrades the content type to `application/octet-stream` and serves the body.
+    #[tokio::test]
+    async fn a_malformed_stored_content_type_degrades_the_get_instead_of_panicking() {
+        let gateway = Arc::new(StoredMetaGateway {
+            // CRLF is a valid Rust string but never a valid HTTP header value.
+            content_type: Some("text/plain\r\ninjected: header".to_string()),
+            ..StoredMetaGateway::new()
+        });
+        let response = signed_get_through_router(gateway).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a malformed stored content type must still serve the object — not panic the GET",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .expect("a GET carries a content-type")
+                .to_str()
+                .expect("the served content type is ascii"),
+            "application/octet-stream",
+            "an un-renderable stored content type degrades to the S3 default",
+        );
+        // The ETag is still surfaced — hardening the content type does not drop other metadata.
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .expect("a GET carries the stored ETag")
+                .to_str()
+                .expect("ascii"),
+            "\"0badc0de0badc0de\"",
+        );
+    }
+
+    /// A stored `etag` that is NOT a valid HTTP header value must NOT panic a GET.
+    ///
+    /// Symmetric with the malformed-`content_type` case above and the residual gap it
+    /// left: pre-hardening the GET arm passed the stored etag straight to
+    /// `.header("etag", quote_etag(<bad>))`, which records an invalid-`HeaderValue` error
+    /// that only surfaces when the body is built — at `.expect("streaming response is always
+    /// valid")` — so **every** read of such an object panics the handler. The stored etag is
+    /// committed by the write path and decoded **liberally** at the metadata boundary
+    /// (ADR-0045), so store corruption or an out-of-band edit can leave a value carrying a
+    /// non-header byte (e.g. CR/LF) — reachable without any HTTP client, since axum only
+    /// screens malformed *request* headers, never a malformed *stored* value.
+    ///
+    /// Driven through the REAL signed router dispatch → GET arm → response builder, so it
+    /// exercises the production `.expect(...)` path, not a stand-in. Post-hardening the GET
+    /// **omits** the `ETag` header (degrade, never panic) and serves the body.
+    #[tokio::test]
+    async fn a_malformed_stored_etag_degrades_the_get_instead_of_panicking() {
+        let gateway = Arc::new(StoredMetaGateway {
+            // A CR/LF byte is a valid Rust string but never a valid HTTP header value; quoting
+            // it does not make it one, so it would poison the response builder.
+            etag: Some("0badc0de\r\ninjected: header".to_string()),
+            ..StoredMetaGateway::new()
+        });
+        let response = signed_get_through_router(gateway).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a malformed stored etag must still serve the object — not panic the GET",
+        );
+        // The ETag header is OMITTED (degraded), not rendered — the object is still readable.
+        assert!(
+            response.headers().get("etag").is_none(),
+            "an un-renderable stored etag degrades to no ETag header, never a panic",
+        );
+        // The rest of the response is intact: the body still serves and the content type is
+        // present — hardening the etag drops only the etag.
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .expect("a GET carries a content-type")
+                .to_str()
+                .expect("ascii"),
+            "application/octet-stream",
+            "the content type is unaffected — a well-formed (here: absent) type still renders",
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the body serves without panicking");
+        assert_eq!(
+            &body[..],
+            b"object-body",
+            "the object body is served in full despite the malformed stored etag",
+        );
+    }
+
+    /// A stored `modified` past year 9999 must degrade to NO `Last-Modified` header — never
+    /// a malformed one.
+    ///
+    /// IMF-fixdate's year is exactly four digits, but metadata decoding accepts any `u64`
+    /// (ADR-0045), so store corruption or an out-of-band edit can leave a timestamp whose
+    /// year is 10000+. Unlike the malformed etag/content-type cases, such a value IS a
+    /// valid HTTP header value — the failure is not a panic but a five-digit year on the
+    /// wire, which is not a valid IMF-fixdate (RFC 7231 §7.1.1.1) and can misparse in
+    /// caching clients. Post-hardening `http_date` declines the render and the GET omits
+    /// the header, symmetric with the etag degradation above; everything else still serves.
+    #[tokio::test]
+    async fn an_unrenderable_stored_modified_omits_last_modified_instead_of_malforming_it() {
+        // 253_402_300_800_000 ms is 10000-01-01T00:00:00Z — the first unrenderable instant.
+        let gateway = Arc::new(StoredMetaGateway {
+            modified: Some(253_402_300_800_000),
+            ..StoredMetaGateway::new()
+        });
+        let response = signed_get_through_router(gateway).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an unrenderable stored modified time must still serve the object",
+        );
+        assert!(
+            response.headers().get("last-modified").is_none(),
+            "a year-10000+ stored modified time degrades to no Last-Modified header, \
+             never a malformed IMF-fixdate",
+        );
+        // The rest of the metadata is intact — degrading the date drops only the date.
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .expect("a GET carries the stored ETag")
+                .to_str()
+                .expect("ascii"),
+            "\"0badc0de0badc0de\"",
+        );
+
+        // And the boundary itself: the last renderable instant still renders (fixed 4-digit
+        // year at its maximum), one millisecond later does not.
+        assert_eq!(
+            http_date(253_402_300_799_999).as_deref(),
+            Some("Fri, 31 Dec 9999 23:59:59 GMT"),
+        );
+        assert_eq!(http_date(253_402_300_800_000), None);
+        assert_eq!(http_date(u64::MAX), None);
+    }
+
+    /// A committed ETag that is NOT a valid HTTP header value must NOT panic a PUT.
+    ///
+    /// The seam types the committed ETag as an opaque `String`
+    /// ([`ObjectGateway::put_object_streaming`]) — nothing in the contract requires it to be
+    /// a hex digest, so a foreign gateway implementation behind this generic wire layer can
+    /// hand back a value carrying a non-header byte (e.g. CR/LF). Pre-hardening,
+    /// `put_object_response` passed it straight to `.header("etag", ...)`, poisoning the
+    /// builder so the `.expect(...)` panicked the handler — every successful upload through
+    /// such a gateway answered with a connection reset instead of its 200. Post-hardening
+    /// the PUT omits the un-renderable `ETag` header and still answers 200, symmetric with
+    /// the GET-side `etag_header` degradation above.
+    #[tokio::test]
+    async fn an_unrenderable_committed_etag_degrades_the_put_instead_of_panicking() {
+        let gateway = Arc::new(StoredMetaGateway {
+            etag: Some("0badc0de\r\ninjected: header".to_string()),
+            ..StoredMetaGateway::new()
+        });
+        let response = signed_through_router(gateway, "PUT", b"object-body").await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an un-renderable committed etag must still answer the PUT — not panic it",
+        );
+        assert!(
+            response.headers().get("etag").is_none(),
+            "an un-renderable committed etag degrades to no ETag header, never a panic",
+        );
+
+        // The same wire path with a well-formed committed etag still serves it — the guard
+        // degrades only the un-renderable case, not the happy path.
+        let response =
+            signed_through_router(Arc::new(StoredMetaGateway::new()), "PUT", b"object-body").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .expect("a PUT answers with the committed ETag")
+                .to_str()
+                .expect("ascii"),
+            "\"0badc0de0badc0de\"",
+        );
     }
 }

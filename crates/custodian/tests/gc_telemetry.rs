@@ -139,6 +139,7 @@ async fn commit_reference(
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(meta, ROOT, name, inode, &record)
         .await

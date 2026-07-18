@@ -156,12 +156,26 @@ where
     /// conditional, so a concurrent writer would lose with an error rather than
     /// corrupt the object.
     pub async fn put_object(&self, key: &str, data: &[u8]) -> Result<()> {
-        let plan = write::plan_write(data, self.chunk_size, self.durability, || {
+        let mut plan = write::plan_write(data, self.chunk_size, self.durability, || {
             self.mint_chunk_id()
         })?;
         let lease_expiry = now_millis() + self.lease_ttl_millis;
         write::intent(&self.meta, &plan, lease_expiry).await?;
         write::write_fragments(&self.chunks, &plan).await?;
+        // A buffered PUT is a content publication like any other (ADR-0047): stamp the
+        // digest and the publication instant so the S3 surface serves an ETag and
+        // Last-Modified for buffered writes too — and so a buffered OVERWRITE of an
+        // object uploaded with metadata re-stamps rather than serving the prior
+        // version's digest for the new bytes. Stamped AFTER the data phase, immediately
+        // before the commit, so `modified` records when the object became atomically
+        // visible — not when a possibly-slow upload began — matching the streaming
+        // path's post-stream stamp. No declared content type on this path, so
+        // `content_type` stays `None` (GET falls back to the S3 default).
+        plan.object_meta = metadata::ObjectMeta {
+            etag: Some(hex(&Sha256::digest(data))),
+            content_type: None,
+            modified: Some(now_millis()),
+        };
         self.commit_written(key, &plan).await
     }
 
@@ -271,12 +285,13 @@ where
         key: &str,
         source: S,
         expected: ContentHash,
-    ) -> Result<()>
+        content_type: Option<String>,
+    ) -> Result<String>
     where
         S: futures_util::Stream<Item = Result<Bytes>> + Send + Unpin + 'static,
     {
         let mut hashing = HashingSource::new(source);
-        let plan = write::stream_write_data(
+        let mut plan = write::stream_write_data(
             &self.meta,
             &self.chunks,
             &mut hashing,
@@ -291,15 +306,28 @@ where
         )
         .await?;
 
+        // The object's ETag (ADR-0047) is the SHA-256 the write path already streamed through
+        // `HashingSource` — no second read of the body. Finalising consumes the hasher, so it
+        // is computed once here and used both for the `Expected` integrity check below and as
+        // the committed change-token.
+        let digest = hex(&hashing.finalize());
         if let ContentHash::Expected(claimed) = expected {
-            let actual = hex(&hashing.finalize());
-            if !constant_time_eq(claimed.as_bytes(), actual.as_bytes()) {
+            if !constant_time_eq(claimed.as_bytes(), digest.as_bytes()) {
                 // Authenticated, but the delivered bytes are not the expected bytes:
                 // abort before the commit — the leased fragments are never published.
                 return Err(GatewayError::PayloadMismatch.into());
             }
         }
-        self.commit_written(key, &plan).await
+        // Stamp the object metadata onto the plan so it commits ATOMICALLY with the chunk map
+        // (ADR-0047): the digest as the ETag, the client's declared content type verbatim, and
+        // the publication instant (the commit call site — madsim virtualises `now_millis`).
+        plan.object_meta = metadata::ObjectMeta {
+            etag: Some(digest.clone()),
+            content_type,
+            modified: Some(now_millis()),
+        };
+        self.commit_written(key, &plan).await?;
+        Ok(digest)
     }
 
     /// GET, **streaming**: resolve the object and return a body stream that reads it one
@@ -318,6 +346,12 @@ where
         // reclaimed by a racing DELETE), the body ends early and the client detects the short
         // read as a truncation instead of a complete object (issue #364 carry-forward).
         let size = inode.size;
+        // Carry the committed object metadata (ADR-0047) out with the stream so the wire layer
+        // can surface the ETag, the stored content type, and Last-Modified. A record written
+        // before this model carries `None`, degrading to the pre-metadata wire behaviour.
+        let etag = inode.etag.clone();
+        let content_type = inode.content_type.clone();
+        let modified = inode.modified;
         // A small bound (a handful of chunks) so peak resident bytes stay O(chunk_size),
         // not O(object): the reader task blocks on the channel until the socket drains.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
@@ -344,6 +378,9 @@ where
         Ok(Some(ObjectRead {
             size,
             stream: Box::pin(ReceiverStream::new(rx)),
+            etag,
+            content_type,
+            modified,
         }))
     }
 

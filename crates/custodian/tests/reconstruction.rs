@@ -403,6 +403,114 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
     );
 }
 
+// ---- ADR-0047: reconstruction PRESERVES object metadata (a repair, not a republish) ----
+
+/// Overwrite the committed inode `id` in place with a metadata-carrying version of the
+/// SAME content — the ADR-0047 publication trio a real create/overwrite leaves behind —
+/// via the same prior-record CAS the durability paths use. Returns the seeded trio for the
+/// preservation assertion. Used only by the metadata-preservation test below; every OTHER
+/// test here seeds all-`None` metadata, which makes preservation vacuous.
+async fn stamp_object_meta(meta: &MemMeta, id: InodeId) -> (String, String, u64) {
+    let etag = "0badf00d0badf00d".to_string();
+    let content_type = "text/markdown; charset=utf-8".to_string();
+    let modified = 1_700_000_000_789_u64;
+    let prior = read_inode_id(meta, id).await;
+    let next = InodeRecord {
+        etag: Some(etag.clone()),
+        content_type: Some(content_type.clone()),
+        modified: Some(modified),
+        ..prior.clone()
+    };
+    let key = metadata::inode_key(id);
+    let outcome = meta
+        .commit(
+            WriteBatch::new()
+                .require(key.clone(), metadata::encode(&prior))
+                .put(key, metadata::encode(&next)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+    (etag, content_type, modified)
+}
+
+/// Reconstruction rebuilds the SAME content, so its repair commit must PRESERVE the object
+/// metadata trio (ADR-0047): a rebuild must not move Last-Modified or drop the
+/// ETag/content type. Guards `reconstruction.rs`'s preservation `..plan.prior.clone()`
+/// against silently regressing to `..Default::default()` (which still compiles but drops
+/// the trio to `None`). Every other reconstruction test seeds all-`None` metadata, so this
+/// invariant is otherwise VACUOUSLY true.
+#[tokio::test]
+async fn reconstruction_preserves_object_metadata_across_a_repair() {
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+
+    let data = write_rs_2_1(&meta, &fleet).await;
+    // Stamp the published object's ADR-0047 metadata (the write helper seeds none).
+    let (etag, content_type, modified) = stamp_object_meta(&meta, 1).await;
+
+    // KILL D server 1: its fragment is lost, so the chunk is under-replicated and enqueued.
+    d1.delete_fragment(frag(1)).await.unwrap();
+    repair::enqueue_repair(&meta, CHUNK, "health")
+        .await
+        .unwrap();
+
+    let mut healthy_topo = Topology::default();
+    healthy_topo
+        .register(0, "A")
+        .register(2, "C")
+        .register(3, "D");
+    let healthy_fleet: [(DServerId, &dyn ChunkStore); 3] = [(0, &d0), (2, &d2), (3, &d3)];
+    let ctx = ReconstructionContext {
+        meta: &meta,
+        fleet: &healthy_fleet,
+        topology: &healthy_topo,
+        unreachable: &[],
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the under-replicated chunk was reconstructed (the commit under test fires)"
+    );
+
+    let record = read_inode(&meta).await;
+    assert_eq!(
+        record.etag,
+        Some(etag),
+        "reconstruction PRESERVES the ETag (ADR-0047): a rebuild does not republish content"
+    );
+    assert_eq!(
+        record.content_type,
+        Some(content_type),
+        "reconstruction PRESERVES the stored content type"
+    );
+    assert_eq!(
+        record.modified,
+        Some(modified),
+        "reconstruction must NOT move Last-Modified"
+    );
+    // Sanity: the repair really re-placed the fragment — metadata was preserved, not frozen.
+    assert_eq!(
+        read_object(&meta, &fleet, 1).await.unwrap(),
+        Some(data),
+        "the object still reads correctly after repair"
+    );
+}
+
 // ---- criterion 3: a checksum-failing fragment is excluded and rebuilt around ----
 
 #[tokio::test]

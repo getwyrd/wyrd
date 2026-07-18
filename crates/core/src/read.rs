@@ -740,6 +740,7 @@ mod tests {
             chunk_map: Vec::new(),
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
 
         let result = read_object_from(&UnreachableStore, &inode).await;

@@ -184,8 +184,20 @@ A zone is the unit of atomicity and the unit of (intra-provider) federation.
 
 Hierarchical: **inode + dirent**, not path-as-key.
 
-- `inode:<id>` → attributes, chunk map (or inline data for small files), state, version.
+- `inode:<id>` → attributes, chunk map (or inline data for small files), state, version,
+  and the **object metadata** the S3 surface serves (ADR-0047): the content digest
+  (`etag`, an opaque change-token — the lowercase-hex SHA-256, not MD5), the writing
+  client's declared `content_type`, and the content-publication time (`modified`). Each
+  is optional with a serde default *and* skipped when absent, so a record written before
+  the fields decodes, degrades on the wire to the pre-metadata behaviour, and re-encodes
+  byte-identically — the latter load-bearing because every commit is a full-value CAS on
+  the record's stored bytes.
 - `dirent:<parent_id>/<name>` → child inode id.
+
+Object metadata is stamped only at **content publication** (create / overwrite, in the
+same atomic commit as the chunk map). The repair paths — reconstruction, backfill,
+rebalance — re-commit the *same* content, so they **preserve** the stored trio: a
+placement-maintenance commit never moves `Last-Modified` or drops the content type.
 
 This makes rename a single dirent mutation (atomic under the same mechanism as a write) instead of a mass key rewrite, and makes cross-zone sharing expressible (a dirent pointing at an inode owned elsewhere). It is the strongest concrete driver of the requirement that the metadata store offer an **atomic multi-key transaction**, because file creation must atomically write both the inode and its dirent. That requirement is what disqualified HBase-class stores and what every backend choice since has had to satisfy; the backend satisfying it in production is now FoundationDB (ADR-0042, superseding ADR-0008's TiKV). See section 6.
 
