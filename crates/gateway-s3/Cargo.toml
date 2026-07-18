@@ -26,6 +26,11 @@ futures-util.workspace = true
 # SHA-256 (payload + canonical-request digest) and HMAC-SHA256 (the signing MAC).
 hmac.workspace = true
 sha2.workspace = true
+# CRC-32C (Castagnoli) for the `x-amz-checksum-crc32c` streaming trailer (issue #505):
+# already vetted/allowlisted (root Cargo.toml, already used by `wyrd-chunk-format`), so
+# no new ADR-0003 audit. Plain `x-amz-checksum-crc32` is a DIFFERENT polynomial this
+# crate does not compute — see `checksum.rs` for the in-tree table-driven IEEE CRC-32.
+crc32c.workspace = true
 # The runtime that hosts the listener and the bounded-channel decode/read tasks.
 tokio.workspace = true
 tokio-stream.workspace = true

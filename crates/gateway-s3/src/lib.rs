@@ -20,7 +20,12 @@
 //! `x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`; that body is de-framed and
 //! its per-chunk signatures verified as it streams ([`streaming::decode`]), so a real SDK
 //! upload round-trips byte-identical rather than being refused (issue #364 carry-forward,
-//! real-SDK streaming interop).
+//! real-SDK streaming interop). A **default-configured** stock SDK actually goes further and
+//! sends the checksum-**trailer** framing (`STREAMING-UNSIGNED-PAYLOAD-TRAILER` /
+//! `STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`, a declared `x-amz-checksum-*` trailer after
+//! the terminating zero-length chunk) — also de-framed, trailer-signature-verified (signed
+//! variant) and checksum-validated ([`checksum`]) as it streams, so that default upload is
+//! accepted too rather than 403-ing (issue #505).
 //!
 //! # Crate boundary (issue #364 carry-forward, T5-a — extracted, ratified)
 //! This wire surface is its **own crate** (`wyrd-gateway-s3`, architecture §5:132's named
@@ -51,6 +56,7 @@
 //! decision the listener is exercised over loopback and an operator/#367 fronts it with
 //! the public-TLS terminator ([`S3Gateway::serve`] takes an already-bound listener).
 
+pub mod checksum;
 pub mod crypto;
 pub mod request_id;
 pub mod sigv4;
@@ -868,6 +874,18 @@ fn classify(err: &BoxError) -> (StatusCode, &'static str, String) {
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
                 format!("malformed aws-chunked streaming body: {what}"),
+            ),
+            // A declared `x-amz-checksum-*` streaming trailer that does not match the
+            // bytes actually streamed (issue #505) — a content-integrity failure, S3's own
+            // code for a checksum mismatch (distinct from `SignatureDoesNotMatch`: the
+            // unsigned `-TRAILER` variant has no signature to fail, only a checksum to
+            // mismatch). The object is never committed (`streaming::decode` aborts the
+            // write on this `Err` before `put_object_streaming` ever sees a commit).
+            streaming::StreamingError::ChecksumMismatch => (
+                StatusCode::BAD_REQUEST,
+                "BadDigest",
+                "the declared x-amz-checksum-* trailer does not match the streamed body"
+                    .to_string(),
             ),
         };
     }

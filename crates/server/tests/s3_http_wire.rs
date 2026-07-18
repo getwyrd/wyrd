@@ -1015,6 +1015,8 @@ mod streaming_interop {
             date_time: amz_date.clone(),
             scope: format!("{}/{REGION}/s3/aws4_request", &amz_date[..8]),
             signed: true,
+            // The plain, no-trailer sentinel this module drives — no trailer declaration.
+            trailer: None,
         };
         let headers = vec![
             ("authorization".to_string(), signed.authorization),
