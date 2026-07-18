@@ -1198,6 +1198,10 @@ impl<S: ChunkStore + 'static> DServer<S> {
         // the health server then gets [`HEALTH_SHUTDOWN_GRACE`] to finish, after which it
         // is aborted — a probe stream carries no user data, and a supervisor that ordered
         // the shutdown is not owed a drained watch stream.
+        // A fresh observer of the shutdown signal, so the data/health race below can tell
+        // an EXPECTED health-task exit (shutdown draining both) from an UNEXPECTED one
+        // (the probe surface died while we are still serving data).
+        let shutdown_observed = shutdown_rx.clone();
         let servers = async {
             match health_surface {
                 Some((health_listener, health_server)) => {
@@ -1241,23 +1245,76 @@ impl<S: ChunkStore + 'static> DServer<S> {
                     // The guard ties the task's lifetime to this future: dropped for any
                     // reason ⇒ aborted.
                     let mut health_task = AbortOnDrop(tokio::spawn(health_serve));
-                    let data_res: Result<()> = serve.await.map_err(Into::into);
-                    let health_res: Result<()> =
+                    tokio::pin!(serve);
+                    // Await the data server, but WATCH the health task alongside it: if
+                    // the probe surface exits (accept error under fd exhaustion, a panic)
+                    // while data is still serving and NO shutdown is in progress, the
+                    // role must terminate promptly so the outer `select!` revokes the
+                    // lease — a node that keeps advertising `ready` with its probe gone
+                    // is worse than one that stops (Codex P2 on #587). An EXPECTED
+                    // health exit (shutdown draining both) is not a failure.
+                    // `health_consumed` records whether the health arm polled the
+                    // JoinHandle to completion (only on the expected-shutdown path) — a
+                    // finished-but-UNPOLLED handle must still be awaited so its
+                    // error/panic surfaces, never skipped by an `is_finished()` peek.
+                    let mut health_consumed = false;
+                    let data_res: Result<()> = tokio::select! {
+                        biased;
+                        res = &mut serve => res.map_err(Into::into),
+                        joined = &mut health_task.0 => {
+                            health_consumed = true;
+                            if shutdown_observed.has_changed().unwrap_or(true) {
+                                // Shutdown is draining both surfaces — expected. Let the
+                                // data server finish its own graceful drain, but do NOT
+                                // swallow a health task that errored or panicked mid-drain:
+                                // only a clean exit is expected, any other outcome is
+                                // surfaced (data error preferred, then health).
+                                let health_outcome: Result<()> = match joined {
+                                    Ok(Ok(())) => Ok(()),
+                                    Ok(Err(e)) => Err(format!(
+                                        "d-server health probe surface failed during \
+                                         shutdown: {e}"
+                                    )
+                                    .into()),
+                                    Err(join_err) => Err(format!(
+                                        "d-server health probe task panicked during \
+                                         shutdown: {join_err}"
+                                    )
+                                    .into()),
+                                };
+                                let data_outcome: Result<()> = serve.await.map_err(Into::into);
+                                data_outcome.and(health_outcome)
+                            } else {
+                                let reason = match joined {
+                                    Ok(Ok(())) => {
+                                        "exited unexpectedly while serving data".to_string()
+                                    }
+                                    Ok(Err(e)) => format!("failed while serving data: {e}"),
+                                    Err(join_err) => {
+                                        format!("task panicked while serving data: {join_err}")
+                                    }
+                                };
+                                Err(format!("d-server health probe surface {reason}").into())
+                            }
+                        }
+                    };
+                    // Data server has stopped (shutdown, or a data error). If the health
+                    // task was NOT already consumed above, await it within the grace
+                    // window — the timeout returns immediately for an already-finished
+                    // task, so a finished-but-unpolled health error/panic still surfaces.
+                    let health_res: Result<()> = if health_consumed {
+                        Ok(())
+                    } else {
                         match tokio::time::timeout(HEALTH_SHUTDOWN_GRACE, &mut health_task.0).await
                         {
-                            Ok(joined) => match joined {
-                                Ok(served) => served.map_err(Into::into),
-                                // The health task panicking is a real defect — surface it.
-                                Err(join_err) => Err(join_err.into()),
-                            },
-                            Err(_grace_elapsed) => {
-                                // A connected Watch stream is pinning the drain: cut it
-                                // loose (the guard's abort). Deliberately Ok — an aborted
-                                // probe stream at shutdown is the designed outcome, not a
-                                // serve failure.
-                                Ok(())
-                            }
-                        };
+                            Ok(Ok(served)) => served.map_err(Into::into),
+                            Ok(Err(join_err)) => Err(join_err.into()),
+                            // A connected Watch stream is pinning the drain: cut it loose
+                            // (the guard's abort). Ok — an aborted probe stream at
+                            // shutdown is the designed outcome, not a serve failure.
+                            Err(_grace_elapsed) => Ok(()),
+                        }
+                    };
                     data_res?;
                     health_res
                 }
