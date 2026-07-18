@@ -70,7 +70,7 @@ const MAX_TRAILER_SIZE: usize = 8 * 1024;
 pub enum StreamingError {
     /// The chunk framing was malformed (bad size line, missing CRLF, truncated body) — or,
     /// for a `-TRAILER` framing (issue #505), a malformed trailer section: bad base64, a
-    /// trailer name not declared in `x-amz-trailer`, a declared trailer never sent, a
+    /// trailer name not declared in `x-amz-trailer`, a declared trailer never sent, an
     /// `x-amz-decoded-content-length` mismatch, or bytes after the trailer block. Maps to
     /// HTTP 400.
     Framing(String),

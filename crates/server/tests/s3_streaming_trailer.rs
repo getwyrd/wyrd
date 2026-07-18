@@ -835,6 +835,6 @@ async fn a_decoded_content_length_mismatch_is_refused() {
     let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
     assert_eq!(
         status, 400,
-        "a x-amz-decoded-content-length mismatch must be a 400 (was blanket 403 pre-#505)"
+        "an x-amz-decoded-content-length mismatch must be a 400 (was blanket 403 pre-#505)"
     );
 }
