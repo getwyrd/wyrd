@@ -1716,8 +1716,13 @@ fn docs_check() -> Result<(), String> {
         );
         return Ok(());
     }
-    let out = std::env::temp_dir().join("wyrd-docs-build");
-    let out = out.to_string_lossy().into_owned();
+    // A per-process output path: `render_site.py` DELETES its --out directory before
+    // rebuilding it, so a shared fixed path would let two concurrent `cargo xtask ci`
+    // runs (separate worktrees / CI lanes) wipe each other's render mid-audit. The
+    // pid-suffixed directory is removed afterwards — it is scratch, only the exit
+    // status matters here.
+    let out_dir = std::env::temp_dir().join(format!("wyrd-docs-build-{}", std::process::id()));
+    let out = out_dir.to_string_lossy().into_owned();
     print_step(&[
         "python3",
         "docs/publishing/tools/render_site.py",
@@ -1735,6 +1740,7 @@ fn docs_check() -> Result<(), String> {
         .current_dir(workspace_root())
         .status()
         .map_err(|e| format!("failed to spawn python3: {e}"))?;
+    let _ = std::fs::remove_dir_all(&out_dir);
     match status.success() {
         true => Ok(()),
         false => Err(format!("`render_site.py --check` failed with {status}")),

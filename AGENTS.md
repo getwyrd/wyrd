@@ -51,8 +51,11 @@ run the checks that match the surface you changed.
   comments, and docs alike.
 - **Docs check (`docs-check`)** — `cargo xtask ci` runs both steps (#598):
   - `python3 docs/publishing/tools/lint_docs.py`
-  - `python3 docs/publishing/tools/render_site.py --check --out /tmp/wyrd-docs-build`
-    (skipped locally with a warning if the pinned renderer deps are absent).
+  - `python3 docs/publishing/tools/render_site.py --check --out <scratch dir>`
+    (the gate renders into a per-process temp directory it removes afterwards;
+    skipped locally with a warning if the pinned renderer deps are absent).
+  Running the render manually, use any scratch path, e.g.
+  `--out /tmp/wyrd-docs-build`.
   If the renderer needs the pinned Mermaid asset and network is unavailable,
   rerun with network access or report the exact blocker.
 - **Document immutability (`adr-immutability`, renamed to `docs-immutability`
