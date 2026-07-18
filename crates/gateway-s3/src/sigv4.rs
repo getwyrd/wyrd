@@ -25,6 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::HeaderMap;
 
+use crate::checksum::ChecksumAlgorithm;
 use crate::crypto;
 
 /// The `x-amz-date` freshness window (S3's default 15 minutes): a request whose signed
@@ -85,6 +86,31 @@ pub struct StreamingContext {
     /// chunk-by-chunk; an unsigned one is de-framed but not chunk-authenticated (its
     /// integrity rides the seed signature + transport, the same posture as `UNSIGNED-PAYLOAD`).
     pub signed: bool,
+    /// The `-TRAILER` framing's declaration (`None` for the plain, no-trailer
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`): what the decoder ([`super::streaming`]) must
+    /// find — and validate — in the trailer section after the terminating zero-length
+    /// chunk. Built by [`verify`] from `x-amz-trailer` / `x-amz-decoded-content-length`
+    /// **before** any body is read, so an unverifiable declaration (an unrecognised
+    /// checksum algorithm, a missing declaration) is refused up front rather than
+    /// consumed-and-ignored deeper in the pipeline (issue #505; the same "no half-accept"
+    /// invariant as `streaming_variant`).
+    pub trailer: Option<TrailerDeclaration>,
+}
+
+/// A `-TRAILER` streaming framing's declared trailer: the ONE `x-amz-checksum-*` header
+/// this slice validates (brief #505 scope — the single checksum trailer a stock SDK
+/// sends), plus the declared decoded byte count if the client sent one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailerDeclaration {
+    /// The declared trailer header name, lower-cased (e.g. `x-amz-checksum-crc32`) — what
+    /// the decoder must find in the wire trailer section; anything else there is a trailer
+    /// name not declared in `x-amz-trailer` and is refused (400), never silently accepted.
+    pub name: String,
+    /// The checksum algorithm `name` names.
+    pub algorithm: ChecksumAlgorithm,
+    /// `x-amz-decoded-content-length`, if the client sent one — the decoder checks the
+    /// number of DE-FRAMED object bytes against it once the trailer is consumed.
+    pub decoded_content_length: Option<u64>,
 }
 
 /// Why a request's signature was refused. Every variant maps to HTTP 403; the
@@ -473,13 +499,24 @@ pub fn verify(
         PayloadHash::Unsigned
     } else if is_hex_sha256(claimed) {
         PayloadHash::Signed(claimed.to_string())
-    } else if let Some(signed) = streaming_variant(claimed) {
+    } else if let Some((signed, has_trailer)) = streaming_variant(claimed) {
+        // A `-TRAILER` framing's declaration headers are part of the contract, not
+        // decoration (brief #505 scope): parsed and validated here, before any body is
+        // read, so an unverifiable declaration (a missing `x-amz-trailer`, an unrecognised
+        // checksum algorithm) is refused up front rather than admitted and only later
+        // discovered unconsumable deeper in the decoder.
+        let trailer = if has_trailer {
+            Some(parse_trailer_declaration(headers)?)
+        } else {
+            None
+        };
         PayloadHash::Streaming(StreamingContext {
             seed_signature: expected,
             signing_key: signing_key(&cred.secret_access_key, &authz.date, region, service),
             date_time: amz_date.to_string(),
             scope: format!("{}/{region}/{service}/aws4_request", authz.date),
             signed,
+            trailer,
         })
     } else {
         // Not UNSIGNED-PAYLOAD, not a hex digest, not a streaming sentinel the decoder
@@ -492,26 +529,64 @@ pub fn verify(
 }
 
 /// The `aws-chunked` streaming sentinels the decoder ([`super::streaming`]) can actually
-/// de-frame, each mapped to whether its **data chunks are per-chunk signed**. A **closed**
-/// set: `Some(true)` — signed data chunks, each frame carries a chained `chunk-signature=`
-/// the decoder verifies fail-closed; `Some(false)` — framing only (integrity rides the seed
-/// signature + transport, as `UNSIGNED-PAYLOAD`); `None` — an unknown streaming sentinel
+/// de-frame, each mapped to `(signed, has_trailer)`. A **closed** set: `signed` — data
+/// chunks are per-chunk signed, each frame carries a chained `chunk-signature=` the decoder
+/// verifies fail-closed; `has_trailer` — a `-TRAILER` framing whose trailer section the
+/// decoder now consumes (issue #505) — checksum-validated always, and, for the signed
+/// variant, trailer-signature-verified too (per AWS's published trailing-header
+/// string-to-sign, `streaming::sign_trailer`). `None` — an unknown streaming sentinel
 /// [`verify`] must refuse rather than half-accept (issue #364 carry-forward, iter-6 item 3).
 ///
-/// The `-TRAILER` variants append trailer headers (and, for the signed variant, a trailer
-/// signature) *after* the terminating zero-length chunk. The `aws-chunked` decoder
-/// ([`super::streaming::Decoder::next_chunk`]) requires an immediate CRLF after that zero
-/// chunk and cannot consume those trailer bytes, so admitting a `-TRAILER` sentinel is a
-/// half-accept: a real checksum-trailer upload would authenticate and then fail mid-body as
-/// malformed (issue #364 carry-forward, iter-6 item 3 — "no half-accept"). So they return
-/// `None` here and are refused up front, before any body is read. The only fully-consumable
-/// framing is the signed, no-trailer `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`. Trailer
-/// consumption/verification stays deferred with the rest of the streaming-checksum surface.
-fn streaming_variant(sentinel: &str) -> Option<bool> {
+/// Issue #505 carry-forward note: the `-TRAILER` variants used to return `None` here
+/// unconditionally — the decoder could not yet consume the trailer bytes after the
+/// terminating zero-length chunk, so admitting them would have been a half-accept (a real
+/// checksum-trailer upload — what a **default-configured** modern SDK actually sends —
+/// would authenticate and then fail mid-body as malformed). Now that the decoder fully
+/// consumes and validates the trailer section (`streaming::Decoder::next_chunk`), admitting
+/// them restores SDK compatibility without reopening that half-accept.
+fn streaming_variant(sentinel: &str) -> Option<(bool, bool)> {
     match sentinel {
-        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Some(true),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => Some((true, false)),
+        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" => Some((true, true)),
+        "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => Some((false, true)),
         _ => None,
     }
+}
+
+/// Parse and validate a `-TRAILER` framing's declaration headers — `x-amz-trailer`
+/// (required: the ONE checksum trailer this slice supports, brief #505 scope) and the
+/// optional `x-amz-decoded-content-length`. Runs **before any body is read**, so an
+/// unverifiable declaration (a missing `x-amz-trailer`, more than one declared trailer
+/// name, an unrecognised checksum algorithm — including the out-of-scope
+/// `x-amz-checksum-crc64nvme`) is refused up front rather than admitted and only later
+/// discovered unconsumable in the decoder (the same "no half-accept" invariant
+/// [`streaming_variant`] documents).
+fn parse_trailer_declaration(headers: &HeaderMap) -> Result<TrailerDeclaration, AuthError> {
+    let raw = header(headers, "x-amz-trailer").ok_or_else(|| {
+        AuthError::Malformed("missing x-amz-trailer for a -TRAILER streaming upload".into())
+    })?;
+    if raw.contains(',') {
+        // A stock SDK declares exactly one checksum trailer; refuse rather than
+        // half-validate a multi-trailer declaration this slice does not support.
+        return Err(AuthError::Malformed(
+            "multiple x-amz-trailer names are not supported".into(),
+        ));
+    }
+    let name = raw.trim().to_ascii_lowercase();
+    let algorithm = ChecksumAlgorithm::from_trailer_name(&name).ok_or_else(|| {
+        AuthError::Malformed(format!("unsupported x-amz-trailer checksum `{name}`"))
+    })?;
+    let decoded_content_length = match header(headers, "x-amz-decoded-content-length") {
+        Some(v) => Some(v.parse::<u64>().map_err(|_| {
+            AuthError::Malformed("x-amz-decoded-content-length is not a valid integer".into())
+        })?),
+        None => None,
+    };
+    Ok(TrailerDeclaration {
+        name,
+        algorithm,
+        decoded_content_length,
+    })
 }
 
 /// Whether `s` is a 64-character hex string — the shape of a literal SHA-256 payload hash.
@@ -931,6 +1006,8 @@ mod tests {
         assert_eq!(ctx.seed_signature, signature);
         assert_eq!(ctx.scope, "20150830/us-east-1/s3/aws4_request");
         assert_eq!(ctx.date_time, amz_date);
+        // The plain, no-trailer sentinel carries no trailer declaration.
+        assert_eq!(ctx.trailer, None);
         // The signing key matches the SigV4 ladder for these credentials/scope.
         assert_eq!(
             ctx.signing_key,
@@ -941,6 +1018,17 @@ mod tests {
     /// Sign a request over an arbitrary `x-amz-content-sha256` claim and run it through
     /// [`verify`] with a fresh clock, returning the classification (or the refusal).
     fn verify_with_claim(claim: &str) -> Result<PayloadHash, AuthError> {
+        verify_with_claim_and_headers(claim, &[])
+    }
+
+    /// As [`verify_with_claim`], but with additional (unsigned — the trailer-declaration
+    /// headers, like `x-amz-content-sha256` itself, need not be in `SignedHeaders` to be
+    /// read here) headers on the request — what a `-TRAILER` sentinel needs
+    /// (`x-amz-trailer`, optionally `x-amz-decoded-content-length`).
+    fn verify_with_claim_and_headers(
+        claim: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<PayloadHash, AuthError> {
         let creds = Credentials {
             access_key_id: "AKIDEXAMPLE".to_string(),
             secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
@@ -963,6 +1051,12 @@ mod tests {
         headers.insert("authorization", signed.authorization.parse().unwrap());
         headers.insert("x-amz-date", signed.amz_date.parse().unwrap());
         headers.insert("x-amz-content-sha256", claim.parse().unwrap());
+        for (name, value) in extra_headers {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
         let fresh = UNIX_EPOCH + Duration::from_secs(1_440_938_160);
         verify(
             "PUT",
@@ -1010,22 +1104,89 @@ mod tests {
                 ..
             }))
         ));
-        // The `-TRAILER` variants are refused up front: the decoder cannot consume the
-        // trailer bytes after the terminating zero chunk, so admitting them would be the
-        // iter-6 half-accept (authenticate, then fail mid-body). Rejected cleanly here.
-        assert!(matches!(
-            verify_with_claim("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"),
-            Err(AuthError::Malformed(_))
-        ));
-        assert!(matches!(
-            verify_with_claim("STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
-            Err(AuthError::Malformed(_))
-        ));
         // A literal 64-char hex digest is a signed single-shot payload.
         let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert!(matches!(
             verify_with_claim(hex),
             Ok(PayloadHash::Signed(h)) if h == hex
+        ));
+    }
+
+    /// Issue #505: the decoder now fully consumes and validates the `-TRAILER` framings'
+    /// trailer section, so `verify` no longer half-accepts-by-refusing them — a
+    /// well-formed `-TRAILER` sentinel that ALSO declares its trailer (`x-amz-trailer`) now
+    /// classifies as `PayloadHash::Streaming` carrying the parsed [`TrailerDeclaration`],
+    /// flipping the former iter-6 blanket refusal (`sigv4.rs` pre-#505) into acceptance for
+    /// a request the decoder can now fully de-frame and verify.
+    #[test]
+    fn verify_admits_the_trailer_sentinels_with_a_declared_trailer() {
+        let payload = verify_with_claim_and_headers(
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+            &[("x-amz-trailer", "x-amz-checksum-crc32")],
+        )
+        .expect("a signed -TRAILER sentinel with a declared, supported trailer authenticates");
+        let PayloadHash::Streaming(ctx) = payload else {
+            panic!("a -TRAILER sentinel must still classify as PayloadHash::Streaming");
+        };
+        assert!(ctx.signed, "…-PAYLOAD-TRAILER chunks are signed");
+        assert_eq!(
+            ctx.trailer,
+            Some(TrailerDeclaration {
+                name: "x-amz-checksum-crc32".to_string(),
+                algorithm: ChecksumAlgorithm::Crc32,
+                decoded_content_length: None,
+            })
+        );
+
+        let payload = verify_with_claim_and_headers(
+            "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+            &[
+                ("x-amz-trailer", "x-amz-checksum-crc32c"),
+                ("x-amz-decoded-content-length", "42"),
+            ],
+        )
+        .expect("an unsigned -TRAILER sentinel with a declared, supported trailer authenticates");
+        let PayloadHash::Streaming(ctx) = payload else {
+            panic!("a -TRAILER sentinel must still classify as PayloadHash::Streaming");
+        };
+        assert!(!ctx.signed, "…-UNSIGNED-… chunks are not per-chunk signed");
+        assert_eq!(
+            ctx.trailer,
+            Some(TrailerDeclaration {
+                name: "x-amz-checksum-crc32c".to_string(),
+                algorithm: ChecksumAlgorithm::Crc32c,
+                decoded_content_length: Some(42),
+            })
+        );
+    }
+
+    /// The `-TRAILER` admission stays fail-closed on its OWN declaration (issue #505: "the
+    /// trailer-mode DECLARATION headers are part of the contract, not decoration") — a
+    /// `-TRAILER` sentinel with no `x-amz-trailer` at all, or one naming a checksum this
+    /// gateway cannot verify (`x-amz-checksum-crc64nvme`, out of scope), is refused
+    /// **before any body is read**, never half-accepted.
+    #[test]
+    fn verify_rejects_an_unverifiable_trailer_declaration() {
+        assert!(matches!(
+            verify_with_claim("STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"),
+            Err(AuthError::Malformed(_))
+        ));
+        assert!(matches!(
+            verify_with_claim_and_headers(
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                &[("x-amz-trailer", "x-amz-checksum-crc64nvme")],
+            ),
+            Err(AuthError::Malformed(_))
+        ));
+        assert!(matches!(
+            verify_with_claim_and_headers(
+                "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                &[(
+                    "x-amz-trailer",
+                    "x-amz-checksum-crc32,x-amz-checksum-sha256"
+                )],
+            ),
+            Err(AuthError::Malformed(_))
         ));
     }
 }
