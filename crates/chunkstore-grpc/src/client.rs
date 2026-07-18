@@ -254,3 +254,45 @@ impl ChunkStore for GrpcChunkStore {
         Ok(conv::from_wire_health(response.into_inner().status)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `:51` — every code of proposal 0010's transient trio must sit in [`class_of`]'s
+    /// transient arm. The integration tests exercise `UNAVAILABLE` (dead server) and
+    /// `CANCELLED` (expired channel deadline) through a real transport, but no test in the
+    /// tree produces `DEADLINE_EXCEEDED` (a server-set deadline) or `RESOURCE_EXHAUSTED`
+    /// (admission-control load shedding) on the wire — removing either from the match arm
+    /// kept everything green (#581). This pins all four.
+    #[test]
+    fn the_transient_trio_codes_all_classify_transient() {
+        for code in [
+            Code::Unavailable,
+            Code::Cancelled,
+            Code::DeadlineExceeded,
+            Code::ResourceExhausted,
+        ] {
+            assert_eq!(
+                class_of(code),
+                ErrorClass::Transient,
+                "{code:?} is in proposal 0010's transient trio and must classify transient"
+            );
+        }
+    }
+
+    /// `:54`/`:55` — the two non-transient arms: `DATA_LOSS` reconstructs the integrity
+    /// class, and an unlisted code falls through to the fail-safe terminal default
+    /// (including `ABORTED`, whose retry belongs to the layer owning the precondition).
+    #[test]
+    fn data_loss_is_integrity_and_the_rest_fail_safe_to_terminal() {
+        assert_eq!(class_of(Code::DataLoss), ErrorClass::Integrity);
+        for code in [Code::Aborted, Code::Internal, Code::NotFound] {
+            assert_eq!(
+                class_of(code),
+                ErrorClass::Terminal,
+                "{code:?} is not in the transient or integrity sets — the default is terminal"
+            );
+        }
+    }
+}

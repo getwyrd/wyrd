@@ -209,8 +209,10 @@ async fn a_genuine_unreachable_d_server_classifies_transient_over_grpc() {
 }
 
 /// **Transient, over the wire — the timed-out flavour.** A request that outlives the
-/// channel's deadline fails with a genuine tonic `DEADLINE_EXCEEDED`, which is the second
-/// of proposal 0010's transient trio (unreachable / timed out / busy).
+/// channel's deadline fails with a genuine tonic `CANCELLED "Timeout expired"` — how tonic
+/// renders an expired channel deadline (`tonic-0.14.6/src/status.rs:644-646`), **not**
+/// `DEADLINE_EXCEEDED` — which is the second of proposal 0010's transient trio
+/// (unreachable / timed out / busy).
 ///
 /// The store parks so the deadline is the only thing that can answer; the *fault* is still
 /// produced by the real client + transport, and the class is reconstructed by the real

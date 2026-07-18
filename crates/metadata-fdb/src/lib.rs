@@ -986,11 +986,14 @@ mod store {
     /// outcome a `?`-only caller would read as success.
     ///
     /// **This is the backend's transient class** (#577), and FoundationDB itself is what
-    /// says so: this error exists *only* on the path where every one of the `MAX_ATTEMPTS`
-    /// failures was retryable by FDB's own `is_retryable()` predicate
-    /// ([`is_retryable`](FdbError::is_retryable), the gate on the retry loop below). So the
-    /// class needs no code taxonomy of ours to guess at — an exhausted budget of *retryable*
-    /// failures is "try again later" by construction. Its
+    /// says so: this error exists *only* on paths where every one of the `MAX_ATTEMPTS`
+    /// failures passed the loop's own FDB retryability gate —
+    /// [`is_retryable`](FdbError::is_retryable) on the `get`/`scan` loops, and the
+    /// **strictly narrower** `is_retryable_not_committed()` on the blind-commit loop
+    /// (`blind_commit_step`, which must never widen to `is_retryable()`: that turns `1021
+    /// commit_unknown_result` into a silent double-apply). Every gate admits only
+    /// *retryable* failures, so the class needs no code taxonomy of ours to guess at — an
+    /// exhausted budget of retryable failures is "try again later" by construction. Its
     /// [`source`](std::error::Error::source) is a synthetic
     /// [`wyrd_traits::TransientFault`], which makes `wyrd_traits::classify` return
     /// [`wyrd_traits::ErrorClass::Transient`] without any consumer-side change.
