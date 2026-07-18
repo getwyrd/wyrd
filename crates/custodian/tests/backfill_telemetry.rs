@@ -105,6 +105,7 @@ async fn seed_committed(
         chunk_map: vec![],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     meta.commit(WriteBatch::new().put(metadata::inode_key(id), metadata::encode(&prior)))
         .await

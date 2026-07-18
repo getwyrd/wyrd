@@ -47,6 +47,16 @@ pub struct ObjectRead {
     pub size: u64,
     /// The object body as a bounded, chunk-at-a-time byte stream.
     pub stream: ObjectStream,
+    /// The object's content digest (opaque change-token), if recorded — the wire layer
+    /// quotes it as S3's `ETag`. `None` for a record written before object metadata was
+    /// modelled, in which case the wire layer omits the header (ADR-0047).
+    pub etag: Option<String>,
+    /// The `Content-Type` the writer declared, round-tripped verbatim. `None` falls back
+    /// to `application/octet-stream` on the wire.
+    pub content_type: Option<String>,
+    /// Content-publication time (epoch millis); the wire layer renders it as an RFC-7231
+    /// `Last-Modified`. `None` when unrecorded.
+    pub modified: Option<u64>,
 }
 
 /// The payload-integrity instruction a gateway hands its object-store for a streaming PUT.
@@ -109,14 +119,18 @@ pub trait ObjectGateway: Send + Sync + 'static {
     /// Store the object whose bytes arrive over `source` under `key`, creating it or
     /// overwriting an existing one, without ever holding the whole object in memory.
     /// `expected` is the payload-integrity check (verified before commit); a body that
-    /// fails it is rejected before publication. A concurrent writer loses with
-    /// [`GatewayError::Conflict`] rather than corrupting the object.
+    /// fails it is rejected before publication. `content_type` is the writer's declared
+    /// `Content-Type` (round-tripped verbatim, `None` if the client sent none). Returns
+    /// the committed object's **ETag** — the content digest as an opaque change-token; the
+    /// wire layer quotes it as S3's `ETag` header (ADR-0047). A concurrent writer loses
+    /// with [`GatewayError::Conflict`] rather than corrupting the object.
     fn put_object_streaming<S>(
         &self,
         key: &str,
         source: S,
         expected: ContentHash,
-    ) -> impl Future<Output = Result<()>> + Send
+        content_type: Option<String>,
+    ) -> impl Future<Output = Result<String>> + Send
     where
         S: Stream<Item = Result<Bytes>> + Send + Unpin + 'static;
 

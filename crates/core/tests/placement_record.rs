@@ -232,6 +232,7 @@ fn moved_fragment_resolved_from_record_after_reopen() {
             }],
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
         {
             let meta = RedbMetadataStore::open(&db_path).unwrap();
@@ -325,6 +326,7 @@ fn empty_placement_ec_none_resolves_via_identity_fallback() {
             }],
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
         assert!(
             record.chunk_map[0].placement.is_empty(),
@@ -375,6 +377,7 @@ fn empty_placement_rs_6_3_resolves_via_identity_fallback() {
             }],
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
         assert!(
             record.chunk_map[0].placement.is_empty(),
@@ -438,6 +441,7 @@ fn short_placement_rs_6_3_mixed_explicit_and_fallback() {
             }],
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
         assert_eq!(
             record.chunk_map[0].placement.len(),

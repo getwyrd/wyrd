@@ -169,6 +169,7 @@ async fn commit_inode(meta: &MemMeta, inode: u64, chunk: ChunkRef, size: u64) {
         chunk_map: vec![chunk],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = meta
         .commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))

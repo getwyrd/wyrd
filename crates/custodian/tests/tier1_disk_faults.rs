@@ -391,6 +391,7 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(&meta, ROOT, "tier1-obj", INODE_ID, &inode)
         .await

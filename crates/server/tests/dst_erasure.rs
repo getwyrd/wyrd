@@ -229,6 +229,7 @@ fn mixed_era_read(seed: u64) {
                 .collect(),
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
 
         let mut expected = part_none.clone();
@@ -301,6 +302,7 @@ fn empty_placement_resolves_identically(seed: u64) {
             chunk_map,
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
 
         // READ resolves every fragment via the identity-placement fallback.

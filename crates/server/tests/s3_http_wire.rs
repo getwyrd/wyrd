@@ -938,6 +938,7 @@ mod streaming_behaviour {
                 "wyrd-bucket/streamed",
                 Box::pin(source),
                 ContentHash::Unverified,
+                None,
             )
             .await
             .expect("streaming put");

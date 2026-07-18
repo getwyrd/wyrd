@@ -200,6 +200,7 @@ fn mixed_era_chunks_read_through_one_path() {
             chunk_map,
             state: InodeState::Committed,
             version: 1,
+            ..Default::default()
         };
 
         let mut expected = part_none.to_vec();

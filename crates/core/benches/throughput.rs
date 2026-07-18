@@ -110,6 +110,7 @@ fn bench_throughput(c: &mut Criterion) {
         chunk_map: plan.chunk_refs(),
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
 
     let mut wgroup = c.benchmark_group("dserver_write_throughput");

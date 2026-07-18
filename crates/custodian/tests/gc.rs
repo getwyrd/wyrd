@@ -149,6 +149,7 @@ async fn commit_reference(
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     let outcome = metadata::create(meta, ROOT, name, inode, &record)
         .await
@@ -328,6 +329,7 @@ async fn identity_fallback_none_empty_placement_protects_index0() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     metadata::create(&meta, ROOT, "fallback-none-obj", 10, &record)
         .await
@@ -396,6 +398,7 @@ async fn identity_fallback_rs_empty_placement_protects_index_above_zero() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     metadata::create(&meta, ROOT, "fallback-rs-obj", 20, &record)
         .await
@@ -464,6 +467,7 @@ async fn short_placement_vector_fallback_protects_fallback_index() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     metadata::create(&meta, ROOT, "short-placement-obj", 30, &record)
         .await
@@ -527,6 +531,7 @@ async fn identity_fallback_rs_6_3_empty_placement_protects_an_inner_index() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     metadata::create(&meta, ROOT, "fallback-rs-6-3-obj", 40, &record)
         .await
@@ -586,6 +591,7 @@ async fn short_placement_vector_rs_6_3_fallback_protects_fallback_index() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     metadata::create(&meta, ROOT, "short-rs-6-3-obj", 41, &record)
         .await
@@ -668,6 +674,7 @@ async fn malformed_placement_gc_treats_chunk_as_fully_referenced() {
         }],
         state: InodeState::Committed,
         version: 1,
+        ..Default::default()
     };
     metadata::create(&meta, ROOT, "malformed-rs-4-2-obj", 20, &record)
         .await
