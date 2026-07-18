@@ -37,6 +37,17 @@ use wyrd_traits::{BoxError, ChunkStore, Coordination, DServerId, Health, Lease, 
 /// The discovery group under which D servers register their gRPC endpoints.
 pub const DSERVER_GROUP: &str = "chunkstore";
 
+/// The `grpc.health.v1.Health` service name reporting **liveness** — "is this process
+/// up", answered SERVING once at startup and never flipped (not on an unhealthy store,
+/// not during graceful shutdown), so a supervisor's LIVENESS probe restarts the node
+/// only when the process is truly gone (the socket stops answering), never for a store
+/// that is merely unready. READINESS — "should this node receive work" — is the
+/// store-derived status on the empty overall service and the `ChunkStore` service name
+/// (#576). Kubernetes guidance: gate traffic with a readiness probe, restart sparingly
+/// with a liveness probe that does not depend on external state — this split provides
+/// both. Probe it with `grpc_health_probe -addr … -service liveness`.
+pub const DSERVER_LIVENESS_SERVICE: &str = "liveness";
+
 /// The default opaque failure-domain label a D server reports when none is
 /// configured — a single-domain zone (the M2 best-effort posture). Real
 /// deployments set a per-server rack / power / switch label (architecture §7.3).
@@ -910,11 +921,15 @@ impl<S: ChunkStore + 'static> DServer<S> {
     /// probe surface is served by its **own, separately bounded** transport, so it stays
     /// answerable even when the data plane is shedding at its admission bound (a probe
     /// shed as `RESOURCE_EXHAUSTED` would make supervisors restart an
-    /// overloaded-but-healthy node). The store-derived status is published on **both**
-    /// the overall empty-name service (what a plain `Health/Check` with no `service`
-    /// field reads — the default for `grpcurl` and `grpc_health_probe`) and the
-    /// `ChunkStoreServer`'s registered name, from one reading, so they can never
-    /// disagree; liveness is simply the probe socket answering at all.
+    /// overloaded-but-healthy node). **READINESS** — the store-derived status — is
+    /// published on **both** the overall empty-name service (what a plain `Health/Check`
+    /// with no `service` field reads — the default for `grpcurl` and `grpc_health_probe`)
+    /// and the `ChunkStoreServer`'s registered name, from one reading, so they can never
+    /// disagree. **LIVENESS** is the dedicated [`DSERVER_LIVENESS_SERVICE`], SERVING for
+    /// the life of the process and store-independent, so a supervisor's liveness probe
+    /// restarts the node only when it is truly gone — never for a store that is merely
+    /// unready (which readiness already reports). Gate traffic with a readiness probe,
+    /// restart with the liveness one.
     pub async fn serve<Co>(
         self,
         coord: Arc<Co>,
@@ -997,6 +1012,14 @@ impl<S: ChunkStore + 'static> DServer<S> {
                 // (not `NOT_FOUND`, what a never-registered name reads as; not the ""
                 // default `Serving`, which would be a false ready).
                 let (health_reporter, health_server) = tonic_health::server::health_reporter();
+                // LIVENESS: SERVING for the life of the process, store-independent — the
+                // refresher and the shutdown flip below never touch it, so a liveness
+                // probe fails only when the process itself stops answering (#576).
+                health_reporter
+                    .set_service_status(DSERVER_LIVENESS_SERVICE, ServingStatus::Serving)
+                    .await;
+                // READINESS: the empty overall service and the ChunkStore service name,
+                // both fail-closed NOT_SERVING until the first `health()` read.
                 health_reporter
                     .set_service_status("", ServingStatus::NotServing)
                     .await;

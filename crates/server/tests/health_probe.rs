@@ -43,7 +43,7 @@ use wyrd_chunk_format::{encode, FragmentHeader};
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_chunkstore_grpc::{ChunkStoreServer, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
-use wyrd_server::dserver::{AdmissionControl, DServer, DSERVER_GROUP};
+use wyrd_server::dserver::{AdmissionControl, DServer, DSERVER_GROUP, DSERVER_LIVENESS_SERVICE};
 use wyrd_traits::{ChunkId, ChunkStore, Coordination, FragmentId, Health, Result};
 
 fn fid(chunk: ChunkId, index: u16) -> FragmentId {
@@ -793,6 +793,77 @@ async fn shutdown_publishes_not_serving_before_draining() {
         "the Watch stream must receive NOT_SERVING on shutdown, before the surface closes"
     );
 
+    let _ = handle.await;
+}
+
+/// LIVENESS is store-INDEPENDENT: the dedicated `liveness` service reads SERVING and
+/// STAYS SERVING even when the store goes Unhealthy (readiness flips, liveness does
+/// not) — so a supervisor's liveness probe never restarts a node for a store that is
+/// merely unready (Codex P2 on #587). Readiness ("" and the ChunkStore name) tracks the
+/// store; liveness is "the process is up".
+#[tokio::test]
+async fn liveness_stays_serving_when_the_store_is_unhealthy() {
+    let (store, _dir) = fs_store();
+    let health = Arc::new(Mutex::new(HealthMode::Healthy));
+    let controllable = ControllableStore {
+        inner: store,
+        health: Arc::clone(&health),
+        entered: None,
+        gate: None,
+    };
+    let health_bind = reserve_addr().await;
+    let (_endpoint, shutdown, handle) = serve_controllable(
+        controllable,
+        AdmissionControl::default(),
+        health_bind,
+        Duration::from_millis(20),
+    )
+    .await;
+    let mut client = health_client(&format!("http://{health_bind}")).await;
+
+    // Liveness is SERVING from the start (store-independent).
+    wait_for_check(
+        &mut client,
+        DSERVER_LIVENESS_SERVICE,
+        WireServingStatus::Serving,
+        Duration::from_secs(5),
+    )
+    .await;
+    // And readiness has converged to SERVING for the healthy store.
+    wait_for_check(
+        &mut client,
+        readiness_service_name(),
+        WireServingStatus::Serving,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Store goes Unhealthy: readiness must flip to NOT_SERVING...
+    *health.lock().unwrap() = HealthMode::Unhealthy;
+    wait_for_check(
+        &mut client,
+        readiness_service_name(),
+        WireServingStatus::NotServing,
+        Duration::from_secs(5),
+    )
+    .await;
+    // ...but LIVENESS stays SERVING — a liveness probe must not restart a merely-unready
+    // node. Give the refresher several cadences to (wrongly) touch it, then assert.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let live = client
+        .check(HealthCheckRequest {
+            service: DSERVER_LIVENESS_SERVICE.to_string(),
+        })
+        .await
+        .expect("liveness Check succeeds")
+        .into_inner();
+    assert_eq!(
+        live.status,
+        WireServingStatus::Serving as i32,
+        "liveness must stay SERVING while the store is unhealthy (readiness carries that)",
+    );
+
+    let _ = shutdown.send(());
     let _ = handle.await;
 }
 

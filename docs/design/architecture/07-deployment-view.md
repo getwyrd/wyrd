@@ -79,7 +79,7 @@ The wiring of a production single-zone (Small multi-node) deployment — who dia
 | App → SDK gateway | gRPC | operator-set | TLS; **OIDC** | §3.2 |
 | Operator → Management API | gRPC / REST | operator-set | **mTLS + OIDC** | ADR-0013, §8.5 |
 | Gateway / client lib → D server | gRPC | **`50051`** (Wyrd default) | **mTLS, no plaintext fallback** | direct **bulk fragment** I/O; ADR-0025; `crates/server/src/cli.rs:32` |
-| Supervisor / LB → D server health probe | gRPC (`grpc.health.v1.Health`) | **`50052`** (Wyrd default; derives from `--bind`'s interface, `--health-bind` overrides) | unauthenticated; keep on the internal/host network | readiness/liveness (Check + Watch), reflecting `ChunkStore::health()`; #576, `crates/server/src/dserver.rs` |
+| Supervisor / LB → D server health probe | gRPC (`grpc.health.v1.Health`) | **`50052`** (Wyrd default; derives from `--bind`'s interface, `--health-bind` overrides) | unauthenticated; keep on the internal/host network | **readiness** (empty service + `ChunkStore` name) reflects `ChunkStore::health()`; **liveness** (`-service liveness`) is store-independent, SERVING while the process is up — gate traffic with readiness, restart with liveness; #576, `crates/server/src/dserver.rs` |
 | Gateway / client lib → metadata (**FoundationDB**) | FDB client protocol (`libfdb_c`) | `4500` (coordinators) | TLS | atomic multi-key commit; ADR-0042, §7.6. *redb backend is embedded — in-process, no port* |
 | Custodian → D servers | gRPC | `50051` | mTLS | scrub / repair / reconstruct |
 | Custodian → metadata (**FoundationDB**) | FDB client protocol (`libfdb_c`) | `4500` | TLS | under-replication scan, chunk-maps |
