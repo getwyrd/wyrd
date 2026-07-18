@@ -562,6 +562,26 @@ where
 
     match method {
         Method::PUT => {
+            // `x-amz-copy-source` marks this PUT as a CopyObject request (issue #504), not an
+            // ordinary object PUT. Dispatch below streams the request BODY into the
+            // destination key — but a copy request's payload IS the copy-source reference,
+            // so its body is empty; falling through here would silently overwrite the
+            // destination with zero bytes and answer 200 (data loss). Refuse it before any
+            // body byte is read, mirroring the subresource guard above (:548-561) and its
+            // rationale — a form this floor does not implement is refused, never silently
+            // mishandled. The header need not be part of the client's SigV4 signed-header
+            // set for this guard to apply, so it is read directly off the request headers.
+            // Server-side copy (resolving the source dirent/inode and aliasing its chunk
+            // map, returning the source's ETag) is issue #504 step 2 — gated on #503's
+            // metadata model — and out of scope here.
+            if parts.headers.contains_key("x-amz-copy-source") {
+                return error_response(
+                    request_id,
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    "CopyObject (x-amz-copy-source) is not supported",
+                );
+            }
             // The client's declared `Content-Type`, round-tripped verbatim on GET (ADR-0047).
             // Read from the request head BEFORE the body stream is consumed. `None` if the
             // client sent none (or a non-ASCII value) — GET then falls back to
