@@ -572,6 +572,17 @@ where
     }
 }
 
+/// Aborts the wrapped task when dropped — ties a spawned helper's lifetime to a scope,
+/// so it cannot leak past an early return. Used for both the shutdown fan-out (whole
+/// `serve` scope) and the health serve task (Codex #587).
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Clone)]
 struct AdmissionObserver<S> {
     inner: S,
@@ -930,10 +941,14 @@ impl<S: ChunkStore + 'static> DServer<S> {
         // every receiver the same one-shot signal. Created BEFORE the probe surface so the
         // readiness refresher can observe shutdown and flip NOT_SERVING first (below).
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
-        tokio::spawn(async move {
+        // Bound the fan-out task to THIS `serve` call: on any non-shutdown return
+        // (a health-bind failure below, a data-server error, a lost lease) the guard
+        // drops and aborts it, so a caller's still-pending `shutdown` future — and
+        // whatever it owns — is not leaked by a detached waiter (Codex P2 on #587).
+        let _shutdown_fanout = AbortOnDrop(tokio::spawn(async move {
             shutdown.await;
             let _ = shutdown_tx.send(());
-        });
+        }));
         // READINESS-BEFORE-DRAIN handshake (Codex P1 on #587): on shutdown the refresher
         // publishes NOT_SERVING on both health names, then fires this channel; the data
         // (and health) drain wait on it before beginning, so a load balancer watching the
@@ -1225,14 +1240,6 @@ impl<S: ChunkStore + 'static> DServer<S> {
                     // alive indefinitely after `serve()` returned and revoked the lease.
                     // The guard ties the task's lifetime to this future: dropped for any
                     // reason ⇒ aborted.
-                    struct AbortOnDrop(
-                        tokio::task::JoinHandle<std::result::Result<(), tonic::transport::Error>>,
-                    );
-                    impl Drop for AbortOnDrop {
-                        fn drop(&mut self) {
-                            self.0.abort();
-                        }
-                    }
                     let mut health_task = AbortOnDrop(tokio::spawn(health_serve));
                     let data_res: Result<()> = serve.await.map_err(Into::into);
                     let health_res: Result<()> =
