@@ -57,6 +57,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0043](0043-testing-fixture-profiles.md) | Testing fixture profiles: one minimal container topology per test class; root compose removed | Accepted |
 | [0044](0044-provisional-conformance-pins.md) | Provisional pins in the shared conformance suite: mark, don't gate (governs the multi-backend `MetadataStore` contract; refines ADR-0006) | Proposed |
 | [0045](0045-metadata-validation-boundaries.md) | Metadata validation boundaries: parse-don't-validate at decode, liberal read / strict maintenance (generalizes ADR-0040's posture across all metadata) | Proposed |
+| [0046](0046-bucket-model-real-namespace.md) | Bucket model: real bucket records in the `MetadataStore` behind a protocol-neutral container seam; synthesized prefixes rejected (decides #502; shapes #507, #511) | Accepted |
 
 ## Why not ... ?
 
