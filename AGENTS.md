@@ -43,13 +43,16 @@ run the checks that match the surface you changed.
   of the required Rust gate: fmt, clippy with warnings denied, build, tests,
   cargo-deny, cargo-machete, and conformance. Docs-only changes may skip this
   locally because CI's `gate` job handles the docs-only skip.
-- **Spell check (`ci` / job: `typos`)** — if prose, identifiers, comments, or
-  docs changed, run `typos` when available. If `typos` is not installed, say so
-  in the PR/check summary rather than pretending it ran.
-- **Docs check (`docs-check`)** — for any docs, ADR, proposal, spec, README, or
-  publishing-template change, run:
+- **Spell check (`ci` / job: `typos`)** — `cargo xtask ci` runs `typos` as its
+  first step (#598), so running the gate covers this. If `typos` is not
+  installed locally the gate warns and skips — install it
+  (`cargo install typos-cli --locked`) or run `typos` yourself; never pretend
+  it ran. This gate is always-on in CI and fires on prose, identifiers,
+  comments, and docs alike.
+- **Docs check (`docs-check`)** — `cargo xtask ci` runs both steps (#598):
   - `python3 docs/publishing/tools/lint_docs.py`
   - `python3 docs/publishing/tools/render_site.py --check --out /tmp/wyrd-docs-build`
+    (skipped locally with a warning if the pinned renderer deps are absent).
   If the renderer needs the pinned Mermaid asset and network is unavailable,
   rerun with network access or report the exact blocker.
 - **Document immutability (`adr-immutability`, renamed to `docs-immutability`

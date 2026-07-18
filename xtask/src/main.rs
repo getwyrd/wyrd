@@ -2,7 +2,8 @@
 //! laptop and in CI (ADR-0016, ADR-0009).
 //!
 //! Subcommands:
-//! - `ci` — fmt, clippy, build, test, cargo-machete, cargo-deny, conformance,
+//! - `ci` — typos + docs lint/render (the prose gates, #598), then fmt, clippy,
+//!   build, test, cargo-machete, cargo-deny, conformance,
 //!   and the madsim DST tier; the single gate CI calls. The clippy/warnings
 //!   levels come from `[workspace.lints]` in the root Cargo.toml (single source
 //!   of truth), so no `-D warnings` flag is passed here.
@@ -1425,6 +1426,11 @@ fn run_ci_steps(
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
 /// failure stops the run.
 fn run_ci() -> Result<(), String> {
+    // The prose gates first: both are sub-second, and until #598 they ran only
+    // as GitHub-side jobs — the one gate class a locally-green tree kept
+    // failing on. Fail fast before the expensive clippy/build/test.
+    typos_check()?;
+    docs_check()?;
     run_ci_steps(&mut |name| std::env::var_os(name).is_some(), &mut |args| {
         cargo(args)
     })?;
@@ -1634,6 +1640,104 @@ fn cargo_machete_check() -> Result<(), String> {
             "`cargo-machete` found unused dependencies (exit {status}). Remove them, \
              or mark intentional ones with `[package.metadata.cargo-machete] ignored`."
         )),
+    }
+}
+
+/// Run `typos` — the same spell check as CI's own always-on `typos` job
+/// (`.github/workflows/ci.yml`), sharing its config/allowlist (`typos.toml`).
+/// Until #598 this gate existed ONLY on GitHub, so a tree could pass
+/// `cargo xtask ci` clean and still open a PR red on the `typos` status —
+/// which is exactly what happened three times (#595, #564, #569). Mirrors
+/// `cargo_machete_check`: skip with a warning if the binary is not installed
+/// locally; in CI a missing binary is a hard failure so the check is always
+/// enforced.
+fn typos_check() -> Result<(), String> {
+    // Probe the binary directly so "not installed" is cleanly distinguishable
+    // from "found misspellings" (a non-zero exit of the real run).
+    if Command::new("typos").arg("--version").output().is_err() {
+        if is_ci() {
+            return Err("typos is not installed but is required in CI".to_string());
+        }
+        eprintln!(
+            "warning: typos not installed; skipping the spell check locally. \
+             Install it with `cargo install typos-cli --locked`."
+        );
+        return Ok(());
+    }
+    print_step(&["typos"]);
+    let status = Command::new("typos")
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn typos: {e}"))?;
+    match status.success() {
+        true => Ok(()),
+        false => Err(format!(
+            "`typos` found misspellings (exit {status}). Fix them, or record a \
+             deliberate exception in typos.toml (keep the allowlist tight)."
+        )),
+    }
+}
+
+/// Run the docs gate — the same two steps as CI's `docs-check` job
+/// (`.github/workflows/docs-check.yml`): the Markdown/spec-marker lint
+/// (`lint_docs.py`, stdlib-only, always runs) and the whole-site render with
+/// the internal-link audit (`render_site.py --check`, which needs the pinned
+/// `markdown-it-py`/`PyYAML` renderer deps — probed first, warn-and-skip
+/// locally when absent, hard failure in CI, the `cargo_machete_check`
+/// convention). Part of the #598 CI-parity fix alongside [`typos_check`].
+fn docs_check() -> Result<(), String> {
+    print_step(&["python3", "docs/publishing/tools/lint_docs.py"]);
+    let status = Command::new("python3")
+        .arg("docs/publishing/tools/lint_docs.py")
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn python3: {e}"))?;
+    if !status.success() {
+        return Err(format!("`lint_docs.py` failed with {status}"));
+    }
+
+    let deps_present = Command::new("python3")
+        .args(["-c", "import markdown_it, yaml"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !deps_present {
+        if is_ci() {
+            return Err(
+                "the docs renderer deps (markdown-it-py, PyYAML) are not installed \
+                 but are required in CI"
+                    .to_string(),
+            );
+        }
+        eprintln!(
+            "warning: docs renderer deps not installed; skipping the site-render \
+             link audit locally. Install them with \
+             `pip install \"markdown-it-py[linkify]==3.0.0\" \"PyYAML==6.0.2\"`."
+        );
+        return Ok(());
+    }
+    let out = std::env::temp_dir().join("wyrd-docs-build");
+    let out = out.to_string_lossy().into_owned();
+    print_step(&[
+        "python3",
+        "docs/publishing/tools/render_site.py",
+        "--check",
+        "--out",
+        &out,
+    ]);
+    let status = Command::new("python3")
+        .args([
+            "docs/publishing/tools/render_site.py",
+            "--check",
+            "--out",
+            &out,
+        ])
+        .current_dir(workspace_root())
+        .status()
+        .map_err(|e| format!("failed to spawn python3: {e}"))?;
+    match status.success() {
+        true => Ok(()),
+        false => Err(format!("`render_site.py --check` failed with {status}")),
     }
 }
 

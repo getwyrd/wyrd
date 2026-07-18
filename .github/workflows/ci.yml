@@ -99,13 +99,20 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # Prebuilt binaries, so the license/advisory wall and the unused-dependency
-      # check cost seconds, not a from-source compile. `cargo xtask ci` shells out
-      # to both (hard-failing in CI if either is missing — see xtask).
-      - name: Install cargo-deny + cargo-machete
+      # Prebuilt binaries, so the license/advisory wall, the unused-dependency
+      # check, and the spell check cost seconds, not a from-source compile.
+      # `cargo xtask ci` shells out to all three (hard-failing in CI if any is
+      # missing — see xtask).
+      - name: Install cargo-deny + cargo-machete + typos
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-machete
+          tool: cargo-deny,cargo-machete,typos-cli
+
+      # The docs renderer deps, so `cargo xtask ci`'s docs gate (#598) runs the
+      # same lint + link-audit here as the standalone docs-check workflow —
+      # pinned to the identical versions.
+      - name: Install docs renderer deps
+        run: pip install "markdown-it-py[linkify]==3.0.0" "PyYAML==6.0.2"
 
       # Runs BOTH dependency walls (see xtask::cargo_deny_check): the default graph —
       # the artifact we ship — and, via deny-all-features.toml, the off-by-default
