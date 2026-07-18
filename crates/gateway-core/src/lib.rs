@@ -59,6 +59,27 @@ pub struct ObjectRead {
     pub modified: Option<u64>,
 }
 
+/// A **HEAD** response: the same header-bearing metadata [`ObjectRead`] carries, without a
+/// body stream. Deliberately its own type rather than `ObjectRead` with the `stream` field
+/// ignored — resolving one would force a metadata-only lookup to conjure a stream it never
+/// plays out (or spawn a reader task solely to satisfy the type), which defeats the point of
+/// a HEAD costing metadata round-trips, not data reads (issue #506).
+pub struct ObjectMeta {
+    /// The object's total length in bytes (its committed inode size) — the wire layer's
+    /// `Content-Length`.
+    pub size: u64,
+    /// The object's content digest (opaque change-token), if recorded — the wire layer
+    /// quotes it as S3's `ETag`. `None` for a record written before object metadata was
+    /// modelled, in which case the wire layer omits the header (ADR-0047).
+    pub etag: Option<String>,
+    /// The `Content-Type` the writer declared, round-tripped verbatim. `None` falls back
+    /// to `application/octet-stream` on the wire.
+    pub content_type: Option<String>,
+    /// Content-publication time (epoch millis); the wire layer renders it as an RFC-7231
+    /// `Last-Modified`. `None` when unrecorded.
+    pub modified: Option<u64>,
+}
+
 /// The payload-integrity instruction a gateway hands its object-store for a streaming PUT.
 ///
 /// Neutral by design: a protocol that authenticated the body against a known hash (S3's
@@ -142,6 +163,13 @@ pub trait ObjectGateway: Send + Sync + 'static {
         self: Arc<Self>,
         key: &str,
     ) -> impl Future<Output = Result<Option<ObjectRead>>> + Send;
+
+    /// Resolve `key`'s metadata **only** — size, ETag, Content-Type, and publication time
+    /// (ADR-0047) — without opening its fragment stream. `None` if `key` has no committed
+    /// object. This is the seam a wire layer's **HEAD** answers from (issue #506): unlike
+    /// [`get_object_streaming`](Self::get_object_streaming), resolving it costs metadata
+    /// round-trips, not data reads, so a HEAD of a large object is cheap.
+    fn head_object(&self, key: &str) -> impl Future<Output = Result<Option<ObjectMeta>>> + Send;
 
     /// Remove the object under `key`. **Idempotent**: `Ok(true)` if an object was removed,
     /// `Ok(false)` if `key` was already absent — deleting a missing key is a success.
