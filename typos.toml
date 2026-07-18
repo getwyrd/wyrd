@@ -3,6 +3,13 @@
 # covered too. Keep this allowlist tight: each entry is a deliberate exception,
 # the same "encode the decision" discipline as deny.toml.
 
+[default]
+# RFC 4648 §10's base64 known-answer vectors ("f", "fo", "foo", "foob", …):
+# `"fo"` is the canonical decode of `Zm8=`, pinned by the checksum tests
+# (crates/gateway-s3/src/checksum.rs) — not a typo of "of"/"for". Scoped to the
+# exact quoted vector so a stray "fo" in prose anywhere else still fails.
+extend-ignore-re = ['"fo"']
+
 [default.extend-words]
 # The project name is Old English "wyrd" (fate) — not a misspelling of "weird".
 wyrd = "wyrd"
