@@ -72,7 +72,7 @@ use axum::response::Response;
 use axum::Router;
 use futures_util::StreamExt;
 use tracing::Instrument;
-use wyrd_gateway_core::{ContentHash, GatewayError, ObjectGateway, ObjectRead};
+use wyrd_gateway_core::{ContentHash, GatewayError, ObjectGateway, ObjectMeta, ObjectRead};
 use wyrd_traits::BoxError;
 
 use crate::request_id::{RequestId, RequestIds};
@@ -698,6 +698,53 @@ where
             ),
             Err(err) => gateway_error_response(request_id, &err),
         },
+        // HEAD answers exactly GET's metadata headers with no body (issue #506): the
+        // ubiquitous HEAD-before-GET/PUT pattern (`aws s3 cp`'s download preflight, most SDK
+        // existence checks) 405-ed before this arm existed. Resolved via the metadata-only
+        // `head_object` seam — not `get_object_streaming` — so a HEAD of a large object costs
+        // a metadata round-trip, never opens the fragment stream, and never spawns the
+        // chunk-reader task GET does. `finish_response` already classifies every HEAD
+        // response as body-less, so hyper suppresses whatever body this builder sets and no
+        // access-log change is needed here.
+        Method::HEAD => match state.gateway.head_object(&object_key).await {
+            Ok(Some(ObjectMeta {
+                size,
+                etag,
+                content_type,
+                modified,
+            })) => {
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    // Same content-type fallback GET uses (ADR-0047); see `content_type_header`.
+                    .header("content-type", content_type_header(content_type.as_deref()))
+                    // The object's real size, not 0 — a HEAD's `Content-Length` must match what
+                    // a follow-up GET would declare (brief success criterion).
+                    .header("content-length", size.to_string());
+                // Additive, exactly as the GET arm above: a record predating the metadata model
+                // carries neither ETag nor Last-Modified, and an un-renderable stored etag
+                // degrades to no header via `etag_header` rather than panicking the HEAD.
+                if let Some(value) = etag.as_deref().and_then(etag_header) {
+                    builder = builder.header("etag", value);
+                }
+                if let Some(value) = modified.and_then(http_date) {
+                    builder = builder.header("last-modified", value);
+                }
+                builder
+                    .body(Body::empty())
+                    .expect("static response is always valid")
+            }
+            // Mirrors the GET arm's `Ok(None)` mapping above: an absent key is `404 NoSuchKey`.
+            // The XML body `error_response` builds never reaches the wire — hyper suppresses
+            // every HEAD response body — but building the same response GET's error path builds
+            // keeps the two arms symmetric.
+            Ok(None) => error_response(
+                request_id,
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "the specified key does not exist",
+            ),
+            Err(err) => gateway_error_response(request_id, &err),
+        },
         Method::DELETE => match state.gateway.delete_object(&object_key).await {
             // DELETE is idempotent: removing a present or an absent key both succeed.
             Ok(_) => empty_response(StatusCode::NO_CONTENT),
@@ -707,7 +754,7 @@ where
             request_id,
             StatusCode::METHOD_NOT_ALLOWED,
             "MethodNotAllowed",
-            "only object PUT, GET, and DELETE are supported",
+            "only object PUT, GET, HEAD, and DELETE are supported",
         ),
     }
 }
@@ -1295,6 +1342,10 @@ mod tests {
                 Ok(None)
             }
 
+            async fn head_object(&self, _key: &str) -> wyrd_traits::Result<Option<ObjectMeta>> {
+                Ok(None)
+            }
+
             async fn delete_object(&self, _key: &str) -> wyrd_traits::Result<bool> {
                 Ok(false)
             }
@@ -1578,6 +1629,10 @@ mod tests {
             self: Arc<Self>,
             _key: &str,
         ) -> wyrd_traits::Result<Option<ObjectRead>> {
+            Ok(None)
+        }
+
+        async fn head_object(&self, _key: &str) -> wyrd_traits::Result<Option<ObjectMeta>> {
             Ok(None)
         }
 
@@ -2105,6 +2160,15 @@ mod tests {
                 etag: self.etag.clone(),
                 content_type: self.content_type.clone(),
                 modified: self.modified,
+            }))
+        }
+
+        async fn head_object(&self, _key: &str) -> wyrd_traits::Result<Option<ObjectMeta>> {
+            Ok(Some(ObjectMeta {
+                size: 11, // b"object-body".len()
+                etag: self.etag.clone(),
+                content_type: self.content_type.clone(),
+                modified: Some(1_700_000_000_000),
             }))
         }
 
