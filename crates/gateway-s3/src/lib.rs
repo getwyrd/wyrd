@@ -73,7 +73,7 @@ use axum::Router;
 use futures_util::StreamExt;
 use tracing::Instrument;
 use wyrd_gateway_core::{ContentHash, GatewayError, ObjectGateway, ObjectMeta, ObjectRead};
-use wyrd_traits::BoxError;
+use wyrd_traits::{BoxError, ErrorClass};
 
 use crate::request_id::{RequestId, RequestIds};
 use crate::sigv4::Credentials;
@@ -121,6 +121,7 @@ impl S3Config {
 pub struct S3Gateway<G> {
     gateway: Arc<G>,
     config: Arc<S3Config>,
+    metrics: Option<tracing::Dispatch>,
 }
 
 struct AppState<G> {
@@ -129,6 +130,12 @@ struct AppState<G> {
     /// This process's request-id minter (#529). Shared, not per-request: the monotonic
     /// half of the id must be drawn from one counter.
     request_ids: Arc<RequestIds>,
+    /// The `tracing` dispatch the **request plane's RED metrics** are emitted into
+    /// (observability floor, proposal 0010 item 4) — see
+    /// [`S3Gateway::with_metrics_dispatch`]. `None` ⇒ emit into the ambient subscriber,
+    /// which is what a library caller and this crate's own tests get: the emission is
+    /// unconditional, only the *sink* is a role's choice.
+    metrics: Option<tracing::Dispatch>,
 }
 
 // `Arc` makes the state cheap to clone regardless of the gateway type, so avoid a
@@ -139,6 +146,9 @@ impl<G> Clone for AppState<G> {
             gateway: Arc::clone(&self.gateway),
             config: Arc::clone(&self.config),
             request_ids: Arc::clone(&self.request_ids),
+            // `Dispatch` is itself a cheap handle (an `Arc` inside), so cloning the state
+            // per request does not clone the subscriber.
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -152,16 +162,40 @@ where
         Self {
             gateway,
             config: Arc::new(config),
+            metrics: None,
         }
+    }
+
+    /// Emit this front door's **request-plane RED metrics** into `dispatch` (observability
+    /// floor, proposal 0010 §"Scope boundary" item 4): a per-op latency histogram and an
+    /// error counter keyed by op **and** the typed failure class.
+    ///
+    /// The dispatch is the role's metrics sink — `wyrd_telemetry::DurabilityTelemetry::
+    /// metrics_dispatch()`, composed at the `wyrd s3` role entry (`cli::cmd_s3`) with the
+    /// export surface chosen by `ExporterConfig`. This crate takes a plain
+    /// [`tracing::Dispatch`] and never names a telemetry backend: the whole OpenTelemetry /
+    /// Prometheus / OTLP stack stays behind the shared seam at the composition root
+    /// (ADR-0012; 0010's "no concrete telemetry backend leaks into a leaf crate").
+    ///
+    /// It is carried rather than scoped because `axum::serve` spawns a task per connection,
+    /// which does not inherit a scoped dispatch — see `DurabilityTelemetry::metrics_dispatch`.
+    /// Unset, the metrics are emitted into the ambient subscriber (today's behaviour).
+    pub fn with_metrics_dispatch(mut self, dispatch: tracing::Dispatch) -> Self {
+        self.metrics = Some(dispatch);
+        self
     }
 
     /// The axum router: every method/path routes through the `handle` dispatcher, which
     /// verifies the SigV4 signature first and then dispatches by verb.
     pub fn router(self) -> Router {
+        // Mint every RED series this front door can ever report, at zero, before it serves
+        // anything — see [`preregister_red`].
+        preregister_red(self.metrics.as_ref());
         let state = AppState {
             gateway: self.gateway,
             config: self.config,
             request_ids: Arc::new(RequestIds::new()),
+            metrics: self.metrics,
         };
         Router::new().fallback(handle::<G>).with_state(state)
     }
@@ -171,6 +205,117 @@ where
     pub async fn serve(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
         axum::serve(listener, self.router()).await
     }
+}
+
+// ---- the request plane (observability floor, proposal 0010 §"Scope boundary" item 4) ----
+//
+// RED for the S3 front door: a per-op latency histogram and an error counter keyed by op and
+// by the typed failure class. Counters, not traces — the ratified floor shape (0010
+// §Alternatives: "adequate, not elegant"); a span graph is deferred to its own ADR.
+//
+// Emitted as `tracing` metric events so the shared `MetricsLayer` bridge carries them to
+// whichever export surface the role wired (ADR-0012 dual export, no backend hardcoded). That
+// is the one instrumentation path this workspace has (ADR-0012): the custodian's durability
+// plane raises `monotonic_counter.` / `gauge.` events the same way
+// (`crates/core/src/read.rs:191-200`, `crates/custodian/src/rebalance.rs:320-326`), and
+// minting OTel meters directly here would fork a second path around the seam.
+//
+// The **rate** half of RED is deliberately not a separate counter: the OTel→Prometheus
+// exporter renders a histogram's own `_count` series, so `s3_request_duration_ms_count` is the
+// per-op request rate and a parallel `s3_requests_total` could only drift from it.
+
+/// Every op label the request plane can report. A **bounded** label space (0010 §Open
+/// questions: op + class only — no per-key / per-tenant labels): the front door dispatches
+/// PUT / GET / DELETE, answers HEAD body-lessly, and refuses everything else as `other`, so a
+/// client sending `TRACE` mints no new series. Enumerated here so [`preregister_red`] can
+/// raise the whole space up front.
+const OPS: [&str; 5] = ["put", "get", "delete", "head", "other"];
+
+/// The op label for `method` — the request plane's stable, low-cardinality key.
+fn op_label(method: &Method) -> &'static str {
+    match *method {
+        Method::PUT => "put",
+        Method::GET => "get",
+        Method::DELETE => "delete",
+        Method::HEAD => "head",
+        _ => "other",
+    }
+}
+
+/// Run `f` — which raises `tracing` metric events — against the role's metrics sink.
+///
+/// `Some` ⇒ the role configured a metrics dispatch ([`S3Gateway::with_metrics_dispatch`]);
+/// enter it for the emission. `None` ⇒ emit into the ambient subscriber, which is what a
+/// library caller gets. Entering a dispatch is sound from *any* task (it is a thread-local
+/// set for the closure's duration), which is exactly why the sink is carried rather than
+/// scoped around the serve future: `axum::serve` spawns a task per connection.
+///
+/// `f` must do nothing but emit — it runs with a metrics-only subscriber current, so an
+/// ordinary log line raised inside it would land nowhere.
+fn emit_into(dispatch: Option<&tracing::Dispatch>, f: impl FnOnce()) {
+    match dispatch {
+        Some(dispatch) => tracing::dispatcher::with_default(dispatch, f),
+        None => f(),
+    }
+}
+
+/// Raise every error **counter** series this front door can ever report, at **zero**, before
+/// it serves a request.
+///
+/// A counter that only learns a label the first time that fault fires reports *nothing at
+/// all* until something breaks — so a dashboard reads "no data" both when the gateway is
+/// healthy and when it was never wired, and an alert on `rate(s3_request_errors[5m])` cannot
+/// distinguish "no errors" from "no metric". #577 minted [`ErrorClass::ALL`] for exactly this
+/// (its doc names this issue): a **closed** class set with a **stable** label form, so the
+/// whole op × class space is enumerable up front rather than discovered during an incident.
+///
+/// **Only the counter.** The latency histogram is deliberately NOT pre-registered, and the
+/// asymmetry is not an oversight: `add(0)` on a counter is value-neutral, but `record(0)` on
+/// a histogram is a real observation — it would seed every op's distribution with a phantom
+/// 0ms sample, dragging p50 toward zero and reporting a front door faster than it is. A
+/// latency series that does not exist until the first request is served is the honest
+/// alternative, and it costs nothing: unlike an error, a request arriving is the normal case,
+/// so the series appears immediately in any deployment that is doing anything at all.
+fn preregister_red(dispatch: Option<&tracing::Dispatch>) {
+    emit_into(dispatch, || {
+        for op in OPS {
+            for class in ErrorClass::ALL {
+                tracing::info!(
+                    monotonic_counter.s3_request_errors = 0_u64,
+                    op = op,
+                    class = class.as_str(),
+                );
+            }
+        }
+    });
+}
+
+/// Raise one request's RED sample: always its latency, and — when the request failed — one
+/// error keyed by op **and** the failure class.
+///
+/// The `class` label is #577's [`ErrorClass::as_str`], a value the seam **exports** with a
+/// stable, bounded label form. It is *consumed*, never re-derived: `wyrd_traits::classify` is
+/// the seam's one classifier (`gateway_error_response` runs it over the error's whole
+/// `source()` chain and hands the verdict here through a response extension), so this counter
+/// cannot drift from what the rest of the system calls the same fault — the whole point of
+/// keying item 4's counter on item 6's typed class.
+fn emit_request_red(
+    dispatch: Option<&tracing::Dispatch>,
+    op: &'static str,
+    class: ErrorClass,
+    duration_ms: u64,
+    errored: bool,
+) {
+    emit_into(dispatch, || {
+        tracing::info!(histogram.s3_request_duration_ms = duration_ms, op = op);
+        if errored {
+            tracing::info!(
+                monotonic_counter.s3_request_errors = 1_u64,
+                op = op,
+                class = class.as_str(),
+            );
+        }
+    });
 }
 
 /// The S3 subresource / multipart query keys this object-only floor does not implement.
@@ -272,15 +417,31 @@ struct AccessLogged<S> {
     declared: Option<u64>,
     finished: bool,
     span: tracing::Span,
+    /// The request plane's op label and failure class, carried to the completion point so
+    /// the RED sample is raised from the same place — and at the same moment — as the
+    /// access row (see [`record_access`]).
+    op: &'static str,
+    class: ErrorClass,
+    metrics: Option<tracing::Dispatch>,
 }
 
-/// Write ONE access row — the single place it is emitted, so the body-carrying and body-less
-/// paths cannot drift in what they record.
+/// Write ONE access row **and raise this request's RED sample** — the single place both are
+/// emitted, so the body-carrying and body-less paths cannot drift in what they record, and the
+/// log row and the metric can never disagree about how an op ended.
 ///
 /// `request_id` is a field of the EVENT, not merely inherited from `span`: a target-scoped
 /// directive (`RUST_LOG=wyrd.gateway.s3.access=info` — the natural way to keep the access plane
 /// and quieten the rest) enables this event without enabling the span, whose target is the module
 /// path, so inheriting alone would lose the join key under exactly that directive.
+///
+/// **The RED sample rides here, and that placement is the whole point.** This function is called
+/// when the transfer actually ENDS, not when the head is built (`finish_response`) — a GET's body
+/// is polled after the handler returns, so a latency measured at head time would report a
+/// near-zero duration for a transfer that may still run for seconds, truncate, or fail. The
+/// access row already made that argument for `duration_ms`; the histogram is the same number, so
+/// it belongs at the same point. It is also why a caller reading the metric back must first drain
+/// the response body.
+#[allow(clippy::too_many_arguments)]
 fn record_access(
     span: &tracing::Span,
     request_id: RequestId,
@@ -288,6 +449,9 @@ fn record_access(
     status: u16,
     bytes: u64,
     outcome: &'static str,
+    op: &'static str,
+    class: ErrorClass,
+    metrics: Option<&tracing::Dispatch>,
 ) {
     let duration_ms = started.elapsed().map(|d| d.as_millis()).unwrap_or(0);
     span.in_scope(|| {
@@ -301,12 +465,33 @@ fn record_access(
             "request served",
         );
     });
+    // What counts as an ERROR for RED is the request's *observed* fate, not just its status
+    // line. A 4xx/5xx is a failed request. So is a `200` head whose body then errored
+    // (`failed`) or ended short of its declared length (`truncated`): the client did not get
+    // the object, and counting it a success would be the "confident, wrong answer" this
+    // module's own body-wrapping exists to prevent. `aborted` is NOT an error — that is a
+    // client that hung up, which is not the gateway failing.
+    let errored = status >= 400 || matches!(outcome, "failed" | "truncated");
+    emit_request_red(metrics, op, class, duration_ms as u64, errored);
 }
 
 impl<S> AccessLogged<S> {
-    /// Write the row, exactly once. `outcome` is the *observed* fate of the transfer, not the
-    /// status line's optimism.
+    /// Write the row, exactly once, with the class the **head** carried.
+    ///
+    /// Correct for every path whose failure was already decided when the head was built: the
+    /// error response's own body cannot itself fail, so the verdict stamped on it by
+    /// [`gateway_error_response`] is still the most specific statement about the request when
+    /// that one-shot frame is consumed. The one path this is *not* true for takes
+    /// [`record_classified`](Self::record_classified) instead.
     fn record(&mut self, outcome: &'static str) {
+        let class = self.class;
+        self.record_classified(outcome, class);
+    }
+
+    /// Write the row, exactly once, with `class` **in place of** the head-time verdict — for
+    /// the one path whose failure is not knowable until mid-body (see the `Err` arm of
+    /// [`poll_next`](futures_util::Stream::poll_next)).
+    fn record_classified(&mut self, outcome: &'static str, class: ErrorClass) {
         if self.finished {
             return;
         }
@@ -318,6 +503,9 @@ impl<S> AccessLogged<S> {
             self.status,
             self.bytes,
             outcome,
+            self.op,
+            class,
+            self.metrics.as_ref(),
         );
     }
 }
@@ -341,7 +529,24 @@ where
             Poll::Ready(Some(Err(e))) => {
                 // The client got a 200 head and then a truncated body. The row must say so —
                 // this is precisely the case a head-time log would have reported as "served".
-                self.record("failed");
+                //
+                // **And the CLASS comes from THIS error, not from the head.** A streaming GET's
+                // head is built before a single chunk has been read, so it carries no seam error
+                // and `handle`'s head-time read defaults to `Terminal` (its documented fail-safe).
+                // But the fault that actually ended the transfer arrives *here* — a D-server dying
+                // mid-read raises a `TransientFault` inside the body stream — and reporting it
+                // `terminal` would tell an operator "retrying cannot help" about the one failure
+                // shape where retrying is the whole remedy. That is the precise
+                // transient-vs-terminal distinction the counter exists to carry, inverted.
+                //
+                // So the seam's own classifier runs over the error the stream yielded (#577's
+                // contract: consume the class, never re-derive it locally). It walks `source()`,
+                // which is what makes this work through the `axum::Error` the body machinery wraps
+                // every stream error in (`axum-core`'s `StreamBody::poll_frame` → `Error::new`,
+                // whose `source()` is the original `BoxError`) — so the wrapping is transparent to
+                // the verdict, exactly as it is for a fault a backend wrapped in its own error.
+                let class = wyrd_traits::classify(&e);
+                self.record_classified("failed", class);
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
@@ -349,6 +554,11 @@ where
                 // `content-length` truncated the object on the wire — the client sees a failed
                 // transfer, and a row calling it `complete` would hide exactly the fault this
                 // logging exists to diagnose.
+                //
+                // A truncation has no error to classify — the stream simply stopped — so this
+                // keeps the head-time class, which for a streaming GET is `Terminal`. That is not
+                // a gap left by the `Err` arm above: `Terminal` is the same answer `classify`
+                // returns for anything it cannot name, and this is precisely the unnameable case.
                 let short = self.declared.is_some_and(|declared| self.bytes < declared);
                 self.record(if short { "truncated" } else { "complete" });
                 Poll::Ready(None)
@@ -391,12 +601,16 @@ impl<S> Drop for AccessLogged<S> {
 ///   would send every successful DELETE, which answers `204`, straight to the `Drop` arm and
 ///   record it as `aborted` — a systematic lie about the most ordinary success there is, and one
 ///   that would read as a fleet of clients hanging up mid-download. (Codex review of #532.)
+#[allow(clippy::too_many_arguments)]
 fn finish_response(
     response: Response,
     method: &Method,
     span: &tracing::Span,
     request_id: RequestId,
     started: SystemTime,
+    op: &'static str,
+    class: ErrorClass,
+    metrics: Option<tracing::Dispatch>,
 ) -> Response {
     let status = response.status();
     // Hyper never polls the body of a `204`/`304`/`1xx` (HTTP forbids one), and it SUPPRESSES the
@@ -406,7 +620,17 @@ fn finish_response(
     let bodyless =
         matches!(status.as_u16(), 204 | 304) || status.is_informational() || method == Method::HEAD;
     if bodyless {
-        record_access(span, request_id, started, status.as_u16(), 0, "complete");
+        record_access(
+            span,
+            request_id,
+            started,
+            status.as_u16(),
+            0,
+            "complete",
+            op,
+            class,
+            metrics.as_ref(),
+        );
         return response;
     }
     let declared = response
@@ -424,6 +648,9 @@ fn finish_response(
             declared,
             finished: false,
             span: span.clone(),
+            op,
+            class,
+            metrics,
         })
     })
 }
@@ -435,6 +662,10 @@ where
     let request_id = state.request_ids.mint();
     let started = SystemTime::now();
     let method = req.method().clone();
+    // The request plane's op label + metrics sink, read before `state` is moved into the
+    // dispatcher below.
+    let op = op_label(&method);
+    let metrics = state.metrics.clone();
     let span = tracing::info_span!(
         "s3.request",
         request_id = %request_id,
@@ -444,6 +675,32 @@ where
     let response = dispatch(state, req, request_id)
         .instrument(span.clone())
         .await;
+
+    // **The failure class, as the seam classified it — not as this layer guesses it.**
+    // `gateway_error_response` runs #577's `wyrd_traits::classify` over the error's whole
+    // `source()` chain and stamps the verdict onto the response, so the RED counter keys on
+    // the same typed class the retry policies and the audit log read (0010 item 4: "keyed by
+    // the typed failure class from item 6").
+    //
+    // No extension ⇒ the response carries no seam error at all: the request was refused by
+    // this layer before any backend was touched (an unsigned request's 403, an unparsable
+    // path's 400, an unsupported subresource's 501, an absent key's 404, a bad verb's 405).
+    // Those default to `Terminal`, which is not a fallback so much as the SAME answer
+    // `classify` gives — its documented fail-safe default for anything it cannot otherwise
+    // name — and it is correct here on the merits: retrying an unsigned request or a missing
+    // key cannot help.
+    //
+    // **A streaming GET's `200` head also lands on that default, and for it the default is only
+    // provisional.** Its body has not been read yet, so no seam error exists to stamp — but one
+    // may arrive mid-transfer (a D-server dying mid-read). The body wrapper classifies *that*
+    // error where it surfaces and overrides this verdict (`AccessLogged::poll_next`'s `Err`
+    // arm), so a transient mid-stream fault is not reported `terminal`. Head time is simply too
+    // early to know, which is the same reason the latency sample is not taken here either.
+    let class = response
+        .extensions()
+        .get::<ErrorClass>()
+        .copied()
+        .unwrap_or(ErrorClass::Terminal);
 
     // **The access line — without it the id is a promise this crate does not keep.**
     //
@@ -469,7 +726,9 @@ where
     // fail mid-stream — a row that is actively misleading in exactly the field-diagnosis case the
     // id exists for. The body is wrapped so the row carries the *observed* outcome: bytes
     // actually sent, the real duration, and whether the transfer completed (#529 review).
-    let mut response = finish_response(response, &method, &span, request_id, started);
+    let mut response = finish_response(
+        response, &method, &span, request_id, started, op, class, metrics,
+    );
 
     // Stamp it on the wire too. An SDK surfaces `x-amz-request-id` in its own error
     // reporting, so the tester who hits the failure can quote the id without any
@@ -1065,7 +1324,19 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
             "the gateway refused the request",
         );
     }
-    error_response(request_id, status, code, &message)
+    let mut response = error_response(request_id, status, code, &message);
+    // **Carry the typed failure class out to the request plane.** The class is derived HERE,
+    // where the backend's error still exists, by the seam's own classifier (#577's
+    // `wyrd_traits::classify`, which walks the `source()` chain so a wrapped fault is still
+    // named) — and it is stamped on the response rather than re-derived from the status code
+    // at the completion point. Re-deriving would be a second, divergent classifier: the S3
+    // status mapping above deliberately answers `500 InternalError` for BOTH a transient
+    // fault and a may-have-landed commit, so the wire status simply does not carry the
+    // distinction the counter is supposed to report.
+    response
+        .extensions_mut()
+        .insert(wyrd_traits::classify(err.as_ref()));
+    response
 }
 
 /// The error → (status, S3 code, client message) mapping, split out so the *classification*
@@ -1779,6 +2050,11 @@ mod tests {
                 declared,
                 finished: false,
                 span: tracing::info_span!("s3.request"),
+                // This test drives the ACCESS ROW, not the RED metrics: no sink, so the
+                // metric event falls through to the ambient subscriber (#575).
+                op: "get",
+                class: ErrorClass::Terminal,
+                metrics: None,
             };
             let body = Body::from_stream(logged);
             if drain {
@@ -1874,6 +2150,9 @@ mod tests {
                 declared: Some(5),
                 finished: false,
                 span: tracing::info_span!("s3.request"),
+                op: "get",
+                class: ErrorClass::Terminal,
+                metrics: None,
             };
             let _ = futures_util::StreamExt::next(&mut logged).await; // the 5 declared bytes
             drop(logged); // hyper stops here: no EOF poll
@@ -1926,6 +2205,9 @@ mod tests {
                 &span,
                 RequestIds::new().mint(),
                 SystemTime::now(),
+                op_label(&method),
+                ErrorClass::Terminal,
+                None,
             );
             if drain {
                 let _ = axum::body::to_bytes(finished.into_body(), usize::MAX).await;

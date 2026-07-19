@@ -169,6 +169,121 @@ impl MetadataBackend {
 
 /// Resolve the metadata backend from config: the `--metadata-backend` flag wins,
 /// else the `WYRD_METADATA_BACKEND` env var, else the redb dev default.
+/// The health probe's DEFAULT bind when `--health-bind` is not given: `--bind`'s own
+/// interface at the stable probe port ([`dserver::DEFAULT_HEALTH_BIND`]'s port). The
+/// probe must be reachable from wherever data clients reach the server — a container
+/// binding data on `0.0.0.0` with a loopback-only probe reads connection-refused to
+/// every Docker port-forward / k8s gRPC probe / external LB (Codex P1 on #587) — while
+/// a loopback data bind keeps a loopback probe, so the derivation never exposes an
+/// interface the operator did not already choose. Pure; unit-tested below.
+fn default_health_bind(data_bind: SocketAddr) -> SocketAddr {
+    match data_bind {
+        SocketAddr::V4(v4) => {
+            SocketAddr::new((*v4.ip()).into(), dserver::DEFAULT_HEALTH_BIND.port())
+        }
+        // Keep the V6 scope ID: for a link-local `--bind [fe80::1%2]:50051` the scope
+        // IS the interface — `SocketAddr::new` from the bare `IpAddr` would derive
+        // `[fe80::1]:50052`, which names no NIC and commonly fails to bind at all
+        // (Codex P2 on #587).
+        SocketAddr::V6(v6) => SocketAddr::V6(std::net::SocketAddrV6::new(
+            *v6.ip(),
+            dserver::DEFAULT_HEALTH_BIND.port(),
+            v6.flowinfo(),
+            v6.scope_id(),
+        )),
+    }
+}
+
+/// Whether two listener addresses CERTAINLY cannot coexist on one host: the same port
+/// with equal IPs, or the same port where a same-family wildcard covers the other side
+/// — a wildcard listener occupies its port on every interface of its family, so
+/// `--bind 0.0.0.0:50051` with `--health-bind 127.0.0.1:50051` fails at the second
+/// bind despite unequal addresses (Codex P2 on #587). Only mechanical certainties
+/// refuse here: cross-family pairs are never a certain collision (an IPv4 wildcard
+/// cannot cover an IPv6 listener, and even `[::]` vs IPv4 depends on the socket's
+/// `IPV6_V6ONLY` — see [`dual_stack_overlap_risk`]). Pure; unit-tested below.
+fn binds_collide(a: SocketAddr, b: SocketAddr) -> bool {
+    if a.port() != b.port() {
+        return false;
+    }
+    // Equality must keep IPv6 scope IDs: `[fe80::1%2]` and `[fe80::1%3]` are the same
+    // Ipv6Addr on DIFFERENT interfaces and coexist happily — `.ip()` alone would
+    // declare a false certain collision (Codex P2 on #587).
+    let same_addr = match (a, b) {
+        (SocketAddr::V6(x), SocketAddr::V6(y)) => x.ip() == y.ip() && x.scope_id() == y.scope_id(),
+        _ => a.ip() == b.ip(),
+    };
+    if same_addr {
+        return true;
+    }
+    a.is_ipv4() == b.is_ipv4() && (a.ip().is_unspecified() || b.ip().is_unspecified())
+}
+
+/// Whether a probe/data pair MAY collide depending on the host's dual-stack posture:
+/// the IPv6 wildcard `[::]` against an IPv4 address on the same port. Linux binds
+/// `[::]` dual-stack by default (`net.ipv6.bindv6only=0`), grabbing the IPv4 port too
+/// — but `bindv6only=1` (and some platforms' defaults) keeps them separate, so this is
+/// NOT a parse-time certainty either way (Codex P2 on #587, both directions). The CLI
+/// warns and lets the actual bind adjudicate: on a dual-stack host the second bind
+/// fails fast with the warning already on screen naming the sysctl. Pure;
+/// unit-tested below.
+fn dual_stack_overlap_risk(a: SocketAddr, b: SocketAddr) -> bool {
+    let v6_wildcard = |addr: SocketAddr| addr.is_ipv6() && addr.ip().is_unspecified();
+    a.port() == b.port() && a.is_ipv4() != b.is_ipv4() && (v6_wildcard(a) || v6_wildcard(b))
+}
+
+/// Resolve the probe bind from the optional `--health-bind` flag and the data `--bind`,
+/// REFUSING what cannot work: a `:0` probe port (an OS-assigned port nothing exposes),
+/// and any [`binds_collide`] overlap with the data listener — both would otherwise
+/// surface long after parse, as an undiscoverable probe or a bare `EADDRINUSE` from the
+/// second bind. The overlap arises legitimately — a data bind on the stable probe port
+/// (`--bind 10.0.1.7:50052`, no `--health-bind`) derives the identical address (Codex
+/// P2 on #587) — so the refusals name the fix. Pure; unit-tested below.
+fn resolve_health_bind(
+    explicit: Option<&str>,
+    data_bind: SocketAddr,
+) -> Result<SocketAddr, String> {
+    let health_bind = match explicit {
+        Some(s) => s
+            .parse()
+            .map_err(|e| format!("d-server: invalid --health-bind address: {e}"))?,
+        None => default_health_bind(data_bind),
+    };
+    // Port zero would bind an OS-assigned ephemeral port that nothing exposes — the
+    // startup log and `health_bind()` keep reporting `:0` while the real listener sits
+    // where no supervisor can discover it. The probe exists to be a KNOWN address.
+    if health_bind.port() == 0 {
+        return Err(
+            "d-server: --health-bind must use a concrete port, not 0: an OS-assigned \
+             ephemeral probe port is exposed nowhere, so no supervisor could ever find it"
+                .to_string(),
+        );
+    }
+    if binds_collide(health_bind, data_bind) {
+        return Err(format!(
+            "d-server: the health probe would bind {health_bind}, which collides with --bind \
+             {data_bind} (same port; a wildcard listener occupies the port on every \
+             interface). The probe surface needs its own socket (it answers outside the \
+             data plane's admission layers); pass --health-bind with a different port{}",
+            if explicit.is_none() {
+                " (the default derives --bind's interface at the stable probe port)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if dual_stack_overlap_risk(health_bind, data_bind) {
+        eprintln!(
+            "d-server: WARNING: --health-bind {health_bind} and --bind {data_bind} share a \
+             port across IP families with an IPv6 wildcard. On a dual-stack host (Linux \
+             default, net.ipv6.bindv6only=0) the [::] listener also occupies the IPv4 \
+             port, so the second bind will fail; if that happens, give the probe its own \
+             port or set an explicit interface."
+        );
+    }
+    Ok(health_bind)
+}
+
 fn resolve_backend(parsed: &ParsedArgs) -> Result<MetadataBackend, BoxError> {
     let value = match parsed.flag("metadata-backend") {
         Some(flag) => Some(flag.to_string()),
@@ -363,7 +478,7 @@ fn usage() {
     eprintln!("usage:");
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
-    eprintln!("  wyrd d-server [--bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd]");
+    eprintln!("  wyrd d-server [--bind ADDR] [--health-bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd] [--max-concurrent-requests N] [--request-timeout-secs N] [--otlp-endpoint URL]");
     eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore] [--gc-expired-pending]");
     eprintln!("      --reconcile-after-restore runs ONE post-restore reconciliation pass and exits (#551): after");
     eprintln!("      restoring metadata from a backup, with the writers STOPPED. It marks fragments the restore");
@@ -374,7 +489,7 @@ fn usage() {
     eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
     eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
     eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  every command also accepts:");
@@ -623,6 +738,18 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         .unwrap_or(DEFAULT_DSERVER_BIND)
         .parse()
         .map_err(|e| format!("d-server: invalid --bind address: {e}"))?;
+    // The stable, operator-configurable address the `grpc.health.v1.Health` probe
+    // surface binds (proposal 0010 item 7, issue #576) — a SEPARATE socket from `--bind`
+    // so the probe answers outside the data-plane admission layers, and a KNOWN address
+    // a deployment supervisor (systemd/k8s/LB) can dial rather than an ephemeral one it
+    // cannot discover. Unset, the default FOLLOWS `--bind`'s interface (at the stable
+    // probe port): a supervisor dials the probe from the SAME network position data
+    // clients dial from, so a container/pod that binds data on `0.0.0.0` must not get a
+    // probe hidden on container loopback — Docker port-forwards, k8s gRPC probes, and
+    // external LBs all connect to the pod IP and would read connection-refused (Codex P1
+    // on #587). A loopback data bind keeps a loopback probe: the derivation never
+    // exposes an interface the operator did not already choose.
+    let health_bind: SocketAddr = resolve_health_bind(parsed.flag("health-bind"), bind)?;
     // The endpoint to REGISTER for discovery, decoupled from `bind` above (#458):
     // a routable DNS service name or NAT-mapped address, not necessarily a
     // `SocketAddr` `bind` could parse (a container's wildcard bind has no such
@@ -666,6 +793,16 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
         ..dserver::AdmissionControl::default()
     };
 
+    // The export surface, selected exactly as `cmd_custodian` selects its own
+    // (`cli.rs:797-802`): Prometheus always, plus OTLP push when `--otlp-endpoint` names a
+    // collector. No backend hardcoded (ADR-0012).
+    let exporter = match parsed.flag("otlp-endpoint") {
+        Some(endpoint) => ExporterConfig::Both {
+            otlp_endpoint: endpoint.to_string(),
+        },
+        None => ExporterConfig::Prometheus,
+    };
+
     let chunk_dir = Path::new(data_dir).join("chunks");
     let store = FsChunkStore::open(&chunk_dir)?;
 
@@ -680,19 +817,27 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let params = DServerParams {
-        bind,
-        advertise_addr,
-        dserver_id,
-        failure_domain,
-        admission,
-        group: group.to_string(),
-        lease_ttl,
-        renew_interval,
-        data_dir: data_dir.to_string(),
-    };
     runtime.block_on(async move {
-        match coordination {
+        // **The metrics provider this role was missing** — the item-3 enabler. `init_global`
+        // gives every role the LOG layers (#527); until now only `cmd_custodian` built a
+        // `DurabilityTelemetry`, so the d-server's admission decisions had nowhere to land
+        // even once instrumented. Built inside the runtime (the OTLP exporter's tonic
+        // transport is constructed there).
+        let telemetry = DurabilityTelemetry::new(exporter)?;
+        let params = DServerParams {
+            bind,
+            health_bind,
+            advertise_addr,
+            dserver_id,
+            failure_domain,
+            admission,
+            group: group.to_string(),
+            lease_ttl,
+            renew_interval,
+            data_dir: data_dir.to_string(),
+            metrics: Some(telemetry.metrics_dispatch()),
+        };
+        let served = match coordination {
             CoordinationBackend::Mem => {
                 run_d_server(Arc::new(MemCoordination::new()), store, params).await
             }
@@ -700,7 +845,11 @@ fn cmd_d_server(args: &[String]) -> Result<ExitCode, BoxError> {
             CoordinationBackend::Etcd => {
                 run_d_server(Arc::new(open_etcd_coordination().await?), store, params).await
             }
-        }
+        };
+        // Hold the handle for the role's whole life: it owns the export readers the
+        // capacity-plane metrics are exported through.
+        drop(telemetry);
+        served
     })?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1342,6 +1491,10 @@ fn parse_str_list(raw: Option<&str>) -> Vec<String> {
 /// over the coordination concrete without a long argument list.
 struct DServerParams {
     bind: SocketAddr,
+    /// The stable, operator-configurable address the `grpc.health.v1.Health` probe
+    /// surface binds (proposal 0010 item 7) — a separate socket from `bind`, answered
+    /// outside the data-plane admission layers.
+    health_bind: SocketAddr,
     /// The endpoint to register for discovery, decoupled from `bind` (#458). `None`
     /// leaves the registered endpoint at the bound-address value (today's loopback
     /// behaviour); `Some` overrides it (a routable DNS name / NAT-mapped address).
@@ -1353,6 +1506,9 @@ struct DServerParams {
     lease_ttl: Duration,
     renew_interval: Duration,
     data_dir: String,
+    /// The role's metrics sink, which the capacity plane emits its admission signals into
+    /// (proposal 0010 item 5). `None` ⇒ the ambient subscriber (an in-process caller).
+    metrics: Option<tracing::Dispatch>,
 }
 
 /// Host the local filesystem `ChunkStore` over gRPC and register through the given
@@ -1371,14 +1527,21 @@ where
     let mut server = DServer::bind(store, params.bind)
         .await?
         .with_identity(params.dserver_id, params.failure_domain)
-        .with_admission_control(params.admission);
+        .with_admission_control(params.admission)
+        .with_health_bind(params.health_bind);
     if let Some(advertise_addr) = params.advertise_addr {
         server = server.with_advertise_addr(advertise_addr);
     }
+    if let Some(metrics) = params.metrics {
+        server = server.with_metrics_dispatch(metrics);
+    }
     eprintln!(
-        "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {})",
+        "wyrd d-server: serving gRPC ChunkStore on {} (data-dir {}); \
+         grpc.health.v1 readiness/liveness probe on http://{}",
         server.endpoint(),
-        params.data_dir
+        params.data_dir,
+        // The role always configures a health bind (defaulted above), so this is `Some`.
+        params.health_bind,
     );
     let lease = server
         .register(&*coord, &params.group, params.lease_ttl)
@@ -1744,8 +1907,27 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
         secret_access_key: secret_key,
     }];
 
+    // The export surface, selected exactly as `cmd_custodian` selects its own
+    // (`cli.rs:797-802`): a Prometheus registry is always wired (in-process read-back);
+    // `--otlp-endpoint` additionally pushes to a collector (the production path). No backend
+    // is hardcoded (ADR-0012) — the role picks, the emitting crates never name one.
+    let exporter = match parsed.flag("otlp-endpoint") {
+        Some(endpoint) => ExporterConfig::Both {
+            otlp_endpoint: endpoint.to_string(),
+        },
+        None => ExporterConfig::Prometheus,
+    };
+
     let runtime = tokio_runtime()?;
     runtime.block_on(async move {
+        // **The metrics provider this role was missing.** `init_global` (`cli.rs:358`)
+        // installs the LOG layers at every role entry (#527), but a metrics provider was
+        // wired only in `cmd_custodian` — so the S3 front door's instrumentation, however
+        // complete, emitted into a subscriber with no bridge and reported nothing. This is
+        // the item-3 enabler items 4-5 need to be observable at all. Built inside the runtime
+        // because the OTLP exporter's tonic transport is constructed there.
+        let telemetry = DurabilityTelemetry::new(exporter)?;
+        let metrics = telemetry.metrics_dispatch();
         let listener = tokio::net::TcpListener::bind(listen).await?;
         eprintln!(
             "wyrd s3: serving S3-compatible HTTP on {} (data-dir {data_dir})",
@@ -1771,7 +1953,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             dservers = endpoints.as_deref().map_or(0, <[String]>::len),
             "role started",
         );
-        serve_s3_role(
+        let served = serve_s3_role(
             backend,
             coordination,
             data_dir,
@@ -1779,8 +1961,14 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             credentials,
             region,
             listener,
+            Some(metrics),
         )
-        .await
+        .await;
+        // Hold the handle for the role's whole life: it owns the readers (the Prometheus
+        // registry and the OTLP `PeriodicReader`) that the emitted metrics are exported
+        // through.
+        drop(telemetry);
+        served
     })?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1800,6 +1988,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
 ///
 /// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
 /// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_s3_role(
     backend: MetadataBackend,
     coordination: CoordinationBackend,
@@ -1808,6 +1997,7 @@ pub async fn serve_s3_role(
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
+    metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError> {
     match endpoints {
         // Cluster front door: the chunk plane is the gRPC fan-out over the configured
@@ -1823,6 +2013,7 @@ pub async fn serve_s3_role(
                 credentials,
                 region,
                 listener,
+                metrics,
             )
             .await
         }
@@ -1838,6 +2029,7 @@ pub async fn serve_s3_role(
                 credentials,
                 region,
                 listener,
+                metrics,
             )
             .await
         }
@@ -1851,6 +2043,7 @@ pub async fn serve_s3_role(
 /// roles' single-axis matches are (`cluster_put` `cli.rs:1266`, `cmd_d_server`
 /// `cli.rs:530`), so the default build compiles only the redb + mem arm and the
 /// production `tikv` + `etcd` arms build under their respective cargo features.
+#[allow(clippy::too_many_arguments)]
 async fn serve_s3_dispatch<C>(
     backend: MetadataBackend,
     coordination: CoordinationBackend,
@@ -1859,6 +2052,7 @@ async fn serve_s3_dispatch<C>(
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
+    metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError>
 where
     C: PlacementChunkStore + Send + Sync + 'static,
@@ -1867,40 +2061,40 @@ where
         (MetadataBackend::Redb, CoordinationBackend::Mem) => {
             let meta = open_local_meta_redb(data_dir)?;
             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "tikv")]
         (MetadataBackend::Tikv, CoordinationBackend::Mem) => {
             let meta = open_tikv_meta().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "etcd")]
         (MetadataBackend::Redb, CoordinationBackend::Etcd) => {
             let meta = open_local_meta_redb(data_dir)?;
             let coord = open_etcd_coordination().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "tikv", feature = "etcd"))]
         (MetadataBackend::Tikv, CoordinationBackend::Etcd) => {
             let meta = open_tikv_meta().await?;
             let coord = open_etcd_coordination().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "fdb")]
         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
             let meta = open_fdb_meta().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "fdb", feature = "etcd"))]
         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
             let meta = open_fdb_meta().await?;
             let coord = open_etcd_coordination().await?;
             let gateway = Arc::new(Gateway::new(meta, chunks, coord));
-            serve_s3(gateway, credentials, region, listener).await
+            serve_s3(gateway, credentials, region, listener, metrics).await
         }
     }
 }
@@ -1916,6 +2110,7 @@ pub async fn serve_s3<M, C, Co>(
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
+    metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError>
 where
     M: MetadataStore + Send + Sync + 'static,
@@ -1930,7 +2125,13 @@ where
     gateway.recover().await?;
     let mut config = s3::S3Config::new(credentials);
     config.region = region;
-    let server = s3::S3Gateway::new(gateway, config);
+    // The request plane's sink (observability floor, item 4 + the item-3 role wiring): the
+    // front door emits its RED metrics into the role's telemetry handle. `None` leaves them on
+    // the ambient subscriber -- the composition an in-process caller gets.
+    let mut server = s3::S3Gateway::new(gateway, config);
+    if let Some(metrics) = metrics {
+        server = server.with_metrics_dispatch(metrics);
+    }
     server.serve(listener).await?;
     Ok(())
 }
@@ -2082,6 +2283,129 @@ impl ParsedArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe's default bind follows `--bind`'s interface at the stable probe port:
+    /// a wildcard data bind must yield a wildcard probe (a container-loopback probe is
+    /// unreachable by every supervisor that dials the pod IP — Codex P1 on #587), and a
+    /// loopback data bind must keep a loopback probe (the derivation never exposes an
+    /// interface the operator did not already choose).
+    #[test]
+    fn the_default_health_bind_follows_the_data_bind_interface() {
+        let wildcard = default_health_bind("0.0.0.0:50051".parse().unwrap());
+        assert_eq!(wildcard, "0.0.0.0:50052".parse().unwrap());
+        let loopback = default_health_bind("127.0.0.1:50051".parse().unwrap());
+        assert_eq!(loopback, "127.0.0.1:50052".parse().unwrap());
+        // The interface follows --bind; the PORT is the stable documented probe port —
+        // independent of the data port, so a nonstandard data port cannot collide.
+        let odd_port = default_health_bind("10.0.1.7:9000".parse().unwrap());
+        assert_eq!(odd_port, "10.0.1.7:50052".parse().unwrap());
+        // IPv6 data binds derive IPv6 probe binds.
+        let v6 = default_health_bind("[::]:50051".parse().unwrap());
+        assert_eq!(v6, "[::]:50052".parse().unwrap());
+        // A scoped link-local bind KEEPS its scope: the scope names the interface, and
+        // a derived `[fe80::1]:50052` without it commonly cannot bind at all.
+        let scoped = default_health_bind("[fe80::1%2]:50051".parse().unwrap());
+        assert_eq!(scoped, "[fe80::1%2]:50052".parse().unwrap());
+        match scoped {
+            std::net::SocketAddr::V6(v6) => assert_eq!(v6.scope_id(), 2),
+            std::net::SocketAddr::V4(_) => unreachable!("a v6 bind derives a v6 probe"),
+        }
+    }
+
+    /// The probe may never silently share the data listener's socket: a data bind ON
+    /// the stable probe port derives an identical address (Codex P2 on #587), and an
+    /// explicit `--health-bind` equal to `--bind` is the same mistake spelled out —
+    /// both must refuse at parse with the fix named, not surface later as a bare
+    /// `EADDRINUSE` from the second bind.
+    #[test]
+    fn a_probe_data_address_collision_refuses_at_parse() {
+        // Derived collision: data plane parked on the stable probe port.
+        let err = resolve_health_bind(None, "10.0.1.7:50052".parse().unwrap())
+            .expect_err("a derived collision must refuse");
+        assert!(err.contains("--health-bind") && err.contains("collides with --bind"));
+        // Explicit collision.
+        resolve_health_bind(Some("10.0.1.7:50051"), "10.0.1.7:50051".parse().unwrap())
+            .expect_err("an explicit collision must refuse");
+        // The healthy paths still resolve: derived...
+        assert_eq!(
+            resolve_health_bind(None, "0.0.0.0:50051".parse().unwrap()).unwrap(),
+            "0.0.0.0:50052".parse().unwrap()
+        );
+        // ...and explicit.
+        assert_eq!(
+            resolve_health_bind(Some("10.0.1.7:9000"), "10.0.1.7:50051".parse().unwrap()).unwrap(),
+            "10.0.1.7:9000".parse().unwrap()
+        );
+    }
+
+    /// The collision guard must see through wildcards: a wildcard listener occupies its
+    /// port on EVERY interface, so `--bind 0.0.0.0:50051 --health-bind 127.0.0.1:50051`
+    /// fails at the second bind despite unequal addresses (Codex P2 on #587) — in either
+    /// direction. Distinct concrete IPs on one port coexist and must stay accepted.
+    #[test]
+    fn wildcard_probe_data_overlaps_refuse_and_distinct_ips_coexist() {
+        // Wildcard data listener vs loopback probe, same port: refused.
+        resolve_health_bind(Some("127.0.0.1:50051"), "0.0.0.0:50051".parse().unwrap())
+            .expect_err("a wildcard data bind occupies the probe's port on every interface");
+        // The mirror image: wildcard probe vs concrete data bind, same port.
+        resolve_health_bind(Some("0.0.0.0:50051"), "10.0.1.7:50051".parse().unwrap())
+            .expect_err("a wildcard probe bind would collide with the data listener");
+        // Distinct concrete IPs on one port genuinely coexist: accepted.
+        assert_eq!(
+            resolve_health_bind(Some("10.0.1.8:50051"), "10.0.1.7:50051".parse().unwrap()).unwrap(),
+            "10.0.1.8:50051".parse().unwrap()
+        );
+        // Families are distinguished: an IPv4 wildcard never covers an IPv6 listener,
+        // so 0.0.0.0 + [::1] on one port coexist...
+        assert_eq!(
+            resolve_health_bind(Some("[::1]:50051"), "0.0.0.0:50051".parse().unwrap()).unwrap(),
+            "[::1]:50051".parse().unwrap()
+        );
+        // ...and the [::]-vs-IPv4 pair is NOT refused at parse — whether it collides
+        // depends on the host's IPV6_V6ONLY posture, so the CLI warns and lets the
+        // actual bind adjudicate. The risk predicate itself is pinned separately.
+        assert!(
+            resolve_health_bind(Some("127.0.0.1:50051"), "[::]:50051".parse().unwrap()).is_ok(),
+            "a platform-dependent overlap must not hard-refuse at parse"
+        );
+    }
+
+    /// The dual-stack risk predicate: fires only for an IPv6 wildcard sharing a port
+    /// across families (either direction) — the one pair whose collision depends on
+    /// the host's `IPV6_V6ONLY` posture and therefore WARNS instead of refusing.
+    #[test]
+    fn dual_stack_overlap_risk_fires_only_for_the_v6_wildcard_cross_family() {
+        let risk =
+            |a: &str, b: &str| dual_stack_overlap_risk(a.parse().unwrap(), b.parse().unwrap());
+        assert!(risk("[::]:50051", "127.0.0.1:50051"));
+        assert!(risk("10.0.1.7:50051", "[::]:50051"));
+        // A concrete v6 address, a v4 wildcard, or distinct ports: no dual-stack risk.
+        assert!(!risk("[::1]:50051", "0.0.0.0:50051"));
+        assert!(!risk("0.0.0.0:50051", "[::1]:50051"));
+        assert!(!risk("[::]:50052", "127.0.0.1:50051"));
+        // Same-family pairs are binds_collide's business, not this predicate's.
+        assert!(!risk("0.0.0.0:50051", "127.0.0.1:50051"));
+    }
+
+    /// Scoped link-local IPv6 addresses collide only when the SCOPE matches too:
+    /// `[fe80::1%2]` and `[fe80::1%3]` are one `Ipv6Addr` on two different interfaces
+    /// and coexist — comparing `.ip()` alone would declare a false certain collision.
+    #[test]
+    fn scoped_ipv6_binds_collide_only_within_one_scope() {
+        let collide = |a: &str, b: &str| binds_collide(a.parse().unwrap(), b.parse().unwrap());
+        assert!(!collide("[fe80::1%2]:50051", "[fe80::1%3]:50051"));
+        assert!(collide("[fe80::1%2]:50051", "[fe80::1%2]:50051"));
+    }
+
+    /// A `:0` probe port binds an OS-assigned ephemeral port that nothing exposes — the
+    /// startup log and `health_bind()` keep reporting `:0` while the real listener sits
+    /// where no supervisor can discover it (Codex P2 on #587). Refused at parse.
+    #[test]
+    fn an_ephemeral_probe_port_refuses_at_parse() {
+        let err = resolve_health_bind(Some("127.0.0.1:0"), "127.0.0.1:50051".parse().unwrap())
+            .expect_err("port 0 must refuse — an undiscoverable probe defeats its purpose");
+        assert!(err.contains("concrete port"));
+    }
 
     /// The #551 one-shot is a VALUELESS flag — and adding it must not weaken the guard that a
     /// dangling VALUE flag still fails (#531). Both halves, because the tempting shortcut

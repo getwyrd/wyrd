@@ -96,6 +96,10 @@ tokio.workspace = true
 tokio-stream.workspace = true
 # The transport that hosts the gRPC ChunkStore service for the `d-server` role.
 tonic.workspace = true
+http-body.workspace = true
+# The standard `grpc.health.v1` liveness/readiness probe surface the d-server role
+# serves alongside `ChunkStoreServer` (proposal 0010 item 7, issue #576).
+tonic-health.workspace = true
 # Tower middleware for the d-server's fail-closed admission control (issue #205,
 # architecture §8.9): a server-wide concurrency bound + load-shedding applied to
 # the tonic service stack via `Server::layer`.
