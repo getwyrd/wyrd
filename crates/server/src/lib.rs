@@ -37,7 +37,7 @@ use wyrd_traits::{
 // The client-facing gateway seam this crate composes concretes behind (ADR-0010). The S3
 // wire surface (`wyrd-gateway-s3`) is generic over `ObjectGateway`; `Gateway` implements it.
 pub use wyrd_gateway_core::GatewayError;
-use wyrd_gateway_core::{ContentHash, ObjectGateway, ObjectRead};
+use wyrd_gateway_core::{ContentHash, ObjectGateway, ObjectMeta, ObjectRead};
 
 /// The root inode every object key is bound under — a flat namespace at M0.
 const ROOT: InodeId = 0;
@@ -381,6 +381,25 @@ where
             etag,
             content_type,
             modified,
+        }))
+    }
+
+    /// HEAD, **metadata only**: resolve `key`'s committed inode and answer its size, ETag,
+    /// content type, and publication time — without walking its `chunk_map` or reading any
+    /// fragment (issue #506). This is exactly the metadata-resolution half of
+    /// [`get_object_streaming`](Self::get_object_streaming) (the shared
+    /// [`read::committed_inode`] lookup above) with the fragment-streaming half
+    /// (channel + spawned reader task) omitted, so a HEAD of a large object costs one
+    /// metadata round-trip, not a chunk read.
+    async fn head_object(&self, key: &str) -> Result<Option<ObjectMeta>> {
+        let Some(inode) = read::committed_inode(&self.meta, ROOT, key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(ObjectMeta {
+            size: inode.size,
+            etag: inode.etag,
+            content_type: inode.content_type,
+            modified: inode.modified,
         }))
     }
 
