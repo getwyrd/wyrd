@@ -29,6 +29,7 @@ use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use prometheus::Encoder;
 use tracing_opentelemetry::MetricsLayer;
+use tracing_subscriber::layer::SubscriberExt;
 
 /// The instrumentation scope name the durability-plane meters live under. Other
 /// planes (request / capacity) attach their own scope through the same provider.
@@ -128,6 +129,34 @@ impl DurabilityTelemetry {
         S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
     {
         MetricsLayer::new(self.provider.clone())
+    }
+
+    /// A **metrics-only** `tracing` [`Dispatch`](tracing::Dispatch) over this handle's
+    /// bridge — the sink a *server* role hands to instrumentation running in tasks the
+    /// role does not own.
+    ///
+    /// [`metrics_layer`](Self::metrics_layer) is composed into a role's own subscriber when
+    /// the role drives the instrumented code itself: the custodian wraps each reconciliation
+    /// pass in one scoped dispatch (`crates/server/src/custodian.rs:310`), and a scoped
+    /// dispatch is a thread-local that a pass inherits because the pass *is* the task. A
+    /// server role cannot do that. `tonic` and `axum` `tokio::spawn` a task **per
+    /// connection** (`tonic-0.14.6` `src/transport/server/mod.rs:925`), and a spawned task
+    /// does not inherit the spawner's scoped dispatch — so a `with_subscriber` around the
+    /// serve future would reach no handler, and the request/capacity planes would emit into
+    /// whatever global subscriber happened to be installed. Instead they **carry** this
+    /// dispatch and enter it around each (synchronous) metric emission, which works from any
+    /// task and keeps each server's telemetry its own — the same per-provider isolation the
+    /// custodian's read-back tests rely on.
+    ///
+    /// It is metrics-**only** on purpose, and that is the difference from
+    /// `CustodianService::with_logging`'s log+metrics dispatch. That one is *current* for a
+    /// whole pass, so it must carry the log layers or it would swallow the pass's audit
+    /// lines. This one is current for exactly one `tracing` metric event, so composing a
+    /// `fmt` layer in would only echo every metric onto stderr as a second log row — one
+    /// extra line per request on a hot path. Everything else a role logs keeps going to the
+    /// process-global subscriber (#527), untouched.
+    pub fn metrics_dispatch(&self) -> tracing::Dispatch {
+        tracing::Dispatch::new(tracing_subscriber::registry().with(self.metrics_layer()))
     }
 
     /// Force the meter provider to flush its readers (collect + export). Returns the
