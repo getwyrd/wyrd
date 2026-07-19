@@ -72,7 +72,9 @@ use axum::response::Response;
 use axum::Router;
 use futures_util::StreamExt;
 use tracing::Instrument;
-use wyrd_gateway_core::{ContentHash, GatewayError, ObjectGateway, ObjectMeta, ObjectRead};
+use wyrd_gateway_core::{
+    ContentHash, GatewayError, ListedObject, ObjectGateway, ObjectMeta, ObjectRead,
+};
 use wyrd_traits::{BoxError, ErrorClass};
 
 use crate::request_id::{RequestId, RequestIds};
@@ -320,49 +322,88 @@ fn emit_request_red(
 
 /// The S3 subresource / multipart query keys this object-only floor does not implement.
 /// A request carrying any of them is refused (501) rather than falling through to a plain
-/// object PUT/GET/DELETE, which would mishandle it — destructively for `PUT ?partNumber`
-/// (UploadPart) and `DELETE ?tagging`. Returns the first offending key found. Benign
-/// params a normal SDK adds to ordinary object requests (e.g. `x-id=PutObject`) are not
-/// listed, so they still pass; this is a denylist of unsupported operations, not a ban on
-/// all query strings.
+/// object PUT/GET/DELETE (or, on the bucket route, a listing), which would mishandle it —
+/// destructively for `PUT ?partNumber` (UploadPart) and `DELETE ?tagging`, and silently for
+/// `GET /bucket?acl` (would read a listing document). Benign params a normal SDK adds to
+/// ordinary requests (e.g. `x-id=PutObject`) are not listed, so they still pass; this is a
+/// denylist of unsupported operations, not a ban on all query strings.
+const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
+    "uploads",
+    "uploadId",
+    "partNumber",
+    "tagging",
+    "acl",
+    "versions",
+    "versionId",
+    "cors",
+    "lifecycle",
+    "policy",
+    "website",
+    "location",
+    "delete",
+    "restore",
+    "select",
+    "retention",
+    "legal-hold",
+    "torrent",
+    "accelerate",
+    "logging",
+    "notification",
+    "replication",
+    "encryption",
+    "requestPayment",
+    "analytics",
+    "inventory",
+    "metrics",
+    "object-lock",
+    "publicAccessBlock",
+    "attributes",
+    // Bucket-level subresource GETs whose query key differs from the object-level spelling
+    // above: without these a `GET /bucket?versioning` (and the rest) slips past the bucket
+    // route's fence and is answered with a `<ListBucketResult>` instead of a clean `501`,
+    // dying in the client's XML decoder (`expected VersioningConfiguration`) — the "bucket
+    // subresource op silently answered with a listing" the routing decision forbids (issue
+    // #507 adversary). `versions` (object versions) is spelled differently from `versioning`
+    // (bucket versioning config), so both must be listed.
+    "versioning",
+    "intelligent-tiering",
+    "ownershipControls",
+    "policyStatus",
+    "metadataTable",
+];
+
+/// The first [`UNSUPPORTED_SUBRESOURCES`] query key present in `query`, matching **raw**
+/// (un-decoded) keys. Used on the OBJECT path (PUT/GET/DELETE), where a missed subresource
+/// falls through to the plain verb rather than to a listing — so this is a raw match, not the
+/// percent-decoding one the bucket route needs ([`unsupported_subresource_decoded`]).
+///
+/// The residual (adversary, not pressed): a client that percent-encodes a subresource key
+/// (`?part%4Eumber`) dodges this raw match and the request executes as a plain object verb.
+/// It is not a listing-disclosure like the bucket route's gap — only a fully-credentialed
+/// client that deliberately encodes the key can reach it, and such a client can issue the
+/// plain verb directly anyway, so a raw match is adequate HERE (unlike the bucket route).
+/// Returns the first offending key found.
 fn unsupported_subresource(query: &str) -> Option<&str> {
-    const SUBRESOURCES: &[&str] = &[
-        "uploads",
-        "uploadId",
-        "partNumber",
-        "tagging",
-        "acl",
-        "versions",
-        "versionId",
-        "cors",
-        "lifecycle",
-        "policy",
-        "website",
-        "location",
-        "delete",
-        "restore",
-        "select",
-        "retention",
-        "legal-hold",
-        "torrent",
-        "accelerate",
-        "logging",
-        "notification",
-        "replication",
-        "encryption",
-        "requestPayment",
-        "analytics",
-        "inventory",
-        "metrics",
-        "object-lock",
-        "publicAccessBlock",
-        "attributes",
-    ];
     query
         .split('&')
         .filter(|p| !p.is_empty())
         .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
-        .find(|k| SUBRESOURCES.contains(k))
+        .find(|k| UNSUPPORTED_SUBRESOURCES.contains(k))
+}
+
+/// Like [`unsupported_subresource`] but matches against **percent-decoded** query keys, so a
+/// bucket subresource cannot slip past the listing route by percent-encoding its name
+/// (`GET /bucket?%61cl`, `GET /bucket?upload%73`). The bucket route routes anything not on the
+/// denylist to a listing, so an encoded `?acl` that dodged a raw match would be answered with
+/// a listing document — precisely the "bucket subresource op silently answered with a listing"
+/// the routing decision forbids (issue #507 adversarial finding). Returns the decoded key.
+fn unsupported_subresource_decoded(query: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
+        .map(percent_decode_utf8)
+        .find(|k| UNSUPPORTED_SUBRESOURCES.contains(&k.as_str()))
 }
 
 /// Split a request path `/{bucket}/{key}` into `(bucket, key)`. `key` may itself contain
@@ -374,6 +415,633 @@ fn split_bucket_key(path: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((bucket, key))
+}
+
+/// The bucket name for a **bucket-scoped** path (`/{bucket}` or `/{bucket}/`), or `None`
+/// for an object path (`/{bucket}/{key}`, non-empty key) or the empty path (`/`). The
+/// counterpart to [`split_bucket_key`]: that one names objects, this one names buckets, and
+/// the two partition every path so the dispatcher routes a listing without touching the
+/// object-path guard (issue #507). The returned name is still percent-encoded — the caller
+/// decodes it, exactly as the object path is decoded.
+fn bucket_scoped_path(path: &str) -> Option<&str> {
+    // Strip EXACTLY the one leading `/` an HTTP request-target always carries, not every
+    // leading slash: `trim_start_matches('/')` would fold `//bucket` down to `bucket` and
+    // answer it as a listing, hiding the empty-bucket-segment forms this match rejects
+    // (issue #507 sign-off adversary). With a single strip, `//bucket` keeps its empty first
+    // segment and falls through to the object-path guard's error instead of a bogus 200.
+    let trimmed = path.strip_prefix('/')?;
+    match trimmed.split_once('/') {
+        // `/{bucket}/{key}` with a non-empty key → an OBJECT path; not bucket-scoped. A
+        // double-slash path `//{key}` lands here too — empty bucket segment, non-empty
+        // remainder — so it is refused a listing and falls to the object-path guard's error.
+        Some((_, key)) if !key.is_empty() => None,
+        // `/{bucket}/` → bucket-scoped (a trailing slash, empty key).
+        Some((bucket, _)) if !bucket.is_empty() => Some(bucket),
+        // `//` — an empty bucket segment (and empty key) → neither. Reachable now that only
+        // the single leading `/` is stripped (was dead under `trim_start_matches`).
+        Some(_) => None,
+        // `/{bucket}` (no slash at all) → bucket-scoped; `/` (empty) → neither.
+        None => (!trimmed.is_empty()).then_some(trimmed),
+    }
+}
+
+/// The percent-decoded value of query parameter `name` (first occurrence), or `None` if
+/// absent or valueless. S3 percent-encodes `prefix`/`delimiter`/`continuation-token` values,
+/// so they are decoded with the same [`percent_decode_utf8`] the object path uses (`+` is a
+/// literal, not a space — an S3 key/token is a path value, not form data).
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter_map(|p| p.split_once('='))
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| percent_decode_utf8(v))
+}
+
+/// Render `epoch_millis` as an ISO-8601 / RFC-3339 UTC instant
+/// (`2009-10-12T17:50:30.000Z`) — the shape S3 uses for a listing's `<LastModified>`
+/// (distinct from the IMF-fixdate [`http_date`] uses for the `Last-Modified` *header*).
+/// Shares [`civil_from_days`] with `http_date`, so no date dependency is pulled in.
+fn iso8601(epoch_millis: u64) -> String {
+    const SECS_PER_DAY: u64 = 86_400;
+    let secs = epoch_millis / 1_000;
+    let millis = epoch_millis % 1_000;
+    let days = (secs / SECS_PER_DAY) as i64;
+    let sod = secs % SECS_PER_DAY;
+    let (hour, minute, second) = (sod / 3_600, (sod % 3_600) / 60, sod % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+/// One computed listing page: the `<Contents>` rows, the `<CommonPrefixes>` (delimiter
+/// rollups), whether the listing was truncated at `max-keys`, and TWO resume points that
+/// coincide except at a delimiter rollup:
+///
+/// * `next_key` — the last underlying object key **consumed** (raw). This is the v2
+///   continuation token's payload: because a common-prefix rollup is emitted for a WHOLE
+///   contiguous group at once, resuming strictly after that group's last raw key skips the
+///   entire rollup and can never re-emit it on the next page (ADR-0046 codex finding).
+/// * `next_marker` — the last item **returned**: the common prefix when the last entry was a
+///   delimiter rollup, else the last content key. This is v1's `<NextMarker>` — AWS emits the
+///   rollup's prefix (`a/`), not its last raw key (`a/2`), and a client that stores and
+///   resends that prefix as `marker` must skip the whole group, not re-receive it (issue #507
+///   adversary). [`compute_page`]'s resume filter handles a marker naming a common prefix.
+struct ListPage<'a> {
+    contents: Vec<&'a ListedObject>,
+    common_prefixes: Vec<String>,
+    is_truncated: bool,
+    next_key: Option<String>,
+    next_marker: Option<String>,
+}
+
+/// Which resume mechanism produced `resume_after`, distinguishing the two delimiter-group
+/// collapse rules (issue #507 Delta 2). The `resume == cp` whole-group collapse is valid ONLY
+/// for the server-issued v1 `NextMarker`, which names the common prefix (`a/`) by design; a
+/// CLIENT-chosen v2 `start-after` exactly equal to a common prefix (`start-after=a/`, the
+/// folder-marker workflow) must NOT collapse the group — AWS applies `start-after` to the raw
+/// keyspace before rollup, so a surviving key still rolls up. A server-issued v2
+/// `continuation-token` always encodes the last raw CONSUMED key, so it collapses the group via
+/// the `resume >= last_raw` clause alone — no v2 behaviour depends on the `== cp` clause.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResumeKind {
+    /// v2 `start-after` / `continuation-token` — the `resume == cp` group collapse does NOT
+    /// apply (a `start-after` equal to a common prefix keeps the group; a v2 token collapses it
+    /// via `>= last_raw`).
+    V2,
+    /// v1 `marker` — the server-issued `NextMarker` may be the common prefix itself, so
+    /// `resume == cp` legitimately collapses the whole group.
+    V1Marker,
+}
+
+/// Compute one listing page over the container's complete, already-sorted key set —
+/// `prefix` filter, `delimiter` common-prefix rollups, the **combined** `max-keys` slice
+/// (`Contents` + `CommonPrefixes` counted together), and the resume point. Pure over its
+/// inputs so the wire behaviour is exercised by the SDK-driven integration test end to end.
+fn compute_page<'a>(
+    objects: &'a [ListedObject],
+    prefix: &str,
+    delimiter: Option<&str>,
+    resume_after: Option<&str>,
+    resume_kind: ResumeKind,
+    max_keys: usize,
+) -> ListPage<'a> {
+    // S3: `max-keys=0` is a valid request for zero keys — it returns an empty, **non-truncated**
+    // page (`KeyCount=0`, `IsTruncated=false`, no continuation token). A truncated page MUST
+    // always carry a resume point; a zero budget has none, so flagging it truncated would wedge
+    // a conforming paginator that re-sends while `IsTruncated` with no token to advance
+    // (issue #507 adversary). Handle it before the loop so the budget check never trips at 0.
+    if max_keys == 0 {
+        return ListPage {
+            contents: Vec::new(),
+            common_prefixes: Vec::new(),
+            is_truncated: false,
+            next_key: None,
+            next_marker: None,
+        };
+    }
+
+    // `objects` arrives lexicographically sorted from the seam; keep that order (filtering only
+    // by `prefix`). The resume skip is applied per emitted item/group INSIDE the loop rather
+    // than as a pre-filter on raw keys, so a `resume_after` that names a common prefix (`a/`,
+    // AWS's v1 `NextMarker` for a rollup) skips the WHOLE `a/…` group — a pre-filter of
+    // `key > "a/"` would keep `a/1`, `a/2` and re-emit the `a/` rollup (issue #507 adversary).
+    let filtered: Vec<&ListedObject> = objects
+        .iter()
+        .filter(|o| o.key.starts_with(prefix))
+        .collect();
+
+    let mut contents = Vec::new();
+    let mut common_prefixes = Vec::new();
+    let mut count = 0usize;
+    let mut next_key = None;
+    let mut next_marker = None;
+    let mut is_truncated = false;
+
+    let mut i = 0;
+    while i < filtered.len() {
+        let obj = filtered[i];
+        let rest = &obj.key[prefix.len()..];
+        if let Some(delim) = delimiter {
+            if let Some(idx) = rest.find(delim) {
+                // Common prefix = everything up to and including the first delimiter after
+                // `prefix`. All keys sharing it are contiguous (sorted).
+                let cp = format!("{}{}", prefix, &rest[..idx + delim.len()]);
+                // Delimit the group's extent [group_start, group_end) and its last raw key.
+                let group_start = i;
+                let mut group_end = i;
+                while group_end < filtered.len() && filtered[group_end].key.starts_with(&cp) {
+                    group_end += 1;
+                }
+                let last_raw = filtered[group_end - 1].key.as_str();
+                // Skip the WHOLE group only when the resume point has genuinely consumed it. A
+                // resume at-or-past the group's last raw key (`a/2`) has consumed it under EITHER
+                // resume mechanism — that covers the server-issued v2 `continuation-token` (which
+                // always encodes the last raw consumed key) and any resume past the group. The
+                // `resume == cp` collapse (the resume value IS the common prefix `a/`) is valid
+                // ONLY for the server-issued v1 `NextMarker`, which names the common prefix by
+                // design (`ResumeKind::V1Marker`). A CLIENT-chosen v2 `start-after` equal to a
+                // common prefix (`start-after=a/`) must NOT collapse the group: AWS applies
+                // start-after to the raw keyspace BEFORE rollup, so `a/1`/`a/2` survive and roll
+                // up. Restricting `== cp` to the v1 marker path fixes the folder-marker case the
+                // iteration-4 sign-off reproduced (Delta 2, issue #507); no v2 behaviour is lost
+                // because a v2 token always satisfies `>= last_raw`.
+                let group_consumed = resume_after.is_some_and(|r| {
+                    r >= last_raw || (resume_kind == ResumeKind::V1Marker && r == cp.as_str())
+                });
+                // Otherwise filter the group's raw keys individually: the rollup survives iff at
+                // least one key is strictly after the resume point.
+                let survives = !group_consumed
+                    && match resume_after {
+                        Some(r) => filtered[group_start..group_end]
+                            .iter()
+                            .any(|o| o.key.as_str() > r),
+                        None => true,
+                    };
+                if !survives {
+                    i = group_end;
+                    continue;
+                }
+                // Budget checked only for an item we would actually emit: entering here with the
+                // budget spent means a genuine unlisted entry remains, so the page is truncated.
+                if count >= max_keys {
+                    is_truncated = true;
+                    break;
+                }
+                // Emit the group as ONE combined-count entry: the rollup is the last RETURNED
+                // item (`next_marker`, v1 `NextMarker`); the group's last raw key is the last
+                // CONSUMED key (`next_key`, the v2 token payload). The token payload stays the
+                // last raw key even when a client resume landed inside the group, so the NEXT
+                // page's v2 token (`>= last_raw`) collapses the whole group via `group_consumed`.
+                common_prefixes.push(cp.clone());
+                count += 1;
+                next_marker = Some(cp.clone());
+                next_key = Some(last_raw.to_string());
+                i = group_end;
+                continue;
+            }
+        }
+        // A plain content key already consumed by the resume point is skipped (not counted).
+        if resume_after.is_some_and(|r| obj.key.as_str() <= r) {
+            i += 1;
+            continue;
+        }
+        if count >= max_keys {
+            is_truncated = true;
+            break;
+        }
+        contents.push(obj);
+        count += 1;
+        // A content row is both the last consumed key and the last returned item.
+        next_key = Some(obj.key.clone());
+        next_marker = Some(obj.key.clone());
+        i += 1;
+    }
+
+    ListPage {
+        contents,
+        common_prefixes,
+        is_truncated,
+        next_key: if is_truncated { next_key } else { None },
+        next_marker: if is_truncated { next_marker } else { None },
+    }
+}
+
+/// Handle a bucket-scoped listing GET — ListObjectsV2 (`?list-type=2`) or the v1 shim
+/// (bare / `marker`). Parses the S3 query vocabulary, drives the neutral
+/// [`ObjectGateway::list_container`] seam, then computes grouping, the combined `max-keys`
+/// slice, and pagination wire-side (ADR-0046 seam decision) before emitting a
+/// `<ListBucketResult>` by string building (no XML dependency — a human-gated decision).
+async fn list_objects<G>(
+    state: &AppState<G>,
+    request_id: RequestId,
+    bucket: &str,
+    query: &str,
+) -> Response
+where
+    G: ObjectGateway,
+{
+    // `encoding-type` (issue #507 Delta 1). botocore injects `encoding-type=url` into EVERY
+    // ListObjects/V2 request (aws-cli, boto3, rclone), so it is load-bearing for the stock
+    // clients this feature targets — not optional. `url` turns on render-time percent-encoding
+    // of the returned `Key`/`Prefix`/`Delimiter`/`CommonPrefixes` and the resume echoes
+    // (`StartAfter`/`Marker`/`NextMarker`); the opaque continuation tokens stay untouched.
+    // Encoding is RENDER-TIME ONLY — filtering, grouping, resume comparison and token payloads
+    // all operate on raw keys. Any OTHER `encoding-type` value is a client error: AWS answers
+    // `400 InvalidArgument` (matching S3), never a silent degrade.
+    let encode = match query_param(query, "encoding-type") {
+        None => false,
+        Some(v) if v == "url" => true,
+        Some(_) => {
+            return error_response(
+                request_id,
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "the `encoding-type` parameter must be `url`",
+            )
+        }
+    };
+
+    // v2 iff `list-type=2`. `list-type` present with any OTHER value is a client error — AWS
+    // answers `400 InvalidArgument` rather than silently degrading to the v1 shim (which would
+    // hide a client bug). Absent `list-type` is the v1 shim (a bare `GET /bucket`, or `?marker`).
+    match query_param(query, "list-type") {
+        None => {}
+        Some(v) if v == "2" => {}
+        Some(_) => {
+            return error_response(
+                request_id,
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "the `list-type` parameter must be 2",
+            )
+        }
+    }
+    let is_v2 = query_param(query, "list-type").as_deref() == Some("2");
+    let prefix = query_param(query, "prefix").unwrap_or_default();
+    let delimiter = query_param(query, "delimiter").filter(|d| !d.is_empty());
+
+    // `max-keys` defaults to 1000 and clamps to it; a non-numeric value is a client error.
+    let max_keys = match query_param(query, "max-keys") {
+        None => 1000usize,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) => n.min(1000),
+            Err(_) => {
+                return error_response(
+                    request_id,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "max-keys is not a valid non-negative integer",
+                )
+            }
+        },
+    };
+
+    // The resume point. v2: the OPAQUE base64 `continuation-token` decodes to the last key of
+    // the previous page; an undecodable token is a 400, never a silent restart. v1: the raw
+    // `marker` IS a key, used verbatim.
+    let request_token = if is_v2 {
+        query_param(query, "continuation-token")
+    } else {
+        None
+    };
+    let request_marker = if is_v2 {
+        None
+    } else {
+        query_param(query, "marker")
+    };
+    // The v2 `start-after` request value, echoed back in `<StartAfter>` (AWS echoes the request
+    // parameter regardless of whether a `continuation-token` overrides it as the resume point).
+    let request_start_after = if is_v2 {
+        query_param(query, "start-after").filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let resume_after: Option<String> = if is_v2 {
+        match &request_token {
+            Some(tok) => match decode_continuation_token(tok) {
+                Some(key) => Some(key),
+                None => {
+                    return error_response(
+                        request_id,
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "the continuation-token is not valid",
+                    )
+                }
+            },
+            // No `continuation-token`: `start-after` (v2) sets the resume point for the FIRST
+            // page — the listing begins strictly AFTER this key. Not silently ignored: a
+            // `start-after` client would otherwise re-receive keys it already consumed
+            // (issue #507 carry-forward). An empty value is treated as absent. Once a
+            // `continuation-token` is present it takes precedence, and `start-after` is ignored
+            // as the resume point (AWS semantics — the stock paginator resends `StartAfter`
+            // alongside every token, so this is the NORMAL flow, not an edge; a `max(token,
+            // start-after)` blend would be wrong).
+            None => request_start_after.clone(),
+        }
+    } else {
+        request_marker.clone().filter(|m| !m.is_empty())
+    };
+    // The `resume == cp` whole-group collapse is valid only for the server-issued v1 marker
+    // (Delta 2). v2 resume (start-after / token) relies on per-key `> r` filtering plus the
+    // `>= last_raw` collapse a server-issued token always satisfies.
+    let resume_kind = if is_v2 {
+        ResumeKind::V2
+    } else {
+        ResumeKind::V1Marker
+    };
+
+    // Drive the neutral seam: the complete, sorted key set — or `None` (no bucket record).
+    let objects = match state.gateway.list_container(bucket).await {
+        Ok(Some(objects)) => objects,
+        Ok(None) => {
+            return error_response(
+                request_id,
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+            )
+        }
+        Err(err) => return gateway_error_response(request_id, &err),
+    };
+
+    let page = compute_page(
+        &objects,
+        &prefix,
+        delimiter.as_deref(),
+        resume_after.as_deref(),
+        resume_kind,
+        max_keys,
+    );
+
+    let view = ListView {
+        bucket,
+        prefix: &prefix,
+        delimiter: delimiter.as_deref(),
+        max_keys,
+        encode,
+    };
+    let xml = if is_v2 {
+        render_list_v2(
+            &view,
+            request_token.as_deref(),
+            request_start_after.as_deref(),
+            &page,
+        )
+    } else {
+        render_list_v1(&view, request_marker.as_deref().unwrap_or(""), &page)
+    };
+    list_response(xml)
+}
+
+/// Decode an opaque ListObjectsV2 continuation token back to the resume key: standard base64
+/// of the key's UTF-8 bytes. `None` when the token is not well-formed base64 or not UTF-8 —
+/// the caller answers `400 InvalidArgument` (never a silent restart from the top).
+fn decode_continuation_token(token: &str) -> Option<String> {
+    let bytes = crate::checksum::base64_decode(token)?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Encode a resume key as an opaque continuation token — standard base64 of its UTF-8 bytes.
+fn encode_continuation_token(key: &str) -> String {
+    crate::checksum::base64_encode(key.as_bytes())
+}
+
+/// Percent-encode a listing value for `encoding-type=url` (issue #507 Delta 1). RENDER-TIME
+/// ONLY — filtering, grouping, resume comparison and token payloads all use raw keys; this
+/// projects a value onto the wire. Only the unreserved set `A-Za-z0-9`, `-`, `_`, `.`, `~`
+/// plus `/` (S3 keeps a key's path separators literal) pass through unescaped; every other
+/// byte encodes as `%XX` (upper-hex) over its UTF-8 bytes — a space becomes `%20`, never `+`
+/// (botocore URL-decodes these values, so `a&b/c d` must return as `a%26b/c%20d`).
+fn url_encode_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(
+                    char::from_digit(u32::from(b >> 4), 16)
+                        .expect("nibble")
+                        .to_ascii_uppercase(),
+                );
+                out.push(
+                    char::from_digit(u32::from(b & 0x0f), 16)
+                        .expect("nibble")
+                        .to_ascii_uppercase(),
+                );
+            }
+        }
+    }
+    out
+}
+
+/// Project a listing value onto the wire: under `encoding-type=url` percent-encode it
+/// ([`url_encode_value`], Delta 1) THEN XML-escape; otherwise XML-escape only. URL-encoding
+/// leaves no XML-special byte in practice, but the XML escape stays as the outer invariant
+/// (ADR-0046 XML decision) so the output is well-formed either way.
+fn project_value(s: &str, encode: bool) -> String {
+    if encode {
+        xml_escape(&url_encode_value(s))
+    } else {
+        xml_escape(s)
+    }
+}
+
+/// Render one `<Contents>` row — key projected ([`project_value`]; URL-encoded under
+/// `encoding-type=url`), size, the S3-quoted ETag (when recorded), the ISO-8601
+/// `<LastModified>`, and a `STANDARD` storage class.
+fn render_contents(out: &mut String, obj: &ListedObject, encode: bool) {
+    out.push_str("<Contents><Key>");
+    out.push_str(&project_value(&obj.key, encode));
+    out.push_str("</Key><LastModified>");
+    out.push_str(&iso8601(obj.modified.unwrap_or(0)));
+    out.push_str("</LastModified>");
+    if let Some(etag) = &obj.etag {
+        out.push_str("<ETag>");
+        out.push_str(&xml_escape(&quote_etag(etag)));
+        out.push_str("</ETag>");
+    }
+    out.push_str("<Size>");
+    out.push_str(&obj.size.to_string());
+    out.push_str("</Size><StorageClass>STANDARD</StorageClass></Contents>");
+}
+
+/// Render the `<CommonPrefixes>` rollups (each already delimiter-terminated); each prefix is
+/// projected ([`project_value`]; URL-encoded under `encoding-type=url`).
+fn render_common_prefixes(out: &mut String, prefixes: &[String], encode: bool) {
+    for cp in prefixes {
+        out.push_str("<CommonPrefixes><Prefix>");
+        out.push_str(&project_value(cp, encode));
+        out.push_str("</Prefix></CommonPrefixes>");
+    }
+}
+
+/// The request-level fields both listing renderers echo back into `<ListBucketResult>` — the
+/// bucket name, `prefix`, `delimiter`, effective `max-keys`, and whether `encoding-type=url`
+/// is in effect. Bundled so each renderer keeps a small argument list (clippy too-many-args).
+struct ListView<'a> {
+    bucket: &'a str,
+    prefix: &'a str,
+    delimiter: Option<&'a str>,
+    max_keys: usize,
+    encode: bool,
+}
+
+/// Emit a ListObjectsV2 `<ListBucketResult>` (issue #507). `KeyCount` is the COMBINED count
+/// of `Contents` + `CommonPrefixes` returned; `NextContinuationToken` is present only when
+/// the listing was truncated, and is the opaque token for the next page. Under
+/// `encoding-type=url` (`view.encode`) the `Key`/`Prefix`/`Delimiter`/`CommonPrefixes`/
+/// `StartAfter` values are percent-encoded and an `<EncodingType>url</EncodingType>` element is
+/// emitted; the opaque `ContinuationToken`/`NextContinuationToken` are left UNTOUCHED so a
+/// returned token resumes verbatim (Delta 1).
+fn render_list_v2(
+    view: &ListView<'_>,
+    request_token: Option<&str>,
+    start_after: Option<&str>,
+    page: &ListPage<'_>,
+) -> String {
+    let encode = view.encode;
+    let key_count = page.contents.len() + page.common_prefixes.len();
+    let mut out = String::with_capacity(256 + key_count * 128);
+    out.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    out.push_str(&format!("<Name>{}</Name>", xml_escape(view.bucket)));
+    out.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        project_value(view.prefix, encode)
+    ));
+    out.push_str(&format!("<KeyCount>{key_count}</KeyCount>"));
+    out.push_str(&format!("<MaxKeys>{}</MaxKeys>", view.max_keys));
+    if let Some(delim) = view.delimiter {
+        out.push_str(&format!(
+            "<Delimiter>{}</Delimiter>",
+            project_value(delim, encode)
+        ));
+    }
+    // The `<EncodingType>` element is echoed only when the client asked for `url`, matching AWS.
+    if encode {
+        out.push_str("<EncodingType>url</EncodingType>");
+    }
+    out.push_str(&format!("<IsTruncated>{}</IsTruncated>", page.is_truncated));
+    // The opaque tokens are echoed VERBATIM (only XML-escaped, never URL-encoded) so a returned
+    // token resumes the listing exactly (Delta 1).
+    if let Some(tok) = request_token {
+        out.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            xml_escape(tok)
+        ));
+    }
+    if let Some(next) = &page.next_key {
+        out.push_str(&format!(
+            "<NextContinuationToken>{}</NextContinuationToken>",
+            xml_escape(&encode_continuation_token(next))
+        ));
+    }
+    // Echo `<StartAfter>` when the request carried it (URL-encoded under `encoding-type=url`).
+    if let Some(sa) = start_after {
+        out.push_str(&format!(
+            "<StartAfter>{}</StartAfter>",
+            project_value(sa, encode)
+        ));
+    }
+    for obj in &page.contents {
+        render_contents(&mut out, obj, encode);
+    }
+    render_common_prefixes(&mut out, &page.common_prefixes, encode);
+    out.push_str("</ListBucketResult>");
+    out
+}
+
+/// Emit a v1 ListObjects `<ListBucketResult>` — the thin compat shim (`GET /bucket`, no
+/// `list-type`). `Marker`-based rather than token-based: it echoes the request `<Marker>`
+/// and, when truncated with a delimiter, a `<NextMarker>` (the last RETURNED item — the
+/// common prefix for a rollup, `page.next_marker`) the client resends as `marker`.
+fn render_list_v1(view: &ListView<'_>, request_marker: &str, page: &ListPage<'_>) -> String {
+    let encode = view.encode;
+    let key_count = page.contents.len() + page.common_prefixes.len();
+    let mut out = String::with_capacity(256 + key_count * 128);
+    out.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    out.push_str(&format!("<Name>{}</Name>", xml_escape(view.bucket)));
+    out.push_str(&format!(
+        "<Prefix>{}</Prefix>",
+        project_value(view.prefix, encode)
+    ));
+    out.push_str(&format!(
+        "<Marker>{}</Marker>",
+        project_value(request_marker, encode)
+    ));
+    out.push_str(&format!("<MaxKeys>{}</MaxKeys>", view.max_keys));
+    if let Some(delim) = view.delimiter {
+        out.push_str(&format!(
+            "<Delimiter>{}</Delimiter>",
+            project_value(delim, encode)
+        ));
+    }
+    // The `<EncodingType>` element is echoed only when the client asked for `url`, matching AWS.
+    if encode {
+        out.push_str("<EncodingType>url</EncodingType>");
+    }
+    out.push_str(&format!("<IsTruncated>{}</IsTruncated>", page.is_truncated));
+    // AWS emits `<NextMarker>` in a v1 listing ONLY when a `delimiter` is set; without one the
+    // client resumes from the last `<Key>` of `<Contents>` itself. Emitting it unconditionally
+    // is a non-AWS superset that a conforming client ignores — match AWS and gate on delimiter
+    // (issue #507 conformance nit). The value is the last RETURNED item (`next_marker`): for a
+    // delimiter rollup that is the common prefix (`a/`), NOT the group's last raw key (`a/2`) —
+    // a client that stores `a/` and resends it as `marker` must skip the whole group, which
+    // `compute_page`'s resume filter (`resume == cp`) does on the v1 marker path (issue #507).
+    // Under `encoding-type=url` the marker echo is URL-encoded (Delta 1).
+    if let Some(next) = &page.next_marker {
+        if view.delimiter.is_some() {
+            out.push_str(&format!(
+                "<NextMarker>{}</NextMarker>",
+                project_value(next, encode)
+            ));
+        }
+    }
+    for obj in &page.contents {
+        render_contents(&mut out, obj, encode);
+    }
+    render_common_prefixes(&mut out, &page.common_prefixes, encode);
+    out.push_str("</ListBucketResult>");
+    out
+}
+
+/// A `200` XML listing response. Declares `content-length` so the access-log body wrapper
+/// ([`AccessLogged`]) accounts the transfer as complete (see [`empty_response`]).
+fn list_response(xml: String) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .header("content-length", xml.len().to_string())
+        .body(Body::from(xml))
+        .expect("static response is always valid")
 }
 
 /// Mint this request's id, run the dispatcher **inside a span carrying it**, and stamp the
@@ -784,6 +1452,44 @@ where
             );
         }
     };
+
+    // Bucket-scoped dispatch, split off BEFORE the object-path guard (issue #507, ADR-0046
+    // routing decision). A path naming a bucket but no object (`/{bucket}` or `/{bucket}/`)
+    // is a bucket-level request, not the malformed object path the guard below rejects —
+    // `split_bucket_key` returns `None` for both, so without this split every bucket GET
+    // would answer 400. `split_bucket_key` stays UNTOUCHED (it is load-bearing for object
+    // verbs); the split routes bucket-scoped GET to the listing handler and leaves every
+    // other bucket-scoped method on today's 400 (#511 / 509 extend the split later).
+    if let Some(bucket) = bucket_scoped_path(&path) {
+        // The bucket path MUST still consult the subresource denylist first: only a listing
+        // form (`?list-type=2`, the v1 bare / `marker` / `prefix` / `delimiter` / `max-keys`
+        // forms, and benign params) routes to listing. `GET /bucket?acl` / `?policy` /
+        // `?versions` / `?location` / `?uploads` etc. stay `501 NotImplemented` so a bucket
+        // subresource op is never silently answered with a listing document (which would let
+        // `aws s3api get-bucket-acl` read a listing, and would destroy 508's
+        // ListMultipartUploads red). The keys are DECODED before matching so a percent-encoded
+        // subresource (`?%61cl`, `?upload%73`) cannot dodge the fence (issue #507 adversary).
+        if let Some(sub) = unsupported_subresource_decoded(&query) {
+            return error_response(
+                request_id,
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                &format!("the `{sub}` S3 subresource/operation is not supported"),
+            );
+        }
+        return match method {
+            Method::GET => {
+                list_objects(&state, request_id, &percent_decode_utf8(bucket), &query).await
+            }
+            // Other bucket-scoped methods keep today's behaviour (bucket ops are #511/509).
+            _ => error_response(
+                request_id,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "expected a bucket-scoped object path /{bucket}/{key}",
+            ),
+        };
+    }
 
     let Some((bucket, key)) = split_bucket_key(&path) else {
         return error_response(
@@ -2303,6 +3009,24 @@ mod tests {
         assert_eq!(split_bucket_key("/bucket/"), None);
         assert_eq!(split_bucket_key("/bucket"), None);
         assert_eq!(split_bucket_key("/"), None);
+    }
+
+    #[test]
+    fn bucket_scoped_path_names_buckets_and_rejects_empty_segments() {
+        // Bucket-scoped forms: `/{bucket}` and `/{bucket}/` name a bucket.
+        assert_eq!(bucket_scoped_path("/bucket"), Some("bucket"));
+        assert_eq!(bucket_scoped_path("/bucket/"), Some("bucket"));
+        // Object paths are NOT bucket-scoped (they belong to `split_bucket_key`).
+        assert_eq!(bucket_scoped_path("/bucket/key"), None);
+        assert_eq!(bucket_scoped_path("/bucket/nested/key"), None);
+        // The root path names no bucket.
+        assert_eq!(bucket_scoped_path("/"), None);
+        // Empty-bucket-segment forms must NOT be answered as a listing (sign-off #507
+        // adversary): `trim_start_matches('/')` folded `//bucket` down to `bucket` and
+        // returned a bogus 200; a single `strip_prefix('/')` keeps the empty first segment.
+        assert_eq!(bucket_scoped_path("//bucket"), None);
+        assert_eq!(bucket_scoped_path("//"), None);
+        assert_eq!(bucket_scoped_path("///"), None);
     }
 
     #[test]

@@ -141,6 +141,36 @@ fn crc32_ieee_append(crc: u32, data: &[u8]) -> u32 {
     !crc
 }
 
+/// Encode raw bytes as **standard** (`+`/`/`, `=`-padded) base64 — the inverse of
+/// [`base64_decode`]. Used to make an **opaque** ListObjectsV2 continuation token out of a
+/// listing's resume key (issue #507): the wire echoes it as `<NextContinuationToken>` and the
+/// client hands it back verbatim, and [`base64_decode`] recovers the key (an undecodable token
+/// is a `400 InvalidArgument`, never a silent restart). Empty input encodes to `""`; a resume
+/// key is always a non-empty object key, so a real token is never empty.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(ALPHABET[(n >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 /// Decode a **standard** (`+`/`/`, `=`-padded) base64 string to raw bytes — the encoding
 /// AWS uses for every `x-amz-checksum-*` trailer value. `None` on anything malformed
 /// (wrong alphabet, wrong length, bad padding), so the caller refuses a declared checksum
@@ -243,6 +273,24 @@ mod tests {
         assert_eq!(base64_decode("Zm9vYg==").unwrap(), b"foob");
         assert_eq!(base64_decode("Zm9vYmE=").unwrap(), b"fooba");
         assert_eq!(base64_decode("Zm9vYmFy").unwrap(), b"foobar");
+    }
+
+    /// RFC 4648 §10 encode vectors — the inverse of [`base64_decode`], and encode→decode is
+    /// the identity, so an opaque ListObjectsV2 continuation token round-trips (issue #507).
+    #[test]
+    fn base64_encode_rfc4648_vectors_round_trip() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // A realistic resume key (contains `/`, non-ASCII) survives encode → decode intact.
+        for key in ["photos/2024/x.jpg", "α/β", "key-06", "a&b<c>\"d"] {
+            let token = base64_encode(key.as_bytes());
+            assert_eq!(base64_decode(&token).unwrap(), key.as_bytes());
+        }
     }
 
     /// The real-world shape: a base64-encoded CRC-32C trailer value, matching the AWS
