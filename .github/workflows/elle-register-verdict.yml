@@ -105,7 +105,7 @@ jobs:
 
       # elle-cli is a Clojure/JVM tool (ADR-0041's whole reason this checker stays off-Check).
       - name: Install the JVM (elle-cli is Clojure/JVM)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
