@@ -494,25 +494,6 @@ struct ListPage<'a> {
     next_marker: Option<String>,
 }
 
-/// Which resume mechanism produced `resume_after`, distinguishing the two delimiter-group
-/// collapse rules (issue #507 Delta 2). The `resume == cp` whole-group collapse is valid ONLY
-/// for the server-issued v1 `NextMarker`, which names the common prefix (`a/`) by design; a
-/// CLIENT-chosen v2 `start-after` exactly equal to a common prefix (`start-after=a/`, the
-/// folder-marker workflow) must NOT collapse the group — AWS applies `start-after` to the raw
-/// keyspace before rollup, so a surviving key still rolls up. A server-issued v2
-/// `continuation-token` always encodes the last raw CONSUMED key, so it collapses the group via
-/// the `resume >= last_raw` clause alone — no v2 behaviour depends on the `== cp` clause.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResumeKind {
-    /// v2 `start-after` / `continuation-token` — the `resume == cp` group collapse does NOT
-    /// apply (a `start-after` equal to a common prefix keeps the group; a v2 token collapses it
-    /// via `>= last_raw`).
-    V2,
-    /// v1 `marker` — the server-issued `NextMarker` may be the common prefix itself, so
-    /// `resume == cp` legitimately collapses the whole group.
-    V1Marker,
-}
-
 /// Compute one listing page over the container's complete, already-sorted key set —
 /// `prefix` filter, `delimiter` common-prefix rollups, the **combined** `max-keys` slice
 /// (`Contents` + `CommonPrefixes` counted together), and the resume point. Pure over its
@@ -522,7 +503,6 @@ fn compute_page<'a>(
     prefix: &str,
     delimiter: Option<&str>,
     resume_after: Option<&str>,
-    resume_kind: ResumeKind,
     max_keys: usize,
 ) -> ListPage<'a> {
     // S3: `max-keys=0` is a valid request for zero keys — it returns an empty, **non-truncated**
@@ -542,8 +522,8 @@ fn compute_page<'a>(
 
     // `objects` arrives lexicographically sorted from the seam; keep that order (filtering only
     // by `prefix`). The resume skip is applied per emitted item/group INSIDE the loop rather
-    // than as a pre-filter on raw keys, so a `resume_after` that names a common prefix (`a/`,
-    // AWS's v1 `NextMarker` for a rollup) skips the WHOLE `a/…` group — a pre-filter of
+    // than as a pre-filter on raw keys, because a rollup is filtered on the COMMON PREFIX
+    // itself, not on its surviving raw keys (see the group rule below) — a pre-filter of
     // `key > "a/"` would keep `a/1`, `a/2` and re-emit the `a/` rollup (issue #507 adversary).
     let filtered: Vec<&ListedObject> = objects
         .iter()
@@ -567,36 +547,28 @@ fn compute_page<'a>(
                 // `prefix`. All keys sharing it are contiguous (sorted).
                 let cp = format!("{}{}", prefix, &rest[..idx + delim.len()]);
                 // Delimit the group's extent [group_start, group_end) and its last raw key.
-                let group_start = i;
                 let mut group_end = i;
                 while group_end < filtered.len() && filtered[group_end].key.starts_with(&cp) {
                     group_end += 1;
                 }
                 let last_raw = filtered[group_end - 1].key.as_str();
-                // Skip the WHOLE group only when the resume point has genuinely consumed it. A
-                // resume at-or-past the group's last raw key (`a/2`) has consumed it under EITHER
-                // resume mechanism — that covers the server-issued v2 `continuation-token` (which
-                // always encodes the last raw consumed key) and any resume past the group. The
-                // `resume == cp` collapse (the resume value IS the common prefix `a/`) is valid
-                // ONLY for the server-issued v1 `NextMarker`, which names the common prefix by
-                // design (`ResumeKind::V1Marker`). A CLIENT-chosen v2 `start-after` equal to a
-                // common prefix (`start-after=a/`) must NOT collapse the group: AWS applies
-                // start-after to the raw keyspace BEFORE rollup, so `a/1`/`a/2` survive and roll
-                // up. Restricting `== cp` to the v1 marker path fixes the folder-marker case the
-                // iteration-4 sign-off reproduced (Delta 2, issue #507); no v2 behaviour is lost
-                // because a v2 token always satisfies `>= last_raw`.
-                let group_consumed = resume_after.is_some_and(|r| {
-                    r >= last_raw || (resume_kind == ResumeKind::V1Marker && r == cp.as_str())
-                });
-                // Otherwise filter the group's raw keys individually: the rollup survives iff at
-                // least one key is strictly after the resume point.
-                let survives = !group_consumed
-                    && match resume_after {
-                        Some(r) => filtered[group_start..group_end]
-                            .iter()
-                            .any(|o| o.key.as_str() > r),
-                        None => true,
-                    };
+                // A rollup survives the resume point iff the COMMON PREFIX itself is strictly
+                // after it — AWS documents this rule verbatim for both listing forms:
+                // "`CommonPrefixes` is filtered out from results if it is not lexicographically
+                // greater than the `StartAfter` value" (ListObjectsV2, `delimiter`) and "… than
+                // the key-marker" (ListObjects). One comparison covers every resume mechanism:
+                // a client resume landing INSIDE the group (`start-after=a/1`) or naming the
+                // prefix (`start-after=a/`) drops the `a/` rollup (`"a/" ≤ "a/1"`), the
+                // server-issued v1 `NextMarker` naming the prefix collapses it the same way,
+                // and the server-issued v2 `continuation-token` — always the group's LAST raw
+                // key, because a rollup consumes its whole group below — likewise satisfies
+                // `cp ≤ resume` exactly when the group was consumed. (Supersedes the
+                // iteration-4 Delta 2 raw-keyspace-before-rollup reading, which contradicted
+                // the documented rule.)
+                let survives = match resume_after {
+                    Some(r) => cp.as_str() > r,
+                    None => true,
+                };
                 if !survives {
                     i = group_end;
                     continue;
@@ -762,15 +734,6 @@ where
     } else {
         request_marker.clone().filter(|m| !m.is_empty())
     };
-    // The `resume == cp` whole-group collapse is valid only for the server-issued v1 marker
-    // (Delta 2). v2 resume (start-after / token) relies on per-key `> r` filtering plus the
-    // `>= last_raw` collapse a server-issued token always satisfies.
-    let resume_kind = if is_v2 {
-        ResumeKind::V2
-    } else {
-        ResumeKind::V1Marker
-    };
-
     // Drive the neutral seam: the complete, sorted key set — or `None` (no bucket record).
     let objects = match state.gateway.list_container(bucket).await {
         Ok(Some(objects)) => objects,
@@ -790,7 +753,6 @@ where
         &prefix,
         delimiter.as_deref(),
         resume_after.as_deref(),
-        resume_kind,
         max_keys,
     );
 
@@ -872,13 +834,25 @@ fn project_value(s: &str, encode: bool) -> String {
 
 /// Render one `<Contents>` row — key projected ([`project_value`]; URL-encoded under
 /// `encoding-type=url`), size, the S3-quoted ETag (when recorded), the ISO-8601
-/// `<LastModified>`, and a `STANDARD` storage class.
+/// `<LastModified>` (when recorded), and a `STANDARD` storage class. An object whose
+/// metadata predates the timestamp model has `modified: None`; the element is OMITTED then —
+/// like the ETag right below — never backfilled with the epoch: sync tools (`aws s3 sync`,
+/// rclone) compare `LastModified` to decide whether to transfer, and a fabricated
+/// `1970-01-01` makes every local copy look newer, silently leaving stale content in place.
+/// This mirrors the GET/HEAD arm, which already omits the `Last-Modified` HEADER for the same
+/// records (`modified.and_then(http_date)`), so a legacy object presents one consistent "no
+/// recorded time" face on every surface; the stock SDKs model the field as optional (a parse
+/// cannot fail on absence), and a consumer that then errors does so VISIBLY — the fail-closed
+/// trade over silently corrupting sync decisions with invented data (ADR-0047 stance).
 fn render_contents(out: &mut String, obj: &ListedObject, encode: bool) {
     out.push_str("<Contents><Key>");
     out.push_str(&project_value(&obj.key, encode));
-    out.push_str("</Key><LastModified>");
-    out.push_str(&iso8601(obj.modified.unwrap_or(0)));
-    out.push_str("</LastModified>");
+    out.push_str("</Key>");
+    if let Some(modified) = obj.modified {
+        out.push_str("<LastModified>");
+        out.push_str(&iso8601(modified));
+        out.push_str("</LastModified>");
+    }
     if let Some(etag) = &obj.etag {
         out.push_str("<ETag>");
         out.push_str(&xml_escape(&quote_etag(etag)));
@@ -1016,7 +990,7 @@ fn render_list_v1(view: &ListView<'_>, request_marker: &str, page: &ListPage<'_>
     // (issue #507 conformance nit). The value is the last RETURNED item (`next_marker`): for a
     // delimiter rollup that is the common prefix (`a/`), NOT the group's last raw key (`a/2`) —
     // a client that stores `a/` and resends it as `marker` must skip the whole group, which
-    // `compute_page`'s resume filter (`resume == cp`) does on the v1 marker path (issue #507).
+    // `compute_page`'s resume filter (a rollup survives only when `cp > marker`) guarantees.
     // Under `encoding-type=url` the marker echo is URL-encoded (Delta 1).
     if let Some(next) = &page.next_marker {
         if view.delimiter.is_some() {
@@ -3700,6 +3674,50 @@ mod tests {
         assert_eq!(etag_header("abc\"def"), None);
         // Spaces are header-valid but outside `etagc` too.
         assert_eq!(etag_header("abc def"), None);
+    }
+
+    #[test]
+    fn a_contents_row_omits_last_modified_when_the_store_never_recorded_one() {
+        // An object whose metadata predates the timestamp model (`modified: None`) must NOT
+        // be rendered with a fabricated epoch `<LastModified>1970-01-01…`: sync tools compare
+        // `LastModified` to decide whether to transfer, and a zero backfill makes every local
+        // copy look newer, silently leaving stale content in place. The element is omitted —
+        // the same degradation the absent ETag right beside it already uses.
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "old-object".to_string(),
+                size: 3,
+                etag: None,
+                modified: None,
+            },
+            false,
+        );
+        assert!(
+            !out.contains("<LastModified>"),
+            "an unrecorded modified time must be omitted, never backfilled: {out}"
+        );
+
+        // A recorded timestamp still renders.
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "new-object".to_string(),
+                size: 3,
+                etag: None,
+                modified: Some(1_700_000_000_000),
+            },
+            false,
+        );
+        assert!(
+            out.contains(&format!(
+                "<LastModified>{}</LastModified>",
+                iso8601(1_700_000_000_000)
+            )),
+            "a recorded modified time renders as ISO-8601: {out}"
+        );
     }
 
     /// A gateway whose stored object carries a caller-chosen `content_type` and `etag` — used
