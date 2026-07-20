@@ -608,7 +608,9 @@ async fn obsolete_http_date_formats_are_honored_on_conditionals() {
 
     // (format label, a PAST instant, a FUTURE instant) for each obsolete date format.
     let cases: &[(&str, &str, &str)] = &[
-        // RFC-850: full weekday name, two-digit year (pivot at 70 — `94` → 1994, `69` → 2069).
+        // RFC-850: full weekday name, two-digit year, resolved relative to the clock per
+        // RFC 9110 §5.6.7 (current century first, minus 100 when >50 years ahead — `94` →
+        // 1994, `69` → 2069 at any plausible test-run date).
         (
             "RFC-850",
             "Sunday, 06-Nov-94 08:49:37 GMT",
@@ -642,6 +644,34 @@ async fn obsolete_http_date_formats_are_honored_on_conditionals() {
         );
         assert!(body.is_empty(), "{label}: a 304 carries no body");
     }
+}
+
+/// Repeated `Range` FIELD LINES are, under HTTP field combination (RFC 9110 §5.2), one
+/// comma-separated multi-range set — unsupported here, so they must degrade to the full 200
+/// exactly like the in-line `bytes=a-b,c-d` form. A handler reading only the FIRST stored
+/// value would honour `bytes=0-1` as a 206 and silently discard the second requested span —
+/// a half-served request (issue #510 review).
+#[tokio::test]
+async fn repeated_range_field_lines_degrade_to_the_full_200() {
+    let (addr, _dir, _counter) = start_gateway().await;
+    let path = "/wyrd-bucket/repeated-range-object";
+    let (object, _etag) = put_object(addr, path).await;
+    let host = addr.to_string();
+
+    let mut headers = signed_headers("GET", path, &host, b"");
+    headers.push(("range".to_string(), "bytes=0-1".to_string()));
+    headers.push(("range".to_string(), "bytes=4-5".to_string()));
+    let (status, head, body) = send(addr, "GET", path, &headers, b"").await;
+    assert_eq!(
+        status, 200,
+        "two Range field lines are a multi-range set and must answer the full 200, \
+         not a 206 of the first line only"
+    );
+    assert_eq!(body, object, "the full body is served");
+    assert!(
+        header_value(&head, "content-range").is_none(),
+        "a full 200 carries no Content-Range"
+    );
 }
 
 /// HEAD must HONOUR `Range` now that it advertises `Accept-Ranges: bytes` (carry-forward item 3):

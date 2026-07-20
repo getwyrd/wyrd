@@ -1657,10 +1657,7 @@ where
     // A multi-range, non-`bytes`, or syntactically malformed `Range` parses to `None` and is
     // IGNORED — S3 serves the full 200 for anything it cannot honour (brief out-of-scope:
     // multi-range and malformed values answer the full 200 exactly as real S3 does).
-    let range = headers
-        .get("range")
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_range);
+    let range = honoured_range(headers);
 
     // Conditionals (RFC 9110 §13.2.2 precedence, S3 comparison semantics — see
     // `evaluate_conditionals`) are evaluated against the metadata of the SAME resolve that yields
@@ -1681,9 +1678,12 @@ where
             .await
         {
             Ok(Some(RangeRead { meta, outcome })) => {
-                if let Some(verdict) =
-                    evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified)
-                {
+                if let Some(verdict) = evaluate_conditionals(
+                    &cond,
+                    meta.etag.as_deref(),
+                    meta.modified,
+                    epoch_secs_now(),
+                ) {
                     // A 304/412 short-circuits before the range is applied (§13.2); the
                     // (possibly-open) covering-chunk stream in `outcome` is dropped unread.
                     return precondition_response(
@@ -1714,9 +1714,12 @@ where
             .await
         {
             Ok(Some(read)) => {
-                if let Some(verdict) =
-                    evaluate_conditionals(&cond, read.etag.as_deref(), read.modified)
-                {
+                if let Some(verdict) = evaluate_conditionals(
+                    &cond,
+                    read.etag.as_deref(),
+                    read.modified,
+                    epoch_secs_now(),
+                ) {
                     return precondition_response(
                         verdict,
                         read.etag.as_deref(),
@@ -1751,14 +1754,12 @@ where
     let cond = Conditionals::from_headers(headers);
     // A multi-range / non-`bytes` / malformed `Range` parses to `None` and is ignored (the full
     // metadata 200), exactly as on GET.
-    let range = headers
-        .get("range")
-        .and_then(|v| v.to_str().ok())
-        .and_then(parse_range);
+    let range = honoured_range(headers);
     match state.gateway.head_object(object_key).await {
         Ok(Some(meta)) => {
             // 1. Conditionals first (same precedence and S3 semantics as GET).
-            if let Some(verdict) = evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified)
+            if let Some(verdict) =
+                evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified, epoch_secs_now())
             {
                 return precondition_response(
                     verdict,
@@ -1973,6 +1974,23 @@ fn no_such_key(request_id: RequestId) -> Response {
     )
 }
 
+/// The request's honoured `Range`, or `None` when it cannot be honoured (→ the full 200).
+///
+/// Reads ALL `Range` field lines, not just the first: under HTTP field combination (RFC 9110
+/// §5.2) repeated `Range` lines are semantically ONE comma-separated multi-range set — which
+/// [`parse_range`] already refuses in its in-line form. `HeaderMap::get` observes only the
+/// first stored value, so going through it would honour `Range: bytes=0-1` + `Range:
+/// bytes=4-5` as a `206` of the first span while silently discarding the second — a
+/// half-served request instead of the documented full-200 degradation (issue #510 review).
+fn honoured_range(headers: &axum::http::HeaderMap) -> Option<ByteRange> {
+    let mut values = headers.get_all("range").iter();
+    let first = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    first.to_str().ok().and_then(parse_range)
+}
+
 /// Parse a `Range` header value into a single [`ByteRange`], or `None` when the value is a
 /// multi-range (`bytes=a-b,c-d`), a non-`bytes` unit, or syntactically malformed — in every
 /// `None` case the caller serves the full 200 exactly as real S3 does (brief: multi-range and
@@ -2073,6 +2091,7 @@ fn evaluate_conditionals(
     cond: &Conditionals<'_>,
     etag: Option<&str>,
     modified: Option<u64>,
+    now_secs: u64,
 ) -> Option<Precondition> {
     // 1. If-Match takes precedence over If-Unmodified-Since (only one of the two is consulted).
     if let Some(im) = cond.if_match {
@@ -2082,7 +2101,7 @@ fn evaluate_conditionals(
         }
     } else if let Some(ius) = cond.if_unmodified_since {
         // If-Unmodified-Since: FAIL if the object was modified strictly AFTER the given instant.
-        if let (Some(m), Some(since)) = (modified, parse_http_date(ius)) {
+        if let (Some(m), Some(since)) = (modified, parse_http_date(ius, now_secs)) {
             if m / 1_000 > since {
                 return Some(Precondition::Failed);
             }
@@ -2097,7 +2116,7 @@ fn evaluate_conditionals(
         }
     } else if let Some(ims) = cond.if_modified_since {
         // If-Modified-Since: `304` if the object was NOT modified after the given instant.
-        if let (Some(m), Some(since)) = (modified, parse_http_date(ims)) {
+        if let (Some(m), Some(since)) = (modified, parse_http_date(ims, now_secs)) {
             if m / 1_000 <= since {
                 return Some(Precondition::NotModified);
             }
@@ -2159,14 +2178,23 @@ fn etag_matches(header_value: &str, stored: Option<&str>, strong: bool) -> bool 
 /// (unknown format, impossible calendar date, out-of-range time) still returns `None` so the
 /// caller ignores that conditional (RFC 9110 §13.1.3-4). Byte-indexing below assumes ASCII, so a
 /// non-ASCII value is rejected up front.
-fn parse_http_date(value: &str) -> Option<u64> {
+fn parse_http_date(value: &str, now_secs: u64) -> Option<u64> {
     let value = value.trim();
     if !value.is_ascii() {
         return None;
     }
     parse_imf_fixdate(value)
-        .or_else(|| parse_rfc850_date(value))
+        .or_else(|| parse_rfc850_date(value, now_secs))
         .or_else(|| parse_asctime_date(value))
+}
+
+/// The wall clock as epoch seconds — the `now` the RFC-850 two-digit-year rule is relative to
+/// ([`parse_rfc850_date`]). Kept at the wire edge so the parsers stay pure over their inputs.
+fn epoch_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The preferred IMF-fixdate `Www, DD Mmm YYYY HH:MM:SS GMT` — exactly 29 ASCII bytes.
@@ -2192,10 +2220,14 @@ fn parse_imf_fixdate(value: &str) -> Option<u64> {
 
 /// The obsolete RFC-850 date `Weekday, DD-Mmm-YY HH:MM:SS GMT` — a variable-length weekday name,
 /// then a fixed 22-byte `DD-Mmm-YY HH:MM:SS GMT` with a two-digit year. The two-digit year is
-/// disambiguated the way the `httpdate` crate does — pivot at 70 (`00..=69` → 2000+, `70..=99` →
-/// 1900+) — a fixed rule with no clock dependency (RFC 7231's "50 years in the future" heuristic
-/// would make the parse non-deterministic).
-fn parse_rfc850_date(value: &str) -> Option<u64> {
+/// disambiguated exactly as RFC 9110 §5.6.7 REQUIRES: interpret it in the current century
+/// first, then move it back 100 years only when that lands more than 50 years in the future of
+/// `now_secs` (compared at year granularity). A fixed pivot (the `httpdate` crate's 70-cutoff,
+/// this parser's previous rule) violates that MUST and misreads e.g. `-75` as 1975 while the
+/// clock says 2026 — turning an `If-Unmodified-Since` carrying 2075 into a spurious `412`
+/// (issue #510 review). The clock dependency is injected (`now_secs`), so the parse stays a
+/// pure, testable function of its inputs.
+fn parse_rfc850_date(value: &str, now_secs: u64) -> Option<u64> {
     // Split the weekday name (`Sunday`..`Wednesday`, variable length) off at the ", ".
     let (_weekday, rest) = value.split_once(", ")?;
     let bytes = rest.as_bytes();
@@ -2211,10 +2243,23 @@ fn parse_rfc850_date(value: &str) -> Option<u64> {
     let day: u32 = rest[0..2].parse().ok()?;
     let month = month_index(&rest[3..6])?;
     let yy: i64 = rest[7..9].parse().ok()?;
-    let year = if yy < 70 { 2000 + yy } else { 1900 + yy };
     let hour: u64 = rest[10..12].parse().ok()?;
     let minute: u64 = rest[13..15].parse().ok()?;
     let second: u64 = rest[16..18].parse().ok()?;
+    // RFC 9110 §5.6.7: current century first; "more than 50 years in the future" → last
+    // century. The cutoff is applied at FULL TIMESTAMP precision, not year precision: at
+    // `now = 2026-07-20 09:00`, a candidate `2076-07-20 10:00` is 50 years and one hour ahead
+    // and must resolve to 1976, while `2076-07-19` (50 years minus a day) stays 2076. The
+    // comparison shifts the CANDIDATE back 50 years and tuple-compares calendar fields
+    // against `now` — exact calendar arithmetic with no averaged year length, and no shifted
+    // date is ever constructed, so a Feb-29 candidate needs no leap-year special case.
+    let (now_year, now_month, now_day) = civil_from_days((now_secs / 86_400) as i64);
+    let now_sod = now_secs % 86_400;
+    let mut year = now_year - now_year % 100 + yy;
+    let candidate_sod = hour * 3_600 + minute * 60 + second;
+    if (year - 50, month, day, candidate_sod) > (now_year, now_month, now_day, now_sod) {
+        year -= 100;
+    }
     ymd_hms_to_epoch(year, month, day, hour, minute, second)
 }
 
@@ -3936,6 +3981,51 @@ mod tests {
 
     async fn signed_get_through_router(gateway: Arc<StoredMetaGateway>) -> Response {
         signed_through_router(gateway, "GET", b"").await
+    }
+
+    #[test]
+    fn rfc850_two_digit_years_resolve_relative_to_the_clock() {
+        // RFC 9110 §5.6.7 (a MUST): a two-digit RFC-850 year is interpreted in the CURRENT
+        // century first, and moved back 100 years only when that lands more than 50 years in
+        // the future. All expectations are independent epoch oracles (Python `calendar.timegm`);
+        // `now` is injected, so the rule is exercised deterministically at a fixed 2026 clock.
+        const NOW_2026: u64 = 1_767_225_600; // 2026-01-01T00:00:00Z
+                                             // `-75` → 2075 (49 years ahead ≤ 50: stays in the current century). The previous fixed
+                                             // pivot-at-70 read this as 1975, turning an If-Unmodified-Since carrying 2075 into a
+                                             // spurious 412.
+        assert_eq!(
+            parse_rfc850_date("Sunday, 20-Jul-75 08:49:37 GMT", NOW_2026),
+            Some(3_330_838_177),
+        );
+        // `-77` → 2077 would be 51 years ahead (> 50): moved back to 1977.
+        assert_eq!(
+            parse_rfc850_date("Wednesday, 20-Jul-77 08:49:37 GMT", NOW_2026),
+            Some(238_236_577),
+        );
+        // The RFC's own example stays 1994 (2094 is far in the future), and `-69` resolves to
+        // 2069 — the same answers the old fixed pivot gave, so existing wire vectors hold.
+        assert_eq!(
+            parse_rfc850_date("Sunday, 06-Nov-94 08:49:37 GMT", NOW_2026),
+            Some(784_111_777),
+        );
+        assert_eq!(
+            parse_rfc850_date("Wednesday, 06-Nov-69 08:49:37 GMT", NOW_2026),
+            Some(3_150_953_377),
+        );
+
+        // The cutoff bites at FULL TIMESTAMP precision, not year precision: with the clock at
+        // 2026-07-20T09:00, a candidate 2076-07-20T10:00 is 50 years and ONE HOUR ahead —
+        // more than 50 years → 1976 — while 2076-07-20T08:00 (one hour short of the mark)
+        // stays 2076. A year-granular comparison gets the first one wrong.
+        const NOW_MID_2026: u64 = 1_784_538_000; // 2026-07-20T09:00:00Z
+        assert_eq!(
+            parse_rfc850_date("Monday, 20-Jul-76 10:00:00 GMT", NOW_MID_2026),
+            Some(206_704_800), // 1976-07-20T10:00:00Z
+        );
+        assert_eq!(
+            parse_rfc850_date("Monday, 20-Jul-76 08:00:00 GMT", NOW_MID_2026),
+            Some(3_362_457_600), // 2076-07-20T08:00:00Z
+        );
     }
 
     #[test]
