@@ -462,7 +462,12 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 /// (`2009-10-12T17:50:30.000Z`) — the shape S3 uses for a listing's `<LastModified>`
 /// (distinct from the IMF-fixdate [`http_date`] uses for the `Last-Modified` *header*).
 /// Shares [`civil_from_days`] with `http_date`, so no date dependency is pulled in.
-fn iso8601(epoch_millis: u64) -> String {
+///
+/// `None` past year 9999 — the same bound [`http_date`] applies, for the same reason: the
+/// stored `modified` is an unrestricted `u64`, and a five-digit year is not a valid RFC-3339
+/// timestamp, so a strict SDK date parser would reject the whole listing document over one
+/// pathological record. The caller omits the element instead (the ADR-0047 degradation).
+fn iso8601(epoch_millis: u64) -> Option<String> {
     const SECS_PER_DAY: u64 = 86_400;
     let secs = epoch_millis / 1_000;
     let millis = epoch_millis % 1_000;
@@ -470,7 +475,12 @@ fn iso8601(epoch_millis: u64) -> String {
     let sod = secs % SECS_PER_DAY;
     let (hour, minute, second) = (sod / 3_600, (sod % 3_600) / 60, sod % 60);
     let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+    if year > 9_999 {
+        return None;
+    }
+    Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+    ))
 }
 
 /// One computed listing page: the `<Contents>` rows, the `<CommonPrefixes>` (delimiter
@@ -833,27 +843,36 @@ fn project_value(s: &str, encode: bool) -> String {
 }
 
 /// Render one `<Contents>` row — key projected ([`project_value`]; URL-encoded under
-/// `encoding-type=url`), size, the S3-quoted ETag (when recorded), the ISO-8601
-/// `<LastModified>` (when recorded), and a `STANDARD` storage class. An object whose
-/// metadata predates the timestamp model has `modified: None`; the element is OMITTED then —
-/// like the ETag right below — never backfilled with the epoch: sync tools (`aws s3 sync`,
-/// rclone) compare `LastModified` to decide whether to transfer, and a fabricated
-/// `1970-01-01` makes every local copy look newer, silently leaving stale content in place.
-/// This mirrors the GET/HEAD arm, which already omits the `Last-Modified` HEADER for the same
-/// records (`modified.and_then(http_date)`), so a legacy object presents one consistent "no
-/// recorded time" face on every surface; the stock SDKs model the field as optional (a parse
-/// cannot fail on absence), and a consumer that then errors does so VISIBLY — the fail-closed
-/// trade over silently corrupting sync decisions with invented data (ADR-0047 stance).
+/// `encoding-type=url`), size, the S3-quoted ETag (when recorded and well-formed), the
+/// ISO-8601 `<LastModified>` (when recorded and renderable), and a `STANDARD` storage class.
+/// An object whose metadata predates the timestamp model has `modified: None`; the element is
+/// OMITTED then — like the ETag right below — never backfilled with the epoch: sync tools
+/// (`aws s3 sync`, rclone) compare `LastModified` to decide whether to transfer, and a
+/// fabricated `1970-01-01` makes every local copy look newer, silently leaving stale content
+/// in place. This mirrors the GET/HEAD arm, which already omits the `Last-Modified` HEADER
+/// for the same records (`modified.and_then(http_date)`), so a legacy object presents one
+/// consistent "no recorded time" face on every surface; the stock SDKs model the field as
+/// optional (a parse cannot fail on absence), and a consumer that then errors does so VISIBLY
+/// — the fail-closed trade over silently corrupting sync decisions with invented data
+/// (ADR-0047 stance).
+///
+/// The same degrade-by-omission covers the two ways a RECORDED value can still be
+/// unpresentable, so one pathological record can never poison the whole listing document for
+/// every other object in the bucket: a `modified` past year 9999 has no valid RFC-3339
+/// rendering ([`iso8601`] returns `None`, the bound [`http_date`] already applies on GET),
+/// and a stored ETag that is not a well-formed entity-tag (store corruption / out-of-band
+/// edits — `xml_escape` cannot neutralise an XML-1.0-forbidden control byte) is omitted via
+/// the SAME [`etag_header`] validation the GET path uses.
 fn render_contents(out: &mut String, obj: &ListedObject, encode: bool) {
     out.push_str("<Contents><Key>");
     out.push_str(&project_value(&obj.key, encode));
     out.push_str("</Key>");
-    if let Some(modified) = obj.modified {
+    if let Some(rendered) = obj.modified.and_then(iso8601) {
         out.push_str("<LastModified>");
-        out.push_str(&iso8601(modified));
+        out.push_str(&rendered);
         out.push_str("</LastModified>");
     }
-    if let Some(etag) = &obj.etag {
+    if let Some(etag) = obj.etag.as_deref().filter(|e| etag_header(e).is_some()) {
         out.push_str("<ETag>");
         out.push_str(&xml_escape(&quote_etag(etag)));
         out.push_str("</ETag>");
@@ -3721,9 +3740,70 @@ mod tests {
         assert!(
             out.contains(&format!(
                 "<LastModified>{}</LastModified>",
-                iso8601(1_700_000_000_000)
+                iso8601(1_700_000_000_000).expect("in-range instant renders")
             )),
             "a recorded modified time renders as ISO-8601: {out}"
+        );
+    }
+
+    #[test]
+    fn a_contents_row_omits_unpresentable_recorded_metadata() {
+        // A RECORDED value can still be unpresentable; each degrades by omission so one
+        // pathological record cannot poison the whole listing document (the GET path's
+        // established behaviour, applied to the listing renderer).
+        //
+        // A `modified` past year 9999 has no valid RFC-3339 rendering (a five-digit year) —
+        // the same bound `http_date` applies to the `Last-Modified` header on GET.
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "far-future".to_string(),
+                size: 3,
+                etag: None,
+                modified: Some(253_402_300_800_000),
+            },
+            false,
+        );
+        assert!(
+            !out.contains("<LastModified>"),
+            "a year-10000+ modified time must be omitted, not rendered malformed: {out}"
+        );
+
+        // A stored ETag that is not a well-formed entity-tag (here: an XML-1.0-forbidden
+        // control byte `xml_escape` cannot neutralise) is omitted via the same `etag_header`
+        // validation the GET path uses — never emitted into the document.
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "corrupt-etag".to_string(),
+                size: 3,
+                etag: Some("abc\u{0008}def".to_string()),
+                modified: None,
+            },
+            false,
+        );
+        assert!(
+            !out.contains("<ETag>"),
+            "a malformed stored ETag must be omitted from the listing: {out}"
+        );
+
+        // The well-formed baseline still renders quoted.
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "ok".to_string(),
+                size: 3,
+                etag: Some("0badc0de0badc0de".to_string()),
+                modified: None,
+            },
+            false,
+        );
+        assert!(
+            out.contains("<ETag>&quot;0badc0de0badc0de&quot;</ETag>"),
+            "a well-formed stored ETag renders S3-quoted (then XML-escaped): {out}"
         );
     }
 
