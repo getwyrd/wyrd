@@ -73,8 +73,8 @@ use axum::Router;
 use futures_util::StreamExt;
 use tracing::Instrument;
 use wyrd_gateway_core::{
-    resolve_byte_range, ByteRange, ContentHash, GatewayError, ListedObject, ObjectGateway,
-    ObjectMeta, ObjectRead, ObjectStream, RangeOutcome, RangeRead,
+    resolve_byte_range, ByteRange, ContainerGateway, ContentHash, GatewayError, ListedObject,
+    ObjectGateway, ObjectMeta, ObjectRead, ObjectStream, RangeOutcome, RangeRead,
 };
 use wyrd_traits::{BoxError, ErrorClass};
 
@@ -158,7 +158,7 @@ impl<G> Clone for AppState<G> {
 
 impl<G> S3Gateway<G>
 where
-    G: ObjectGateway,
+    G: ObjectGateway + ContainerGateway,
 {
     /// Compose the front door over a gateway and its config.
     pub fn new(gateway: Arc<G>, config: S3Config) -> Self {
@@ -620,7 +620,7 @@ fn compute_page<'a>(
 
 /// Handle a bucket-scoped listing GET — ListObjectsV2 (`?list-type=2`) or the v1 shim
 /// (bare / `marker`). Parses the S3 query vocabulary, drives the neutral
-/// [`ObjectGateway::list_container`] seam, then computes grouping, the combined `max-keys`
+/// [`ContainerGateway::list_container`] seam, then computes grouping, the combined `max-keys`
 /// slice, and pagination wire-side (ADR-0046 seam decision) before emitting a
 /// `<ListBucketResult>` by string building (no XML dependency — a human-gated decision).
 async fn list_objects<G>(
@@ -630,7 +630,7 @@ async fn list_objects<G>(
     query: &str,
 ) -> Response
 where
-    G: ObjectGateway,
+    G: ObjectGateway + ContainerGateway,
 {
     // `encoding-type` (issue #507 Delta 1). botocore injects `encoding-type=url` into EVERY
     // ListObjects/V2 request (aws-cli, boto3, rclone), so it is load-bearing for the stock
@@ -1300,7 +1300,7 @@ fn finish_response(
 
 async fn handle<G>(State(state): State<AppState<G>>, req: Request) -> Response
 where
-    G: ObjectGateway,
+    G: ObjectGateway + ContainerGateway,
 {
     let request_id = state.request_ids.mint();
     let started = SystemTime::now();
@@ -1384,7 +1384,7 @@ where
 
 async fn dispatch<G>(state: AppState<G>, req: Request, request_id: RequestId) -> Response
 where
-    G: ObjectGateway,
+    G: ObjectGateway + ContainerGateway,
 {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
@@ -2858,6 +2858,9 @@ mod tests {
         use tracing_subscriber::{fmt as tsfmt, EnvFilter, Layer};
 
         struct NoGateway;
+        // Object-focused double: the default `list_container` (`Ok(None)`) is exactly the
+        // no-container answer these tests need.
+        impl ContainerGateway for NoGateway {}
         impl ObjectGateway for NoGateway {
             async fn put_object_streaming<S>(
                 &self,
@@ -3147,6 +3150,10 @@ mod tests {
     /// check, which is the whole point — the id must be findable for a request that never got
     /// near a backend.
     struct NoGateway;
+
+    // Object-focused double: the default `list_container` (`Ok(None)`) is exactly the
+    // no-container answer these tests need.
+    impl ContainerGateway for NoGateway {}
 
     impl ObjectGateway for NoGateway {
         async fn put_object_streaming<S>(
@@ -3742,6 +3749,8 @@ mod tests {
             }
         }
     }
+
+    impl ContainerGateway for StoredMetaGateway {}
 
     impl ObjectGateway for StoredMetaGateway {
         async fn put_object_streaming<S>(

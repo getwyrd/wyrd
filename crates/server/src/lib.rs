@@ -38,8 +38,8 @@ use wyrd_traits::{
 // wire surface (`wyrd-gateway-s3`) is generic over `ObjectGateway`; `Gateway` implements it.
 pub use wyrd_gateway_core::GatewayError;
 use wyrd_gateway_core::{
-    resolve_byte_range, ByteRange, ContentHash, ListedObject, ObjectGateway, ObjectMeta,
-    ObjectRead, RangeOutcome, RangeRead,
+    resolve_byte_range, ByteRange, ContainerGateway, ContentHash, ListedObject, ObjectGateway,
+    ObjectMeta, ObjectRead, RangeOutcome, RangeRead,
 };
 
 /// The root inode every object key is bound under — a flat namespace at M0.
@@ -551,7 +551,17 @@ where
         }
         Err(GatewayError::Conflict.into())
     }
+}
 
+/// `Gateway` is also the composition root's [`ContainerGateway`] — ADR-0046 decision 6: the
+/// container surface crosses the seam as this narrow companion trait so [`ObjectGateway`]
+/// stays object-only and bucket-free; the S3 crate alone projects containers as buckets.
+impl<M, C, Co> ContainerGateway for Gateway<M, C, Co>
+where
+    M: MetadataStore + Send + Sync + 'static,
+    C: PlacementChunkStore + Send + Sync + 'static,
+    Co: Coordination + Send + Sync + 'static,
+{
     /// LIST a container's objects (issue #507, ADR-0046): the bucket-existence read plus the
     /// per-bucket dirent scan, returned as the container's **complete**, lexicographically
     /// sorted key set. The wire layer computes `prefix`/`delimiter`/`max-keys`/pagination over

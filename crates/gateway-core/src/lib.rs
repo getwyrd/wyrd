@@ -382,7 +382,14 @@ pub trait ObjectGateway: Send + Sync + 'static {
     /// Remove the object under `key`. **Idempotent**: `Ok(true)` if an object was removed,
     /// `Ok(false)` if `key` was already absent — deleting a missing key is a success.
     fn delete_object(&self, key: &str) -> impl Future<Output = Result<bool>> + Send;
+}
 
+/// The **container** side of the gateway seam — ADR-0046 decision 6: [`ObjectGateway`] stays
+/// object-only and bucket-free, and container operations arrive as this narrow companion
+/// trait speaking container vocabulary (list now; create/head/delete arrive with their
+/// issues, #511). Implemented by `wyrd-server` at the composition root per ADR-0010; the S3
+/// crate alone projects containers as buckets.
+pub trait ContainerGateway: Send + Sync + 'static {
     /// List `container`'s **complete**, lexicographically-sorted object set — each key
     /// (relative to the container) with its size/etag/modified — as one materialized,
     /// `SCAN_CAP`-bounded [`Vec`] (issue #507, ADR-0046). Grouping (`delimiter`), the
@@ -410,8 +417,8 @@ pub trait ObjectGateway: Send + Sync + 'static {
     /// bound, not a surprise.
     ///
     /// A default of `Ok(None)` (no such container) keeps a gateway that has no container
-    /// concept — and the crate's own wire-layer test doubles — free of a bespoke impl; the
-    /// composition root's real gateway overrides it.
+    /// concept — and the wire crate's own object-focused test doubles — free of a bespoke
+    /// impl; the composition root's real gateway overrides it.
     fn list_container(
         &self,
         container: &str,
