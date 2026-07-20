@@ -25,8 +25,10 @@
 //!   (`StartAfter`/`Marker`/`NextMarker`), emits `<EncodingType>url</EncodingType>`, and
 //!   leaves the opaque continuation tokens untouched (a returned token resumes verbatim); an
 //!   `encoding-type` value other than `url` answers `400 InvalidArgument`;
-//! * a v2 `start-after` exactly equal to a common prefix still returns that rollup (Delta 2),
-//!   and a `continuation-token` overrides a co-sent `start-after` (AWS precedence).
+//! * a rollup is filtered on the common prefix ITSELF: a `CommonPrefixes` entry not
+//!   lexicographically greater than the client's `start-after` / v1 `marker` is dropped
+//!   whole — the AWS-documented rule for both listing forms;
+//! * a `continuation-token` overrides a co-sent `start-after` (AWS precedence).
 //!
 //! The encoding-type / v1 shim / malformed-param assertions drive **raw signed HTTP** (the SDK
 //! paginator does not inject `encoding-type` by default, unlike botocore, and raw HTTP asserts
@@ -734,11 +736,13 @@ async fn get_bucket_versioning_is_501_not_a_listing_document() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_v2_start_after_inside_delimiter_group_still_rolls_up_survivors() {
-    // The iteration-3 refutation, reproduced end-to-end: bucket {a/1, a/2, b} with delimiter=/
-    // and a CLIENT-chosen `start-after=a/1` that lands strictly INSIDE the `a/` group. AWS
-    // applies start-after to the RAW keyspace before rollup, so `a/2 > a/1` survives and rolls
-    // up: CommonPrefixes=[a/], Contents=[b].
+async fn list_v2_start_after_inside_delimiter_group_drops_the_rollup() {
+    // Bucket {a/1, a/2, b} with delimiter=/ and a CLIENT-chosen `start-after=a/1` that lands
+    // strictly INSIDE the `a/` group. AWS filters a rollup on the common prefix ITSELF:
+    // "`CommonPrefixes` is filtered out from results if it is not lexicographically greater
+    // than the `StartAfter` value" (ListObjectsV2 API reference, `delimiter`) — `"a/" ≤ "a/1"`,
+    // so the `a/` entry a client explicitly resumed past is never re-delivered:
+    // CommonPrefixes=[], Contents=[b].
     let (addr, _dir) = start_gateway(&["bucket"]).await;
     let client = sdk_client(addr);
     for k in ["a/1", "a/2", "b"] {
@@ -759,23 +763,19 @@ async fn list_v2_start_after_inside_delimiter_group_still_rolls_up_survivors() {
         .filter_map(|p| p.prefix())
         .collect();
     let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
-    assert_eq!(
-        cps,
-        vec!["a/"],
-        "start-after landing inside the a/ group must still roll up the surviving a/2 into a/"
+    assert!(
+        cps.is_empty(),
+        "a/ is not lexicographically greater than start-after=a/1, so the rollup is dropped; got {cps:?}"
     );
-    assert_eq!(
-        keys,
-        vec!["b"],
-        "the top-level key b lists after the a/ rollup"
-    );
+    assert_eq!(keys, vec!["b"], "only the top-level key b remains");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_v1_marker_inside_delimiter_group_still_rolls_up_survivors() {
-    // Same landed refutation via the v1 shim: `?delimiter=/&marker=a/1` over {a/1, a/2, b}. The
-    // v1 `marker` is an arbitrary client-chosen key exactly like v2 `start-after`; a survivor
-    // (`a/2 > a/1`) must still roll up into the `a/` common prefix.
+async fn list_v1_marker_inside_delimiter_group_drops_the_rollup() {
+    // Same rule via the v1 shim: `?delimiter=/&marker=a/1` over {a/1, a/2, b}. The v1 API
+    // reference documents the identical filter — "`CommonPrefixes` is filtered out from
+    // results if it is not lexicographically greater than the key-marker" — so the `a/`
+    // rollup (`"a/" ≤ "a/1"`) is dropped whole: CommonPrefixes=[], Contents=[b].
     let (addr, _dir) = start_gateway(&["bucket"]).await;
     let client = sdk_client(addr);
     for k in ["a/1", "a/2", "b"] {
@@ -796,16 +796,11 @@ async fn list_v1_marker_inside_delimiter_group_still_rolls_up_survivors() {
         .filter_map(|p| p.prefix())
         .collect();
     let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
-    assert_eq!(
-        cps,
-        vec!["a/"],
-        "v1 marker landing inside the a/ group must still roll up the surviving a/2 into a/"
+    assert!(
+        cps.is_empty(),
+        "a/ is not lexicographically greater than marker=a/1, so the rollup is dropped; got {cps:?}"
     );
-    assert_eq!(
-        keys,
-        vec!["b"],
-        "the top-level key b lists after the a/ rollup"
-    );
+    assert_eq!(keys, vec!["b"], "only the top-level key b remains");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -999,13 +994,13 @@ async fn list_v1_encoding_type_url_encodes_marker_and_next_marker() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_v2_start_after_equal_to_common_prefix_still_returns_rollup() {
-    // Delta 2: a CLIENT-chosen v2 `start-after` EXACTLY EQUAL to a common prefix
-    // (`start-after=a/`, the folder-marker workflow) must NOT collapse the `a/` group — AWS
-    // applies start-after to the raw keyspace before rollup. Bucket {a/1, a/2, b} with
-    // `?list-type=2&delimiter=/&start-after=a/` returns CommonPrefixes=[a/], Contents=[b].
-    // The previous attempt's `r == cp` collapse (applied on both paths) returned
-    // CommonPrefixes=[], hiding the group.
+async fn list_v2_start_after_equal_to_common_prefix_drops_the_rollup() {
+    // A CLIENT-chosen v2 `start-after` EXACTLY EQUAL to a common prefix (`start-after=a/`,
+    // the folder-marker workflow) collapses the `a/` group: the rollup is filtered on the
+    // common prefix itself, and `"a/"` is not lexicographically GREATER than `start-after=a/`
+    // (the AWS-documented rule; equality is not enough). Bucket {a/1, a/2, b} with
+    // `?list-type=2&delimiter=/&start-after=a/` returns CommonPrefixes=[], Contents=[b] —
+    // the same collapse a v1 client gets resending the server-issued `NextMarker=a/`.
     let (addr, _dir) = start_gateway(&["bucket"]).await;
     let client = sdk_client(addr);
     for k in ["a/1", "a/2", "b"] {
@@ -1026,16 +1021,11 @@ async fn list_v2_start_after_equal_to_common_prefix_still_returns_rollup() {
         .filter_map(|p| p.prefix())
         .collect();
     let keys: Vec<&str> = out.contents().iter().filter_map(|o| o.key()).collect();
-    assert_eq!(
-        cps,
-        vec!["a/"],
-        "start-after=a/ must NOT collapse the a/ group (raw-keyspace semantics)"
+    assert!(
+        cps.is_empty(),
+        "a/ is not lexicographically greater than start-after=a/, so the rollup is dropped; got {cps:?}"
     );
-    assert_eq!(
-        keys,
-        vec!["b"],
-        "the top-level key b lists after the a/ rollup"
-    );
+    assert_eq!(keys, vec!["b"], "only the top-level key b remains");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
