@@ -80,6 +80,26 @@ pub struct ObjectMeta {
     pub modified: Option<u64>,
 }
 
+/// One object in a container listing (issue #507): the object's key **relative to the
+/// container** (the container segment already stripped) plus the wire-relevant metadata a
+/// listing row carries. The S3 wire layer groups these by delimiter, applies the combined
+/// `max-keys` slice, and renders `<Contents>`; this type names **no** S3 vocabulary
+/// (buckets, delimiters, tokens) — those stay in the S3 crate (ADR-0010, ADR-0046 dec. 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    /// The object key, relative to the container (the container segment stripped).
+    pub key: String,
+    /// The object's total length in bytes (its committed inode size).
+    pub size: u64,
+    /// The object's content digest (opaque change-token), if recorded — the wire layer
+    /// quotes it as S3's `ETag`. `None` for a record written before object metadata was
+    /// modelled (ADR-0047).
+    pub etag: Option<String>,
+    /// Content-publication time (epoch millis); the wire layer renders it as an ISO-8601
+    /// `<LastModified>`. `None` when unrecorded.
+    pub modified: Option<u64>,
+}
+
 /// The payload-integrity instruction a gateway hands its object-store for a streaming PUT.
 ///
 /// Neutral by design: a protocol that authenticated the body against a known hash (S3's
@@ -174,4 +194,48 @@ pub trait ObjectGateway: Send + Sync + 'static {
     /// Remove the object under `key`. **Idempotent**: `Ok(true)` if an object was removed,
     /// `Ok(false)` if `key` was already absent — deleting a missing key is a success.
     fn delete_object(&self, key: &str) -> impl Future<Output = Result<bool>> + Send;
+}
+
+/// The **container** side of the gateway seam — ADR-0046 decision 6: [`ObjectGateway`] stays
+/// object-only and bucket-free, and container operations arrive as this narrow companion
+/// trait speaking container vocabulary (list now; create/head/delete arrive with their
+/// issues, #511). Implemented by `wyrd-server` at the composition root per ADR-0010; the S3
+/// crate alone projects containers as buckets.
+pub trait ContainerGateway: Send + Sync + 'static {
+    /// List `container`'s **complete**, lexicographically-sorted object set — each key
+    /// (relative to the container) with its size/etag/modified — as one materialized,
+    /// `SCAN_CAP`-bounded [`Vec`] (issue #507, ADR-0046). Grouping (`delimiter`), the
+    /// combined `max-keys` slice, and pagination all happen in ONE place — the wire layer —
+    /// over this single sorted view, so `max-keys` (which counts `Contents` + `CommonPrefixes`
+    /// combined) and cross-page common-prefix dedup stay correct (ADR-0046 seam decision).
+    ///
+    /// `None` when `container` has **no record** — the wire layer maps that to S3's
+    /// `NoSuchBucket`. `Some(vec![])` is an existing but empty container, which lists as an
+    /// empty `200`, not a `404`: the existence read (ADR-0046 decision 4) is the implementer's,
+    /// so this seam names no bucket vocabulary and a non-container gateway simply has none.
+    ///
+    /// The dirent scan itself adds no new cost class over an ordinary `scan`: it is already
+    /// materialized and `SCAN_CAP`-bounded, and a scan past the cap surfaces as `Err` (the
+    /// complete-or-`Err` contract) rather than a silently truncated listing.
+    ///
+    /// **Bounded Alpha debt (explicit, not hidden):** the real implementation resolves each
+    /// dirent's size/etag/modified with one *sequential* inode point-read, and — because the
+    /// wire layer pages over the whole sorted view — the scan + N inode reads + sort re-run
+    /// for **every** page of a paginated listing (`≤SCAN_CAP` reads/page). On an in-memory
+    /// backend this is cheap; on a networked metadata backend it is up to N serial round-trips
+    /// per page. Batching the inode reads and/or caching the sorted view across a listing's
+    /// pages is deferred (tracked with the streaming-`scan` evolution, ADR-0046 consequences)
+    /// — acceptable at Alpha under the `SCAN_CAP` ceiling, called out here so it is a known
+    /// bound, not a surprise.
+    ///
+    /// A default of `Ok(None)` (no such container) keeps a gateway that has no container
+    /// concept — and the wire crate's own object-focused test doubles — free of a bespoke
+    /// impl; the composition root's real gateway overrides it.
+    fn list_container(
+        &self,
+        container: &str,
+    ) -> impl Future<Output = Result<Option<Vec<ListedObject>>>> + Send {
+        let _ = container;
+        std::future::ready(Ok(None))
+    }
 }

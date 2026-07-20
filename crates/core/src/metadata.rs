@@ -41,6 +41,14 @@ pub fn pending_key(chunk: ChunkId) -> Vec<u8> {
     format!("pending:{chunk}").into_bytes()
 }
 
+/// Key for a **bucket record**: `bucket:<name>` (ADR-0046 decision 1) — disjoint from
+/// `inode:`/`dirent:`/`pending:`/`orphan:`. The record is the authority on bucket
+/// existence. CreateBucket (#511) **writes** it; ListObjectsV2 / GET / HEAD (#507) **read**
+/// it so an absent bucket answers `NoSuchBucket` rather than an empty listing or `NoSuchKey`.
+pub fn bucket_key(name: &str) -> Vec<u8> {
+    format!("bucket:{name}").into_bytes()
+}
+
 /// Key prefix for the **orphan ledger** — the reader-safe grace record an orphaning
 /// operation (a delete, or a completed reconstruction / rebalance) writes when it
 /// strands a fragment, so the custodian **GC** loop reclaims the bytes only once the
