@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
@@ -355,32 +356,44 @@ where
         let etag = inode.etag.clone();
         let content_type = inode.content_type.clone();
         let modified = inode.modified;
-        // A small bound (a handful of chunks) so peak resident bytes stay O(chunk_size),
-        // not O(object): the reader task blocks on the channel until the socket drains.
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
         let this = Arc::clone(&self);
         let chunk_map = inode.chunk_map;
-        // `in_current_span` carries the caller's span — the S3 request span holding
-        // `request_id` (#529) — across the spawn. Without it the reader task starts with no
-        // span, and every fault the read path raises here would be logged unattributed: the
-        // task is *detached*, so its errors already reach no caller (#464 — "the gateway
-        // logged nothing for the failed read"), and an unattributed log line could not be
-        // joined back to the request that provoked it either.
-        tokio::spawn(
-            async move {
-                for chunk in &chunk_map {
-                    let piece = read::read_chunk_verified(&this.meta, &this.chunks, chunk).await;
-                    let is_err = piece.is_err();
-                    if tx.send(piece).await.is_err() || is_err {
-                        break;
+        // The reader task is spawned LAZILY — on the stream's first poll, not here — so a
+        // caller that resolves the object and then never reads the body (the wire layer's
+        // 304/412 conditional short-circuit drops the stream unread, issue #510 review) costs
+        // ZERO chunk reads. An eager spawn races ahead the moment this returns: it fetches a
+        // first chunk (and buffers up to the channel bound) before discovering at `tx.send`
+        // that the receiver is gone — chunk-store I/O for a body nobody will ever see.
+        // `Span::current()` is captured HERE, not at first poll: the S3 request span holding
+        // `request_id` (#529) is live now, while the first poll happens wherever the response
+        // body is driven — outside the request span. Without it every fault the read path
+        // raises would be logged unattributed: the task is *detached*, so its errors already
+        // reach no caller (#464 — "the gateway logged nothing for the failed read"), and an
+        // unattributed log line could not be joined back to the request that provoked it.
+        let span = tracing::Span::current();
+        let stream = futures_util::stream::once(async move {
+            // A small bound (a handful of chunks) so peak resident bytes stay O(chunk_size),
+            // not O(object): the reader task blocks on the channel until the socket drains.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+            tokio::spawn(
+                async move {
+                    for chunk in &chunk_map {
+                        let piece =
+                            read::read_chunk_verified(&this.meta, &this.chunks, chunk).await;
+                        let is_err = piece.is_err();
+                        if tx.send(piece).await.is_err() || is_err {
+                            break;
+                        }
                     }
                 }
-            }
-            .in_current_span(),
-        );
+                .instrument(span),
+            );
+            ReceiverStream::new(rx)
+        })
+        .flatten();
         Ok(Some(ObjectRead {
             size,
-            stream: Box::pin(ReceiverStream::new(rx)),
+            stream: Box::pin(stream),
             etag,
             content_type,
             modified,
@@ -443,40 +456,48 @@ where
             let take = (overlap_end - overlap_start) as usize;
             covering.push((chunk.clone(), skip, take));
         }
-        // Same bounded-channel backpressure as `get_object_streaming`: peak resident bytes stay
-        // O(chunk_size), the reader task blocks until the socket drains, and the caller's span
-        // (the S3 request span holding `request_id`) rides across the spawn so a mid-range read
-        // fault is attributed, not logged detached (issue #529 / #464).
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+        // Same bounded-channel backpressure and LAZY first-poll spawn as
+        // `get_object_streaming` (peak resident bytes stay O(chunk_size); a 304/412
+        // conditional short-circuit that drops this stream unread costs zero chunk reads),
+        // with the caller's span (the S3 request span holding `request_id`) captured now and
+        // carried into the spawn so a mid-range read fault is attributed, not logged detached
+        // (issue #529 / #464).
         let this = Arc::clone(&self);
-        tokio::spawn(
-            async move {
-                for (chunk, skip, take) in &covering {
-                    let piece = read::read_chunk_verified(&this.meta, &this.chunks, chunk)
-                        .await
-                        .map(|bytes| {
-                            // Trim the covered sub-span out of the chunk. Clamp defensively so a
-                            // chunk that read back shorter than its logical length can never
-                            // panic the slice — it degrades to a short body the wire layer's
-                            // declared span length then flags as a truncation (issue #364).
-                            let hi = skip.saturating_add(*take).min(bytes.len());
-                            let lo = (*skip).min(hi);
-                            bytes.slice(lo..hi)
-                        });
-                    let is_err = piece.is_err();
-                    if tx.send(piece).await.is_err() || is_err {
-                        break;
+        let span = tracing::Span::current();
+        let stream = futures_util::stream::once(async move {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+            tokio::spawn(
+                async move {
+                    for (chunk, skip, take) in &covering {
+                        let piece = read::read_chunk_verified(&this.meta, &this.chunks, chunk)
+                            .await
+                            .map(|bytes| {
+                                // Trim the covered sub-span out of the chunk. Clamp defensively
+                                // so a chunk that read back shorter than its logical length can
+                                // never panic the slice — it degrades to a short body the wire
+                                // layer's declared span length then flags as a truncation
+                                // (issue #364).
+                                let hi = skip.saturating_add(*take).min(bytes.len());
+                                let lo = (*skip).min(hi);
+                                bytes.slice(lo..hi)
+                            });
+                        let is_err = piece.is_err();
+                        if tx.send(piece).await.is_err() || is_err {
+                            break;
+                        }
                     }
                 }
-            }
-            .in_current_span(),
-        );
+                .instrument(span),
+            );
+            ReceiverStream::new(rx)
+        })
+        .flatten();
         Ok(Some(RangeRead {
             meta,
             outcome: RangeOutcome::Satisfiable {
                 offset,
                 len,
-                stream: Box::pin(ReceiverStream::new(rx)),
+                stream: Box::pin(stream),
             },
         }))
     }

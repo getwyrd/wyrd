@@ -2110,6 +2110,14 @@ fn evaluate_conditionals(
 /// comparison semantics: `*` matches any existing entity; otherwise an exact opaque-value match on
 /// the quoted value.
 ///
+/// The wildcard tests **existence of a current representation**, not possession of a persisted
+/// entity-tag (RFC 9110 §13.1.1: `If-Match: *` is false only "if the origin server does not have
+/// a current representation"). Every caller evaluates conditionals AFTER resolving the object, so
+/// existence is already established here and `*` matches unconditionally — including a
+/// pre-ADR-0047 record whose stored ETag is `None`. Gating `*` on `stored.is_some()` would 412 an
+/// `If-Match: *` overwrite guard and serve a full 200 to an `If-None-Match: *` cache probe on
+/// exactly those legacy records.
+///
 /// `strong` selects RFC 9110's comparison function. `If-Match` uses the **strong** comparison
 /// (§13.1.1): a weak entity-tag (`W/`-prefixed) NEVER matches, so `If-Match: W/"<etag>"` fails →
 /// 412 — silently accepting it as a match is exactly the precondition the RFC forbids weak
@@ -2117,12 +2125,12 @@ fn evaluate_conditionals(
 /// is ignored before comparing the opaque value. Weak comparators are otherwise out of *support*
 /// (stock aws clients send a single strong value); this narrow split only refuses to weak-match
 /// where it would be wrong, it does not add weak-tag support. A record with no stored ETag never
-/// matches a specific tag (no current entity-tag), so a specific `If-Match` fails on it — as the
-/// design requires (degrade safely on a pre-ADR-0047 record).
+/// matches a **specific** tag (no current entity-tag), so a specific `If-Match` fails on it — as
+/// the design requires (degrade safely on a pre-ADR-0047 record).
 fn etag_matches(header_value: &str, stored: Option<&str>, strong: bool) -> bool {
     let value = header_value.trim();
     if value == "*" {
-        return stored.is_some();
+        return true;
     }
     // Under strong comparison a weak entity-tag cannot match; under weak comparison the `W/`
     // indicator is stripped before the opaque values are compared.
@@ -3930,6 +3938,99 @@ mod tests {
         signed_through_router(gateway, "GET", b"").await
     }
 
+    #[test]
+    fn a_wildcard_validator_matches_object_existence_not_stored_etag_presence() {
+        // RFC 9110 §13.1.1: `If-Match: *` is false only "if the origin server does not have a
+        // current representation" — it tests EXISTENCE, not possession of a persisted
+        // entity-tag. Every caller evaluates conditionals after resolving the object, so `*`
+        // matches even a pre-ADR-0047 record whose stored ETag is `None`; gating on
+        // `stored.is_some()` would 412 an `If-Match: *` overwrite guard and serve a full 200
+        // to an `If-None-Match: *` cache probe on exactly those legacy records.
+        assert!(
+            etag_matches("*", None, true),
+            "If-Match: * on a legacy record"
+        );
+        assert!(
+            etag_matches("*", None, false),
+            "If-None-Match: * on a legacy record"
+        );
+        assert!(etag_matches("*", Some("0badc0de"), true));
+        assert!(etag_matches("*", Some("0badc0de"), false));
+        // A SPECIFIC tag still never matches a record with no stored ETag.
+        assert!(!etag_matches("\"0badc0de\"", None, true));
+        assert!(!etag_matches("\"0badc0de\"", None, false));
+    }
+
+    /// The wildcard semantics end to end, on a legacy record with NO stored ETag: through the
+    /// real signed router, `If-None-Match: *` must answer `304` (the object exists — the
+    /// wildcard needs no persisted entity-tag), and `If-Match: *` must serve the `200`.
+    #[tokio::test]
+    async fn wildcard_conditionals_fire_on_etag_less_legacy_records() {
+        let legacy = || {
+            Arc::new(StoredMetaGateway {
+                etag: None,
+                ..StoredMetaGateway::new()
+            })
+        };
+        let response = signed_get_with_header(legacy(), ("if-none-match", "*")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_MODIFIED,
+            "If-None-Match: * over an existing etag-less record revalidates (304)",
+        );
+
+        let response = signed_get_with_header(legacy(), ("if-match", "*")).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "If-Match: * over an existing etag-less record must NOT 412",
+        );
+    }
+
+    /// [`signed_get_through_router`] plus one extra (unsigned) conditional header — the guard
+    /// applies whether or not the client put the header in its SigV4 signed-header set.
+    async fn signed_get_with_header(
+        gateway: Arc<StoredMetaGateway>,
+        (name, value): (&'static str, &'static str),
+    ) -> Response {
+        use tower::ServiceExt;
+
+        let creds = crate::sigv4::Credentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+        };
+        let router = S3Gateway::new(gateway, S3Config::new(vec![creds.clone()])).router();
+        let host = "example.com";
+        let path = "/bucket/key";
+        let amz_date = crate::sigv4::format_amz_date(SystemTime::now());
+        let signed = crate::sigv4::sign(
+            "GET",
+            path,
+            "",
+            host,
+            &amz_date,
+            b"",
+            &creds,
+            "us-east-1",
+            "s3",
+        );
+        router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header("host", host)
+                    .header("authorization", signed.authorization)
+                    .header("x-amz-date", signed.amz_date)
+                    .header("x-amz-content-sha256", signed.content_sha256)
+                    .header(name, value)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("the router answers without panicking")
+    }
+
     /// A stored `content_type` that is NOT a valid HTTP header value must NOT panic a GET.
     ///
     /// Pre-hardening, the GET arm passed the stored string straight to
@@ -4143,7 +4244,7 @@ mod tests {
     /// Drive a signed request with arbitrary extra request headers (`range`, `if-*`) through the
     /// REAL router against `gateway`, returning the response — the generic sibling of
     /// `signed_through_router`, for the range-seam doubles below.
-    async fn signed_ranged_request<G: ObjectGateway>(
+    async fn signed_ranged_request<G: ObjectGateway + ContainerGateway>(
         gateway: Arc<G>,
         method: &str,
         extra_headers: &[(&str, &str)],
@@ -4195,6 +4296,8 @@ mod tests {
     struct DefaultRangeSeamGateway {
         body: Vec<u8>,
     }
+
+    impl ContainerGateway for DefaultRangeSeamGateway {}
 
     impl ObjectGateway for DefaultRangeSeamGateway {
         async fn put_object_streaming<S>(
@@ -4313,6 +4416,8 @@ mod tests {
     impl VersionSkewGateway {
         const FRESH_BODY: &'static [u8] = b"RANGEBYTES"; // 10 bytes, the served span
     }
+
+    impl ContainerGateway for VersionSkewGateway {}
 
     impl ObjectGateway for VersionSkewGateway {
         async fn put_object_streaming<S>(

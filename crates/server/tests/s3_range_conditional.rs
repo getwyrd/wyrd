@@ -748,3 +748,62 @@ async fn narrow_range_fetches_only_the_covering_chunks() {
          whole {total_chunks}-chunk object"
     );
 }
+
+/// The conditional-short-circuit oracle (issue #510 review): a GET whose precondition fires
+/// (304/412) must cost ZERO chunk reads. The conditionals are deliberately judged against the
+/// SAME resolve that yields the body (no head-then-read TOCTOU window), and the wire layer then
+/// drops the body stream unread — so the stream must be LAZY: an implementation that spawns its
+/// reader eagerly at resolve time races ahead and fetches chunks (up to its channel bound) for a
+/// body nobody will ever see, and every header/status assertion above passes byte-identically.
+/// Only the fragment counter catches it. Both the unranged (`get_object_streaming`) and ranged
+/// (`get_object_range`) paths are held to the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fired_precondition_costs_zero_chunk_reads() {
+    let (addr, _dir, counter) = start_gateway().await;
+    let path = "/wyrd-bucket/revalidated-object";
+    let (_object, etag) = put_object(addr, path).await;
+    let host = addr.to_string();
+
+    // 304 — the cache-revalidation loop's steady state: the client already holds the bytes, so
+    // fetching even one chunk is pure waste, multiplied by every revalidation of every object.
+    counter.reset();
+    let mut headers = signed_headers("GET", path, &host, b"");
+    headers.push(("if-none-match".to_string(), etag.clone()));
+    let (status, _head, _body) = send(addr, "GET", path, &headers, b"").await;
+    assert_eq!(status, 304);
+    assert_eq!(
+        counter.distinct_chunks(),
+        0,
+        "a 304 revalidation must read no chunk at all — the body stream is dropped unread and \
+         must not have started"
+    );
+
+    // 412 — an If-Match overwrite guard that loses: same bound.
+    counter.reset();
+    let mut headers = signed_headers("GET", path, &host, b"");
+    headers.push(("if-match".to_string(), "\"0badc0de0badc0de\"".to_string()));
+    let (status, _head, _body) = send(addr, "GET", path, &headers, b"").await;
+    assert_eq!(status, 412);
+    assert_eq!(
+        counter.distinct_chunks(),
+        0,
+        "a 412 precondition failure must read no chunk at all"
+    );
+
+    // The RANGED path's short-circuit: `get_object_range` resolves metadata and covering
+    // chunks from one snapshot; a firing precondition drops that stream unread too.
+    counter.reset();
+    let mut headers = signed_headers("GET", path, &host, b"");
+    headers.push(("if-none-match".to_string(), etag.clone()));
+    headers.push(("range".to_string(), "bytes=8-15".to_string()));
+    let (status, _head, _body) = send(addr, "GET", path, &headers, b"").await;
+    assert_eq!(
+        status, 304,
+        "a conditional ranged GET short-circuits first (§13.2)"
+    );
+    assert_eq!(
+        counter.distinct_chunks(),
+        0,
+        "a 304 on the ranged path must read no chunk at all"
+    );
+}
