@@ -66,7 +66,7 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_chunkstore_grpc::GrpcChunkStore;
 use wyrd_coordination_mem::MemCoordination;
-use wyrd_gateway_core::{ContentHash, ObjectGateway, ObjectMeta, ObjectRead};
+use wyrd_gateway_core::{ContainerGateway, ContentHash, ObjectGateway, ObjectMeta, ObjectRead};
 use wyrd_gateway_s3::sigv4::{format_amz_date, sign, Credentials};
 use wyrd_gateway_s3::{S3Config, S3Gateway};
 use wyrd_metadata_redb::RedbMetadataStore;
@@ -180,6 +180,8 @@ type Backend = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
 /// production: the test injects the fault, it does not assert the classification.
 struct FaultyGateway;
 
+impl ContainerGateway for FaultyGateway {}
+
 impl ObjectGateway for FaultyGateway {
     async fn put_object_streaming<S>(
         &self,
@@ -246,6 +248,8 @@ impl MidStreamFaultGateway {
         }
     }
 }
+
+impl ContainerGateway for MidStreamFaultGateway {}
 
 impl ObjectGateway for MidStreamFaultGateway {
     async fn put_object_streaming<S>(
@@ -341,7 +345,7 @@ fn build_gateway(dir: &std::path::Path) -> Arc<Backend> {
 /// metrics sink — the composition `cli::serve_s3` builds for `wyrd s3`.
 async fn start_s3<G>(gateway: Arc<G>, telemetry: &DurabilityTelemetry) -> SocketAddr
 where
-    G: ObjectGateway,
+    G: ObjectGateway + ContainerGateway,
 {
     let config = S3Config::new(vec![Credentials {
         access_key_id: ACCESS_KEY.to_string(),
