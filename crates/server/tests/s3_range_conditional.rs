@@ -558,9 +558,9 @@ async fn invalid_weekday_token_conditional_is_ignored() {
     let host = addr.to_string();
 
     for bad in [
-        "Xxx, 06 Nov 1994 08:49:37 GMT",  // IMF-fixdate — unknown 3-letter weekday
+        "Xxx, 06 Nov 1994 08:49:37 GMT", // IMF-fixdate — unknown 3-letter weekday
         "Xxxday, 06-Nov-94 08:49:37 GMT", // RFC-850 — unknown full weekday name
-        "Xxx Nov  6 08:49:37 1994",       // asctime — unknown 3-letter weekday
+        "Xxx Nov  6 08:49:37 1994",      // asctime — unknown 3-letter weekday
     ] {
         let mut ius = signed_headers("GET", path, &host, b"");
         ius.push(("if-unmodified-since".to_string(), bad.to_string()));
@@ -568,6 +568,40 @@ async fn invalid_weekday_token_conditional_is_ignored() {
         assert_eq!(
             status, 200,
             "{bad}: an unrecognized weekday token makes the date malformed → ignored → full 200, not 412"
+        );
+        assert_eq!(
+            body, object,
+            "{bad}: the ignored conditional serves the whole object"
+        );
+    }
+}
+
+/// HTTP-date numeric fields are digit-only, but Rust's integer parser accepts a leading `+` (and
+/// `-` for the year), so a signed field such as the `+8` in `… 1994 +8:49:37 GMT` would misparse as
+/// `08` and fire a spurious precondition instead of the malformed value being IGNORED (RFC 9110
+/// §13.1.4). Every numeric slice of all three date formats is now digit-validated, mirroring the
+/// `Range` parser's `+8-` rejection (PR #611 review). Each value below is otherwise a PAST instant
+/// whose well-formed sibling elsewhere in this suite fires 412, so a 200 here isolates the sign as
+/// the sole reason it is ignored.
+#[tokio::test]
+async fn signed_http_date_fields_are_ignored_not_misparsed() {
+    let (addr, _dir, _counter) = start_gateway().await;
+    let path = "/wyrd-bucket/signed-date-object";
+    let (object, _etag) = put_object(addr, path).await;
+    let host = addr.to_string();
+
+    for bad in [
+        "Sun, 06 Nov 1994 +8:49:37 GMT",  // IMF-fixdate — signed hour
+        "Sun, +6 Nov 1994 08:49:37 GMT",  // IMF-fixdate — signed day
+        "Sunday, 06-Nov-94 +8:49:37 GMT", // RFC-850 — signed hour
+        "Sun Nov  6 08:49:+7 1994",       // asctime — signed second
+    ] {
+        let mut ius = signed_headers("GET", path, &host, b"");
+        ius.push(("if-unmodified-since".to_string(), bad.to_string()));
+        let (status, _head, body) = send(addr, "GET", path, &ius, b"").await;
+        assert_eq!(
+            status, 200,
+            "{bad}: a signed HTTP-date field makes the value malformed → ignored → full 200, not 412"
         );
         assert_eq!(
             body, object,

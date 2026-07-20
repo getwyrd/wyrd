@@ -2205,6 +2205,21 @@ fn epoch_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Parse a fixed-width HTTP-date numeric field that MUST be all ASCII digits, into `T`. Rust's
+/// integer parser accepts a leading `+`/`-` (`"+8".parse::<u64>()` == `Ok(8)`, and an `i64` year
+/// also takes `-`), even though an HTTP-date component is digit-only — so a signed field like the
+/// `+8` in `… 1994 +8:49:37 GMT` would slip through as `08` and fire a spurious precondition
+/// instead of the malformed value being IGNORED (RFC 9110 §13.1.4). Reject an empty slice or any
+/// non-digit byte (a sign, whitespace, garbage) up front — the same strict-digit contract
+/// [`digits_or_empty`] enforces on a `Range` position (PR #611 review). Callers pass an
+/// already-`trim`med slice for the space-padded day columns.
+fn parse_date_field<T: std::str::FromStr>(field: &str) -> Option<T> {
+    if field.is_empty() || !field.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    field.parse().ok()
+}
+
 /// The preferred IMF-fixdate `Www, DD Mmm YYYY HH:MM:SS GMT` — exactly 29 ASCII bytes.
 fn parse_imf_fixdate(value: &str) -> Option<u64> {
     let bytes = value.as_bytes();
@@ -2220,12 +2235,12 @@ fn parse_imf_fixdate(value: &str) -> Option<u64> {
     if !is_weekday_abbrev(&value[0..3]) {
         return None;
     }
-    let day: u32 = value[5..7].trim().parse().ok()?;
+    let day: u32 = parse_date_field(value[5..7].trim())?;
     let month = month_index(&value[8..11])?;
-    let year: i64 = value[12..16].parse().ok()?;
-    let hour: u64 = value[17..19].parse().ok()?;
-    let minute: u64 = value[20..22].parse().ok()?;
-    let second: u64 = value[23..25].parse().ok()?;
+    let year: i64 = parse_date_field(&value[12..16])?;
+    let hour: u64 = parse_date_field(&value[17..19])?;
+    let minute: u64 = parse_date_field(&value[20..22])?;
+    let second: u64 = parse_date_field(&value[23..25])?;
     ymd_hms_to_epoch(year, month, day, hour, minute, second)
 }
 
@@ -2255,12 +2270,12 @@ fn parse_rfc850_date(value: &str, now_secs: u64) -> Option<u64> {
     if bytes[12] != b':' || bytes[15] != b':' {
         return None;
     }
-    let day: u32 = rest[0..2].parse().ok()?;
+    let day: u32 = parse_date_field(&rest[0..2])?;
     let month = month_index(&rest[3..6])?;
-    let yy: i64 = rest[7..9].parse().ok()?;
-    let hour: u64 = rest[10..12].parse().ok()?;
-    let minute: u64 = rest[13..15].parse().ok()?;
-    let second: u64 = rest[16..18].parse().ok()?;
+    let yy: i64 = parse_date_field(&rest[7..9])?;
+    let hour: u64 = parse_date_field(&rest[10..12])?;
+    let minute: u64 = parse_date_field(&rest[13..15])?;
+    let second: u64 = parse_date_field(&rest[16..18])?;
     // RFC 9110 §5.6.7: current century first; "more than 50 years in the future" → last
     // century. The cutoff is applied at FULL TIMESTAMP precision, not year precision: at
     // `now = 2026-07-20 09:00`, a candidate `2076-07-20 10:00` is 50 years and one hour ahead
@@ -2295,11 +2310,11 @@ fn parse_asctime_date(value: &str) -> Option<u64> {
         return None;
     }
     let month = month_index(&value[4..7])?;
-    let day: u32 = value[8..10].trim().parse().ok()?;
-    let hour: u64 = value[11..13].parse().ok()?;
-    let minute: u64 = value[14..16].parse().ok()?;
-    let second: u64 = value[17..19].parse().ok()?;
-    let year: i64 = value[20..24].parse().ok()?;
+    let day: u32 = parse_date_field(value[8..10].trim())?;
+    let hour: u64 = parse_date_field(&value[11..13])?;
+    let minute: u64 = parse_date_field(&value[14..16])?;
+    let second: u64 = parse_date_field(&value[17..19])?;
+    let year: i64 = parse_date_field(&value[20..24])?;
     ymd_hms_to_epoch(year, month, day, hour, minute, second)
 }
 
@@ -2316,7 +2331,7 @@ fn month_index(name: &str) -> Option<u32> {
 /// Whether `name` is one of the seven English weekday ABBREVIATIONS (`Mon`..`Sun`) — the leading
 /// token the IMF-fixdate and asctime formats carry, and the sibling of [`is_weekday_full`]. RFC
 /// 9110 §5.6.7 dates open with a weekday token; a value whose weekday is not a recognized name is
-/// malformed and must be rejected here, so an unparseable conditional is IGNORED (the object is
+/// malformed and must be rejected here, so an unparsable conditional is IGNORED (the object is
 /// served) rather than fired as a spurious `304`/`412` (PR #611 review). The parsers otherwise
 /// discarded the weekday bytes entirely, accepting `Xxx, 06 Nov 1994 …` as a valid date.
 fn is_weekday_abbrev(name: &str) -> bool {
