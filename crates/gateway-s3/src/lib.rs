@@ -1994,10 +1994,18 @@ fn honoured_range(headers: &axum::http::HeaderMap) -> Option<ByteRange> {
 /// Parse a `Range` header value into a single [`ByteRange`], or `None` when the value is a
 /// multi-range (`bytes=a-b,c-d`), a non-`bytes` unit, or syntactically malformed — in every
 /// `None` case the caller serves the full 200 exactly as real S3 does (brief: multi-range and
-/// malformed values are out of scope and answer 200). Only `bytes=` is honoured; `If-Range` is
-/// out of scope (Alpha).
+/// malformed values are out of scope and answer 200). Only the `bytes` unit is honoured; `If-Range`
+/// is out of scope (Alpha).
+///
+/// The range-unit token is matched ASCII case-insensitively (`bytes` / `Bytes` / `BYTES`): RFC 9110
+/// §14.1 range-unit names are case-insensitive, so a `Range: Bytes=0-15` must serve the requested
+/// slice (206) rather than silently degrade to the full 200 (PR #611 review). Only the unit is
+/// case-folded — the range-spec after `=` keeps its strict, no-tolerance parsing below.
 fn parse_range(value: &str) -> Option<ByteRange> {
-    let spec = value.trim().strip_prefix("bytes=")?;
+    let (unit, spec) = value.trim().split_once('=')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
     // A comma is a multi-range set — ignore it (out of scope → full 200).
     if spec.contains(',') {
         return None;
@@ -2209,6 +2217,9 @@ fn parse_imf_fixdate(value: &str) -> Option<u64> {
     if bytes[19] != b':' || bytes[22] != b':' || &value[25..] != " GMT" {
         return None;
     }
+    if !is_weekday_abbrev(&value[0..3]) {
+        return None;
+    }
     let day: u32 = value[5..7].trim().parse().ok()?;
     let month = month_index(&value[8..11])?;
     let year: i64 = value[12..16].parse().ok()?;
@@ -2228,8 +2239,12 @@ fn parse_imf_fixdate(value: &str) -> Option<u64> {
 /// (issue #510 review). The clock dependency is injected (`now_secs`), so the parse stays a
 /// pure, testable function of its inputs.
 fn parse_rfc850_date(value: &str, now_secs: u64) -> Option<u64> {
-    // Split the weekday name (`Sunday`..`Wednesday`, variable length) off at the ", ".
-    let (_weekday, rest) = value.split_once(", ")?;
+    // Split the weekday name (`Monday`..`Sunday`, variable length) off at the ", " and validate it
+    // is a recognized full weekday name — an unknown token (`Xxxday, …`) makes the value malformed.
+    let (weekday, rest) = value.split_once(", ")?;
+    if !is_weekday_full(weekday) {
+        return None;
+    }
     let bytes = rest.as_bytes();
     if bytes.len() != 22 {
         return None;
@@ -2276,6 +2291,9 @@ fn parse_asctime_date(value: &str) -> Option<u64> {
     if bytes[13] != b':' || bytes[16] != b':' {
         return None;
     }
+    if !is_weekday_abbrev(&value[0..3]) {
+        return None;
+    }
     let month = month_index(&value[4..7])?;
     let day: u32 = value[8..10].trim().parse().ok()?;
     let hour: u64 = value[11..13].parse().ok()?;
@@ -2293,6 +2311,32 @@ fn month_index(name: &str) -> Option<u32> {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     MONTHS.iter().position(|m| *m == name).map(|i| i as u32 + 1)
+}
+
+/// Whether `name` is one of the seven English weekday ABBREVIATIONS (`Mon`..`Sun`) — the leading
+/// token the IMF-fixdate and asctime formats carry, and the sibling of [`is_weekday_full`]. RFC
+/// 9110 §5.6.7 dates open with a weekday token; a value whose weekday is not a recognized name is
+/// malformed and must be rejected here, so an unparseable conditional is IGNORED (the object is
+/// served) rather than fired as a spurious `304`/`412` (PR #611 review). The parsers otherwise
+/// discarded the weekday bytes entirely, accepting `Xxx, 06 Nov 1994 …` as a valid date.
+fn is_weekday_abbrev(name: &str) -> bool {
+    const DAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    DAYS.contains(&name)
+}
+
+/// Whether `name` is one of the seven English weekday FULL names (`Monday`..`Sunday`) — the token
+/// the obsolete RFC-850 format carries in place of [`is_weekday_abbrev`]'s three-letter form.
+fn is_weekday_full(name: &str) -> bool {
+    const DAYS: [&str; 7] = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ];
+    DAYS.contains(&name)
 }
 
 /// Assemble a validated `(Y, M, D, h, m, s)` into epoch SECONDS, shared by the three

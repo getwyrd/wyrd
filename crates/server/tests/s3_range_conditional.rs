@@ -406,6 +406,36 @@ async fn out_of_scope_and_malformed_ranges_answer_full_200_with_accept_ranges() 
     }
 }
 
+/// The range-unit token is case-insensitive (RFC 9110 §14.1): `Range: Bytes=8-15` /
+/// `Range: BYTES=8-15` must serve the requested slice as a `206`, exactly as the lowercase `bytes=`
+/// form does. A case-sensitive prefix match silently degraded a case-variant unit to the full `200`
+/// — defeating a client that varies the token's casing (PR #611 review).
+#[tokio::test]
+async fn range_unit_is_matched_case_insensitively() {
+    let (addr, _dir, _counter) = start_gateway().await;
+    let path = "/wyrd-bucket/case-range-object";
+    let (object, _etag) = put_object(addr, path).await;
+    let size = object.len();
+
+    for range in ["Bytes=8-15", "BYTES=8-15", "bYtEs=8-15"] {
+        let (status, head, body) = ranged_get(addr, path, range).await;
+        assert_eq!(
+            status, 206,
+            "{range}: a case-variant range unit must still answer 206 Partial Content"
+        );
+        assert_eq!(
+            header_value(&head, "content-range").as_deref(),
+            Some(format!("bytes 8-15/{size}").as_str()),
+            "{range}: Content-Range names the resolved span in the canonical lowercase unit"
+        );
+        assert_eq!(
+            body,
+            object[8..=15],
+            "{range}: the body is byte-identical to the requested slice"
+        );
+    }
+}
+
 #[tokio::test]
 async fn if_none_match_with_the_objects_etag_returns_304_on_get_and_head() {
     let (addr, _dir, _counter) = start_gateway().await;
@@ -511,6 +541,39 @@ async fn invalid_conditional_date_is_ignored_not_misparsed() {
         body, object,
         "the ignored conditional serves the whole object"
     );
+}
+
+/// A conditional whose HTTP-date carries an UNRECOGNIZED weekday token is malformed and must be
+/// IGNORED (RFC 9110 §13.1.4) — answering the full 200 — not parsed as a valid past instant that
+/// fires the precondition. The parsers previously discarded the weekday bytes, so `Xxx, 06 Nov 1994
+/// …` (and its RFC-850 / asctime forms) wrongly resolved to a real past date; a past
+/// `If-Unmodified-Since` on a just-PUT object then 412'd (PR #611 review). Each value below shares
+/// its date with a valid-weekday sibling elsewhere in this suite that DOES fire 412, so a 200 here
+/// isolates the weekday token as the sole reason it is ignored.
+#[tokio::test]
+async fn invalid_weekday_token_conditional_is_ignored() {
+    let (addr, _dir, _counter) = start_gateway().await;
+    let path = "/wyrd-bucket/invalid-weekday-object";
+    let (object, _etag) = put_object(addr, path).await;
+    let host = addr.to_string();
+
+    for bad in [
+        "Xxx, 06 Nov 1994 08:49:37 GMT",  // IMF-fixdate — unknown 3-letter weekday
+        "Xxxday, 06-Nov-94 08:49:37 GMT", // RFC-850 — unknown full weekday name
+        "Xxx Nov  6 08:49:37 1994",       // asctime — unknown 3-letter weekday
+    ] {
+        let mut ius = signed_headers("GET", path, &host, b"");
+        ius.push(("if-unmodified-since".to_string(), bad.to_string()));
+        let (status, _head, body) = send(addr, "GET", path, &ius, b"").await;
+        assert_eq!(
+            status, 200,
+            "{bad}: an unrecognized weekday token makes the date malformed → ignored → full 200, not 412"
+        );
+        assert_eq!(
+            body, object,
+            "{bad}: the ignored conditional serves the whole object"
+        );
+    }
 }
 
 /// A **pre-1970** `If-Unmodified-Since` must FIRE 412, not be silently ignored (carry-forward
