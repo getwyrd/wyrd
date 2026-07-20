@@ -31,6 +31,11 @@ sha2.workspace = true
 # no new ADR-0003 audit. Plain `x-amz-checksum-crc32` is a DIFFERENT polynomial this
 # crate does not compute — see `checksum.rs` for the in-tree table-driven IEEE CRC-32.
 crc32c.workspace = true
+# Well-formed-XML DOM parser for the DeleteObjects request body (issue #509). The bulk-delete
+# path must answer `400 MalformedXML` to ANY body that is not a well-formed `<Delete>` document
+# and delete nothing; delegating the whole grammar to a vetted parser (rather than a hand-rolled
+# well-formedness pass) is what makes that invariant structural instead of a list of point checks.
+roxmltree.workspace = true
 # The runtime that hosts the listener and the bounded-channel decode/read tasks.
 tokio.workspace = true
 tokio-stream.workspace = true

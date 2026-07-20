@@ -392,6 +392,38 @@ fn unsupported_subresource(query: &str) -> Option<&str> {
         .find(|k| UNSUPPORTED_SUBRESOURCES.contains(k))
 }
 
+/// True if `query` names the **`delete`** subresource (`?delete`, `?delete=`, `?delete&x=1`) —
+/// the marker of a bulk **DeleteObjects** POST (issue #509). A **bare-key** match, mirroring
+/// [`unsupported_subresource`]'s split (:387-393): `?delete` has no `=`, so [`query_param`]
+/// (:453), which requires `k=v`, would return `None` and miss it. Used on the bucket route to
+/// intercept `POST /bucket?delete` BEFORE the subresource denylist (which lists `"delete"`, :344)
+/// would refuse it — while `"delete"` stays on the OBJECT-path denylist so `DELETE /b/k?delete`
+/// remains `501`.
+fn is_delete_subresource(query: &str) -> bool {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
+        .any(|k| k == "delete")
+}
+
+/// The buffered-byte cap for a bulk **DeleteObjects** request body (issue #509). The body is
+/// small (≤1000 keys) and SigV4-signed, so — unlike a streamed object PUT — it is buffered whole;
+/// the cap is enforced BY CONSTRUCTION as the body is read (never by trusting `Content-Length`),
+/// and an over-cap body is refused as `MalformedXML`.
+///
+/// The bound must sit in `[~1.1 MB, 3 MiB)`. FLOOR: a legal maximum request — 1000 keys × a
+/// 1024-byte key + the `<Object><Key></Key></Object>` envelope ≈ 1.06 MB — MUST fit, or the cap
+/// fail-closed-rejects a legal DeleteObjects (no test guards this floor; the 1000-key test uses
+/// tiny keys ≈ 33 KB). CEILING: the retained oversized-body test sends a 3 MiB body, so the cap
+/// MUST be < 3 MiB to refuse it. 2 MiB sits in `[1.1 MB, 3 MiB)`.
+const MAX_DELETE_BODY_BYTES: usize = 2 * 1024 * 1024;
+const _: () = assert!(
+    MAX_DELETE_BODY_BYTES > 1_100_000 && MAX_DELETE_BODY_BYTES < 3 * 1024 * 1024,
+    "MAX_DELETE_BODY_BYTES must exceed a legal 1000-key request (~1.1 MB) and stay under the \
+     3 MiB oversized-body test's body",
+);
+
 /// Like [`unsupported_subresource`] but matches against **percent-decoded** query keys, so a
 /// bucket subresource cannot slip past the listing route by percent-encoding its name
 /// (`GET /bucket?%61cl`, `GET /bucket?upload%73`). The bucket route routes anything not on the
@@ -1455,6 +1487,22 @@ where
     // verbs); the split routes bucket-scoped GET to the listing handler and leaves every
     // other bucket-scoped method on today's 400 (#511 / 509 extend the split later).
     if let Some(bucket) = bucket_scoped_path(&path) {
+        // Bulk DeleteObjects (issue #509): `POST /bucket?delete` carries an XML `<Delete>` body
+        // of keys and answers a `<DeleteResult>`. It is intercepted HERE, BEFORE the subresource
+        // denylist below — which lists `"delete"` (:344) and would otherwise `501` it — so the
+        // bulk handler runs. `"delete"` stays on the OBJECT-path denylist (:1513) so
+        // `DELETE /b/k?delete` is still `501`. `?delete` is detected with a bare-key match
+        // ([`is_delete_subresource`]); `query_param` would miss a valueless `?delete`.
+        if method == Method::POST && is_delete_subresource(&query) {
+            return delete_objects(
+                &state,
+                request_id,
+                &percent_decode_utf8(bucket),
+                payload,
+                body,
+            )
+            .await;
+        }
         // The bucket path MUST still consult the subresource denylist first: only a listing
         // form (`?list-type=2`, the v1 bare / `marker` / `prefix` / `delimiter` / `max-keys`
         // forms, and benign params) routes to listing. `GET /bucket?acl` / `?policy` /
@@ -1716,6 +1764,250 @@ where
             "only object PUT, GET, HEAD, and DELETE are supported",
         ),
     }
+}
+
+/// Why buffering a bulk-delete body was refused: over the byte cap, or a broken read.
+enum BufferError {
+    /// The accumulated bytes would exceed the cap — refused AS READ, by construction (never by
+    /// trusting `Content-Length`), before the whole body is resident.
+    TooLarge,
+    /// The request-body stream yielded an error before it completed (a truncated / aborted body).
+    Read(#[allow(dead_code)] BoxError),
+}
+
+/// Buffer `body` whole into a `Vec<u8>`, refusing the moment the accumulated bytes would exceed
+/// `cap`. The cap is a hard bound on what is materialised — the read stops at the first chunk
+/// that would breach it, so an oversized body is never fully resident (issue #509, DeleteObjects
+/// buffering). Used ONLY for the small, signed bulk-delete body; the object PUT/GET paths stay
+/// streaming.
+async fn buffer_capped(body: Body, cap: usize) -> Result<Vec<u8>, BufferError> {
+    let mut stream = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let chunk = frame.map_err(|e| BufferError::Read(Box::new(e) as BoxError))?;
+        if buf.len() + chunk.len() > cap {
+            return Err(BufferError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// A parsed, validated bulk-delete request: the requested object keys (literal, already
+/// XML-entity-decoded once by the parser) and whether the client asked for a `Quiet` result.
+struct DeleteRequest {
+    keys: Vec<String>,
+    quiet: bool,
+}
+
+/// The `400 MalformedXML` a DeleteObjects request answers when its body is not a well-formed
+/// `<Delete>` document (or violates a semantic bound / the fail-closed key-extraction contract).
+/// **The load-bearing safety invariant:** this is returned BEFORE any `delete_object` call, so a
+/// rejected request authorises no deletion. `MalformedXML` is S3's own code (issue #509).
+fn malformed_xml(request_id: RequestId) -> Response {
+    error_response(
+        request_id,
+        StatusCode::BAD_REQUEST,
+        "MalformedXML",
+        "the XML you provided was not well-formed or did not validate against the published schema",
+    )
+}
+
+/// Bulk **DeleteObjects** (issue #509): `POST /bucket?delete` with an XML `<Delete>` body of
+/// keys. Deletes each named key over the existing idempotent single-object seam and answers a
+/// `200` S3 `<DeleteResult>` — a per-key `<Deleted>` (removed AND absent keys, S3 delete being
+/// idempotent) or `<Error>` — honouring `<Quiet>`.
+///
+/// **The one destructive-path invariant** (the re-plan's whole point): any body that is not a
+/// well-formed `<Delete>` document is `400 MalformedXML` and touches NO key. Well-formedness is
+/// delegated WHOLE to [`roxmltree`] (a full XML-1.0 DOM validator that rejects DTDs by default —
+/// no XXE), so this handler writes no hand-rolled grammar production and there is no next
+/// production to miss (the five prior rejections were a hand-rolled tokenizer letting one more
+/// XML production through each round).
+async fn delete_objects<G>(
+    state: &AppState<G>,
+    request_id: RequestId,
+    bucket: &str,
+    payload: sigv4::PayloadHash,
+    body: Body,
+) -> Response
+where
+    G: ObjectGateway + ContainerGateway,
+{
+    // Buffer the signed body whole under the byte cap (refused as read; see [`buffer_capped`]).
+    // An over-cap body is `MalformedXML` — S3 refuses an over-large request body, and this fires
+    // before any key is touched.
+    let bytes = match buffer_capped(body, MAX_DELETE_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return malformed_xml(request_id),
+    };
+
+    // Verify the signed payload digest EXACTLY as the PUT `Signed` path does (:1579): the
+    // buffered body is checked against the signed `x-amz-content-sha256` before any key is
+    // touched (mismatch text mirrors :2116). An `UNSIGNED-PAYLOAD` body carries no digest to
+    // check; an aws-chunked streaming framing is not a shape a DeleteObjects client sends, and
+    // its raw frames are not a well-formed `<Delete>` document, so the parse below rejects them
+    // fail-closed.
+    if let sigv4::PayloadHash::Signed(expected) = &payload {
+        let actual = crypto::hex(&crypto::sha256(&bytes));
+        if !crypto::constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+            return error_response(
+                request_id,
+                StatusCode::BAD_REQUEST,
+                "XAmzContentSHA256Mismatch",
+                "the delivered body does not match the signed x-amz-content-sha256",
+            );
+        }
+    }
+
+    // `roxmltree::Document::parse` takes `&str`, so a non-UTF-8 body cannot be a well-formed XML
+    // document — it is `MalformedXML`, no key touched.
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return malformed_xml(request_id);
+    };
+
+    // Parse + walk the validated tree. ANY parse error, semantic-bound violation, or fail-closed
+    // key-extraction violation ⇒ `MalformedXML`, no key touched.
+    let request = match parse_delete_request(text) {
+        Ok(request) => request,
+        Err(()) => return malformed_xml(request_id),
+    };
+
+    // Fan out over the existing idempotent single-object delete seam (the object DELETE arm,
+    // :1755): `delete_object` returns `Ok(_)` for both a removed and an already-absent key (S3
+    // delete is idempotent — both are `<Deleted>`), and a per-key gateway error becomes a per-key
+    // `<Error>` via the shared [`classify`] rather than failing the whole batch.
+    let mut deleted: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, &'static str, String)> = Vec::new();
+    for key in request.keys {
+        let object_key = format!("{bucket}/{key}");
+        match state.gateway.delete_object(&object_key).await {
+            Ok(_) => deleted.push(key),
+            Err(err) => {
+                let (_, code, message) = classify(&err);
+                errors.push((key, code, message));
+            }
+        }
+    }
+
+    list_response(render_delete_result(&deleted, &errors, request.quiet))
+}
+
+/// Walk a buffered body as a well-formed S3 `<Delete>` document (issue #509), returning the
+/// requested keys and the `Quiet` flag, or `Err(())` (⇒ `MalformedXML`, no key touched) on ANY
+/// of:
+///
+///  * a [`roxmltree`] parse error — the WHOLE XML-1.0 grammar (exactly one root, matched/nested
+///    tags, unique attribute names, valid char/entity references, no raw `<`/`&` in an attribute
+///    value, comment/PI/CDATA grammar) is validated by construction, and DTDs are rejected (no
+///    XXE); we write no XML validation of our own, so there is no next production to miss;
+///  * a semantic bound: a root not locally named `Delete`, an empty key list, `>1000` `<Object>`,
+///    an `<Object>` with zero or `>1` `<Key>`, or `>1` `<Quiet>`;
+///  * the fail-closed key-extraction contract ([`char_data`]): a `<Key>` (or `<Quiet>`) whose
+///    content is not a pure character-data run.
+///
+/// Elements are matched by LOCAL name, namespace-insensitively (`node.tag_name().name()`), so an
+/// unqualified `<Delete>`, the S3-default-namespace form, and a prefixed `<s3:Delete>` are all
+/// accepted (real S3's leniency / the stock SDK body). Unknown sibling elements are ignored ONLY
+/// as children of `<Delete>` / `<Object>` — `<VersionId>` is parsed-and-ignored (out of scope).
+fn parse_delete_request(text: &str) -> Result<DeleteRequest, ()> {
+    let doc = roxmltree::Document::parse(text).map_err(|_| ())?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "Delete" {
+        return Err(());
+    }
+    let mut keys: Vec<String> = Vec::new();
+    let mut quiet = false;
+    let mut quiet_seen = false;
+    for child in root.children().filter(|n| n.is_element()) {
+        match child.tag_name().name() {
+            "Object" => {
+                let mut key_elems = child
+                    .children()
+                    .filter(|n| n.is_element() && n.tag_name().name() == "Key");
+                let key_elem = key_elems.next().ok_or(())?; // zero <Key> ⇒ malformed
+                if key_elems.next().is_some() {
+                    return Err(()); // >1 <Key> in one <Object> ⇒ malformed
+                }
+                let key = char_data(&key_elem)?;
+                // An empty `<Key></Key>` is rejected — never a delete of `bucket/`.
+                if key.is_empty() {
+                    return Err(());
+                }
+                keys.push(key);
+            }
+            "Quiet" => {
+                if quiet_seen {
+                    return Err(()); // >1 <Quiet> ⇒ malformed
+                }
+                quiet_seen = true;
+                // `<Quiet>` content is subject to the same fail-closed extraction as `<Key>`;
+                // S3 spells the flag as the literal `true`.
+                quiet = char_data(&child)? == "true";
+            }
+            // Unknown sibling elements (incl. `<VersionId>`) are ignored — S3 is lenient about
+            // extras in a well-formed `<Delete>`.
+            _ => {}
+        }
+    }
+    if keys.is_empty() || keys.len() > 1000 {
+        return Err(());
+    }
+    Ok(DeleteRequest { keys, quiet })
+}
+
+/// The character-data value of `node`, FAIL-CLOSED (issue #509 Scope (6)): `Err(())` if ANY child
+/// is not a text/CDATA node — a child element, COMMENT, or processing-instruction inside a
+/// `<Key>` / `<Quiet>` is malformed, never ignored (this closes the parses-but-deletes-wrong
+/// class in key EXTRACTION, downstream of roxmltree's grammar gate). The value is built by
+/// CONCATENATING the text/CDATA child values in document order — NOT [`roxmltree::Node::text`],
+/// which is first-text-node-only and TRUNCATES a run split by a comment/PI (`<Key>a<!--x-->c`
+/// → `.text()` = `a`, which is exactly why such a `<Key>` is rejected here). The value roxmltree
+/// yields is ALREADY XML-entity-decoded exactly once: it is the literal object key, used verbatim
+/// — NOT re-decoded, NOT percent-decoded, NOT whitespace-trimmed.
+fn char_data(node: &roxmltree::Node) -> Result<String, ()> {
+    let mut value = String::new();
+    for child in node.children() {
+        if !child.is_text() {
+            return Err(());
+        }
+        value.push_str(child.text().unwrap_or(""));
+    }
+    Ok(value)
+}
+
+/// Render an S3 `<DeleteResult>` by string building with [`xml_escape`], mirroring 507's
+/// `render_list_v2` / `list_response` (:913, :1032; escape :1893) — the maintainer-blessed
+/// string-built output (`roxmltree` is adopted for INPUT parsing only). `Quiet=true` omits the
+/// `<Deleted>` entries (the objects are still gone); `<Error>` entries are always emitted.
+fn render_delete_result(
+    deleted: &[String],
+    errors: &[(String, &str, String)],
+    quiet: bool,
+) -> String {
+    let mut out = String::with_capacity(128 + (deleted.len() + errors.len()) * 64);
+    out.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    if !quiet {
+        for key in deleted {
+            out.push_str(&format!(
+                "<Deleted><Key>{}</Key></Deleted>",
+                xml_escape(key)
+            ));
+        }
+    }
+    for (key, code, message) in errors {
+        out.push_str(&format!(
+            "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
+            xml_escape(key),
+            xml_escape(code),
+            xml_escape(message),
+        ));
+    }
+    out.push_str("</DeleteResult>");
+    out
 }
 
 fn empty_response(status: StatusCode) -> Response {
