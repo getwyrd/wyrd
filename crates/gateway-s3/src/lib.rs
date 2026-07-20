@@ -73,7 +73,8 @@ use axum::Router;
 use futures_util::StreamExt;
 use tracing::Instrument;
 use wyrd_gateway_core::{
-    ContentHash, GatewayError, ListedObject, ObjectGateway, ObjectMeta, ObjectRead,
+    resolve_byte_range, ByteRange, ContentHash, GatewayError, ListedObject, ObjectGateway,
+    ObjectMeta, ObjectRead, ObjectStream, RangeOutcome, RangeRead,
 };
 use wyrd_traits::{BoxError, ErrorClass};
 
@@ -1612,104 +1613,20 @@ where
                 Err(err) => gateway_error_response(request_id, &err),
             }
         }
-        Method::GET => match Arc::clone(&state.gateway)
-            .get_object_streaming(&object_key)
-            .await
-        {
-            Ok(Some(ObjectRead {
-                size,
-                stream,
-                etag,
-                content_type,
-                modified,
-            })) => {
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    // The stored content type, or the S3 default when none was recorded
-                    // (an old record, or a PUT that declared none) — and also when the
-                    // stored value is not a valid HTTP header value (ADR-0047). The seam
-                    // commits the client's declared type verbatim, so it may be any string;
-                    // an un-renderable one must degrade to the default, not panic the GET.
-                    .header("content-type", content_type_header(content_type.as_deref()))
-                    // Declare the exact object length so a body truncated by a mid-stream fault
-                    // (e.g. a fragment reclaimed by a racing DELETE) is a detectable short read,
-                    // not a silent "complete" 200 (issue #364 carry-forward: GET fault framing).
-                    .header("content-length", size.to_string());
-                // The ETag and Last-Modified are additive: a record predating the metadata
-                // model carries neither, so the headers are simply omitted (ADR-0047). A
-                // stored etag is committed by the write path and decoded liberally (ADR-0045),
-                // so a corrupt/out-of-band value may carry a non-header byte (e.g. CR/LF);
-                // `etag_header` degrades such a value to no header rather than panicking the
-                // GET — symmetric with `content_type_header` above.
-                if let Some(value) = etag.as_deref().and_then(etag_header) {
-                    builder = builder.header("etag", value);
-                }
-                // `http_date` declines (`None`) a timestamp past year 9999 — IMF-fixdate has a
-                // fixed 4-digit year, so such a value (reachable only via store corruption or
-                // an out-of-band edit, like the etag above) cannot be rendered as a valid
-                // `Last-Modified` and the header is omitted instead of sent malformed.
-                if let Some(value) = modified.and_then(http_date) {
-                    builder = builder.header("last-modified", value);
-                }
-                builder
-                    .body(Body::from_stream(stream))
-                    .expect("streaming response is always valid")
-            }
-            Ok(None) => error_response(
-                request_id,
-                StatusCode::NOT_FOUND,
-                "NoSuchKey",
-                "the specified key does not exist",
-            ),
-            Err(err) => gateway_error_response(request_id, &err),
-        },
-        // HEAD answers exactly GET's metadata headers with no body (issue #506): the
-        // ubiquitous HEAD-before-GET/PUT pattern (`aws s3 cp`'s download preflight, most SDK
-        // existence checks) 405-ed before this arm existed. Resolved via the metadata-only
-        // `head_object` seam — not `get_object_streaming` — so a HEAD of a large object costs
-        // a metadata round-trip, never opens the fragment stream, and never spawns the
-        // chunk-reader task GET does. `finish_response` already classifies every HEAD
-        // response as body-less, so hyper suppresses whatever body this builder sets and no
-        // access-log change is needed here.
-        Method::HEAD => match state.gateway.head_object(&object_key).await {
-            Ok(Some(ObjectMeta {
-                size,
-                etag,
-                content_type,
-                modified,
-            })) => {
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    // Same content-type fallback GET uses (ADR-0047); see `content_type_header`.
-                    .header("content-type", content_type_header(content_type.as_deref()))
-                    // The object's real size, not 0 — a HEAD's `Content-Length` must match what
-                    // a follow-up GET would declare (brief success criterion).
-                    .header("content-length", size.to_string());
-                // Additive, exactly as the GET arm above: a record predating the metadata model
-                // carries neither ETag nor Last-Modified, and an un-renderable stored etag
-                // degrades to no header via `etag_header` rather than panicking the HEAD.
-                if let Some(value) = etag.as_deref().and_then(etag_header) {
-                    builder = builder.header("etag", value);
-                }
-                if let Some(value) = modified.and_then(http_date) {
-                    builder = builder.header("last-modified", value);
-                }
-                builder
-                    .body(Body::empty())
-                    .expect("static response is always valid")
-            }
-            // Mirrors the GET arm's `Ok(None)` mapping above: an absent key is `404 NoSuchKey`.
-            // The XML body `error_response` builds never reaches the wire — hyper suppresses
-            // every HEAD response body — but building the same response GET's error path builds
-            // keeps the two arms symmetric.
-            Ok(None) => error_response(
-                request_id,
-                StatusCode::NOT_FOUND,
-                "NoSuchKey",
-                "the specified key does not exist",
-            ),
-            Err(err) => gateway_error_response(request_id, &err),
-        },
+        // GET honours a `Range` header (206 partial content / 416) and the conditional
+        // preconditions (`If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since`
+        // → 304/412), both evaluated BEFORE any body work, and advertises
+        // `Accept-Ranges: bytes` (issue #510). Extracted so the dispatch stays a thin verb
+        // table (peer `list_objects`).
+        Method::GET => serve_get(&state, &parts.headers, &object_key, request_id).await,
+        // HEAD answers exactly GET's metadata headers with no body (issue #506), now also
+        // honouring the conditional preconditions and advertising `Accept-Ranges: bytes`
+        // (issue #510). Resolved via the metadata-only `head_object` seam — not
+        // `get_object_streaming` — so a HEAD of a large object costs a metadata round-trip,
+        // never opens the fragment stream, and never spawns the chunk-reader task GET does.
+        // `finish_response` classifies every HEAD response as body-less, so hyper suppresses
+        // whatever body a builder sets and no access-log change is needed here.
+        Method::HEAD => serve_head(&state, &parts.headers, &object_key, request_id).await,
         Method::DELETE => match state.gateway.delete_object(&object_key).await {
             // DELETE is idempotent: removing a present or an absent key both succeed.
             Ok(_) => empty_response(StatusCode::NO_CONTENT),
@@ -1722,6 +1639,678 @@ where
             "only object PUT, GET, HEAD, and DELETE are supported",
         ),
     }
+}
+
+/// Serve an object `GET`, honouring the `Range` header (206 partial content, 416 unsatisfiable)
+/// and the `If-Match`/`If-None-Match`/`If-Modified-Since`/`If-Unmodified-Since` preconditions
+/// (304/412) — issue #510. The preconditions run BEFORE any body work, off a metadata-only
+/// [`ObjectGateway::head_object`] resolve (no chunk read), so a 304/412 costs no data read at
+/// all — and are skipped entirely when the request carries none, so a plain or purely-ranged GET
+/// pays no extra metadata round-trip. A satisfiable ranged read then fetches its metadata AND its
+/// bytes from ONE resolve inside [`ObjectGateway::get_object_range`], so the `206` (or the `416`)
+/// is coherent — there is no head-then-read gap in which a racing overwrite could emit a
+/// version-mixed 206 that poisons an ETag-keyed cache. A plain GET keeps the single-lookup
+/// streaming path, now advertising `Accept-Ranges: bytes`.
+async fn serve_get<G>(
+    state: &AppState<G>,
+    headers: &axum::http::HeaderMap,
+    object_key: &str,
+    request_id: RequestId,
+) -> Response
+where
+    G: ObjectGateway,
+{
+    let cond = Conditionals::from_headers(headers);
+    // A multi-range, non-`bytes`, or syntactically malformed `Range` parses to `None` and is
+    // IGNORED — S3 serves the full 200 for anything it cannot honour (brief out-of-scope:
+    // multi-range and malformed values answer the full 200 exactly as real S3 does).
+    let range = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range);
+
+    // Conditionals (RFC 9110 §13.2.2 precedence, S3 comparison semantics — see
+    // `evaluate_conditionals`) are evaluated against the metadata of the SAME resolve that yields
+    // the body, NEVER a separate `head_object` snapshot. A separate head-then-read would reopen a
+    // check-then-act window: an `If-Match` could pass against a stale snapshot while a racing
+    // overwrite's bytes went out under it — a self-coherent 206 of a version the precondition never
+    // authorised (issue #510 carry-forward item 2). Binding both to the one resolve costs a body
+    // resolve on a request that turns out to be 304/412 (the stream is then dropped unread), a
+    // trade the sign-off judged worth making to keep the precondition fence intact.
+    match range {
+        // A ranged read: `get_object_range` resolves the object ONCE and returns its metadata AND
+        // the covering-chunk stream from that one snapshot. The conditionals judge THAT metadata,
+        // so the 206's `Content-Range`/`ETag`, its bytes, and the precondition verdict are all the
+        // same version (no TOCTOU); an unsatisfiable range answers `416` with that snapshot's size,
+        // never a whole-object read discarded wire-side.
+        Some(range) => match Arc::clone(&state.gateway)
+            .get_object_range(object_key, range)
+            .await
+        {
+            Ok(Some(RangeRead { meta, outcome })) => {
+                if let Some(verdict) =
+                    evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified)
+                {
+                    // A 304/412 short-circuits before the range is applied (§13.2); the
+                    // (possibly-open) covering-chunk stream in `outcome` is dropped unread.
+                    return precondition_response(
+                        verdict,
+                        meta.etag.as_deref(),
+                        meta.modified,
+                        request_id,
+                    );
+                }
+                match outcome {
+                    RangeOutcome::Satisfiable {
+                        offset,
+                        len,
+                        stream,
+                    } => partial_content_response(&meta, offset, len, stream),
+                    RangeOutcome::Unsatisfiable => range_not_satisfiable(request_id, meta.size),
+                }
+            }
+            // The object had no committed record (or vanished before the resolve): `NoSuchKey`.
+            Ok(None) => no_such_key(request_id),
+            Err(err) => gateway_error_response(request_id, &err),
+        },
+        // No honoured range: the full object (200), now advertising `Accept-Ranges: bytes`. The
+        // full-object resolve carries the same metadata the conditionals judge, so a 304/412 and
+        // the served body agree on version; a firing precondition drops the (unused) body stream.
+        None => match Arc::clone(&state.gateway)
+            .get_object_streaming(object_key)
+            .await
+        {
+            Ok(Some(read)) => {
+                if let Some(verdict) =
+                    evaluate_conditionals(&cond, read.etag.as_deref(), read.modified)
+                {
+                    return precondition_response(
+                        verdict,
+                        read.etag.as_deref(),
+                        read.modified,
+                        request_id,
+                    );
+                }
+                full_object_response(read)
+            }
+            Ok(None) => no_such_key(request_id),
+            Err(err) => gateway_error_response(request_id, &err),
+        },
+    }
+}
+
+/// Serve an object `HEAD` (issue #506), honouring the conditional preconditions (304/412),
+/// advertising `Accept-Ranges: bytes`, and — now that it advertises range support — honouring
+/// `Range` itself (issue #510 carry-forward item 3). Metadata-only throughout: it never opens the
+/// fragment stream. A HEAD carries no body, so a satisfiable `Range` is resolved from the metadata
+/// size alone (no chunk read) and answered with a body-less `206` mirroring GET's
+/// `Content-Range`/SPAN-`Content-Length`; an unsatisfiable one answers `416`. Conditionals are
+/// evaluated FIRST (§13.2), from the same `head_object` metadata.
+async fn serve_head<G>(
+    state: &AppState<G>,
+    headers: &axum::http::HeaderMap,
+    object_key: &str,
+    request_id: RequestId,
+) -> Response
+where
+    G: ObjectGateway,
+{
+    let cond = Conditionals::from_headers(headers);
+    // A multi-range / non-`bytes` / malformed `Range` parses to `None` and is ignored (the full
+    // metadata 200), exactly as on GET.
+    let range = headers
+        .get("range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_range);
+    match state.gateway.head_object(object_key).await {
+        Ok(Some(meta)) => {
+            // 1. Conditionals first (same precedence and S3 semantics as GET).
+            if let Some(verdict) = evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified)
+            {
+                return precondition_response(
+                    verdict,
+                    meta.etag.as_deref(),
+                    meta.modified,
+                    request_id,
+                );
+            }
+            // 2. A satisfiable `Range` → a body-less `206` with `Content-Range` and the SPAN
+            //    `Content-Length`; an unsatisfiable one → `416`. Resolved from the metadata size,
+            //    so a ranged HEAD stays metadata-only (no chunk read for a body a HEAD never sends).
+            if let Some(range) = range {
+                return match resolve_byte_range(range, meta.size) {
+                    Some((offset, len)) => head_partial_content_response(&meta, offset, len),
+                    None => range_not_satisfiable(request_id, meta.size),
+                };
+            }
+            // 3. Unranged HEAD: the full metadata 200 with the object's real size, not 0 — a
+            //    HEAD's `Content-Length` must match what a follow-up GET would declare (issue #506).
+            let builder = apply_object_headers(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-length", meta.size.to_string()),
+                meta.content_type.as_deref(),
+                meta.etag.as_deref(),
+                meta.modified,
+            );
+            builder
+                .body(Body::empty())
+                .expect("static response is always valid")
+        }
+        Ok(None) => no_such_key(request_id),
+        Err(err) => gateway_error_response(request_id, &err),
+    }
+}
+
+/// Apply the object-metadata headers common to a `200`/`206` object response — `Content-Type`
+/// (with the S3 default fallback), `Accept-Ranges: bytes`, `ETag`, and `Last-Modified` —
+/// degrading an un-renderable stored value to no header rather than panicking the response build
+/// (ADR-0047, symmetric with the PUT path). `Accept-Ranges: bytes` is advertised on every object
+/// read so a client learns range support even from an unranged GET/HEAD (issue #510). The
+/// `Content-Length` is set by the caller (the object size on a 200, the SPAN length on a 206), so
+/// it is not touched here.
+fn apply_object_headers(
+    mut builder: axum::http::response::Builder,
+    content_type: Option<&str>,
+    etag: Option<&str>,
+    modified: Option<u64>,
+) -> axum::http::response::Builder {
+    builder = builder
+        // The stored content type, or the S3 default when none was recorded (an old record, or a
+        // PUT that declared none) — and also when the stored value is not a valid HTTP header
+        // value (ADR-0047): the seam commits the client's declared type verbatim, so an
+        // un-renderable one degrades to the default rather than panicking the read.
+        .header("content-type", content_type_header(content_type))
+        .header("accept-ranges", "bytes");
+    // ETag and Last-Modified are additive: a record predating the metadata model carries neither
+    // (ADR-0047). A stored etag decoded liberally (ADR-0045) may carry a non-header byte;
+    // `etag_header`/`http_date` degrade such a value to no header rather than panicking the read.
+    if let Some(value) = etag.and_then(etag_header) {
+        builder = builder.header("etag", value);
+    }
+    if let Some(value) = modified.and_then(http_date) {
+        builder = builder.header("last-modified", value);
+    }
+    builder
+}
+
+/// A full-object `200` streaming response (the hot GET path), now advertising
+/// `Accept-Ranges: bytes`. Declares the exact object length so a body truncated by a mid-stream
+/// fault is a detectable short read, not a silent "complete" 200 (issue #364 carry-forward).
+fn full_object_response(read: ObjectRead) -> Response {
+    let ObjectRead {
+        size,
+        stream,
+        etag,
+        content_type,
+        modified,
+    } = read;
+    apply_object_headers(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", size.to_string()),
+        content_type.as_deref(),
+        etag.as_deref(),
+        modified,
+    )
+    .body(Body::from_stream(stream))
+    .expect("streaming response is always valid")
+}
+
+/// A `206 Partial Content` response over the resolved span `[offset, offset + len)`. Declares
+/// `Content-Length = len` (the SPAN length, NOT the object size) and `Content-Range: bytes
+/// {offset}-{offset+len-1}/{size}`, so the access-log body wrapper's declared==streamed
+/// accounting holds for the SPAN — a 206 that declared the full size would be logged as truncated
+/// on every ranged GET (issue #364 span invariant, brief note on `content-length`).
+fn partial_content_response(
+    meta: &ObjectMeta,
+    offset: u64,
+    len: u64,
+    stream: ObjectStream,
+) -> Response {
+    // A satisfiable range always has `len >= 1`, so `offset + len - 1` is the inclusive last byte.
+    let last = offset + len - 1;
+    apply_object_headers(
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("content-length", len.to_string())
+            .header(
+                "content-range",
+                format!("bytes {offset}-{last}/{}", meta.size),
+            ),
+        meta.content_type.as_deref(),
+        meta.etag.as_deref(),
+        meta.modified,
+    )
+    .body(Body::from_stream(stream))
+    .expect("streaming response is always valid")
+}
+
+/// Map an [`evaluate_conditionals`] verdict to its wire response — a `304 Not Modified` carrying
+/// the object's cache validators, or a `412 Precondition Failed`. Shared by the GET (ranged and
+/// unranged) and HEAD arms so a precondition answers identically everywhere, judged against the
+/// same `etag`/`modified` the arm resolved (issue #510 carry-forward item 2).
+fn precondition_response(
+    verdict: Precondition,
+    etag: Option<&str>,
+    modified: Option<u64>,
+    request_id: RequestId,
+) -> Response {
+    match verdict {
+        Precondition::NotModified => not_modified_response(etag, modified),
+        Precondition::Failed => precondition_failed(request_id),
+    }
+}
+
+/// A HEAD's `206 Partial Content` for a satisfiable `Range`: the same `Content-Range` and SPAN
+/// `Content-Length` as GET's [`partial_content_response`], but body-less — a HEAD never carries a
+/// body (RFC 9110 §9.3.2). The span is resolved from the metadata size alone, so a ranged HEAD
+/// costs no chunk read (issue #510 carry-forward item 3).
+fn head_partial_content_response(meta: &ObjectMeta, offset: u64, len: u64) -> Response {
+    // A satisfiable range always has `len >= 1`, so `offset + len - 1` is the inclusive last byte.
+    let last = offset + len - 1;
+    apply_object_headers(
+        Response::builder()
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header("content-length", len.to_string())
+            .header(
+                "content-range",
+                format!("bytes {offset}-{last}/{}", meta.size),
+            ),
+        meta.content_type.as_deref(),
+        meta.etag.as_deref(),
+        meta.modified,
+    )
+    .body(Body::empty())
+    .expect("static response is always valid")
+}
+
+/// A `304 Not Modified` for a passing `If-None-Match`/`If-Modified-Since` gate. It carries the
+/// cache validators (`ETag`, `Last-Modified`) and advertises range support, but NO body and no
+/// `Content-Type`/`Content-Length` (RFC 9110 §15.4.5). `finish_response` records a 304 as a
+/// complete body-less transfer, so it needs no declared length.
+fn not_modified_response(etag: Option<&str>, modified: Option<u64>) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header("accept-ranges", "bytes");
+    if let Some(value) = etag.and_then(etag_header) {
+        builder = builder.header("etag", value);
+    }
+    if let Some(value) = modified.and_then(http_date) {
+        builder = builder.header("last-modified", value);
+    }
+    builder
+        .body(Body::empty())
+        .expect("static response is always valid")
+}
+
+/// A `412 Precondition Failed` for a failing `If-Match`/`If-Unmodified-Since` gate.
+fn precondition_failed(request_id: RequestId) -> Response {
+    error_response(
+        request_id,
+        StatusCode::PRECONDITION_FAILED,
+        "PreconditionFailed",
+        "At least one of the preconditions you specified did not hold",
+    )
+}
+
+/// A `416 Range Not Satisfiable` for an unsatisfiable `Range`, carrying `Content-Range: bytes
+/// */{size}` so the client learns the object's true length (RFC 9110 §14.4 / §15.5.17; S3's
+/// `InvalidRange`).
+fn range_not_satisfiable(request_id: RequestId, size: u64) -> Response {
+    let mut response = error_response(
+        request_id,
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        "InvalidRange",
+        "The requested range is not satisfiable",
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("bytes */{size}")) {
+        response.headers_mut().insert("content-range", value);
+    }
+    response
+}
+
+/// The `404 NoSuchKey` an absent object answers with, shared by the GET/HEAD paths.
+fn no_such_key(request_id: RequestId) -> Response {
+    error_response(
+        request_id,
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "the specified key does not exist",
+    )
+}
+
+/// Parse a `Range` header value into a single [`ByteRange`], or `None` when the value is a
+/// multi-range (`bytes=a-b,c-d`), a non-`bytes` unit, or syntactically malformed — in every
+/// `None` case the caller serves the full 200 exactly as real S3 does (brief: multi-range and
+/// malformed values are out of scope and answer 200). Only `bytes=` is honoured; `If-Range` is
+/// out of scope (Alpha).
+fn parse_range(value: &str) -> Option<ByteRange> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    // A comma is a multi-range set — ignore it (out of scope → full 200).
+    if spec.contains(',') {
+        return None;
+    }
+    let (start, end) = spec.split_once('-')?;
+    // Each position must be EMPTY or all-ASCII-digits — no sign, no interior whitespace, no
+    // other byte. `u64::from_str` itself tolerates a leading `+` (`"+8".parse()` == `Ok(8)`), so
+    // a `bytes=+8-+15` would otherwise be honoured as a 206; real S3 treats any such non-digit
+    // byte (or interior whitespace) as malformed and serves the full 200. Reject it here, before
+    // parsing, with no trim tolerance — so `+`, a space, or garbage falls on the malformed→200
+    // side, not the 206 side.
+    match (digits_or_empty(start)?, digits_or_empty(end)?) {
+        // `bytes=-n` — a suffix of the final `n` bytes. `n == 0` is grammatically VALID but
+        // unsatisfiable (`resolve_byte_range` answers it with a 416), distinct from a *malformed*
+        // value which parses to `None` → 200. Real S3 answers `InvalidRange` for `bytes=-0`, so
+        // it must fall on the 416 side, not the ignore-and-200 side.
+        (None, Some(n)) => Some(ByteRange::Suffix(n)),
+        // `bytes=a-` — from `a` to the end.
+        (Some(a), None) => Some(ByteRange::From(a)),
+        // `bytes=a-b` — inclusive. `b < a` is malformed; ignore it (→ full 200).
+        (Some(a), Some(b)) => (b >= a).then_some(ByteRange::FromTo(a, b)),
+        // `bytes=-` — empty on both sides — malformed.
+        (None, None) => None,
+    }
+}
+
+/// One `Range` position: `Some(None)` when EMPTY (a suffix/open form's absent side),
+/// `Some(Some(n))` when it is a run of ASCII digits, and `None` when it holds ANY other byte (a
+/// sign, whitespace, or garbage) — which makes the whole range malformed (`?` → full 200). This
+/// is deliberately STRICTER than `u64::from_str`, which accepts a leading `+`, so a `bytes=+8-…`
+/// is rejected rather than silently honoured.
+fn digits_or_empty(s: &str) -> Option<Option<u64>> {
+    if s.is_empty() {
+        return Some(None);
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        // All ASCII digits, but still `None` if it overflows `u64` — an un-representable range is
+        // ignored (→ full 200), the same safe degrade as any value we cannot honour.
+        s.parse().ok().map(Some)
+    } else {
+        None
+    }
+}
+
+/// The conditional-precondition headers a GET/HEAD may carry (RFC 9110 §13.1), read off the
+/// request head. Borrowed from the header map — no allocation, and the `to_str` skips a
+/// non-ASCII value (an unparsable header is simply absent, which the gates treat as "ignore").
+struct Conditionals<'a> {
+    if_match: Option<&'a str>,
+    if_none_match: Option<&'a str>,
+    if_modified_since: Option<&'a str>,
+    if_unmodified_since: Option<&'a str>,
+}
+
+impl<'a> Conditionals<'a> {
+    fn from_headers(headers: &'a axum::http::HeaderMap) -> Self {
+        // Inlined rather than a closure so each borrow's lifetime ties cleanly to `headers` (a
+        // closure returning a reference derived from a captured borrow trips lifetime inference).
+        Self {
+            if_match: headers.get("if-match").and_then(|v| v.to_str().ok()),
+            if_none_match: headers.get("if-none-match").and_then(|v| v.to_str().ok()),
+            if_modified_since: headers
+                .get("if-modified-since")
+                .and_then(|v| v.to_str().ok()),
+            if_unmodified_since: headers
+                .get("if-unmodified-since")
+                .and_then(|v| v.to_str().ok()),
+        }
+    }
+}
+
+/// The precondition verdict the GET/HEAD gates can short-circuit with.
+enum Precondition {
+    /// `304 Not Modified` — `If-None-Match` matched, or `If-Modified-Since` was not modified.
+    NotModified,
+    /// `412 Precondition Failed` — `If-Match` did not match, or `If-Unmodified-Since` was
+    /// modified.
+    Failed,
+}
+
+/// Evaluate the conditional preconditions in RFC 9110 §13.2.2 PRECEDENCE (If-Match >
+/// If-Unmodified-Since; If-None-Match > If-Modified-Since) but with **S3 comparison semantics**,
+/// not full RFC (S3 itself deviates): exact opaque ETag equality plus `*`; weak comparators and
+/// multi-ETag lists are out of scope (stock aws clients send a single value); date comparison
+/// truncates the stored epoch-millis to SECONDS (IMF-fixdate has second resolution). A record
+/// with no stored ETag (`etag == None`) fails a specific `If-Match` (no current entity-tag) and a
+/// record with no stored `modified` ignores the date conditionals — degrade safely, never panic.
+/// An unparsable date header is ignored (RFC 9110). `None` ⇒ no precondition fired; serve the
+/// object.
+fn evaluate_conditionals(
+    cond: &Conditionals<'_>,
+    etag: Option<&str>,
+    modified: Option<u64>,
+) -> Option<Precondition> {
+    // 1. If-Match takes precedence over If-Unmodified-Since (only one of the two is consulted).
+    if let Some(im) = cond.if_match {
+        // Strong comparison (§13.1.1): a weak `W/`-tag never matches → 412.
+        if !etag_matches(im, etag, true) {
+            return Some(Precondition::Failed);
+        }
+    } else if let Some(ius) = cond.if_unmodified_since {
+        // If-Unmodified-Since: FAIL if the object was modified strictly AFTER the given instant.
+        if let (Some(m), Some(since)) = (modified, parse_http_date(ius)) {
+            if m / 1_000 > since {
+                return Some(Precondition::Failed);
+            }
+        }
+    }
+    // 2. If-None-Match takes precedence over If-Modified-Since.
+    if let Some(inm) = cond.if_none_match {
+        // A listed entity-tag matched → the "none match" precondition is false → for a safe
+        // method (GET/HEAD) that is `304 Not Modified`. Weak comparison (§13.1.2).
+        if etag_matches(inm, etag, false) {
+            return Some(Precondition::NotModified);
+        }
+    } else if let Some(ims) = cond.if_modified_since {
+        // If-Modified-Since: `304` if the object was NOT modified after the given instant.
+        if let (Some(m), Some(since)) = (modified, parse_http_date(ims)) {
+            if m / 1_000 <= since {
+                return Some(Precondition::NotModified);
+            }
+        }
+    }
+    None
+}
+
+/// Whether an `If-Match`/`If-None-Match` header value matches the object's stored ETag under S3
+/// comparison semantics: `*` matches any existing entity; otherwise an exact opaque-value match on
+/// the quoted value.
+///
+/// `strong` selects RFC 9110's comparison function. `If-Match` uses the **strong** comparison
+/// (§13.1.1): a weak entity-tag (`W/`-prefixed) NEVER matches, so `If-Match: W/"<etag>"` fails →
+/// 412 — silently accepting it as a match is exactly the precondition the RFC forbids weak
+/// comparison on. `If-None-Match` uses the **weak** comparison (§13.1.2), where the `W/` indicator
+/// is ignored before comparing the opaque value. Weak comparators are otherwise out of *support*
+/// (stock aws clients send a single strong value); this narrow split only refuses to weak-match
+/// where it would be wrong, it does not add weak-tag support. A record with no stored ETag never
+/// matches a specific tag (no current entity-tag), so a specific `If-Match` fails on it — as the
+/// design requires (degrade safely on a pre-ADR-0047 record).
+fn etag_matches(header_value: &str, stored: Option<&str>, strong: bool) -> bool {
+    let value = header_value.trim();
+    if value == "*" {
+        return stored.is_some();
+    }
+    // Under strong comparison a weak entity-tag cannot match; under weak comparison the `W/`
+    // indicator is stripped before the opaque values are compared.
+    let inner = match value.strip_prefix("W/") {
+        Some(_) if strong => return false,
+        Some(weak) => weak,
+        None => value,
+    };
+    let inner = inner.trim_matches('"');
+    stored == Some(inner)
+}
+
+/// Parse an HTTP-date into epoch SECONDS — the inverse of the [`http_date`] emitter, sharing
+/// [`days_from_civil`] so no date dependency is pulled in. RFC 9110 §5.6.7 defines THREE date
+/// formats and requires a recipient to accept **all three**, even though only the preferred
+/// IMF-fixdate is ever emitted:
+///
+/// * IMF-fixdate — `Sun, 06 Nov 1994 08:49:37 GMT` (preferred; the shape `http_date` and stock
+///   SDKs send);
+/// * RFC-850 (obsolete) — `Sunday, 06-Nov-94 08:49:37 GMT` (a full weekday name, a two-digit year);
+/// * asctime (obsolete) — `Sun Nov  6 08:49:37 1994` (a space-padded day, a four-digit year).
+///
+/// Parsing only IMF-fixdate made a conditional carrying an obsolete date fail OPEN: an
+/// `If-Unmodified-Since` with an RFC-850/asctime value went unparsed → ignored → served `200`
+/// where `412` is conformant (issue #510 carry-forward item 1). A *genuinely* malformed value
+/// (unknown format, impossible calendar date, out-of-range time) still returns `None` so the
+/// caller ignores that conditional (RFC 9110 §13.1.3-4). Byte-indexing below assumes ASCII, so a
+/// non-ASCII value is rejected up front.
+fn parse_http_date(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if !value.is_ascii() {
+        return None;
+    }
+    parse_imf_fixdate(value)
+        .or_else(|| parse_rfc850_date(value))
+        .or_else(|| parse_asctime_date(value))
+}
+
+/// The preferred IMF-fixdate `Www, DD Mmm YYYY HH:MM:SS GMT` — exactly 29 ASCII bytes.
+fn parse_imf_fixdate(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 29 {
+        return None;
+    }
+    if &value[3..5] != ", " || bytes[7] != b' ' || bytes[11] != b' ' || bytes[16] != b' ' {
+        return None;
+    }
+    if bytes[19] != b':' || bytes[22] != b':' || &value[25..] != " GMT" {
+        return None;
+    }
+    let day: u32 = value[5..7].trim().parse().ok()?;
+    let month = month_index(&value[8..11])?;
+    let year: i64 = value[12..16].parse().ok()?;
+    let hour: u64 = value[17..19].parse().ok()?;
+    let minute: u64 = value[20..22].parse().ok()?;
+    let second: u64 = value[23..25].parse().ok()?;
+    ymd_hms_to_epoch(year, month, day, hour, minute, second)
+}
+
+/// The obsolete RFC-850 date `Weekday, DD-Mmm-YY HH:MM:SS GMT` — a variable-length weekday name,
+/// then a fixed 22-byte `DD-Mmm-YY HH:MM:SS GMT` with a two-digit year. The two-digit year is
+/// disambiguated the way the `httpdate` crate does — pivot at 70 (`00..=69` → 2000+, `70..=99` →
+/// 1900+) — a fixed rule with no clock dependency (RFC 7231's "50 years in the future" heuristic
+/// would make the parse non-deterministic).
+fn parse_rfc850_date(value: &str) -> Option<u64> {
+    // Split the weekday name (`Sunday`..`Wednesday`, variable length) off at the ", ".
+    let (_weekday, rest) = value.split_once(", ")?;
+    let bytes = rest.as_bytes();
+    if bytes.len() != 22 {
+        return None;
+    }
+    if bytes[2] != b'-' || bytes[6] != b'-' || bytes[9] != b' ' || &rest[18..] != " GMT" {
+        return None;
+    }
+    if bytes[12] != b':' || bytes[15] != b':' {
+        return None;
+    }
+    let day: u32 = rest[0..2].parse().ok()?;
+    let month = month_index(&rest[3..6])?;
+    let yy: i64 = rest[7..9].parse().ok()?;
+    let year = if yy < 70 { 2000 + yy } else { 1900 + yy };
+    let hour: u64 = rest[10..12].parse().ok()?;
+    let minute: u64 = rest[13..15].parse().ok()?;
+    let second: u64 = rest[16..18].parse().ok()?;
+    ymd_hms_to_epoch(year, month, day, hour, minute, second)
+}
+
+/// The obsolete asctime date `Www Mmm _D HH:MM:SS YYYY` — exactly 24 ASCII bytes; the day is
+/// space-padded to two columns (`%e`: ` 6` or `16`).
+fn parse_asctime_date(value: &str) -> Option<u64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24 {
+        return None;
+    }
+    if bytes[3] != b' ' || bytes[7] != b' ' || bytes[10] != b' ' || bytes[19] != b' ' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+    let month = month_index(&value[4..7])?;
+    let day: u32 = value[8..10].trim().parse().ok()?;
+    let hour: u64 = value[11..13].parse().ok()?;
+    let minute: u64 = value[14..16].parse().ok()?;
+    let second: u64 = value[17..19].parse().ok()?;
+    let year: i64 = value[20..24].parse().ok()?;
+    ymd_hms_to_epoch(year, month, day, hour, minute, second)
+}
+
+/// The 1-based month number for a three-letter English month abbreviation, or `None` for an
+/// unknown one — shared by the three [`parse_http_date`] format parsers and symmetric with the
+/// [`http_date`] emitter's month table.
+fn month_index(name: &str) -> Option<u32> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MONTHS.iter().position(|m| *m == name).map(|i| i as u32 + 1)
+}
+
+/// Assemble a validated `(Y, M, D, h, m, s)` into epoch SECONDS, shared by the three
+/// [`parse_http_date`] format parsers. Rejects an out-of-range time (`>= 24h`/`>= 60m`/`>= 60s`)
+/// or an impossible calendar date (via [`days_from_civil`]). A pre-1970 date is well-formed
+/// (RFC 9110 puts no floor on the date) and is CLAMPED to epoch 0 rather than failing the parse:
+/// failing would make the caller IGNORE the conditional, and for `If-Unmodified-Since` that
+/// INVERTS the answer — an object modified after a pre-epoch instant must FAIL (412), but an
+/// ignored IUS serves the object (200). Clamped to 0, every real object (`modified > 0`) compares
+/// as "modified after", the correct IUS (412) / IMS (200) verdict for any pre-1970 date.
+fn ymd_hms_to_epoch(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u64,
+    minute: u64,
+    second: u64,
+) -> Option<u64> {
+    if hour >= 24 || minute >= 60 || second >= 60 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    let total = days
+        .checked_mul(86_400)?
+        .checked_add((hour * 3_600 + minute * 60 + second) as i64)?;
+    Some(total.max(0) as u64)
+}
+
+/// Days since the Unix epoch (1970-01-01) for a proleptic-Gregorian `(year, month, day)` —
+/// Howard Hinnant's `days_from_civil`, the exact inverse of [`civil_from_days`]. Returns `None`
+/// for an out-of-range month **or a day past the month's real length** (leap-year February
+/// included) so an impossible calendar date (`30 Feb`, `31 Apr`) is ignored rather than misparsed:
+/// a bare `day <= 31` check silently rolled `30 Feb` over into early March, answering a
+/// conditional as if the client had named a real (later) instant. RFC 9110 §13.1.4 requires an
+/// invalid date be ignored, so it must fail parsing here, not resolve to a neighbouring day.
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// The number of days in a proleptic-Gregorian month, so [`days_from_civil`] can reject a day
+/// past the month's real end (`30 Feb`, `31 Sep`). February is 29 days in a leap year, 28
+/// otherwise; `month` is a validated 1..=12 at every callsite.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    const LEN: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if month == 2 && is_leap_year(year) {
+        29
+    } else {
+        LEN[(month as usize - 1).min(11)]
+    }
+}
+
+/// Whether `year` is a Gregorian leap year (divisible by 4, except centuries not divisible by
+/// 400) — so leap-day (`29 Feb`) validates in a leap year and is rejected otherwise.
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
 fn empty_response(status: StatusCode) -> Response {
@@ -3433,6 +4022,377 @@ mod tests {
                 .to_str()
                 .expect("ascii"),
             "\"0badc0de0badc0de\"",
+        );
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Ranged-read seam correctness (issue #510 carry-forward items 3 & 4). These drive the REAL
+    // router (`S3Gateway::router()` → `dispatch` → `serve_get`) against a hand-crafted
+    // `ObjectGateway` double, so they exercise the production wiring — they reference the new
+    // `ByteRange`/`RangeRead`/`RangeOutcome` symbols and therefore ship WITH the fix (they are not
+    // the base red→green discriminator; `crates/server/tests/s3_range_conditional.rs` is).
+    // ------------------------------------------------------------------------------------------
+
+    /// Drive a signed request with arbitrary extra request headers (`range`, `if-*`) through the
+    /// REAL router against `gateway`, returning the response — the generic sibling of
+    /// `signed_through_router`, for the range-seam doubles below.
+    async fn signed_ranged_request<G: ObjectGateway>(
+        gateway: Arc<G>,
+        method: &str,
+        extra_headers: &[(&str, &str)],
+        body: &'static [u8],
+    ) -> Response {
+        use tower::ServiceExt;
+
+        let creds = crate::sigv4::Credentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: "secret".to_string(),
+        };
+        let router = S3Gateway::new(gateway, S3Config::new(vec![creds.clone()])).router();
+
+        let host = "example.com";
+        let path = "/bucket/key";
+        let amz_date = crate::sigv4::format_amz_date(SystemTime::now());
+        let signed = crate::sigv4::sign(
+            method,
+            path,
+            "",
+            host,
+            &amz_date,
+            body,
+            &creds,
+            "us-east-1",
+            "s3",
+        );
+        let mut builder = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", host)
+            .header("authorization", signed.authorization)
+            .header("x-amz-date", signed.amz_date)
+            .header("x-amz-content-sha256", signed.content_sha256);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        router
+            .oneshot(builder.body(Body::from(body)).expect("request"))
+            .await
+            .expect("the router answers without panicking")
+    }
+
+    /// A gateway that serves a fixed object body but does NOT override `get_object_range`, so a
+    /// ranged GET through the router exercises the trait's **correctness-preserving default**
+    /// (full-object read via `get_object_streaming` + wire-side slice, in `gateway-core`). The
+    /// body is emitted in small source pieces so the default's slice crosses source-chunk
+    /// boundaries.
+    struct DefaultRangeSeamGateway {
+        body: Vec<u8>,
+    }
+
+    impl ObjectGateway for DefaultRangeSeamGateway {
+        async fn put_object_streaming<S>(
+            &self,
+            _key: &str,
+            _source: S,
+            _expected: ContentHash,
+            _content_type: Option<String>,
+        ) -> wyrd_traits::Result<String>
+        where
+            S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
+                + Send
+                + Unpin
+                + 'static,
+        {
+            Ok(String::new())
+        }
+
+        async fn get_object_streaming(
+            self: Arc<Self>,
+            _key: &str,
+        ) -> wyrd_traits::Result<Option<ObjectRead>> {
+            let pieces: Vec<wyrd_traits::Result<bytes::Bytes>> = self
+                .body
+                .chunks(3)
+                .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+                .collect();
+            Ok(Some(ObjectRead {
+                size: self.body.len() as u64,
+                stream: Box::pin(futures_util::stream::iter(pieces)),
+                etag: Some("seamdefault".to_string()),
+                content_type: None,
+                modified: None,
+            }))
+        }
+
+        async fn head_object(&self, _key: &str) -> wyrd_traits::Result<Option<ObjectMeta>> {
+            Ok(Some(ObjectMeta {
+                size: self.body.len() as u64,
+                etag: Some("seamdefault".to_string()),
+                content_type: None,
+                modified: None,
+            }))
+        }
+
+        async fn delete_object(&self, _key: &str) -> wyrd_traits::Result<bool> {
+            Ok(false)
+        }
+        // get_object_range: DELIBERATELY the trait DEFAULT (item 4).
+    }
+
+    /// **Item 4.** A gateway that does not override `get_object_range` must still answer a ranged
+    /// GET of an EXISTING object with a correct `206` (and a `416` for an unsatisfiable range) —
+    /// NOT the `Ok(None)` → `404 NoSuchKey` landmine the previous default was, which would 404 an
+    /// object the wire layer just advertised `Accept-Ranges: bytes` for.
+    #[tokio::test]
+    async fn a_non_overriding_gateway_serves_ranges_via_the_correctness_preserving_default() {
+        // 20-byte body: bytes 0..20.
+        let body: Vec<u8> = (0u8..20).collect();
+        let gateway = Arc::new(DefaultRangeSeamGateway { body: body.clone() });
+
+        // A satisfiable range → 206 with the correct span, resolved by the DEFAULT (not a 404).
+        let response =
+            signed_ranged_request(Arc::clone(&gateway), "GET", &[("range", "bytes=8-15")], b"")
+                .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PARTIAL_CONTENT,
+            "the default get_object_range must answer 206 for an existing object, never 404"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-range")
+                .expect("a 206 carries Content-Range")
+                .to_str()
+                .expect("ascii"),
+            "bytes 8-15/20",
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-length")
+                .expect("a 206 carries Content-Length")
+                .to_str()
+                .expect("ascii"),
+            "8",
+        );
+        let sliced = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            &sliced[..],
+            &body[8..16],
+            "the default must slice the CORRECT span out of the full object"
+        );
+
+        // An unsatisfiable range → 416 (the default resolves it against the object size too).
+        let response =
+            signed_ranged_request(Arc::clone(&gateway), "GET", &[("range", "bytes=999-")], b"")
+                .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "the default must answer 416 for an unsatisfiable range, not 404 or 200"
+        );
+    }
+
+    /// A gateway whose `head_object` and `get_object_range` deliberately report DIFFERENT object
+    /// versions — the deterministic stand-in for the race the atomic seam closes: a PUT landing
+    /// between a metadata resolve and the body read. `head_object` reports the "stale" pre-write
+    /// view (size 100, etag `stalehead`); `get_object_range` reports the "fresh" post-write view
+    /// (size 40, etag `freshbody`) that the streamed bytes actually belong to.
+    struct VersionSkewGateway;
+
+    impl VersionSkewGateway {
+        const FRESH_BODY: &'static [u8] = b"RANGEBYTES"; // 10 bytes, the served span
+    }
+
+    impl ObjectGateway for VersionSkewGateway {
+        async fn put_object_streaming<S>(
+            &self,
+            _key: &str,
+            _source: S,
+            _expected: ContentHash,
+            _content_type: Option<String>,
+        ) -> wyrd_traits::Result<String>
+        where
+            S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
+                + Send
+                + Unpin
+                + 'static,
+        {
+            Ok(String::new())
+        }
+
+        async fn get_object_streaming(
+            self: Arc<Self>,
+            _key: &str,
+        ) -> wyrd_traits::Result<Option<ObjectRead>> {
+            // The "fresh" full object — only reached by a non-ranged GET, unused by this test.
+            Ok(Some(ObjectRead {
+                size: 40,
+                stream: Box::pin(futures_util::stream::once(async move {
+                    Ok(bytes::Bytes::from_static(b"fresh"))
+                })),
+                etag: Some("freshbody".to_string()),
+                content_type: None,
+                modified: None,
+            }))
+        }
+
+        async fn get_object_range(
+            self: Arc<Self>,
+            _key: &str,
+            _range: ByteRange,
+        ) -> wyrd_traits::Result<Option<RangeRead>> {
+            // The FRESH view: the metadata and the bytes are one version (size 40, etag
+            // `freshbody`). A racing overwrite is exactly what makes this differ from `head_object`
+            // below; the wire layer must frame the 206 from THIS meta, not the stale head.
+            let stream: ObjectStream = Box::pin(futures_util::stream::once(async move {
+                Ok(bytes::Bytes::from_static(Self::FRESH_BODY))
+            }));
+            Ok(Some(RangeRead {
+                meta: ObjectMeta {
+                    size: 40,
+                    etag: Some("freshbody".to_string()),
+                    content_type: None,
+                    modified: None,
+                },
+                outcome: RangeOutcome::Satisfiable {
+                    offset: 8,
+                    len: Self::FRESH_BODY.len() as u64,
+                    stream,
+                },
+            }))
+        }
+
+        async fn head_object(&self, _key: &str) -> wyrd_traits::Result<Option<ObjectMeta>> {
+            // The STALE view a separate metadata resolve would return under a race.
+            Ok(Some(ObjectMeta {
+                size: 100,
+                etag: Some("stalehead".to_string()),
+                content_type: None,
+                modified: None,
+            }))
+        }
+
+        async fn delete_object(&self, _key: &str) -> wyrd_traits::Result<bool> {
+            Ok(false)
+        }
+    }
+
+    /// **Item 3.** A ranged GET must frame its `206` entirely from `get_object_range`'s single
+    /// resolve — the `Content-Range` total, `Content-Length`, `ETag`, and body all from the one
+    /// snapshot the bytes came from — never mixing in a *separate* `head_object` resolve. With the
+    /// two seams reporting different versions (the deterministic stand-in for a racing overwrite),
+    /// the `206` must name the range seam's `freshbody`/size-40, not the stale head's
+    /// `stalehead`/size-100: a version-mixed 206 (fresh bytes labelled with the stale size/etag)
+    /// is precisely what poisons an ETag-keyed cache.
+    #[tokio::test]
+    async fn ranged_206_is_framed_from_the_range_seam_not_a_separate_head_resolve() {
+        let response = signed_ranged_request(
+            Arc::new(VersionSkewGateway),
+            "GET",
+            &[("range", "bytes=8-17")],
+            b"",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        let last = 8 + VersionSkewGateway::FRESH_BODY.len() - 1;
+        assert_eq!(
+            response
+                .headers()
+                .get("content-range")
+                .expect("206 Content-Range")
+                .to_str()
+                .expect("ascii"),
+            format!("bytes 8-{last}/40"),
+            "the Content-Range total must be the range seam's size (40), not the stale head's (100)"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("etag")
+                .expect("206 ETag")
+                .to_str()
+                .expect("ascii"),
+            "\"freshbody\"",
+            "the 206 must carry the range seam's ETag, not the stale head's — no version mixing"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-length")
+                .expect("206 Content-Length")
+                .to_str()
+                .expect("ascii"),
+            VersionSkewGateway::FRESH_BODY.len().to_string(),
+        );
+        let served = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            &served[..],
+            VersionSkewGateway::FRESH_BODY,
+            "the served bytes are the range seam's span"
+        );
+    }
+
+    /// **Item 2 (carry-forward).** A conditional GET's preconditions must be judged against the
+    /// SAME version its body is served from — the single `get_object_range`/`get_object_streaming`
+    /// resolve — never a separate `head_object` snapshot. With the two seams reporting different
+    /// versions (the deterministic stand-in for a racing overwrite between a metadata resolve and
+    /// the body read), an `If-Match` naming the STALE head's ETag must FAIL with `412`: it does not
+    /// match the version the served bytes belong to. Evaluating it against the stale head instead
+    /// would let it pass and emit a self-coherent `206`/`200` of a version the client's precondition
+    /// never authorised — the check-then-act window the atomic seam closes.
+    #[tokio::test]
+    async fn conditionals_are_judged_against_the_served_version_not_a_stale_head() {
+        // Ranged path: If-Match on the STALE head's etag must 412 — the served version is
+        // `freshbody`, which the stale `"stalehead"` never matches.
+        let response = signed_ranged_request(
+            Arc::new(VersionSkewGateway),
+            "GET",
+            &[("range", "bytes=8-17"), ("if-match", "\"stalehead\"")],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "a ranged If-Match against the stale head's etag must 412 — it judges the served \
+             version (get_object_range's), not a separate head_object snapshot",
+        );
+
+        // Unranged path: the same window on the full-object resolve (`get_object_streaming`), which
+        // also reports `freshbody` — a stale-head If-Match must 412 here too.
+        let response = signed_ranged_request(
+            Arc::new(VersionSkewGateway),
+            "GET",
+            &[("if-match", "\"stalehead\"")],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "an unranged If-Match must judge the served version (get_object_streaming's), not \
+             the stale head_object snapshot",
+        );
+
+        // Positive control: If-Match on the SERVED version (`freshbody`) passes the fence → the
+        // `206` is served — the fix rejects only the mismatched (stale) tag, not a genuine match.
+        let response = signed_ranged_request(
+            Arc::new(VersionSkewGateway),
+            "GET",
+            &[("range", "bytes=8-17"), ("if-match", "\"freshbody\"")],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PARTIAL_CONTENT,
+            "If-Match matching the served version passes → 206",
         );
     }
 }

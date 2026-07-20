@@ -80,6 +80,136 @@ pub struct ObjectMeta {
     pub modified: Option<u64>,
 }
 
+/// A byte range a client asked for, in **object-byte terms** (issue #510) — the seam names
+/// NO HTTP `Range` vocabulary (the suffix/open/closed forms below are byte-offset math, not
+/// the `bytes=` header grammar). The wire layer parses the client's `Range:` header into one
+/// of these and maps the [`RangeOutcome`] back onto 206/416/`Content-Range`.
+///
+/// The range is carried UNRESOLVED (not a pre-clamped `(offset, len)`): the implementer
+/// resolves it against the object's own size *at read time*, so the span, the metadata, and
+/// the streamed bytes all come from ONE inode resolve. A pre-resolved `(offset, len)` derived
+/// from a *separate* metadata lookup would reopen a TOCTOU window — a racing overwrite between
+/// that lookup and the body read could emit a `206` whose `Content-Range`/`ETag` name one
+/// version while the bytes are another, poisoning an ETag-keyed cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRange {
+    /// `bytes=a-b` — the inclusive byte range `[a, b]` (`b >= a`; the wire layer rejects an
+    /// inverted range as malformed before it reaches here).
+    FromTo(u64, u64),
+    /// `bytes=a-` — from byte `a` to the end of the object.
+    From(u64),
+    /// `bytes=-n` — the final `n` bytes of the object. `n == 0` resolves to
+    /// [`RangeOutcome::Unsatisfiable`] (a grammatically valid but empty suffix → 416).
+    Suffix(u64),
+}
+
+/// The result of a ranged read (issue #510): the object's metadata AND the range outcome,
+/// both from a **single** inode resolve so a `206`'s headers and body can never mix object
+/// versions. The outer `None` (on the seam's `Result<Option<RangeRead>>`) means no committed
+/// object — the wire layer answers `404 NoSuchKey`.
+pub struct RangeRead {
+    /// The object's metadata, resolved from the SAME snapshot as [`Self::outcome`]'s stream,
+    /// so the wire layer frames the `206`'s `Content-Range`/`ETag`/`Last-Modified` (and a
+    /// `416`'s `bytes */{size}`) against the version the bytes came from.
+    pub meta: ObjectMeta,
+    /// Whether the range was satisfiable against this object's size, and — when it was — the
+    /// covering-chunk stream.
+    pub outcome: RangeOutcome,
+}
+
+/// Whether a [`ByteRange`] resolved to a satisfiable span (with its stream) or not.
+pub enum RangeOutcome {
+    /// A satisfiable span `[offset, offset + len)` with `len >= 1`, plus a stream over ONLY
+    /// the chunks overlapping the span (never the whole object, discarded wire-side).
+    Satisfiable {
+        /// The absolute start byte of the span.
+        offset: u64,
+        /// The span length (`>= 1`) — the wire layer's `206` `Content-Length`.
+        len: u64,
+        /// The span's bytes, chunk-at-a-time.
+        stream: ObjectStream,
+    },
+    /// Syntactically valid but not satisfiable against this object's size (start at/after the
+    /// end, or any range against a zero-byte object) — the wire layer answers `416` with
+    /// `Content-Range: bytes */{size}` (`size` from [`RangeRead::meta`]).
+    Unsatisfiable,
+}
+
+/// Resolve a [`ByteRange`] against a known object `size` into a concrete `(offset, len)`
+/// span, clamping to the object as RFC 9110 §14.1.2 requires (an end past the last byte is
+/// truncated; a suffix larger than the object is the whole object). `None` when the range is
+/// unsatisfiable (start at/after the end, a zero-length suffix, or any range against a
+/// zero-byte object) — the caller answers `416`. Shared by the seam's default implementation
+/// and every overriding gateway so the span math has ONE definition.
+pub fn resolve_byte_range(range: ByteRange, size: u64) -> Option<(u64, u64)> {
+    match range {
+        ByteRange::FromTo(a, b) => {
+            if a >= size || b < a {
+                None
+            } else {
+                let end = b.min(size - 1); // clamp to the last byte
+                Some((a, end - a + 1))
+            }
+        }
+        ByteRange::From(a) => {
+            if a >= size {
+                None
+            } else {
+                Some((a, size - a))
+            }
+        }
+        ByteRange::Suffix(n) => {
+            // A zero-length suffix (`bytes=-0`) is unsatisfiable, as is any suffix against a
+            // zero-byte object.
+            if size == 0 || n == 0 {
+                None
+            } else {
+                let n = n.min(size); // a suffix longer than the object is the whole object
+                Some((size - n, n))
+            }
+        }
+    }
+}
+
+/// Adapt a full-object body `stream` into the sub-span `[offset, offset + len)` by skipping
+/// the leading `offset` bytes and yielding the next `len` — the wire-side slice the seam's
+/// **default** [`ObjectGateway::get_object_range`] uses for a gateway with no chunk-aware
+/// ranged read. A mid-stream error is forwarded once and ends the slice. This buffers no more
+/// than one source chunk at a time (each `Bytes::slice` is a cheap refcount), so the "stream,
+/// don't buffer" invariant holds even in the default.
+fn slice_object_stream(inner: ObjectStream, offset: u64, len: u64) -> ObjectStream {
+    use futures_util::StreamExt;
+    Box::pin(futures_util::stream::unfold(
+        (inner, offset, len),
+        |(mut inner, mut skip, mut remaining)| async move {
+            loop {
+                if remaining == 0 {
+                    return None;
+                }
+                match inner.next().await {
+                    None => return None,
+                    // Forward the error, then end the slice (state `remaining = 0`).
+                    Some(Err(err)) => return Some((Err(err), (inner, 0, 0))),
+                    Some(Ok(mut chunk)) => {
+                        if skip > 0 {
+                            let s = (skip as usize).min(chunk.len());
+                            chunk = chunk.slice(s..);
+                            skip -= s as u64;
+                            if chunk.is_empty() {
+                                continue; // this source chunk was entirely before the span
+                            }
+                        }
+                        let take = (remaining as usize).min(chunk.len());
+                        let out = chunk.slice(0..take);
+                        remaining -= take as u64;
+                        return Some((Ok(out), (inner, skip, remaining)));
+                    }
+                }
+            }
+        },
+    ))
+}
+
 /// One object in a container listing (issue #507): the object's key **relative to the
 /// container** (the container segment already stripped) plus the wire-relevant metadata a
 /// listing row carries. The S3 wire layer groups these by delimiter, applies the combined
@@ -183,6 +313,64 @@ pub trait ObjectGateway: Send + Sync + 'static {
         self: Arc<Self>,
         key: &str,
     ) -> impl Future<Output = Result<Option<ObjectRead>>> + Send;
+
+    /// Read the byte `range` of the object under `key` (issue #510): the object's metadata
+    /// **and** the range outcome, resolved from ONE inode snapshot so a `206`'s headers and
+    /// body can never mix versions. `None` if `key` has no committed object.
+    ///
+    /// The seam names no HTTP vocabulary: the wire layer parses the client's `Range:` header
+    /// into a [`ByteRange`] and maps the returned [`RangeOutcome`] back onto 206/416. The
+    /// implementer resolves the range against its OWN freshly-read size ([`resolve_byte_range`]),
+    /// so the span, the `Content-Range` size, and the streamed bytes are all one version — a
+    /// range pre-resolved against a *separate* metadata lookup would reopen the head-then-read
+    /// TOCTOU (a racing overwrite could emit a version-mixed 206 that poisons an ETag-keyed
+    /// cache). A satisfiable read streams **only the chunks overlapping the span**, never the
+    /// whole object discarded wire-side (issue #510 anti-wire-side-discard oracle), and its
+    /// `206` `Content-Length` is the SPAN length, so a body cut short by a mid-stream fault is
+    /// still a detectable truncation of the requested span (issue #364, applied to the span).
+    ///
+    /// The **default** is correctness-preserving, not a landmine: it reads the whole object
+    /// through [`get_object_streaming`](Self::get_object_streaming) (one resolve → meta + full
+    /// stream) and slices the span off wire-side. That is exactly the whole-object read the
+    /// chunk-aware override avoids for large objects — but as a default it is *correct* and
+    /// *atomic* (meta and bytes from the one streaming resolve), so a gateway that does not
+    /// override still answers a ranged GET of an existing object with a correct `206`/`416`
+    /// rather than a `404` after the wire layer has advertised `Accept-Ranges: bytes`. The
+    /// composition root's real gateway overrides it with a chunk-map walk that fetches only the
+    /// covering chunks.
+    fn get_object_range(
+        self: Arc<Self>,
+        key: &str,
+        range: ByteRange,
+    ) -> impl Future<Output = Result<Option<RangeRead>>> + Send {
+        async move {
+            let Some(read) = self.get_object_streaming(key).await? else {
+                return Ok(None);
+            };
+            let ObjectRead {
+                size,
+                stream,
+                etag,
+                content_type,
+                modified,
+            } = read;
+            let meta = ObjectMeta {
+                size,
+                etag,
+                content_type,
+                modified,
+            };
+            let outcome = match resolve_byte_range(range, size) {
+                None => RangeOutcome::Unsatisfiable,
+                Some((offset, len)) => RangeOutcome::Satisfiable {
+                    offset,
+                    len,
+                    stream: slice_object_stream(stream, offset, len),
+                },
+            };
+            Ok(Some(RangeRead { meta, outcome }))
+        }
+    }
 
     /// Resolve `key`'s metadata **only** — size, ETag, Content-Type, and publication time
     /// (ADR-0047) — without opening its fragment stream. `None` if `key` has no committed
