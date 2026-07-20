@@ -37,7 +37,7 @@ use wyrd_traits::{
 // The client-facing gateway seam this crate composes concretes behind (ADR-0010). The S3
 // wire surface (`wyrd-gateway-s3`) is generic over `ObjectGateway`; `Gateway` implements it.
 pub use wyrd_gateway_core::GatewayError;
-use wyrd_gateway_core::{ContentHash, ObjectGateway, ObjectMeta, ObjectRead};
+use wyrd_gateway_core::{ContentHash, ListedObject, ObjectGateway, ObjectMeta, ObjectRead};
 
 /// The root inode every object key is bound under — a flat namespace at M0.
 const ROOT: InodeId = 0;
@@ -453,6 +453,62 @@ where
             }
         }
         Err(GatewayError::Conflict.into())
+    }
+
+    /// LIST a container's objects (issue #507, ADR-0046): the bucket-existence read plus the
+    /// per-bucket dirent scan, returned as the container's **complete**, lexicographically
+    /// sorted key set. The wire layer computes `prefix`/`delimiter`/`max-keys`/pagination over
+    /// this one sorted view (the seam names no S3 vocabulary — ADR-0010, ADR-0046 decision 6).
+    async fn list_container(&self, container: &str) -> Result<Option<Vec<ListedObject>>> {
+        // ADR-0046 decision 4: listing consults the bucket record (a plain read) FIRST, so an
+        // absent bucket answers `NoSuchBucket` rather than an empty listing. #511 writes the
+        // marker (CreateBucket); this issue only reads it. A present-but-empty bucket falls
+        // through to an empty `Vec` (a `200` empty listing, not a `404`).
+        if self
+            .meta
+            .get(&metadata::bucket_key(container))
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        // The per-bucket dirent prefix of the flat `{bucket}/{key}` encoding: an object PUT
+        // stores its key as the dirent name `{bucket}/{key}` under `ROOT`
+        // (`gateway-s3` composes `object_key = "{bucket}/{key}"`), so the dirents for this
+        // bucket are exactly those under `dirent:{ROOT}/{bucket}/`. The trailing `/` fences
+        // bucket `foo` off from `foobar` — a prefix without it would spill across buckets.
+        let scan_prefix = metadata::dirent_key(ROOT, &format!("{container}/"));
+        let dirents = self.meta.scan(&scan_prefix).await?;
+        let mut listed = Vec::with_capacity(dirents.len());
+        for (raw_key, value) in &dirents {
+            // The object key relative to the container = the dirent key with the
+            // `dirent:{ROOT}/{bucket}/` prefix stripped.
+            let Some(rel) = raw_key.strip_prefix(scan_prefix.as_slice()) else {
+                continue;
+            };
+            let key = String::from_utf8_lossy(rel).into_owned();
+            let dirent: metadata::DirentRecord = metadata::decode(value)?;
+            // Resolve the inode for size/etag/modified. A dirent whose inode is missing (a
+            // torn write) or still `Pending` (an in-flight streaming write not yet committed)
+            // is not a listable object — skip it, matching `committed_inode`'s "only committed
+            // content is readable" semantics on the GET path.
+            let Some(inode) = read::read_inode(&self.meta, dirent.inode).await? else {
+                continue;
+            };
+            if inode.state != metadata::InodeState::Committed {
+                continue;
+            }
+            listed.push(ListedObject {
+                key,
+                size: inode.size,
+                etag: inode.etag,
+                modified: inode.modified,
+            });
+        }
+        // `scan` order is unspecified (trait contract); the wire layer's grouping and
+        // pagination require one deterministic order, so sort lexicographically by key here.
+        listed.sort_by(|a, b| a.key.cmp(&b.key));
+        Ok(Some(listed))
     }
 }
 
