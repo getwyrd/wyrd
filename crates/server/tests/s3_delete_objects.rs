@@ -571,6 +571,41 @@ async fn delete_objects_more_than_1000_keys_is_refused() {
     );
 }
 
+/// The body cap must be sized on the ESCAPED wire bytes, not the raw key bytes. A request at both
+/// documented limits — 1000 keys, each a legal 1024-byte key — serializes to far more than 1024
+/// bytes per key once escaped (`&` becomes `&amp;`), so a cap floored on the raw size
+/// fail-closed-rejected a perfectly legal DeleteObjects with `400 MalformedXML` (PR #612 review).
+/// This body is ≈5.1 MB escaped, comfortably past the previous 2 MiB cap, and must be ACCEPTED.
+#[tokio::test]
+async fn delete_objects_max_keys_with_escaped_content_is_accepted() {
+    let (addr, _dir) = start_gateway().await;
+    // 1000 keys × a 1024-byte key made entirely of `&` — each `&` costs 5 body bytes as `&amp;`.
+    let escaped_key = "&amp;".repeat(1024);
+    let mut xml = String::from("<Delete>");
+    for _ in 0..1000 {
+        xml.push_str("<Object><Key>");
+        xml.push_str(&escaped_key);
+        xml.push_str("</Key></Object>");
+    }
+    xml.push_str("</Delete>");
+    assert!(
+        xml.len() > 2 * 1024 * 1024,
+        "the fixture must exceed the previous 2 MiB cap to be a regression guard, got {}",
+        xml.len()
+    );
+
+    let (status, head, body) = post_delete_raw(addr, "delete", xml.as_bytes()).await;
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status, 200,
+        "a legal 1000-key request whose keys are XML-escaped must be accepted, not capped: {head}",
+    );
+    assert!(
+        !body.contains("MalformedXML"),
+        "a legal escaped-key request must not be refused as MalformedXML, got body: {body}",
+    );
+}
+
 #[tokio::test]
 async fn delete_objects_oversized_body_is_refused_before_it_is_resident() {
     // The bulk-delete body is buffered whole (unlike a streamed object PUT), so the handler
@@ -580,11 +615,11 @@ async fn delete_objects_oversized_body_is_refused_before_it_is_resident() {
     // production `buffer_capped` -> `BufferError::TooLarge` -> 400 branch over the wire; the
     // 1000-key semantic bound above cannot reach it (1001 small keys are well under the cap).
     let (addr, _dir) = start_gateway().await;
-    // A single element whose text pads the body past the 2 MiB cap: well-formed XML, so a
+    // A single element whose text pads the body past the 8 MiB cap: well-formed XML, so a
     // *green* handler that ignored the cap would parse it and answer 200 — only the byte cap
     // makes this a 400.
     let mut xml = String::from("<Delete><Object><Key>");
-    xml.push_str(&"a".repeat(3 * 1024 * 1024));
+    xml.push_str(&"a".repeat(9 * 1024 * 1024));
     xml.push_str("</Key></Object></Delete>");
 
     let (status, head, body) = post_delete_raw(addr, "delete", xml.as_bytes()).await;

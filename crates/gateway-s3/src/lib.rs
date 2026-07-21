@@ -412,16 +412,37 @@ fn is_delete_subresource(query: &str) -> bool {
 /// the cap is enforced BY CONSTRUCTION as the body is read (never by trusting `Content-Length`),
 /// and an over-cap body is refused as `MalformedXML`.
 ///
-/// The bound must sit in `[~1.1 MB, 3 MiB)`. FLOOR: a legal maximum request — 1000 keys × a
-/// 1024-byte key + the `<Object><Key></Key></Object>` envelope ≈ 1.06 MB — MUST fit, or the cap
-/// fail-closed-rejects a legal DeleteObjects (no test guards this floor; the 1000-key test uses
-/// tiny keys ≈ 33 KB). CEILING: the retained oversized-body test sends a 3 MiB body, so the cap
-/// MUST be < 3 MiB to refuse it. 2 MiB sits in `[1.1 MB, 3 MiB)`.
-const MAX_DELETE_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// The bound must sit in `[~6.2 MB, 9 MiB)`. FLOOR: a legal maximum request MUST fit **as it is
+/// serialized on the wire — after XML escaping**. A 1024-byte key is legal, and one key character
+/// can occupy up to 6 body bytes once escaped (`&quot;`/`&apos;`, or a `&#xNN;` character
+/// reference), so the worst case is 1000 × 1024 × 6 ≈ 6.14 MB of key text plus the
+/// `<Object><Key></Key></Object>` envelope (≈28 KB) ≈ 6.2 MB. Sizing this floor on the RAW key
+/// bytes (~1.06 MB, the previous 2 MiB cap) fail-closed-rejected a request that satisfies both
+/// documented limits — 1000 keys, each ≤1024 bytes — merely because its keys contained `&`
+/// (PR #612 review). CEILING: the retained oversized-body test sends a 9 MiB body, so the cap MUST
+/// be < 9 MiB to refuse it. 8 MiB sits in `[6.2 MB, 9 MiB)`.
+///
+/// A character reference may be padded with leading zeros (`&#x00000041;`) without bound, so no
+/// finite cap accommodates EVERY escaping of a legal key; such a body is still refused. The floor
+/// is sized for worst-case *standard* escaping, not adversarial padding.
+const MAX_DELETE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many per-key deletes a bulk **DeleteObjects** has in flight at once (issue #509).
+///
+/// The fan-out is what makes the bulk verb worth having: `delete_object` is a metadata operation
+/// that can be a network round trip, so awaiting each key before starting the next made a 1000-key
+/// batch cost the SUM of 1000 latencies — slower than the client just issuing 1000 parallel
+/// single-object DELETE requests, which inverts the whole point of the batch (PR #612 review).
+///
+/// It stays BOUNDED so one request cannot open an unbounded number of concurrent metadata
+/// operations against the backend, and the fan-out uses `buffered` — NOT `buffer_unordered` — so
+/// results come back in request order and each `<Deleted>`/`<Error>` row still lines up with the
+/// key that produced it. The response stays byte-for-byte deterministic.
+const DELETE_FANOUT: usize = 16;
 const _: () = assert!(
-    MAX_DELETE_BODY_BYTES > 1_100_000 && MAX_DELETE_BODY_BYTES < 3 * 1024 * 1024,
-    "MAX_DELETE_BODY_BYTES must exceed a legal 1000-key request (~1.1 MB) and stay under the \
-     3 MiB oversized-body test's body",
+    MAX_DELETE_BODY_BYTES > 6_200_000 && MAX_DELETE_BODY_BYTES < 9 * 1024 * 1024,
+    "MAX_DELETE_BODY_BYTES must exceed a legal 1000-key request AFTER XML escaping (~6.2 MB) and \
+     stay under the 9 MiB oversized-body test's body",
 );
 
 /// Like [`unsupported_subresource`] but matches against **percent-decoded** query keys, so a
@@ -1877,11 +1898,24 @@ where
     // :1755): `delete_object` returns `Ok(_)` for both a removed and an already-absent key (S3
     // delete is idempotent — both are `<Deleted>`), and a per-key gateway error becomes a per-key
     // `<Error>` via the shared [`classify`] rather than failing the whole batch.
+    // Bounded-concurrency fan-out ([`DELETE_FANOUT`]): `buffered` keeps at most N deletes in
+    // flight and yields their outcomes in REQUEST order, so the batch costs the slowest window
+    // rather than the sum of every key's latency while each row stays paired with its own key.
+    let outcomes = futures_util::stream::iter(request.keys.into_iter().map(|key| {
+        let object_key = format!("{bucket}/{key}");
+        async move {
+            let outcome = state.gateway.delete_object(&object_key).await;
+            (key, outcome)
+        }
+    }))
+    .buffered(DELETE_FANOUT)
+    .collect::<Vec<_>>()
+    .await;
+
     let mut deleted: Vec<String> = Vec::new();
     let mut errors: Vec<(String, &'static str, String)> = Vec::new();
-    for key in request.keys {
-        let object_key = format!("{bucket}/{key}");
-        match state.gateway.delete_object(&object_key).await {
+    for (key, outcome) in outcomes {
+        match outcome {
             Ok(_) => deleted.push(key),
             Err(err) => {
                 let (_, code, message) = classify(&err);
