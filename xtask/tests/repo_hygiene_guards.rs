@@ -133,13 +133,13 @@ fn plant_crate(root: &Path, name: &str, lib_rs: &str) {
 }
 
 fn fixture_dir(tag: &str) -> PathBuf {
+    // pid + per-process counter for uniqueness — deliberately no wall-clock
+    // read (the rubric's clock rule: nothing here owns a clocked lifecycle).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     std::env::temp_dir().join(format!(
         "wyrd-repo-guard-fixture-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
 }
 
