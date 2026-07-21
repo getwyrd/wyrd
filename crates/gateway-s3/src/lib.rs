@@ -235,12 +235,21 @@ where
 const OPS: [&str; 5] = ["put", "get", "delete", "head", "other"];
 
 /// The op label for `method` — the request plane's stable, low-cardinality key.
-fn op_label(method: &Method) -> &'static str {
+fn op_label(method: &Method, path: &str, query: &str) -> &'static str {
     match *method {
         Method::PUT => "put",
         Method::GET => "get",
         Method::DELETE => "delete",
         Method::HEAD => "head",
+        // **Bulk `DeleteObjects` is a POST on the wire but a DELETE as an OPERATION.** Labelling
+        // by method alone filed every bulk delete under `other` — pooled with unsupported methods
+        // — so the `delete` RED series was blind to the one path that removes up to 1000 objects
+        // per request, and its latency and failures never reached a delete dashboard or alert
+        // (PR #612 review). The predicate mirrors the route's own interception exactly (see
+        // `dispatch`), so this label can never name a request the bulk handler did not take.
+        Method::POST if bucket_scoped_path(path).is_some() && is_delete_subresource(query) => {
+            "delete"
+        }
         _ => "other",
     }
 }
@@ -1379,7 +1388,11 @@ where
     let method = req.method().clone();
     // The request plane's op label + metrics sink, read before `state` is moved into the
     // dispatcher below.
-    let op = op_label(&method);
+    let op = op_label(
+        &method,
+        req.uri().path(),
+        req.uri().query().unwrap_or_default(),
+    );
     let metrics = state.metrics.clone();
     let span = tracing::info_span!(
         "s3.request",
@@ -1889,7 +1902,25 @@ where
         match outcome {
             Ok(_) => deleted.push(key),
             Err(err) => {
-                let (_, code, message) = classify(&err);
+                let (status, code, message) = classify(&err);
+                // **Record the fault before the error is discarded.** The batch still answers
+                // `200` with this key's `<Error>` row, so the request-level RED path sees a
+                // success and reports nothing — this is the ONLY place the backend fault is
+                // observable to an operator, and it carries the same request_id the client holds.
+                //
+                // The key is BUCKET-QUALIFIED, for the same reason `request_id` is a field on the
+                // event rather than inherited from the span: `s3.request` is an `info_span!`, so
+                // under an error-only filter it is never enabled and the path is not there to
+                // disambiguate. Logging the bare XML key would make the same key in two buckets
+                // indistinguishable in exactly the configuration an operator alerts on. Allocated
+                // only on the failure arm.
+                record_gateway_error(
+                    request_id,
+                    &err,
+                    status,
+                    code,
+                    Some(&format!("{bucket}/{key}")),
+                );
                 errors.push((key, code, message));
             }
         }
@@ -3077,6 +3108,56 @@ impl std::fmt::Display for CauseChain<'_> {
 /// The client-facing `<Message>` deliberately stays free of internal detail — **detail to the
 /// log, request id to the client**. That is also why the 500 arm's message is unchanged: what
 /// was missing was never a better string for the client, it was a record for the operator.
+/// Record a backend fault on the error plane — the shared body of [`gateway_error_response`] and
+/// the bulk-delete per-key path, so a fault is logged IDENTICALLY whether it fails the whole
+/// request or only one key of a batch.
+///
+/// `key` names the object when the fault is scoped to ONE entry of a bulk operation. That case is
+/// why this is split out: a bulk delete answers `200` with a per-key `<Error>` row, so the
+/// request-level RED path sees a success and records nothing. Without this call the backend fault
+/// reached the client as an XML row and left the operator NO request-id-linked diagnostic — no
+/// cause chain, no `may_still_commit`, no typed class — for a fault that may have destroyed data
+/// (PR #612 review).
+fn record_gateway_error(
+    request_id: RequestId,
+    err: &BoxError,
+    status: StatusCode,
+    code: &str,
+    key: Option<&str>,
+) {
+    if status.is_server_error() {
+        // `may_still_commit` is a FIELD, not prose in the message: it is the one bit an operator
+        // filters on. `true` means the batch may land AFTER this response, so a re-read that sees
+        // nothing proves nothing — the single hardest state to reason about, and the reason the
+        // client's generic 500 is not the whole story (#515).
+        let may_still_commit = err
+            .downcast_ref::<wyrd_traits::CommitUnknownResult>()
+            .map(|u| u.may_still_commit);
+        tracing::error!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            may_still_commit,
+            object_key = key,
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway failed the request",
+        );
+    } else {
+        tracing::warn!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            object_key = key,
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway refused the request",
+        );
+    }
+}
+
 fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     let (status, code, message) = classify(err);
 
@@ -3094,35 +3175,7 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     // error-only filter (`--log-level error`) it is never enabled and `with_current_span(true)`
     // has no fields to attach. This line, the one an operator reaches for at 3am, would be the
     // ONE that lost the `x-amz-request-id` the client is holding.
-    if status.is_server_error() {
-        // `may_still_commit` is a FIELD, not prose in the message: it is the one bit an operator
-        // filters on. `true` means the batch may land AFTER this response, so a re-read that sees
-        // nothing proves nothing — the single hardest state to reason about, and the reason the
-        // client's generic 500 is not the whole story (#515).
-        let may_still_commit = err
-            .downcast_ref::<wyrd_traits::CommitUnknownResult>()
-            .map(|u| u.may_still_commit);
-        tracing::error!(
-            target: "wyrd.gateway.s3.error",
-            request_id = %request_id,
-            s3_code = code,
-            http_status = status.as_u16(),
-            may_still_commit,
-            error = %err,
-            cause_chain = %CauseChain(err.as_ref()),
-            "the gateway failed the request",
-        );
-    } else {
-        tracing::warn!(
-            target: "wyrd.gateway.s3.error",
-            request_id = %request_id,
-            s3_code = code,
-            http_status = status.as_u16(),
-            error = %err,
-            cause_chain = %CauseChain(err.as_ref()),
-            "the gateway refused the request",
-        );
-    }
+    record_gateway_error(request_id, err, status, code, None);
     let mut response = error_response(request_id, status, code, &message);
     // **Carry the typed failure class out to the request plane.** The class is derived HERE,
     // where the backend's error still exists, by the seam's own classifier (#577's
@@ -4011,7 +4064,9 @@ mod tests {
                 &span,
                 RequestIds::new().mint(),
                 SystemTime::now(),
-                op_label(&method),
+                // This case exercises response FINISHING, not routing: an ordinary object path
+                // with no query keeps the label purely method-derived.
+                op_label(&method, "/bucket/key", ""),
                 ErrorClass::Terminal,
                 None,
             );
@@ -4109,6 +4164,29 @@ mod tests {
         assert_eq!(split_bucket_key("/bucket/"), None);
         assert_eq!(split_bucket_key("/bucket"), None);
         assert_eq!(split_bucket_key("/"), None);
+    }
+
+    /// Bulk `DeleteObjects` must land in the `delete` RED series, not `other`. It is a POST on the
+    /// wire, so a method-only label pooled it with unsupported methods and left delete dashboards
+    /// and alerts blind to the one path that removes up to 1000 objects per request (PR #612
+    /// review). The label must track the route's own interception predicate — bucket-scoped path
+    /// AND a bare `?delete` — so it never claims a request the bulk handler did not take.
+    #[test]
+    fn op_label_attributes_bulk_delete_to_the_delete_series() {
+        // The bulk-delete route: a bucket-scoped POST carrying a bare `?delete`.
+        assert_eq!(op_label(&Method::POST, "/bucket", "delete"), "delete");
+        assert_eq!(op_label(&Method::POST, "/bucket/", "delete"), "delete");
+        // Ordinary methods keep their method-derived label.
+        assert_eq!(op_label(&Method::GET, "/bucket/key", ""), "get");
+        assert_eq!(op_label(&Method::DELETE, "/bucket/key", ""), "delete");
+        assert_eq!(op_label(&Method::PUT, "/bucket/key", ""), "put");
+        assert_eq!(op_label(&Method::HEAD, "/bucket/key", ""), "head");
+        // A POST the bulk handler does NOT take stays `other`, so the delete series is never
+        // credited with a request that deleted nothing: an OBJECT path (the route only fires on
+        // a bucket-scoped path), and a bucket POST with no `?delete` marker.
+        assert_eq!(op_label(&Method::POST, "/bucket/key", "delete"), "other");
+        assert_eq!(op_label(&Method::POST, "/bucket", ""), "other");
+        assert_eq!(op_label(&Method::POST, "/bucket", "uploads"), "other");
     }
 
     #[test]
