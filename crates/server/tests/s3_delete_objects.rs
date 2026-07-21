@@ -293,6 +293,40 @@ async fn delete_objects_denylisted_query_companion_is_refused_and_deletes_nothin
     }
 }
 
+/// S3's **conditional-delete** fields — `<ETag>`, `<LastModifiedTime>`, `<Size>` — mean "delete
+/// this only if it still looks like this". Ignoring them converts a guarded request into an
+/// unconditional delete, destroying exactly the object whose failed precondition was supposed to
+/// save it: the worst failure available on a destructive verb. They are refused whole, like
+/// `<VersionId>` (PR #612 review).
+#[tokio::test]
+async fn delete_objects_conditional_delete_fields_are_refused_and_delete_nothing() {
+    let (addr, _dir) = start_gateway().await;
+    let client = sdk_client(addr);
+
+    for field in [
+        "<ETag>\"d41d8cd98f00b204e9800998ecf8427e\"</ETag>",
+        "<LastModifiedTime>2026-07-21T00:00:00.000Z</LastModifiedTime>",
+        "<Size>42</Size>",
+    ] {
+        put_object(&client, "victim").await;
+        let body =
+            format!("<Delete><Object><Key>victim</Key>{field}</Object></Delete>").into_bytes();
+        let (status, head, resp) = post_delete_raw(addr, "delete", &body).await;
+        let resp = String::from_utf8_lossy(&resp);
+        assert_eq!(
+            status, 501,
+            "{field}: a conditional-delete field this gateway cannot enforce must be refused, \
+             never silently dropped into an unconditional delete: {head}",
+        );
+        assert!(
+            resp.contains("NotImplemented"),
+            "{field}: expected S3 NotImplemented, got body: {resp}",
+        );
+        // The load-bearing assertion: the object the precondition was protecting survives.
+        assert_present(&client, "victim").await;
+    }
+}
+
 /// A `<VersionId>` inside an `<Object>` must be REFUSED, never silently dropped. Ignoring it turns
 /// "delete this OLD version" into "delete the CURRENT object" — irrecoverably destroying the live
 /// object the client asked to keep. `versionId` is already on the object route's unsupported

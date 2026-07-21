@@ -1855,12 +1855,26 @@ struct DeleteRequest {
 enum DeleteRequestError {
     /// Not a well-formed / semantically valid `<Delete>` document ⇒ `400 MalformedXML`.
     Malformed,
-    /// An `<Object>` carried a `<VersionId>` ⇒ `501 NotImplemented`. The document is perfectly
-    /// well-formed, so reporting it as malformed would misdirect the client; what is missing is
-    /// the FEATURE (version-aware deletion), exactly as `?versionId` is missing on the object
-    /// route.
-    VersionedDelete,
+    /// An `<Object>` carried a child that decides **which object, or whether,** the key is
+    /// deleted, and this gateway cannot honour it ⇒ `501 NotImplemented`. The document is
+    /// perfectly well-formed, so reporting it as malformed would misdirect the client; what is
+    /// missing is the FEATURE, exactly as `?versionId` is missing on the object route. Carries the
+    /// field name so the refusal says which one.
+    UnhonourableObjectField(&'static str),
 }
+
+/// The `<Object>` children that decide **which object, or whether,** a key is deleted — the ones
+/// that must never be silently dropped (PR #612 review).
+///
+/// `<VersionId>` scopes the delete to one version; `<ETag>`, `<LastModifiedTime>` and `<Size>` are
+/// S3's **conditional-delete** fields, a client's "only delete this if it still looks like this".
+/// Ignoring any of them converts a guarded request into an unconditional destruction of the CURRENT
+/// object — the caller's precondition silently discarded, which is the worst possible failure on a
+/// destructive verb: it destroys precisely the object the client was trying to protect.
+///
+/// Every OTHER unknown child stays inert decoration and is ignored (real S3 is lenient about
+/// extras); these four are refused whole.
+const UNHONOURABLE_OBJECT_FIELDS: [&str; 4] = ["VersionId", "ETag", "LastModifiedTime", "Size"];
 
 /// `char_data`'s fail-closed `Err(())` is a MALFORMED body — this lets the extraction contract
 /// keep its minimal error type while `?` lifts it into [`DeleteRequestError`] inside the parser.
@@ -1958,21 +1972,23 @@ where
     };
 
     // Parse + walk the validated tree. ANY parse error, semantic-bound violation, or fail-closed
-    // key-extraction violation ⇒ `MalformedXML`, no key touched; a version-scoped entry ⇒ `501`,
-    // also with no key touched.
+    // key-extraction violation ⇒ `MalformedXML`, no key touched; a version-scoped or
+    // conditional-delete entry ⇒ `501`, also with no key touched.
     let request = match parse_delete_request(text) {
         Ok(request) => request,
         Err(DeleteRequestError::Malformed) => return malformed_xml(request_id),
         // Refuse the WHOLE request rather than mishandle part of it — the same rule the object
         // route applies to `?versionId` (:1582). Deleting only the unversioned entries would be a
         // partial success on a destructive op whose refused half is exactly the dangerous one.
-        Err(DeleteRequestError::VersionedDelete) => {
+        Err(DeleteRequestError::UnhonourableObjectField(field)) => {
             return error_response(
                 request_id,
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                "version-scoped delete is not supported: an <Object> carrying a <VersionId> is \
-                 refused, and no key in this request was deleted",
+                &format!(
+                    "version-scoped and conditional deletes are not supported: an <Object> \
+                     carrying a <{field}> is refused, and no key in this request was deleted"
+                ),
             );
         }
     };
@@ -2064,10 +2080,11 @@ where
 /// accepted (real S3's leniency / the stock SDK body). Unknown sibling elements are ignored ONLY
 /// as children of `<Delete>` / `<Object>`.
 ///
-/// `<VersionId>` is the ONE exception to that leniency: it is refused
-/// ([`DeleteRequestError::VersionedDelete`]), never ignored. Every other unknown element is inert
-/// decoration, but a `<VersionId>` changes WHICH object the key names — dropping it would silently
-/// convert "delete this old version" into "delete the current object" (PR #612 review).
+/// [`UNHONOURABLE_OBJECT_FIELDS`] are the exception to that leniency: they are refused
+/// ([`DeleteRequestError::UnhonourableObjectField`]), never ignored. Every other unknown element is
+/// inert decoration, but those four decide WHICH object — or WHETHER — the key is deleted, so
+/// dropping one silently converts a guarded request into an unconditional destruction of the
+/// current object (PR #612 review).
 fn parse_delete_request(text: &str) -> Result<DeleteRequest, DeleteRequestError> {
     let doc = roxmltree::Document::parse(text).map_err(|_| DeleteRequestError::Malformed)?;
     let root = doc.root_element();
@@ -2080,17 +2097,22 @@ fn parse_delete_request(text: &str) -> Result<DeleteRequest, DeleteRequestError>
     for child in root.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
             "Object" => {
-                // **A `<VersionId>` must never be silently dropped.** Ignoring it turns "delete
-                // this OLD version" into "delete the CURRENT object" — destroying the live object
-                // the client meant to keep, irrecoverably. Version-aware deletion does not exist
-                // here, and `versionId` is already on the object route's unsupported-subresource
-                // denylist (:338), so honouring the XML spelling while refusing the query spelling
-                // was also self-inconsistent (PR #612 review).
-                if child
-                    .children()
-                    .any(|n| n.is_element() && n.tag_name().name() == "VersionId")
-                {
-                    return Err(DeleteRequestError::VersionedDelete);
+                // **A child that decides WHICH object, or WHETHER, the key dies must never be
+                // silently dropped** — see [`UNHONOURABLE_OBJECT_FIELDS`]. A `<VersionId>` turns
+                // "delete this OLD version" into "delete the CURRENT object"; an `<ETag>` /
+                // `<LastModifiedTime>` / `<Size>` turns "delete this only if it still looks like
+                // this" into an unconditional delete, destroying exactly the object whose failed
+                // precondition was supposed to save it. Both are irrecoverable, and `versionId` is
+                // already on the object route's unsupported-subresource denylist, so honouring an
+                // XML spelling while refusing the query spelling was self-inconsistent too
+                // (PR #612 review).
+                if let Some(field) = child.children().filter(|n| n.is_element()).find_map(|n| {
+                    UNHONOURABLE_OBJECT_FIELDS
+                        .iter()
+                        .copied()
+                        .find(|f| *f == n.tag_name().name())
+                }) {
+                    return Err(DeleteRequestError::UnhonourableObjectField(field));
                 }
                 let mut key_elems = child
                     .children()
