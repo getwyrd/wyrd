@@ -157,6 +157,40 @@ pub fn scan_gitlinks(ls_files_z: &str, declared: &[String]) -> Vec<String> {
     violations
 }
 
+/// Does the CRATE-LEVEL attribute preamble of comment-stripped source contain
+/// `required`? rustc only applies an inner attribute crate-wide when it
+/// appears before the first item, so the walk accepts blank lines and other
+/// inner attributes (`#![...]`, including ones spanning lines — tracked by
+/// bracket balance) and stops at the first real item: an occurrence inside a
+/// nested module, which scopes to that module only (and may even sit behind
+/// `#[cfg(any())]`), never counts. Comparison is whitespace-insensitive so a
+/// rustfmt re-wrap cannot defeat it.
+fn preamble_contains(stripped: &str, required: &str) -> bool {
+    let normalize = |s: &str| s.split_whitespace().collect::<String>();
+    let wanted = normalize(required);
+    let mut pending = String::new(); // an inner attribute still open across lines
+    for raw in stripped.lines() {
+        let t = raw.trim();
+        if !pending.is_empty() {
+            pending.push(' ');
+            pending.push_str(t);
+        } else if t.is_empty() {
+            continue;
+        } else if t.starts_with("#![") {
+            pending = t.to_string();
+        } else {
+            return false; // first real item — the crate-level preamble is over
+        }
+        if pending.matches(']').count() >= pending.matches('[').count() {
+            if normalize(&pending) == wanted {
+                return true;
+            }
+            pending.clear();
+        }
+    }
+    false
+}
+
 /// Scan the built-artifact crate roots under `crates_dir` for
 /// `#![forbid(unsafe_code)]`, honoring [`UNSAFE_FORBID_ALLOWLIST`]. Each
 /// conventional rustc crate root is its own compilation unit needing its own
@@ -253,13 +287,14 @@ pub fn scan_crate_roots(crates_dir: &Path) -> Result<Vec<String>, String> {
             .find(|(root, _, _)| Path::new(root) == rel)
             .map(|(_, attr, _)| *attr)
             .unwrap_or("#![forbid(unsafe_code)]");
-        // Comment-stripped match: a commented-out attribute is inactive to
-        // rustc and must not satisfy the guard.
-        if !strip_comments(&content)
-            .lines()
-            .any(|line| line.trim() == required)
-        {
-            violations.push(format!("{}: missing active `{required}`", file.display()));
+        // Comment-stripped, preamble-scoped match: a commented-out attribute
+        // is inactive to rustc, and one inside a nested module scopes to that
+        // module only — neither satisfies the guard.
+        if !preamble_contains(&strip_comments(&content), required) {
+            violations.push(format!(
+                "{}: missing active crate-level `{required}`",
+                file.display()
+            ));
         }
     }
     Ok(violations)

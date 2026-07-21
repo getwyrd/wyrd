@@ -349,6 +349,43 @@ fn scan_crate_roots_is_green_over_the_real_workspace_crates() {
 }
 
 #[test]
+fn scan_crate_roots_requires_the_attribute_at_crate_level() {
+    // An inner attribute inside a nested module scopes to THAT module only
+    // (rustc applies crate-wide inner attributes only before the first item),
+    // so a nested — or even cfg'd-out — occurrence must not satisfy the
+    // guard; a multi-line inner attribute BEFORE it must not end the
+    // preamble walk early.
+    let dir = fixture_dir("nested-attr");
+    plant_crate(
+        &dir,
+        "nested",
+        "pub mod inner {\n    #![forbid(unsafe_code)]\n}\n",
+    );
+    plant_crate(
+        &dir,
+        "cfgd-out",
+        "#[cfg(any())]\nmod ghost {\n    #![forbid(unsafe_code)]\n}\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "after-multiline-attr",
+        "//! docs\n#![cfg_attr(\n    test,\n    allow(dead_code)\n)]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    assert_eq!(
+        violations.len(),
+        2,
+        "nested and cfg'd-out are red; preamble-after-multiline is green: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("nested"))
+            && violations.iter().any(|v| v.contains("cfgd-out")),
+        "{violations:?}"
+    );
+}
+
+#[test]
 fn scan_crate_roots_fails_closed_when_it_cannot_see_the_tree() {
     // A missing crates dir (e.g. after a workspace move) and a dir with no
     // crate roots must both be Err — a guard that cannot see the tree says
