@@ -1127,6 +1127,42 @@ fn list_response(xml: String) -> Response {
 /// A non-streaming response (every error path, and PUT/DELETE) has a one-shot body, so it takes
 /// the same path and its row is written the moment that single frame is consumed — same shape,
 /// no special case.
+/// Marks a response whose STATUS LINE is a success but which nevertheless carries backend
+/// failures — today exactly one shape: a bulk `DeleteObjects` answering the protocol-required
+/// `200` with per-key `<Error>` rows.
+///
+/// [`record_access`] derives `errored` from the status line and the stream outcome, so without
+/// this marker a batch in which the backend failed to delete keys counted as a healthy request:
+/// `s3_request_errors` stayed flat and a partially failed *destructive* batch was indistinguishable
+/// from a clean one on the error dashboard (PR #612 review). It rides in the response extensions
+/// beside the [`ErrorClass`] the same handler stamps, so the counter is keyed by the seam's own
+/// typed class rather than the `Terminal` default.
+#[derive(Clone, Copy)]
+struct PartialFailure;
+
+/// The single class a batch reports when several keys failed with DIFFERENT classes. One request
+/// raises exactly one RED sample, so it must name one class — and it names the one carrying the
+/// strongest operator obligation, so a batch mixing a routine transient fault with an
+/// indeterminate commit is never filed under the routine one.
+fn worst_class(a: ErrorClass, b: ErrorClass) -> ErrorClass {
+    fn rank(class: ErrorClass) -> u8 {
+        match class {
+            // "may or may not have been applied" — on a DELETE the operator cannot even tell
+            // whether the data is gone. Nothing else here demands attention sooner.
+            ErrorClass::Indeterminate => 3,
+            // Corruption: a durable repair obligation.
+            ErrorClass::Integrity => 2,
+            ErrorClass::Terminal => 1,
+            ErrorClass::Transient => 0,
+        }
+    }
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
 struct AccessLogged<S> {
     inner: S,
     request_id: RequestId,
@@ -1146,6 +1182,10 @@ struct AccessLogged<S> {
     /// access row (see [`record_access`]).
     op: &'static str,
     class: ErrorClass,
+    /// Whether the head carried a [`PartialFailure`] marker — a success status hiding backend
+    /// faults. Carried to the completion point exactly like `class`, so the RED sample raised
+    /// there counts the request as errored.
+    partial_failure: bool,
     metrics: Option<tracing::Dispatch>,
 }
 
@@ -1175,6 +1215,7 @@ fn record_access(
     outcome: &'static str,
     op: &'static str,
     class: ErrorClass,
+    partial_failure: bool,
     metrics: Option<&tracing::Dispatch>,
 ) {
     let duration_ms = started.elapsed().map(|d| d.as_millis()).unwrap_or(0);
@@ -1195,7 +1236,13 @@ fn record_access(
     // the object, and counting it a success would be the "confident, wrong answer" this
     // module's own body-wrapping exists to prevent. `aborted` is NOT an error — that is a
     // client that hung up, which is not the gateway failing.
-    let errored = status >= 400 || matches!(outcome, "failed" | "truncated");
+    //
+    // `partial_failure` is the third way a request can have failed while LOOKING fine: a bulk
+    // `DeleteObjects` must answer `200` with per-key `<Error>` rows even when the backend failed
+    // to delete them (S3 says so), so neither the status nor the stream outcome can reveal it.
+    // Counting that batch a success is exactly the "confident, wrong answer" this derivation
+    // already refuses for a truncated body — and here the request is destructive.
+    let errored = status >= 400 || matches!(outcome, "failed" | "truncated") || partial_failure;
     emit_request_red(metrics, op, class, duration_ms as u64, errored);
 }
 
@@ -1229,6 +1276,7 @@ impl<S> AccessLogged<S> {
             outcome,
             self.op,
             class,
+            self.partial_failure,
             self.metrics.as_ref(),
         );
     }
@@ -1334,6 +1382,7 @@ fn finish_response(
     started: SystemTime,
     op: &'static str,
     class: ErrorClass,
+    partial_failure: bool,
     metrics: Option<tracing::Dispatch>,
 ) -> Response {
     let status = response.status();
@@ -1353,6 +1402,7 @@ fn finish_response(
             "complete",
             op,
             class,
+            partial_failure,
             metrics.as_ref(),
         );
         return response;
@@ -1374,6 +1424,7 @@ fn finish_response(
             span: span.clone(),
             op,
             class,
+            partial_failure,
             metrics,
         })
     })
@@ -1430,6 +1481,11 @@ where
         .copied()
         .unwrap_or(ErrorClass::Terminal);
 
+    // A success status that nonetheless carried backend faults — see [`PartialFailure`]. Read
+    // here, beside the class, because both must reach the completion point where the one RED
+    // sample for this request is raised.
+    let partial_failure = response.extensions().get::<PartialFailure>().is_some();
+
     // **The access line — without it the id is a promise this crate does not keep.**
     //
     // A span is not a log record: the `fmt` layer attaches a span's fields to the *events*
@@ -1455,7 +1511,15 @@ where
     // id exists for. The body is wrapped so the row carries the *observed* outcome: bytes
     // actually sent, the real duration, and whether the transfer completed (#529 review).
     let mut response = finish_response(
-        response, &method, &span, request_id, started, op, class, metrics,
+        response,
+        &method,
+        &span,
+        request_id,
+        started,
+        op,
+        class,
+        partial_failure,
+        metrics,
     );
 
     // Stamp it on the wire too. An SDK surfaces `x-amz-request-id` in its own error
@@ -1898,11 +1962,19 @@ where
 
     let mut deleted: Vec<String> = Vec::new();
     let mut errors: Vec<(String, &'static str, String)> = Vec::new();
+    // The class the RED sample keys on if any key failed — the most severe seen, so a mixed batch
+    // is never filed under its mildest fault. `None` while the batch is still clean.
+    let mut failure_class: Option<ErrorClass> = None;
     for (key, outcome) in outcomes {
         match outcome {
             Ok(_) => deleted.push(key),
             Err(err) => {
                 let (status, code, message) = classify(&err);
+                let class = wyrd_traits::classify(err.as_ref());
+                failure_class = Some(match failure_class {
+                    Some(seen) => worst_class(seen, class),
+                    None => class,
+                });
                 // **Record the fault before the error is discarded.** The batch still answers
                 // `200` with this key's `<Error>` row, so the request-level RED path sees a
                 // success and reports nothing — this is the ONLY place the backend fault is
@@ -1926,7 +1998,17 @@ where
         }
     }
 
-    list_response(render_delete_result(&deleted, &errors, request.quiet))
+    let mut response = list_response(render_delete_result(&deleted, &errors, request.quiet));
+    // **A batch that failed to delete keys is not a healthy request**, even though S3 requires it
+    // to answer `200` with per-key `<Error>` rows. Neither the status line nor the stream outcome
+    // can carry that, so the verdict rides in the extensions to the completion point: the marker
+    // makes the RED sample count as errored, and the class keys it by the seam's own typed
+    // classification instead of the `Terminal` default (PR #612 review).
+    if let Some(class) = failure_class {
+        response.extensions_mut().insert(PartialFailure);
+        response.extensions_mut().insert(class);
+    }
+    response
 }
 
 /// Walk a buffered body as a well-formed S3 `<Delete>` document (issue #509), returning the
@@ -3913,6 +3995,8 @@ mod tests {
                 // metric event falls through to the ambient subscriber (#575).
                 op: "get",
                 class: ErrorClass::Terminal,
+                // These cases drive an ordinary GET, not a partially-failed batch.
+                partial_failure: false,
                 metrics: None,
             };
             let body = Body::from_stream(logged);
@@ -4011,6 +4095,8 @@ mod tests {
                 span: tracing::info_span!("s3.request"),
                 op: "get",
                 class: ErrorClass::Terminal,
+                // These cases drive an ordinary GET, not a partially-failed batch.
+                partial_failure: false,
                 metrics: None,
             };
             let _ = futures_util::StreamExt::next(&mut logged).await; // the 5 declared bytes
@@ -4068,6 +4154,7 @@ mod tests {
                 // with no query keeps the label purely method-derived.
                 op_label(&method, "/bucket/key", ""),
                 ErrorClass::Terminal,
+                false,
                 None,
             );
             if drain {
