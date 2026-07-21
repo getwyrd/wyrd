@@ -28,6 +28,46 @@
 
 use std::path::Path;
 
+/// Strip `//` line comments and (nesting-aware) `/* */` block comments, so an
+/// attribute that was commented OUT — inactive to rustc — cannot satisfy the
+/// unsafe-code scan by raw text match. Deliberately NOT a full lexer: a string
+/// literal containing `/*` can over-strip, and an attribute spelled inside a
+/// raw string would still count as present — both require writing the evasion
+/// on purpose; the guard's threat model is the accidental drift (a
+/// commented-out attribute that keeps its line intact), which this closes.
+fn strip_comments(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.chars().peekable();
+    let mut depth = 0usize;
+    while let Some(c) = chars.next() {
+        match (c, chars.peek(), depth) {
+            ('/', Some('*'), _) => {
+                chars.next();
+                depth += 1;
+            }
+            ('*', Some('/'), 1..) => {
+                chars.next();
+                depth -= 1;
+            }
+            ('/', Some('/'), 0) => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        out.push('\n');
+                        break;
+                    }
+                }
+            }
+            (_, _, 1..) => {
+                if c == '\n' {
+                    out.push('\n');
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// The tracked prefix that must never appear in the index: per-task agent
 /// worktrees live beside the repo (AGENTS.md §Worktree discipline) or under an
 /// ignored `.claude/worktrees/`; a tracked entry there is always an accident.
@@ -133,14 +173,16 @@ pub fn scan_crate_roots(crates_dir: &Path) -> Vec<String> {
                 }
             }
             // Bench and example roots build with the workspace
-            // (`--all-targets`); examples also allow the dir-with-main.rs form.
-            for (sub, dir_form) in [("benches", false), ("examples", true)] {
+            // (`--all-targets`); both auto-discover the flat `<name>.rs` AND
+            // the directory `<name>/main.rs` forms (verified via
+            // `cargo metadata` target discovery).
+            for sub in ["benches", "examples"] {
                 if let Ok(found) = std::fs::read_dir(dir.join(sub)) {
                     for item in found.flatten() {
                         let path = item.path();
                         if path.extension().is_some_and(|e| e == "rs") {
                             roots.push(path);
-                        } else if dir_form && path.join("main.rs").is_file() {
+                        } else if path.join("main.rs").is_file() {
                             roots.push(path.join("main.rs"));
                         }
                     }
@@ -164,8 +206,13 @@ pub fn scan_crate_roots(crates_dir: &Path) -> Vec<String> {
             .find(|(root, _, _)| Path::new(root) == rel)
             .map(|(_, attr, _)| *attr)
             .unwrap_or("#![forbid(unsafe_code)]");
-        if !content.lines().any(|line| line.trim() == required) {
-            violations.push(format!("{}: missing `{required}`", file.display()));
+        // Comment-stripped match: a commented-out attribute is inactive to
+        // rustc and must not satisfy the guard.
+        if !strip_comments(&content)
+            .lines()
+            .any(|line| line.trim() == required)
+        {
+            violations.push(format!("{}: missing active `{required}`", file.display()));
         }
     }
     violations

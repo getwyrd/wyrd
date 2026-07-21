@@ -199,8 +199,11 @@ fn scan_crate_roots_covers_build_scripts_benches_and_examples() {
     plant_crate(&dir, "tooling", "#![forbid(unsafe_code)]\npub fn f() {}\n");
     std::fs::create_dir_all(dir.join("tooling/benches")).expect("create benches dir");
     std::fs::create_dir_all(dir.join("tooling/examples/demo")).expect("create example dirs");
+    std::fs::create_dir_all(dir.join("tooling/benches/suite")).expect("create bench dir-form");
     std::fs::write(dir.join("tooling/build.rs"), "fn main() {}\n").expect("write build.rs");
     std::fs::write(dir.join("tooling/benches/perf.rs"), "fn main() {}\n").expect("write bench");
+    std::fs::write(dir.join("tooling/benches/suite/main.rs"), "fn main() {}\n")
+        .expect("write dir-form bench");
     std::fs::write(dir.join("tooling/examples/flat.rs"), "fn main() {}\n").expect("write example");
     std::fs::write(
         dir.join("tooling/examples/demo/main.rs"),
@@ -214,12 +217,52 @@ fn scan_crate_roots_covers_build_scripts_benches_and_examples() {
 
     assert_eq!(
         violations.len(),
-        3,
+        4,
         "compliant demo/main.rs passes: {violations:?}"
     );
     assert!(violations[0].contains("perf.rs"), "{violations:?}");
-    assert!(violations[1].contains("build.rs"), "{violations:?}");
-    assert!(violations[2].contains("flat.rs"), "{violations:?}");
+    assert!(
+        violations[1].contains("suite") && violations[1].contains("main.rs"),
+        "the dir-form bench root is scanned (cargo auto-discovers benches/*/main.rs): {violations:?}"
+    );
+    assert!(violations[2].contains("build.rs"), "{violations:?}");
+    assert!(violations[3].contains("flat.rs"), "{violations:?}");
+}
+
+#[test]
+fn scan_crate_roots_rejects_a_commented_out_attribute() {
+    // A block-commented attribute keeps its line byte-identical, but rustc
+    // applies no lint — the guard must see through comments, not match text.
+    let dir = fixture_dir("commented");
+    plant_crate(
+        &dir,
+        "sneaky",
+        "/*\n#![forbid(unsafe_code)]\n*/\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "line-commented",
+        "// #![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "active-after-docs",
+        "//! docs mention /* oddities */ freely\n#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+
+    let violations = scan_crate_roots(&dir);
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        violations.len(),
+        2,
+        "both commented forms are red; the active one passes: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("sneaky"))
+            && violations.iter().any(|v| v.contains("line-commented")),
+        "{violations:?}"
+    );
 }
 
 #[test]
