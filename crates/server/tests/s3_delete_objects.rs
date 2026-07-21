@@ -257,6 +257,42 @@ async fn assert_rejected_and_keeps_victim(body: &[u8]) {
     assert_present(&client, "victim").await;
 }
 
+/// The bulk-delete route is intercepted BEFORE the subresource denylist, so that `?delete` — itself
+/// a denylisted key — is not refused by it. That early return also skipped the denylist for every
+/// OTHER key in the same query, making the one destructive route a hole in the fence: `POST
+/// /bucket?delete&versionId=v` ran an ordinary UNVERSIONED bulk delete while the client had
+/// explicitly asked for version semantics, destroying the current object. That is the same
+/// data-loss shape a `<VersionId>` in the BODY is refused for, reached by the query spelling
+/// instead (PR #612 review). The percent-encoded companion is covered too, since the fence decodes.
+#[tokio::test]
+async fn delete_objects_denylisted_query_companion_is_refused_and_deletes_nothing() {
+    let (addr, _dir) = start_gateway().await;
+    let client = sdk_client(addr);
+    let body = b"<Delete><Object><Key>victim</Key></Object></Delete>";
+
+    for query in [
+        "delete&versionId=v",   // the data-loss case: version semantics + a bulk delete
+        "versionId=v&delete",   // order must not matter
+        "delete&acl",           // any other denylisted subresource
+        "delete&%76ersionId=v", // percent-encoded companion still decodes to versionId
+    ] {
+        put_object(&client, "victim").await;
+        let (status, head, resp) = post_delete_raw(addr, query, body).await;
+        let resp = String::from_utf8_lossy(&resp);
+        assert_eq!(
+            status, 501,
+            "?{query}: a denylisted subresource riding alongside the delete marker must be \
+             refused, not walked past the fence into the destructive handler: {head}",
+        );
+        assert!(
+            resp.contains("NotImplemented"),
+            "?{query}: expected S3 NotImplemented, got body: {resp}",
+        );
+        // The load-bearing assertion: the refused request deleted nothing.
+        assert_present(&client, "victim").await;
+    }
+}
+
 /// A `<VersionId>` inside an `<Object>` must be REFUSED, never silently dropped. Ignoring it turns
 /// "delete this OLD version" into "delete the CURRENT object" — irrecoverably destroying the live
 /// object the client asked to keep. `versionId` is already on the object route's unsupported

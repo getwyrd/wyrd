@@ -469,6 +469,28 @@ fn unsupported_subresource_decoded(query: &str) -> Option<String> {
         .find(|k| UNSUPPORTED_SUBRESOURCES.contains(&k.as_str()))
 }
 
+/// The denylisted subresource a bulk-delete query carries BESIDES its own `delete` marker, if any
+/// — percent-decoded, exactly like [`unsupported_subresource_decoded`].
+///
+/// The bulk-delete route is intercepted BEFORE the denylist, so that `?delete` — which is itself on
+/// the denylist — is not refused by it. That early return also skipped the denylist for every
+/// OTHER key in the same query, making the one destructive route a hole in the fence every other
+/// bucket verb passes through: `POST /bucket?delete&versionId=v` ran an ordinary UNVERSIONED bulk
+/// delete while the client had explicitly asked for version semantics, destroying the current
+/// object. That is the exact data-loss shape a `<VersionId>` in the BODY is refused for, reached by
+/// the query spelling instead (PR #612 review).
+///
+/// Only the `delete` marker is exempt; every other denylisted key still refuses. Benign query
+/// params are untouched, so this narrows nothing a client legitimately sends.
+fn foreign_subresource_on_delete(query: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
+        .map(percent_decode_utf8)
+        .find(|k| k != "delete" && UNSUPPORTED_SUBRESOURCES.contains(&k.as_str()))
+}
+
 /// Split a request path `/{bucket}/{key}` into `(bucket, key)`. `key` may itself contain
 /// `/` (a nested key on the flat namespace). Returns `None` for a bucket-only or empty
 /// path — bucket-level operations are out of scope.
@@ -1592,6 +1614,19 @@ where
         // `DELETE /b/k?delete` is still `501`. `?delete` is detected with a bare-key match
         // ([`is_delete_subresource`]); `query_param` would miss a valueless `?delete`.
         if method == Method::POST && is_delete_subresource(&query) {
+            // This interception runs BEFORE the denylist below, so the denylist has to be applied
+            // to every OTHER key here — otherwise the bulk-delete marker is a skeleton key that
+            // walks any denylisted subresource past the fence and into a destructive handler
+            // (`?delete&versionId=v` deleting the CURRENT object). Refuse exactly as the denylist
+            // would have.
+            if let Some(sub) = foreign_subresource_on_delete(&query) {
+                return error_response(
+                    request_id,
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    &format!("the `{sub}` S3 subresource/operation is not supported"),
+                );
+            }
             return delete_objects(
                 &state,
                 request_id,
