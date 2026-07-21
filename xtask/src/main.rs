@@ -1399,7 +1399,7 @@ fn run_gitlink_guard() -> Result<(), String> {
                 "-f",
                 ".gitmodules",
                 "--get-regexp",
-                r"^submodule\..*\.path$",
+                r"^submodule\..*\.(path|url)$",
             ])
             .current_dir(&root)
             .output()

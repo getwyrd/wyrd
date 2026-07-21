@@ -85,18 +85,43 @@ pub const UNSAFE_FORBID_ALLOWLIST: &[(&str, &str, &str)] = &[(
     "FFI: the FoundationDB C bindings need one audited #[allow(unsafe_code)]",
 )];
 
-/// Extract submodule `path` values from NUL-delimited
-/// `git config -z -f .gitmodules --get-regexp <pattern>` output, whose record
-/// shape is `<key>\n<value>\0`. Letting `git config` do the reading means
-/// quoted/escaped config values (`path = "vendor/my dep"`) arrive here already
-/// decoded to the raw path `git ls-files` reports.
+/// Extract the *usable* submodule paths from NUL-delimited
+/// `git config -z -f .gitmodules --get-regexp '^submodule\..*\.(path|url)$'`
+/// output, whose record shape is `<key>\n<value>\0`. Letting `git config` do
+/// the reading means quoted/escaped config values (`path = "vendor/my dep"`)
+/// arrive here already decoded to the raw path `git ls-files` reports.
+///
+/// A path only counts when the SAME stanza also carries a non-empty `url`:
+/// git refuses a path-only declaration at consumption time (`fatal: No url
+/// found for submodule path '<p>' in .gitmodules` from `git clone
+/// --recurse-submodules` / `submodule update --init` — verified live), so a
+/// gitlink covered only by a url-less stanza still breaks fresh clones and
+/// must stay a violation.
 pub fn gitmodules_config_paths(config_z: &str) -> Vec<String> {
-    config_z
-        .split('\0')
-        .filter_map(|record| {
-            let (key, value) = record.split_once('\n')?;
-            (key.ends_with(".path") && !value.is_empty()).then(|| value.to_string())
-        })
+    let mut paths: Vec<(String, String)> = Vec::new(); // (stanza name, path)
+    let mut with_url: Vec<String> = Vec::new(); // stanza names with a real url
+    for record in config_z.split('\0') {
+        let Some((key, value)) = record.split_once('\n') else {
+            continue;
+        };
+        // Key shape: `submodule.<name>.path` / `submodule.<name>.url`; the
+        // name may itself contain dots, so strip the known prefix/suffix.
+        let Some(rest) = key.strip_prefix("submodule.") else {
+            continue;
+        };
+        if let Some(name) = rest.strip_suffix(".path") {
+            if !value.is_empty() {
+                paths.push((name.to_string(), value.to_string()));
+            }
+        } else if let Some(name) = rest.strip_suffix(".url") {
+            if !value.is_empty() {
+                with_url.push(name.to_string());
+            }
+        }
+    }
+    paths
+        .into_iter()
+        .filter_map(|(name, path)| with_url.contains(&name).then_some(path))
         .collect()
 }
 

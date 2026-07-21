@@ -65,11 +65,29 @@ fn scan_gitlinks_is_green_for_a_declared_submodule() {
     // declared list comes from `git config -z -f .gitmodules` output
     // (`<key>\n<value>\0` records), so git handles config quoting upstream —
     // a value that was quoted in .gitmodules ("vendor/my dep") arrives raw.
-    let cfg = "submodule.dep.path\nvendor/dep\0submodule.spaced.path\nvendor/my dep\0";
+    let cfg = "submodule.dep.path\nvendor/dep\0submodule.dep.url\nhttps://example.com/dep\0\
+               submodule.spaced.path\nvendor/my dep\0submodule.spaced.url\n../rel/dep\0";
     let declared = gitmodules_config_paths(cfg);
     assert_eq!(declared, ["vendor/dep", "vendor/my dep"]);
     let ls = "160000 bbbbbbbb 0\tvendor/dep\x00160000 cccccccc 0\tvendor/my dep\0";
     assert!(scan_gitlinks(ls, &declared).is_empty());
+}
+
+#[test]
+fn scan_gitlinks_is_red_on_a_url_less_submodule_stanza() {
+    // A path-only stanza is not a usable declaration: git refuses it at
+    // consumption time ("fatal: No url found for submodule path ... in
+    // .gitmodules" from clone --recurse-submodules / submodule update --init,
+    // verified live), so the gitlink still breaks fresh clones.
+    let cfg = "submodule.dep.path\nvendor/dep\0";
+    let declared = gitmodules_config_paths(cfg);
+    assert!(
+        declared.is_empty(),
+        "path without url is unusable: {declared:?}"
+    );
+    let ls = "160000 bbbbbbbb 0\tvendor/dep\0";
+    let violations = scan_gitlinks(ls, &declared);
+    assert_eq!(violations.len(), 1, "{violations:?}");
 }
 
 #[test]
@@ -106,7 +124,7 @@ fn scan_gitlinks_is_green_over_the_real_index() {
                 "-f",
                 ".gitmodules",
                 "--get-regexp",
-                r"^submodule\..*\.path$",
+                r"^submodule\..*\.(path|url)$",
             ])
             .current_dir(workspace_root())
             .output()
