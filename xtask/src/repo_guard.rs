@@ -30,26 +30,42 @@ use std::path::Path;
 
 /// Strip `//` line comments and (nesting-aware) `/* */` block comments, so an
 /// attribute that was commented OUT — inactive to rustc — cannot satisfy the
-/// unsafe-code scan by raw text match. Deliberately NOT a full lexer: a string
-/// literal containing `/*` can over-strip, and an attribute spelled inside a
-/// raw string would still count as present — both require writing the evasion
-/// on purpose; the guard's threat model is the accidental drift (a
-/// commented-out attribute that keeps its line intact), which this closes.
+/// unsafe-code scan by raw text match. String-aware where it matters: comment
+/// markers inside string literals — `#![doc(html_root_url = "https://…")]` is
+/// the canonical preamble case — are content, not comments (normal strings
+/// with `\` escapes, raw strings by hash count); inside a block comment,
+/// quotes are plain text. Deliberately NOT a full lexer: char literals and
+/// exotic token sequences below the preamble cannot affect the preamble walk
+/// (stripping is streaming and order-preserving), and an attribute spelled
+/// inside a raw string still counts as present — that requires writing the
+/// evasion on purpose; the threat model is accidental drift.
 fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut chars = src.chars().peekable();
-    let mut depth = 0usize;
+    let mut depth = 0usize; // block-comment nesting
     while let Some(c) = chars.next() {
-        match (c, chars.peek(), depth) {
-            ('/', Some('*'), _) => {
-                chars.next();
-                depth += 1;
+        if depth > 0 {
+            // Inside a block comment: only nesting and newlines matter.
+            match (c, chars.peek()) {
+                ('/', Some('*')) => {
+                    chars.next();
+                    depth += 1;
+                }
+                ('*', Some('/')) => {
+                    chars.next();
+                    depth -= 1;
+                }
+                ('\n', _) => out.push('\n'),
+                _ => {}
             }
-            ('*', Some('/'), 1..) => {
+            continue;
+        }
+        match (c, chars.peek()) {
+            ('/', Some('*')) => {
                 chars.next();
-                depth -= 1;
+                depth = 1;
             }
-            ('/', Some('/'), 0) => {
+            ('/', Some('/')) => {
                 for n in chars.by_ref() {
                     if n == '\n' {
                         out.push('\n');
@@ -57,10 +73,53 @@ fn strip_comments(src: &str) -> String {
                     }
                 }
             }
-            (_, _, 1..) => {
-                if c == '\n' {
-                    out.push('\n');
+            ('"', _) => {
+                // Normal string literal: copy verbatim through the closing
+                // quote, honoring `\` escapes.
+                out.push(c);
+                while let Some(s) = chars.next() {
+                    out.push(s);
+                    match s {
+                        '\\' => {
+                            if let Some(e) = chars.next() {
+                                out.push(e);
+                            }
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
                 }
+            }
+            ('r', Some(&next)) if next == '"' || next == '#' => {
+                // Possible raw string r"…" / r#"…"# — count hashes, then copy
+                // verbatim until `"` followed by that many hashes.
+                out.push(c);
+                let mut hashes = 0usize;
+                while chars.peek() == Some(&'#') {
+                    out.push(chars.next().unwrap());
+                    hashes += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    out.push(chars.next().unwrap());
+                    'raw: while let Some(s) = chars.next() {
+                        out.push(s);
+                        if s == '"' {
+                            let mut seen = 0usize;
+                            while seen < hashes {
+                                if chars.peek() == Some(&'#') {
+                                    out.push(chars.next().unwrap());
+                                    seen += 1;
+                                } else {
+                                    continue 'raw;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                // `r` not followed by a raw string (e.g. an identifier):
+                // already emitted; the hash case without a quote emitted the
+                // hashes too — both are plain tokens, scanning continues.
             }
             _ => out.push(c),
         }

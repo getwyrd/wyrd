@@ -386,6 +386,36 @@ fn scan_crate_roots_requires_the_attribute_at_crate_level() {
 }
 
 #[test]
+fn scan_crate_roots_accepts_comment_markers_inside_attribute_strings() {
+    // `//` inside a string literal is content, not a comment: the canonical
+    // preamble case is `#![doc(html_root_url = "https://docs.rs/foo")]`
+    // before the unsafe attribute — the guard must not over-strip the URL,
+    // unbalance the doc attribute, and swallow the forbid that follows.
+    let dir = fixture_dir("attr-strings");
+    plant_crate(
+        &dir,
+        "docurl",
+        "#![doc(html_root_url = \"https://docs.rs/foo\")]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "rawstr",
+        "#![doc(html_root_url = r#\"https://docs.rs/bar\"#)]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "starry",
+        "#![doc = \"see /* not a comment */ and // neither\"]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    assert!(
+        violations.is_empty(),
+        "string contents must never unbalance the preamble walk: {violations:?}"
+    );
+}
+
+#[test]
 fn scan_crate_roots_fails_closed_when_it_cannot_see_the_tree() {
     // A missing crates dir (e.g. after a workspace move) and a dir with no
     // crate roots must both be Err — a guard that cannot see the tree says
