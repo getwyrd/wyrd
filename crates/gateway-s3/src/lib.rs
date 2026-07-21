@@ -2076,9 +2076,21 @@ fn parse_delete_request(text: &str) -> Result<DeleteRequest, DeleteRequestError>
                     return Err(DeleteRequestError::Malformed); // >1 <Quiet> ⇒ malformed
                 }
                 quiet_seen = true;
-                // `<Quiet>` content is subject to the same fail-closed extraction as `<Key>`;
-                // S3 spells the flag as the literal `true`.
-                quiet = char_data(&child)? == "true";
+                // `<Quiet>` content is subject to the same fail-closed extraction as `<Key>`, and
+                // its VALUE is validated too. S3 types the field `xs:boolean`, whose lexical space
+                // is exactly `true`/`false`/`1`/`0`.
+                //
+                // Comparing against the literal `true` alone was wrong in both directions: a
+                // garbage value (`<Quiet>garbage</Quiet>`) silently read as "verbose" and
+                // authorised the whole destructive fan-out, in a parser that otherwise refuses
+                // every semantic violation before touching a key; and a perfectly valid `1`
+                // answered a client's quiet request with a full listing (PR #612 review).
+                // Refusing costs nothing here — no key has been touched yet.
+                quiet = match char_data(&child)?.as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => return Err(DeleteRequestError::Malformed),
+                };
             }
             // Other unknown sibling elements are ignored — S3 is lenient about extras in a
             // well-formed `<Delete>`. `<VersionId>` is NOT among them: it changes WHICH object a

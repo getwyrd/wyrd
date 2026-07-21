@@ -392,6 +392,64 @@ async fn delete_objects_removes_present_and_absent_keys_idempotently() {
     }
 }
 
+/// `<Quiet>` is typed `xs:boolean` by S3, so its lexical space is exactly `true`/`false`/`1`/`0`.
+/// Comparing against the literal `true` alone was wrong both ways: a garbage value read as
+/// "verbose" and authorised the destructive fan-out anyway — in a parser that refuses every other
+/// semantic violation before touching a key — and a valid `1` answered a quiet request with a full
+/// listing (PR #612 review).
+#[tokio::test]
+async fn delete_objects_invalid_quiet_is_rejected_and_deletes_nothing() {
+    for body in [
+        &b"<Delete><Object><Key>victim</Key></Object><Quiet>garbage</Quiet></Delete>"[..],
+        // An empty flag is not a boolean either.
+        &b"<Delete><Object><Key>victim</Key></Object><Quiet></Quiet></Delete>"[..],
+        // Case matters: `xs:boolean` is lower-case only.
+        &b"<Delete><Object><Key>victim</Key></Object><Quiet>True</Quiet></Delete>"[..],
+    ] {
+        assert_rejected_and_keeps_victim(body).await;
+    }
+}
+
+/// The other half of the `xs:boolean` lexical space: `1` and `0` are valid spellings of the flag
+/// and must be honoured, not silently degraded to "verbose".
+#[tokio::test]
+async fn delete_objects_numeric_quiet_spellings_are_honoured() {
+    let (addr, _dir) = start_gateway().await;
+    let client = sdk_client(addr);
+    put_object(&client, "n1").await;
+    put_object(&client, "n0").await;
+
+    // `1` means quiet: the object is deleted and NO <Deleted> row is echoed.
+    let (status, head, resp) = post_delete_raw(
+        addr,
+        "delete",
+        b"<Delete><Object><Key>n1</Key></Object><Quiet>1</Quiet></Delete>",
+    )
+    .await;
+    let resp = String::from_utf8_lossy(&resp);
+    assert_eq!(status, 200, "<Quiet>1</Quiet> is a valid boolean: {head}");
+    assert!(
+        !resp.contains("<Deleted>"),
+        "`1` means Quiet=true, so no <Deleted> row is echoed: {resp}"
+    );
+    assert_absent(&client, "n1").await;
+
+    // `0` means verbose: the object is deleted and the <Deleted> row IS echoed.
+    let (status, head, resp) = post_delete_raw(
+        addr,
+        "delete",
+        b"<Delete><Object><Key>n0</Key></Object><Quiet>0</Quiet></Delete>",
+    )
+    .await;
+    let resp = String::from_utf8_lossy(&resp);
+    assert_eq!(status, 200, "<Quiet>0</Quiet> is a valid boolean: {head}");
+    assert!(
+        resp.contains("<Deleted>"),
+        "`0` means Quiet=false, so the <Deleted> row is echoed: {resp}"
+    );
+    assert_absent(&client, "n0").await;
+}
+
 #[tokio::test]
 async fn delete_objects_quiet_omits_deleted_entries_but_still_deletes() {
     let (addr, _dir) = start_gateway().await;
