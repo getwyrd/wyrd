@@ -1443,7 +1443,7 @@ fn run_unsafe_forbid_guard() -> Result<(), String> {
         "unsafe-guard",
         "(#616 forbid(unsafe_code) in crate roots)",
     ]);
-    let violations = xtask::repo_guard::scan_crate_roots(&workspace_root().join("crates"));
+    let violations = xtask::repo_guard::scan_crate_roots(&workspace_root().join("crates"))?;
     if violations.is_empty() {
         println!("xtask unsafe-guard: every crate root forbids unsafe code (#616)");
         Ok(())

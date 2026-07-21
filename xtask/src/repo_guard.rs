@@ -170,10 +170,21 @@ pub fn scan_gitlinks(ls_files_z: &str, declared: &[String]) -> Vec<String> {
 /// safety) and custom `path =` target overrides (none exist in the workspace —
 /// `server`'s `[[bin]]` points at the conventional `src/main.rs` — and
 /// introducing one is a manifest diff a reviewer sees).
-/// Returns one violation string per non-compliant root (empty ⇒ clean).
-pub fn scan_crate_roots(crates_dir: &Path) -> Vec<String> {
+///
+/// Fails CLOSED: an unscannable `crates_dir` or the discovery of zero crate
+/// roots is `Err`, never an empty (vacuously clean) violation list — a guard
+/// that cannot see the tree must say so, not pass it. An unreadable
+/// individual root file is reported as a violation for the same reason.
+/// `Ok` carries one violation string per non-compliant root (empty ⇒ clean).
+pub fn scan_crate_roots(crates_dir: &Path) -> Result<Vec<String>, String> {
     let mut roots = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(crates_dir) {
+    {
+        let entries = std::fs::read_dir(crates_dir).map_err(|e| {
+            format!(
+                "unsafe-guard: cannot scan {}: {e} — refusing to pass a tree it cannot see",
+                crates_dir.display()
+            )
+        })?;
         for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.join("Cargo.toml").is_file() {
@@ -215,11 +226,22 @@ pub fn scan_crate_roots(crates_dir: &Path) -> Vec<String> {
             }
         }
     }
+    if roots.is_empty() {
+        return Err(format!(
+            "unsafe-guard: found no crate roots under {} — a moved or empty crates tree \
+             must fail the gate, not pass it vacuously",
+            crates_dir.display()
+        ));
+    }
     roots.sort();
     let mut violations = Vec::new();
     for file in roots {
-        let Ok(content) = std::fs::read_to_string(&file) else {
-            continue;
+        let content = match std::fs::read_to_string(&file) {
+            Ok(content) => content,
+            Err(e) => {
+                violations.push(format!("{}: unreadable crate root: {e}", file.display()));
+                continue;
+            }
         };
         // Allowlist lookup by the exact `crates/`-relative root path (Path
         // comparison, so the match is separator-agnostic): only the recorded
@@ -240,5 +262,5 @@ pub fn scan_crate_roots(crates_dir: &Path) -> Vec<String> {
             violations.push(format!("{}: missing active `{required}`", file.display()));
         }
     }
-    violations
+    Ok(violations)
 }

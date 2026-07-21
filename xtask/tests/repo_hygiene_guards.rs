@@ -173,7 +173,7 @@ fn scan_crate_roots_is_red_when_the_attribute_is_missing() {
         "#![forbid(unsafe_code)]\npub fn f() {}\n",
     );
 
-    let violations = scan_crate_roots(&dir);
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(violations.len(), 1, "{violations:?}");
@@ -197,7 +197,7 @@ fn scan_crate_roots_is_red_on_an_uncovered_bin_root() {
     )
     .expect("write bin main");
 
-    let violations = scan_crate_roots(&dir);
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
@@ -229,7 +229,7 @@ fn scan_crate_roots_covers_build_scripts_benches_and_examples() {
     )
     .expect("write example main");
 
-    let mut violations = scan_crate_roots(&dir);
+    let mut violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
     violations.sort();
 
@@ -268,7 +268,7 @@ fn scan_crate_roots_rejects_a_commented_out_attribute() {
         "//! docs mention /* oddities */ freely\n#![forbid(unsafe_code)]\npub fn f() {}\n",
     );
 
-    let violations = scan_crate_roots(&dir);
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
@@ -295,14 +295,16 @@ fn scan_crate_roots_honors_the_deny_allowlist() {
         "#![deny(unsafe_code)]\npub fn f() {}\n",
     );
     assert!(
-        scan_crate_roots(&dir).is_empty(),
+        scan_crate_roots(&dir)
+            .expect("fixture tree is scannable")
+            .is_empty(),
         "deny satisfies the exception"
     );
     std::fs::remove_dir_all(&dir).ok();
 
     let dir = fixture_dir("allowlist-decayed");
     plant_crate(&dir, "metadata-fdb", "pub fn f() {}\n");
-    let violations = scan_crate_roots(&dir);
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert!(
@@ -325,7 +327,7 @@ fn scan_crate_roots_honors_the_deny_allowlist() {
         "#![deny(unsafe_code)]\nfn main() {}\n",
     )
     .expect("write bin");
-    let violations = scan_crate_roots(&dir);
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert!(
@@ -338,11 +340,31 @@ fn scan_crate_roots_honors_the_deny_allowlist() {
 fn scan_crate_roots_is_green_over_the_real_workspace_crates() {
     // The invariant itself: every crate root complies today (this PR added the
     // attribute to gateway-core and gateway-s3, closing the observed drift).
-    let violations = scan_crate_roots(&workspace_root().join("crates"));
+    let violations = scan_crate_roots(&workspace_root().join("crates"))
+        .expect("the real crates tree is scannable");
     assert!(
         violations.is_empty(),
         "non-compliant crate roots: {violations:?}"
     );
+}
+
+#[test]
+fn scan_crate_roots_fails_closed_when_it_cannot_see_the_tree() {
+    // A missing crates dir (e.g. after a workspace move) and a dir with no
+    // crate roots must both be Err — a guard that cannot see the tree says
+    // so; it never passes vacuously (the repo's own "resting red on
+    // non-existence" rule, applied to the guard itself).
+    let missing = fixture_dir("missing-tree");
+    assert!(
+        scan_crate_roots(&missing).is_err(),
+        "missing dir must be Err"
+    );
+
+    let empty = fixture_dir("empty-tree");
+    std::fs::create_dir_all(&empty).expect("create empty fixture dir");
+    let out = scan_crate_roots(&empty);
+    std::fs::remove_dir_all(&empty).ok();
+    assert!(out.is_err(), "zero discovered roots must be Err: {out:?}");
 }
 
 #[test]
