@@ -48,7 +48,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_coordination_mem::MemCoordination;
-use wyrd_gateway_s3::sigv4::{format_amz_date, sign, Credentials};
+use wyrd_gateway_s3::sigv4::{format_amz_date, sign, sign_with_payload_hash, Credentials};
 use wyrd_gateway_s3::{S3Config, S3Gateway};
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_server::Gateway;
@@ -254,6 +254,97 @@ async fn assert_rejected_and_keeps_victim(body: &[u8]) {
         "expected S3 MalformedXML code, got body: {resp}",
     );
     // The load-bearing assertion: the rejected request removed nothing.
+    assert_present(&client, "victim").await;
+}
+
+/// A `<VersionId>` inside an `<Object>` must be REFUSED, never silently dropped. Ignoring it turns
+/// "delete this OLD version" into "delete the CURRENT object" — irrecoverably destroying the live
+/// object the client asked to keep. `versionId` is already on the object route's unsupported
+/// denylist, so honouring the XML spelling while refusing the query spelling was self-inconsistent
+/// too (PR #612 review).
+#[tokio::test]
+async fn delete_objects_version_scoped_entry_is_refused_and_deletes_nothing() {
+    let (addr, _dir) = start_gateway().await;
+    let client = sdk_client(addr);
+    put_object(&client, "victim").await;
+
+    let body = b"<Delete><Object><Key>victim</Key><VersionId>abc123</VersionId></Object></Delete>";
+    let (status, head, resp) = post_delete_raw(addr, "delete", body).await;
+    let resp = String::from_utf8_lossy(&resp);
+    assert_eq!(
+        status, 501,
+        "a version-scoped DeleteObjects entry must be refused as unsupported: {head}",
+    );
+    assert!(
+        resp.contains("NotImplemented"),
+        "expected S3 NotImplemented code, got body: {resp}",
+    );
+    // The load-bearing assertion: the LIVE object — which the client did not ask to delete — is
+    // still there. A silently-ignored <VersionId> would have removed it.
+    assert_present(&client, "victim").await;
+
+    // A MIXED batch is refused WHOLE: the unversioned sibling is not deleted either, so the
+    // destructive half never partially applies.
+    put_object(&client, "sibling").await;
+    let mixed = b"<Delete><Object><Key>sibling</Key></Object>\
+                  <Object><Key>victim</Key><VersionId>v1</VersionId></Object></Delete>";
+    let (status, head, _resp) = post_delete_raw(addr, "delete", mixed).await;
+    assert_eq!(
+        status, 501,
+        "a batch mixing versioned and unversioned entries is refused whole: {head}",
+    );
+    assert_present(&client, "sibling").await;
+    assert_present(&client, "victim").await;
+}
+
+/// A bulk delete carried on an UNVERIFIED body must be refused before any key is touched. Under
+/// `UNSIGNED-PAYLOAD` the body sits deliberately outside the signature and this gateway validates
+/// no `Content-MD5`/`x-amz-checksum-*`, so nothing proves the key list arrived as sent — corruption
+/// or tampering in flight could substitute keys and destroy the wrong objects (PR #612 review).
+/// The signature itself is VALID here: the caller is authenticated, only the body is unprotected.
+#[tokio::test]
+async fn delete_objects_unsigned_payload_is_refused_and_deletes_nothing() {
+    let (addr, _dir) = start_gateway().await;
+    let client = sdk_client(addr);
+    put_object(&client, "victim").await;
+
+    let body = b"<Delete><Object><Key>victim</Key></Object></Delete>";
+    let host = addr.to_string();
+    let uri = format!("/{BUCKET}");
+    let amz_date = format_amz_date(SystemTime::now());
+    let creds = Credentials {
+        access_key_id: ACCESS_KEY.to_string(),
+        secret_access_key: SECRET_KEY.to_string(),
+    };
+    let signed = sign_with_payload_hash(
+        "POST",
+        &uri,
+        "delete",
+        &host,
+        &amz_date,
+        "UNSIGNED-PAYLOAD",
+        &creds,
+        REGION,
+        "s3",
+    );
+    let headers = vec![
+        ("authorization".to_string(), signed.authorization),
+        ("x-amz-date".to_string(), signed.amz_date),
+        ("x-amz-content-sha256".to_string(), signed.content_sha256),
+    ];
+    let target = format!("{uri}?delete");
+    let (status, head, resp) = send(addr, "POST", &target, &headers, body).await;
+    let resp = String::from_utf8_lossy(&resp);
+    assert_eq!(
+        status, 400,
+        "an UNSIGNED-PAYLOAD bulk delete must be refused, not executed on an unverified body: \
+         {head}",
+    );
+    assert!(
+        resp.contains("InvalidRequest"),
+        "expected S3 InvalidRequest code, got body: {resp}",
+    );
+    // The load-bearing assertion: nothing was deleted on the unverified body.
     assert_present(&client, "victim").await;
 }
 

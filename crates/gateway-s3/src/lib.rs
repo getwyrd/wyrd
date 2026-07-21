@@ -1737,6 +1737,27 @@ struct DeleteRequest {
     quiet: bool,
 }
 
+/// Why a `<Delete>` body was refused — and therefore which S3 error the request answers. **Both
+/// variants are returned BEFORE any `delete_object` call**, so a refused request authorises no
+/// deletion whatsoever; the distinction is only about telling the client the truth.
+enum DeleteRequestError {
+    /// Not a well-formed / semantically valid `<Delete>` document ⇒ `400 MalformedXML`.
+    Malformed,
+    /// An `<Object>` carried a `<VersionId>` ⇒ `501 NotImplemented`. The document is perfectly
+    /// well-formed, so reporting it as malformed would misdirect the client; what is missing is
+    /// the FEATURE (version-aware deletion), exactly as `?versionId` is missing on the object
+    /// route.
+    VersionedDelete,
+}
+
+/// `char_data`'s fail-closed `Err(())` is a MALFORMED body — this lets the extraction contract
+/// keep its minimal error type while `?` lifts it into [`DeleteRequestError`] inside the parser.
+impl From<()> for DeleteRequestError {
+    fn from((): ()) -> Self {
+        Self::Malformed
+    }
+}
+
 /// The `400 MalformedXML` a DeleteObjects request answers when its body is not a well-formed
 /// `<Delete>` document (or violates a semantic bound / the fail-closed key-extraction contract).
 /// **The load-bearing safety invariant:** this is returned BEFORE any `delete_object` call, so a
@@ -1779,20 +1800,41 @@ where
         Err(_) => return malformed_xml(request_id),
     };
 
-    // Verify the signed payload digest EXACTLY as the PUT `Signed` path does (:1579): the
-    // buffered body is checked against the signed `x-amz-content-sha256` before any key is
-    // touched (mismatch text mirrors :2116). An `UNSIGNED-PAYLOAD` body carries no digest to
-    // check; an aws-chunked streaming framing is not a shape a DeleteObjects client sends, and
-    // its raw frames are not a well-formed `<Delete>` document, so the parse below rejects them
-    // fail-closed.
-    if let sigv4::PayloadHash::Signed(expected) = &payload {
-        let actual = crypto::hex(&crypto::sha256(&bytes));
-        if !crypto::constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+    // **Body integrity is a PRECONDITION of the destructive fan-out**, not an optional extra: the
+    // keys about to be deleted must be provably the keys the client sent. The match is EXHAUSTIVE
+    // so a payload mode can never be added that silently skips the check (PR #612 review).
+    match &payload {
+        // Verify the signed digest EXACTLY as the PUT `Signed` path does: the buffered body is
+        // checked against the signed `x-amz-content-sha256` before any key is touched.
+        sigv4::PayloadHash::Signed(expected) => {
+            let actual = crypto::hex(&crypto::sha256(&bytes));
+            if !crypto::constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+                return error_response(
+                    request_id,
+                    StatusCode::BAD_REQUEST,
+                    "XAmzContentSHA256Mismatch",
+                    "the delivered body does not match the signed x-amz-content-sha256",
+                );
+            }
+        }
+        // `UNSIGNED-PAYLOAD` puts the body deliberately OUTSIDE the signature, and this gateway
+        // validates no `Content-MD5`/`x-amz-checksum-*` — so nothing whatsoever proves the key
+        // list arrived as sent. On a read that is a caller's own risk; on a bulk DELETE it means
+        // corruption or tampering between signing and receipt can substitute keys and destroy the
+        // wrong objects, irrecoverably. Real S3 will not accept a multi-object delete without an
+        // integrity header either. Refuse before parsing — never delete on an unverified body.
+        //
+        // `aws-chunked` streaming is refused by the same rule (previously it was only refused
+        // *implicitly*, because raw chunk framing is not a well-formed `<Delete>` document —
+        // a fail-closed accident rather than a stated precondition).
+        sigv4::PayloadHash::Unsigned | sigv4::PayloadHash::Streaming(_) => {
             return error_response(
                 request_id,
                 StatusCode::BAD_REQUEST,
-                "XAmzContentSHA256Mismatch",
-                "the delivered body does not match the signed x-amz-content-sha256",
+                "InvalidRequest",
+                "DeleteObjects requires an integrity-protected body: send the payload digest in \
+                 a signed x-amz-content-sha256 (UNSIGNED-PAYLOAD and aws-chunked streaming are \
+                 refused for bulk delete, which deletes nothing unverified)",
             );
         }
     }
@@ -1804,10 +1846,23 @@ where
     };
 
     // Parse + walk the validated tree. ANY parse error, semantic-bound violation, or fail-closed
-    // key-extraction violation ⇒ `MalformedXML`, no key touched.
+    // key-extraction violation ⇒ `MalformedXML`, no key touched; a version-scoped entry ⇒ `501`,
+    // also with no key touched.
     let request = match parse_delete_request(text) {
         Ok(request) => request,
-        Err(()) => return malformed_xml(request_id),
+        Err(DeleteRequestError::Malformed) => return malformed_xml(request_id),
+        // Refuse the WHOLE request rather than mishandle part of it — the same rule the object
+        // route applies to `?versionId` (:1582). Deleting only the unversioned entries would be a
+        // partial success on a destructive op whose refused half is exactly the dangerous one.
+        Err(DeleteRequestError::VersionedDelete) => {
+            return error_response(
+                request_id,
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "version-scoped delete is not supported: an <Object> carrying a <VersionId> is \
+                 refused, and no key in this request was deleted",
+            );
+        }
     };
 
     // Fan out over the existing idempotent single-object delete seam (the object DELETE arm,
@@ -1859,12 +1914,17 @@ where
 /// Elements are matched by LOCAL name, namespace-insensitively (`node.tag_name().name()`), so an
 /// unqualified `<Delete>`, the S3-default-namespace form, and a prefixed `<s3:Delete>` are all
 /// accepted (real S3's leniency / the stock SDK body). Unknown sibling elements are ignored ONLY
-/// as children of `<Delete>` / `<Object>` — `<VersionId>` is parsed-and-ignored (out of scope).
-fn parse_delete_request(text: &str) -> Result<DeleteRequest, ()> {
-    let doc = roxmltree::Document::parse(text).map_err(|_| ())?;
+/// as children of `<Delete>` / `<Object>`.
+///
+/// `<VersionId>` is the ONE exception to that leniency: it is refused
+/// ([`DeleteRequestError::VersionedDelete`]), never ignored. Every other unknown element is inert
+/// decoration, but a `<VersionId>` changes WHICH object the key names — dropping it would silently
+/// convert "delete this old version" into "delete the current object" (PR #612 review).
+fn parse_delete_request(text: &str) -> Result<DeleteRequest, DeleteRequestError> {
+    let doc = roxmltree::Document::parse(text).map_err(|_| DeleteRequestError::Malformed)?;
     let root = doc.root_element();
     if root.tag_name().name() != "Delete" {
-        return Err(());
+        return Err(DeleteRequestError::Malformed);
     }
     let mut keys: Vec<String> = Vec::new();
     let mut quiet = false;
@@ -1872,36 +1932,49 @@ fn parse_delete_request(text: &str) -> Result<DeleteRequest, ()> {
     for child in root.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
             "Object" => {
+                // **A `<VersionId>` must never be silently dropped.** Ignoring it turns "delete
+                // this OLD version" into "delete the CURRENT object" — destroying the live object
+                // the client meant to keep, irrecoverably. Version-aware deletion does not exist
+                // here, and `versionId` is already on the object route's unsupported-subresource
+                // denylist (:338), so honouring the XML spelling while refusing the query spelling
+                // was also self-inconsistent (PR #612 review).
+                if child
+                    .children()
+                    .any(|n| n.is_element() && n.tag_name().name() == "VersionId")
+                {
+                    return Err(DeleteRequestError::VersionedDelete);
+                }
                 let mut key_elems = child
                     .children()
                     .filter(|n| n.is_element() && n.tag_name().name() == "Key");
-                let key_elem = key_elems.next().ok_or(())?; // zero <Key> ⇒ malformed
+                let key_elem = key_elems.next().ok_or(DeleteRequestError::Malformed)?; // zero <Key>
                 if key_elems.next().is_some() {
-                    return Err(()); // >1 <Key> in one <Object> ⇒ malformed
+                    return Err(DeleteRequestError::Malformed); // >1 <Key> in one <Object>
                 }
                 let key = char_data(&key_elem)?;
                 // An empty `<Key></Key>` is rejected — never a delete of `bucket/`.
                 if key.is_empty() {
-                    return Err(());
+                    return Err(DeleteRequestError::Malformed);
                 }
                 keys.push(key);
             }
             "Quiet" => {
                 if quiet_seen {
-                    return Err(()); // >1 <Quiet> ⇒ malformed
+                    return Err(DeleteRequestError::Malformed); // >1 <Quiet> ⇒ malformed
                 }
                 quiet_seen = true;
                 // `<Quiet>` content is subject to the same fail-closed extraction as `<Key>`;
                 // S3 spells the flag as the literal `true`.
                 quiet = char_data(&child)? == "true";
             }
-            // Unknown sibling elements (incl. `<VersionId>`) are ignored — S3 is lenient about
-            // extras in a well-formed `<Delete>`.
+            // Other unknown sibling elements are ignored — S3 is lenient about extras in a
+            // well-formed `<Delete>`. `<VersionId>` is NOT among them: it changes WHICH object a
+            // key names, so it is refused above rather than dropped.
             _ => {}
         }
     }
     if keys.is_empty() || keys.len() > 1000 {
-        return Err(());
+        return Err(DeleteRequestError::Malformed);
     }
     Ok(DeleteRequest { keys, quiet })
 }
