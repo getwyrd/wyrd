@@ -1363,6 +1363,100 @@ fn run_orchestrator_guard() -> Result<(), String> {
     }
 }
 
+/// #616: no stray gitlinks in the index. Four PRs (#594, #595, #597, #600)
+/// accidentally committed `.claude/worktrees/*` gitlink entries (mode 160000,
+/// no `.gitmodules` declaration), which break fresh clones and had to be
+/// caught by review each time — the "found twice becomes a gate" rule. Runs
+/// the SAME scan `xtask/tests/repo_hygiene_guards.rs` drives over planted
+/// index listings (`xtask::repo_guard::scan_gitlinks`) — one guard, two call
+/// sites.
+fn run_gitlink_guard() -> Result<(), String> {
+    print_step(&["xtask", "gitlink-guard", "(#616 no stray gitlinks)"]);
+    let root = workspace_root();
+    // `-z`: NUL-delimited raw paths — the newline form C-quotes non-ASCII
+    // paths under the default `core.quotePath`, which would let a quoted
+    // `.claude/worktrees/…` entry dodge the prefix check.
+    let output = Command::new("git")
+        .args(["ls-files", "-s", "-z"])
+        .current_dir(&root)
+        .output()
+        .map_err(|e| format!("gitlink-guard: failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gitlink-guard: `git ls-files -s -z` failed with {}:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let ls_files = String::from_utf8_lossy(&output.stdout);
+    // Declared submodule paths via `git config -z` so git itself decodes any
+    // quoted/escaped values — no ad-hoc .gitmodules parsing here.
+    let declared = if root.join(".gitmodules").is_file() {
+        let cfg = Command::new("git")
+            .args([
+                "config",
+                "-z",
+                "-f",
+                ".gitmodules",
+                "--get-regexp",
+                r"^submodule\..*\.path$",
+            ])
+            .current_dir(&root)
+            .output()
+            .map_err(|e| format!("gitlink-guard: failed to spawn git config: {e}"))?;
+        // Exit 1 with empty output = no matches (a .gitmodules with no path
+        // entries); anything else non-zero — e.g. a malformed .gitmodules —
+        // is a real failure the guard must surface, not an empty declared list.
+        let no_matches = cfg.status.code() == Some(1) && cfg.stdout.is_empty();
+        if !cfg.status.success() && !no_matches {
+            return Err(format!(
+                "gitlink-guard: `git config -f .gitmodules` failed with {}:\n{}",
+                cfg.status,
+                String::from_utf8_lossy(&cfg.stderr)
+            ));
+        }
+        xtask::repo_guard::gitmodules_config_paths(&String::from_utf8_lossy(&cfg.stdout))
+    } else {
+        Vec::new()
+    };
+    let violations = xtask::repo_guard::scan_gitlinks(&ls_files, &declared);
+    if violations.is_empty() {
+        println!("xtask gitlink-guard: no stray gitlinks or tracked agent worktrees (#616)");
+        Ok(())
+    } else {
+        Err(format!(
+            "stray tracked entries (#616) — remove them from the index (`git rm --cached \
+             <path>`); real submodules need a .gitmodules declaration:\n  {}",
+            violations.join("\n  ")
+        ))
+    }
+}
+
+/// #616: every crate root under `crates/` carries `#![forbid(unsafe_code)]`
+/// (`metadata-fdb` holds the sole FFI-motivated `deny` exception — see
+/// `xtask::repo_guard::UNSAFE_FORBID_ALLOWLIST`). The convention held by
+/// habit until the two newest crates shipped without the attribute; this
+/// makes it load-bearing. Same scan the fixture test drives.
+fn run_unsafe_forbid_guard() -> Result<(), String> {
+    print_step(&[
+        "xtask",
+        "unsafe-guard",
+        "(#616 forbid(unsafe_code) in crate roots)",
+    ]);
+    let violations = xtask::repo_guard::scan_crate_roots(&workspace_root().join("crates"));
+    if violations.is_empty() {
+        println!("xtask unsafe-guard: every crate root forbids unsafe code (#616)");
+        Ok(())
+    } else {
+        Err(format!(
+            "crate roots missing the unsafe-code attribute (#616) — add \
+             `#![forbid(unsafe_code)]` after the crate-level docs (or record an audited \
+             exception in UNSAFE_FORBID_ALLOWLIST with a stated reason):\n  {}",
+            violations.join("\n  ")
+        ))
+    }
+}
+
 /// The ordered `cargo` steps of the CI gate, executed via the injected `exec`
 /// (`run_ci` passes `cargo`; the unit test passes a recording closure so the real
 /// wiring is exercised without spawning `cargo`).
@@ -1431,6 +1525,11 @@ fn run_ci() -> Result<(), String> {
     // failing on. Fail fast before the expensive clippy/build/test.
     typos_check()?;
     docs_check()?;
+    // The repo-hygiene guards next (#616): also sub-second, and their failure
+    // modes (a committed worktree gitlink, a crate root missing the unsafe-code
+    // attribute) should surface before a multi-minute build, not after.
+    run_gitlink_guard()?;
+    run_unsafe_forbid_guard()?;
     run_ci_steps(&mut |name| std::env::var_os(name).is_some(), &mut |args| {
         cargo(args)
     })?;

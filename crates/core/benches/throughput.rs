@@ -17,6 +17,8 @@
 //! CI tracks the numbers (regression visibility), it does not gate on them —
 //! wall-clock is noisy (mirrors the M1.7 EC bench, issue #99).
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};

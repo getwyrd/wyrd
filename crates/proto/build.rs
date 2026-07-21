@@ -13,6 +13,8 @@
 //! Cargo exports `CARGO_CFG_MADSIM` to this build script exactly when the crate
 //! is being compiled under `--cfg madsim`, which is how the branch is chosen.
 
+#![forbid(unsafe_code)]
+
 use std::error::Error;
 use std::path::PathBuf;
 
