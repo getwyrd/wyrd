@@ -705,6 +705,11 @@ where
 /// Current wall-clock time in milliseconds since the Unix epoch. The access
 /// layer may read the real clock; the DST-tested core takes time as a parameter.
 fn now_millis() -> u64 {
+    // wall-clock exempt: the access layer's single wall-clock source — lease
+    // stamps and ADR-0047 publication timestamps all read THIS fn, so one
+    // lifecycle never mixes clocks; madsim virtualises the read under DST
+    // (#619).
+    #[allow(clippy::disallowed_methods)]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

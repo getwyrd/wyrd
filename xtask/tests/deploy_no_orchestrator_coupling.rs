@@ -69,13 +69,12 @@ fn scan_dir_is_red_when_an_orchestrator_import_is_planted() {
     // production scan (`xtask::deploy_guard::scan_dir` — the function `cargo xtask
     // ci` runs over `crates/`) catches it: the "demonstrated red" the brief
     // requires, not a guard resting red on non-existence.
+    // pid + per-process counter for uniqueness — no wall-clock read (#619).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "wyrd-deploy-guard-fixture-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(dir.join("src")).expect("create fixture dir");
     std::fs::write(

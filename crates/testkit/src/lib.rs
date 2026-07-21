@@ -32,6 +32,9 @@ pub struct SystemClock;
 
 impl Clock for SystemClock {
     fn now_millis(&self) -> u64 {
+        // wall-clock exempt: this IS the Clock seam's wall-clock arm — the one
+        // place a bare read is the point (#619).
+        #[allow(clippy::disallowed_methods)]
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)

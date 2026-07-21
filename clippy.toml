@@ -1,0 +1,18 @@
+# Wall-clock discipline (#619; AGENTS.md § Review rubric — "one clock per
+# correctness lifecycle"). A bare `SystemTime::now()` stamped one clock into a
+# lifecycle whose expiry check read another (#557/#559, #565: GC reclaiming
+# in-flight bytes; commits publishing over reclaimable bytes). Disallowing the
+# method makes every wall-clock read a deliberate, reviewed decision: each call
+# site carries `#[allow(clippy::disallowed_methods)]` plus a comment naming the
+# clock source that owns its lifecycle. Conforming patterns stay conforming —
+# the ADR-0047 publication timestamp reads `SystemTime::now()` at the commit
+# call site precisely because madsim virtualises it (DST-deterministic); the
+# annotation records that, it does not forbid it.
+#
+# Activated at DENY by `clippy.all = "deny"` in the workspace lints (root
+# Cargo.toml) — this file adds no lint level of its own (ADR-0016: one source).
+# `Instant::now` / `tokio::time` are deliberately not listed: the observed
+# defect class is exclusively SystemTime (extend only on ledger evidence).
+disallowed-methods = [
+  { path = "std::time::SystemTime::now", reason = "name the clock that owns this lifecycle: testkit Clock seam for test-controlled time; a per-site allow + reason for wall-clock reads (ADR-0047 publication stamps, lease stamping) — AGENTS.md § Review rubric" },
+]

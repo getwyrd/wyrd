@@ -46,6 +46,11 @@
 //! [`get`]: ObservableS3Client::get
 //! [`delete`]: ObservableS3Client::delete
 
+// wall-clock exempt (module-wide): the observer records REAL wall-clock op
+// windows (start/end stamps the Elle checker orders by) and SigV4 dates against
+// a live cluster — a real-environment runner, outside DST authority (#619).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::time::SystemTime;
 

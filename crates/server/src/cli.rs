@@ -1449,6 +1449,9 @@ impl DServerConnector for GrpcDServerConnector {
 /// stamps its time-to-repair samples with. Monotonic enough for telemetry; a clock skew
 /// never corrupts state (the loop is fenced by leadership, not time).
 fn wall_clock_millis() -> u64 {
+    // wall-clock exempt: telemetry stamps; the loop is fenced by leadership,
+    // not time (#619).
+    #[allow(clippy::disallowed_methods)]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

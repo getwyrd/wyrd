@@ -53,6 +53,11 @@
 //! state, so these callsites must not be raced by a no-subscriber sibling (the
 //! `custodian_day_one.rs` discipline).
 
+// wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
+// live in-process server use real wall time; nothing here mixes clock sources
+// within one asserted lifecycle (#619).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};

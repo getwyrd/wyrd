@@ -536,18 +536,20 @@ fn the_live_client_library_adapter_reads_the_real_env_and_filesystem() {
     // call). The configured directory is searched FIRST and short-circuits, and we control
     // whether the file under it exists, so neither assertion depends on whether the host has
     // a system `libfdb_c` (this host does; the plain verify worktree does not).
+    // pid + per-process counter for uniqueness — no wall-clock read (#619).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let unique = format!(
         "wyrd-fdb-doctor-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is after the epoch")
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let present_dir = std::env::temp_dir().join(format!("{unique}-present"));
     let absent_dir = std::env::temp_dir().join(format!("{unique}-absent"));
     std::fs::create_dir_all(&present_dir).expect("create the present tempdir");
     std::fs::create_dir_all(&absent_dir).expect("create the absent tempdir");
+    // The absent dir must be soname-free even if a crashed prior run's dir of
+    // the same name (PID reuse) is being reused.
+    let _ = std::fs::remove_file(absent_dir.join(fdb_doctor::CLIENT_LIBRARY_SONAME));
     let planted = present_dir.join(fdb_doctor::CLIENT_LIBRARY_SONAME);
     std::fs::write(&planted, b"not a real shared object").expect("plant a fake libfdb_c.so");
     let planted_str = planted.to_string_lossy().into_owned();

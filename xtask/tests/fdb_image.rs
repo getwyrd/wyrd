@@ -339,13 +339,12 @@ fn consistency_check_is_red_on_a_mismatched_fdb_version() {
     // tag and crate line, and prove the SAME `check_fdb_version_consistency` the green
     // test drives rejects it — a demonstrated red, not a check resting on file
     // non-existence (the `deploy_no_orchestrator_coupling.rs:67` planted-red pattern).
+    // pid + per-process counter for uniqueness — no wall-clock read (#619).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "wyrd-fdb-image-fixture-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("create fixture dir");
     let bad_dockerfile = "FROM rust:1.96.0-bookworm AS build\n\

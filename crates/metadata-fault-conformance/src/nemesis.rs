@@ -40,6 +40,11 @@
 //! are opt-in (`WYRD_TIER1=1`) and off-Check; the pure decision logic they turn on is unit-tested
 //! at Check.
 
+// wall-clock exempt (module-wide): the nemesis drives REAL cluster faults on
+// real hosts — outside DST authority by design (ADR-0009); its schedules and
+// probes are wall-clock-native (#619).
+#![allow(clippy::disallowed_methods)]
+
 use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::process::Command;
