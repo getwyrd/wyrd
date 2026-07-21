@@ -428,6 +428,43 @@ async fn send(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> u16 {
     status_of(&raw)
 }
 
+/// Sign and send a bulk `DeleteObjects` — `POST /{bucket}?delete`. It needs its own sender because
+/// [`signed_headers`] signs with an EMPTY query, while this route is selected BY its `?delete`
+/// marker: the query has to be signed separately from the path or the gateway's canonical form
+/// will not match and the request is refused 403 before the handler is ever reached.
+async fn send_bulk_delete(addr: SocketAddr, body: &[u8]) -> u16 {
+    let host = addr.to_string();
+    let creds = Credentials {
+        access_key_id: ACCESS_KEY.to_string(),
+        secret_access_key: SECRET_KEY.to_string(),
+    };
+    let amz_date = format_amz_date(SystemTime::now());
+    let signed = sign(
+        "POST", "/bucket", "delete", &host, &amz_date, body, &creds, REGION, "s3",
+    );
+    let mut request = String::from("POST /bucket?delete HTTP/1.1\r\n");
+    request.push_str(&format!("host: {host}\r\n"));
+    request.push_str(&format!("authorization: {}\r\n", signed.authorization));
+    request.push_str(&format!("x-amz-date: {}\r\n", signed.amz_date));
+    request.push_str(&format!(
+        "x-amz-content-sha256: {}\r\n",
+        signed.content_sha256
+    ));
+    request.push_str(&format!("content-length: {}\r\n", body.len()));
+    request.push_str("connection: close\r\n\r\n");
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write head");
+    stream.write_all(body).await.expect("write body");
+    stream.flush().await.expect("flush");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    status_of(&raw)
+}
+
 /// Read from `conn` until the response head **and** `want` body bytes have arrived, and hand
 /// back the status plus those body bytes.
 ///
@@ -515,6 +552,51 @@ async fn the_request_plane_records_per_op_latency_for_a_put_and_a_get() {
         0.0,
         "no DELETE was sent, so op=\"delete\" measures nothing — the op label is a real key, \
          not decoration; got:\n{exposed}"
+    );
+}
+
+/// A bulk `DeleteObjects` whose per-key deletes fail in the backend must STILL be counted as a
+/// failed request. S3 requires the batch to answer `200` carrying per-key `<Error>` rows, so
+/// neither the status line nor the stream outcome can reveal the fault: pre-fix `errored` was
+/// derived from those two alone, `s3_request_errors` stayed flat, and a partially failed
+/// *destructive* batch was indistinguishable from a clean one on the error dashboard
+/// (PR #612 review).
+///
+/// This also pins the op label: a bulk delete is a POST on the wire, so counting it required
+/// classifying the route as `delete` rather than reading the method alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_request_plane_counts_a_partially_failed_bulk_delete() {
+    enable_metric_callsites();
+    let telemetry = prometheus_telemetry();
+    let addr = start_s3(Arc::new(FaultyGateway), &telemetry).await;
+
+    // A signed, well-formed bulk delete whose BACKEND fails every key transiently.
+    let body = b"<Delete><Object><Key>doomed</Key></Object></Delete>";
+    assert_eq!(
+        send_bulk_delete(addr, body).await,
+        200,
+        "S3 requires a bulk delete to answer 200 with per-key <Error> rows even when the \
+         backend failed the keys — the protocol status is not the signal here"
+    );
+
+    let exposed = gather_until(&telemetry, |exposed| {
+        counter(
+            exposed,
+            "s3_request_errors",
+            &[("op", "delete"), ("class", "transient")],
+        ) >= 1.0
+    })
+    .await;
+
+    assert!(
+        counter(
+            &exposed,
+            "s3_request_errors",
+            &[("op", "delete"), ("class", "transient")]
+        ) >= 1.0,
+        "a 200 batch whose backend deletes all failed must still count on the error plane — \
+         under op=\"delete\" (not \"other\": it is a POST on the wire) and under the seam's own \
+         typed class; got:\n{exposed}"
     );
 }
 

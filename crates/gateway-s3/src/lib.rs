@@ -235,12 +235,21 @@ where
 const OPS: [&str; 5] = ["put", "get", "delete", "head", "other"];
 
 /// The op label for `method` — the request plane's stable, low-cardinality key.
-fn op_label(method: &Method) -> &'static str {
+fn op_label(method: &Method, path: &str, query: &str) -> &'static str {
     match *method {
         Method::PUT => "put",
         Method::GET => "get",
         Method::DELETE => "delete",
         Method::HEAD => "head",
+        // **Bulk `DeleteObjects` is a POST on the wire but a DELETE as an OPERATION.** Labelling
+        // by method alone filed every bulk delete under `other` — pooled with unsupported methods
+        // — so the `delete` RED series was blind to the one path that removes up to 1000 objects
+        // per request, and its latency and failures never reached a delete dashboard or alert
+        // (PR #612 review). The predicate mirrors the route's own interception exactly (see
+        // `dispatch`), so this label can never name a request the bulk handler did not take.
+        Method::POST if bucket_scoped_path(path).is_some() && is_delete_subresource(query) => {
+            "delete"
+        }
         _ => "other",
     }
 }
@@ -392,6 +401,59 @@ fn unsupported_subresource(query: &str) -> Option<&str> {
         .find(|k| UNSUPPORTED_SUBRESOURCES.contains(k))
 }
 
+/// True if `query` names the **`delete`** subresource (`?delete`, `?delete=`, `?delete&x=1`) —
+/// the marker of a bulk **DeleteObjects** POST (issue #509). A **bare-key** match, mirroring
+/// [`unsupported_subresource`]'s split (:387-393): `?delete` has no `=`, so [`query_param`]
+/// (:453), which requires `k=v`, would return `None` and miss it. Used on the bucket route to
+/// intercept `POST /bucket?delete` BEFORE the subresource denylist (which lists `"delete"`, :344)
+/// would refuse it — while `"delete"` stays on the OBJECT-path denylist so `DELETE /b/k?delete`
+/// remains `501`.
+fn is_delete_subresource(query: &str) -> bool {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
+        .any(|k| k == "delete")
+}
+
+/// The buffered-byte cap for a bulk **DeleteObjects** request body (issue #509). The body is
+/// small (≤1000 keys) and SigV4-signed, so — unlike a streamed object PUT — it is buffered whole;
+/// the cap is enforced BY CONSTRUCTION as the body is read (never by trusting `Content-Length`),
+/// and an over-cap body is refused as `MalformedXML`.
+///
+/// The bound must sit in `[~6.2 MB, 9 MiB)`. FLOOR: a legal maximum request MUST fit **as it is
+/// serialized on the wire — after XML escaping**. A 1024-byte key is legal, and one key character
+/// can occupy up to 6 body bytes once escaped (`&quot;`/`&apos;`, or a `&#xNN;` character
+/// reference), so the worst case is 1000 × 1024 × 6 ≈ 6.14 MB of key text plus the
+/// `<Object><Key></Key></Object>` envelope (≈28 KB) ≈ 6.2 MB. Sizing this floor on the RAW key
+/// bytes (~1.06 MB, the previous 2 MiB cap) fail-closed-rejected a request that satisfies both
+/// documented limits — 1000 keys, each ≤1024 bytes — merely because its keys contained `&`
+/// (PR #612 review). CEILING: the retained oversized-body test sends a 9 MiB body, so the cap MUST
+/// be < 9 MiB to refuse it. 8 MiB sits in `[6.2 MB, 9 MiB)`.
+///
+/// A character reference may be padded with leading zeros (`&#x00000041;`) without bound, so no
+/// finite cap accommodates EVERY escaping of a legal key; such a body is still refused. The floor
+/// is sized for worst-case *standard* escaping, not adversarial padding.
+const MAX_DELETE_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many per-key deletes a bulk **DeleteObjects** has in flight at once (issue #509).
+///
+/// The fan-out is what makes the bulk verb worth having: `delete_object` is a metadata operation
+/// that can be a network round trip, so awaiting each key before starting the next made a 1000-key
+/// batch cost the SUM of 1000 latencies — slower than the client just issuing 1000 parallel
+/// single-object DELETE requests, which inverts the whole point of the batch (PR #612 review).
+///
+/// It stays BOUNDED so one request cannot open an unbounded number of concurrent metadata
+/// operations against the backend, and the fan-out uses `buffered` — NOT `buffer_unordered` — so
+/// results come back in request order and each `<Deleted>`/`<Error>` row still lines up with the
+/// key that produced it. The response stays byte-for-byte deterministic.
+const DELETE_FANOUT: usize = 16;
+const _: () = assert!(
+    MAX_DELETE_BODY_BYTES > 6_200_000 && MAX_DELETE_BODY_BYTES < 9 * 1024 * 1024,
+    "MAX_DELETE_BODY_BYTES must exceed a legal 1000-key request AFTER XML escaping (~6.2 MB) and \
+     stay under the 9 MiB oversized-body test's body",
+);
+
 /// Like [`unsupported_subresource`] but matches against **percent-decoded** query keys, so a
 /// bucket subresource cannot slip past the listing route by percent-encoding its name
 /// (`GET /bucket?%61cl`, `GET /bucket?upload%73`). The bucket route routes anything not on the
@@ -405,6 +467,28 @@ fn unsupported_subresource_decoded(query: &str) -> Option<String> {
         .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
         .map(percent_decode_utf8)
         .find(|k| UNSUPPORTED_SUBRESOURCES.contains(&k.as_str()))
+}
+
+/// The denylisted subresource a bulk-delete query carries BESIDES its own `delete` marker, if any
+/// — percent-decoded, exactly like [`unsupported_subresource_decoded`].
+///
+/// The bulk-delete route is intercepted BEFORE the denylist, so that `?delete` — which is itself on
+/// the denylist — is not refused by it. That early return also skipped the denylist for every
+/// OTHER key in the same query, making the one destructive route a hole in the fence every other
+/// bucket verb passes through: `POST /bucket?delete&versionId=v` ran an ordinary UNVERSIONED bulk
+/// delete while the client had explicitly asked for version semantics, destroying the current
+/// object. That is the exact data-loss shape a `<VersionId>` in the BODY is refused for, reached by
+/// the query spelling instead (PR #612 review).
+///
+/// Only the `delete` marker is exempt; every other denylisted key still refuses. Benign query
+/// params are untouched, so this narrows nothing a client legitimately sends.
+fn foreign_subresource_on_delete(query: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
+        .map(percent_decode_utf8)
+        .find(|k| k != "delete" && UNSUPPORTED_SUBRESOURCES.contains(&k.as_str()))
 }
 
 /// Split a request path `/{bucket}/{key}` into `(bucket, key)`. `key` may itself contain
@@ -1065,6 +1149,42 @@ fn list_response(xml: String) -> Response {
 /// A non-streaming response (every error path, and PUT/DELETE) has a one-shot body, so it takes
 /// the same path and its row is written the moment that single frame is consumed — same shape,
 /// no special case.
+/// Marks a response whose STATUS LINE is a success but which nevertheless carries backend
+/// failures — today exactly one shape: a bulk `DeleteObjects` answering the protocol-required
+/// `200` with per-key `<Error>` rows.
+///
+/// [`record_access`] derives `errored` from the status line and the stream outcome, so without
+/// this marker a batch in which the backend failed to delete keys counted as a healthy request:
+/// `s3_request_errors` stayed flat and a partially failed *destructive* batch was indistinguishable
+/// from a clean one on the error dashboard (PR #612 review). It rides in the response extensions
+/// beside the [`ErrorClass`] the same handler stamps, so the counter is keyed by the seam's own
+/// typed class rather than the `Terminal` default.
+#[derive(Clone, Copy)]
+struct PartialFailure;
+
+/// The single class a batch reports when several keys failed with DIFFERENT classes. One request
+/// raises exactly one RED sample, so it must name one class — and it names the one carrying the
+/// strongest operator obligation, so a batch mixing a routine transient fault with an
+/// indeterminate commit is never filed under the routine one.
+fn worst_class(a: ErrorClass, b: ErrorClass) -> ErrorClass {
+    fn rank(class: ErrorClass) -> u8 {
+        match class {
+            // "may or may not have been applied" — on a DELETE the operator cannot even tell
+            // whether the data is gone. Nothing else here demands attention sooner.
+            ErrorClass::Indeterminate => 3,
+            // Corruption: a durable repair obligation.
+            ErrorClass::Integrity => 2,
+            ErrorClass::Terminal => 1,
+            ErrorClass::Transient => 0,
+        }
+    }
+    if rank(b) > rank(a) {
+        b
+    } else {
+        a
+    }
+}
+
 struct AccessLogged<S> {
     inner: S,
     request_id: RequestId,
@@ -1084,6 +1204,10 @@ struct AccessLogged<S> {
     /// access row (see [`record_access`]).
     op: &'static str,
     class: ErrorClass,
+    /// Whether the head carried a [`PartialFailure`] marker — a success status hiding backend
+    /// faults. Carried to the completion point exactly like `class`, so the RED sample raised
+    /// there counts the request as errored.
+    partial_failure: bool,
     metrics: Option<tracing::Dispatch>,
 }
 
@@ -1113,6 +1237,7 @@ fn record_access(
     outcome: &'static str,
     op: &'static str,
     class: ErrorClass,
+    partial_failure: bool,
     metrics: Option<&tracing::Dispatch>,
 ) {
     let duration_ms = started.elapsed().map(|d| d.as_millis()).unwrap_or(0);
@@ -1133,7 +1258,13 @@ fn record_access(
     // the object, and counting it a success would be the "confident, wrong answer" this
     // module's own body-wrapping exists to prevent. `aborted` is NOT an error — that is a
     // client that hung up, which is not the gateway failing.
-    let errored = status >= 400 || matches!(outcome, "failed" | "truncated");
+    //
+    // `partial_failure` is the third way a request can have failed while LOOKING fine: a bulk
+    // `DeleteObjects` must answer `200` with per-key `<Error>` rows even when the backend failed
+    // to delete them (S3 says so), so neither the status nor the stream outcome can reveal it.
+    // Counting that batch a success is exactly the "confident, wrong answer" this derivation
+    // already refuses for a truncated body — and here the request is destructive.
+    let errored = status >= 400 || matches!(outcome, "failed" | "truncated") || partial_failure;
     emit_request_red(metrics, op, class, duration_ms as u64, errored);
 }
 
@@ -1167,6 +1298,7 @@ impl<S> AccessLogged<S> {
             outcome,
             self.op,
             class,
+            self.partial_failure,
             self.metrics.as_ref(),
         );
     }
@@ -1272,6 +1404,7 @@ fn finish_response(
     started: SystemTime,
     op: &'static str,
     class: ErrorClass,
+    partial_failure: bool,
     metrics: Option<tracing::Dispatch>,
 ) -> Response {
     let status = response.status();
@@ -1291,6 +1424,7 @@ fn finish_response(
             "complete",
             op,
             class,
+            partial_failure,
             metrics.as_ref(),
         );
         return response;
@@ -1312,6 +1446,7 @@ fn finish_response(
             span: span.clone(),
             op,
             class,
+            partial_failure,
             metrics,
         })
     })
@@ -1326,7 +1461,11 @@ where
     let method = req.method().clone();
     // The request plane's op label + metrics sink, read before `state` is moved into the
     // dispatcher below.
-    let op = op_label(&method);
+    let op = op_label(
+        &method,
+        req.uri().path(),
+        req.uri().query().unwrap_or_default(),
+    );
     let metrics = state.metrics.clone();
     let span = tracing::info_span!(
         "s3.request",
@@ -1364,6 +1503,11 @@ where
         .copied()
         .unwrap_or(ErrorClass::Terminal);
 
+    // A success status that nonetheless carried backend faults — see [`PartialFailure`]. Read
+    // here, beside the class, because both must reach the completion point where the one RED
+    // sample for this request is raised.
+    let partial_failure = response.extensions().get::<PartialFailure>().is_some();
+
     // **The access line — without it the id is a promise this crate does not keep.**
     //
     // A span is not a log record: the `fmt` layer attaches a span's fields to the *events*
@@ -1389,7 +1533,15 @@ where
     // id exists for. The body is wrapped so the row carries the *observed* outcome: bytes
     // actually sent, the real duration, and whether the transfer completed (#529 review).
     let mut response = finish_response(
-        response, &method, &span, request_id, started, op, class, metrics,
+        response,
+        &method,
+        &span,
+        request_id,
+        started,
+        op,
+        class,
+        partial_failure,
+        metrics,
     );
 
     // Stamp it on the wire too. An SDK surfaces `x-amz-request-id` in its own error
@@ -1455,6 +1607,35 @@ where
     // verbs); the split routes bucket-scoped GET to the listing handler and leaves every
     // other bucket-scoped method on today's 400 (#511 / 509 extend the split later).
     if let Some(bucket) = bucket_scoped_path(&path) {
+        // Bulk DeleteObjects (issue #509): `POST /bucket?delete` carries an XML `<Delete>` body
+        // of keys and answers a `<DeleteResult>`. It is intercepted HERE, BEFORE the subresource
+        // denylist below — which lists `"delete"` (:344) and would otherwise `501` it — so the
+        // bulk handler runs. `"delete"` stays on the OBJECT-path denylist (:1513) so
+        // `DELETE /b/k?delete` is still `501`. `?delete` is detected with a bare-key match
+        // ([`is_delete_subresource`]); `query_param` would miss a valueless `?delete`.
+        if method == Method::POST && is_delete_subresource(&query) {
+            // This interception runs BEFORE the denylist below, so the denylist has to be applied
+            // to every OTHER key here — otherwise the bulk-delete marker is a skeleton key that
+            // walks any denylisted subresource past the fence and into a destructive handler
+            // (`?delete&versionId=v` deleting the CURRENT object). Refuse exactly as the denylist
+            // would have.
+            if let Some(sub) = foreign_subresource_on_delete(&query) {
+                return error_response(
+                    request_id,
+                    StatusCode::NOT_IMPLEMENTED,
+                    "NotImplemented",
+                    &format!("the `{sub}` S3 subresource/operation is not supported"),
+                );
+            }
+            return delete_objects(
+                &state,
+                request_id,
+                &percent_decode_utf8(bucket),
+                payload,
+                body,
+            )
+            .await;
+        }
         // The bucket path MUST still consult the subresource denylist first: only a listing
         // form (`?list-type=2`, the v1 bare / `marker` / `prefix` / `delimiter` / `max-keys`
         // forms, and benign params) routes to listing. `GET /bucket?acl` / `?policy` /
@@ -1632,6 +1813,406 @@ where
             "only object PUT, GET, HEAD, and DELETE are supported",
         ),
     }
+}
+
+/// Why buffering a bulk-delete body was refused: over the byte cap, or a broken read.
+enum BufferError {
+    /// The accumulated bytes would exceed the cap — refused AS READ, by construction (never by
+    /// trusting `Content-Length`), before the whole body is resident.
+    TooLarge,
+    /// The request-body stream yielded an error before it completed (a truncated / aborted body).
+    Read(#[allow(dead_code)] BoxError),
+}
+
+/// Buffer `body` whole into a `Vec<u8>`, refusing the moment the accumulated bytes would exceed
+/// `cap`. The cap is a hard bound on what is materialised — the read stops at the first chunk
+/// that would breach it, so an oversized body is never fully resident (issue #509, DeleteObjects
+/// buffering). Used ONLY for the small, signed bulk-delete body; the object PUT/GET paths stay
+/// streaming.
+async fn buffer_capped(body: Body, cap: usize) -> Result<Vec<u8>, BufferError> {
+    let mut stream = body.into_data_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = stream.next().await {
+        let chunk = frame.map_err(|e| BufferError::Read(Box::new(e) as BoxError))?;
+        if buf.len() + chunk.len() > cap {
+            return Err(BufferError::TooLarge);
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// A parsed, validated bulk-delete request: the requested object keys (literal, already
+/// XML-entity-decoded once by the parser) and whether the client asked for a `Quiet` result.
+struct DeleteRequest {
+    keys: Vec<String>,
+    quiet: bool,
+}
+
+/// Why a `<Delete>` body was refused — and therefore which S3 error the request answers. **Both
+/// variants are returned BEFORE any `delete_object` call**, so a refused request authorises no
+/// deletion whatsoever; the distinction is only about telling the client the truth.
+enum DeleteRequestError {
+    /// Not a well-formed / semantically valid `<Delete>` document ⇒ `400 MalformedXML`.
+    Malformed,
+    /// An `<Object>` carried a child that decides **which object, or whether,** the key is
+    /// deleted, and this gateway cannot honour it ⇒ `501 NotImplemented`. The document is
+    /// perfectly well-formed, so reporting it as malformed would misdirect the client; what is
+    /// missing is the FEATURE, exactly as `?versionId` is missing on the object route. Carries the
+    /// field name so the refusal says which one.
+    UnhonourableObjectField(&'static str),
+}
+
+/// The `<Object>` children that decide **which object, or whether,** a key is deleted — the ones
+/// that must never be silently dropped (PR #612 review).
+///
+/// `<VersionId>` scopes the delete to one version; `<ETag>`, `<LastModifiedTime>` and `<Size>` are
+/// S3's **conditional-delete** fields, a client's "only delete this if it still looks like this".
+/// Ignoring any of them converts a guarded request into an unconditional destruction of the CURRENT
+/// object — the caller's precondition silently discarded, which is the worst possible failure on a
+/// destructive verb: it destroys precisely the object the client was trying to protect.
+///
+/// Every OTHER unknown child stays inert decoration and is ignored (real S3 is lenient about
+/// extras); these four are refused whole.
+const UNHONOURABLE_OBJECT_FIELDS: [&str; 4] = ["VersionId", "ETag", "LastModifiedTime", "Size"];
+
+/// `char_data`'s fail-closed `Err(())` is a MALFORMED body — this lets the extraction contract
+/// keep its minimal error type while `?` lifts it into [`DeleteRequestError`] inside the parser.
+impl From<()> for DeleteRequestError {
+    fn from((): ()) -> Self {
+        Self::Malformed
+    }
+}
+
+/// The `400 MalformedXML` a DeleteObjects request answers when its body is not a well-formed
+/// `<Delete>` document (or violates a semantic bound / the fail-closed key-extraction contract).
+/// **The load-bearing safety invariant:** this is returned BEFORE any `delete_object` call, so a
+/// rejected request authorises no deletion. `MalformedXML` is S3's own code (issue #509).
+fn malformed_xml(request_id: RequestId) -> Response {
+    error_response(
+        request_id,
+        StatusCode::BAD_REQUEST,
+        "MalformedXML",
+        "the XML you provided was not well-formed or did not validate against the published schema",
+    )
+}
+
+/// Bulk **DeleteObjects** (issue #509): `POST /bucket?delete` with an XML `<Delete>` body of
+/// keys. Deletes each named key over the existing idempotent single-object seam and answers a
+/// `200` S3 `<DeleteResult>` — a per-key `<Deleted>` (removed AND absent keys, S3 delete being
+/// idempotent) or `<Error>` — honouring `<Quiet>`.
+///
+/// **The one destructive-path invariant** (the re-plan's whole point): any body that is not a
+/// well-formed `<Delete>` document is `400 MalformedXML` and touches NO key. Well-formedness is
+/// delegated WHOLE to [`roxmltree`] (a full XML-1.0 DOM validator that rejects DTDs by default —
+/// no XXE), so this handler writes no hand-rolled grammar production and there is no next
+/// production to miss (the five prior rejections were a hand-rolled tokenizer letting one more
+/// XML production through each round).
+async fn delete_objects<G>(
+    state: &AppState<G>,
+    request_id: RequestId,
+    bucket: &str,
+    payload: sigv4::PayloadHash,
+    body: Body,
+) -> Response
+where
+    G: ObjectGateway + ContainerGateway,
+{
+    // Buffer the signed body whole under the byte cap (refused as read; see [`buffer_capped`]).
+    // An over-cap body is `MalformedXML` — S3 refuses an over-large request body, and this fires
+    // before any key is touched.
+    let bytes = match buffer_capped(body, MAX_DELETE_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => return malformed_xml(request_id),
+    };
+
+    // **Body integrity is a PRECONDITION of the destructive fan-out**, not an optional extra: the
+    // keys about to be deleted must be provably the keys the client sent. The match is EXHAUSTIVE
+    // so a payload mode can never be added that silently skips the check (PR #612 review).
+    match &payload {
+        // Verify the signed digest EXACTLY as the PUT `Signed` path does: the buffered body is
+        // checked against the signed `x-amz-content-sha256` before any key is touched.
+        sigv4::PayloadHash::Signed(expected) => {
+            let actual = crypto::hex(&crypto::sha256(&bytes));
+            if !crypto::constant_time_eq(actual.as_bytes(), expected.as_bytes()) {
+                return error_response(
+                    request_id,
+                    StatusCode::BAD_REQUEST,
+                    "XAmzContentSHA256Mismatch",
+                    "the delivered body does not match the signed x-amz-content-sha256",
+                );
+            }
+        }
+        // `UNSIGNED-PAYLOAD` puts the body deliberately OUTSIDE the signature, and this gateway
+        // validates no `Content-MD5`/`x-amz-checksum-*` — so nothing whatsoever proves the key
+        // list arrived as sent. On a read that is a caller's own risk; on a bulk DELETE it means
+        // corruption or tampering between signing and receipt can substitute keys and destroy the
+        // wrong objects, irrecoverably. Real S3 will not accept a multi-object delete without an
+        // integrity header either. Refuse before parsing — never delete on an unverified body.
+        //
+        // `aws-chunked` streaming is refused by the same rule (previously it was only refused
+        // *implicitly*, because raw chunk framing is not a well-formed `<Delete>` document —
+        // a fail-closed accident rather than a stated precondition).
+        sigv4::PayloadHash::Unsigned | sigv4::PayloadHash::Streaming(_) => {
+            return error_response(
+                request_id,
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "DeleteObjects requires an integrity-protected body: send the payload digest in \
+                 a signed x-amz-content-sha256 (UNSIGNED-PAYLOAD and aws-chunked streaming are \
+                 refused for bulk delete, which deletes nothing unverified)",
+            );
+        }
+    }
+
+    // `roxmltree::Document::parse` takes `&str`, so a non-UTF-8 body cannot be a well-formed XML
+    // document — it is `MalformedXML`, no key touched.
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return malformed_xml(request_id);
+    };
+
+    // Parse + walk the validated tree. ANY parse error, semantic-bound violation, or fail-closed
+    // key-extraction violation ⇒ `MalformedXML`, no key touched; a version-scoped or
+    // conditional-delete entry ⇒ `501`, also with no key touched.
+    let request = match parse_delete_request(text) {
+        Ok(request) => request,
+        Err(DeleteRequestError::Malformed) => return malformed_xml(request_id),
+        // Refuse the WHOLE request rather than mishandle part of it — the same rule the object
+        // route applies to `?versionId` (:1582). Deleting only the unversioned entries would be a
+        // partial success on a destructive op whose refused half is exactly the dangerous one.
+        Err(DeleteRequestError::UnhonourableObjectField(field)) => {
+            return error_response(
+                request_id,
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                &format!(
+                    "version-scoped and conditional deletes are not supported: an <Object> \
+                     carrying a <{field}> is refused, and no key in this request was deleted"
+                ),
+            );
+        }
+    };
+
+    // Fan out over the existing idempotent single-object delete seam (the object DELETE arm,
+    // :1755): `delete_object` returns `Ok(_)` for both a removed and an already-absent key (S3
+    // delete is idempotent — both are `<Deleted>`), and a per-key gateway error becomes a per-key
+    // `<Error>` via the shared [`classify`] rather than failing the whole batch.
+    // Bounded-concurrency fan-out ([`DELETE_FANOUT`]): `buffered` keeps at most N deletes in
+    // flight and yields their outcomes in REQUEST order, so the batch costs the slowest window
+    // rather than the sum of every key's latency while each row stays paired with its own key.
+    let outcomes = futures_util::stream::iter(request.keys.into_iter().map(|key| {
+        let object_key = format!("{bucket}/{key}");
+        async move {
+            let outcome = state.gateway.delete_object(&object_key).await;
+            (key, outcome)
+        }
+    }))
+    .buffered(DELETE_FANOUT)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut deleted: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, &'static str, String)> = Vec::new();
+    // The class the RED sample keys on if any key failed — the most severe seen, so a mixed batch
+    // is never filed under its mildest fault. `None` while the batch is still clean.
+    let mut failure_class: Option<ErrorClass> = None;
+    for (key, outcome) in outcomes {
+        match outcome {
+            Ok(_) => deleted.push(key),
+            Err(err) => {
+                let (status, code, message) = classify(&err);
+                let class = wyrd_traits::classify(err.as_ref());
+                failure_class = Some(match failure_class {
+                    Some(seen) => worst_class(seen, class),
+                    None => class,
+                });
+                // **Record the fault before the error is discarded.** The batch still answers
+                // `200` with this key's `<Error>` row, so the request-level RED path sees a
+                // success and reports nothing — this is the ONLY place the backend fault is
+                // observable to an operator, and it carries the same request_id the client holds.
+                //
+                // The key is BUCKET-QUALIFIED, for the same reason `request_id` is a field on the
+                // event rather than inherited from the span: `s3.request` is an `info_span!`, so
+                // under an error-only filter it is never enabled and the path is not there to
+                // disambiguate. Logging the bare XML key would make the same key in two buckets
+                // indistinguishable in exactly the configuration an operator alerts on. Allocated
+                // only on the failure arm.
+                record_gateway_error(
+                    request_id,
+                    &err,
+                    status,
+                    code,
+                    Some(&format!("{bucket}/{key}")),
+                );
+                errors.push((key, code, message));
+            }
+        }
+    }
+
+    let mut response = list_response(render_delete_result(&deleted, &errors, request.quiet));
+    // **A batch that failed to delete keys is not a healthy request**, even though S3 requires it
+    // to answer `200` with per-key `<Error>` rows. Neither the status line nor the stream outcome
+    // can carry that, so the verdict rides in the extensions to the completion point: the marker
+    // makes the RED sample count as errored, and the class keys it by the seam's own typed
+    // classification instead of the `Terminal` default (PR #612 review).
+    if let Some(class) = failure_class {
+        response.extensions_mut().insert(PartialFailure);
+        response.extensions_mut().insert(class);
+    }
+    response
+}
+
+/// Walk a buffered body as a well-formed S3 `<Delete>` document (issue #509), returning the
+/// requested keys and the `Quiet` flag, or `Err(())` (⇒ `MalformedXML`, no key touched) on ANY
+/// of:
+///
+///  * a [`roxmltree`] parse error — the WHOLE XML-1.0 grammar (exactly one root, matched/nested
+///    tags, unique attribute names, valid char/entity references, no raw `<`/`&` in an attribute
+///    value, comment/PI/CDATA grammar) is validated by construction, and DTDs are rejected (no
+///    XXE); we write no XML validation of our own, so there is no next production to miss;
+///  * a semantic bound: a root not locally named `Delete`, an empty key list, `>1000` `<Object>`,
+///    an `<Object>` with zero or `>1` `<Key>`, or `>1` `<Quiet>`;
+///  * the fail-closed key-extraction contract ([`char_data`]): a `<Key>` (or `<Quiet>`) whose
+///    content is not a pure character-data run.
+///
+/// Elements are matched by LOCAL name, namespace-insensitively (`node.tag_name().name()`), so an
+/// unqualified `<Delete>`, the S3-default-namespace form, and a prefixed `<s3:Delete>` are all
+/// accepted (real S3's leniency / the stock SDK body). Unknown sibling elements are ignored ONLY
+/// as children of `<Delete>` / `<Object>`.
+///
+/// [`UNHONOURABLE_OBJECT_FIELDS`] are the exception to that leniency: they are refused
+/// ([`DeleteRequestError::UnhonourableObjectField`]), never ignored. Every other unknown element is
+/// inert decoration, but those four decide WHICH object — or WHETHER — the key is deleted, so
+/// dropping one silently converts a guarded request into an unconditional destruction of the
+/// current object (PR #612 review).
+fn parse_delete_request(text: &str) -> Result<DeleteRequest, DeleteRequestError> {
+    let doc = roxmltree::Document::parse(text).map_err(|_| DeleteRequestError::Malformed)?;
+    let root = doc.root_element();
+    if root.tag_name().name() != "Delete" {
+        return Err(DeleteRequestError::Malformed);
+    }
+    let mut keys: Vec<String> = Vec::new();
+    let mut quiet = false;
+    let mut quiet_seen = false;
+    for child in root.children().filter(|n| n.is_element()) {
+        match child.tag_name().name() {
+            "Object" => {
+                // **A child that decides WHICH object, or WHETHER, the key dies must never be
+                // silently dropped** — see [`UNHONOURABLE_OBJECT_FIELDS`]. A `<VersionId>` turns
+                // "delete this OLD version" into "delete the CURRENT object"; an `<ETag>` /
+                // `<LastModifiedTime>` / `<Size>` turns "delete this only if it still looks like
+                // this" into an unconditional delete, destroying exactly the object whose failed
+                // precondition was supposed to save it. Both are irrecoverable, and `versionId` is
+                // already on the object route's unsupported-subresource denylist, so honouring an
+                // XML spelling while refusing the query spelling was self-inconsistent too
+                // (PR #612 review).
+                if let Some(field) = child.children().filter(|n| n.is_element()).find_map(|n| {
+                    UNHONOURABLE_OBJECT_FIELDS
+                        .iter()
+                        .copied()
+                        .find(|f| *f == n.tag_name().name())
+                }) {
+                    return Err(DeleteRequestError::UnhonourableObjectField(field));
+                }
+                let mut key_elems = child
+                    .children()
+                    .filter(|n| n.is_element() && n.tag_name().name() == "Key");
+                let key_elem = key_elems.next().ok_or(DeleteRequestError::Malformed)?; // zero <Key>
+                if key_elems.next().is_some() {
+                    return Err(DeleteRequestError::Malformed); // >1 <Key> in one <Object>
+                }
+                let key = char_data(&key_elem)?;
+                // An empty `<Key></Key>` is rejected — never a delete of `bucket/`.
+                if key.is_empty() {
+                    return Err(DeleteRequestError::Malformed);
+                }
+                keys.push(key);
+            }
+            "Quiet" => {
+                if quiet_seen {
+                    return Err(DeleteRequestError::Malformed); // >1 <Quiet> ⇒ malformed
+                }
+                quiet_seen = true;
+                // `<Quiet>` content is subject to the same fail-closed extraction as `<Key>`, and
+                // its VALUE is validated too. S3 types the field `xs:boolean`, whose lexical space
+                // is exactly `true`/`false`/`1`/`0`.
+                //
+                // Comparing against the literal `true` alone was wrong in both directions: a
+                // garbage value (`<Quiet>garbage</Quiet>`) silently read as "verbose" and
+                // authorised the whole destructive fan-out, in a parser that otherwise refuses
+                // every semantic violation before touching a key; and a perfectly valid `1`
+                // answered a client's quiet request with a full listing (PR #612 review).
+                // Refusing costs nothing here — no key has been touched yet.
+                quiet = match char_data(&child)?.as_str() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    _ => return Err(DeleteRequestError::Malformed),
+                };
+            }
+            // Other unknown sibling elements are ignored — S3 is lenient about extras in a
+            // well-formed `<Delete>`. `<VersionId>` is NOT among them: it changes WHICH object a
+            // key names, so it is refused above rather than dropped.
+            _ => {}
+        }
+    }
+    if keys.is_empty() || keys.len() > 1000 {
+        return Err(DeleteRequestError::Malformed);
+    }
+    Ok(DeleteRequest { keys, quiet })
+}
+
+/// The character-data value of `node`, FAIL-CLOSED (issue #509 Scope (6)): `Err(())` if ANY child
+/// is not a text/CDATA node — a child element, COMMENT, or processing-instruction inside a
+/// `<Key>` / `<Quiet>` is malformed, never ignored (this closes the parses-but-deletes-wrong
+/// class in key EXTRACTION, downstream of roxmltree's grammar gate). The value is built by
+/// CONCATENATING the text/CDATA child values in document order — NOT [`roxmltree::Node::text`],
+/// which is first-text-node-only and TRUNCATES a run split by a comment/PI (`<Key>a<!--x-->c`
+/// → `.text()` = `a`, which is exactly why such a `<Key>` is rejected here). The value roxmltree
+/// yields is ALREADY XML-entity-decoded exactly once: it is the literal object key, used verbatim
+/// — NOT re-decoded, NOT percent-decoded, NOT whitespace-trimmed.
+fn char_data(node: &roxmltree::Node) -> Result<String, ()> {
+    let mut value = String::new();
+    for child in node.children() {
+        if !child.is_text() {
+            return Err(());
+        }
+        value.push_str(child.text().unwrap_or(""));
+    }
+    Ok(value)
+}
+
+/// Render an S3 `<DeleteResult>` by string building with [`xml_escape`], mirroring 507's
+/// `render_list_v2` / `list_response` (:913, :1032; escape :1893) — the maintainer-blessed
+/// string-built output (`roxmltree` is adopted for INPUT parsing only). `Quiet=true` omits the
+/// `<Deleted>` entries (the objects are still gone); `<Error>` entries are always emitted.
+fn render_delete_result(
+    deleted: &[String],
+    errors: &[(String, &str, String)],
+    quiet: bool,
+) -> String {
+    let mut out = String::with_capacity(128 + (deleted.len() + errors.len()) * 64);
+    out.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    if !quiet {
+        for key in deleted {
+            out.push_str(&format!(
+                "<Deleted><Key>{}</Key></Deleted>",
+                xml_escape(key)
+            ));
+        }
+    }
+    for (key, code, message) in errors {
+        out.push_str(&format!(
+            "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
+            xml_escape(key),
+            xml_escape(code),
+            xml_escape(message),
+        ));
+    }
+    out.push_str("</DeleteResult>");
+    out
 }
 
 /// Serve an object `GET`, honouring the `Range` header (206 partial content, 416 unsatisfiable)
@@ -2678,6 +3259,56 @@ impl std::fmt::Display for CauseChain<'_> {
 /// The client-facing `<Message>` deliberately stays free of internal detail — **detail to the
 /// log, request id to the client**. That is also why the 500 arm's message is unchanged: what
 /// was missing was never a better string for the client, it was a record for the operator.
+/// Record a backend fault on the error plane — the shared body of [`gateway_error_response`] and
+/// the bulk-delete per-key path, so a fault is logged IDENTICALLY whether it fails the whole
+/// request or only one key of a batch.
+///
+/// `key` names the object when the fault is scoped to ONE entry of a bulk operation. That case is
+/// why this is split out: a bulk delete answers `200` with a per-key `<Error>` row, so the
+/// request-level RED path sees a success and records nothing. Without this call the backend fault
+/// reached the client as an XML row and left the operator NO request-id-linked diagnostic — no
+/// cause chain, no `may_still_commit`, no typed class — for a fault that may have destroyed data
+/// (PR #612 review).
+fn record_gateway_error(
+    request_id: RequestId,
+    err: &BoxError,
+    status: StatusCode,
+    code: &str,
+    key: Option<&str>,
+) {
+    if status.is_server_error() {
+        // `may_still_commit` is a FIELD, not prose in the message: it is the one bit an operator
+        // filters on. `true` means the batch may land AFTER this response, so a re-read that sees
+        // nothing proves nothing — the single hardest state to reason about, and the reason the
+        // client's generic 500 is not the whole story (#515).
+        let may_still_commit = err
+            .downcast_ref::<wyrd_traits::CommitUnknownResult>()
+            .map(|u| u.may_still_commit);
+        tracing::error!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            may_still_commit,
+            object_key = key,
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway failed the request",
+        );
+    } else {
+        tracing::warn!(
+            target: "wyrd.gateway.s3.error",
+            request_id = %request_id,
+            s3_code = code,
+            http_status = status.as_u16(),
+            object_key = key,
+            error = %err,
+            cause_chain = %CauseChain(err.as_ref()),
+            "the gateway refused the request",
+        );
+    }
+}
+
 fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     let (status, code, message) = classify(err);
 
@@ -2695,35 +3326,7 @@ fn gateway_error_response(request_id: RequestId, err: &BoxError) -> Response {
     // error-only filter (`--log-level error`) it is never enabled and `with_current_span(true)`
     // has no fields to attach. This line, the one an operator reaches for at 3am, would be the
     // ONE that lost the `x-amz-request-id` the client is holding.
-    if status.is_server_error() {
-        // `may_still_commit` is a FIELD, not prose in the message: it is the one bit an operator
-        // filters on. `true` means the batch may land AFTER this response, so a re-read that sees
-        // nothing proves nothing — the single hardest state to reason about, and the reason the
-        // client's generic 500 is not the whole story (#515).
-        let may_still_commit = err
-            .downcast_ref::<wyrd_traits::CommitUnknownResult>()
-            .map(|u| u.may_still_commit);
-        tracing::error!(
-            target: "wyrd.gateway.s3.error",
-            request_id = %request_id,
-            s3_code = code,
-            http_status = status.as_u16(),
-            may_still_commit,
-            error = %err,
-            cause_chain = %CauseChain(err.as_ref()),
-            "the gateway failed the request",
-        );
-    } else {
-        tracing::warn!(
-            target: "wyrd.gateway.s3.error",
-            request_id = %request_id,
-            s3_code = code,
-            http_status = status.as_u16(),
-            error = %err,
-            cause_chain = %CauseChain(err.as_ref()),
-            "the gateway refused the request",
-        );
-    }
+    record_gateway_error(request_id, err, status, code, None);
     let mut response = error_response(request_id, status, code, &message);
     // **Carry the typed failure class out to the request plane.** The class is derived HERE,
     // where the backend's error still exists, by the seam's own classifier (#577's
@@ -3461,6 +4064,8 @@ mod tests {
                 // metric event falls through to the ambient subscriber (#575).
                 op: "get",
                 class: ErrorClass::Terminal,
+                // These cases drive an ordinary GET, not a partially-failed batch.
+                partial_failure: false,
                 metrics: None,
             };
             let body = Body::from_stream(logged);
@@ -3559,6 +4164,8 @@ mod tests {
                 span: tracing::info_span!("s3.request"),
                 op: "get",
                 class: ErrorClass::Terminal,
+                // These cases drive an ordinary GET, not a partially-failed batch.
+                partial_failure: false,
                 metrics: None,
             };
             let _ = futures_util::StreamExt::next(&mut logged).await; // the 5 declared bytes
@@ -3612,8 +4219,11 @@ mod tests {
                 &span,
                 RequestIds::new().mint(),
                 SystemTime::now(),
-                op_label(&method),
+                // This case exercises response FINISHING, not routing: an ordinary object path
+                // with no query keeps the label purely method-derived.
+                op_label(&method, "/bucket/key", ""),
                 ErrorClass::Terminal,
+                false,
                 None,
             );
             if drain {
@@ -3710,6 +4320,29 @@ mod tests {
         assert_eq!(split_bucket_key("/bucket/"), None);
         assert_eq!(split_bucket_key("/bucket"), None);
         assert_eq!(split_bucket_key("/"), None);
+    }
+
+    /// Bulk `DeleteObjects` must land in the `delete` RED series, not `other`. It is a POST on the
+    /// wire, so a method-only label pooled it with unsupported methods and left delete dashboards
+    /// and alerts blind to the one path that removes up to 1000 objects per request (PR #612
+    /// review). The label must track the route's own interception predicate — bucket-scoped path
+    /// AND a bare `?delete` — so it never claims a request the bulk handler did not take.
+    #[test]
+    fn op_label_attributes_bulk_delete_to_the_delete_series() {
+        // The bulk-delete route: a bucket-scoped POST carrying a bare `?delete`.
+        assert_eq!(op_label(&Method::POST, "/bucket", "delete"), "delete");
+        assert_eq!(op_label(&Method::POST, "/bucket/", "delete"), "delete");
+        // Ordinary methods keep their method-derived label.
+        assert_eq!(op_label(&Method::GET, "/bucket/key", ""), "get");
+        assert_eq!(op_label(&Method::DELETE, "/bucket/key", ""), "delete");
+        assert_eq!(op_label(&Method::PUT, "/bucket/key", ""), "put");
+        assert_eq!(op_label(&Method::HEAD, "/bucket/key", ""), "head");
+        // A POST the bulk handler does NOT take stays `other`, so the delete series is never
+        // credited with a request that deleted nothing: an OBJECT path (the route only fires on
+        // a bucket-scoped path), and a bucket POST with no `?delete` marker.
+        assert_eq!(op_label(&Method::POST, "/bucket/key", "delete"), "other");
+        assert_eq!(op_label(&Method::POST, "/bucket", ""), "other");
+        assert_eq!(op_label(&Method::POST, "/bucket", "uploads"), "other");
     }
 
     #[test]
