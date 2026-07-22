@@ -615,6 +615,9 @@ fn a_crate_missing_from_workspace_members_is_reported() {
         "#![forbid(unsafe_code)]\npub fn f() {}\n",
     );
     plant_crate(&crates, "forgotten", "pub fn f() {}\n");
+    // Nested under an intermediate grouping directory — the shape a
+    // single-level listing walks straight past.
+    plant_crate(&crates.join("storage"), "buried", "pub fn f() {}\n");
     let metadata = format!(
         r#"{{"packages":[{{"manifest_path":"{}","targets":[]}}]}}"#,
         crates.join("listed/Cargo.toml").display()
@@ -623,10 +626,24 @@ fn a_crate_missing_from_workspace_members_is_reported() {
     let missing = unregistered_manifests(&metadata, &crates).expect("metadata parses");
     std::fs::remove_dir_all(&dir).ok();
 
-    assert_eq!(missing.len(), 1, "only the unlisted crate: {missing:?}");
+    assert_eq!(
+        missing.len(),
+        2,
+        "both unlisted crates, at any depth: {missing:?}"
+    );
     assert!(
-        missing[0].contains("forgotten") && missing[0].contains("workspace member"),
-        "the violation names the crate and why it matters: {missing:?}"
+        missing.iter().any(|m| m.contains("forgotten")),
+        "the top-level unlisted crate: {missing:?}"
+    );
+    assert!(
+        missing
+            .iter()
+            .any(|m| m.contains("storage") && m.contains("buried")),
+        "the nested unlisted crate must not escape the cross-check: {missing:?}"
+    );
+    assert!(
+        missing.iter().all(|m| m.contains("workspace member")),
+        "each violation says why it matters: {missing:?}"
     );
 }
 

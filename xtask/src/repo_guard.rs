@@ -362,17 +362,17 @@ pub fn unregistered_manifests(
         .map(std::path::PathBuf::from)
         .collect();
 
+    // Walk the WHOLE tree, not just its immediate children: a package may sit
+    // under an intermediate grouping directory (`crates/storage/foo/`), and a
+    // single-level listing would miss exactly the unregistered package this
+    // check exists to find.
+    let mut manifests = Vec::new();
+    collect_manifests(crates_dir, &mut manifests);
+    manifests.sort();
+
     let mut missing = Vec::new();
-    let Ok(entries) = std::fs::read_dir(crates_dir) else {
-        // A missing crates/ dir is not this check's to report: the root-list
-        // emptiness check in `scan_roots` already fails closed on it.
-        return Ok(missing);
-    };
-    let mut dirs: Vec<_> = entries.flatten().map(|e| e.path()).collect();
-    dirs.sort();
-    for dir in dirs {
-        let manifest = dir.join("Cargo.toml");
-        if manifest.is_file() && !known.iter().any(|k| k == &manifest) {
+    for manifest in manifests {
+        if !known.iter().any(|k| k == &manifest) {
             missing.push(format!(
                 "{}: package is not a workspace member — nothing builds, tests or lints it \
                  (add it to [workspace] members in the root Cargo.toml)",
@@ -381,6 +381,30 @@ pub fn unregistered_manifests(
         }
     }
     Ok(missing)
+}
+
+/// Every `Cargo.toml` at or below `dir`, at any depth. `target/` and
+/// dot-directories are skipped (a build cache holds vendored manifests that
+/// are not this workspace's packages). A package directory IS descended into,
+/// because cargo permits a package nested inside another package's directory.
+/// A missing/unreadable `dir` yields nothing — `scan_roots`' empty-root-list
+/// check is what fails closed on an unseeable tree.
+fn collect_manifests(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            collect_manifests(&path, out);
+        } else if path.file_name().is_some_and(|n| n == "Cargo.toml") {
+            out.push(path);
+        }
+    }
 }
 
 /// Scan the given crate roots for `#![forbid(unsafe_code)]`, honoring
