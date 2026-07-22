@@ -97,13 +97,14 @@ fn crate_dir() -> PathBuf {
 
 /// A unique temp directory, mirroring `xtask/tests/deploy_no_orchestrator_coupling.rs:72-79`.
 fn temp_fixture_dir(tag: &str) -> PathBuf {
+    // pid + per-process counter for uniqueness — no wall-clock read (#619;
+    // under madsim a virtualised clock repeats per seed, so real time is a
+    // WORSE uniqueness source here, not just a disallowed one).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "wyrd-no-fdb-linkage-{tag}-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("create fixture dir");
     dir

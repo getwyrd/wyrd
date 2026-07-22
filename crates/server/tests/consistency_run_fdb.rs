@@ -53,6 +53,11 @@
 //! stays green with no FDB, no Docker, no JVM. Launched only by `WYRD_TIER1=1 cargo xtask
 //! consistency-run` (`xtask/src/consistency_run_runner.rs`); this file never shells `java`.
 
+// wall-clock exempt (test crate): the checked-consistency leg records REAL
+// wall-clock op windows for the Elle checker against a live cluster, like
+// server::consistency_observable (#619).
+#![allow(clippy::disallowed_methods)]
+
 /// The FDB cluster file, or `None` when FDB is not configured (clean-skip gate — mirrors
 /// `tier1_metadata_nemesis.rs::cluster_file`).
 fn cluster_file() -> Option<String> {
