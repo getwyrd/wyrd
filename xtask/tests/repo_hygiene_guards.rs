@@ -17,7 +17,8 @@
 use std::path::{Path, PathBuf};
 
 use xtask::repo_guard::{
-    gitmodules_config_paths, scan_gitlinks, scan_roots, target_src_paths, UNSAFE_FORBID_ALLOWLIST,
+    gitmodules_config_paths, scan_gitlinks, scan_roots, target_src_paths, unregistered_manifests,
+    UNSAFE_FORBID_ALLOWLIST,
 };
 
 /// The workspace root (`<root>/xtask` is this crate's manifest dir).
@@ -598,6 +599,56 @@ fn scan_crate_roots_looks_past_a_leading_shebang() {
         "only the attribute-less one is red: {violations:?}"
     );
     assert!(violations[0].contains("scripted-missing"), "{violations:?}");
+}
+
+#[test]
+fn a_crate_missing_from_workspace_members_is_reported() {
+    // The workspace lists members explicitly, so a new crates/<name> nobody
+    // wired up is absent from cargo metadata — and a metadata-driven scan
+    // would pass over it exactly as it passes over a crate that does not
+    // exist. It is also a defect in its own right: nothing builds or tests it.
+    let dir = fixture_dir("unlisted");
+    let crates = dir.join("crates");
+    plant_crate(
+        &crates,
+        "listed",
+        "#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+    plant_crate(&crates, "forgotten", "pub fn f() {}\n");
+    let metadata = format!(
+        r#"{{"packages":[{{"manifest_path":"{}","targets":[]}}]}}"#,
+        crates.join("listed/Cargo.toml").display()
+    );
+
+    let missing = unregistered_manifests(&metadata, &crates).expect("metadata parses");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(missing.len(), 1, "only the unlisted crate: {missing:?}");
+    assert!(
+        missing[0].contains("forgotten") && missing[0].contains("workspace member"),
+        "the violation names the crate and why it matters: {missing:?}"
+    );
+}
+
+#[test]
+fn every_crate_directory_is_a_workspace_member_today() {
+    // The invariant over the real tree, and the reason the cross-check is
+    // cheap to keep: it should always be empty here.
+    let meta = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("failed to spawn cargo metadata");
+    assert!(meta.status.success(), "cargo metadata must succeed");
+    let missing = unregistered_manifests(
+        &String::from_utf8_lossy(&meta.stdout),
+        &workspace_root().join("crates"),
+    )
+    .expect("cargo metadata parses");
+    assert!(
+        missing.is_empty(),
+        "unlisted crate directories: {missing:?}"
+    );
 }
 
 #[test]

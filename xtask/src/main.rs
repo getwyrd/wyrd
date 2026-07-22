@@ -1461,8 +1461,15 @@ fn run_unsafe_forbid_guard() -> Result<(), String> {
             String::from_utf8_lossy(&meta.stderr)
         ));
     }
-    let roots = xtask::repo_guard::target_src_paths(&String::from_utf8_lossy(&meta.stdout))?;
-    let violations = xtask::repo_guard::scan_roots(&roots, &root)?;
+    let metadata = String::from_utf8_lossy(&meta.stdout);
+    let roots = xtask::repo_guard::target_src_paths(&metadata)?;
+    let mut violations = xtask::repo_guard::scan_roots(&roots, &root)?;
+    // A crate under `crates/` that is missing from `[workspace] members` never
+    // reaches metadata, so the scan above would pass over it silently.
+    violations.extend(xtask::repo_guard::unregistered_manifests(
+        &metadata,
+        &root.join("crates"),
+    )?);
     if violations.is_empty() {
         println!("xtask unsafe-guard: every crate root forbids unsafe code (#616)");
         Ok(())

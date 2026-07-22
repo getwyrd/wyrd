@@ -336,6 +336,53 @@ pub fn target_src_paths(metadata_json: &str) -> Result<Vec<std::path::PathBuf>, 
     Ok(roots)
 }
 
+/// Package directories under `crates_dir` that `cargo metadata` did not report.
+///
+/// The workspace lists `[workspace] members` EXPLICITLY, and a path dependency
+/// only becomes an implicit member when some member depends on it. So a new
+/// `crates/foo` that nobody has wired up yet is absent from metadata — and a
+/// guard driven by metadata alone would pass without ever seeing it, exactly
+/// as it would pass over a crate that does not exist.
+///
+/// Reported as violations in their own right, because "under `crates/` but not
+/// a workspace member" is a defect regardless of this guard: nothing compiles,
+/// tests, or lints that directory, so it looks live while being dead.
+pub fn unregistered_manifests(
+    metadata_json: &str,
+    crates_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|e| format!("unsafe-guard: cannot parse cargo metadata: {e}"))?;
+    let known: Vec<std::path::PathBuf> = meta
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| "unsafe-guard: cargo metadata has no `packages` array".to_string())?
+        .iter()
+        .filter_map(|p| p.get("manifest_path").and_then(|m| m.as_str()))
+        .map(std::path::PathBuf::from)
+        .collect();
+
+    let mut missing = Vec::new();
+    let Ok(entries) = std::fs::read_dir(crates_dir) else {
+        // A missing crates/ dir is not this check's to report: the root-list
+        // emptiness check in `scan_roots` already fails closed on it.
+        return Ok(missing);
+    };
+    let mut dirs: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let manifest = dir.join("Cargo.toml");
+        if manifest.is_file() && !known.iter().any(|k| k == &manifest) {
+            missing.push(format!(
+                "{}: package is not a workspace member — nothing builds, tests or lints it \
+                 (add it to [workspace] members in the root Cargo.toml)",
+                manifest.display()
+            ));
+        }
+    }
+    Ok(missing)
+}
+
 /// Scan the given crate roots for `#![forbid(unsafe_code)]`, honoring
 /// [`UNSAFE_FORBID_ALLOWLIST`] (keyed by workspace-root-relative path).
 ///
