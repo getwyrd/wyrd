@@ -34,6 +34,8 @@
 //! Under `cargo xtask ci` the `fdb` feature is off, this binary compiles to skip notices, and
 //! nothing links `libfdb_c`. `cargo xtask fdb-conformance` runs it for real.
 
+#![forbid(unsafe_code)]
+
 /// How long a case may take before the harness calls it hung. Generously above the
 /// [`STORE_TIMEOUT_MS`] deadline (and above the driver's `MAX_ATTEMPTS` × deadline worst
 /// case), so this bound is only ever reached by an operation that is not coming back.

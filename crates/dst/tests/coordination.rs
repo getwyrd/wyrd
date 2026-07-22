@@ -35,6 +35,8 @@
 //!
 //! madsim replays every seed the `dst` tier sweeps, so any ordering that could
 //! break single-leader or fencing is a reproducible failure, not a flake.
+
+#![forbid(unsafe_code)]
 #![cfg(madsim)]
 
 use std::sync::atomic::{AtomicBool, Ordering};

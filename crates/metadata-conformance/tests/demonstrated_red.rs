@@ -18,6 +18,8 @@
 //! together they demonstrate the new property adds discriminating power the
 //! old suite lacked, not just a differently-shaped restatement of it.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 

@@ -48,6 +48,8 @@
 //! - D server 3 (domain D): healthy `FsChunkStore` in a tmpdir — the re-placement
 //!   target for the rebuilt fragment after reconstruction.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};

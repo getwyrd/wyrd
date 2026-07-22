@@ -24,6 +24,8 @@
 //! - Once `k` fragments verify, the read reconstructs and drops the rest, so
 //!   exactly `k` fetches ever reach the inner store: the cancellation invariant.
 
+#![forbid(unsafe_code)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};

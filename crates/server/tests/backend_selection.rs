@@ -14,6 +14,8 @@
 //! parameterization seam: revert the production change and it no longer compiles
 //! (the C4-verify red), fix it and both assertions pass (green).
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use bytes::Bytes;

@@ -18,6 +18,8 @@
 //! DETERMINISTIC proof of the same store lives in `crates/dst/tests/coordination.rs`
 //! (the madsim etcd simulator), which needs neither a container nor `protoc`.
 
+#![forbid(unsafe_code)]
+
 fn etcd_endpoints() -> Option<Vec<String>> {
     match std::env::var("WYRD_ETCD_ENDPOINTS") {
         Ok(raw) if !raw.trim().is_empty() => Some(

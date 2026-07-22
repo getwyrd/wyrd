@@ -15,6 +15,7 @@
 //! brings up the throwaway `deploy/fdb-single-node` cluster, writes the cluster file,
 //! rebuilds with `--features fdb`, and runs it for real.
 
+#![forbid(unsafe_code)]
 // wall-clock exempt (test crate): fresh-namespace uniqueness must hold across
 // RUNS against a live, persistent external cluster — a pid+counter scheme
 // collides with leftovers from earlier runs; real time is the tool (#619).

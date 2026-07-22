@@ -13,6 +13,8 @@
 //! `--features tikv`, and runs it for real. The paging/cap **decision** logic that
 //! IS observable without a TiKV lives in the `paging` unit tests in `src/lib.rs`.
 
+#![forbid(unsafe_code)]
+
 /// The PD (Placement Driver) endpoints, or `None` when TiKV is not configured.
 fn pd_endpoints() -> Option<Vec<String>> {
     match std::env::var("WYRD_TIKV_PD_ENDPOINTS") {

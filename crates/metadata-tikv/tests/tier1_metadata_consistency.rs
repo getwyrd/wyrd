@@ -96,6 +96,7 @@
 //! `cargo test --features tikv -- --ignored` (routed by
 //! `xtask::metadata_faults::metadata_tier_dispatch`).
 
+#![forbid(unsafe_code)]
 // wall-clock exempt (test crate): namespace uniqueness across runs against a
 // live cluster, and PD liveness comparisons against PD's own wall-clock
 // heartbeat stamps — both inherently real-time (#619).

@@ -23,6 +23,8 @@
 //! the `read.rs` production change and this test fails again while the object still
 //! reads back correctly — proving the enqueue, not the read, is what this test pins.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

@@ -19,6 +19,8 @@
 //! wrong bytes, no enqueue) and rejects it post-fix (typed error + enqueue: below `k`
 //! intact fragments remain, so the read fails rather than returning wrong bytes).
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

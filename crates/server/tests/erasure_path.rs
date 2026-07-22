@@ -5,6 +5,8 @@
 //! checksum-failing fragments and erroring cleanly below k. Wired against the real
 //! redb + filesystem backends; `pollster::block_on` drives the sync path.
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_chunk_format::{decode, EcSchemeType};
 use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};

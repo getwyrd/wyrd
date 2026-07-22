@@ -50,6 +50,8 @@
 //! up `deploy/fdb-multi-replica`, configures the database, writes the cluster file and exports
 //! the env below. Absent that, it skips cleanly so `cargo xtask ci` stays green.
 
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "fdb")]
 use std::time::Duration;
 

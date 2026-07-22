@@ -30,6 +30,8 @@
 //! — contention needs no fault, so a single-node cluster would also do, but the battery runs
 //! it against the multi-process cluster the verdict is about.
 
+#![forbid(unsafe_code)]
+
 /// The FDB cluster file, or `None` when FDB is not configured (clean-skip gate).
 fn cluster_file() -> Option<String> {
     match std::env::var("WYRD_FDB_CLUSTER_FILE") {

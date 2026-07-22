@@ -3,6 +3,8 @@
 //! backends (redb + filesystem) and the persisted inode allocator carry state
 //! from one process to the next.
 
+#![forbid(unsafe_code)]
+
 use std::path::Path;
 use std::process::{Command, Output};
 

@@ -25,6 +25,7 @@
 //! signature is inside the freshness/replay window the gateway enforces. RED before the
 //! wire surface exists (no `s3` module to bind / dial); GREEN once it does.
 
+#![forbid(unsafe_code)]
 // wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
 // live in-process server use real wall time; nothing here mixes clock sources
 // within one asserted lifecycle (#619).

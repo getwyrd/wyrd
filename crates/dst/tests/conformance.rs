@@ -18,6 +18,8 @@
 //!
 //! Requires `--cfg madsim` (set by `cargo xtask dst`); without it this file compiles
 //! to nothing, so a normal `cargo test` neither builds nor runs it.
+
+#![forbid(unsafe_code)]
 #![cfg(madsim)]
 
 use wyrd_metadata_redb::RedbMetadataStore;

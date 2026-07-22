@@ -20,6 +20,8 @@
 //! authenticated the body against, verified by the implementer **before commit** and
 //! **after** the body has streamed (never buffered).
 
+#![forbid(unsafe_code)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

@@ -12,6 +12,8 @@
 //! **deletion**, the tests that matter most here are the ones that prove what it does NOT
 //! touch — a marked live fragment is silent corruption on a delay.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

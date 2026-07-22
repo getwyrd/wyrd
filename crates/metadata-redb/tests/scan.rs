@@ -10,6 +10,8 @@
 //! `with_scan_cap` so the fail-loud arm is reachable without writing 2^20 keys — the
 //! production `scan` path is driven either way, only the ceiling moves.
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_metadata_redb::{RedbMetadataStore, ScanCapExceeded, SCAN_CAP};
 use wyrd_traits::{MetadataStore, WriteBatch};

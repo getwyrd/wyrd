@@ -38,6 +38,8 @@
 //! `.github/workflows/fdb-conformance.yml` job. What is asserted here is the decision logic
 //! those probes feed — the same functions production calls.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 use xtask::fdb_doctor::{

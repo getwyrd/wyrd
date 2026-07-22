@@ -13,6 +13,8 @@
 //! the same domain. Post-rewire `WritePlan::place` runs the failure-domain selector,
 //! so the recorded placement spans nine distinct domains.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 

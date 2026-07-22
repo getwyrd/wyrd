@@ -7,6 +7,8 @@
 //! the networked-profile composition (`C: ChunkStore`), so `core`'s write/read
 //! paths run unchanged against it (ADR-0010).
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

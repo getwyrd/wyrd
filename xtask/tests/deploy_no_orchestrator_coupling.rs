@@ -28,6 +28,8 @@
 //! exactly as `deploy/tikv-single-node/`'s own conformance test skips cleanly with
 //! no TiKV configured.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

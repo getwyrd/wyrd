@@ -9,6 +9,8 @@
 //!   loopback gRPC, discovers them, resolves the fan-out endpoint set, and proves
 //!   a *discovered* endpoint actually serves a fragment round-trip.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

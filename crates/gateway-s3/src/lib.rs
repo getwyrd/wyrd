@@ -56,6 +56,8 @@
 //! decision the listener is exercised over loopback and an operator/#367 fronts it with
 //! the public-TLS terminator ([`S3Gateway::serve`] takes an already-bound listener).
 
+#![forbid(unsafe_code)]
+
 pub mod checksum;
 pub mod crypto;
 pub mod request_id;

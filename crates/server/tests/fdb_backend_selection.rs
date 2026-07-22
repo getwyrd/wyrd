@@ -15,6 +15,7 @@
 //!    unknown-value text lists all three backends, not just two.
 //! 3. The compiled binary's no-args usage (stderr) lists `redb|tikv|fdb`.
 
+#![forbid(unsafe_code)]
 // This patch declares the `fdb` feature (`crates/server/Cargo.toml:31`), so with the fix
 // applied `feature = "fdb"` is a known cfg value and this allow is inert. It exists for
 // the ONE tree where the feature is not declared: `C4-verify`'s RED phase, which reverts

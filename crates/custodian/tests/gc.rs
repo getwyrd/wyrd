@@ -22,6 +22,8 @@
 //!    (`gc_telemetry.rs`) — it must not share this process's `tracing` callsite cache
 //!    with the criteria above (issue #214).
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

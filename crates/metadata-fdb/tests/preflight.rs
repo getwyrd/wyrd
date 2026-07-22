@@ -20,6 +20,8 @@
 //! `tests/conformance.rs::connect_probes_the_real_cluster_from_inside_a_runtime`, both run
 //! by `cargo xtask fdb-conformance`.
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use wyrd_metadata_fdb::preflight::{message, verdict, ClientStatus, Verdict};

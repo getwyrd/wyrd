@@ -10,6 +10,8 @@
 //! Mirrors `failure_domain_registration.rs`'s bind→register→discover→decode
 //! harness over an in-process `MemCoordination` — no etcd, no Docker.
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use wyrd_chunkstore_fs::FsChunkStore;

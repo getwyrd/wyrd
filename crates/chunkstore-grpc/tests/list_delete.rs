@@ -11,6 +11,8 @@
 //! of the additive `ListFragments` / `DeleteFragment` messages), mirroring the
 //! shape of `round_trip.rs`.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 
 use bytes::Bytes;

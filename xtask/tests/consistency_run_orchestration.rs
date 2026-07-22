@@ -23,6 +23,8 @@
 //! --workspace` and go **RED** when the orchestration, the vacuity gate, the invocation builder,
 //! the parser, the fixtures, the evidence fidelity, or the report renderer are regressed/removed.
 
+#![forbid(unsafe_code)]
+
 use xtask::consistency_run::{
     consistency_run_scenario_args, edn_history_has_expected_vocabulary, elle_invocation,
     elle_version_extraction, evaluate_summary, parse_checker_output, parse_elle_version,

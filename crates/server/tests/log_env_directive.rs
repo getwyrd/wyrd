@@ -18,6 +18,8 @@
 //! module; this pins the WIRING — that `LogConfig::new` actually consults the environment. Without
 //! it, a `new` that never read `RUST_LOG` would keep the pure test green.
 
+#![forbid(unsafe_code)]
+
 use wyrd_server::logging::LogConfig;
 
 #[test]

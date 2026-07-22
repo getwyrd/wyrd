@@ -14,6 +14,8 @@
 //! Run via `cargo xtask bench`. CI tracks the numbers (regression visibility),
 //! it does not gate on them — wall-clock is noisy (issue #99).
 
+#![forbid(unsafe_code)]
+
 use std::hint::black_box;
 use std::time::Duration;
 

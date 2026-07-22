@@ -20,6 +20,7 @@ pub mod dist;
 pub mod fdb_doctor;
 pub mod metadata_faults;
 pub mod nemesis;
+pub mod repo_guard;
 
 /// Opt the `tikv` feature's type-check into `cargo xtask ci`. Set only by the privileged
 /// Tier CI job that has the pre-1.0 `tikv-client` build toolchain (grpcio/protoc).

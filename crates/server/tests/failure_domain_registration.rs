@@ -9,6 +9,8 @@
 //! topology composes them, and the selector then places `n` fragments across `n`
 //! distinct domains.
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use wyrd_chunkstore_fs::FsChunkStore;

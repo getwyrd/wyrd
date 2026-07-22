@@ -28,6 +28,8 @@
 //! `crates/chunkstore-grpc/tests/round_trip.rs`), against the real `DServer::serve`
 //! composition — not a stand-in.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

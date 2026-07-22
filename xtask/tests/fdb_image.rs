@@ -17,6 +17,8 @@
 //! logic. The actual `docker build` is the deferred half, exercised by
 //! `.github/workflows/fdb-image.yml`.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 /// The workspace root (`<root>/xtask` is this crate's manifest dir).

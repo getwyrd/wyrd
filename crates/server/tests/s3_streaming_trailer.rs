@@ -44,6 +44,7 @@
 //! `signed_headers`) is adapted/duplicated from `s3_http_wire.rs` per the brief's citation
 //! — those helpers are PRIVATE to that test crate, not importable from here.
 
+#![forbid(unsafe_code)]
 // wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
 // live in-process server use real wall time; nothing here mixes clock sources
 // within one asserted lifecycle (#619).

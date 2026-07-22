@@ -6,6 +6,8 @@
 //! point M2.4 retires: a partial fan-out must abort the data phase — never a
 //! half-written set silently treated as complete.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 use std::sync::Mutex;
 

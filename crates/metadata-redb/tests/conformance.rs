@@ -10,6 +10,8 @@
 //! `testkit`) stay here — they exercise redb's serialized-write-transaction
 //! guarantee directly and are not part of the backend-agnostic contract.
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_core::metadata::{self, InodeRecord, InodeState, PendingEntry};
 use wyrd_metadata_conformance as conformance;

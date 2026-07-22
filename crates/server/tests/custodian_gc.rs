@@ -74,6 +74,8 @@
 //! process-global state, so this role's metric callsites must not be raced by a no-subscriber
 //! sibling test — the same isolation reason `custodian_day_one.rs` documents.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

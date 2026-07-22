@@ -42,6 +42,8 @@
 //!
 //! Runs only under `cargo xtask fdb-metadata-tier1`; skips cleanly otherwise.
 
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "fdb")]
 use std::time::Duration;
 

@@ -9,6 +9,7 @@
 //! `now - ttl` lands in the PAST — asserting the lease expires no earlier than the
 //! instant the PUT started kills the mutant.
 
+#![forbid(unsafe_code)]
 // wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
 // live in-process server use real wall time; nothing here mixes clock sources
 // within one asserted lifecycle (#619).

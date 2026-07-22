@@ -31,6 +31,8 @@
 //! **concurrently**: redb takes an exclusive file lock, so it cannot model two live processes
 //! sharing one store; the shared `Arc` backing does.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
