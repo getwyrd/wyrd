@@ -1115,7 +1115,7 @@ mod store {
     mod tests {
         use std::time::Duration;
 
-        use tikv_client::{Error, ProtoKeyError, ProtoRegionError};
+        use tikv_client::{Error, ProtoKeyError};
         use wyrd_traits::{BoxError, CommitUnknownResult};
 
         use super::{is_undetermined_commit, is_write_conflict, tikv_unknown_result};
@@ -1123,19 +1123,21 @@ mod store {
 
         /// A `KeyError` carrying `conflict` — TiKV's single write-conflict signal.
         fn write_conflict() -> Error {
-            let mut ke = ProtoKeyError::default();
-            ke.conflict = Some(Default::default());
+            let ke = ProtoKeyError {
+                conflict: Some(Default::default()),
+                ..Default::default()
+            };
             Error::KeyError(Box::new(ke))
         }
 
         /// A `KeyError` that is NOT a conflict (a `locked` key, say) — still a decision the
         /// server sent us inside a response.
         fn other_key_error() -> Error {
-            Error::KeyError(Box::new(ProtoKeyError::default()))
+            Error::KeyError(Box::default())
         }
 
         fn region_error() -> Error {
-            Error::RegionError(Box::new(ProtoRegionError::default()))
+            Error::RegionError(Box::default())
         }
 
         /// The deadline fires on a read that never completes — the hang this exists to

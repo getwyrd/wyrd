@@ -1006,9 +1006,13 @@ fn the_workflow_runs_on_pull_requests_and_nightly_and_is_not_a_merge_gate() {
 
 // ─── (5) the feature-gated type-checks, and their INDEPENDENT toolchain gates ──────────
 
-/// Is `row` a `cargo check -p <pkg> --features <feature> …` invocation?
+/// Is `row` a `cargo clippy -p <pkg> --features <feature> …` invocation?
+/// Clippy, not check (#619): these rows are the ONLY step that compiles the
+/// feature-gated bodies, so linting them here is what puts `clippy.toml` and
+/// `clippy.all = "deny"` in reach of code behind `fdb` / `tikv`. Clippy
+/// type-checks too, so the anti-rot guarantee these rows carry is unchanged.
 fn is_check_of(row: &[&str], pkg: &str, feature: &str) -> bool {
-    row.first() == Some(&"check")
+    row.first() == Some(&"clippy")
         && row.windows(2).any(|w| w == ["-p", pkg])
         && row.windows(2).any(|w| w == ["--features", feature])
 }

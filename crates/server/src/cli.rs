@@ -301,7 +301,7 @@ async fn open_tikv_meta() -> Result<wyrd_metadata_tikv::TikvMetadataStore, BoxEr
         "tikv backend: set WYRD_TIKV_PD_ENDPOINTS to the PD endpoints (comma-separated)"
     })?;
     let endpoints = parse_endpoints(&raw)?;
-    Ok(wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints).await?)
+    wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints).await
 }
 
 /// Connect the production FoundationDB metadata store. Compiled only under the
@@ -391,7 +391,7 @@ async fn open_etcd_coordination() -> Result<wyrd_coordination_etcd::EtcdCoordina
         "etcd backend: set WYRD_ETCD_ENDPOINTS to the etcd endpoints (comma-separated)"
     })?;
     let endpoints = parse_endpoints(&raw)?;
-    Ok(wyrd_coordination_etcd::EtcdCoordination::connect(&endpoints).await?)
+    wyrd_coordination_etcd::EtcdCoordination::connect(&endpoints).await
 }
 
 /// Parse `args` (including argv[0]) and run the requested command, returning the

@@ -1848,9 +1848,15 @@ mod tests {
     // so it could not tell the two apart — and telling them apart is the whole point of the
     // `tikv,etcd` row (the gateway's dispatch arm is `cfg(all(tikv, etcd))`). A guard that
     // passes under both spellings guards nothing.
+    // `clippy `, not `check ` (#619): these rows are the ONLY step that compiles the
+    // feature-gated bodies, so they are also the only place `clippy.toml` and
+    // `clippy.all = "deny"` can reach code behind `fdb`/`tikv`. Clippy type-checks
+    // too, so the anti-rot guarantee these rows carry is unchanged — but asserting
+    // the spelling keeps a future edit from silently dropping back to `check` and
+    // taking the lint coverage with it.
     fn is_feature_check(pkg: &'static str, feature: &'static str) -> impl Fn(&String) -> bool {
         move |c: &String| {
-            c.starts_with("check ")
+            c.starts_with("clippy ")
                 && c.contains(&format!("-p {pkg}"))
                 && c.contains(&format!("--features {feature} "))
                 && c.contains("--tests")
@@ -1886,7 +1892,7 @@ mod tests {
             let is_tikv_check = is_feature_check(pkg, features);
             assert!(
                 with_toolchain.iter().any(&is_tikv_check),
-                "run_ci must invoke `cargo check -p {pkg} --features {features} --tests` when \
+                "run_ci must invoke `cargo clippy -p {pkg} --features {features} --tests` when \
                  the TiKV toolchain is present, so the feature-gated TiKV surface — including \
                  the cli.rs selection arms AND the tikv×etcd gateway dispatch arm (#443's \
                  retained fallback, the shape `deploy/small-multi-node/` actually runs) — is \
@@ -1922,7 +1928,7 @@ mod tests {
             let is_fdb_check = is_feature_check(pkg, features);
             assert!(
                 fdb_only.iter().any(&is_fdb_check),
-                "run_ci must invoke `cargo check -p {pkg} --features {features} --tests` when \
+                "run_ci must invoke `cargo clippy -p {pkg} --features {features} --tests` when \
                  the FDB toolchain is declared, independently of WYRD_TIKV_TOOLCHAIN: \
                  {fdb_only:?}"
             );

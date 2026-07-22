@@ -204,8 +204,8 @@ jobs:
       #     WYRD_TIKV_TOOLCHAIN=1 cargo xtask ci
       - name: Compile the tikv feature (crate + cli.rs selection arms + tikv×etcd + tests)
         run: |
-          cargo check -p wyrd-metadata-tikv --features tikv --tests
-          cargo check -p wyrd-server --features tikv,etcd --tests
+          cargo clippy -p wyrd-metadata-tikv --features tikv --tests
+          cargo clippy -p wyrd-server --features tikv,etcd --tests
 
   # Spell-check (typos) as its OWN always-on status check. Unlike the Rust gate,
   # it carries no docs-skip: prose lives in docs/ and specs, so a docs-only PR is
