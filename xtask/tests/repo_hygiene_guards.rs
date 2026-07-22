@@ -754,6 +754,58 @@ fn scan_crate_roots_accepts_any_forbid_list_containing_unsafe_code() {
 }
 
 #[test]
+fn a_cfg_attr_touching_unsafe_code_is_a_conditional_policy_and_red() {
+    // `#![cfg_attr(feature = "fdb", allow(unsafe_code))]` lowers the level to
+    // `allow` whenever the feature is on, so the crate permits unsafe in some
+    // configuration. The guard cannot evaluate the predicate, so it refuses a
+    // conditional unsafe policy — the level must hold unconditionally.
+    let dir = fixture_dir("cfg-attr");
+    plant_crate(
+        &dir.join("crates"),
+        "metadata-fdb",
+        "#![deny(unsafe_code)]\n#![cfg_attr(feature = \"fdb\", allow(unsafe_code))]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "conditional-forbid",
+        "#![cfg_attr(not(test), forbid(unsafe_code))]\npub fn f() {}\n",
+    );
+
+    let mut violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
+    std::fs::remove_dir_all(&dir).ok();
+    violations.sort();
+
+    assert_eq!(
+        violations.len(),
+        2,
+        "both conditional roots are red: {violations:?}"
+    );
+    assert!(
+        violations.iter().all(|v| v.contains("conditional")),
+        "the message explains the policy is not uniform: {violations:?}"
+    );
+}
+
+#[test]
+fn scan_crate_roots_accepts_a_leading_utf8_bom() {
+    // rustc accepts a UTF-8 BOM, but `str::trim()` does not strip U+FEFF, so a
+    // BOM-prefixed `#![forbid(unsafe_code)]` would not be recognized as the
+    // first token — a false red on a compliant file.
+    let dir = fixture_dir("bom");
+    plant_crate(
+        &dir,
+        "bommed",
+        "\u{feff}#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        violations.is_empty(),
+        "a BOM must not defeat the attribute: {violations:?}"
+    );
+}
+
+#[test]
 fn the_deny_exemption_is_red_when_a_later_allow_overrides_it() {
     // The FFI root requires `deny` (its item-level `#[allow]` must be able to
     // override it). But a CRATE-LEVEL `#![allow(unsafe_code)]` after the deny

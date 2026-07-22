@@ -39,7 +39,7 @@ use std::path::Path;
 /// Blanking string bodies (rather than copying them through) is what makes the
 /// walk correct on real preambles: `#![doc(html_root_url = "https://…")]` must
 /// not have its `//` read as a comment, and `#![doc = "unmatched ["]` must not
-/// have its bracket counted when [`preamble_unsafe_level`] balances an attribute.
+/// have its bracket counted when [`preamble_unsafe`] balances an attribute.
 /// It also means an attribute spelled inside a string no longer counts as
 /// present. Normal strings honor `\` escapes; raw strings are matched by hash
 /// count; inside a block comment, quotes are plain text.
@@ -288,21 +288,54 @@ fn attribute_level_for_unsafe(attr: &str) -> Option<&'static str> {
     None
 }
 
-/// The EFFECTIVE crate-level lint level applied to `unsafe_code` by the
-/// preamble, or `None` if the preamble sets none.
+/// Does the inner attribute conditionally set a lint level on `unsafe_code`
+/// via `cfg_attr`? `#![cfg_attr(feature = "x", allow(unsafe_code))]` lowers
+/// the level to `allow` whenever the predicate holds — so the crate's unsafe
+/// policy varies by configuration, which the guard cannot accept: it must be
+/// forbidden/denied in EVERY configuration. Detected by shape (a `cfg_attr`
+/// attribute mentioning `unsafe_code`), because the guard cannot evaluate the
+/// predicate.
+fn attribute_conditionally_touches_unsafe(attr: &str) -> bool {
+    let compact: String = attr.split_whitespace().collect();
+    compact
+        .strip_prefix("#![")
+        .and_then(|s| s.strip_suffix("]"))
+        .is_some_and(|inner| inner.starts_with("cfg_attr(") && inner.contains("unsafe_code"))
+}
+
+/// The unsafe-code verdict a crate-level preamble produces.
+struct PreambleUnsafe {
+    /// The last UNCONDITIONAL crate-level level applied to `unsafe_code`, or
+    /// `None` if the preamble sets none.
+    level: Option<&'static str>,
+    /// A `cfg_attr` in the preamble sets a level on `unsafe_code` in some
+    /// configuration — the policy is not uniform, so no fixed level can be
+    /// certified.
+    conditional: bool,
+}
+
+/// The EFFECTIVE crate-level unsafe-code verdict for a comment-stripped
+/// preamble.
 ///
 /// rustc applies the LAST level set before the first item, so the walk does
 /// not stop at the first match: `#![deny(unsafe_code)]` followed by
 /// `#![allow(unsafe_code)]` resolves to `allow`, and a guard that returned on
 /// the deny would miss the downgrade. (Only reachable for the `deny`
-/// exemption — a later override of a `forbid` does not compile.) The walk
-/// accepts blank lines, a leading shebang, and inner attributes spanning
-/// lines (tracked by bracket balance), and stops at the first real item: an
-/// occurrence inside a nested module — even behind `#[cfg(any())]` — scopes
-/// to that module only and never reaches this walk.
-fn preamble_unsafe_level(stripped: &str) -> Option<&'static str> {
+/// exemption — a later override of a `forbid` does not compile.) A
+/// `cfg_attr` touching `unsafe_code` makes the policy configuration-dependent
+/// (`conditional`). The walk accepts a leading UTF-8 BOM (rustc does), blank
+/// lines, a shebang, and inner attributes spanning lines (tracked by bracket
+/// balance), and stops at the first real item: an occurrence inside a nested
+/// module — even behind `#[cfg(any())]` — scopes to that module only and
+/// never reaches this walk.
+fn preamble_unsafe(stripped: &str) -> PreambleUnsafe {
+    // rustc accepts a leading BOM; `str::trim()` does not remove U+FEFF, so an
+    // un-stripped BOM would make the first line not start with `#![` and end
+    // the walk before the attribute — a false red on a compliant file.
+    let stripped = stripped.strip_prefix('\u{feff}').unwrap_or(stripped);
     let mut pending = String::new(); // an inner attribute still open across lines
     let mut effective = None;
+    let mut conditional = false;
     for (idx, raw) in stripped.lines().enumerate() {
         let t = raw.trim();
         // A first-line `#!` that is not `#![` is a SHEBANG, which rustc skips
@@ -324,11 +357,16 @@ fn preamble_unsafe_level(stripped: &str) -> Option<&'static str> {
         if pending.matches(']').count() >= pending.matches('[').count() {
             if let Some(level) = attribute_level_for_unsafe(&pending) {
                 effective = Some(level);
+            } else if attribute_conditionally_touches_unsafe(&pending) {
+                conditional = true;
             }
             pending.clear();
         }
     }
-    effective
+    PreambleUnsafe {
+        level: effective,
+        conditional,
+    }
 }
 
 /// Extract every non-test Cargo target's `src_path` from `cargo metadata
@@ -489,13 +527,22 @@ pub fn scan_roots(
             .find(|(root, _, _)| Path::new(root) == rel)
             .map(|(_, level, _)| *level)
             .unwrap_or("forbid");
-        // The EFFECTIVE preamble level must equal what the root requires. A
-        // commented-out attribute is inactive, one inside a nested module
-        // scopes there only, and a later override wins — none satisfies the
-        // guard. `deny` and `forbid` are distinct requirements: the FFI root
-        // needs `deny` (a later item-level `#[allow]` must be able to override
-        // it), every other root needs `forbid`.
-        if preamble_unsafe_level(&strip_comments(&content)) != Some(level) {
+        // The EFFECTIVE preamble level must equal what the root requires, in
+        // EVERY configuration. A commented-out attribute is inactive, one
+        // inside a nested module scopes there only, a later override wins, and
+        // a `cfg_attr` makes the level configuration-dependent — none
+        // satisfies the guard. `deny` and `forbid` are distinct requirements:
+        // the FFI root needs `deny` (a later item-level `#[allow]` must be
+        // able to override it), every other root needs `forbid`.
+        let verdict = preamble_unsafe(&strip_comments(&content));
+        if verdict.conditional {
+            violations.push(format!(
+                "{}: crate-level unsafe-code policy is conditional — a `cfg_attr` sets a \
+                 level on `unsafe_code`, so some configuration may permit it. It must be \
+                 `#![{level}(unsafe_code)]` unconditionally.",
+                file.display()
+            ));
+        } else if verdict.level != Some(level) {
             violations.push(format!(
                 "{}: missing active crate-level `#![{level}(unsafe_code)]` \
                  (a lint list containing `unsafe_code` satisfies it; a later \
