@@ -74,6 +74,26 @@ fn scan_gitlinks_is_green_for_a_declared_submodule() {
 }
 
 #[test]
+fn scan_gitlinks_follows_gits_effective_value_for_duplicate_stanzas() {
+    // `[submodule "dep"]` repeated with different paths: git resolves the
+    // single-valued key to the LAST definition, and `git submodule status`
+    // fatals on the shadowed first path ("no submodule mapping found in
+    // .gitmodules for path 'vendor/a'" — verified live). The shadowed path
+    // must therefore NOT legitimize a gitlink.
+    let cfg = "submodule.dep.path\nvendor/a\0submodule.dep.url\nhttps://example.com/a\0\
+               submodule.dep.path\nvendor/b\0submodule.dep.url\nhttps://example.com/b\0";
+    let declared = gitmodules_config_paths(cfg);
+    assert_eq!(declared, ["vendor/b"], "last definition wins: {declared:?}");
+    let ls = "160000 aaaaaaaa 0\tvendor/a\x00160000 bbbbbbbb 0\tvendor/b\0";
+    let violations = scan_gitlinks(ls, &declared);
+    assert_eq!(violations.len(), 1, "{violations:?}");
+    assert!(
+        violations[0].starts_with("vendor/a:"),
+        "the shadowed path is the violation: {violations:?}"
+    );
+}
+
+#[test]
 fn scan_gitlinks_is_red_on_a_url_less_submodule_stanza() {
     // A path-only stanza is not a usable declaration: git refuses it at
     // consumption time ("fatal: No url found for submodule path ... in

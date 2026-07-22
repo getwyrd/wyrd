@@ -11,8 +11,10 @@
 //! check) and flags (a) any mode-160000 entry whose path is not a declared
 //! submodule, and (b) ANY tracked path under `.claude/worktrees/` — agent
 //! worktrees are never repository content. Declared submodule paths come from
-//! `git config -z -f .gitmodules` (parsed by [`gitmodules_config_paths`]), so
-//! git itself handles config quoting/escaping rather than an ad-hoc parser.
+//! the INDEX blob `git config -z --blob :.gitmodules` (parsed by
+//! [`gitmodules_config_paths`]), so git itself handles config
+//! quoting/escaping rather than an ad-hoc parser, and both halves of the
+//! check read the same snapshot the commit would carry.
 //! Both functions are pure text → the flippable test feeds synthetic listings;
 //! planting a real gitlink in a fixture would itself commit the accident the
 //! guard exists to prevent.
@@ -169,9 +171,25 @@ pub fn index_has(ls_files_z: &str, path: &str) -> bool {
 /// --recurse-submodules` / `submodule update --init` — verified live), so a
 /// gitlink covered only by a url-less stanza still breaks fresh clones and
 /// must stay a violation.
+///
+/// Duplicate stanza names follow git's EFFECTIVE-value semantics: for a
+/// single-valued key git resolves the last definition (`git config --get`),
+/// so when `[submodule "dep"]` appears twice mapping first `vendor/a` then
+/// `vendor/b`, only `vendor/b` is a real mapping — `git submodule status`
+/// fatals with `no submodule mapping found in .gitmodules for path
+/// 'vendor/a'` (verified live). Keeping every raw `--get-regexp` row would
+/// let the shadowed path legitimize a gitlink git itself cannot resolve.
 pub fn gitmodules_config_paths(config_z: &str) -> Vec<String> {
-    let mut paths: Vec<(String, String)> = Vec::new(); // (stanza name, path)
-    let mut with_url: Vec<String> = Vec::new(); // stanza names with a real url
+    let mut path_of: Vec<(String, String)> = Vec::new(); // stanza name -> effective path
+    let mut url_of: Vec<(String, String)> = Vec::new(); // stanza name -> effective url
+    let upsert = |map: &mut Vec<(String, String)>, name: &str, value: &str| {
+        // Last definition wins, matching `git config --get`.
+        if let Some(slot) = map.iter_mut().find(|(n, _)| n == name) {
+            slot.1 = value.to_string();
+        } else {
+            map.push((name.to_string(), value.to_string()));
+        }
+    };
     for record in config_z.split('\0') {
         let Some((key, value)) = record.split_once('\n') else {
             continue;
@@ -182,18 +200,18 @@ pub fn gitmodules_config_paths(config_z: &str) -> Vec<String> {
             continue;
         };
         if let Some(name) = rest.strip_suffix(".path") {
-            if !value.is_empty() {
-                paths.push((name.to_string(), value.to_string()));
-            }
+            upsert(&mut path_of, name, value);
         } else if let Some(name) = rest.strip_suffix(".url") {
-            if !value.is_empty() {
-                with_url.push(name.to_string());
-            }
+            upsert(&mut url_of, name, value);
         }
     }
-    paths
+    path_of
         .into_iter()
-        .filter_map(|(name, path)| with_url.contains(&name).then_some(path))
+        .filter_map(|(name, path)| {
+            let usable =
+                !path.is_empty() && url_of.iter().any(|(n, url)| *n == name && !url.is_empty());
+            usable.then_some(path)
+        })
         .collect()
 }
 
