@@ -13,6 +13,13 @@
 //! brings up the throwaway `deploy/` TiKV, sets the endpoint, rebuilds with
 //! `--features tikv`, and runs it for real.
 
+// wall-clock exempt (test crate): fresh-namespace uniqueness must hold across
+// RUNS against a live, persistent external cluster — a pid+counter scheme
+// collides with leftovers from earlier runs; real time is the tool (#619).
+// File scope (not per-site) is deliberate here: a test crate never
+// ships, so no production lifecycle can acquire a mixed clock from it.
+#![allow(clippy::disallowed_methods)]
+
 /// The PD (Placement Driver) endpoints, or `None` when TiKV is not configured.
 fn pd_endpoints() -> Option<Vec<String>> {
     match std::env::var("WYRD_TIKV_PD_ENDPOINTS") {

@@ -35,6 +35,13 @@
 //! `cargo xtask fdb-conformance` brings up the throwaway `deploy/fdb-single-node` cluster,
 //! sets the cluster file, rebuilds with `--features fdb`, and runs it for real.
 
+// wall-clock exempt (test crate): fresh-namespace uniqueness must hold across
+// RUNS against a live, persistent external cluster — a pid+counter scheme
+// collides with leftovers from earlier runs; real time is the tool (#619).
+// File scope (not per-site) is deliberate here: a test crate never
+// ships, so no production lifecycle can acquire a mixed clock from it.
+#![allow(clippy::disallowed_methods)]
+
 /// The FoundationDB cluster file, or `None` when FDB is not configured.
 fn cluster_file() -> Option<String> {
     match std::env::var("WYRD_FDB_CLUSTER_FILE") {

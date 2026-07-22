@@ -18,6 +18,13 @@
 //! `501 NotImplemented` before touching the body, leaving the destination untouched, while
 //! an ordinary PUT (no such header) still stores normally.
 
+// wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
+// live in-process server use real wall time; nothing here mixes clock sources
+// within one asserted lifecycle (#619).
+// File scope (not per-site) is deliberate here: a test crate never
+// ships, so no production lifecycle can acquire a mixed clock from it.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

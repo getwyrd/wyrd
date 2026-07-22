@@ -536,18 +536,20 @@ fn the_live_client_library_adapter_reads_the_real_env_and_filesystem() {
     // call). The configured directory is searched FIRST and short-circuits, and we control
     // whether the file under it exists, so neither assertion depends on whether the host has
     // a system `libfdb_c` (this host does; the plain verify worktree does not).
+    // pid + per-process counter for uniqueness — no wall-clock read (#619).
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let unique = format!(
         "wyrd-fdb-doctor-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is after the epoch")
-            .as_nanos()
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let present_dir = std::env::temp_dir().join(format!("{unique}-present"));
     let absent_dir = std::env::temp_dir().join(format!("{unique}-absent"));
     std::fs::create_dir_all(&present_dir).expect("create the present tempdir");
     std::fs::create_dir_all(&absent_dir).expect("create the absent tempdir");
+    // The absent dir must be soname-free even if a crashed prior run's dir of
+    // the same name (PID reuse) is being reused.
+    let _ = std::fs::remove_file(absent_dir.join(fdb_doctor::CLIENT_LIBRARY_SONAME));
     let planted = present_dir.join(fdb_doctor::CLIENT_LIBRARY_SONAME);
     std::fs::write(&planted, b"not a real shared object").expect("plant a fake libfdb_c.so");
     let planted_str = planted.to_string_lossy().into_owned();
@@ -1004,9 +1006,13 @@ fn the_workflow_runs_on_pull_requests_and_nightly_and_is_not_a_merge_gate() {
 
 // ─── (5) the feature-gated type-checks, and their INDEPENDENT toolchain gates ──────────
 
-/// Is `row` a `cargo check -p <pkg> --features <feature> …` invocation?
+/// Is `row` a `cargo clippy -p <pkg> --features <feature> …` invocation?
+/// Clippy, not check (#619): these rows are the ONLY step that compiles the
+/// feature-gated bodies, so linting them here is what puts `clippy.toml` and
+/// `clippy.all = "deny"` in reach of code behind `fdb` / `tikv`. Clippy
+/// type-checks too, so the anti-rot guarantee these rows carry is unchanged.
 fn is_check_of(row: &[&str], pkg: &str, feature: &str) -> bool {
-    row.first() == Some(&"check")
+    row.first() == Some(&"clippy")
         && row.windows(2).any(|w| w == ["-p", pkg])
         && row.windows(2).any(|w| w == ["--features", feature])
 }

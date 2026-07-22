@@ -47,6 +47,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wyrd_testkit::{fdb_peer_sees_target_live, heal_is_complete, partition_took_effect};
 
+/// The module's single wall-clock owner (#619). The nemesis drives REAL cluster
+/// faults on real hosts — outside DST authority by design (ADR-0009) — so its
+/// schedules, deadlines and liveness probes are wall-clock-native. Routing every
+/// read through one annotated seam keeps the exemption reviewable: a bare
+/// `SystemTime::now()` added later still fails the lint.
+fn wall_now() -> SystemTime {
+    #[allow(clippy::disallowed_methods)]
+    SystemTime::now()
+}
+
 /// Which of the three fault classes a nemesis leg injects. Both #408 and the battery import
 /// this to enumerate the campaign.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -509,7 +519,7 @@ fn run_docker(args: &[&str]) -> Result<String, String> {
 }
 
 fn harness_epoch_secs() -> i64 {
-    SystemTime::now()
+    wall_now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
@@ -628,8 +638,8 @@ impl NemesisLeg for PartitionLeg {
     }
 
     fn plan(&self) -> Result<(), String> {
-        let deadline = SystemTime::now() + Duration::from_secs(90);
-        while SystemTime::now() < deadline {
+        let deadline = wall_now() + Duration::from_secs(90);
+        while wall_now() < deadline {
             if self.peers_see_target_live() {
                 return Ok(());
             }
@@ -653,9 +663,9 @@ impl NemesisLeg for PartitionLeg {
     fn confirm_materialized(&self) -> Result<PartitionEvidence, String> {
         // Poll the survivors' view for up to 45s; `during == true` after the whole window is a
         // no-op cut (recorded, not hidden). The container must stay `running` throughout.
-        let deadline = SystemTime::now() + Duration::from_secs(45);
+        let deadline = wall_now() + Duration::from_secs(45);
         let mut during = true;
-        while SystemTime::now() < deadline {
+        while wall_now() < deadline {
             if !self.peers_see_target_live() {
                 during = false;
                 break;
@@ -696,8 +706,8 @@ impl NemesisLeg for PartitionLeg {
     }
 
     fn confirm_healed(&self, timeout: Duration) -> bool {
-        let deadline = SystemTime::now() + timeout;
-        while SystemTime::now() < deadline {
+        let deadline = wall_now() + timeout;
+        while wall_now() < deadline {
             if self.peers_see_target_live() {
                 return true;
             }
@@ -762,8 +772,8 @@ impl NemesisLeg for ProcessPauseLeg {
     }
 
     fn plan(&self) -> Result<(), String> {
-        let deadline = SystemTime::now() + Duration::from_secs(90);
-        while SystemTime::now() < deadline {
+        let deadline = wall_now() + Duration::from_secs(90);
+        while wall_now() < deadline {
             if self.target_served() {
                 return Ok(());
             }
@@ -784,9 +794,9 @@ impl NemesisLeg for ProcessPauseLeg {
         // seconds to drop a frozen peer, so a single immediate probe is near-deterministically
         // inconclusive. `during` stays `true` only if the target kept serving the WHOLE window
         // (a no-op freeze). Crucially this does NOT unpause — the workload runs under the freeze.
-        let deadline = SystemTime::now() + Duration::from_secs(45);
+        let deadline = wall_now() + Duration::from_secs(45);
         let mut during = true;
-        while SystemTime::now() < deadline {
+        while wall_now() < deadline {
             if !self.target_served() {
                 during = false;
                 break;
@@ -821,8 +831,8 @@ impl NemesisLeg for ProcessPauseLeg {
 
     fn confirm_healed(&self, timeout: Duration) -> bool {
         // The third serve→pause→**serve** transition: the survivors see the target serving again.
-        let deadline = SystemTime::now() + timeout;
-        while SystemTime::now() < deadline {
+        let deadline = wall_now() + timeout;
+        while wall_now() < deadline {
             if self.target_served() {
                 return true;
             }
@@ -904,12 +914,12 @@ impl ClockSkewLeg {
     }
 
     fn wait_execable(&self, timeout: Duration) -> Result<i64, String> {
-        let deadline = SystemTime::now() + timeout;
+        let deadline = wall_now() + timeout;
         loop {
             if let Some(epoch) = self.container_epoch() {
                 return Ok(epoch);
             }
-            if SystemTime::now() >= deadline {
+            if wall_now() >= deadline {
                 return Err("clock-skew leg: target container never became exec-able".into());
             }
             std::thread::sleep(Duration::from_secs(2));
@@ -922,14 +932,14 @@ impl ClockSkewLeg {
     /// re-stabilization gate Design §3 requires between a recreate and the measured workload, so
     /// the leg never measures the restart. Mirrors [`PartitionLeg::plan`]'s survivor-side poll.
     fn wait_cluster_recovered(&self, timeout: Duration) -> Result<(), String> {
-        let deadline = SystemTime::now() + timeout;
+        let deadline = wall_now() + timeout;
         loop {
             if let Some(status) = survivor_status_json(&self.survivor_container) {
                 if fdb_cluster_fully_recovered(&status) {
                     return Ok(());
                 }
             }
-            if SystemTime::now() >= deadline {
+            if wall_now() >= deadline {
                 return Err(
                     "clock-skew leg: cluster did not fully recover / re-replicate after the \
                      force-recreate within the timeout — refusing to open the workload window on a \
@@ -992,8 +1002,8 @@ impl NemesisLeg for ClockSkewLeg {
     }
 
     fn confirm_healed(&self, timeout: Duration) -> bool {
-        let deadline = SystemTime::now() + timeout;
-        while SystemTime::now() < deadline {
+        let deadline = wall_now() + timeout;
+        while wall_now() < deadline {
             if let Some(epoch) = self.container_epoch() {
                 // Healed = the clock is back within the floor of the harness clock.
                 if clock_offset_secs(epoch, harness_epoch_secs()).unsigned_abs() < self.floor_secs {

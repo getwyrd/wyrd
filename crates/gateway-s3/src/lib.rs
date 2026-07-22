@@ -1457,6 +1457,9 @@ where
     G: ObjectGateway + ContainerGateway,
 {
     let request_id = state.request_ids.mint();
+    // wall-clock exempt: request-latency observation stamp — owns no lifecycle
+    // another clock also writes (#619).
+    #[allow(clippy::disallowed_methods)]
     let started = SystemTime::now();
     let method = req.method().clone();
     // The request plane's op label + metrics sink, read before `state` is moved into the
@@ -1572,6 +1575,9 @@ where
         &state.config.credentials,
         &state.config.region,
         &state.config.service,
+        // wall-clock exempt: SigV4's clock-skew window is defined against real
+        // wall time (#619).
+        #[allow(clippy::disallowed_methods)]
         SystemTime::now(),
     ) {
         Ok(payload) => payload,
@@ -2780,6 +2786,10 @@ fn parse_http_date(value: &str, now_secs: u64) -> Option<u64> {
 /// The wall clock as epoch seconds — the `now` the RFC-850 two-digit-year rule is relative to
 /// ([`parse_rfc850_date`]). Kept at the wire edge so the parsers stay pure over their inputs.
 fn epoch_secs_now() -> u64 {
+    // wall-clock exempt: the RFC 9110 clock-relative two-digit-year pivot is
+    // defined against real wall time; kept at the wire edge so the parsers
+    // stay pure (#619).
+    #[allow(clippy::disallowed_methods)]
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3428,6 +3438,9 @@ fn classify(err: &BoxError) -> (StatusCode, &'static str, String) {
 
 #[cfg(test)]
 mod tests {
+    // wall-clock exempt: tests stamp arbitrary wall times into log/signature
+    // fixtures; no test asserts on a clocked lifecycle (#619).
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     /// An error whose real diagnosis lives in its `source()` chain — the shape every backend

@@ -18,6 +18,13 @@
 //! the hardcoded `application/octet-stream` regardless of what the PUT sent. GREEN with the
 //! metadata model in place.
 
+// wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
+// live in-process server use real wall time; nothing here mixes clock sources
+// within one asserted lifecycle (#619).
+// File scope (not per-site) is deliberate here: a test crate never
+// ships, so no production lifecycle can acquire a mixed clock from it.
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;

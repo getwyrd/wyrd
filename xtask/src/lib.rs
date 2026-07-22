@@ -36,8 +36,8 @@ pub const TIKV_TOOLCHAIN_ENV: &str = "WYRD_TIKV_TOOLCHAIN";
 /// other's.
 pub const FDB_TOOLCHAIN_ENV: &str = "WYRD_FDB_TOOLCHAIN";
 
-/// The dedicated `cargo check --features …` runs `run_ci` makes to type-check
-/// feature-gated code the default `--workspace` build never compiles.
+/// The dedicated `cargo clippy --features …` runs `run_ci` makes to compile AND
+/// lint feature-gated code the default `--workspace` build never touches.
 ///
 /// `run_ci`'s `build`/`test`/`clippy` all run `--workspace` with **default**
 /// features. `--all-targets` widens the *target kinds* (bins, tests, benches) but
@@ -72,11 +72,16 @@ pub const FDB_TOOLCHAIN_ENV: &str = "WYRD_FDB_TOOLCHAIN";
 /// `main.rs`'s `run_ci_steps` is its only production caller; that call site derives both
 /// booleans from the two env names above and is covered by `run_ci_steps`' own
 /// recording-executor unit test, so reading one gate's variable for the other flips red.
+/// `clippy`, not `check` (#619): the workspace clippy step never enables these
+/// features, so a `#[cfg(feature = ...)]` body was compiled by the anti-rot bar
+/// but linted by nothing — `clippy.toml`'s wall-clock ban and the whole
+/// `clippy.all = "deny"` policy stopped at the feature boundary. Clippy also
+/// type-checks, so this is a strict superset of what `check` covered.
 pub fn feature_gated_checks(tikv: bool, fdb: bool) -> Vec<Vec<&'static str>> {
     let mut checks = Vec::new();
     if tikv {
         checks.push(vec![
-            "check",
+            "clippy",
             "-p",
             "wyrd-metadata-tikv",
             "--features",
@@ -98,7 +103,7 @@ pub fn feature_gated_checks(tikv: bool, fdb: bool) -> Vec<Vec<&'static str>> {
         // gateways run `--metadata-backend tikv --coordination-backend etcd`). Compiling the
         // pair also compiles every `tikv`-only arm, so it is a superset, not a trade.
         checks.push(vec![
-            "check",
+            "clippy",
             "-p",
             "wyrd-server",
             "--features",
@@ -108,7 +113,7 @@ pub fn feature_gated_checks(tikv: bool, fdb: bool) -> Vec<Vec<&'static str>> {
     }
     if fdb {
         checks.push(vec![
-            "check",
+            "clippy",
             "-p",
             "wyrd-metadata-fdb",
             "--features",
@@ -120,7 +125,7 @@ pub fn feature_gated_checks(tikv: bool, fdb: bool) -> Vec<Vec<&'static str>> {
         // builds `FEATURES: "fdb,etcd"`. A plain `--features fdb` check left that arm — the
         // one the CANONICAL production stack actually executes — compiled by no CI job at all.
         checks.push(vec![
-            "check",
+            "clippy",
             "-p",
             "wyrd-server",
             "--features",

@@ -148,8 +148,8 @@ jobs:
       # at build time.
       - name: Type-check the fdb feature arms
         run: |
-          cargo check -p wyrd-metadata-fdb --features fdb --tests
-          cargo check -p wyrd-server --features fdb,etcd --tests
+          cargo clippy -p wyrd-metadata-fdb --features fdb --tests
+          cargo clippy -p wyrd-server --features fdb,etcd --tests
 
       # Brings up deploy/fdb-single-node, runs `configure new single memory`, writes the
       # host-side cluster file, drives the five `--features fdb` test legs, and tears the

@@ -1451,18 +1451,34 @@ const DST_SEEDS: &str = "50";
 /// flag and seed count are set on this child process only, so the normal build
 /// is untouched; this recompiles `wyrd-dst` and its deps under the simulator.
 fn run_dst() -> Result<(), String> {
-    print_step(&["cargo", "test", "-p", "wyrd-dst", "(--cfg madsim)"]);
-
     // Append `--cfg madsim` to any existing RUSTFLAGS rather than clobbering it.
     let rustflags = match std::env::var("RUSTFLAGS") {
         Ok(existing) if !existing.is_empty() => format!("{existing} --cfg madsim"),
         _ => "--cfg madsim".to_string(),
     };
 
+    // Lint the DST tier too (#619). The workspace clippy step excludes
+    // `wyrd-dst` (it only compiles under `--cfg madsim`), so without this leg
+    // the crate is the one production tree no lint policy reaches — including
+    // `clippy.toml`'s wall-clock ban, whose whole point is that a new clock
+    // read is a reviewed decision. Same RUSTFLAGS as the test run below, so
+    // one `--cfg madsim` build serves both.
+    print_step(&["cargo", "clippy", "-p", "wyrd-dst", "(--cfg madsim)"]);
+    let status = Command::new("cargo")
+        .args(["clippy", "-p", "wyrd-dst", "--all-targets"])
+        .current_dir(workspace_root())
+        .env("RUSTFLAGS", &rustflags)
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!("madsim DST clippy failed with {status}"));
+    }
+
+    print_step(&["cargo", "test", "-p", "wyrd-dst", "(--cfg madsim)"]);
     let status = Command::new("cargo")
         .args(["test", "-p", "wyrd-dst"])
         .current_dir(workspace_root())
-        .env("RUSTFLAGS", rustflags)
+        .env("RUSTFLAGS", &rustflags)
         .env("MADSIM_TEST_NUM", DST_SEEDS)
         .status()
         .map_err(|e| format!("failed to spawn cargo: {e}"))?;
@@ -1832,9 +1848,15 @@ mod tests {
     // so it could not tell the two apart — and telling them apart is the whole point of the
     // `tikv,etcd` row (the gateway's dispatch arm is `cfg(all(tikv, etcd))`). A guard that
     // passes under both spellings guards nothing.
+    // `clippy `, not `check ` (#619): these rows are the ONLY step that compiles the
+    // feature-gated bodies, so they are also the only place `clippy.toml` and
+    // `clippy.all = "deny"` can reach code behind `fdb`/`tikv`. Clippy type-checks
+    // too, so the anti-rot guarantee these rows carry is unchanged — but asserting
+    // the spelling keeps a future edit from silently dropping back to `check` and
+    // taking the lint coverage with it.
     fn is_feature_check(pkg: &'static str, feature: &'static str) -> impl Fn(&String) -> bool {
         move |c: &String| {
-            c.starts_with("check ")
+            c.starts_with("clippy ")
                 && c.contains(&format!("-p {pkg}"))
                 && c.contains(&format!("--features {feature} "))
                 && c.contains("--tests")
@@ -1870,7 +1892,7 @@ mod tests {
             let is_tikv_check = is_feature_check(pkg, features);
             assert!(
                 with_toolchain.iter().any(&is_tikv_check),
-                "run_ci must invoke `cargo check -p {pkg} --features {features} --tests` when \
+                "run_ci must invoke `cargo clippy -p {pkg} --features {features} --tests` when \
                  the TiKV toolchain is present, so the feature-gated TiKV surface — including \
                  the cli.rs selection arms AND the tikv×etcd gateway dispatch arm (#443's \
                  retained fallback, the shape `deploy/small-multi-node/` actually runs) — is \
@@ -1906,7 +1928,7 @@ mod tests {
             let is_fdb_check = is_feature_check(pkg, features);
             assert!(
                 fdb_only.iter().any(&is_fdb_check),
-                "run_ci must invoke `cargo check -p {pkg} --features {features} --tests` when \
+                "run_ci must invoke `cargo clippy -p {pkg} --features {features} --tests` when \
                  the FDB toolchain is declared, independently of WYRD_TIKV_TOOLCHAIN: \
                  {fdb_only:?}"
             );

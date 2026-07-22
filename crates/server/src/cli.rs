@@ -301,7 +301,7 @@ async fn open_tikv_meta() -> Result<wyrd_metadata_tikv::TikvMetadataStore, BoxEr
         "tikv backend: set WYRD_TIKV_PD_ENDPOINTS to the PD endpoints (comma-separated)"
     })?;
     let endpoints = parse_endpoints(&raw)?;
-    Ok(wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints).await?)
+    wyrd_metadata_tikv::TikvMetadataStore::connect(endpoints).await
 }
 
 /// Connect the production FoundationDB metadata store. Compiled only under the
@@ -391,7 +391,7 @@ async fn open_etcd_coordination() -> Result<wyrd_coordination_etcd::EtcdCoordina
         "etcd backend: set WYRD_ETCD_ENDPOINTS to the etcd endpoints (comma-separated)"
     })?;
     let endpoints = parse_endpoints(&raw)?;
-    Ok(wyrd_coordination_etcd::EtcdCoordination::connect(&endpoints).await?)
+    wyrd_coordination_etcd::EtcdCoordination::connect(&endpoints).await
 }
 
 /// Parse `args` (including argv[0]) and run the requested command, returning the
@@ -1449,6 +1449,9 @@ impl DServerConnector for GrpcDServerConnector {
 /// stamps its time-to-repair samples with. Monotonic enough for telemetry; a clock skew
 /// never corrupts state (the loop is fenced by leadership, not time).
 fn wall_clock_millis() -> u64 {
+    // wall-clock exempt: telemetry stamps; the loop is fenced by leadership,
+    // not time (#619).
+    #[allow(clippy::disallowed_methods)]
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

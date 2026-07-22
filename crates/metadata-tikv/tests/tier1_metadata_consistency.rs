@@ -96,6 +96,13 @@
 //! `cargo test --features tikv -- --ignored` (routed by
 //! `xtask::metadata_faults::metadata_tier_dispatch`).
 
+// wall-clock exempt (test crate): namespace uniqueness across runs against a
+// live cluster, and PD liveness comparisons against PD's own wall-clock
+// heartbeat stamps — both inherently real-time (#619).
+// File scope (not per-site) is deliberate here: a test crate never
+// ships, so no production lifecycle can acquire a mixed clock from it.
+#![allow(clippy::disallowed_methods)]
+
 /// The PD endpoints, or `None` when TiKV is not configured (clean-skip gate).
 fn pd_endpoints() -> Option<Vec<String>> {
     match std::env::var("WYRD_TIKV_PD_ENDPOINTS") {
