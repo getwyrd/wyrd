@@ -1390,14 +1390,17 @@ fn run_gitlink_guard() -> Result<(), String> {
     }
     let ls_files = String::from_utf8_lossy(&output.stdout);
     // Declared submodule paths via `git config -z` so git itself decodes any
-    // quoted/escaped values — no ad-hoc .gitmodules parsing here.
-    let declared = if root.join(".gitmodules").is_file() {
+    // quoted/escaped values — no ad-hoc .gitmodules parsing here. Read the
+    // INDEX blob (`--blob :.gitmodules`), not the working-tree file, so the
+    // declarations come from the same snapshot as `git ls-files -s` and an
+    // unstaged edit cannot legitimize a staged gitlink.
+    let declared = if xtask::repo_guard::index_has(&ls_files, ".gitmodules") {
         let cfg = Command::new("git")
             .args([
                 "config",
                 "-z",
-                "-f",
-                ".gitmodules",
+                "--blob",
+                ":.gitmodules",
                 "--get-regexp",
                 r"^submodule\..*\.(path|url)$",
             ])

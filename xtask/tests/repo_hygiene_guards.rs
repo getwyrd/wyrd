@@ -113,16 +113,16 @@ fn scan_gitlinks_is_green_over_the_real_index() {
         .expect("failed to spawn `git ls-files -s -z`");
     assert!(output.status.success(), "git ls-files -s -z must succeed");
     let ls = String::from_utf8_lossy(&output.stdout);
-    // Declared submodules via the SAME `git config -z` path the production
-    // guard reads (empty when no .gitmodules exists), so this regression stays
-    // green if a legitimate declared submodule is ever added.
-    let declared = if workspace_root().join(".gitmodules").is_file() {
+    // Declared submodules via the SAME index-snapshot path the production
+    // guard reads (`--blob :.gitmodules`; empty when untracked), so this
+    // regression stays green if a legitimate declared submodule is ever added.
+    let declared = if xtask::repo_guard::index_has(&ls, ".gitmodules") {
         let cfg = std::process::Command::new("git")
             .args([
                 "config",
                 "-z",
-                "-f",
-                ".gitmodules",
+                "--blob",
+                ":.gitmodules",
                 "--get-regexp",
                 r"^submodule\..*\.(path|url)$",
             ])

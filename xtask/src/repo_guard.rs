@@ -144,6 +144,19 @@ pub const UNSAFE_FORBID_ALLOWLIST: &[(&str, &str, &str)] = &[(
     "FFI: the FoundationDB C bindings need one audited #[allow(unsafe_code)]",
 )];
 
+/// Is `path` a tracked entry in NUL-delimited `git ls-files -s -z` output?
+/// Used to decide whether an INDEX `.gitmodules` blob exists at all — the
+/// gitlink guard reads declarations from the index (`git config --blob
+/// :.gitmodules`), never the working tree, so both halves of the check see
+/// the same snapshot the commit would carry (an unstaged declaration cannot
+/// legitimize a staged gitlink).
+pub fn index_has(ls_files_z: &str, path: &str) -> bool {
+    ls_files_z
+        .split('\0')
+        .filter_map(|record| record.split_once('\t'))
+        .any(|(_, p)| p == path)
+}
+
 /// Extract the *usable* submodule paths from NUL-delimited
 /// `git config -z -f .gitmodules --get-regexp '^submodule\..*\.(path|url)$'`
 /// output, whose record shape is `<key>\n<value>\0`. Letting `git config` do
