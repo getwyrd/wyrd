@@ -436,6 +436,67 @@ fn scan_crate_roots_accepts_comment_markers_inside_attribute_strings() {
 }
 
 #[test]
+fn scan_crate_roots_ignores_brackets_and_attributes_inside_strings() {
+    // Bracket characters inside a string literal must not unbalance the
+    // preamble walk (`#![doc = "unmatched ["]` before the forbid was a FALSE
+    // RED), and an attribute spelled inside a string must not count as
+    // present — both follow from blanking string bodies.
+    let dir = fixture_dir("string-brackets");
+    plant_crate(
+        &dir,
+        "bracketed",
+        "#![doc = \"unmatched [\"]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "raw-bracketed",
+        "#![doc = r#\"a ] and a [\"#]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "spelled-in-string",
+        "#![doc = \"#![forbid(unsafe_code)]\"]\npub fn f() {}\n",
+    );
+
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        violations.len(),
+        1,
+        "the two bracketed crates are compliant; only the string-spelled one is red: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("spelled-in-string"),
+        "{violations:?}"
+    );
+}
+
+#[test]
+fn scan_crate_roots_finds_packages_below_an_intermediate_directory() {
+    // A workspace may group packages under an intermediate dir
+    // (crates/storage/foo/Cargo.toml). A single-level listing walks past it,
+    // leaving that crate unscanned while the gate stays green.
+    let dir = fixture_dir("nested-pkg");
+    plant_crate(&dir, "top", "#![forbid(unsafe_code)]\npub fn f() {}\n");
+    std::fs::create_dir_all(dir.join("storage")).expect("create grouping dir");
+    plant_crate(&dir.join("storage"), "foo", "pub fn f() {}\n");
+
+    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        violations.len(),
+        1,
+        "the nested package is scanned: {violations:?}"
+    );
+    assert!(
+        violations[0].contains("storage") && violations[0].contains("foo"),
+        "{violations:?}"
+    );
+}
+
+#[test]
 fn scan_crate_roots_fails_closed_when_it_cannot_see_the_tree() {
     // A missing crates dir (e.g. after a workspace move) and a dir with no
     // crate roots must both be Err — a guard that cannot see the tree says

@@ -30,17 +30,22 @@
 
 use std::path::Path;
 
-/// Strip `//` line comments and (nesting-aware) `/* */` block comments, so an
-/// attribute that was commented OUT — inactive to rustc — cannot satisfy the
-/// unsafe-code scan by raw text match. String-aware where it matters: comment
-/// markers inside string literals — `#![doc(html_root_url = "https://…")]` is
-/// the canonical preamble case — are content, not comments (normal strings
-/// with `\` escapes, raw strings by hash count); inside a block comment,
-/// quotes are plain text. Deliberately NOT a full lexer: char literals and
-/// exotic token sequences below the preamble cannot affect the preamble walk
-/// (stripping is streaming and order-preserving), and an attribute spelled
-/// inside a raw string still counts as present — that requires writing the
-/// evasion on purpose; the threat model is accidental drift.
+/// Normalize source for the preamble walk: strip `//` line comments and
+/// (nesting-aware) `/* */` block comments — so an attribute commented OUT,
+/// inactive to rustc, cannot satisfy the scan by raw text match — and BLANK
+/// the contents of string literals, keeping their delimiters.
+///
+/// Blanking string bodies (rather than copying them through) is what makes the
+/// walk correct on real preambles: `#![doc(html_root_url = "https://…")]` must
+/// not have its `//` read as a comment, and `#![doc = "unmatched ["]` must not
+/// have its bracket counted when [`preamble_contains`] balances an attribute.
+/// It also means an attribute spelled inside a string no longer counts as
+/// present. Normal strings honor `\` escapes; raw strings are matched by hash
+/// count; inside a block comment, quotes are plain text.
+///
+/// Deliberately NOT a full lexer: char literals and exotic token sequences
+/// below the preamble cannot affect the verdict, because stripping is
+/// streaming and order-preserving and the walk stops at the first item.
 fn strip_comments(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     let mut chars = src.chars().peekable();
@@ -76,19 +81,23 @@ fn strip_comments(src: &str) -> String {
                 }
             }
             ('"', _) => {
-                // Normal string literal: copy verbatim through the closing
-                // quote, honoring `\` escapes.
+                // Normal string literal: keep the delimiters, blank the body
+                // (newlines preserved so line numbers do not shift).
                 out.push(c);
                 while let Some(s) = chars.next() {
-                    out.push(s);
                     match s {
                         '\\' => {
+                            out.push(' ');
                             if let Some(e) = chars.next() {
-                                out.push(e);
+                                out.push(if e == '\n' { '\n' } else { ' ' });
                             }
                         }
-                        '"' => break,
-                        _ => {}
+                        '"' => {
+                            out.push('"');
+                            break;
+                        }
+                        '\n' => out.push('\n'),
+                        _ => out.push(' '),
                     }
                 }
             }
@@ -104,8 +113,8 @@ fn strip_comments(src: &str) -> String {
                 if chars.peek() == Some(&'"') {
                     out.push(chars.next().unwrap());
                     'raw: while let Some(s) = chars.next() {
-                        out.push(s);
                         if s == '"' {
+                            out.push('"');
                             let mut seen = 0usize;
                             while seen < hashes {
                                 if chars.peek() == Some(&'#') {
@@ -117,6 +126,7 @@ fn strip_comments(src: &str) -> String {
                             }
                             break;
                         }
+                        out.push(if s == '\n' { '\n' } else { ' ' });
                     }
                 }
                 // `r` not followed by a raw string (e.g. an identifier):
@@ -281,6 +291,32 @@ fn preamble_contains(stripped: &str, required: &str) -> bool {
     false
 }
 
+/// Collect every directory at or below `dir` that holds a `Cargo.toml`.
+/// A package directory is not descended into (its subdirectories are that
+/// package's own sources), and `target/` plus dot-directories are skipped so
+/// a build cache or VCS metadata cannot slow or confuse the walk. Returns the
+/// read error for the ROOT only — an unreadable subdirectory would otherwise
+/// silently shrink the scan.
+fn collect_package_dirs(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name == "target" || name.starts_with('.') {
+            continue;
+        }
+        if path.join("Cargo.toml").is_file() {
+            out.push(path);
+        } else {
+            // Intermediate grouping directory — keep descending.
+            let _ = collect_package_dirs(&path, out);
+        }
+    }
+    Ok(())
+}
+
 /// Scan the built-artifact crate roots under `crates_dir` for
 /// `#![forbid(unsafe_code)]`, honoring [`UNSAFE_FORBID_ALLOWLIST`]. Each
 /// conventional rustc crate root is its own compilation unit needing its own
@@ -303,17 +339,18 @@ fn preamble_contains(stripped: &str, required: &str) -> bool {
 pub fn scan_crate_roots(crates_dir: &Path) -> Result<Vec<String>, String> {
     let mut roots = Vec::new();
     {
-        let entries = std::fs::read_dir(crates_dir).map_err(|e| {
+        // Package directories at ANY depth: a workspace may group packages
+        // under an intermediate directory (`crates/storage/foo/Cargo.toml`),
+        // which a single-level listing would walk straight past, leaving that
+        // crate unscanned while the gate stayed green.
+        let mut packages = Vec::new();
+        collect_package_dirs(crates_dir, &mut packages).map_err(|e| {
             format!(
                 "unsafe-guard: cannot scan {}: {e} — refusing to pass a tree it cannot see",
                 crates_dir.display()
             )
         })?;
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.join("Cargo.toml").is_file() {
-                continue;
-            }
+        for dir in packages {
             for root in ["src/lib.rs", "src/main.rs", "build.rs"] {
                 let file = dir.join(root);
                 if file.is_file() {
