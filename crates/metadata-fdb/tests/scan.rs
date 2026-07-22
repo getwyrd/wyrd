@@ -37,6 +37,8 @@
 // wall-clock exempt (test crate): fresh-namespace uniqueness must hold across
 // RUNS against a live, persistent external cluster — a pid+counter scheme
 // collides with leftovers from earlier runs; real time is the tool (#619).
+// File scope (not per-site) is deliberate here: a test crate never
+// ships, so no production lifecycle can acquire a mixed clock from it.
 #![allow(clippy::disallowed_methods)]
 
 /// The FoundationDB cluster file, or `None` when FDB is not configured.

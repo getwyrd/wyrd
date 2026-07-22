@@ -56,6 +56,8 @@
 // wall-clock exempt (test crate): the checked-consistency leg records REAL
 // wall-clock op windows for the Elle checker against a live cluster, like
 // server::consistency_observable (#619).
+// File scope (not per-site) is deliberate here: a test crate never
+// ships, so no production lifecycle can acquire a mixed clock from it.
 #![allow(clippy::disallowed_methods)]
 
 /// The FDB cluster file, or `None` when FDB is not configured (clean-skip gate — mirrors
