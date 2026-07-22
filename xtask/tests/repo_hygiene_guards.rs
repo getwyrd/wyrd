@@ -669,6 +669,53 @@ fn every_crate_directory_is_a_workspace_member_today() {
 }
 
 #[test]
+fn scan_crate_roots_accepts_any_forbid_list_containing_unsafe_code() {
+    // `#![forbid(unsafe_code, unused_imports)]` forbids unsafe exactly as the
+    // bare spelling does — rejecting it would fail a compliant crate. But a
+    // list WITHOUT unsafe_code, and a weaker level, must still be red.
+    let dir = fixture_dir("lint-lists");
+    plant_crate(
+        &dir,
+        "listed-first",
+        "#![forbid(unsafe_code, unused_imports)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "listed-later",
+        "#![forbid(unused_imports, unsafe_code)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "trailing-comma",
+        "#![forbid(unsafe_code,)]\npub fn f() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "other-lints-only",
+        "#![forbid(unused_imports)]\npub fn f() {}\n",
+    );
+    plant_crate(&dir, "too-weak", "#![deny(unsafe_code)]\npub fn f() {}\n");
+
+    let mut violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
+    std::fs::remove_dir_all(&dir).ok();
+    violations.sort();
+
+    assert_eq!(
+        violations.len(),
+        2,
+        "only the two non-compliant crates: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("other-lints-only")),
+        "a forbid list without unsafe_code is not compliance: {violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.contains("too-weak")),
+        "deny does not satisfy a forbid requirement: {violations:?}"
+    );
+}
+
+#[test]
 fn scan_crate_roots_fails_closed_when_it_cannot_see_the_tree() {
     // A missing crates dir (e.g. after a workspace move) and a dir with no
     // crate roots must both be Err — a guard that cannot see the tree says
@@ -693,9 +740,13 @@ fn unsafe_forbid_allowlist_is_narrow_and_reasoned() {
     // path (never a whole crate), names a concrete required attribute, and
     // carries a non-empty reason — an exemption is a reviewed, explained
     // one-liner scoped to one file, never a blank crate-wide pass.
-    for (root, attr, reason) in UNSAFE_FORBID_ALLOWLIST {
+    for (root, level, reason) in UNSAFE_FORBID_ALLOWLIST {
         assert!(root.ends_with(".rs"), "path-keyed, not crate-keyed: {root}");
-        assert!(attr.contains("unsafe_code") && !reason.is_empty());
+        assert!(
+            *level == "deny" || *level == "forbid",
+            "the exception records a lint LEVEL, not an attribute spelling: {level}"
+        );
+        assert!(!reason.is_empty(), "every exception states its reason");
     }
     assert!(
         UNSAFE_FORBID_ALLOWLIST.len() <= 1,

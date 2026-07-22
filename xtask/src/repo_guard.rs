@@ -146,14 +146,17 @@ fn strip_comments(src: &str) -> String {
 pub const WORKTREES_PREFIX: &str = ".claude/worktrees/";
 
 /// Crate roots exempt from `#![forbid(unsafe_code)]`, keyed by the exact
-/// `crates/`-relative root path — NOT the crate name, so a future bin root in
-/// an exempt crate does not silently inherit the weaker attribute. Each entry
-/// carries the attribute the root must have instead and the audited reason.
+/// workspace-relative root path — NOT the crate name, so a future bin root in
+/// an exempt crate does not silently inherit the weaker level. Each entry
+/// carries the lint LEVEL that root must use instead (`deny`) and the audited
+/// reason. The level is matched exactly: `forbid` would not satisfy a `deny`
+/// requirement, because `forbid` cannot be overridden by the `#[allow]` the
+/// exempt root needs — it would not compile.
 /// Kept as data (the `STATICS_ALLOWLIST` style) so an exemption is a reviewed
 /// one-line diff.
 pub const UNSAFE_FORBID_ALLOWLIST: &[(&str, &str, &str)] = &[(
     "crates/metadata-fdb/src/lib.rs",
-    "#![deny(unsafe_code)]",
+    "deny",
     "FFI: the FoundationDB C bindings need one audited #[allow(unsafe_code)]",
 )];
 
@@ -258,6 +261,33 @@ pub fn scan_gitlinks(ls_files_z: &str, declared: &[String]) -> Vec<String> {
     violations
 }
 
+/// Is `attr` an inner attribute applying `level` (`forbid` / `deny`) to a lint
+/// list that includes `unsafe_code`?
+///
+/// A list, not a fixed spelling: `#![forbid(unsafe_code, unused_imports)]` and
+/// `#![forbid(unsafe_code,)]` forbid unsafe exactly as the bare form does, and
+/// rejecting them would fail compliant crates. The level must match what the
+/// root requires — `deny` does not satisfy a `forbid` requirement (it is
+/// weaker), and `forbid` does not satisfy a `deny` one (the exempt FFI root
+/// needs an overridable level).
+fn attribute_forbids_unsafe(attr: &str, level: &str) -> bool {
+    let compact: String = attr.split_whitespace().collect();
+    let Some(inner) = compact
+        .strip_prefix("#![")
+        .and_then(|s| s.strip_suffix("]"))
+    else {
+        return false;
+    };
+    let Some(list) = inner
+        .strip_prefix(level)
+        .and_then(|s| s.strip_prefix('('))
+        .and_then(|s| s.strip_suffix(')'))
+    else {
+        return false;
+    };
+    list.split(',').any(|lint| lint == "unsafe_code")
+}
+
 /// Does the CRATE-LEVEL attribute preamble of comment-stripped source contain
 /// `required`? rustc only applies an inner attribute crate-wide when it
 /// appears before the first item, so the walk accepts blank lines and other
@@ -266,9 +296,7 @@ pub fn scan_gitlinks(ls_files_z: &str, declared: &[String]) -> Vec<String> {
 /// nested module, which scopes to that module only (and may even sit behind
 /// `#[cfg(any())]`), never counts. Comparison is whitespace-insensitive so a
 /// rustfmt re-wrap cannot defeat it.
-fn preamble_contains(stripped: &str, required: &str) -> bool {
-    let normalize = |s: &str| s.split_whitespace().collect::<String>();
-    let wanted = normalize(required);
+fn preamble_contains(stripped: &str, level: &str) -> bool {
     let mut pending = String::new(); // an inner attribute still open across lines
     for (idx, raw) in stripped.lines().enumerate() {
         let t = raw.trim();
@@ -289,7 +317,7 @@ fn preamble_contains(stripped: &str, required: &str) -> bool {
             return false; // first real item — the crate-level preamble is over
         }
         if pending.matches(']').count() >= pending.matches('[').count() {
-            if normalize(&pending) == wanted {
+            if attribute_forbids_unsafe(&pending, level) {
                 return true;
             }
             pending.clear();
@@ -439,17 +467,18 @@ pub fn scan_roots(
         // root gets its recorded exception — sibling roots in the same crate
         // still require the full `forbid`.
         let rel = file.strip_prefix(workspace_root).unwrap_or(file);
-        let required = UNSAFE_FORBID_ALLOWLIST
+        let level = UNSAFE_FORBID_ALLOWLIST
             .iter()
             .find(|(root, _, _)| Path::new(root) == rel)
-            .map(|(_, attr, _)| *attr)
-            .unwrap_or("#![forbid(unsafe_code)]");
+            .map(|(_, level, _)| *level)
+            .unwrap_or("forbid");
         // Comment-stripped, preamble-scoped match: a commented-out attribute
         // is inactive to rustc, and one inside a nested module scopes to that
         // module only — neither satisfies the guard.
-        if !preamble_contains(&strip_comments(&content), required) {
+        if !preamble_contains(&strip_comments(&content), level) {
             violations.push(format!(
-                "{}: missing active crate-level `{required}`",
+                "{}: missing active crate-level `#![{level}(unsafe_code)]` \
+                 (a lint list containing `unsafe_code` also satisfies it)",
                 file.display()
             ));
         }
