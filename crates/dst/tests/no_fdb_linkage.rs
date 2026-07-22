@@ -76,6 +76,8 @@
 //! `#![cfg(madsim)]`-gated, so it also runs under a bare
 //! `cargo test -p wyrd-dst --test no_fdb_linkage`.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;

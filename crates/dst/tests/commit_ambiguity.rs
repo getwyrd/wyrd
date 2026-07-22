@@ -62,6 +62,8 @@
 //! this file compiles to nothing, so a normal `cargo test` neither builds nor runs it. The
 //! structural companion guard, `crates/dst/tests/no_fdb_linkage.rs`, is deliberately *not*
 //! madsim-gated.
+
+#![forbid(unsafe_code)]
 #![cfg(madsim)]
 
 use std::sync::Arc;

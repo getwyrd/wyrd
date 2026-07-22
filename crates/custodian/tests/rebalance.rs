@@ -37,6 +37,8 @@
 //!    fragment is left as **collectable garbage** (no orphan record, no torn chunk), and
 //!    the conflict is surfaced on the durability seam.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

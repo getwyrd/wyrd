@@ -3,6 +3,8 @@
 //! This is a compile-first assertion — it fails to build if a stub is missing or
 //! the requests lose their `FragmentId`.
 
+#![forbid(unsafe_code)]
+
 use wyrd_proto::v0::{
     chunk_store_client::ChunkStoreClient, chunk_store_server::ChunkStoreServer, ChunkId,
     FragmentGetResponse, FragmentId, FragmentPutRequest,

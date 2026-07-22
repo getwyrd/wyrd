@@ -6,6 +6,8 @@
 //! end-to-end tests of the protocol belong here. Sync backends never yield, so
 //! `pollster::block_on` drives the async path deterministically.
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_chunk_format::decode;
 use wyrd_chunkstore_fs::FsChunkStore;

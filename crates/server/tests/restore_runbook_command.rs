@@ -10,6 +10,8 @@
 //! This test compiles it — it extracts the command from the runbook itself and pushes its
 //! topology through the SAME validator the real one-shot runs, so the two cannot drift.
 
+#![forbid(unsafe_code)]
+
 use wyrd_server::cli::{parse_endpoints, require_aligned_topology};
 
 const RUNBOOK: &str = "../../docs/design/architecture/m4-first-deployment-blueprint.md";

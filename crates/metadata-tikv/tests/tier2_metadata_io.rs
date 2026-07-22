@@ -21,6 +21,8 @@
 //! Tier-2 job (`WYRD_TIER2=1`), against a real single-node TiKV on one machine, routed via
 //! `xtask::metadata_faults::metadata_scenario_args`.
 
+#![forbid(unsafe_code)]
+
 /// The PD endpoints, or `None` when TiKV is not configured (clean-skip gate).
 fn pd_endpoints() -> Option<Vec<String>> {
     match std::env::var("WYRD_TIKV_PD_ENDPOINTS") {

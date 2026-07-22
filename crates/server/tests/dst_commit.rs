@@ -4,6 +4,8 @@
 //! reproduces the run exactly. This is the graduation proof that the commit is
 //! atomic under fault injection.
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_core::metadata::EcScheme;

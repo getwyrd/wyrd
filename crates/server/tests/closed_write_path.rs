@@ -47,6 +47,8 @@
 //! leaves the reconstruction queue empty → gauge 0; and dropping the fragment loss (step 3)
 //! leaves scrub with nothing to enqueue → gauge 0. Either is the "empty store" symptom.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
 

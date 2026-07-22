@@ -23,6 +23,8 @@
 //! lapsed upload is REFUSED (the stream errors, or the commit does not return `Committed`) and
 //! the key still reads back the ORIGINAL bytes — never the lapsed version.
 
+#![forbid(unsafe_code)]
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 

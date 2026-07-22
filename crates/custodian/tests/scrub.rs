@@ -19,6 +19,8 @@
 //!    and scrub-detected corruption are emitted on the `DurabilityTelemetry` seam as
 //!    metric + audit events and read back in-process via `gather_prometheus`.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

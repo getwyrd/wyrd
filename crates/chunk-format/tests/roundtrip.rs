@@ -3,6 +3,8 @@
 //! payload survive exactly. A seed that ever fails is committable here as a
 //! permanent regression.
 
+#![forbid(unsafe_code)]
+
 use wyrd_chunk_format::{decode, encode, EcSchemeType, FragmentHeader};
 use wyrd_testkit::Sim;
 

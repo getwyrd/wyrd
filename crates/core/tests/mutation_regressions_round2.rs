@@ -7,6 +7,8 @@
 //! loss deterministically by pre-occupying the target inode so `commit_create`
 //! conflicts.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

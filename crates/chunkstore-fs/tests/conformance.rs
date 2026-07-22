@@ -6,6 +6,8 @@
 //! are filesystem-specific (they reach the bytes on disk). Filesystem I/O is
 //! sync, so `pollster::block_on` drives the async methods deterministically.
 
+#![forbid(unsafe_code)]
+
 use bytes::Bytes;
 use pollster::block_on;
 use wyrd_chunk_format::{encode, FragmentHeader};

@@ -26,6 +26,8 @@
 //! fail to compile (`use xtask::disk_faults::*` has no lib to resolve against),
 //! so the RED check observes a non-zero exit and declares RED ✓.
 
+#![forbid(unsafe_code)]
+
 use xtask::disk_faults::{
     dm_table_error, dm_table_linear, verdict_campaign, verdict_passes, verdict_scrub_leg,
 };

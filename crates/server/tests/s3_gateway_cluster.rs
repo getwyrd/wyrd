@@ -25,6 +25,8 @@
 //! drives) does not exist, so the test does not compile against the shipped surface.
 //! GREEN once `cmd_s3` composes its backends by configuration.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::path::Path;
 

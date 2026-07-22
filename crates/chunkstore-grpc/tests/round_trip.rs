@@ -8,6 +8,8 @@
 //! not-found get returns `Ok(None)`, and a non-fragment put is rejected by the
 //! store and surfaced as a transport error.
 
+#![forbid(unsafe_code)]
+
 use bytes::Bytes;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;

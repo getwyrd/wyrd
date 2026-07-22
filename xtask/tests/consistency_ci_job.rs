@@ -18,6 +18,8 @@
 //! own execution (Docker/FDB cluster/JVM/elle-cli) is deferred to a post-merge
 //! `workflow_dispatch` — see the workflow's own header for that confirmation step.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 /// The workspace root (`<root>/xtask` is this crate's manifest dir).

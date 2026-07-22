@@ -17,6 +17,8 @@
 //! (`scratch_names_are_unique_per_seq_and_invisible_to_listing`); this test is
 //! the behavioural half — every concurrent put returns `Ok`.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Barrier;
 use std::thread;
 

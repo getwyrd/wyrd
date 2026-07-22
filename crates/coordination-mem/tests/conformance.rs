@@ -11,6 +11,8 @@
 //! (deterministic lease expiry under a manual clock; the rising-lease-id and
 //! config-starts-at-zero absolutes that etcd does not promise) stay here.
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use bytes::Bytes;

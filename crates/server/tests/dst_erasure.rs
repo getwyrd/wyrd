@@ -8,6 +8,8 @@
 //! exactly, so any seed that ever surfaces a bug is pinned below as a permanent
 //! regression guard.
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
 use wyrd_core::metadata::{ChunkRef, EcScheme, InodeRecord, InodeState};

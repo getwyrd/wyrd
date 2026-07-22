@@ -14,6 +14,8 @@
 //!    **both** a Prometheus registry **and** OTLP push, with no backend hardcoded —
 //!    asserted in-process by reading the metric back off the Prometheus surface.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashSet;
 
 use tracing_subscriber::prelude::*;

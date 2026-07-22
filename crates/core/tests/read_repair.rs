@@ -14,6 +14,8 @@
 //! repair-queue assertions below fire while the bytes still read back — proving the
 //! enqueue, not the read, is what these tests pin.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

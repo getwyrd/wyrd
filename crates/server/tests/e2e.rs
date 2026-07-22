@@ -2,6 +2,8 @@
 //! commit, then a GET back, byte-identical, in one process — against the real
 //! redb + filesystem backends the gateway composes.
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_coordination_mem::MemCoordination;

@@ -28,6 +28,8 @@
 //! with empty `.frag` files directly — no fragment encoding needed — keeping the
 //! unit under test import-light (no GUI / display) and safe on a headless runner.
 
+#![forbid(unsafe_code)]
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;

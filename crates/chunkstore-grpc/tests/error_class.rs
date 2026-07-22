@@ -27,6 +27,8 @@
 //! "no doubles" constraint bound the binding-criterion producers above, not this
 //! supplementary coverage of a production arm no real store can reach in-tree.
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use bytes::Bytes;

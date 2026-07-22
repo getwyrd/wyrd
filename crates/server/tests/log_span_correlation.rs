@@ -11,6 +11,8 @@
 //!
 //! A separate binary is a separate process, so the callsites below are hit only by these tests.
 
+#![forbid(unsafe_code)]
+
 use std::io;
 use std::sync::{Arc, Mutex};
 

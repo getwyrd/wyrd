@@ -6,6 +6,8 @@
 //! Proven in-process over the trait stores — the same backend-agnostic style as
 //! `read_repair.rs` / `write_fanout.rs`.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

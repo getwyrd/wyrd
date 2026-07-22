@@ -16,6 +16,8 @@
 //!    (Red against today's `index % n` read path — it has neither the record nor the
 //!    placement-aware resolution; green once the read consumes the record.)
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

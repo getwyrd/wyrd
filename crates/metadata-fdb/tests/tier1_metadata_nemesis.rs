@@ -28,6 +28,8 @@
 //! (`xtask::nemesis::nemesis_leg_ran_exactly_one`), so renaming one here without updating that
 //! dispatch fails the leg loudly instead of passing as a silent green no-op.
 
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "fdb")]
 mod support;
 

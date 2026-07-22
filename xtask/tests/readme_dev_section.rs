@@ -6,6 +6,8 @@
 //! entry point and the `wyrd demo` try-it line the README names must be backed by
 //! the actual dispatch in `xtask/src/main.rs` and `crates/server/src/cli.rs`.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 /// The workspace root (`<root>/xtask` is this crate's manifest dir).

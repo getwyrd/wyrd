@@ -27,6 +27,8 @@
 //!
 //! Requires `--cfg madsim` (set by `cargo xtask dst`, which sweeps 50 seeds); a
 //! normal `cargo test` neither builds nor runs this file.
+
+#![forbid(unsafe_code)]
 #![cfg(madsim)]
 
 use std::collections::HashMap;

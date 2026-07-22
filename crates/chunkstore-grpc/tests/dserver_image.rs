@@ -15,6 +15,8 @@
 //! never invokes Docker (containers are outside the DST/gate substrate), so
 //! that half is a maintainer/CI smoke check, not this test's job.
 
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::path::Path;
 

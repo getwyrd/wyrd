@@ -25,6 +25,8 @@
 //! container. A NEW file: it does not extend `deploy_no_orchestrator_coupling.rs`, whose
 //! two existing signals keep gating byte-unchanged.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

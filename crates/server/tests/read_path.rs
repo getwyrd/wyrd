@@ -2,6 +2,8 @@
 //! the real redb + filesystem backends `server` composes and driven by
 //! `pollster::block_on` (sync backends never yield).
 
+#![forbid(unsafe_code)]
+
 use pollster::block_on;
 use wyrd_chunkstore_fs::{fragment_path, FsChunkStore};
 use wyrd_core::metadata::{self, EcScheme, InodeRecord};

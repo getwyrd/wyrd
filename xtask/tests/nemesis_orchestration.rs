@@ -15,6 +15,8 @@
 //! building the real fdb-feature scenario invocation, or when the name-drift guard stops
 //! rejecting a leg that ran zero tests.
 
+#![forbid(unsafe_code)]
+
 use xtask::nemesis::{
     metadata_nemesis_legs, nemesis_leg_ran_exactly_one, nemesis_scenario_args, parse_tests_run,
     NemesisLegKind, METADATA_NEMESIS_SCENARIO_TEST,

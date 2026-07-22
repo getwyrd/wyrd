@@ -22,6 +22,8 @@
 //! prove the orphan record is keyed by the **placed** D server, not the fragment index: a
 //! record keyed by the index would miss the fleet slot GC sweeps and never reclaim.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

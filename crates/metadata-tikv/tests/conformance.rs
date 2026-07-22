@@ -8,6 +8,8 @@
 //! green; the `xtask tikv-conformance` job brings up the throwaway `deploy/` TiKV,
 //! sets the endpoint, rebuilds with `--features tikv`, and runs it for real.
 
+#![forbid(unsafe_code)]
+
 /// The PD (Placement Driver) endpoints, or `None` when TiKV is not configured.
 fn pd_endpoints() -> Option<Vec<String>> {
     match std::env::var("WYRD_TIKV_PD_ENDPOINTS") {

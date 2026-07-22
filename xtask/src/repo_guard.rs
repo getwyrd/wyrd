@@ -270,8 +270,14 @@ fn preamble_contains(stripped: &str, required: &str) -> bool {
     let normalize = |s: &str| s.split_whitespace().collect::<String>();
     let wanted = normalize(required);
     let mut pending = String::new(); // an inner attribute still open across lines
-    for raw in stripped.lines() {
+    for (idx, raw) in stripped.lines().enumerate() {
         let t = raw.trim();
+        // A first-line `#!` that is not `#![` is a SHEBANG, which rustc skips
+        // (`#!/usr/bin/env rust-script`); treating it as the first item would
+        // reject a compliant crate whose attribute follows it.
+        if idx == 0 && t.starts_with("#!") && !t.starts_with("#![") {
+            continue;
+        }
         if !pending.is_empty() {
             pending.push(' ');
             pending.push_str(t);
@@ -300,10 +306,13 @@ fn preamble_contains(stripped: &str, required: &str) -> bool {
 /// the guard cannot fall behind a manifest that moves a target somewhere the
 /// scan never thought to look.
 ///
-/// `test`-kind targets are excluded deliberately (~100 integration-test roots
-/// in this workspace): they never ship and remain under the workspace lint
-/// wall; a sweep there buys no shipped-path safety. Every other kind — `lib`,
-/// `bin`, `bench`, `example`, `custom-build` — is in scope.
+/// EVERY target kind is in scope — `lib`, `bin`, `bench`, `example`,
+/// `custom-build` and `test` alike. Integration-test roots were briefly
+/// excluded on the theory that they never ship and stay covered by the
+/// workspace lint wall; the second half of that is false, because
+/// `warnings = "deny"` and `clippy.all = "deny"` do not forbid unsafe code.
+/// Nothing else would have caught unsafe in a test, so the invariant now
+/// holds uniformly: one rule, every crate root, no asterisk.
 pub fn target_src_paths(metadata_json: &str) -> Result<Vec<std::path::PathBuf>, String> {
     let meta: serde_json::Value = serde_json::from_str(metadata_json)
         .map_err(|e| format!("unsafe-guard: cannot parse cargo metadata: {e}"))?;
@@ -317,14 +326,6 @@ pub fn target_src_paths(metadata_json: &str) -> Result<Vec<std::path::PathBuf>, 
             continue;
         };
         for target in targets {
-            let kinds: Vec<&str> = target
-                .get("kind")
-                .and_then(|k| k.as_array())
-                .map(|k| k.iter().filter_map(|s| s.as_str()).collect())
-                .unwrap_or_default();
-            if kinds.contains(&"test") {
-                continue;
-            }
             if let Some(path) = target.get("src_path").and_then(|s| s.as_str()) {
                 roots.push(std::path::PathBuf::from(path));
             }

@@ -17,6 +17,8 @@
 //! pending entries are left for the sweep (not released). A clock still inside the TTL
 //! at the commit instant publishes normally (the boundary leg).
 
+#![forbid(unsafe_code)]
+
 use std::cell::Cell;
 
 use wyrd_chunkstore_fs::FsChunkStore;

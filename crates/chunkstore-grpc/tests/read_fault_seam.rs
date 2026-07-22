@@ -29,6 +29,8 @@
 //! carries no `io::Error` in its source chain, so `is_block_read_fault` returns
 //! `false` and a dead-sector fault is classified transient → retried forever.
 
+#![forbid(unsafe_code)]
+
 use std::io;
 
 use async_trait::async_trait;

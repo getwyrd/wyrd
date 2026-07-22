@@ -15,6 +15,8 @@
 //! the dispatch is regressed. Each assertion uses an independent expectation, not the
 //! literal the function returns.
 
+#![forbid(unsafe_code)]
+
 use xtask::metadata_faults::{
     metadata_scenario_args, metadata_tier_dispatch, MetadataTierDispatch,
     METADATA_TIER1_LEGACY_CMD_VAR, METADATA_TIER1_SCENARIO_TEST,

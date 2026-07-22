@@ -48,6 +48,8 @@
 //! so the reconstruction callsites must not be raced by a no-subscriber sibling test — a
 //! separate binary is a separate process.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

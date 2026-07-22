@@ -27,6 +27,8 @@
 //! covered — it is the third leg of ADR-0040 decision 4's classification alongside
 //! (a)/(b).
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

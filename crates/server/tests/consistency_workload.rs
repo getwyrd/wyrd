@@ -30,6 +30,8 @@
 //! `cargo xtask ci` (which permits loopback bind). The linearizability verdict is Elle's,
 //! off-Check, over the SAME serialized history this file produces.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

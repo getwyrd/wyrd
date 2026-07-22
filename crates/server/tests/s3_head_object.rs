@@ -13,6 +13,7 @@
 //! `Last-Modified` headers a GET of the same object carries (#503); a HEAD of an absent key
 //! returns `404` headers-only.
 
+#![forbid(unsafe_code)]
 // wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
 // live in-process server use real wall time; nothing here mixes clock sources
 // within one asserted lifecycle (#619).

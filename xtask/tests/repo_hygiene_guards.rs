@@ -12,6 +12,8 @@
 //! gitlink in a fixture would itself commit the accident the guard exists to
 //! prevent.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 use xtask::repo_guard::{
@@ -527,11 +529,11 @@ fn scan_crate_roots_finds_packages_below_an_intermediate_directory() {
 }
 
 #[test]
-fn target_src_paths_follows_manifest_overrides_and_skips_tests() {
+fn target_src_paths_follows_manifest_overrides_for_every_kind() {
     // The reason discovery is cargo's job, not a layout guess: a manifest may
     // point any target anywhere (`[lib] path`, `package.build`, custom
     // `[[bin]]`/`[[bench]]`/`[[example]]` paths), and cargo has already
-    // resolved all of it. Test-kind targets are excluded by design.
+    // resolved all of it. Every kind is in scope, `test` included.
     let metadata = r#"{"packages":[{"targets":[
         {"kind":["lib"],"src_path":"/w/crates/odd/weird/place.rs"},
         {"kind":["custom-build"],"src_path":"/w/crates/odd/build-script.rs"},
@@ -545,23 +547,20 @@ fn target_src_paths_follows_manifest_overrides_and_skips_tests() {
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(roots.len(), 5, "every non-test target: {roots:?}");
+    assert_eq!(roots.len(), 6, "every target, whatever its kind: {roots:?}");
     for expected in [
         "place.rs",
         "build-script.rs",
         "cli.rs",
         "suite.rs",
         "show.rs",
+        "it.rs",
     ] {
         assert!(
             names.iter().any(|n| n == expected),
             "{expected} (a manifest-placed target) must be discovered: {roots:?}"
         );
     }
-    assert!(
-        !names.iter().any(|n| n == "it.rs"),
-        "test-kind targets stay out of scope: {roots:?}"
-    );
 }
 
 #[test]
@@ -571,6 +570,34 @@ fn target_src_paths_rejects_unusable_metadata() {
         target_src_paths(r#"{"no_packages":[]}"#).is_err(),
         "metadata without a packages array must fail closed"
     );
+}
+
+#[test]
+fn scan_crate_roots_looks_past_a_leading_shebang() {
+    // rustc skips a first-line shebang, so an attribute after it IS the
+    // crate-level attribute; treating the shebang as the first item would
+    // reject a compliant binary.
+    let dir = fixture_dir("shebang");
+    plant_crate(
+        &dir,
+        "scripted",
+        "#!/usr/bin/env rust-script\n#![forbid(unsafe_code)]\nfn main() {}\n",
+    );
+    plant_crate(
+        &dir,
+        "scripted-missing",
+        "#!/usr/bin/env rust-script\nfn main() {}\n",
+    );
+
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert_eq!(
+        violations.len(),
+        1,
+        "only the attribute-less one is red: {violations:?}"
+    );
+    assert!(violations[0].contains("scripted-missing"), "{violations:?}");
 }
 
 #[test]

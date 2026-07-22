@@ -12,6 +12,8 @@
 //! recorded); GREEN once it drives real PUT/GET/DELETE over the wire and records a
 //! well-formed, non-vacuous history.
 
+#![forbid(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

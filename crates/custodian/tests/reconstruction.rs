@@ -29,6 +29,8 @@
 //! 5. **Repair-vs-serve priority** (`0005:305-317`): the priority function rises as
 //!    redundancy falls, so a near-floor chunk is ordered ahead of a comfortable one.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

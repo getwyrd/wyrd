@@ -69,6 +69,8 @@
 //! `cargo xtask ci` → `run_dst` under `--cfg madsim` (`xtask/src/main.rs`). Requires
 //! `--cfg madsim`; without it this file compiles to nothing (matching `concurrency.rs`), so a
 //! plain `cargo test` neither builds nor runs it.
+
+#![forbid(unsafe_code)]
 #![cfg(madsim)]
 
 use std::sync::Arc;

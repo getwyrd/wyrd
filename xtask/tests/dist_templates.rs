@@ -8,6 +8,8 @@
 //! (`docker build`, tar) is the deferred half exercised by
 //! `.github/workflows/release.yml`.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 use xtask::dist;

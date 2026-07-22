@@ -53,6 +53,7 @@
 //! state, so these callsites must not be raced by a no-subscriber sibling (the
 //! `custodian_day_one.rs` discipline).
 
+#![forbid(unsafe_code)]
 // wall-clock exempt (test crate): SigV4 request dates / lease stamps against a
 // live in-process server use real wall time; nothing here mixes clock sources
 // within one asserted lifecycle (#619).

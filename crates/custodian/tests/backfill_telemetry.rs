@@ -14,6 +14,8 @@
 //! the callsite as disabled, silently dropping the gauge here (issue #214). A separate
 //! test binary is a separate process, so its callsite cache is its own.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

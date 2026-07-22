@@ -22,6 +22,8 @@
 //! inode-derived chunk ids), exactly as the local-disk path does, is what makes
 //! both objects survive and round-trip byte-identically.
 
+#![forbid(unsafe_code)]
+
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use wyrd_chunkstore_fs::FsChunkStore;

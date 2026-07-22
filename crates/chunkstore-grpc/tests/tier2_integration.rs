@@ -21,6 +21,8 @@
 //! steps 1–6; this is the wiring that makes the §10 Q6 throughput claim first
 //! measurable on real hardware.
 
+#![forbid(unsafe_code)]
+
 use std::time::Duration;
 
 use wyrd_chunkstore_grpc::{FanoutChunkStore, GrpcChunkStore};

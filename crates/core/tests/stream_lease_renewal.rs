@@ -18,6 +18,8 @@
 //! Under the old single-stamp behaviour the sweep would reclaim the first two chunks — this
 //! is the behavioural red the renewal turns green.
 
+#![forbid(unsafe_code)]
+
 use bytes::Bytes;
 use futures_util::stream;
 use pollster::block_on;

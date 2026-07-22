@@ -37,6 +37,8 @@
 //! (compile-time) type-check of the scenario to fail — the born-at-tier seam is
 //! load-bearing.
 
+#![forbid(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;

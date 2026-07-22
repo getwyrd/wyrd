@@ -14,6 +14,8 @@
 //! gate (the "deferred ≠ unbuilt" bar), while the live three-leg runs are opt-in (`WYRD_TIER1=1`),
 //! off-Check.
 
+#![forbid(unsafe_code)]
+
 use std::cell::Cell;
 use std::time::Duration;
 
