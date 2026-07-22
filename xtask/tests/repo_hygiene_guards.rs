@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use xtask::repo_guard::{
-    gitmodules_config_paths, scan_crate_roots, scan_gitlinks, UNSAFE_FORBID_ALLOWLIST,
+    gitmodules_config_paths, scan_gitlinks, scan_roots, target_src_paths, UNSAFE_FORBID_ALLOWLIST,
 };
 
 /// The workspace root (`<root>/xtask` is this crate's manifest dir).
@@ -162,6 +162,28 @@ fn scan_gitlinks_is_green_over_the_real_index() {
 
 // ─── (2) forbid(unsafe_code) guard ────────────────────────────────────────────
 
+/// Every `.rs` file under `dir`, sorted — the fixture stand-in for the target
+/// list `cargo metadata` supplies in production.
+fn planted_roots(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Plant a fixture crate tree: `<tmp>/crates/<name>/{Cargo.toml, src/lib.rs}`.
 fn plant_crate(root: &Path, name: &str, lib_rs: &str) {
     let dir = root.join(name);
@@ -193,7 +215,7 @@ fn scan_crate_roots_is_red_when_the_attribute_is_missing() {
         "#![forbid(unsafe_code)]\npub fn f() {}\n",
     );
 
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(violations.len(), 1, "{violations:?}");
@@ -217,7 +239,7 @@ fn scan_crate_roots_is_red_on_an_uncovered_bin_root() {
     )
     .expect("write bin main");
 
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
@@ -249,7 +271,7 @@ fn scan_crate_roots_covers_build_scripts_benches_and_examples() {
     )
     .expect("write example main");
 
-    let mut violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let mut violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
     violations.sort();
 
@@ -288,7 +310,7 @@ fn scan_crate_roots_rejects_a_commented_out_attribute() {
         "//! docs mention /* oddities */ freely\n#![forbid(unsafe_code)]\npub fn f() {}\n",
     );
 
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
@@ -310,12 +332,12 @@ fn scan_crate_roots_honors_the_deny_allowlist() {
     // into "no attribute at all".
     let dir = fixture_dir("allowlist");
     plant_crate(
-        &dir,
+        &dir.join("crates"),
         "metadata-fdb",
         "#![deny(unsafe_code)]\npub fn f() {}\n",
     );
     assert!(
-        scan_crate_roots(&dir)
+        scan_roots(&planted_roots(&dir), &dir)
             .expect("fixture tree is scannable")
             .is_empty(),
         "deny satisfies the exception"
@@ -323,8 +345,8 @@ fn scan_crate_roots_honors_the_deny_allowlist() {
     std::fs::remove_dir_all(&dir).ok();
 
     let dir = fixture_dir("allowlist-decayed");
-    plant_crate(&dir, "metadata-fdb", "pub fn f() {}\n");
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    plant_crate(&dir.join("crates"), "metadata-fdb", "pub fn f() {}\n");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert!(
@@ -337,17 +359,17 @@ fn scan_crate_roots_honors_the_deny_allowlist() {
     // FFI carve-out covers src/lib.rs alone.
     let dir = fixture_dir("allowlist-bin");
     plant_crate(
-        &dir,
+        &dir.join("crates"),
         "metadata-fdb",
         "#![deny(unsafe_code)]\npub fn f() {}\n",
     );
-    std::fs::create_dir_all(dir.join("metadata-fdb/src/bin")).expect("create bin dir");
+    std::fs::create_dir_all(dir.join("crates/metadata-fdb/src/bin")).expect("create bin dir");
     std::fs::write(
-        dir.join("metadata-fdb/src/bin/fdbtool.rs"),
+        dir.join("crates/metadata-fdb/src/bin/fdbtool.rs"),
         "#![deny(unsafe_code)]\nfn main() {}\n",
     )
     .expect("write bin");
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(violations.len(), 1, "{violations:?}");
     assert!(
@@ -360,8 +382,16 @@ fn scan_crate_roots_honors_the_deny_allowlist() {
 fn scan_crate_roots_is_green_over_the_real_workspace_crates() {
     // The invariant itself: every crate root complies today (this PR added the
     // attribute to gateway-core and gateway-s3, closing the observed drift).
-    let violations = scan_crate_roots(&workspace_root().join("crates"))
-        .expect("the real crates tree is scannable");
+    let meta = std::process::Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(workspace_root())
+        .output()
+        .expect("failed to spawn cargo metadata");
+    assert!(meta.status.success(), "cargo metadata must succeed");
+    let roots =
+        target_src_paths(&String::from_utf8_lossy(&meta.stdout)).expect("cargo metadata parses");
+    let violations =
+        scan_roots(&roots, &workspace_root()).expect("the real workspace is scannable");
     assert!(
         violations.is_empty(),
         "non-compliant crate roots: {violations:?}"
@@ -392,7 +422,7 @@ fn scan_crate_roots_requires_the_attribute_at_crate_level() {
         "//! docs\n#![cfg_attr(\n    test,\n    allow(dead_code)\n)]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
     );
 
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     assert_eq!(
         violations.len(),
         2,
@@ -428,7 +458,7 @@ fn scan_crate_roots_accepts_comment_markers_inside_attribute_strings() {
         "#![doc = \"see /* not a comment */ and // neither\"]\n#![forbid(unsafe_code)]\npub fn f() {}\n",
     );
 
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     assert!(
         violations.is_empty(),
         "string contents must never unbalance the preamble walk: {violations:?}"
@@ -458,7 +488,7 @@ fn scan_crate_roots_ignores_brackets_and_attributes_inside_strings() {
         "#![doc = \"#![forbid(unsafe_code)]\"]\npub fn f() {}\n",
     );
 
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
@@ -482,7 +512,7 @@ fn scan_crate_roots_finds_packages_below_an_intermediate_directory() {
     std::fs::create_dir_all(dir.join("storage")).expect("create grouping dir");
     plant_crate(&dir.join("storage"), "foo", "pub fn f() {}\n");
 
-    let violations = scan_crate_roots(&dir).expect("fixture tree is scannable");
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
 
     assert_eq!(
@@ -497,6 +527,53 @@ fn scan_crate_roots_finds_packages_below_an_intermediate_directory() {
 }
 
 #[test]
+fn target_src_paths_follows_manifest_overrides_and_skips_tests() {
+    // The reason discovery is cargo's job, not a layout guess: a manifest may
+    // point any target anywhere (`[lib] path`, `package.build`, custom
+    // `[[bin]]`/`[[bench]]`/`[[example]]` paths), and cargo has already
+    // resolved all of it. Test-kind targets are excluded by design.
+    let metadata = r#"{"packages":[{"targets":[
+        {"kind":["lib"],"src_path":"/w/crates/odd/weird/place.rs"},
+        {"kind":["custom-build"],"src_path":"/w/crates/odd/build-script.rs"},
+        {"kind":["bin"],"src_path":"/w/crates/odd/tools/cli.rs"},
+        {"kind":["bench"],"src_path":"/w/crates/odd/perf/suite.rs"},
+        {"kind":["example"],"src_path":"/w/crates/odd/demo/show.rs"},
+        {"kind":["test"],"src_path":"/w/crates/odd/tests/it.rs"}
+    ]}]}"#;
+    let roots = target_src_paths(metadata).expect("metadata parses");
+    let names: Vec<String> = roots
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(roots.len(), 5, "every non-test target: {roots:?}");
+    for expected in [
+        "place.rs",
+        "build-script.rs",
+        "cli.rs",
+        "suite.rs",
+        "show.rs",
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "{expected} (a manifest-placed target) must be discovered: {roots:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|n| n == "it.rs"),
+        "test-kind targets stay out of scope: {roots:?}"
+    );
+}
+
+#[test]
+fn target_src_paths_rejects_unusable_metadata() {
+    assert!(target_src_paths("not json").is_err());
+    assert!(
+        target_src_paths(r#"{"no_packages":[]}"#).is_err(),
+        "metadata without a packages array must fail closed"
+    );
+}
+
+#[test]
 fn scan_crate_roots_fails_closed_when_it_cannot_see_the_tree() {
     // A missing crates dir (e.g. after a workspace move) and a dir with no
     // crate roots must both be Err — a guard that cannot see the tree says
@@ -504,13 +581,13 @@ fn scan_crate_roots_fails_closed_when_it_cannot_see_the_tree() {
     // non-existence" rule, applied to the guard itself).
     let missing = fixture_dir("missing-tree");
     assert!(
-        scan_crate_roots(&missing).is_err(),
+        scan_roots(&planted_roots(&missing), &missing).is_err(),
         "missing dir must be Err"
     );
 
     let empty = fixture_dir("empty-tree");
     std::fs::create_dir_all(&empty).expect("create empty fixture dir");
-    let out = scan_crate_roots(&empty);
+    let out = scan_roots(&planted_roots(&empty), &empty);
     std::fs::remove_dir_all(&empty).ok();
     assert!(out.is_err(), "zero discovered roots must be Err: {out:?}");
 }

@@ -1446,7 +1446,23 @@ fn run_unsafe_forbid_guard() -> Result<(), String> {
         "unsafe-guard",
         "(#616 forbid(unsafe_code) in crate roots)",
     ]);
-    let violations = xtask::repo_guard::scan_crate_roots(&workspace_root().join("crates"))?;
+    // Authoritative target list from cargo itself: manifest `path` overrides
+    // and unconventional layouts cannot hide a root from the scan (#616).
+    let root = workspace_root();
+    let meta = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(&root)
+        .output()
+        .map_err(|e| format!("unsafe-guard: failed to spawn cargo metadata: {e}"))?;
+    if !meta.status.success() {
+        return Err(format!(
+            "unsafe-guard: `cargo metadata` failed with {}:\n{}",
+            meta.status,
+            String::from_utf8_lossy(&meta.stderr)
+        ));
+    }
+    let roots = xtask::repo_guard::target_src_paths(&String::from_utf8_lossy(&meta.stdout))?;
+    let violations = xtask::repo_guard::scan_roots(&roots, &root)?;
     if violations.is_empty() {
         println!("xtask unsafe-guard: every crate root forbids unsafe code (#616)");
         Ok(())

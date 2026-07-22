@@ -25,8 +25,9 @@
 //! `lib.rs` needs one audited `#[allow(unsafe_code)]` for the C bindings).
 //! Nothing enforced the convention on *new* crates, and the two newest
 //! (`gateway-core`, `gateway-s3`) shipped without the attribute — exactly the
-//! drift this gate exists to stop. [`scan_crate_roots`] scans each crate root
-//! file (`src/lib.rs` / `src/main.rs`) for the required attribute.
+//! drift this gate exists to stop. Target discovery comes from `cargo
+//! metadata` ([`target_src_paths`]) so no manifest override or unconventional
+//! layout can hide a root from the scan; [`scan_roots`] then checks each one.
 
 use std::path::Path;
 
@@ -151,7 +152,7 @@ pub const WORKTREES_PREFIX: &str = ".claude/worktrees/";
 /// Kept as data (the `STATICS_ALLOWLIST` style) so an exemption is a reviewed
 /// one-line diff.
 pub const UNSAFE_FORBID_ALLOWLIST: &[(&str, &str, &str)] = &[(
-    "metadata-fdb/src/lib.rs",
+    "crates/metadata-fdb/src/lib.rs",
     "#![deny(unsafe_code)]",
     "FFI: the FoundationDB C bindings need one audited #[allow(unsafe_code)]",
 )];
@@ -291,124 +292,81 @@ fn preamble_contains(stripped: &str, required: &str) -> bool {
     false
 }
 
-/// Collect every directory at or below `dir` that holds a `Cargo.toml`.
-/// A package directory is not descended into (its subdirectories are that
-/// package's own sources), and `target/` plus dot-directories are skipped so
-/// a build cache or VCS metadata cannot slow or confuse the walk. Returns the
-/// read error for the ROOT only — an unreadable subdirectory would otherwise
-/// silently shrink the scan.
-fn collect_package_dirs(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        if name == "target" || name.starts_with('.') {
-            continue;
-        }
-        if path.join("Cargo.toml").is_file() {
-            out.push(path);
-        } else {
-            // Intermediate grouping directory — keep descending.
-            let _ = collect_package_dirs(&path, out);
-        }
-    }
-    Ok(())
-}
-
-/// Scan the built-artifact crate roots under `crates_dir` for
-/// `#![forbid(unsafe_code)]`, honoring [`UNSAFE_FORBID_ALLOWLIST`]. Each
-/// conventional rustc crate root is its own compilation unit needing its own
-/// attribute; the scan covers everything that builds into or alongside the
-/// shipped artifacts: `src/lib.rs`, `src/main.rs`, the auto-discovered bin
-/// roots `src/bin/*.rs` / `src/bin/*/main.rs`, the build script `build.rs`,
-/// `benches/*.rs`, and `examples/*.rs` / `examples/*/main.rs` (all compiled
-/// by `--all-targets`). Deliberately OUT of scope, with reasons:
-/// `tests/*.rs` (~100 integration-test roots — never shipped, still under the
-/// workspace lint wall; a 100-file attribute sweep buys no shipped-path
-/// safety) and custom `path =` target overrides (none exist in the workspace —
-/// `server`'s `[[bin]]` points at the conventional `src/main.rs` — and
-/// introducing one is a manifest diff a reviewer sees).
+/// Extract every non-test Cargo target's `src_path` from `cargo metadata
+/// --no-deps --format-version 1` output. This is the AUTHORITATIVE target
+/// list: it already accounts for `[lib] path`, `package.build`, custom
+/// `[[bin]]`/`[[bench]]`/`[[example]]` paths, packages nested under an
+/// intermediate directory, and every conventional auto-discovered layout — so
+/// the guard cannot fall behind a manifest that moves a target somewhere the
+/// scan never thought to look.
 ///
-/// Fails CLOSED: an unscannable `crates_dir` or the discovery of zero crate
-/// roots is `Err`, never an empty (vacuously clean) violation list — a guard
-/// that cannot see the tree must say so, not pass it. An unreadable
-/// individual root file is reported as a violation for the same reason.
-/// `Ok` carries one violation string per non-compliant root (empty ⇒ clean).
-pub fn scan_crate_roots(crates_dir: &Path) -> Result<Vec<String>, String> {
+/// `test`-kind targets are excluded deliberately (~100 integration-test roots
+/// in this workspace): they never ship and remain under the workspace lint
+/// wall; a sweep there buys no shipped-path safety. Every other kind — `lib`,
+/// `bin`, `bench`, `example`, `custom-build` — is in scope.
+pub fn target_src_paths(metadata_json: &str) -> Result<Vec<std::path::PathBuf>, String> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json)
+        .map_err(|e| format!("unsafe-guard: cannot parse cargo metadata: {e}"))?;
+    let packages = meta
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .ok_or_else(|| "unsafe-guard: cargo metadata has no `packages` array".to_string())?;
     let mut roots = Vec::new();
-    {
-        // Package directories at ANY depth: a workspace may group packages
-        // under an intermediate directory (`crates/storage/foo/Cargo.toml`),
-        // which a single-level listing would walk straight past, leaving that
-        // crate unscanned while the gate stayed green.
-        let mut packages = Vec::new();
-        collect_package_dirs(crates_dir, &mut packages).map_err(|e| {
-            format!(
-                "unsafe-guard: cannot scan {}: {e} — refusing to pass a tree it cannot see",
-                crates_dir.display()
-            )
-        })?;
-        for dir in packages {
-            for root in ["src/lib.rs", "src/main.rs", "build.rs"] {
-                let file = dir.join(root);
-                if file.is_file() {
-                    roots.push(file);
-                }
+    for package in packages {
+        let Some(targets) = package.get("targets").and_then(|t| t.as_array()) else {
+            continue;
+        };
+        for target in targets {
+            let kinds: Vec<&str> = target
+                .get("kind")
+                .and_then(|k| k.as_array())
+                .map(|k| k.iter().filter_map(|s| s.as_str()).collect())
+                .unwrap_or_default();
+            if kinds.contains(&"test") {
+                continue;
             }
-            // Auto-discovered binary roots: src/bin/<name>.rs and
-            // src/bin/<name>/main.rs are each independent crate roots.
-            if let Ok(bins) = std::fs::read_dir(dir.join("src/bin")) {
-                for bin in bins.flatten() {
-                    let path = bin.path();
-                    if path.extension().is_some_and(|e| e == "rs") {
-                        roots.push(path);
-                    } else if path.join("main.rs").is_file() {
-                        roots.push(path.join("main.rs"));
-                    }
-                }
-            }
-            // Bench and example roots build with the workspace
-            // (`--all-targets`); both auto-discover the flat `<name>.rs` AND
-            // the directory `<name>/main.rs` forms (verified via
-            // `cargo metadata` target discovery).
-            for sub in ["benches", "examples"] {
-                if let Ok(found) = std::fs::read_dir(dir.join(sub)) {
-                    for item in found.flatten() {
-                        let path = item.path();
-                        if path.extension().is_some_and(|e| e == "rs") {
-                            roots.push(path);
-                        } else if path.join("main.rs").is_file() {
-                            roots.push(path.join("main.rs"));
-                        }
-                    }
-                }
+            if let Some(path) = target.get("src_path").and_then(|s| s.as_str()) {
+                roots.push(std::path::PathBuf::from(path));
             }
         }
-    }
-    if roots.is_empty() {
-        return Err(format!(
-            "unsafe-guard: found no crate roots under {} — a moved or empty crates tree \
-             must fail the gate, not pass it vacuously",
-            crates_dir.display()
-        ));
     }
     roots.sort();
+    roots.dedup();
+    Ok(roots)
+}
+
+/// Scan the given crate roots for `#![forbid(unsafe_code)]`, honoring
+/// [`UNSAFE_FORBID_ALLOWLIST`] (keyed by workspace-root-relative path).
+///
+/// Fails CLOSED: an empty root list is `Err`, never a vacuously clean pass —
+/// a guard that was handed nothing to check must say so. An unreadable root
+/// file is reported as a violation for the same reason.
+/// `Ok` carries one violation string per non-compliant root (empty ⇒ clean).
+pub fn scan_roots(
+    roots: &[std::path::PathBuf],
+    workspace_root: &Path,
+) -> Result<Vec<String>, String> {
+    if roots.is_empty() {
+        return Err(
+            "unsafe-guard: cargo metadata yielded no crate roots — refusing to pass \
+             a workspace it cannot see"
+                .to_string(),
+        );
+    }
     let mut violations = Vec::new();
     for file in roots {
-        let content = match std::fs::read_to_string(&file) {
+        let content = match std::fs::read_to_string(file) {
             Ok(content) => content,
             Err(e) => {
                 violations.push(format!("{}: unreadable crate root: {e}", file.display()));
                 continue;
             }
         };
-        // Allowlist lookup by the exact `crates/`-relative root path (Path
+        // Allowlist lookup by the exact workspace-relative root path (Path
         // comparison, so the match is separator-agnostic): only the recorded
         // root gets its recorded exception — sibling roots in the same crate
         // still require the full `forbid`.
-        let rel = file.strip_prefix(crates_dir).unwrap_or(&file);
+        let rel = file.strip_prefix(workspace_root).unwrap_or(file);
         let required = UNSAFE_FORBID_ALLOWLIST
             .iter()
             .find(|(root, _, _)| Path::new(root) == rel)
