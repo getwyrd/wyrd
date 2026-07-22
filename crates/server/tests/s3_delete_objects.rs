@@ -36,6 +36,11 @@
 //! drives the wire only (SDK + signed HTTP), importing no new production symbol, so the
 //! C4-verify red leg fails by assertion, not compile error.
 
+// wall-clock exempt (test crate): SigV4 request dates against a live
+// in-process server use real wall time; nothing here mixes clock sources
+// within one asserted lifecycle (#619).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
