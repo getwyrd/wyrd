@@ -39,7 +39,7 @@ use std::path::Path;
 /// Blanking string bodies (rather than copying them through) is what makes the
 /// walk correct on real preambles: `#![doc(html_root_url = "https://…")]` must
 /// not have its `//` read as a comment, and `#![doc = "unmatched ["]` must not
-/// have its bracket counted when [`preamble_contains`] balances an attribute.
+/// have its bracket counted when [`preamble_unsafe_level`] balances an attribute.
 /// It also means an attribute spelled inside a string no longer counts as
 /// present. Normal strings honor `\` escapes; raw strings are matched by hash
 /// count; inside a block comment, quotes are plain text.
@@ -261,43 +261,48 @@ pub fn scan_gitlinks(ls_files_z: &str, declared: &[String]) -> Vec<String> {
     violations
 }
 
-/// Is `attr` an inner attribute applying `level` (`forbid` / `deny`) to a lint
-/// list that includes `unsafe_code`?
+/// The lint level (`forbid` / `deny` / `warn` / `allow`) an inner attribute
+/// applies to `unsafe_code`, or `None` if it does not mention it.
 ///
-/// A list, not a fixed spelling: `#![forbid(unsafe_code, unused_imports)]` and
-/// `#![forbid(unsafe_code,)]` forbid unsafe exactly as the bare form does, and
-/// rejecting them would fail compliant crates. The level must match what the
-/// root requires — `deny` does not satisfy a `forbid` requirement (it is
-/// weaker), and `forbid` does not satisfy a `deny` one (the exempt FFI root
-/// needs an overridable level).
-fn attribute_forbids_unsafe(attr: &str, level: &str) -> bool {
+/// A list is parsed, not a fixed spelling: `#![forbid(unsafe_code,
+/// unused_imports)]` and `#![forbid(unsafe_code,)]` set the level on
+/// `unsafe_code` exactly as the bare form does, while `#![forbid(dead_code)]`
+/// does not mention it. Whitespace-insensitive, so a rustfmt re-wrap cannot
+/// defeat it.
+fn attribute_level_for_unsafe(attr: &str) -> Option<&'static str> {
     let compact: String = attr.split_whitespace().collect();
-    let Some(inner) = compact
+    let inner = compact
         .strip_prefix("#![")
-        .and_then(|s| s.strip_suffix("]"))
-    else {
-        return false;
-    };
-    let Some(list) = inner
-        .strip_prefix(level)
-        .and_then(|s| s.strip_prefix('('))
-        .and_then(|s| s.strip_suffix(')'))
-    else {
-        return false;
-    };
-    list.split(',').any(|lint| lint == "unsafe_code")
+        .and_then(|s| s.strip_suffix("]"))?;
+    for level in ["forbid", "deny", "warn", "allow"] {
+        if let Some(list) = inner
+            .strip_prefix(level)
+            .and_then(|s| s.strip_prefix('('))
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            if list.split(',').any(|lint| lint == "unsafe_code") {
+                return Some(level);
+            }
+        }
+    }
+    None
 }
 
-/// Does the CRATE-LEVEL attribute preamble of comment-stripped source contain
-/// `required`? rustc only applies an inner attribute crate-wide when it
-/// appears before the first item, so the walk accepts blank lines and other
-/// inner attributes (`#![...]`, including ones spanning lines — tracked by
-/// bracket balance) and stops at the first real item: an occurrence inside a
-/// nested module, which scopes to that module only (and may even sit behind
-/// `#[cfg(any())]`), never counts. Comparison is whitespace-insensitive so a
-/// rustfmt re-wrap cannot defeat it.
-fn preamble_contains(stripped: &str, level: &str) -> bool {
+/// The EFFECTIVE crate-level lint level applied to `unsafe_code` by the
+/// preamble, or `None` if the preamble sets none.
+///
+/// rustc applies the LAST level set before the first item, so the walk does
+/// not stop at the first match: `#![deny(unsafe_code)]` followed by
+/// `#![allow(unsafe_code)]` resolves to `allow`, and a guard that returned on
+/// the deny would miss the downgrade. (Only reachable for the `deny`
+/// exemption — a later override of a `forbid` does not compile.) The walk
+/// accepts blank lines, a leading shebang, and inner attributes spanning
+/// lines (tracked by bracket balance), and stops at the first real item: an
+/// occurrence inside a nested module — even behind `#[cfg(any())]` — scopes
+/// to that module only and never reaches this walk.
+fn preamble_unsafe_level(stripped: &str) -> Option<&'static str> {
     let mut pending = String::new(); // an inner attribute still open across lines
+    let mut effective = None;
     for (idx, raw) in stripped.lines().enumerate() {
         let t = raw.trim();
         // A first-line `#!` that is not `#![` is a SHEBANG, which rustc skips
@@ -314,16 +319,16 @@ fn preamble_contains(stripped: &str, level: &str) -> bool {
         } else if t.starts_with("#![") {
             pending = t.to_string();
         } else {
-            return false; // first real item — the crate-level preamble is over
+            break; // first real item — the crate-level preamble is over
         }
         if pending.matches(']').count() >= pending.matches('[').count() {
-            if attribute_forbids_unsafe(&pending, level) {
-                return true;
+            if let Some(level) = attribute_level_for_unsafe(&pending) {
+                effective = Some(level);
             }
             pending.clear();
         }
     }
-    false
+    effective
 }
 
 /// Extract every non-test Cargo target's `src_path` from `cargo metadata
@@ -484,13 +489,17 @@ pub fn scan_roots(
             .find(|(root, _, _)| Path::new(root) == rel)
             .map(|(_, level, _)| *level)
             .unwrap_or("forbid");
-        // Comment-stripped, preamble-scoped match: a commented-out attribute
-        // is inactive to rustc, and one inside a nested module scopes to that
-        // module only — neither satisfies the guard.
-        if !preamble_contains(&strip_comments(&content), level) {
+        // The EFFECTIVE preamble level must equal what the root requires. A
+        // commented-out attribute is inactive, one inside a nested module
+        // scopes there only, and a later override wins — none satisfies the
+        // guard. `deny` and `forbid` are distinct requirements: the FFI root
+        // needs `deny` (a later item-level `#[allow]` must be able to override
+        // it), every other root needs `forbid`.
+        if preamble_unsafe_level(&strip_comments(&content)) != Some(level) {
             violations.push(format!(
                 "{}: missing active crate-level `#![{level}(unsafe_code)]` \
-                 (a lint list containing `unsafe_code` also satisfies it)",
+                 (a lint list containing `unsafe_code` satisfies it; a later \
+                 crate-level override does not)",
                 file.display()
             ));
         }

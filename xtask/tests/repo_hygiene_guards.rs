@@ -722,6 +722,13 @@ fn scan_crate_roots_accepts_any_forbid_list_containing_unsafe_code() {
         "#![forbid(unused_imports)]\npub fn f() {}\n",
     );
     plant_crate(&dir, "too-weak", "#![deny(unsafe_code)]\npub fn f() {}\n");
+    // A later crate-level allow downgrades an earlier forbid: rustc uses the
+    // LAST level, so the effective level is `allow` and the root is red.
+    plant_crate(
+        &dir,
+        "overridden",
+        "#![forbid(unsafe_code)]\n#![allow(unsafe_code)]\npub fn f() {}\n",
+    );
 
     let mut violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
     std::fs::remove_dir_all(&dir).ok();
@@ -729,8 +736,8 @@ fn scan_crate_roots_accepts_any_forbid_list_containing_unsafe_code() {
 
     assert_eq!(
         violations.len(),
-        2,
-        "only the two non-compliant crates: {violations:?}"
+        3,
+        "only the non-compliant crates: {violations:?}"
     );
     assert!(
         violations.iter().any(|v| v.contains("other-lints-only")),
@@ -740,6 +747,32 @@ fn scan_crate_roots_accepts_any_forbid_list_containing_unsafe_code() {
         violations.iter().any(|v| v.contains("too-weak")),
         "deny does not satisfy a forbid requirement: {violations:?}"
     );
+    assert!(
+        violations.iter().any(|v| v.contains("overridden")),
+        "a later crate-level allow downgrades the forbid — effective level wins: {violations:?}"
+    );
+}
+
+#[test]
+fn the_deny_exemption_is_red_when_a_later_allow_overrides_it() {
+    // The FFI root requires `deny` (its item-level `#[allow]` must be able to
+    // override it). But a CRATE-LEVEL `#![allow(unsafe_code)]` after the deny
+    // downgrades the whole crate — the exact hole a stop-at-first-match walk
+    // left open, since it accepted the deny and never saw the allow.
+    let dir = fixture_dir("deny-overridden");
+    plant_crate(
+        &dir.join("crates"),
+        "metadata-fdb",
+        "#![deny(unsafe_code)]\n#![allow(unsafe_code)]\npub fn f() {}\n",
+    );
+    let violations = scan_roots(&planted_roots(&dir), &dir).expect("fixture tree is scannable");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        violations.len(),
+        1,
+        "the overridden deny root is red: {violations:?}"
+    );
+    assert!(violations[0].contains("metadata-fdb"), "{violations:?}");
 }
 
 #[test]
