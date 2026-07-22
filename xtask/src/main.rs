@@ -1451,18 +1451,34 @@ const DST_SEEDS: &str = "50";
 /// flag and seed count are set on this child process only, so the normal build
 /// is untouched; this recompiles `wyrd-dst` and its deps under the simulator.
 fn run_dst() -> Result<(), String> {
-    print_step(&["cargo", "test", "-p", "wyrd-dst", "(--cfg madsim)"]);
-
     // Append `--cfg madsim` to any existing RUSTFLAGS rather than clobbering it.
     let rustflags = match std::env::var("RUSTFLAGS") {
         Ok(existing) if !existing.is_empty() => format!("{existing} --cfg madsim"),
         _ => "--cfg madsim".to_string(),
     };
 
+    // Lint the DST tier too (#619). The workspace clippy step excludes
+    // `wyrd-dst` (it only compiles under `--cfg madsim`), so without this leg
+    // the crate is the one production tree no lint policy reaches — including
+    // `clippy.toml`'s wall-clock ban, whose whole point is that a new clock
+    // read is a reviewed decision. Same RUSTFLAGS as the test run below, so
+    // one `--cfg madsim` build serves both.
+    print_step(&["cargo", "clippy", "-p", "wyrd-dst", "(--cfg madsim)"]);
+    let status = Command::new("cargo")
+        .args(["clippy", "-p", "wyrd-dst", "--all-targets"])
+        .current_dir(workspace_root())
+        .env("RUSTFLAGS", &rustflags)
+        .status()
+        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
+    if !status.success() {
+        return Err(format!("madsim DST clippy failed with {status}"));
+    }
+
+    print_step(&["cargo", "test", "-p", "wyrd-dst", "(--cfg madsim)"]);
     let status = Command::new("cargo")
         .args(["test", "-p", "wyrd-dst"])
         .current_dir(workspace_root())
-        .env("RUSTFLAGS", rustflags)
+        .env("RUSTFLAGS", &rustflags)
         .env("MADSIM_TEST_NUM", DST_SEEDS)
         .status()
         .map_err(|e| format!("failed to spawn cargo: {e}"))?;
