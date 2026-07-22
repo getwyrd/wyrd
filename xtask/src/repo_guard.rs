@@ -422,8 +422,20 @@ fn collect_manifests(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        // `file_type()` does NOT follow symlinks, unlike `Path::is_dir()`. A
+        // followed directory link would collect the same manifest under a
+        // second, symlink-expanded path — which can never equal cargo's
+        // canonical `manifest_path`, producing a false "not a workspace
+        // member" — and a link to an ancestor would recurse until the path
+        // length gave out.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if file_type.is_dir() {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             if name == "target" || name.starts_with('.') {
                 continue;

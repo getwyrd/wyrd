@@ -648,6 +648,33 @@ fn a_crate_missing_from_workspace_members_is_reported() {
 }
 
 #[test]
+fn the_manifest_walk_does_not_follow_directory_symlinks() {
+    // `Path::is_dir()` follows links; a directory symlink under crates/ would
+    // collect the SAME manifest under a second, symlink-expanded path that can
+    // never equal cargo's canonical manifest_path — a false "not a workspace
+    // member" — and a link to an ancestor would recurse until the path gave out.
+    let dir = fixture_dir("symlinked");
+    let crates = dir.join("crates");
+    plant_crate(&crates, "real", "#![forbid(unsafe_code)]\npub fn f() {}\n");
+    std::os::unix::fs::symlink(crates.join("real"), crates.join("linked"))
+        .expect("plant a directory symlink");
+    // A link to the ancestor: a follower would recurse without bound.
+    std::os::unix::fs::symlink(&crates, crates.join("loop")).expect("plant a cyclic symlink");
+    let metadata = format!(
+        r#"{{"packages":[{{"manifest_path":"{}","targets":[]}}]}}"#,
+        crates.join("real/Cargo.toml").display()
+    );
+
+    let missing = unregistered_manifests(&metadata, &crates).expect("metadata parses");
+    std::fs::remove_dir_all(&dir).ok();
+
+    assert!(
+        missing.is_empty(),
+        "a symlinked view of a registered crate is not an unregistered crate: {missing:?}"
+    );
+}
+
+#[test]
 fn every_crate_directory_is_a_workspace_member_today() {
     // The invariant over the real tree, and the reason the cross-check is
     // cheap to keep: it should always be empty here.
