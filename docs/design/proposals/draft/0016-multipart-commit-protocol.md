@@ -602,9 +602,9 @@ envelope regardless of value size; `B` denotes that byte-derived count throughou
 
 | Batch | Preconditions | Mutations | Size bound |
 |---|---|---|---|
-| Create session | **record present:** `require(mpuctl == prior)` with `prior.count < prior.max_sessions` — the **stored** limit, and the gateway refuses+alarms if its own **profile** disagrees with `prior.profile` (iteration-9 finding 5, iteration-10 finding 4); **record absent (fresh/upgraded store, reads as `{count: 0}`):** `require_absent(mpuctl)`; plus `require_absent(mpu:<id>)`, bucket-existence per [ADR-0046][a46] §4 | 1 put session, and either 1 CAS `mpuctl` `{count: c} → {count: c+1}` **or** (bootstrap) 1 put `mpuctl = { count: 1, max_sessions }` | O(1), < 1 KB |
+| Create session | **record present:** `require(mpuctl == prior)` with `prior.count < prior.max_sessions` — the **stored** limit, and the gateway refuses+alarms if its own **profile** disagrees with `prior.profile` (iteration-9 finding 5, iteration-10 finding 4); **record absent (fresh/upgraded store, reads as `{count: 0}`):** `require_absent(mpuctl)`; plus `require_absent(mpu:<id>)`, bucket-existence per [ADR-0046][a46] §4 | 1 put session, and either 1 CAS `mpuctl` `{count: c} → {count: c+1}` **or** (bootstrap) 1 put `mpuctl = { count: 1, max_sessions, profile }` | O(1), < 1 KB |
 | Part slot reserve (`UploadPart` start, decision 5) | `require(mpu == Open@E)` **and** `require_absent(slot:<id>:<k>)` for the chosen index `k` | 1 put `slot:<id>:<k>` | O(1); the cap is the key space `[0, MAX_INFLIGHT_PARTS)`, so no overshoot is representable; a taken index is retried against the next free one (≤ `MAX_INFLIGHT_PARTS` probes) and a full range refuses `503`, **and `404` once the session is not `Open`** (no slot after fence, finding 1) |
-| Part intent | `require(mpu == Open@E)` (the finding-1 serialization edge — a read precondition, not a write, so concurrent intents never conflict) **and `require_absent(desired:dserver:<S>)` for every server `S` in the planned placement** (the drain fence, decision 2, iteration-8 finding 1 — also a read precondition; a failure re-plans against the fresh `Topology::excluding(draining)`) | one owned `sidx:<id>:<part>:<chunk>` staging put per chunk, each its own commit | O(1) per commit; `n ≤ 9` extra read preconditions |
+| Part intent | `require(mpu == Open@E)` (the finding-1 serialization edge — a read precondition, not a write, so concurrent intents never conflict) **and `require_absent(desired:dserver:<S>)` for every server `S` in the planned placement** (the drain fence, decision 2, iteration-8 finding 1 — also a read precondition; a failure re-plans against the fresh `Topology::excluding(draining)`), **and `require(slot:<id>:<k> == prior)` on its own slot** (iteration-11 finding 2) | one owned `sidx:<id>:<part>:<chunk>` staging put per chunk **plus a rewrite of the owning `slot:<id>:<k>` in the SAME batch** (the liveness witness the reap fence pins — creating a fresh live lease without touching the slot would let the fence abort a progressing part), each its own commit | O(1) per commit; `n ≤ 9` extra read preconditions |
 | Part commit | `require(mpu == Open@E)`, `require_absent(part:…)` or `require(part:… == prior)`, `require(slot:<id>:<k> == prior)` (**its own** slot — never another part's, so concurrent commits of *different* part numbers share no writable key and cannot conflict with each other, iteration-7 findings 1/4) | 1 put (part record ≤ `V`), 1 put `psum:<id>:<n>` (the summary, tens of bytes), 1 delete `slot:<id>:<k>` (slot release), ≤ `C_part` owned `sidx:` deletes, ≤ 1 put (`retire:bytes:` on re-upload, ≤ `V`) | ≤ 2·V + O(chunks in part)·(key) |
 | Complete fence | `require(mpu == Open@E)` **and** `attempts < MAX_COMPLETE_ATTEMPTS` (read from the same record) | 1 put (state, `fenced_at_millis`, `publish_target`, `attempts+1`) | O(1); at the cap the fence is refused and the session is only abortable, so rollback→re-Complete cannot mint `seg:` epochs without bound |
 | Segment write (one, decision 7) | `require(mpu == Completing@E)` | `B_seg` `seg:<id>:<E>:` puts (each ≤ `V`), 1 cursor put | ≤ `E_tx/2 = 5 MB`; `B_seg = ⌊(E_tx/2)/V⌋ = 50` seg puts (byte-budgeted, **not** a fixed count) |
@@ -618,7 +618,7 @@ envelope regardless of value size; `B` denotes that byte-derived count throughou
 | Segment repoint (reconstruction / rebalance of a committed segmented object, decision 2/7) | `require(seg:<id>:<E>:<i> == prior)`, `require(inode == prior)`, **`require(orphan:<P_new> == prior)`** (the pre-mark must still stand — see below), **`require_absent(desired:dserver:<S_new>)`** (the drain fence — a repoint must not adopt a destination on a server that started draining in the write→CAS window; a loss leaves the `P_new` pre-mark for GC as usual) | pre-step: 1 put `orphan:<P_new>` pre-mark under the decision-4.2 guard for what it observed (own batch, before the fragment write); then the CAS batch: 1 CAS `seg:` (placement `P_old→P_new`) + 1 delete `orphan:<P_new>` (adopt) + 1 put `orphan:<P_old>` under `require_absent` (evidence the vacated source) | O(1); a lost CAS is a no-op that leaves the `P_new` pre-mark standing for GC — neither branch strands a fragment (X47, adversary C) |
 | Staged part re-place (reconstruction of an in-flight owned chunk, decision 2/5) | `require(mpu == Open@E)`, `require(part:<id>:<n> == prior)`, **`require(orphan:<P_new> == prior)`**, **`require_absent(desired:dserver:<S_new>)`** (the drain fence, as for the segment repoint) | pre-step: 1 put `orphan:<P_new>` pre-mark under the decision-4.2 guard for what it observed (own batch, before the fragment write); then the CAS batch: 1 CAS `part:` (chunk placement `P_old→P_new`) + 1 delete `orphan:<P_new>` (adopt) + 1 put `orphan:<P_old>` under `require_absent` (evidence the vacated source) | O(1); a lost CAS (the session left `Open@E`, or the part moved) is a no-op that leaves the `P_new` pre-mark standing for GC — the rebuilt staged fragment is never stranded (X29, finding 1) |
 | Owned-`sidx:` drain step (Aborting **and** Completed) | the decision-4.2 three-arm guard per mark — `require_absent(orphan:<pos>)` for a position observed absent, `require(orphan:<pos> == prior)` for a stale-evidence re-stamp under this walk's `<upload-id>:<epoch>` identity, none for a same-identity skip (iteration-7 finding 3 as corrected by iteration-9 finding 3); the walk itself is reference-based (decision 5), so there is no obligation record to serialize two drainers on | `B` orphan puts + owned `sidx:` deletes, 1 cursor put | ≤ `E_tx/2` (byte-budgeted, ~1,000 small marks); a guard loss re-reads and re-splits, marking strictly fewer positions — it never re-stamps a live grace clock |
-| Losing-writer compensation (live `Open` session only) | `require(mpu == Open@E)`, `require(slot:<id>:<k> == prior)` | 1 put `retire:bytes:{chunks}` (≤ `V`), 1 delete `slot:<id>:<k>` (slot release), ≤ `C_part` owned `sidx:` deletes | ≤ V + O(chunks in part)·(key) |
+| Live-session compensation — a same-part **losing writer** *or* **any post-staging local refusal** (iteration-11 finding 4) | `require(mpu == Open@E)`, `require(slot:<id>:<k> == prior)` | 1 put `retire:bytes:{chunks}` (≤ `V`), 1 delete `slot:<id>:<k>` (slot release), ≤ `C_part` owned `sidx:` deletes | ≤ V + O(chunks in part)·(key) |
 | Terminal session delete | `require(mpu:<id> == prior)`, **and** no **session-scoped** `retire:` obligation left (two bounded emptiness reads over `retire:bytes:s:<id>:` and `retire:records:s:<id>:`, §1), **and** the session's `sidx:` range observed empty in this pass | 1 delete `mpu:<id>`, ≤ `MAX_INFLIGHT_PARTS` deletes of surviving `slot:<id>:` records, 1 CAS `mpuctl` `count -1` | O(1) in object size (`MAX_INFLIGHT_PARTS` small keys, inside the byte budget) — **the exactly-once decrement point**; the session-record precondition serializes a gateway drain against the reaper (double-decrement fix), and the empty-`sidx:` gate holds because fenced intents (finding 1) let nothing refill the walked-empty range (findings 1/2) |
 
 Every row that installs a `retire:` obligation additionally carries
@@ -1105,7 +1105,8 @@ each is one JSON value:
    (`gc.rs:315-330`) — so adding an event identity is a **value-schema change with legacy data in
    the field**, and it needs the dual-format contract [ADR-0045][a45] requires rather than a silent
    reinterpretation. The value becomes `{ orphaned_at_millis, event }` under the project's ordinary
-   additive-field encoding, and:
+   additive-field encoding — **three variants in total** once GC's reclaim-intent state is counted
+   (legacy bare decimal, structured, and structured-with-`reclaiming`, below) — and:
    - **decoding is dual-format**: a value that parses as a bare decimal is a **legacy mark**,
      carrying `orphaned_at_millis` and **no** event identity; a structured value carries both. Both
      forms are readable by an upgraded custodian, and a legacy mark's timestamp keeps its meaning
@@ -1172,17 +1173,62 @@ each is one JSON value:
    a sweep the ledger asserts a fragment that no longer exists. GC therefore **CASes
    `orphan:<pos>` into a terminal `reclaiming` state — an exact-value CAS from the bytes it read —
    and commits that batch *before* calling `delete_fragment`**; the key itself is deleted after, as
-   today. Then **any** adoption CAS still preconditioned on the pre-mark's original bytes fails
+   today.
+
+   **`reclaiming` is a third value variant with defined decoding and restart (iteration-11
+   finding 5).** A crash *between* that CAS and the `delete_fragment` is not exotic — it is the
+   ordinary crash this ordering deliberately opens a window for — and it leaves a durable
+   `reclaiming` value with the fragment **still present**. So the variant belongs to the value
+   schema, not to an implementation: the value is `{ orphaned_at_millis, event, reclaiming: true }`,
+   `orphan_leases` **decodes it rather than rejecting or skipping it** (a rejection would abort the
+   whole GC pass at its decode boundary; a silent skip would make the fragment permanently
+   unreclaimable, since nothing else ever revisits the position), and it reads as **"reclamation
+   already decided; resume it"**. The next pass re-issues `delete_fragment` for that position —
+   idempotent, and a no-op if the earlier attempt landed — and then deletes the key, with **no**
+   re-evaluation of the grace test: that window already elapsed once, and the `reclaiming` CAS did
+   not disturb the stamp it was measured from. Restart is therefore idempotent and terminating, and
+   a fragment is reclaimed at most once per mark. Then **any** adoption CAS still preconditioned on the pre-mark's original bytes fails
    from the instant reclamation begins, whatever its latency, whatever the commit path, and with no
    clock read on either side. Safety rests on the precondition again — but now on a precondition
    that can actually observe the thing it needs to, which is what the iteration-8 text wrongly
    assumed and the iteration-9 text tried to replace with timing.
 
-   `W_repoint` survives as an **advisory** bound on how long a pre-mark may sit unadopted (it caps
-   wasted destination writes and pre-mark residency, and keeps restarts rare) and is explicitly
-   **not** the safety property; `G_orphan > W_repoint + δ_clock` is likewise a sizing guideline, not
-   an invariant anything rests on. The invariant is the ordering: **no fragment is destroyed before
-   its reclamation is durable in metadata.**
+   That closes the *adoption* end. **The `W_repoint` deadline still has real work to do at the
+   other end — gating the destination WRITE (iteration-11 finding 7).** A worker that pauses after
+   pre-marking but *before* authorizing the D-server write is not protected by the ordering above:
+   GC ages the mark through `G_orphan`, CASes it `reclaiming`, deletes nothing (no fragment is
+   there yet), removes the mark — and when the worker resumes, its newly authorized write lands on
+   a position with **no reference and no evidence**, the adoption CAS having lost. That is outcome
+   (a), a strand. `W_write` cannot cover it, because `W_write` bounds only the interval *after*
+   authorization. So the worker **MUST NOT authorize the destination write if its own pre-mark is
+   older than `W_repoint`** — it restarts from a fresh pre-mark instead — and the sizing is
+   **`G_orphan > W_repoint + W_write + δ_clock`** (strict), so any write this rule permits lands
+   strictly inside its evidence's grace.
+
+   The distinction from the mistake this section already records is the point, and it is worth
+   stating rather than leaving to inference: a caller-side deadline can soundly gate a **caller-side
+   action** — whether this worker issues a network write — because the caller is the one performing
+   it. What it cannot do is bound when a **transaction applies**, which is what the iteration-9 text
+   wrongly asked of it. `W_repoint` is normative for the first job and irrelevant to the second; the
+   adoption CAS's safety is the GC ordering alone. The invariant remains: **no fragment is destroyed
+   before its reclamation is durable in metadata**, and **no fragment is written after its evidence
+   may have been reclaimed**.
+   **A mark whose position never receives a fragment still needs a reclaimer (iteration-11
+   finding 6).** Teardown deliberately marks a failed attempt's **full planned placement** (decision
+   5), so a fragment authorized before the fence is covered wherever it lands — which means a
+   position that never received one is marked too, by design. But today's GC consumes an `orphan:`
+   key only while iterating an actual `list_fragments()` result, so a mark with no fragment beneath
+   it is **never visited and never deleted**. `orphan:` is one of the few namespaces read by a
+   *global* scan (`orphan_leases`), so repeated partial uploads would grow it without bound and
+   eventually fail that scan at `SCAN_CAP` — halting GC for the whole deployment, the F7-class
+   outcome this protocol exists to avoid. GC therefore also reclaims **the marks themselves**: the
+   positions in `orphan_leases` that no server's `list_fragments()` reported are exactly the
+   fragment-less marks, computable in the pass GC already runs, and one whose `orphaned_at_millis`
+   is older than the **late-write deadline** (`W_write + δ_clock`, past which no authorized write
+   can still land — the X49 bound) is deleted in the sweep's ordinary `B`-batches. Before that
+   deadline it is retained, because that is exactly the straggler window the mark exists to cover.
+   So every mark this protocol writes has a deleter whether or not its position is ever written, and
+   the `orphan:` namespace is bounded by the same argument as the rest.
 3. **Admission bounds what cannot be drained: the map, the part, the segment, the session's
    staged total, and the session population.** `MAX_MAP_CHUNKS` caps a flat map, `MAX_SEG_CHUNKS`
    a segment record, `MAX_PART_CHUNKS` a part record, `MAX_ROOT_SEGMENTS` the segments a root may
@@ -1192,6 +1238,19 @@ each is one JSON value:
    refuses **best-effort** early (a cumulative read-only check that concurrent commits can race,
    **D-E**, F17) and Complete refuses **authoritatively** at the fence, where the part set is
    frozen — the authoritative check is what that bound rests on; the early one is a courtesy.
+   **Every refusal that happens AFTER chunks are staged must compensate, not just return
+   (normative; iteration-11 finding 4).** The cumulative `MAX_STAGED_CHUNKS` check refuses at
+   **commit** time, by which point the attempt has already written its owned `sidx:` entries, its
+   fragments and its slot — and the session deliberately stays `Open` and usable. Returning
+   `400 EntityTooLarge` and stopping there strands all of it until the whole session is aborted or
+   reaped: the bytes stay protected, the `sidx:` records stay live, and the **slot is never
+   released**, so a client that repeats the refusal — which the "leave the session usable" answer
+   positively invites — fills `MAX_INFLIGHT_PARTS` and turns the usable session into a permanent
+   `503`. So every post-staging local refusal routes through the **same live-session compensation
+   batch** as a losing writer: `retire:bytes:{chunks}` for the staged bytes, the keyed
+   `require(slot == prior)` release, and this attempt's owned `sidx:` deletes, all under
+   `require(mpu == Open@E)`. The refusal is then a *bounded* event with an exit, not an
+   accumulation — which is what "the session stays usable and abortable" has to mean.
 4. **A session may not stage more chunk-refs than it could ever publish — `MAX_STAGED_CHUNKS`,
    and the overshoot is bounded (the 2026-07-24 sign-off call).** The reference build charges every
    committed part's chunks against the reconcile memory budget (decision 2), so what a session may
@@ -1240,7 +1299,7 @@ this proposal; only a knob whose entire range is safe is the implementer's freel
 | `R_publish` (publish retries) | `[1, small]` | bounded so Complete terminates; exceeding it releases the fence rather than looping | #508 |
 | `MAX_COMPLETE_ATTEMPTS` (fences per session) | `[1, small]` | each Complete fence mints a new `Completing@E` epoch whose rolled-back segments become one `retire:records:{seg:<id>:<E>}` obligation, so an unbounded fence/rollback cycle would let **one** session install obligations and `seg:` generations without bound (`W_session` alone does not bound it — a client can loop faster than the drain). The counter lives in the session record, which every fence CASes anyway; at the cap Complete is refused and the session's only exit is Abort | #508 |
 | `W_write` / `G_orphan` (fragment-write deadline / orphan grace window) | `W_write > 0`, enforced **at both ends** (a fail-closed caller await **and** a D-server refusal of a write past its deadline), and **`G_orphan > W_write + δ_clock`** (**strict**, with a clock-resolution/skew margin `δ_clock`) under the one deployment wall clock | a fragment authorized before a fence lands within `W_write` of its authorization (the write is deadline-bounded, not merely un-renewed), which `G_orphan > W_write + δ_clock` keeps **strictly** inside its landing position's orphan grace — the boundary `G_orphan == W_write` would let GC's inclusive `≥` grace check reclaim the evidence in the same tick the straggler lands, so no straggler is ever unevidenced (finding 3, clock-lifecycle table) | write path (`W_write`) / #625 (`G_orphan`, today's grace window) |
-| `W_repoint` (pre-mark → adoption bound, **advisory**) | `W_repoint > 0`; `G_orphan > W_repoint + δ_clock` recommended for sizing | **Not a safety bound (iteration-10 finding 1).** Safety comes from GC CASing `orphan:<pos>` to `reclaiming` **before** `delete_fragment`, so a late adoption CAS preconditioned on the pre-mark's original bytes fails whatever its latency — a caller-side age check bounds when a batch is *issued*, not when it *applies*. `W_repoint` only caps wasted destination writes and pre-mark residency | reconstruction + rebalance |
+| `W_repoint` (pre-mark → destination-write deadline) | `W_repoint > 0`, enforced fail-closed **before the worker authorizes the destination write** (it restarts from a fresh pre-mark instead), and **`G_orphan > W_repoint + W_write + δ_clock`** (strict) | It bounds a **caller-side action** — whether this worker issues the write — which is what a caller-side deadline can soundly do; it is **not** what makes the adoption CAS safe (that is GC's reclaim-intent ordering, X61), because no caller-side check can bound when a transaction *applies*. Without it, a worker that pauses between pre-mark and write can have its evidence reclaimed and then strand the fragment it writes (iteration-11 finding 7) | reconstruction + rebalance |
 
 **Invariant preserved.** (4) Every obligation installed at publication or teardown is drained
 in bounded work, and replay safety is built into each batch (each drain step carries
@@ -1452,6 +1511,20 @@ Three properties are strictly better here, and the third is what the iteration-7
   install as ordinary residue the reaper reclaims with the session (F11a). Blindly probing a fresh
   index after an unknown outcome would leak the landed one for the session's whole life — the
   same accounting hazard the release side avoids with `require(slot == prior)`.
+- **The request quiesces its own renewal before committing the part (normative; iteration-11
+  finding 3).** Once every liveness batch rewrites the slot (above), this request's *own* renewal
+  loop becomes a writer of the very key its part commit preconditions on
+  (`require(slot:<id>:<k> == prior)`) — so a renewal landing between the commit batch's read and
+  its commit produces "session still `Open`, part record unchanged, own slot moved" **without any
+  prior release**, which is exactly the state the classification below treats as impossible. The
+  request therefore **stops and joins its renewal loop before building the commit batch**; its
+  final renewal stamps a lease covering at least the commit's transaction deadline, which is
+  bounded by the `E_tx` envelope, so quiescing cannot let the lease lapse under the commit. And as
+  a belt-and-braces classification rule: a commit that fails **only** on its own slot precondition,
+  with the session still `Open@E` and the part record unchanged, is a **benign retry** — re-read
+  the slot, rebuild, commit again — and never the losing-writer compensation, which would discard a
+  part whose chunks are all durable. Without both, the protocol has a reachable state with neither a
+  success response nor a bounded retry path.
 - **A durable part commit cannot be starved or discarded.** The counter's `-1` rode in the
   part-commit batch, so a commit failed whenever *another* part released its slot; the retry was
   claimed to terminate in ≤ `MAX_INFLIGHT_PARTS` rounds, which is **false** — fresh part starts
@@ -1593,7 +1666,13 @@ garbage-with-a-sound-reclamation-path within `W_session`, not a fourth, forever-
   the fence pinned are still unchanged — so the fence commits and aborts a request that has
   demonstrably just made progress, which is precisely the hole the pin was added to close. One
   batch per renewal round makes the slot rewrite un-skippable, and costs nothing: the renewal
-  already commits a batch, and the slot is one more small key in it. A renewal,
+  already commits a batch, and the slot is one more small key in it. **The same requirement binds
+  the `sidx:` INTENT batch, not only renewals (iteration-11 finding 2):** an intent creates a
+  *fresh, live* owned lease, which is progress by any reading, yet it changes no slot bytes — so a
+  reaper that read an expired slot could fence a part that has just staged a new chunk, with both
+  the session and the slot preconditions still passing. Every batch that creates or renews this
+  request's liveness evidence therefore rewrites its `slot:<id>:<k>` atomically with it. The slot
+  is the request's **own** key, so none of this contends with anything. A renewal,
   a release, or a *new* reservation between the reads and the fence therefore turns the fence into
   a `Conflict`, and the reaper simply re-derives its decision next pass — the safe direction, and
   one that converges because a genuinely abandoned session stops rewriting slots. Preconditioning
@@ -1956,7 +2035,7 @@ reaper's when no client provides one.
 | **Derive the admission limit per gateway instead of reading it from the ledger (iteration-9 finding 5)** | Run two gateways whose local `W_ref` yields different `MAX_SESSIONS` against one store. The one whose derivation disagrees with `mpuctl.max_sessions` MUST refuse to admit and alarm — never admit on its own larger value. Assert the live session count never exceeds the ledger's `max_sessions`, so `MAX_SESSIONS × U_ref ≤ W_ref` holds through the rolling change; a design that keeps the limit in local config admits past the smaller bound and blows the reconcile host's RAM budget, which the gateway that caused it never observes. |
 | **Fence the idle arm without pinning the liveness evidence (iteration-9 finding 4)** | Seeded DST: start an `UploadPart` whose renewal reads a live lease; hold its commit; let the reaper read the now-expired lease and decide to fence; let the renewal commit; then let the fence commit. The fence MUST `Conflict` on the slot preconditions and the upload MUST go on to commit its part. A design whose fence preconditions only `mpu:` aborts a progressing upload before `W_session` — renewal's expiry test is evaluated in the gateway before the commit, not atomically at the store (`metadata.rs:746-760`), so wall-clock agreement does not close it. Assert too that the `W_session` arm still fences a *renewing* session (the ceiling is not a race). |
 | **Reaper unavailable** | Stop the reaper entirely, then drive creation: `reconcile_step` MUST keep succeeding indefinitely (no `ScanCapExceeded`), because the counter refuses new sessions before `mpu:` can approach the cap and no other namespace is read by an unbounded scan. |
-| **Clock-epoch mismatch** | Write a session record with a foreign `clock_source`; the reaper MUST skip it and raise an operator signal, never reap it. |
+| **Clock-epoch mismatch — skip the *judgments*, never the pass (iteration-11 finding 1)** | Write a session record with a foreign `clock_source`: the reaper MUST raise an operator signal and MUST NOT evaluate any timestamp-comparing arm (`W_open`, `W_session`, `W_completing`, `W_tombstone`) against it. But assert the converse too, or the row licenses the absorbing state X71 closed: a foreign-clocked session that is already `Aborting` or `Completed` MUST still have its owned `sidx:` range walked, its `retire:` obligations drained, and (for `Aborting`) its terminal delete fire — none of which reads a session timestamp. A `Completed` foreign-clocked session holds only until FU-6's operator-authorized terminal expiry. An implementation that skips the whole session strands the records and the admission slot forever. |
 | **Reap by expiry of owned leases** | An `Open` session whose owned leases lapsed (a stalled but live client) MUST NOT have its bytes reclaimed until the session itself is abandoned (arm i) or hits `W_session` (arm ii) and is fenced. |
 
 ---
@@ -2292,6 +2371,14 @@ tested against; every row states what actually happens and what makes it so.
 | X79 (iteration-10 finding 7) | A session Completes just **before** its `W_session` deadline and its completer crashes | The ceiling was evaluated only for `Open`, so the session waited out `W_completing`, rolled back to `Open`, and needed a further pass to be reaped — holding staged references, and blocking a drain, for up to `W_completing` **beyond** the promised ceiling. That falsifies F14's residency claim and the F6 drain bound derived from it. The ceiling is measured from `created_at_millis` and now applies to `Completing` too: an over-age `Completing` session takes `Completing@E → Aborting@E+1` **directly**, in one batch that also installs `retire:records:{seg:<id>:<E>}`, never a rollback first | D6, D3, D-A, F6/F14 |
 | X80 (iteration-10 finding 8) | An operator aborts a `Completing` session (FU-6) that has already written segments | The verb crosses the identical edge as the restore fence, so it needs the identical batch: without `retire:records:{seg:<id>:<E>}` installed atomically with the fence, that attempt's `seg:` records have no adopting inode (no root flip) and no rollback obligation naming them — the X57 hole reached through a different door. FU-6's contract now names the obligation | FU-6, X57, D7 |
 | X81 (iteration-10 finding 9) | A client reuses a **completed** upload id inside the tombstone window with a **different** part list | The window returned the recorded `200` + ETag on the upload id alone, so the client is told *its* assembly succeeded while the stored object holds the earlier one — a silent wrong answer, worse than any error. Idempotence is keyed on **request identity**: the `Completed` record carries `complete_fingerprint` (a digest over the ordered `(part_number, digest)` pairs the winning Complete named), the tombstone answers `200` only on a match, and a mismatch is `404 NoSuchUpload` — what the same request receives one tick after the window closes anyway | D3, §2 (verb table) |
+| X82 (iteration-11 finding 1) | An implementer follows decision 6's *failure-mode row* rather than its algorithm and skips a foreign-clocked session wholesale | The row still said "the reaper MUST skip it" after X71 restricted the guard to timestamp-comparing judgments — and the row is the testable artefact, so it would have been implemented. A foreign-clocked `Aborting`/`Completed` session would then never walk its `sidx:` range or reach its terminal delete, holding its admission slot forever, which is exactly the absorbing state X71 closed. The row now asserts **both** directions: no timestamp arm evaluated, **and** the clock-free teardown still runs | D6 (F10), X71 |
+| X83 (iteration-11 finding 2) | A part stages a **new chunk** (a fresh, live `sidx:` lease) after the reaper read its slot as expired, before the idle fence commits | An intent creates liveness evidence without touching the slot, so the fence's session *and* slot preconditions both still pass and it aborts a demonstrably progressing part — X62's hole reached through creation rather than renewal. Closed by the same rule: **every batch that creates or renews this request's liveness evidence rewrites its `slot:<id>:<k>` atomically with it**, intents included. The slot is the request's own key, so nothing contends | D5, D6, X62, X74 |
+| X84 (iteration-11 finding 3) | This request's **own** renewal rewrites its slot between the part-commit batch's read and its commit | Once every liveness batch rewrites the slot, the request's renewal loop becomes a writer of the key its own commit preconditions on — producing "session `Open`, part unchanged, own slot moved" with **no prior release**, a state the commit classification treats as unreachable, so the protocol has neither a success response nor a bounded retry. Closed twice over: the request **quiesces and joins its renewal loop before building the commit batch** (its last renewal covering the `E_tx`-bounded commit deadline, so nothing lapses underneath), and a commit failing **only** its own slot precondition with the session still `Open@E` and the part unchanged is classified a **benign retry**, never the losing-writer compensation that would discard durable chunks | D5, X74, X83 |
+| X85 (iteration-11 finding 4) | A fully staged part is refused at commit by the cumulative `MAX_STAGED_CHUNKS` check | The refusal left the session `Open` and usable by design, but the only defined live-session compensation was for a same-part losing writer — so the refused attempt kept its `sidx:` records, its bytes **and its slot**. A client repeating the refusal (which "the session stays usable" invites) fills `MAX_INFLIGHT_PARTS` and turns that session into a permanent `503` with its bytes still protected. Every **post-staging local refusal** now routes through the same compensation batch as a losing writer — `retire:bytes:{chunks}`, the keyed slot release, its own `sidx:` deletes, under `require(mpu == Open@E)` — so a refusal is a bounded event with an exit | D4.4, D5 |
+| X86 (iteration-11 finding 5) | A crash lands between GC's `reclaiming` CAS and its `delete_fragment` | The ordering X61 introduced deliberately opens this window, so it must be specified rather than assumed away: a durable `reclaiming` value with the fragment still present. `reclaiming` is therefore a **third value variant** (`{ orphaned_at_millis, event, reclaiming: true }`) that `orphan_leases` **decodes** — rejecting it would abort the GC pass at its decode boundary, skipping it would make the fragment permanently unreclaimable — and reads as "reclamation already decided; resume it": re-issue the idempotent `delete_fragment`, then delete the key, with no re-evaluation of a grace test that already elapsed | D4.2, X61, X75 |
+| X87 (iteration-11 finding 6) | A failed attempt's teardown marks planned positions where **no fragment was ever written** | Marking the full planned placement is deliberate (it covers a straggler wherever it lands), but GC consumes an `orphan:` key only while iterating an actual `list_fragments()` result, so a mark with nothing beneath it is never visited and never deleted. `orphan:` is read by a **global** scan, so repeated partial uploads grow it past `SCAN_CAP` and halt GC deployment-wide — the F7 outcome by another route. GC now reclaims the marks themselves: positions in `orphan_leases` that no `list_fragments()` reported, once older than the late-write deadline `W_write + δ_clock` (retained before it — that is the straggler window), deleted in the ordinary `B`-batches | D4.2, D5, X49 |
+| X88 (iteration-11 finding 7) | A repoint worker pauses **between** writing its pre-mark and authorizing the destination write, long enough for GC to reclaim the mark | GC ages the mark through `G_orphan`, CASes it `reclaiming`, deletes nothing (no fragment yet) and removes the mark; the resumed worker's write then lands with **no reference and no evidence** (outcome (a)). `W_write` cannot cover it — it bounds only the interval *after* authorization. The worker therefore **MUST NOT authorize the write if its own pre-mark is older than `W_repoint`**, with **`G_orphan > W_repoint + W_write + δ_clock`** strict. This is a caller-side deadline gating a **caller-side action**, which is sound — unlike the iteration-9 attempt to use one to bound when a *transaction applies* | D4.2, X61, X49 |
+| X89 (iteration-11 finding 8) | The bootstrap Create writes `mpuctl = { count: 1, max_sessions }`, omitting the schema's `profile` | Structural violations fail decoding rather than acquiring defaults ([ADR-0045][a45]), so the next Create or terminal decrement could not read or CAS the record — multipart admission wedged immediately after the very first session, on every fresh or upgraded store. The bootstrap shape is `{ count: 1, max_sessions, profile }`, matching the schema everywhere else. A one-field omission with a total-outage blast radius, and the same class of table-versus-prose drift the previous round's sweep was meant to catch | §1, D6, X76 |
 
 ### What the implementing slices change (summary)
 
@@ -2340,8 +2427,7 @@ tested against; every row states what actually happens and what makes it so.
 - `crates/custodian/src/gc.rs` — **reclamation intent precedes fragment destruction**: the sweep
   CASes `orphan:<pos>` to `reclaiming` and commits **before** `delete_fragment`, deleting the key
   afterwards as today (iteration-10 finding 1) — the ordering the adoption CAS's precondition
-  depends on; plus **dual-format `orphan:` values** (`{ orphaned_at_millis, event }` and the
-  legacy bare decimal, finding 3) in `mark_orphaned`/`orphan_leases`.
+  depends on; plus the **three `orphan:` value variants** (legacy bare decimal, `{ orphaned_at_millis, event }`, and `{ …, reclaiming: true }` — findings 3 and 5, all three decoded, never rejected) and the **fragment-less mark sweep** (positions no `list_fragments()` reported, aged past `W_write + δ_clock`, finding 6) in `mark_orphaned`/`orphan_leases`.
 - `crates/core/src/write.rs` — staged placement (committed **and** in-flight owned) selects against
   `Topology::excluding(draining)` (`placement.rs:141-152`); `intent` writes the owned `sidx:`
   staging entry with the `WritePlan` placement in `staged` (finding 4) **preconditioned
@@ -2544,6 +2630,10 @@ cost above names one of these; filing them is part of accepting this proposal.
   **the `sidx:`-renews-before-the-slot split-batch race (X74), the legacy-`orphan:`-value contact
   path (X75), the ambiguous Create recovered under the same upload id (X78), the over-age
   `Completing` ceiling (X79), and the tombstone answering a non-identical Complete (X81)**,
+  **the intent-without-slot-rewrite fence race (X83), the self-renewal-versus-own-commit race
+  (X84), the refused-part compensation (X85), the crash between GC's `reclaiming` CAS and its
+  `delete_fragment` (X86), the fragment-less orphan-mark sweep (X87), and the paused-worker
+  pre-mark reclamation (X88)**,
   and arrival-outruns-drain. Each lands as a seeded regression. The `scan_page` ordering and
   continuation rules (X70) land in `metadata-conformance` on every backend rather than as DST.
 - **The classification sweep** — one test helper this protocol earns: given a store and a fleet,
@@ -2595,7 +2685,7 @@ adopts decision 1's fence verbatim, that is the moment to reconsider.
 
 ## Backward compatibility
 
-- **On-disk / record format.** The one *non*-additive change is the `orphan:` **value** (above: bare decimal → `{ orphaned_at_millis, event }`, dual-format on read). Otherwise additive prefixes (`mpuctl:`, `mpu:`, `part:`, `sidx:`, `seg:`,
+- **On-disk / record format.** The one *non*-additive change is the `orphan:` **value** (above: bare decimal → `{ orphaned_at_millis, event }`, plus GC's `reclaiming: true` variant — all three decoded on read, none rejected). Otherwise additive prefixes (`mpuctl:`, `mpu:`, `part:`, `sidx:`, `seg:`,
   `retire:`), each **disjoint from every existing prefix and from each other** — in particular the
   owned staging entry is `sidx:<id>:<part>:<chunk>`, **not** under `pending:`, so the existing
   global `pending:` scans (restore's `pending_chunks`, the expiry sweep) keep exactly their present
@@ -2624,7 +2714,9 @@ adopts decision 1's fence verbatim, that is the moment to reconsider.
   absent).
 - **The `orphan:` value gains a field (iteration-10 finding 3).** Values are bare decimal
   `orphaned_at_millis` today (`gc.rs:110-122`, parsed at `:315-330`) and become
-  `{ orphaned_at_millis, event }`. Decoding is **dual-format** — a bare decimal is a legacy mark
+  `{ orphaned_at_millis, event }`, and GC's in-progress reclamation adds a `reclaiming: true`
+  variant (decision 4.2). Decoding accepts all three and rejects none — a decode error here aborts
+  the whole GC pass. A bare decimal is a legacy mark
   with no identity, which the three-arm rule treats as a *different* identity and replaces on first
   contact, so there is no migration pass and no ledger rewrite by a reader. A downgraded custodian
   fails to parse a structured value and drops it from `orphan_leases`, leaving the fragment
