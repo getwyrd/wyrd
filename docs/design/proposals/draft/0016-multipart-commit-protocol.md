@@ -42,6 +42,114 @@ tags:
 > is ratified; ratification (draft → accepted, architecture-board / founding-maintainer
 > authority) is a separate governance act that is **not** part of this cycle.
 
+## In plain language
+
+This section is for readers who need to know **what the system does**, not how it is built. It
+decides nothing — *Motivation* below carries the argument for why this proposal exists and
+*Design* carries the normative decisions — but nothing here is a simplification either of them
+contradicts. Terms in **bold** are the ones used throughout.
+
+**The everyday scene.** A backup tool uploads a 50 GB file. No single request carries 50 GB, so
+the S3 protocol splits it: the client says "start an upload" and gets an **upload id**; it sends
+the file as numbered **parts**, often eight or sixteen at a time, over minutes or hours; finally
+it says "assemble these parts, in this order, into one object". Only that last step —
+**Complete** — makes the object visible. If the client walks away first, nothing should ever
+appear.
+
+**Why that is harder than it sounds.** Wyrd writes each part's bytes to disk as they arrive,
+spread across many machines. A background housekeeper continuously reclaims bytes that no
+finished object refers to — that is how overwritten and deleted data is freed. But a part that
+arrived twenty minutes ago belongs to no finished object *yet*, so to the housekeeper it looks
+exactly like garbage. Until now the answer was a short-lived ticket — "a write is in progress,
+keep these bytes" — good for thirty seconds and renewed for as long as one request keeps
+streaming. A multipart upload lasts hours and outlives the server holding it, so that ticket
+cannot be what keeps its bytes alive. Everything below follows from replacing it.
+
+### How it works
+
+- **Receipts, not tickets.** Every part that finishes leaves a small durable record saying
+  "these bytes belong to upload X, part 7", and every part still streaming leaves one per chunk
+  saying the same thing. The housekeeping passes are taught to read those receipts: bytes with a
+  receipt are protected, and the protection lasts as long as the receipt does rather than as long
+  as a timer does. A part hands off from the streaming receipt to the finished-part receipt in a
+  single indivisible step, so there is never an instant where the bytes are unclaimed.
+
+- **A fixed number of parking spaces.** Each upload has a small, fixed set of numbered slots —
+  say sixteen — and a part must take one before it may start streaming. Because the slots are
+  *keys that either exist or do not*, no amount of concurrency can create a seventeenth: when
+  they are all taken, the client is told "slow down, try again", which is a normal, expected S3
+  answer. This is what stops one client from leaving unbounded half-finished debris behind, and
+  it is why a crashed part keeps holding its slot — debris is counted, not invisible.
+
+- **A lock at assembly time, not a stopwatch.** When the client asks to assemble, the upload is
+  first **fenced**: the upload's own record is flipped to "completing" in one atomic step, and
+  every part operation carries a check against that record. After the fence, no part can be
+  added, replaced, or removed. That single check is what proves the assembler is looking at
+  exactly the set of parts that exists — the guarantee the thirty-second ticket used to provide,
+  now provided by a lock that no clock can expire.
+
+- **Publication is one flip.** The assembled table of contents is written first — as several
+  records if the object is too large for one, see below — and only then is a single atomic
+  update made that points the object's name at it. Before that update nothing is visible; after
+  it, everything is. There is no half-published object, and if the flip loses a race to someone
+  else writing the same key at the same moment, the upload is unlocked and the client may retry
+  rather than being stranded.
+
+- **Big objects get chapters.** The list of "where each piece of this object lives" is itself
+  data, and a 50 GB object's list does not fit in the single record the store allows. So the list
+  is split into **segments** — chapters written ahead of time — with the object's record naming
+  the set. This is what lets objects exceed the size a single ordinary upload can reach.
+
+- **Cleaning up is a to-do list, not a big bang.** Overwriting or deleting a very large object
+  would otherwise mean millions of small updates in one database transaction — more than any
+  transaction is allowed to hold, so it would fail permanently rather than slowly. Instead the
+  operation records a single durable **obligation** ("these bytes are no longer referenced") in
+  the same instant it makes the change, and a background worker drains it in small batches. A
+  crash mid-drain loses nothing: the to-do item is still there and the work resumes.
+
+- **Evidence before removal, and the clock is never restarted.** Before anything stops protecting
+  a byte, a mark is written saying "this is reclaimable, as of now"; the housekeeper only frees
+  it after a grace period. Marks are written once and never overwritten — a second worker that
+  finds a mark already present leaves it alone, because rewriting it would restart the grace
+  period and could postpone reclamation indefinitely.
+
+- **A janitor for uploads nobody will finish.** Someone presses Ctrl-C; a server dies holding a
+  half-assembled upload. A background pass finds uploads that have shown no progress for a while,
+  or that have simply been open too long, cancels them, and reclaims their bytes. It decides
+  using durable records rather than trusting timestamps from machines whose clocks it does not
+  own, and every state an upload can be in has some actor able to move it out — nothing can get
+  permanently stuck.
+
+- **After a metadata restore, in-flight uploads are cancelled.** If the metadata is rolled back
+  to an earlier backup, an upload that was in progress at that moment may refer to bytes that
+  have since been freed. Rather than guess, the restore cancels every open upload; clients start
+  those uploads again. This is a deliberate simplification, chosen over a resumption protocol
+  that could not prove the bytes still exist.
+
+### What a client sees
+
+Ordinary S3 behaviour, with three refusals that are all normal protocol answers rather than
+errors in the usual sense: **slow down** when too many parts are in flight for one upload or too
+many uploads are open across the system; **no such upload** when an upload was cancelled or
+already finished; and **too large** when a part, or an upload's accumulated parts, exceeds what
+this deployment is configured to publish. A cancelled upload is never a partially visible object
+— the object either appears complete or does not appear at all.
+
+### What the design promises, and what it costs
+
+Four promises, each of which the rest of the document tests against concrete failure scenarios:
+an object is never published over bytes the housekeeper is free to delete; no durable byte is
+left with nothing that will ever clean it up; no upload can reach a state that nothing can move
+it out of; and no operation ever needs a database transaction larger than the store allows.
+
+The costs are chosen and stated rather than discovered later. Deleted or overwritten data is
+retained slightly longer, because evidence is written before protection is lifted. An upload left
+open beyond the configured ceiling is cancelled and must be restarted. A client cannot park more
+staged data in one upload than that upload could ever publish. And the number of uploads the
+system will accept at once follows arithmetically from two operator choices — how much memory the
+housekeeping host has, and how large parts are allowed to be — rather than being a number someone
+picks: large parts buy fewer simultaneous uploads, small parts buy more.
+
 ## Motivation
 
 `CompleteMultipartUpload` is not a new verb over the existing write path. It is the first
