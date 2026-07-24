@@ -1135,6 +1135,22 @@ each is one JSON value:
      event just removed** ⇒ re-stamp it with the new event's identity and a fresh `orphaned_at`,
      starting a full `G_orphan` for the deletion that is actually happening now.
 
+   **An installed-but-undrained `retire:` obligation PROTECTS the bytes it names (normative;
+   iteration-12 finding 5).** The re-stamp above happens in the drain, which is asynchronous — so
+   between the batch that removes the last reference and the drain that refreshes a stale mark
+   there is a window in which GC sees an unreferenced fragment carrying an **already-expired**
+   mark, transitions it to `reclaiming` and deletes it. A GET overlapping that deletion gets none
+   of the grace the refresh exists to give it — the defect this rule was added to fix, merely moved
+   into the gap. Serializing the refresh into the unreference batch is not available: that fan-out
+   is exactly what `retire:` exists to keep out of that batch. So the **obligation itself is a
+   protection class** — GC's `protects()` returns true for every position named by an installed
+   `retire:bytes:` obligation that has not finished draining, exactly as it does for a committed or
+   a staged reference (decision 2). The stale mark cannot be acted on while the obligation is
+   pending; once the drain has refreshed it with the new event identity and retired the obligation,
+   the fragment is unprotected and its **fresh** grace window governs. Cost: reclamation waits for
+   the drain — the direction this design already accepts everywhere ("never earlier than today's
+   inline orphaning, only later").
+
    Re-stamping is bounded to **once per unreference event per position**, so it cannot be driven in
    a loop by a racing pair (they share an identity and take the skip arm) — the two properties are
    independent, and conflating them is what made the earlier rule wrong in one direction while
@@ -1222,13 +1238,38 @@ each is one JSON value:
    *global* scan (`orphan_leases`), so repeated partial uploads would grow it without bound and
    eventually fail that scan at `SCAN_CAP` — halting GC for the whole deployment, the F7-class
    outcome this protocol exists to avoid. GC therefore also reclaims **the marks themselves**: the
-   positions in `orphan_leases` that no server's `list_fragments()` reported are exactly the
-   fragment-less marks, computable in the pass GC already runs, and one whose `orphaned_at_millis`
-   is older than the **late-write deadline** (`W_write + δ_clock`, past which no authorized write
-   can still land — the X49 bound) is deleted in the sweep's ordinary `B`-batches. Before that
-   deadline it is retained, because that is exactly the straggler window the mark exists to cover.
+   positions in the ledger that no server's `list_fragments()` reported are exactly the
+   fragment-less marks, computable in the pass GC already runs, and one older than the
+   **late-write deadline** is deleted in the sweep's ordinary `B`-batches.
+
+   **That deadline is `W_repoint + W_write + δ_clock`, not `W_write + δ_clock` (iteration-12
+   finding 3).** A repoint **pre-mark is legitimately fragment-less** for up to `W_repoint` — that
+   is the whole point of pre-marking *before* writing the destination — so sweeping at the shorter
+   deadline would delete a pre-mark out from under a worker still inside its own budget, which then
+   passes its age check, authorizes the write, and strands it with no reference and no evidence.
+   The two rules were added in the same round and did not compose. The sweep therefore retains any
+   fragment-less mark until `W_repoint + W_write + δ_clock`, still **strictly inside** `G_orphan`
+   by the sizing above, so nothing is retained past its grace. (An implementation may tighten this
+   per event kind — a teardown mark cannot be awaiting a repoint write — since the mark carries its
+   event identity; the uniform bound is the safe default.)
+
+   **And the ledger itself must be walked in pages, not one scan (iteration-12 finding 4).**
+   `orphan_leases` reads the whole prefix with `scan` today (`gc.rs:315-330`), and this proposal
+   makes that unsurvivable: a **single** maximum segmented-object retirement installs up to
+   ~1.78 M `orphan:` records (decision 4's own fan-out number) against a `SCAN_CAP` of 1,048,576 —
+   and `scan` fails whole, with no partial result. One large delete would take GC out permanently,
+   and with it the fragment-less-mark cleanup that is supposed to bound this very namespace: the
+   failure is **self-sealing**, which is the worst property a failure can have. `orphan:` therefore
+   joins `retire:` as a namespace **never read by a single scan** — walked with `scan_page` in
+   cursor-keyed pages (X70's contract, whose no-skip-for-stable-keys rule is what makes a page-wise
+   sweep sound), naturally sub-ranged by the `<dserver>` component of the key so a pass can join a
+   page against that server's `list_fragments()` result, with the sweep's mutations byte-budgeted
+   per batch as everywhere else. Not a new mechanism: the one decision 4 already introduced for
+   `retire:`, applied to the other namespace whose cardinality this protocol drives past the cap.
+
    So every mark this protocol writes has a deleter whether or not its position is ever written, and
-   the `orphan:` namespace is bounded by the same argument as the rest.
+   the `orphan:` namespace is **accessible at every cardinality** rather than bounded below a cap it
+   can legitimately exceed.
 3. **Admission bounds what cannot be drained: the map, the part, the segment, the session's
    staged total, and the session population.** `MAX_MAP_CHUNKS` caps a flat map, `MAX_SEG_CHUNKS`
    a segment record, `MAX_PART_CHUNKS` a part record, `MAX_ROOT_SEGMENTS` the segments a root may
@@ -1427,13 +1468,21 @@ flight.
      chunks, releases its own slot (`require(slot:<id>:<k> == prior)` + delete, under
      `require(mpu == Open@E)`), and deletes its own `sidx:` entries in one batch, then drains it;
    - **its own slot record moved or vanished** while the session is still `Open@E` and the part key
-     is unchanged — while a session is `Open` the only writers of that key are this attempt (its
-     release) and, *once released*, whichever later attempt claims the freed index; a reaper
-     teardown cannot touch an `Open` session. So this branch is reachable **only after this
-     attempt's own release already landed** — it is a retry of a batch that in fact committed
-     (X38's re-read case). The committer re-reads the **part record**, finds its own commit
-     present, and returns success without compensating. It never re-releases the slot, so no
-     double release is representable (iteration-7 finding 4).
+     is unchanged — while a session is `Open` the writers of that key are this attempt (its
+     release **and now its own liveness batches**, iteration-11 finding 2) and, *once released*,
+     whichever later attempt claims the freed index; a reaper teardown cannot touch an `Open`
+     session. **The branch therefore splits, and the split is load-bearing (iteration-12 finding
+     1):** the committer re-reads the **part record** and
+     - **finds its own commit present** ⇒ this is a retry of a batch that in fact committed
+       (X38's re-read case): return success without compensating, and never re-release the slot,
+       so no double release is representable (iteration-7 finding 4);
+     - **finds it absent or another attempt's** ⇒ the slot moved for the *other* reason it now can
+       — **this request's own renewal rewrote it** between the commit's read and its commit — so
+       there is no landed commit to report and treating the branch as one would return success for
+       a part that does not exist. It is the **benign retry** of decision 5: re-read the slot,
+       rebuild the batch, commit again. (Quiescing the renewal loop before building the batch makes
+       this unreachable in a conforming implementation; the branch exists so that a
+       non-conforming one degrades to a retry rather than to a false success.)
 
    There is deliberately **no third branch** for "someone else's part moved a counter I share",
    because the slot table leaves no such key. A part commit therefore either lands, or loses to a
@@ -1997,7 +2046,7 @@ whole-namespace scan is `scan("mpu:")`, bounded by the counter; `part:` (`≤
 MAX_PARTS_PER_SESSION`), `slot:` (`≤ MAX_INFLIGHT_PARTS` by key space), owned `sidx:` (`≤
 MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`, enforced by the slot range) and `seg:`
 (`≤ MAX_ROOT_SEGMENTS`) are per-session/per-object ranges each held below
-`SCAN_CAP` by an enforced bound; `retire:` is walked in cursor-keyed bounded ranges; **no global
+`SCAN_CAP` by an enforced bound; `retire:` **and `orphan:`** are walked in cursor-keyed bounded ranges (the latter added by iteration-12 finding 4 — a single maximum segmented-object retirement installs ~1.78 M marks, well past `SCAN_CAP`); **no global
 `pending:` scan of owned entries exists** (finding 3). Owned-`sidx:` reclamation is
 **fence-then-walk** (**D-E**) for both the `Aborting` and the `Completed` path — a session's
 entries are touched only after that session is fenced or terminal in this pass, so a session
@@ -2023,7 +2072,7 @@ reaper's when no client provides one.
 | **Stale-snapshot reclamation (F15).** Filter a snapshot of owned entries against an older session list | DST: create a session mid-pass; the reaper MUST NOT orphan-mark its in-flight part's fragments or kill its renewals. Fence-then-walk per session makes this unconstructible; a stale-snapshot implementation reaps the live part (a DST observable on the renewal refusal, `write.rs:474-478`). |
 | **Completed-path residue stranded (finding 2).** Walk `sidx:` only for `Aborting`, not `Completed` | Crash an in-flight part (owned `sidx:` residue, no `part:` record), then Complete naming other parts: after the `Completed` teardown, `scan("sidx:<id>:")` MUST be empty before the terminal delete (which discards the surviving `slot:` records outright); the gate is the empty `sidx:` range, **never** an empty `slot:` range (the crashed attempt keeps its slot, §2). A design that skips the `Completed` walk strands the residue forever (outcome (a)). |
 | **Terminal delete before the `sidx:` range is walked empty (findings 1/2).** Delete the session while owned residue remains | DST: leave a crashed in-flight part's owned `sidx:` residue, fence the session, and attempt the terminal delete in the same pass before the `sidx:` walk: it MUST NOT fire until the range is observed empty. Because fenced intents (finding 1) let nothing refill the range, the walk always converges; deleting early would strand residue nothing can discover. |
-| **Clock guard read from the owned entry, not the session (finding 6b).** Reap using an owned-lease stamp before checking the session's `clock_source` | Write a session with a foreign `clock_source` and an owned entry with a *local*-looking lease; the reaper MUST skip the whole session (guard read from `mpu:` first) and never evaluate its owned lease. |
+| **Clock guard read from the owned entry, not the session (finding 6b).** Reap using an owned-lease stamp before checking the session's `clock_source` | Write a session with a foreign `clock_source` and an owned entry with a *local*-looking lease; the reaper MUST read the guard from `mpu:` **first** and MUST NOT evaluate that owned lease in any timestamp-comparing judgment. It MUST NOT, however, skip the session's **clock-free** work — the `sidx:` walk, the `retire:` drain and (for `Aborting`) the terminal delete still run, per X71/X82; asserting a whole-session skip here would license the absorbing state those closed. |
 | **`W_completing` from the wrong instant (F16).** Measure staleness from last part progress | Fence a Complete long after its last part; advance the clock past `W_completing` from that part but not from `fenced_at`; the reaper MUST NOT roll it back. |
 | **The Complete race.** Reap a session concurrently with its Complete | DST both interleavings: (i) reaper fences first → Complete's fence returns `Conflict`, client sees `404 NoSuchUpload`, **no object is published**; (ii) Complete fences first → the reaper's CAS fails and it MUST NOT touch the session, and the published object's fragments MUST carry no `orphan:` record after the drain. |
 | **Roll back a `Completing` session unsafely** | DST: reaper rolls back while the completer's flip batch is in flight; assert the flip returns `Conflict` and that a subsequent Complete publishes exactly once, and that the rolled-back session's stale `seg:` records are reclaimed. |
@@ -2379,6 +2428,12 @@ tested against; every row states what actually happens and what makes it so.
 | X87 (iteration-11 finding 6) | A failed attempt's teardown marks planned positions where **no fragment was ever written** | Marking the full planned placement is deliberate (it covers a straggler wherever it lands), but GC consumes an `orphan:` key only while iterating an actual `list_fragments()` result, so a mark with nothing beneath it is never visited and never deleted. `orphan:` is read by a **global** scan, so repeated partial uploads grow it past `SCAN_CAP` and halt GC deployment-wide — the F7 outcome by another route. GC now reclaims the marks themselves: positions in `orphan_leases` that no `list_fragments()` reported, once older than the late-write deadline `W_write + δ_clock` (retained before it — that is the straggler window), deleted in the ordinary `B`-batches | D4.2, D5, X49 |
 | X88 (iteration-11 finding 7) | A repoint worker pauses **between** writing its pre-mark and authorizing the destination write, long enough for GC to reclaim the mark | GC ages the mark through `G_orphan`, CASes it `reclaiming`, deletes nothing (no fragment yet) and removes the mark; the resumed worker's write then lands with **no reference and no evidence** (outcome (a)). `W_write` cannot cover it — it bounds only the interval *after* authorization. The worker therefore **MUST NOT authorize the write if its own pre-mark is older than `W_repoint`**, with **`G_orphan > W_repoint + W_write + δ_clock`** strict. This is a caller-side deadline gating a **caller-side action**, which is sound — unlike the iteration-9 attempt to use one to bound when a *transaction applies* | D4.2, X61, X49 |
 | X89 (iteration-11 finding 8) | The bootstrap Create writes `mpuctl = { count: 1, max_sessions }`, omitting the schema's `profile` | Structural violations fail decoding rather than acquiring defaults ([ADR-0045][a45]), so the next Create or terminal decrement could not read or CAS the record — multipart admission wedged immediately after the very first session, on every fresh or upgraded store. The bootstrap shape is `{ count: 1, max_sessions, profile }`, matching the schema everywhere else. A one-field omission with a total-outage blast radius, and the same class of table-versus-prose drift the previous round's sweep was meant to catch | §1, D6, X76 |
+| X90 (iteration-12 finding 4) | One maximum segmented-object delete installs ~1.78 M `orphan:` marks and GC then runs | `orphan_leases` reads the whole prefix with a single `scan` (`gc.rs:315-330`) against `SCAN_CAP = 1,048,576`, and `scan` fails **whole**, with no partial result — so that one delete takes GC out permanently, **including the fragment-less-mark cleanup that is supposed to bound this very namespace**. The failure is self-sealing: the mechanism that would recover it is the mechanism it disables. `orphan:` therefore joins `retire:` as a namespace never read by a single scan — `scan_page` in cursor-keyed pages, sub-ranged by the key's `<dserver>` component so a page joins against that server's `list_fragments()`, mutations byte-budgeted per batch. The fan-out number is decision 4's own, so the cap was always exceeded; this proposal is what made it load-bearing | D4.2, D4, X70, traits seam |
+| X91 (iteration-12 finding 3) | GC's fragment-less-mark sweep meets a repoint **pre-mark** whose worker has not yet authorized its write | A pre-mark is *legitimately* fragment-less for up to `W_repoint` — that is what pre-marking before writing means — so sweeping at `W_write + δ_clock` deletes it out from under a worker still inside its budget; the worker then passes its own age check, authorizes the write, and strands it with no reference and no evidence (X88's hole, reopened by X87's sweep). The two rules landed in the same round and did not compose. The sweep's deadline is `W_repoint + W_write + δ_clock`, still strictly inside `G_orphan`; an implementation may tighten it per event kind, since the mark carries its identity | X87, X88, D4.2 |
+| X92 (iteration-12 finding 5) | The last reference to a fragment carrying a **stale, already-expired** mark is removed, and GC runs before the drain refreshes that mark | The refresh is the drain's work and the drain is asynchronous, so GC sees unreferenced + expired, CASes `reclaiming`, and deletes — a GET overlapping the deletion gets none of the promised grace. X63's fix, relocated into its own gap. Serializing the refresh into the unreference batch is unavailable (that fan-out is precisely what `retire:` keeps out of it), so the **obligation itself becomes a protection class**: `protects()` is true for every position named by an installed, undrained `retire:bytes:` obligation. The stale mark is unactionable until the drain refreshes it, after which the fresh grace governs. Cost: reclamation waits for the drain — the direction this design accepts everywhere | D4.2, D2, X63 |
+| X93 (iteration-12 finding 1) | This request's own renewal moves its slot mid-commit, and the commit's classification reaches the "slot moved while `Open`" branch | X84 added the benign-retry rule but left decision 5's *classification* saying that branch can only mean this attempt's release already landed — so an implementation following it would re-read the part record, find nothing, and have no defined outcome (or worse, report success for a part that does not exist). The branch now splits on that re-read: own commit present ⇒ the X38 retry-of-a-committed-batch case, return success without re-releasing; absent or another attempt's ⇒ the **benign retry**. Quiescing makes the second arm unreachable in a conforming implementation; it exists so a non-conforming one degrades to a retry rather than a false success | D5, X84, X38 |
+| X94 (iteration-12 finding 2) | The classification-sweep test helper is run against a correct execution mid-handoff | "Exactly one class" is the wrong assertion and would fail on correct executions: this protocol **deliberately** overlaps protection across both handoffs — a published chunk is committed-referenced *and* still named by a staged `part:` record until `retire:records:{parts}` drains, and a retirement's marks precede its record deletions by construction. That overlap is what closes the gaps the source-before-destination orders exist to prevent (X67), so a disjointness assertion would pressure an implementer to remove the property that makes the handoffs safe. Invariant (2) is a **no-gaps** claim, not a partition: assert **at least one** safe class, and separately reject only genuinely incompatible pairs | Tests, D2, X67 |
+| X95 (iteration-12 finding 6) | An implementer follows decision 6's *other* foreign-clock failure-mode row (the finding-6b guard-ordering row) | A second row still said the reaper "MUST skip the whole session", so X82's correction of the first row left the contradiction intact one row down — and the rows are the artefacts tests are written from. Both rows now assert the same two-sided property: no timestamp-comparing judgment against a foreign-clocked session, **and** its clock-free teardown still runs. Two rows saying different things about the same guard is the drift class these rounds keep surfacing | D6, X71, X82 |
 
 ### What the implementing slices change (summary)
 
@@ -2386,7 +2441,7 @@ tested against; every row states what actually happens and what makes it so.
   ADR-0016 narrow-seam rule): `MetadataStore` gains a **bounded/paginated range scan**
   (`scan_page(prefix, after: Option<&[u8]>, limit) -> (Vec<(key, val)>, next: Option<Vec<u8>>)`) so
   the retirement drain can walk the `retire:` namespace in cursor-keyed pages, none exceeding
-  `SCAN_CAP`. **The signature alone is not the contract, and the semantics are normative
+  `SCAN_CAP` — **and GC can walk `orphan:` the same way**, which iteration-12 finding 4 showed is not optional: one maximum segmented-object retirement installs ~1.78 M marks against a cap of 1,048,576, and `scan` fails whole. **The signature alone is not the contract, and the semantics are normative
   (iteration-9 finding 10):** today's `scan` leaves ordering *unspecified*, so a `scan_page` that
   inherited that freedom could return pages whose continuation silently skips a key — and a skipped
   `retire:` obligation retains its bytes and records **forever**, which is the exact failure the
@@ -2427,7 +2482,7 @@ tested against; every row states what actually happens and what makes it so.
 - `crates/custodian/src/gc.rs` — **reclamation intent precedes fragment destruction**: the sweep
   CASes `orphan:<pos>` to `reclaiming` and commits **before** `delete_fragment`, deleting the key
   afterwards as today (iteration-10 finding 1) — the ordering the adoption CAS's precondition
-  depends on; plus the **three `orphan:` value variants** (legacy bare decimal, `{ orphaned_at_millis, event }`, and `{ …, reclaiming: true }` — findings 3 and 5, all three decoded, never rejected) and the **fragment-less mark sweep** (positions no `list_fragments()` reported, aged past `W_write + δ_clock`, finding 6) in `mark_orphaned`/`orphan_leases`.
+  depends on; **`orphan_leases` and the mark sweep walk the ledger with `scan_page`, never one `scan`** (a single max-object retirement exceeds `SCAN_CAP`, iteration-12 finding 4); **`protects()` gains the pending-`retire:bytes:` class** (finding 5); plus the **three `orphan:` value variants** (legacy bare decimal, `{ orphaned_at_millis, event }`, and `{ …, reclaiming: true }` — findings 3 and 5, all three decoded, never rejected) and the **fragment-less mark sweep** (positions no `list_fragments()` reported, aged past `W_write + δ_clock`, finding 6) in `mark_orphaned`/`orphan_leases`.
 - `crates/core/src/write.rs` — staged placement (committed **and** in-flight owned) selects against
   `Topology::excluding(draining)` (`placement.rs:141-152`); `intent` writes the owned `sidx:`
   staging entry with the `WritePlan` placement in `staged` (finding 4) **preconditioned
@@ -2633,13 +2688,27 @@ cost above names one of these; filing them is part of accepting this proposal.
   **the intent-without-slot-rewrite fence race (X83), the self-renewal-versus-own-commit race
   (X84), the refused-part compensation (X85), the crash between GC's `reclaiming` CAS and its
   `delete_fragment` (X86), the fragment-less orphan-mark sweep (X87), and the paused-worker
-  pre-mark reclamation (X88)**,
-  and arrival-outruns-drain. Each lands as a seeded regression. The `scan_page` ordering and
+  pre-mark reclamation (X88)**, **the sweep-versus-pre-mark composition (X91), the
+  stale-mark-unprotected-before-the-drain delete/read case (X92), and the own-renewal commit
+  classification (X93)**,
+  and arrival-outruns-drain. Each lands as a seeded regression. The `orphan:` pagination (X90)
+  lands in `metadata-conformance` beside X70's `scan_page` contract, and needs a scale case that
+  drives one maximum segmented-object retirement past `SCAN_CAP`. The `scan_page` ordering and
   continuation rules (X70) land in `metadata-conformance` on every backend rather than as DST.
 - **The classification sweep** — one test helper this protocol earns: given a store and a fleet,
-  assert every on-disk fragment is in exactly one class (committed-referenced,
-  staged-with-a-session, evidenced-for-reclamation). It is the mechanical form of invariant (2)
-  and the single strongest regression net for this protocol; run it after every DST scenario.
+  assert every on-disk fragment is in **at least one** safe class — committed-referenced,
+  staged-with-a-session, or evidenced-for-reclamation — and separately that it is in no
+  *genuinely incompatible* combination (evidenced-for-reclamation with its grace already elapsed
+  **while** still committed-referenced is the one that matters, since that is the pair GC would act
+  on wrongly). **"Exactly one" would be wrong, and would fail on correct executions (iteration-12
+  finding 2):** this protocol *deliberately* overlaps protection across both handoffs — after the
+  root flip and before `retire:records:{parts}` drains, every published chunk is simultaneously
+  committed-referenced **and** named by a staged `part:` record, and a retirement's marks precede
+  its record deletions by construction, so a chunk is briefly staged **and** evidenced. That
+  overlap is exactly what closes the gaps the source-before-destination read orders exist to
+  prevent (X67, decision 2), so a helper demanding disjointness would pressure an implementer to
+  remove the very property that makes the handoffs safe. Invariant (2) is a **no-gaps** claim, not
+  a partition. Run it after every DST scenario.
 - **Conformance across backends** (`metadata-conformance`) for the new record round-trips
   (including `slot:` and `psum:`), the segmented map, and the `PendingEntry` decode→encode identity
   on **both** a legacy value (both optional fields absent) and an owned `sidx:` value (`owner` +
