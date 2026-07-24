@@ -29,5 +29,6 @@ This index is the authoritative record of each proposal's current status and any
 | [0013](accepted/0013-implementation-arc-rescoped.md) | The implementation arc (rescoped) | accepted (supersedes 0002; tracker [#298](https://github.com/getwyrd/wyrd/issues/298)) |
 | [0014](draft/0014-milestone-7-failover-and-dr-single-dc.md) | Milestone 7 — failover and disaster recovery, single-DC | draft (authoring: [#368](https://github.com/getwyrd/wyrd/issues/368)) |
 | [0015](accepted/0015-milestone-4-production-metadata-backend-revised.md) | Milestone 4 — production metadata backend (TiKV), revised | accepted (supersedes 0007; tracker [#201](https://github.com/getwyrd/wyrd/issues/201)) |
+| [0016](draft/0016-multipart-commit-protocol.md) | The multipart commit protocol (assembled writes) | draft (settlement: [#626](https://github.com/getwyrd/wyrd/issues/626)) |
 
 ¹ Frozen pre-rescope: uses proposal 0002's original milestone numbering (old M5/M6/M7 = cross-zone replication / global control plane / cross-zone DR → **M9/M10/M11** today), and where these files call M4 the release point or the first deployable/usable product, that is superseded too — the **Step-2 ★ release point moved to M8** (M4 is a soft stopping point that completes the data plane). Reconcile through [0013's old→new mapping table](accepted/0013-implementation-arc-rescoped.md).
