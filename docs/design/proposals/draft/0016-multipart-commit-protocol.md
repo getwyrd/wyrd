@@ -391,14 +391,31 @@ the published map instead would mean reading an inode that may already have been
 this protocol adds states its invariants at the parse boundary, and a violation is an **error**,
 not a silently-corrected default: a `slot:` key whose `<index>` is not a fixed-width decimal in
 `[0, MAX_INFLIGHT_PARTS)`; a `slot:`, `psum:`, `sidx:` or `mpu:` value that fails to decode or
-carries a field the state forbids (a `Completing`-only `fenced_at_millis` on an `Open` session, a
-`sidx:` value whose `staged` placement length does not match its scheme's fragment count); a
+carries a field the state forbids (a `Completing`-only `fenced_at_millis` on an `Open` session); a
 `retire:` key whose mode prefix is neither `bytes` nor `records`; and a segmented root whose
 segment count exceeds `MAX_ROOT_SEGMENTS` or whose `seg:` records' `byte_offset`/`byte_len` do not
 tile `[0, size)` contiguously. The reader **fails closed** — a resolver that meets one returns an
 error and, where a maintenance pass is the reader, alarms and skips that object rather than acting
 on a half-understood record. This is the same boundary rule the `retire:` mode-in-the-key argument
 below rests on, stated once for the whole record set.
+
+**What is *not* a decode error: placement length (iteration-9 finding 2).** A `sidx:` value whose
+`staged` placement length does not match its scheme's fragment count is a **contextual** check, and
+the standing convention puts contextual checks on the other side of the boundary — *"structural
+invariants are validated at decode and surface as errors, never as values; contextual checks (e.g.
+placement length) are liberal on read and strict in maintenance paths"* ([ADR-0045][a45];
+`AGENTS.md:146-149`, which names placement length as **the** example). Rejecting it at decode
+would also defeat the handling the fleet already has: a malformed-placement chunk is not a fault to
+propagate but a record to **quarantine** — GC's safety gate protects *every* fragment bearing its
+id precisely because its true placement cannot be trusted (`crates/custodian/src/gc.rs:160-170`,
+the `malformed-placement` skip reason), and the drain surfaces it as `PendingMalformed { chunks }`
+rather than as an unexplained stall (`desired_state.rs:97-103`). So: a `sidx:` with a
+length-mismatched `staged` placement **decodes**, and the staged reference build classifies it into
+the existing `ReferenceSet.malformed` set, where it is fail-safe protected, attributed in the drain
+answer, and repaired or reaped through the ordinary paths. Turning it into a decode error would
+convert a quarantinable record into an error that aborts the whole reconcile step before GC, scrub,
+reconstruction and rebalance run (each leg `?`-propagates, `reconciliation.rs:75-112`) — strictly
+worse than the quarantine, and a contradiction of the boundary rule this section is applying.
 
 **Why the mode lives in the key, not in a field.** `retire:bytes:` orphan-marks fragments;
 `retire:records:` must never orphan anything, because its bytes are live object content or
@@ -701,7 +718,7 @@ Reading the **source** class before the **destination** class makes the same int
 it in *both* or in `part:` alone, never in neither, without needing a snapshot the store does not
 offer. **The rule is general, not local to this build:** wherever one batch atomically moves a fact
 from one key range to another, every reader of both ranges reads the source first — the reaper's
-`slot:` → `psum:` progress reads obey it for the same reason (decision 6, X59). Building the staged set costs a **product of chunks**, not
+`slot:` → `psum:` progress reads obey it for the same reason (decision 6, X60). Building the staged set costs a **product of chunks**, not
 a single scan: the build iterates the `mpu:` scan (≤ `MAX_SESSIONS`) and, per session, the bounded
 `part:<id>:` range (≤ `MAX_PARTS_PER_SESSION` records, **each expanding to ≤ `MAX_PART_CHUNKS`
 chunk-refs held in memory**) **and** the bounded `sidx:<id>:` range
@@ -787,6 +804,7 @@ now a named class with a named exit (bounded by `W_session`), and the fourth cat
 | Let staged placement — committed OR in-flight owned — land on a draining server | Request a drain, then start a part upload; assert no fragment of the new part (in-flight *or* committed) is placed on the draining server (`Topology::excluding`). Without it, the drain stall is unbounded even under `W_session`. |
 | Filter placement against the draining set but leave intent creation **unfenced** (iteration-8 finding 1) | DST: select a placement naming server `S` from a pre-drain topology snapshot, then interleave the drain request and a `reconciliation_status(S)` read **before** the `sidx:` intent commits. The status MAY be `Satisfied` at that instant, but the intent MUST then fail `require_absent(desired:dserver:S)` and re-plan — assert no fragment of that part ever lands on `S`. A design that only filters the snapshot lets the intent land after `Satisfied`, and wiping `S` then lets the part commit and Complete publish a map naming wiped fragments (outcome (c)). The same fence applies to the destination of a staged re-place and a committed segment repoint. |
 | Build the staged/restore reference set with a global `pending:` scan that owned entries inflate (the iteration-3 finding-3 hole) | Strand fleet-wide owned entries past `SCAN_CAP` across many `Open` sessions, then run `reconcile_after_restore`: it MUST succeed — owned entries live under the disjoint `sidx:` prefix, so `scan("pending:")` sees only ordinary pending; a design that keeps owned entries under `pending:` fails `ScanCapExceeded` and the restore never progresses. |
+| Adopt a pre-marked destination on the ledger precondition alone, with no `W_repoint` deadline (iteration-9 finding 1) | Seeded DST over GC's delete-before-cleanup ordering: let a repoint's pre-mark age past `G_orphan`, run a GC pass that calls `delete_fragment(P_new)` but has not yet committed its `cleanup` batch, then run the adoption CAS. It MUST refuse (its pre-mark is older than `W_repoint`), and the object MUST NOT end up naming `P_new`. A design that trusts `require(orphan:<P_new> == prior)` alone commits — the key still holds its exact pre-mark bytes while the fragment is gone — and publishes a placement over deleted bytes (outcome (c)). |
 | Repair a staged chunk by rewriting its part record without the session precondition, **or without pre-marking the destination fragment** (finding 1) | DST: interleave a reconstruction re-place **after** it has written the destination fragment `P_new` but **before** its CAS, then fence the session (Complete/Abort/reap); the re-place MUST return `Conflict` **and** leave `P_new` covered by its `orphan:<P_new>` pre-mark so GC reclaims it (assert the pre-mark is present and the fragment is not stranded), and the obligation MUST stay queued. A design that writes `P_new` without pre-marking strands it unreferenced-and-unevidenced under `Defer` (outcome (a)). |
 | Scrub staged fragments but leave reconstruction committed-only | Assert a repair obligation enqueued for a staged chunk is *resolved*, not drained: after one reconstruction pass the fragment is rebuilt and the part record's placement updated (never `Assessment::Drain`). |
 | Build the staged reference set with a global `part:` scan | Create sessions past `SCAN_CAP / MAX_PARTS_PER_SESSION` (≈ 104) and assert `reconcile_step` still succeeds — the build MUST iterate sessions and use bounded `part:<id>:` ranges, so it never issues a scan that can cross `SCAN_CAP`. |
@@ -1017,16 +1035,61 @@ each is one JSON value:
    window per collision — unbounded under a persistent racer, and a contradiction of X12's
    "re-entry skips already-marked fragments, grace clock intact". A batch that loses the guard
    re-reads and re-splits, marking strictly fewer positions each round, so it converges.
+   **The skip is scoped to ONE retirement: a mark that predates the reference being removed is
+   stale evidence, not a duplicate, and MUST be re-stamped (normative; iteration-9 finding 3).**
+   An `orphan:` mark can legitimately coexist with a *live* reference, because GC's safety gate
+   tests the reference set **first** and lets a live reference override orphan evidence
+   (`gc.rs:160-170`) — the rollout-skew case is exactly this (an old custodian without decision 2's
+   staged awareness marks live staged fragments via the restore pass, "Backward compatibility"),
+   and those marks survive the upgrade that stops new ones. Given such a mark, already aged past
+   `G_orphan`, an unconditional "present ⇒ skip" would be a **reader-safety** defect rather than a
+   leak: a later supersede/delete removes the last reference, the drain finds the ancient mark and
+   keeps its ancient stamp, and GC — now seeing the fragment unreferenced with grace long elapsed —
+   reclaims it on the very next pass, giving a GET that overlapped the deletion **no grace window
+   at all**, which is the one thing `G_orphan` exists to provide. So the mark **carries the
+   identity of the unreference event that wrote it** (the `retire:` token for a drained obligation,
+   the `<upload-id>:<epoch>` for an owned-`sidx:` walk, the `{inode, version}` for a superseded
+   generation), and the guard reads:
+   - the mark is **absent** ⇒ write it, stamped now;
+   - present with the **same** event identity ⇒ a duplicate of *this* retirement (the second
+     concurrent drainer, X56) ⇒ skip it, original stamp intact — the iteration-7 property, unchanged;
+   - present with a **different** event identity ⇒ **stale evidence predating the reference this
+     event just removed** ⇒ re-stamp it with the new event's identity and a fresh `orphaned_at`,
+     starting a full `G_orphan` for the deletion that is actually happening now.
+
+   Re-stamping is bounded to **once per unreference event per position**, so it cannot be driven in
+   a loop by a racing pair (they share an identity and take the skip arm) — the two properties are
+   independent, and conflating them is what made the earlier rule wrong in one direction while
+   fixing it in the other.
    **A pre-mark must still stand when the move that relies on it commits.** The repoint and
    re-place moves (decision 2, X47/X29) write `orphan:<P_new>` *before* the destination fragment,
    then adopt it in a later CAS batch. A `orphan:` mark is a **grace-limited** promise: if the
    window between the pre-mark and the adoption CAS exceeds `G_orphan` — a paused reconstruction,
    a requeued obligation — GC may reclaim the pre-marked destination fragment, and a CAS landing
    afterwards would publish a placement pointing at bytes that are gone (outcome (c)). The
-   adoption CAS therefore also carries **`require(orphan:<P_new> == prior)`**: safety rests on the
-   precondition, not on the timing, so a repoint that lost its window simply fails and restarts
-   from a fresh pre-mark and a fresh fragment write. Implementations SHOULD also keep that window
-   well inside `G_orphan` so restarts are rare, but no bound on it is load-bearing.
+   adoption CAS therefore also carries **`require(orphan:<P_new> == prior)`**, so a repoint that
+   lost its window fails and restarts from a fresh pre-mark and a fresh fragment write.
+   **But that precondition alone is not sufficient, and the window IS load-bearing (iteration-9
+   finding 1).** The `orphan:` key outlives the bytes it evidences: GC deletes the *fragment*
+   inside its per-server loop and only accumulates the matching `delete(orphan_key(..))` into a
+   `cleanup` batch committed **after the whole fleet sweep** (`crates/custodian/src/gc.rs:189-207`).
+   So between `delete_fragment` and that commit there is a window — as long as the rest of a fleet
+   sweep — in which `orphan:<P_new>` still holds **exactly** its pre-mark bytes while `P_new`'s
+   fragment is already gone. A repoint whose pre-mark had aged past `G_orphan` would pass
+   `require(orphan:<P_new> == prior)` in that window and publish a placement naming deleted bytes
+   (outcome (c)) — the precondition proves the *ledger* entry survives, never the *fragment*.
+   Proving fragment presence from metadata is not available (and a D-server existence probe is
+   TOCTOU against the same sweep), so the bound is restored to the timing, where it can be made
+   sound: the pre-mark → adoption window is a **deadline `W_repoint`**, the adoption CAS
+   **refuses fail-closed if its own pre-mark is older than `W_repoint`** (read from the
+   pre-mark's own `orphaned_at_millis`, so the check needs no extra record), and
+   **`G_orphan > W_repoint + δ_clock`** holds **strictly** under the one deployment wall clock.
+   Then GC's reclamation test (`now ≥ orphaned_at + G_orphan`, `gc.rs:171-176`) cannot have fired
+   for any pre-mark an adoption is still permitted to use, so the deleted-fragment window is
+   unreachable rather than merely narrow. This is the identical construction to
+   `G_orphan > W_write + δ_clock` for the late-landing straggler (finding 3, X49), applied to the
+   other end of the same grace window; the earlier claim that "safety rests on the precondition,
+   not on the timing" was wrong, and both bounds are now stated in the knob table.
 3. **Admission bounds what cannot be drained: the map, the part, the segment, the session's
    staged total, and the session population.** `MAX_MAP_CHUNKS` caps a flat map, `MAX_SEG_CHUNKS`
    a segment record, `MAX_PART_CHUNKS` a part record, `MAX_ROOT_SEGMENTS` the segments a root may
@@ -1084,6 +1147,7 @@ this proposal; only a knob whose entire range is safe is the implementer's freel
 | `R_publish` (publish retries) | `[1, small]` | bounded so Complete terminates; exceeding it releases the fence rather than looping | #508 |
 | `MAX_COMPLETE_ATTEMPTS` (fences per session) | `[1, small]` | each Complete fence mints a new `Completing@E` epoch whose rolled-back segments become one `retire:records:{seg:<id>:<E>}` obligation, so an unbounded fence/rollback cycle would let **one** session install obligations and `seg:` generations without bound (`W_session` alone does not bound it — a client can loop faster than the drain). The counter lives in the session record, which every fence CASes anyway; at the cap Complete is refused and the session's only exit is Abort | #508 |
 | `W_write` / `G_orphan` (fragment-write deadline / orphan grace window) | `W_write > 0`, enforced **at both ends** (a fail-closed caller await **and** a D-server refusal of a write past its deadline), and **`G_orphan > W_write + δ_clock`** (**strict**, with a clock-resolution/skew margin `δ_clock`) under the one deployment wall clock | a fragment authorized before a fence lands within `W_write` of its authorization (the write is deadline-bounded, not merely un-renewed), which `G_orphan > W_write + δ_clock` keeps **strictly** inside its landing position's orphan grace — the boundary `G_orphan == W_write` would let GC's inclusive `≥` grace check reclaim the evidence in the same tick the straggler lands, so no straggler is ever unevidenced (finding 3, clock-lifecycle table) | write path (`W_write`) / #625 (`G_orphan`, today's grace window) |
+| `W_repoint` (pre-mark → adoption deadline, iteration-9 finding 1) | `W_repoint > 0`, enforced fail-closed at the adoption CAS (which reads its own pre-mark's `orphaned_at_millis` and refuses past the deadline), and **`G_orphan > W_repoint + δ_clock`** (**strict**, same `δ_clock`, same deployment wall clock) | the other end of the same grace window as `W_write`. GC deletes a fragment inside its fleet loop but commits the matching `orphan:` key delete only after the whole sweep (`gc.rs:189-207`), so the ledger key **outlives the bytes** and `require(orphan:<P_new> == prior)` cannot witness fragment presence. `G_orphan > W_repoint + δ_clock` makes GC's `now ≥ orphaned_at + G_orphan` test unable to have fired for any pre-mark an adoption may still use, so a repoint can never adopt a reclaimed destination (X61) | #625 (`G_orphan`) / reconstruction + rebalance (`W_repoint`) |
 
 **Invariant preserved.** (4) Every obligation installed at publication or teardown is drained
 in bounded work, and replay safety is built into each batch (each drain step carries
@@ -1391,6 +1455,25 @@ garbage-with-a-sound-reclamation-path within `W_session`, not a fourth, forever-
   slot record stays (residue is deliberately counted against the cap, F11a) but it can no longer
   keep the session alive. Liveness and the cap therefore read different fields of the same record:
   the reaper reads the lease, admission reads the key's existence.
+- **Renewal is CONDITIONAL, and that is what makes the fence need no liveness precondition
+  (normative; iteration-9 finding 4).** The `slot:` lease renewal inherits the exact semantics of
+  the owned-`sidx:` renewal it shares a loop with: `renew_pending` **refuses (`Conflict`) if the
+  lease it is renewing has already lapsed or been swept** — *"a lapsed lease is dead — resurrecting
+  it would let this upload commit an inode over fragments the GC is free to reclaim"*
+  (`crates/core/src/write.rs:485-504`, issue #490) — and the caller then fails the request with
+  `LeaseLapsed` rather than continuing toward commit. **A lapsed lease can therefore never become
+  unlapsed.** That is what closes the otherwise-plausible read/fence race: one might expect the
+  reap fence to need a precondition on the liveness evidence itself, since the reaper reads the
+  `slot:`/`sidx:` leases and only *then* CASes `require(mpu == Open@E)`, leaving a window for a
+  renewal to land in between. It does not, and the case split is total under the single deployment
+  wall clock. Either a lease was **unexpired** at the reaper's read — then abandonment arm (i)'s
+  "owns no unexpired lease" conjunct is false and **no fence is attempted at all** — or **every**
+  lease was expired at that instant, in which case a renewal arriving afterwards is a resurrection
+  of a lapsed lease and is refused, so the uploader is already dead and is about to learn it. There
+  is no interleaving in which a renewal both succeeds and post-dates the reads that authorized the
+  fence, so preconditioning the fence on lease bytes would add a false-conflict source and buy
+  nothing (X62). Arm (ii), the `W_session` residency ceiling, fences a *demonstrably live* session
+  by design — that is the administrative bound (**D-A**), not a race.
 - **Abandonment rule (two arms).** A session in `Open` is fenced to `Aborting` when **either**:
   (i) it is **idle-abandoned** — its last progress instant is older than `W_open` *and* it
   owns no unexpired lease on any `sidx:` entry **or `slot:` record**; **or** (ii) it has reached the **administrative residency
@@ -1478,6 +1561,32 @@ garbage-with-a-sound-reclamation-path within `W_session`, not a fourth, forever-
   scan-then-create is race-prone (ADR-0046 flagged the same shape for `DeleteBucket`) and admits
   unbounded overshoot; a cap overrun would halt the maintenance plane, which is data-loss-class,
   so the bound must be **enforced, not observed**.
+- **The governing limit is stored with the counter, not derived per gateway (iteration-9
+  finding 5).** `MAX_SESSIONS` is **derived** from `W_ref` and `U_ref` (above), which are *local
+  configuration*, so during a rolling change two gateways can hold different values while the
+  counter only orders their increments — it records how many sessions exist, never which threshold
+  admitted them. A gateway still running the larger value would keep admitting after the newer
+  gateways and the custodian consider the smaller limit reached, and the claimed
+  `MAX_SESSIONS × U_ref ≤ W_ref` bound — the thing that keeps the reconcile pass inside its RAM
+  budget — would simply not hold, with the overrun landing on the maintenance plane rather than on
+  the gateway that caused it. So `mpuctl:count` is not a bare integer but
+  **`{ count, max_sessions }`**, one record, and:
+  - Create CASes the **whole record** (`require(mpuctl == prior)`), admitting only while
+    `count < prior.max_sessions` — so **every reserver enforces the value in the ledger**,
+    whatever its local derivation says;
+  - a gateway whose locally derived `MAX_SESSIONS` **differs** from `prior.max_sessions` **refuses
+    to admit and alarms** rather than silently deferring to either value — a fail-closed
+    configuration-skew signal, since the disagreement means one of the two hosts is sized for a
+    budget it is not getting (this is the same "misconfiguration is visible, not absorbed" stance
+    as the reaper-absent refusal in the implementation order);
+  - changing the limit is an **explicit operator act** that CASes `max_sessions` on the record.
+    Raising it is safe only once the reconcile host actually has the RAM the new `W_ref` claims;
+    lowering it below the live `count` needs no drain — admission simply refuses until the count
+    falls under the new value, which is the self-correcting direction.
+
+  The bootstrap path is unchanged in shape: the first Create initializes the record under
+  `require_absent(mpuctl)` with `{ count: 1, max_sessions: <its derived value> }`, so a fresh store
+  adopts the first admitting gateway's derivation and every later one is checked against it.
 
 **The bounding formula, and every namespace bounded.** With the reworked access patterns, the
 **only** global scan multipart adds is one bounded `scan("mpu:")`; everything else is a bounded
@@ -1647,6 +1756,8 @@ reaper's when no client provides one.
 | **The sweep breaks the bounded-work rule** | Reap a 10,000-part session and assert every commit is inside the envelope and that the pass makes durable partial progress when interrupted. |
 | **Tombstone / retire accumulation (F11c/F11b).** Bound only the open population | Drive sustained creates+completes and overwrites; assert `scan("mpu:")` stays `≤ MAX_SESSIONS` (tombstones counted by the counter, expired at `W_tombstone`) and that `retire:` never fails a scan (walked in bounded ranges), while the oldest-obligation-age alarm fires if the drain falls behind. |
 | **Arrival outruns drain** | Drive session creation faster than the reaper reclaims: creation MUST start refusing at `MAX_SESSIONS` (`503`) via the serialized counter, and every namespace MUST stay accessible without `ScanCapExceeded`. |
+| **Derive the admission limit per gateway instead of reading it from the ledger (iteration-9 finding 5)** | Run two gateways whose local `W_ref` yields different `MAX_SESSIONS` against one store. The one whose derivation disagrees with `mpuctl.max_sessions` MUST refuse to admit and alarm — never admit on its own larger value. Assert the live session count never exceeds the ledger's `max_sessions`, so `MAX_SESSIONS × U_ref ≤ W_ref` holds through the rolling change; a design that keeps the limit in local config admits past the smaller bound and blows the reconcile host's RAM budget, which the gateway that caused it never observes. |
+| **Precondition the reap fence on the liveness evidence "to be safe" (iteration-9 finding 4, the rejected shape)** | Not a defect to close but a change to *not* make, asserted as a property: DST a renewal landing between the reaper's lease reads and its fence. Either the lease was unexpired (no fence attempted) or it was expired (the renewal MUST fail `LeaseLapsed`, `write.rs:485-504`) — assert no interleaving exists in which a renewal succeeds *and* the fence commits. Adding `require(slot:… == prior)` to the fence would only introduce false conflicts against a session the reaper is entitled to reap (X62). |
 | **Reaper unavailable** | Stop the reaper entirely, then drive creation: `reconcile_step` MUST keep succeeding indefinitely (no `ScanCapExceeded`), because the counter refuses new sessions before `mpu:` can approach the cap and no other namespace is read by an unbounded scan. |
 | **Clock-epoch mismatch** | Write a session record with a foreign `clock_source`; the reaper MUST skip it and raise an operator signal, never reap it. |
 | **Reap by expiry of owned leases** | An `Open` session whose owned leases lapsed (a stalled but live client) MUST NOT have its bytes reclaimed until the session itself is abandoned (arm i) or hits `W_session` (arm ii) and is fenced. |
@@ -1961,8 +2072,13 @@ tested against; every row states what actually happens and what makes it so.
 | X55 (iteration-7 capacity call) | A client stages parts past `MAX_STAGED_CHUNKS`, and `MAX_INFLIGHT_PARTS` commits race the cumulative check right at the ceiling | The part commit reads the bounded `psum:<id>:` **summary** range (never the fat chunk lists) and refuses `400 EntityTooLarge` past the ceiling, leaving the session usable and abortable. Racing commits can each observe sub-ceiling, but at most `MAX_INFLIGHT_PARTS` are in flight — enforced by the `slot:` key space, not observed — and each adds ≤ `MAX_PART_CHUNKS`, so the staged total never exceeds `MAX_STAGED_CHUNKS + MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`, exactly the headroom `U_ref` charges. The bound therefore holds for **every** interleaving, which is what lets `MAX_SESSIONS` be derived from it (≈19 rather than ≈1 at maximal parts) | D4.4, D2 (`U_ref`), D6 |
 | X56 (iteration-7 finding 3) | A gateway drains its own teardown inline while the reaper drains the **same** session's owned `sidx:` range, and both reach the same fragment | Each mark carries `require_absent(orphan:<pos>)` (decision 4.2), so the second writer's batch loses the guard, re-reads, and **skips** the already-evidenced position with its **original** `orphaned_at` intact; the `sidx:` deletes are idempotent, so both drainers converge on an empty range. Without the guard both marks land, the fragment's grace window restarts on every collision, and a persistently racing pair can postpone its reclamation indefinitely — the drain is then *not* the grace-preserving idempotent step X12 and `restore.rs:108-113` describe (a slow leak, not a stranding, but a contradiction of the stated property) | D4.2, D5 (rule 3), §3 |
 | X57 (iteration-7 adversary) | A session is snapshotted in `Completing@E` **after** its segment-write phase (`seg:<id>:<E>:*` durable) but **before** its root flip; the image is restored and the restore pass fences it | The **restore-fence transition** `Completing@E → Aborting@E+1` (§2, §3) commits, in one batch, the state change, `retire:bytes:{session, parts}` **and** `retire:records:{seg:<id>:<E>}` — so that attempt's segments have a named deleter. Fencing it through the `Open` abort row instead (which the pre-iteration-7 text implied, since no `Completing → Aborting` edge existed) leaves those `seg:` records unreachable by **every** deleter the design defines: no root flip ⇒ no committed inode to supersede, and no rollback ⇒ no `retire:records:{seg}` obligation. Their fragments are still orphan-marked by `retire:bytes:{session}`, so this is record residue rather than lost bytes — but it is unbounded residue in a namespace the design otherwise bounds, and it was absent from the register | D-B, D2 (restore), D3, D7 |
-| X58 (iteration-8 finding 1) | A part upload selects a placement naming server `S` from a topology snapshot; the operator records `S` draining, `reconciliation_status(S)` answers `Satisfied` (no record yet names `S`) and `S` is wiped — **then** the intent lands, the part commits, and Complete publishes | The **drain fence**: the `sidx:` intent batch carries `require_absent(desired:dserver:<S>)` for every server in the placement it records (D2). The two writes therefore race on one key with only two outcomes — intent first (the entry exists before any reconcile can read the drain, so the staged set makes the status `Pending`, never `Satisfied`) or drain first (the intent fails and re-plans against `Topology::excluding(draining)`). Filtering the *selector* alone leaves the select→commit window unfenced, and that window is exactly where outcome (c) reappears one interleaving beyond the F6 trace. The destination side of a staged re-place and a committed segment repoint carries the same fence | D2, §1 (`sidx:`), §3 |
-| X59 (iteration-8 finding 2) | A part commit interleaves **between** the reaper's two progress reads, on a session whose earlier progress is older than `W_open` and which owns no other live lease | The reaper reads **source before destination** — `slot:<id>:` then `psum:<id>:` (D6, normative) — mirroring D2's `sidx:`→`part:` build order, because the commit deletes the slot and writes the summary in one batch. Destination-first sees the part in *neither* range, collapses `progress` to `created_at`, and fences a session that has just made durable progress (a false positive that discards committed staged bytes). Source-first observes it in both ranges or in `psum:` alone; the mirror staleness (a slot seen, then deleted before the `psum:` read) credits a stamp at most one pass old — a one-pass false *negative*, the safe direction | D6, D2 (read order) |
+| X59 (iteration-8 finding 1) | A part upload selects a placement naming server `S` from a topology snapshot; the operator records `S` draining, `reconciliation_status(S)` answers `Satisfied` (no record yet names `S`) and `S` is wiped — **then** the intent lands, the part commits, and Complete publishes | The **drain fence**: the `sidx:` intent batch carries `require_absent(desired:dserver:<S>)` for every server in the placement it records (D2). The two writes therefore race on one key with only two outcomes — intent first (the entry exists before any reconcile can read the drain, so the staged set makes the status `Pending`, never `Satisfied`) or drain first (the intent fails and re-plans against `Topology::excluding(draining)`). Filtering the *selector* alone leaves the select→commit window unfenced, and that window is exactly where outcome (c) reappears one interleaving beyond the F6 trace. The destination side of a staged re-place and a committed segment repoint carries the same fence | D2, §1 (`sidx:`), §3 |
+| X60 (iteration-8 finding 2) | A part commit interleaves **between** the reaper's two progress reads, on a session whose earlier progress is older than `W_open` and which owns no other live lease | The reaper reads **source before destination** — `slot:<id>:` then `psum:<id>:` (D6, normative) — mirroring D2's `sidx:`→`part:` build order, because the commit deletes the slot and writes the summary in one batch. Destination-first sees the part in *neither* range, collapses `progress` to `created_at`, and fences a session that has just made durable progress (a false positive that discards committed staged bytes). Source-first observes it in both ranges or in `psum:` alone; the mirror staleness (a slot seen, then deleted before the `psum:` read) credits a stamp at most one pass old — a one-pass false *negative*, the safe direction | D6, D2 (read order) |
+| X61 (iteration-9 finding 1) | A repoint's pre-mark ages past `G_orphan`; GC deletes the destination fragment and, in the window before its `cleanup` batch commits, the adoption CAS runs against an `orphan:<P_new>` key that still holds exactly its pre-mark bytes | `require(orphan:<P_new> == prior)` would **pass** here — GC deletes the fragment inside its per-server loop but commits the matching `orphan:` key delete only after the whole fleet sweep (`gc.rs:189-207`), so the ledger key outlives the bytes and the precondition proves entry survival, never fragment presence. Closed by making the window load-bearing: the adoption CAS refuses fail-closed when its own pre-mark is older than **`W_repoint`**, and **`G_orphan > W_repoint + δ_clock`** (strict) means GC's `now ≥ orphaned_at + G_orphan` cannot have fired for any pre-mark an adoption may still use — the deleted-fragment window is unreachable, not merely narrow. Same construction as `G_orphan > W_write + δ_clock` at the other end of the grace window (X49) | D4.2, D2 (repoint/re-place), knob table |
+| X62 (iteration-9 finding 4) | An `UploadPart` renews a near-expiry `slot:`/`sidx:` lease **after** the reaper's liveness reads but **before** its `require(mpu == Open@E)` fence commits | **Unconstructible**, so the fence needs no liveness precondition. The case split is total under the one deployment wall clock: a lease **unexpired** at the read makes arm (i)'s "owns no unexpired lease" conjunct false, so no fence is attempted; a lease **expired** at the read cannot later be renewed, because renewal is conditional and refuses a lapsed lease (`renew_pending` → `Conflict` → `LeaseLapsed`, `write.rs:485-504`, issue #490) — resurrection is already forbidden to stop an upload committing over GC-reclaimable fragments. Adding a lease-bytes precondition to the fence would introduce a false-conflict source and close nothing. Arm (ii)'s `W_session` fence of a live session is the administrative ceiling (**D-A**), not a race | D6, D-A, clock table |
+| X63 (iteration-9 finding 3) | A fragment carries a **stale** `orphan:` mark aged past `G_orphan` while still referenced (the rollout-skew case: an old custodian marked live staged fragments); a later supersede/delete then removes the last reference | GC's safety gate tests the reference set first, so a live reference legitimately overrides orphan evidence (`gc.rs:160-170`) and such marks outlive the upgrade that stops new ones. An unconditional "present ⇒ skip" would keep the ancient stamp, and GC — now seeing the fragment unreferenced with grace long elapsed — reclaims on the next pass, leaving a GET that overlapped the deletion **no grace at all**. Closed by scoping the skip to one retirement: the mark carries its **unreference-event identity**, the same identity skips (the concurrent-drainer property, X56), a **different** identity is stale evidence and is re-stamped with a fresh `orphaned_at` — bounded to once per event per position, so no racing pair can loop it | D4.2, X56, X12 |
+| X64 (iteration-9 finding 5) | A rolling configuration change leaves two gateways with different locally derived `MAX_SESSIONS` while both admit against one counter | The counter orders increments but records no threshold, so the larger-valued gateway would keep admitting past the smaller limit and break `MAX_SESSIONS × U_ref ≤ W_ref` — with the overrun landing on the maintenance plane, not the gateway that caused it. Closed by storing the governing limit **with** the counter (`mpuctl = { count, max_sessions }`, CAS'd as one record), so every reserver enforces the ledger's value; a gateway whose local derivation disagrees **refuses and alarms** (fail-closed configuration skew) rather than deferring to either value, and changing the limit is an explicit operator CAS | D6 (**D-C**), D2 (`W_ref`) |
+| X65 (iteration-9 finding 2) | A `sidx:` value's `staged` placement length does not match its scheme's fragment count | **Not a decode error** — placement length is the standing convention's named example of a *contextual* check ("liberal on read, strict in maintenance paths", `AGENTS.md:146-149`, [ADR-0045][a45]). The record decodes and the staged reference build classifies it into `ReferenceSet.malformed`, where GC's safety gate protects **every** fragment bearing that chunk id (`gc.rs:160-170`, the `malformed-placement` skip) and the drain answers `PendingMalformed { chunks }` instead of an unexplained stall. Failing it at decode would convert a quarantinable record into an error that aborts the whole reconcile step before GC, scrub, reconstruction and rebalance run (`reconciliation.rs:75-112`) | §1 (validation boundary), D2 |
 
 ### What the implementing slices change (summary)
 
@@ -2185,8 +2301,11 @@ cost above names one of these; filing them is part of accepting this proposal.
   stale-snapshot mid-pass creation (X19), **continuous part churn against one designated commit
   (X52), the slot-reserve race at the cap (X41/X55), the pre-first-chunk liveness window (decision
   6's finding-2 row), and two concurrent drainers over one owned `sidx:` range (X56)**, **the
-  drain-request-versus-intent race (X58) and the commit-between-the-reaper's-two-progress-reads
-  race (X59)**, and arrival-outruns-drain. Each lands as a seeded regression.
+  drain-request-versus-intent race (X59) and the commit-between-the-reaper's-two-progress-reads
+  race (X60)**, **the adoption-CAS-against-a-GC-deleted-destination window (X61, the
+  delete-before-cleanup interleaving of `gc.rs:189-207`), the stale-orphan-mark-at-a-new-unreference
+  delete/read regression (X63), and the split-`MAX_SESSIONS` rolling-change admission case (X64)**,
+  and arrival-outruns-drain. Each lands as a seeded regression.
 - **The classification sweep** — one test helper this protocol earns: given a store and a fleet,
   assert every on-disk fragment is in exactly one class (committed-referenced,
   staged-with-a-session, evidenced-for-reclamation). It is the mechanical form of invariant (2)
