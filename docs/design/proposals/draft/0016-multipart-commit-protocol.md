@@ -507,9 +507,21 @@ segment records**, corrupting that object's map rather than returning the `Confl
 The probability is the same 2^-128, but the *stated protection* does not cover this case at all,
 which is the defect. Segment records are therefore keyed by a **segment-group nonce** minted with
 the session and independent of its id — `seg:<group-nonce>:<epoch>:<index>` — and the Create batch
-carries `require_absent(seggrp:<group-nonce>)` plus a `seggrp:` marker record whose lifetime is the
-**group's**, not the session's: it is deleted only when the last segment naming it is deleted (by
-the retirement drain, or by the supersede/delete of the object that adopted them). Reuse is then
+carries `require_absent(seggrp:<group-nonce>)` plus a `seggrp:` marker record. **Its lifetime is
+the group's for an ADOPTED group and the session's for one that never segments (iteration-15
+finding 1).** Most uploads — every flat-map publish and every abort — write **no** `seg:` record at
+all, so "delete when the last segment is deleted" would never fire for them and each Create would
+leak one `seggrp:` key permanently. The rule is therefore: the marker is deleted by whichever of two
+events happens, and exactly one always does. **(a)** If the group was **never adopted** by a
+segmented inode — the session reaches its terminal delete (`Completed` flat, or `Aborting`) with no
+`seg:` record naming the nonce — the **terminal session delete removes the `seggrp:` marker in its
+own batch**, since at that point nothing references it and the session that reserved it is gone.
+**(b)** If it **was** adopted, the marker outlives the session and is deleted only when the last
+segment naming it is (by the retirement drain, or the supersede/delete of the object that adopted
+them) — the session teardown then explicitly **leaves it**, gated on observing a `seg:` record in
+the nonce's range, exactly as the terminal delete already gates on the `sidx:` range being empty.
+The two arms are mutually exclusive and exhaustive: a group is adopted or it is not, and the
+terminal delete can tell which by one bounded range read it is already shaped to do. Reuse is then
 structurally impossible rather than improbable, and the `Conflict` claim becomes true for both
 namespaces instead of one.
 
@@ -564,6 +576,7 @@ prior at each flip, so a lost-CAS retry records the correct next version (decisi
 | a session-owned `sidx:` staging entry | orphan-marked and deleted when its session leaves `Open`, **including on the `Completed` path** (a crashed in-flight part's residue, finding 2) or when the session vanishes | retirement drain via the per-session `sidx:` range (decision 5) |
 | a session's `slot:` in-flight reservation | deleted by the part commit or compensation that owns it (`require(slot:<id>:<k> == prior)`, its own key — exactly-once); else discarded with the session at the terminal delete | client; retirement drain |
 | a dangling `seg:` record | deleted by `retire:records:{seg}` on rollback/abort; adopted by the inode on a winning flip | retirement drain (decision 7) |
+| a `seggrp:` group marker | deleted by the **terminal session delete** if the group was never adopted (its `seg:` range empty); else it outlives the session and is deleted when the **last `seg:` naming it** is (retirement drain, or supersede/delete of the adopting object) — iteration-15 finding 1 | retirement drain; else the terminal delete |
 
 The session record is deleted **last**, together with any surviving `slot:<id>:` records and the
 `mpuctl.count` decrement, in a batch **preconditioned on the session record's exact bytes**
@@ -640,7 +653,7 @@ envelope regardless of value size; `B` denotes that byte-derived count throughou
 
 | Batch | Preconditions | Mutations | Size bound |
 |---|---|---|---|
-| Create session | **record present:** `require(mpuctl == prior)` with `prior.count < prior.max_sessions` — the **stored** limit, and the gateway refuses+alarms if its own **profile** disagrees with `prior.profile` (iteration-9 finding 5, iteration-10 finding 4); **record absent (fresh/upgraded store, reads as `{count: 0}`):** `require_absent(mpuctl)`; plus `require_absent(mpu:<id>)`, bucket-existence per [ADR-0046][a46] §4 | 1 put session, and either 1 CAS `mpuctl` `{count: c} → {count: c+1}` **or** (bootstrap) 1 put `mpuctl = { count: 1, max_sessions, profile }` | O(1), < 1 KB |
+| Create session | **record present:** `require(mpuctl == prior)` with `prior.count < prior.max_sessions` — the **stored** limit, and the gateway refuses+alarms if its own **profile** disagrees with `prior.profile` (iteration-9 finding 5, iteration-10 finding 4); **record absent (fresh/upgraded store, reads as `{count: 0}`):** `require_absent(mpuctl)`; plus `require_absent(mpu:<id>)`, **`require_absent(seggrp:<group-nonce>)`** (the segment-group reservation, iteration-14 finding 2 / iteration-15 finding 3), bucket-existence per [ADR-0046][a46] §4 | 1 put session, **1 put `seggrp:<group-nonce>` marker**, and either 1 CAS `mpuctl` `{count: c} → {count: c+1}` **or** (bootstrap) 1 put `mpuctl = { count: 1, max_sessions, profile }` | O(1), < 1 KB |
 | Part slot reserve (`UploadPart` start, decision 5) | `require(mpu == Open@E)` **and** `require_absent(slot:<id>:<k>)` for the chosen index `k` | 1 put `slot:<id>:<k>` | O(1); the cap is the key space `[0, MAX_INFLIGHT_PARTS)`, so no overshoot is representable; a taken index is retried against the next free one (≤ `MAX_INFLIGHT_PARTS` probes) and a full range refuses `503`, **and `404` once the session is not `Open`** (no slot after fence, finding 1) |
 | Part intent | `require(mpu == Open@E)` (the finding-1 serialization edge — a read precondition, not a write, so concurrent intents never conflict) **and `require_absent(desired:dserver:<S>)` for every server `S` in the planned placement** (the drain fence, decision 2, iteration-8 finding 1 — also a read precondition; a failure re-plans against the fresh `Topology::excluding(draining)`), **and `require(slot:<id>:<k> == prior)` on its own slot** (iteration-11 finding 2) | one owned `sidx:<id>:<part>:<chunk>` staging put per chunk **plus a rewrite of the owning `slot:<id>:<k>` in the SAME batch** (the liveness witness the reap fence pins — creating a fresh live lease without touching the slot would let the fence abort a progressing part), each its own commit | O(1) per commit; `n ≤ 9` extra read preconditions |
 | Part commit | `require(mpu == Open@E)`, `require_absent(part:…)` or `require(part:… == prior)`, `require(slot:<id>:<k> == prior)` (**its own** slot — never another part's, so concurrent commits of *different* part numbers share no writable key and cannot conflict with each other, iteration-7 findings 1/4) | 1 put (part record ≤ `V`), 1 put `psum:<id>:<n>` (the summary, tens of bytes), 1 delete `slot:<id>:<k>` (slot release), ≤ `C_part` owned `sidx:` deletes, ≤ 1 put (`retire:bytes:` on re-upload, ≤ `V`) | ≤ 2·V + O(chunks in part)·(key) |
@@ -657,7 +670,7 @@ envelope regardless of value size; `B` denotes that byte-derived count throughou
 | Staged part re-place (reconstruction of an in-flight owned chunk, decision 2/5) | `require(mpu == Open@E)`, `require(part:<id>:<n> == prior)`, **`require(orphan:<P_new> == prior)`**, **`require_absent(desired:dserver:<S_new>)`** (the drain fence, as for the segment repoint) | pre-step: 1 put `orphan:<P_new>` pre-mark under the decision-4.2 guard for what it observed (own batch, before the fragment write); then the CAS batch: 1 CAS `part:` (chunk placement `P_old→P_new`) + 1 delete `orphan:<P_new>` (adopt) + 1 put `orphan:<P_old>` under `require_absent` (evidence the vacated source) | O(1); a lost CAS (the session left `Open@E`, or the part moved) is a no-op that leaves the `P_new` pre-mark standing for GC — the rebuilt staged fragment is never stranded (X29, finding 1) |
 | Owned-`sidx:` drain step (Aborting **and** Completed) | the decision-4.2 three-arm guard per mark — `require_absent(orphan:<pos>)` for a position observed absent, `require(orphan:<pos> == prior)` for a stale-evidence re-stamp under this walk's `<upload-id>:<epoch>` identity, none for a same-identity skip (iteration-7 finding 3 as corrected by iteration-9 finding 3); the walk itself is reference-based (decision 5), so there is no obligation record to serialize two drainers on | `B` orphan puts + owned `sidx:` deletes, 1 cursor put | ≤ `E_tx/2` (byte-budgeted, ~1,000 small marks); a guard loss re-reads and re-splits, marking strictly fewer positions — it never re-stamps a live grace clock |
 | Live-session compensation — a same-part **losing writer** *or* **any post-staging local refusal** (iteration-11 finding 4) | `require(mpu == Open@E)`, `require(slot:<id>:<k> == prior)` | 1 put `retire:bytes:{chunks}` (≤ `V`), 1 delete `slot:<id>:<k>` (slot release), ≤ `C_part` owned `sidx:` deletes | ≤ V + O(chunks in part)·(key) |
-| Terminal session delete | `require(mpu:<id> == prior)`, **and** no **session-scoped** `retire:` obligation left (two bounded emptiness reads over `retire:bytes:s:<id>:` and `retire:records:s:<id>:`, §1), **and** the session's `sidx:` range observed empty in this pass | 1 delete `mpu:<id>`, ≤ `MAX_INFLIGHT_PARTS` deletes of surviving `slot:<id>:` records, 1 CAS `mpuctl` `count -1` | O(1) in object size (`MAX_INFLIGHT_PARTS` small keys, inside the byte budget) — **the exactly-once decrement point**; the session-record precondition serializes a gateway drain against the reaper (double-decrement fix), and the empty-`sidx:` gate holds because fenced intents (finding 1) let nothing refill the walked-empty range (findings 1/2) |
+| Terminal session delete | `require(mpu:<id> == prior)`, **and** no **session-scoped** `retire:` obligation left (two bounded emptiness reads over `retire:bytes:s:<id>:` and `retire:records:s:<id>:`, §1), **and** the session's `sidx:` range observed empty in this pass | 1 delete `mpu:<id>`, ≤ `MAX_INFLIGHT_PARTS` deletes of surviving `slot:<id>:` records, **1 delete `seggrp:<group-nonce>` iff the nonce's `seg:` range is observed empty** (the group was never adopted, iteration-15 finding 1 — an adopted group's marker outlives the session), 1 CAS `mpuctl` `count -1` | O(1) in object size (`MAX_INFLIGHT_PARTS` small keys, inside the byte budget) — **the exactly-once decrement point**; the session-record precondition serializes a gateway drain against the reaper (double-decrement fix), and the empty-`sidx:` gate holds because fenced intents (finding 1) let nothing refill the walked-empty range (findings 1/2) |
 
 Every row that installs a `retire:` obligation additionally carries
 `require_absent(retire:<mode>:<token>)` (§1's token grammar), and every row that writes an
@@ -1155,9 +1168,25 @@ each is one JSON value:
    keeps its ancient stamp, and GC — now seeing the fragment unreferenced with grace long elapsed —
    reclaims it on the very next pass, giving a GET that overlapped the deletion **no grace window
    at all**, which is the one thing `G_orphan` exists to provide. So the mark **carries the
-   identity of the unreference event that wrote it** (the `retire:` token for a drained obligation,
-   the `<upload-id>:<epoch>` for an owned-`sidx:` walk, the `{inode, version}` for a superseded
-   generation), and the guard reads:
+   identity of the unreference event that wrote it**, and the enumeration must cover **every** writer
+   of an `orphan:` mark, including the repoint/re-place pre-marks, or the same-identity arm misfires
+   on them (iteration-15 finding 2):
+   - the `retire:` token for a drained obligation;
+   - the `<upload-id>:<epoch>` for an owned-`sidx:` walk;
+   - the `{inode, version}` for a superseded generation;
+   - and, for a **repoint or staged re-place pre-mark**, a **per-move nonce minted when the move
+     begins** — *not* the `{inode, version}` or session epoch the move operates on. Those coordinates
+     are shared across *successive* moves of the same segment or chunk, so reusing them would let an
+     **old, failed** move's pre-mark look like the current move's own duplicate: the current move
+     would take the same-identity skip arm, adopt against an **expired** stamp on stale evidence, or
+     stall waiting for GC to clear a mark it thinks is its own. The nonce is stable **only across
+     retries of one move** — which is exactly the scope the same-identity arm needs ("this move
+     wrote this pre-mark already") — and a fresh move mints a fresh one, so a stale pre-mark always
+     reads as a *different* identity and is correctly replaced. Both branches of X61's ordering
+     already tolerate a leftover pre-mark (GC reclaims it), so a superseded nonce is reclaimed like
+     any other stranded pre-mark.
+
+   With that enumeration, the guard reads:
    **The value encoding, and the legacy marks already on disk (iteration-10 finding 3).** Today an
    `orphan:` value is a **bare decimal `orphaned_at_millis`** — `orphaned_at_millis.to_string()`
    (`crates/custodian/src/gc.rs:110-122`), parsed straight back as a `u64`
@@ -1222,12 +1251,27 @@ each is one JSON value:
    ago. It is bounded rather than steady-state: a mark can only outlive its event's obligation on a
    fragment that is **still referenced**, which by decision 2 arises from the rollout-skew
    population (an old custodian marking live staged fragments) and from a metadata restore rewinding
-   the ledger — both **one-time, bounded** populations, both already gated by the
-   custodian-before-gateway ordering and by `reconcile_after_restore`. So those passes clear it at
-   the source: the custodian upgrade and the restore fence **re-stamp or drop any mark found on a
-   still-referenced fragment**, in the same page-wise bounded walk they already run, after which the
-   invariant *"a fragment's mark names its most recent unreference event"* holds and the keyed
-   lookup is complete. Protecting against the population forever, instead of clearing a bounded one
+   the ledger — both **one-time, bounded** populations. So a dedicated pass clears it at the source: it
+   **re-stamps or drops any mark found on a still-referenced fragment**, in a page-wise bounded walk
+   (the `orphan:` pagination of iteration-12 finding 4), after which the invariant *"a fragment's
+   mark names its most recent unreference event"* holds and the keyed lookup is complete.
+
+   **The new retirement paths MUST NOT be enabled until that pass has COMPLETED, not merely until a
+   compatible binary is running (normative; iteration-15 finding 5).** A running custodian with the
+   new code is not the same as a store whose stale marks are gone: while the cleanup is still
+   walking, an ordinary overwrite or delete can remove the last reference to a fragment that still
+   carries an expired mark from an older event, and the keyed lookup then checks *that old event's
+   already-drained obligation* — finds it absent — and lets GC reclaim before the new drain
+   installs and refreshes the mark, tearing an overlapping reader out of exactly the grace this
+   rule promises. The keyed lookup is only sound **after** the invariant holds, so the cleanup pass
+   is a **migration gate**: the store carries a durable "orphan-identity cleanup complete" marker
+   set when the page-wise walk finishes, the custodian **refuses to enable the identity-keyed
+   retirement paths until it observes that marker**, and until then it falls back to the
+   conservative pre-migration behaviour (treat every `orphan:` mark as protecting, the safe
+   direction — GC's existing `Defer` arm). This is the same shape as the custodian-before-gateway
+   ordering the Backward compatibility section already mandates, made a checked precondition rather
+   than an operational note, because "compatible binary deployed" and "migration finished" are
+   different instants and only the second is safe. Protecting against the population forever, instead of clearing a bounded one
    once, is what made the first answer unbounded. The stale mark cannot be acted on while the obligation is
    pending; once the drain has refreshed it with the new event identity and retired the obligation,
    the fragment is unprotected and its **fresh** grace window governs. Cost: reclamation waits for
@@ -1419,7 +1463,7 @@ this proposal; only a knob whose entire range is safe is the implementer's freel
 |---|---|---|---|
 | `MAX_MAP_CHUNKS` | `> 0`, and `max_chunkref_bytes × MAX_MAP_CHUNKS ≤ V / 2` | a flat inode value stays inside the backend value ceiling with 2× headroom | #508 |
 | `MAX_SEG_CHUNKS` | same rule against a `seg:` record | ditto for segment values | #508 |
-| `MAX_PART_CHUNKS` | `> 0`, and `max_chunkref_bytes × MAX_PART_CHUNKS ≤ V / 2` (**identical** to `MAX_MAP_CHUNKS`: a `part:` record is one value) ⇒ **165–381** | a `part:` value stays inside the ceiling; sets `max_part_bytes = MAX_PART_CHUNKS × chunk_size` (**165–381 MiB at 1 MiB**), the enforced per-part refusal at `UploadPart` (decision 4) | #508 |
+| `MAX_PART_CHUNKS` | `> 0`, `max_chunkref_bytes × MAX_PART_CHUNKS ≤ V / 2` (**identical** to `MAX_MAP_CHUNKS`: a `part:` record is one value) ⇒ **165–381**, **and `MAX_PART_CHUNKS ≤ B_ops`** (iteration-15 finding 4) | a `part:` value stays inside the ceiling; sets `max_part_bytes = MAX_PART_CHUNKS × chunk_size` (**165–381 MiB at 1 MiB**), the enforced per-part refusal at `UploadPart` (decision 4). **The `B_ops` clamp is the load-bearing addition:** a part commit is an **unsplittable** batch that deletes up to `MAX_PART_CHUNKS` `sidx:` entries plus its reads and puts, and its compensation is the same shape — so if `MAX_PART_CHUNKS` exceeded the operation budget `B_ops`, a *valid* part's commit and its compensation would **both** time out on the slowest backend, permanently, leaving the slot and staged residue behind with no path that ever clears them. The part handoff cannot be split (it is the atomic publish-or-nothing of one part), so the knob is clamped instead, exactly as `MAX_INFLIGHT_PARTS` is for the fence and terminal-delete batches (X98) | #508 |
 | `MAX_ROOT_SEGMENTS` | `> 0`, and `max_segref_bytes × MAX_ROOT_SEGMENTS ≤ V / 2` | a segmented root inode value stays inside the ceiling (decision 7) | #508 |
 | `MAX_STAGED_CHUNKS` (chunk-refs a session may hold in committed `part:` records) | `[MAX_PART_CHUNKS, MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS]`; settled value = the upper end, the publishable segmented ceiling | a session cannot stage more than it could publish, so `U_ref` charges a real ceiling instead of the raw part-number space. Enforced by a `400 EntityTooLarge` refusal at part commit against the bounded `psum:<id>:` summary range, with the overshoot bounded by the in-flight cap (decision 4.4) — at least one maximal part must remain stageable, hence the lower end | #508 |
 | `U_ref` (worst-case per-session staged-reference footprint, **chunk-refs**) | `= min( (MAX_PARTS_PER_SESSION + MAX_INFLIGHT_PARTS) × MAX_PART_CHUNKS ,  MAX_STAGED_CHUNKS + 2 × MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS )` | the reference build holds, per session, **every** chunk of its committed `part:` records **and** its `MAX_INFLIGHT_PARTS` in-flight owned parts — each part expanding to up to `MAX_PART_CHUNKS` chunk-refs (the iteration-4 finding: a part is **not** one unit). The first term is the raw part-number space; the second is the enforced staged ceiling **plus** the bounded commit overshoot (`MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`) **plus** the in-flight owned entries (the same term again). Whichever binds first is the worst legal footprint (the 2026-07-24 tightening: at maximal parts the raw term charges ≈19× what Complete would let the session publish) | derived from `MAX_PARTS_PER_SESSION`, `MAX_INFLIGHT_PARTS`, `MAX_PART_CHUNKS`, `MAX_STAGED_CHUNKS` |
@@ -1551,10 +1595,27 @@ flight.
    `Conflict` without naming which precondition failed, so the committer **re-reads to classify**
    before it acts (the rubric's *re-read to establish what happened*,
    `traits/src/lib.rs:738-745`):
-   - **the `mpu:` record left `Open@E`** — the session fenced under it; the part is genuinely no
-     longer acceptable, so the committer answers `404 NoSuchUpload` and does **not** self-compensate
-     (that avoids a double slot-release racing the reaper; its residue and slot are the reaper's to
-     reclaim, below);
+   - **the `mpu:` record left `Open@E`** — but *where it went* decides who cleans up, and the
+     transient-fence case is not the reaper's (iteration-15 finding 6). Two sub-cases:
+     - **the session is fenced to `Aborting`/`Completing`/`Completed`, or a rollback landed it at a
+       newer `Open@E'` and it is *still* in a non-`Open` state when the committer re-reads** — the
+       part is genuinely no longer acceptable, so the committer answers `404 NoSuchUpload` and does
+       **not** self-compensate: its residue and slot are the reaper's, whose `sidx:` walk covers
+       every non-`Open` state (that avoids a double slot-release racing the reaper);
+     - **the session is back at `Open@E'` with `E' > E`** — a concurrent Complete fenced to
+       `Completing` and **rolled back** to a newer `Open` epoch (decision 3) in the window between
+       this attempt's read and its commit. This is the trap: the reaper **does not walk `sidx:` for
+       an `Open` session** (fence-then-walk, decision 5), so if the committer walked away here its
+       chunks and slot would sit protected until the *whole session* hits `W_session` — and a
+       client whose Completes keep losing the CAS could fill every slot this way and wedge an
+       otherwise usable session. So the committer **compensates against the newer epoch**: it
+       re-reads, confirms `Open@E'`, and runs the ordinary live-session compensation batch
+       (`retire:bytes:{chunks}`, keyed slot release, its own `sidx:` deletes) under
+       `require(mpu == Open@E')`. That is safe because the session *is* live and the committer owns
+       exactly those records; if a *further* fence intervenes before this batch lands, its
+       precondition fails and the committer re-reads into the first sub-case, where the residue is
+       now genuinely the reaper's. The compensation is therefore epoch-chasing but terminating: each
+       lap either compensates against a live `Open` or hands off to a fence;
    - **the part key moved** (a concurrent commit of the **same** part number won, X10) — a genuine
      losing writer: it commits one `retire:bytes:{chunks}` obligation for its **own** distinct
      chunks, releases its own slot (`require(slot:<id>:<k> == prior)` + delete, under
@@ -1577,9 +1638,11 @@ flight.
        non-conforming one degrades to a retry rather than to a false success.)
 
    There is deliberately **no third branch** for "someone else's part moved a counter I share",
-   because the slot table leaves no such key. A part commit therefore either lands, or loses to a
-   same-part rival (compensate, X10), or finds its session fenced (walk away, X7) — an enumeration
-   with no starvation state in it.
+   because the slot table leaves no such key. A part commit therefore either lands, loses to a
+   same-part rival (compensate, X10), finds its session in a **non-`Open`** state (walk away — the
+   reaper's `sidx:` walk reclaims it, X7), or finds it **rolled back to a newer `Open@E'`** by a
+   transient Complete fence (compensate against `E'`, since the reaper does not walk an `Open`
+   session — X108) — an enumeration with no starvation state in it.
 
    A `CommitUnknownResult` is **not** a conflict (the rubric's *Transactions* rule,
    `AGENTS.md:178-180`): the committer re-reads first, and only a settled *not-committed* outcome
@@ -2516,7 +2579,7 @@ tested against; every row states what actually happens and what makes it so.
 | X49 (findings 3/5/6) | A part fragment authorized **before** the fence lands on disk **after** the reaper has orphan-marked and deleted its `sidx:` entry | Two properties close it: (1) the reaper orphan-marked the chunk's **full `staged` placement** (§1, fixed at intent), so the late fragment lands on an `orphan:`-covered position wherever it lands; and (2) the fragment write is a **fail-closed, `W_write`-bounded** await (`AGENTS.md:181-183`) — refusing to *renew* does not *cancel* it, so the deadline, not the renewal loop, is the bound — and the orphan grace satisfies the **strict** **`G_orphan > W_write + δ_clock`** under one clock, so the fragment lands **strictly before** its position's grace elapses (never at the boundary tick GC's inclusive `≥` check would already reclaim) and GC never reclaims the evidence before the late fragment is covered by it (outcome (a) closed). The renewal refusal (`write.rs:474-478`) is a supporting property (no *new* authorizations after the fence), not the bound | D5 (rule 1), D6, clock table |
 | X50 (finding 4) | A single `PutObject` whose object cannot fit `MAX_MAP_CHUNKS` even at `chunk_size_max` | Refused with `400 EntityTooLarge` (the client must use multipart) — **never** silently segmented, because segmentation's staged publication needs an upload-id / `Completing@E` / epoch a single PUT has not got; in the S3 range (`≤ 5 GiB`) chunk-size selection always fits, so this is a guard, not a routine path | D7 (finding 4 carve-out) |
 | X51 (adversary B) | A GET reads a segmented object's root, then a concurrent supersede/delete retires that generation and the drain deletes its `seg:<g>:<E>:*` records mid-resolution | The **resolve-retry rule** (D7h): a segment read that returns absent re-reads the root; a changed/absent root ⇒ restart against the current root or `NoSuchKey`; an *unchanged* root with an absent segment ⇒ fail-closed (a live generation never loses a segment, since `seg:` deletion follows the root flip). No torn map is ever returned — the reader-transparency claim holds without a record-grace clock | D7h, D2 |
-| X52 (iteration-7 findings 1/4) | Two concurrent part commits for **different** part numbers race while a third part starts, all against one `Open` session | They **cannot conflict**: each commit's only writable session-scoped key is its **own** `slot:<id>:<k>` (deleted under `require(slot == prior)`), each start claims a *different* index under `require_absent`, and the shared session record is a **read** precondition. So there is no "benign collision" class to classify and no retry loop to bound — the iteration-6 shared-`sinf:`-counter design had both, with a false ≤ `MAX_INFLIGHT_PARTS`-round termination claim (fresh starts keep moving the counter) and a compensation branch that could discard a durable part. Compensation (`retire:bytes:{chunks}`) fires **only** for a genuine same-part loss (X10); a session that left `Open` is **never** self-compensated — its residue and slots are the reaper's (X7), which is what keeps the release exactly-once | D5 (rule 2), §1 `slot:` |
+| X52 (iteration-7 findings 1/4) | Two concurrent part commits for **different** part numbers race while a third part starts, all against one `Open` session | They **cannot conflict**: each commit's only writable session-scoped key is its **own** `slot:<id>:<k>` (deleted under `require(slot == prior)`), each start claims a *different* index under `require_absent`, and the shared session record is a **read** precondition. So there is no "benign collision" class to classify and no retry loop to bound — the iteration-6 shared-`sinf:`-counter design had both, with a false ≤ `MAX_INFLIGHT_PARTS`-round termination claim (fresh starts keep moving the counter) and a compensation branch that could discard a durable part. Compensation (`retire:bytes:{chunks}`) fires **only** for a genuine same-part loss (X10); a session in any **non-`Open`** state is **never** self-compensated — its residue and slots are the reaper's (X7), which is what keeps the release exactly-once; the one case a departed attempt *does* self-compensate is a session **rolled back to a newer `Open@E'`** (X108), where the reaper — which walks `sidx:` only for non-`Open` sessions — would otherwise never reach it | D5 (rule 2), §1 `slot:` |
 | X53 (finding 2) | The **first** `CreateMultipartUpload` on a **fresh or upgraded** store, where `mpuctl` does not yet exist | The create reads `mpuctl` **absent-as-`{count: 0}`** and initializes it in the same batch with `require_absent(mpuctl)` + `put { count: 1, max_sessions, profile }` (rather than the CAS the steady-state path uses), so the first session is admissible with **no migration/init step**; a concurrent first-create that initialized it first makes the loser's `require_absent` fail and it retries against the re-read `1`. Without this the Create CAS `require(mpuctl == prior)` can never be satisfied and multipart is dead on a new store | D6 (**D-C**, F12, finding 2), §1 |
 | X54 (DeleteObjects adjudication) | A bulk `DeleteObjects` removes 1,000 large/segmented objects in one request | The obligation-**installation** is byte-budgeted, not just the fan-out drain: the verb commits the per-object unlink + `retire:bytes:{generation}` installs in `B`-batches of `≤ E_tx/2` mutation bytes (≈ 50 max-generation obligations per transaction), **never** `1,000 × V ≈ 100 MB` in one transaction (over-envelope, outcome (d)); each transaction is per-object preconditioned, and every installed obligation's fan-out drains in `B`-batches thereafter. This proposal settles the `≤ E_tx/2` bound; the per-request batching is #509's within it | D4 (finding 5 / adjudication), [#509][i509] |
 | X55 (iteration-7 capacity call) | A client stages parts past `MAX_STAGED_CHUNKS`, and `MAX_INFLIGHT_PARTS` commits race the cumulative check right at the ceiling | The part commit reads the bounded `psum:<id>:` **summary** range (never the fat chunk lists) and refuses `400 EntityTooLarge` past the ceiling, leaving the session usable and abortable. Racing commits can each observe sub-ceiling, but at most `MAX_INFLIGHT_PARTS` are in flight — enforced by the `slot:` key space, not observed — and each adds ≤ `MAX_PART_CHUNKS`, so the staged total never exceeds `MAX_STAGED_CHUNKS + MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`, exactly the headroom `U_ref` charges. The bound therefore holds for **every** interleaving, which is what lets `MAX_SESSIONS` be derived from it (≈19 rather than ≈1 at maximal parts) | D4.4, D2 (`U_ref`), D6 |
@@ -2571,6 +2634,12 @@ tested against; every row states what actually happens and what makes it so.
 | X105 (iteration-14 finding 2) | A minted upload id collides with an earlier session that published a **segmented** object whose `mpu:` tombstone has since been deleted | `require_absent(mpu:<id>)` — the stated protection — is already gone: the session record expires with `W_tombstone` while its `seg:` records must live as long as the object they map. The colliding session would find the key free, start its epoch sequence from the same values, and **overwrite a live object's segment records**, corrupting that object's map rather than returning `Conflict`. The probability is the same 2^-128; the defect is that the claimed guard does not cover this namespace at all. Segments are therefore keyed by a **segment-group nonce**, minted with the session, guarded by `require_absent(seggrp:<group-nonce>)` and by a marker whose lifetime is the *group's* — deleted only when the last segment naming it is — so reuse is structurally impossible rather than improbable | §1, D7, X31 |
 | X106 (iteration-14 finding 1) | An `UploadPart` or Complete for a session created by a **differently-clocked** gateway stamps `slot:` `reserved_at`, `psum:` `committed_at`, or `fenced_at` | The reaper validates `mpu.clock_source` once and then trusts stamps that gateway never wrote, so the guard's transitivity is assumed rather than enforced: a future-epoch progress stamp defers cleanup indefinitely, and subtraction against an older epoch reaps a live upload — the #557 class re-entering after the front door was locked. **Every operation writing a session-scoped timestamp now verifies its own source against the session's `clock_source` first and refuses `503` (with the reaper's alarm) on mismatch** — one comparison against a field it already reads for its fence precondition, so a single session field stays sufficient because the invariant is enforced per write. Per-stamp source tagging is recorded as rejected: more machinery, same guarantee | D6 (F10), clock table |
 | X107 (iteration-14 finding 4) | A deployment sets `chunk_size_max` below `⌈5 GiB / MAX_MAP_CHUNKS⌉` and accepts a lengthless `aws-chunked` PUT | X102's fixed size then exceeds the operator's own gateway-memory limit, while clamping to `chunk_size_max` lets a near-5 GiB lengthless stream overflow the flat map — **neither branch is safe**, and nothing in the >10 GiB multipart requirement forbids that configuration. Resolved before any stream starts rather than mid-stream: accepting lengthless PUTs **requires** `chunk_size_max ≥ ⌈5 GiB / MAX_MAP_CHUNKS⌉`, checked at configuration load, and a deployment below that bound refuses lengthless PUTs **at the header** with a stated error | D7 (finding 4), X102, accepted costs |
+| X108 (iteration-15 finding 6) | An in-flight part reads `Open@E`; a concurrent Complete fences to `Completing` and **rolls back** to `Open@E'` (E' > E) before the part classifies its failed commit | The compensation enumeration sent every departure from `Open@E` to the reaper — but the reaper walks `sidx:` **only for non-`Open` sessions** (fence-then-walk), so a session back at `Open@E'` would never have this attempt's chunks and slot reclaimed until the whole session hit `W_session`, and a client whose Completes keep losing the CAS could fill every slot and wedge it. So the committer **compensates against the newer epoch** under `require(mpu == Open@E')` (the ordinary live-session batch); a further fence in the window fails that precondition and re-reads into the genuinely-departed case, which *is* the reaper's. Epoch-chasing but terminating: each lap compensates against a live `Open` or hands off to a fence | D5, D3, X7 |
+| X109 (iteration-15 finding 1) | An ordinary flat-map or aborted upload leaves its `seggrp:` marker behind | The marker is written by **every** Create, but "delete when the last segment is deleted" never fires for a session that writes no `seg:` record — so every small multipart upload would leak one metadata key. The marker's lifetime is therefore the **group's** only for an *adopted* group; for an unadopted one the **terminal session delete removes it** (gated on the nonce's `seg:` range being empty, a read it is already shaped to do), so exactly one of the two arms always fires | §1, D7, X105 |
+| X110 (iteration-15 finding 4) | A deployment calibrates `B_ops` below `MAX_PART_CHUNKS` | A part commit is an **unsplittable** batch deleting up to `MAX_PART_CHUNKS` `sidx:` entries plus reads and puts, and its compensation is the same shape — so a valid part's commit **and** its compensation both time out permanently on the slowest backend, stranding slot and residue with no clearing path. The part handoff cannot be split (atomic publish-or-nothing of one part), so `MAX_PART_CHUNKS ≤ B_ops` becomes a knob clamp, exactly as X98 clamped `MAX_INFLIGHT_PARTS` for the fence and terminal-delete batches | D4, D5, X98 |
+| X111 (iteration-15 finding 5) | The identity-keyed retirement paths are enabled as soon as a compatible custodian binary is running, before the stale-mark cleanup pass finishes | "Binary deployed" and "migration finished" are different instants: while the page-wise cleanup still walks, an overwrite/delete can remove the last reference to a fragment carrying an expired mark from an older event, the keyed lookup checks that old event's already-drained obligation, finds it absent, and GC reclaims before the new drain refreshes the mark — tearing an overlapping reader. The cleanup is therefore a **migration gate**: a durable completion marker is set when the walk finishes, the custodian refuses the identity-keyed paths until it observes that marker, and falls back to the conservative `Defer` behaviour until then | D4.2, Backward compatibility, X97 |
+| X112 (iteration-15 finding 2) | A segment repoint or staged re-place pre-mark reuses the `{inode, version}` or session epoch as its event identity | Those coordinates are shared across *successive* moves of the same segment/chunk, so an old failed move's pre-mark reads as the current move's duplicate — the same-identity arm skips it, and the current move adopts against an expired stamp on stale evidence or stalls waiting for GC to clear a mark it thinks is its own. The pre-mark carries a **per-move nonce** minted when the move begins, stable only across retries of that one move, so a stale pre-mark always reads as a *different* identity and is correctly replaced | D4.2, X61, X63 |
+| X113 (iteration-15 finding 3) | An implementer builds the Create batch from the inventory table, which omitted the `seggrp:` reservation | X105 introduced `require_absent(seggrp:<group-nonce>)` and the marker write in prose and did not add them to the exhaustive batch inventory — so an implementation following the table would create unreserved groups and reopen the segment-overwrite case the nonce exists to prevent. The Create row now lists both, and the terminal-delete row lists the unadopted-marker delete. The same table-versus-prose drift class as prior rounds | §1, X105, X109 |
 
 ### What the implementing slices change (summary)
 
@@ -2831,7 +2900,8 @@ cost above names one of these; filing them is part of accepting this proposal.
   classification (X93)**, **the stale-listing mark sweep (X96), the keyed pending-retirement
   protection under a backed-up drain (X97), and the ambiguous Create against a moved counter
   (X101)**, **the two-publication-obligation drain order (X104) and a differently-clocked gateway
-  stamping a session it did not create (X106)**,
+  stamping a session it did not create (X106)**, **the transient-Complete-fence compensation
+  against a newer `Open` epoch (X108)**,
   and arrival-outruns-drain. Each lands as a seeded regression. The `orphan:` pagination (X90)
   lands in `metadata-conformance` beside X70's `scan_page` contract, and needs a scale case that
   drives one maximum segmented-object retirement past `SCAN_CAP`. **`B_ops` (X98) needs a
