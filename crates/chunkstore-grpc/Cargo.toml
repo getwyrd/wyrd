@@ -50,6 +50,11 @@ tempfile.workspace = true
 # provides the in-process coordination backend for the test-local Custodian::elect.
 wyrd-custodian.workspace = true
 wyrd-coordination-mem.workspace = true
+# `test_double_scan_page` — the dev-only `scan_page` body the in-test
+# `MetadataStore` doubles of the Tier-1/Tier-2 scenarios delegate to (#634). It
+# lives in the testkit crate, not in `wyrd-traits`, so no production backend can
+# reach it; this dev-dependency is how a test double does.
+wyrd-testkit.workspace = true
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

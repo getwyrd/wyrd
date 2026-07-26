@@ -11,10 +11,24 @@ publish.workspace = true
 [dependencies]
 rand.workspace = true
 rand_chacha.workspace = true
+# The seam definitions the metadata test-double helper is written against
+# (`test_double_scan_page`, #634): the `MetadataStore` trait plus the shared
+# page-bound decisions. Seam-only, the ADR-0010 direction — this crate depends on
+# `traits`, never on a concrete backend.
+wyrd-traits.workspace = true
 # Parse PD's `last_heartbeat_ts` (the RFC3339 heartbeat timestamp in /pd/api/v1/stores)
 # into epoch nanoseconds for the metadata partition liveness oracle. Parse-only — the
 # `clock` feature is OFF, so no wall-clock source enters this DST seam crate (ADR-0009).
 chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# `test_double_scan_page`'s own unit tests (#634): a `BTreeMap`-backed
+# `MetadataStore` double (`async-trait` + `bytes`) driven synchronously
+# (`pollster`), so the body all ~34 in-workspace doubles share is pinned in the
+# crate that owns it — load-light, no simulator and no backend.
+async-trait.workspace = true
+bytes.workspace = true
+pollster.workspace = true
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

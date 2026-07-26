@@ -35,15 +35,21 @@
 
 #![forbid(unsafe_code)]
 
+use std::ops::Bound;
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use redb::{backends::InMemoryBackend, Database, ReadableDatabase, ReadableTable, TableDefinition};
-use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
+use wyrd_traits::{
+    page_cursor, page_is_full, page_limit, page_start, BoxError, CommitOutcome, MetadataStore,
+    PageStart, Result, ScanPage, WriteBatch,
+};
 
 /// The shared per-`scan` ceiling and its fail-loud error, re-exported from the
 /// seam crate so a caller can name them without depending on `wyrd-traits`
 /// directly — the same courtesy `metadata-fdb` and `metadata-tikv` extend.
-pub use wyrd_traits::{ScanCapExceeded, SCAN_CAP};
+/// [`ZeroPageLimit`] joins them for the paginated read (#634).
+pub use wyrd_traits::{ScanCapExceeded, ZeroPageLimit, SCAN_CAP};
 
 /// All metadata lives in one keyspace; the model namespaces keys by prefix
 /// (`inode:`, `dirent:`, `pending:`, `meta:`).
@@ -68,7 +74,10 @@ impl RedbMetadataStore {
     }
 
     /// Lower this store's per-`scan` cap, so the fail-loud arm is reachable in a
-    /// test without materializing 2^20 keys.
+    /// test without materializing 2^20 keys. It bounds a
+    /// [`scan_page`](MetadataStore::scan_page) page too — no page may exceed the
+    /// cap (#634) — which is what makes the cap-escape clause reachable: a
+    /// population this `scan` refuses whole is still walkable page by page.
     ///
     /// It **refuses to raise** the cap — `min` with [`SCAN_CAP`], exactly as
     /// `FdbMetadataStore::with_scan_cap` does: the cap is a correctness constraint
@@ -130,6 +139,70 @@ impl MetadataStore for RedbMetadataStore {
             }
         }
         Ok(out)
+    }
+
+    /// One page of the `prefix` range, read natively from redb's own ordered
+    /// B-tree — **not** a slice of [`scan`](MetadataStore::scan), which would
+    /// inherit the cap this method exists to escape (#634).
+    ///
+    /// redb stores keys byte-ordered, so the contract's raw byte-lexicographic
+    /// order and its exclusive cursor are both the range read itself:
+    /// `Bound::Excluded(after)` starts the page strictly past the cursor, and the
+    /// first key that does not carry `prefix` ends it. The three page-bound
+    /// decisions are the seam's, not this backend's ([`page_limit`],
+    /// [`page_start`], [`page_cursor`]), so every backend answers them
+    /// identically; the cap is involved only as the clamp on `limit`, and `scan`'s
+    /// fail-loud behaviour is untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`ZeroPageLimit`] when the page bound resolves to zero (`limit == 0`, or a
+    /// store configured `with_scan_cap(0)` — a bound of zero is refused, never
+    /// answered with a page), plus redb's own transaction/table errors.
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ScanPage> {
+        // Resolved first, and `>= 1` by construction: a page bound of zero is
+        // rejected here rather than turning the loop below into an unbounded read.
+        let limit = page_limit(limit, self.scan_cap, prefix)?;
+        // Where the page starts is the seam's decision, and all three of its arms
+        // are answered here: an ordinary cursor is an exclusive lower bound; a
+        // cursor below the range (or none at all) starts at `prefix` itself, so a
+        // caller cannot be told an unexhausted prefix is done; and a cursor at or
+        // past the prefix's exclusive end is an empty terminal page, taken before
+        // any transaction is opened because there is provably nothing to read.
+        let lower = match page_start(prefix, after) {
+            PageStart::After(cursor) => Bound::Excluded(cursor),
+            PageStart::Prefix => Bound::Included(prefix),
+            PageStart::PastPrefix => return Ok((Vec::new(), None)),
+        };
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(TABLE)?;
+        let mut items: Vec<(Vec<u8>, Bytes)> = Vec::new();
+        for entry in table.range::<&[u8]>((lower, Bound::Unbounded))? {
+            let (k, v) = entry?;
+            let key = k.value();
+            // The range is ordered, so the first key outside the prefix ends it.
+            if !key.starts_with(prefix) {
+                break;
+            }
+            items.push((key.to_vec(), Bytes::copy_from_slice(v.value())));
+            // The seam's fullness rule, not a local comparison: the condition this
+            // loop stops on IS the condition `page_cursor` emits a cursor from, so a
+            // page that stops filling can never be labelled "prefix exhausted".
+            if page_is_full(items.len(), limit) {
+                break;
+            }
+        }
+        // A short page means the prefix is exhausted at this instant; a full one
+        // may have more behind it, so it carries the last key as the cursor. An
+        // empty page therefore never carries one — a non-terminal answer that
+        // made no progress is what makes a drain loop forever.
+        let next = page_cursor(&items, limit);
+        Ok((items, next))
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
@@ -210,6 +283,44 @@ mod error_class_tests {
                 classify(err.as_ref()),
                 ErrorClass::Terminal,
                 "a cap breach is permanent — the identical scan breaches it again: {err}"
+            );
+            assert!(
+                !classify(err.as_ref()).is_transient(),
+                "an embedded store must never offer a retry that cannot help: {err}"
+            );
+        });
+    }
+
+    /// The paginated read's own refusal, from a real store: a page bound that resolves
+    /// to zero is rejected rather than answered (#634), and the class a caller must
+    /// see for it is **terminal**. Neither half of the bound moves on its own — the
+    /// caller's `limit` is its argument and the store's cap is its configuration — so
+    /// a transient class here would be a drain retrying a call that can only ever be
+    /// refused. Driven through `scan_page` rather than by constructing the error,
+    /// because the pin is worth having only if this backend really raises it.
+    #[test]
+    fn a_zero_page_bound_classifies_terminal() {
+        let store = RedbMetadataStore::in_memory()
+            .expect("in-memory store")
+            .with_scan_cap(0);
+        pollster::block_on(async {
+            store
+                .commit(WriteBatch::new().put(b"k:1".to_vec(), "a"))
+                .await
+                .expect("seed");
+            let err = store
+                .scan_page(b"k:", None, 4)
+                .await
+                .expect_err("a store whose effective cap is zero must refuse every page");
+            assert!(
+                err.downcast_ref::<ZeroPageLimit>().is_some(),
+                "the refusal stays the seam type callers downcast: {err}"
+            );
+            assert_eq!(
+                classify(err.as_ref()),
+                ErrorClass::Terminal,
+                "a page bound of zero is permanent — the identical call is refused \
+                 again: {err}"
             );
             assert!(
                 !classify(err.as_ref()).is_transient(),

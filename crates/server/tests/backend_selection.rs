@@ -101,6 +101,18 @@ impl MetadataStore for AlwaysConflict {
         Ok(Vec::new())
     }
 
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+    }
+
     async fn commit(&self, _batch: WriteBatch) -> Result<CommitOutcome> {
         Ok(CommitOutcome::Conflict)
     }

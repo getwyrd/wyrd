@@ -3,11 +3,12 @@
 //! a real `FdbMetadataStore` (ADR-0042: FoundationDB is the production distributed
 //! metadata backend).
 //!
-//! All **seven** clauses run through the one shared `run_all` runner
-//! (`crates/metadata-conformance/src/lib.rs:291`), so FDB drives the identical clause set
-//! with no per-driver list to drift: a new `contract_*` added there is picked up here
-//! automatically. The suite is **shared, not forked** — weakening it to make FDB pass
-//! would violate the very invariant it exists to enforce.
+//! **Every** clause runs through the one shared `run_all` runner — and every cap-scoped
+//! clause through `run_all_cap_scoped`, which hands back a store lowered to the cap the
+//! suite asks for (#634) — so FDB drives the identical clause set with no per-driver list
+//! to drift: a new `contract_*` added there is picked up here automatically. The suite is
+//! **shared, not forked** — weakening it to make FDB pass would violate the very invariant
+//! it exists to enforce.
 //!
 //! The run is **cluster-file-gated**, exactly like `crates/metadata-tikv/tests/conformance.rs:11-34`:
 //! with no `WYRD_FDB_CLUSTER_FILE` set (a laptop or a PDCA worktree with no FDB) it
@@ -118,9 +119,8 @@ fn run(cluster_file: String) {
         .expect("tokio runtime");
 
     // The whole shared contract via the single `run_all` runner. `make_store(tag)` hands
-    // each of the seven clauses a store scoped to a fresh, isolated per-`tag` key prefix
-    // against the one shared cluster — without that isolation the clauses corrupt each
-    // other's keys.
+    // each clause a store scoped to a fresh, isolated per-`tag` key prefix against the one
+    // shared cluster — without that isolation the clauses corrupt each other's keys.
     //
     // The prefix carries the pid AND a nanosecond stamp, matching `tests/contention.rs:334`
     // and `tests/scan.rs`: the pid alone separates concurrent runs, but a *repeat* run on a
@@ -146,10 +146,30 @@ fn run(cluster_file: String) {
                 .with_prefix(prefix)
         }
     }));
+
+    // The cap-scoped half of the same shared contract (#634): `scan_page` must
+    // enumerate a population `scan` refuses whole, and must refuse a page bound of
+    // zero. The suite cannot lower a cap through the trait seam — `with_scan_cap` is
+    // a per-backend inherent method — so the driver hands back a store lowered to
+    // whatever cap the suite asks for.
+    runtime.block_on(conformance::run_all_cap_scoped(|tag, cap| {
+        let cluster_file = cluster_file.clone();
+        let prefix = format!(
+            "wyrd-fdb-conformance/{}/{tag}/{run_stamp}/",
+            std::process::id()
+        )
+        .into_bytes();
+        async move {
+            FdbMetadataStore::open(&cluster_file)
+                .expect("open the FoundationDB metadata store")
+                .with_prefix(prefix)
+                .with_scan_cap(cap)
+        }
+    }));
 }
 
 /// Nanoseconds since the epoch — the per-run component of the isolation prefix. Taken
-/// **once** per process, so all seven clauses of one `run_all` share a run stamp and are
+/// **once** per process, so every clause of one `run_all` shares a run stamp and they are
 /// separated from each other by `tag` alone, exactly as the shared suite intends.
 #[cfg(feature = "fdb")]
 fn nanos() -> u128 {

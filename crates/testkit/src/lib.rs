@@ -754,6 +754,89 @@ impl Clock for Sim {
     }
 }
 
+// ---- Metadata test-double seams (#634) --------------------------------------
+
+/// A [`MetadataStore::scan_page`](wyrd_traits::MetadataStore::scan_page) body **for
+/// test doubles only** — it is *not* a backend implementation, and it must never
+/// become one.
+///
+/// `scan_page` is a **required** trait method precisely so that no production
+/// backend can silently inherit a `scan()`-based body (it would inherit
+/// [`SCAN_CAP`](wyrd_traits::SCAN_CAP), the very bound the method exists to
+/// escape). The ~36 in-workspace test doubles still need *a* body, and hand-rolling
+/// 36 of them would be 36 chances to get the contract wrong, so they delegate to
+/// this one — which pages over the store's own `scan` and therefore **does**
+/// inherit the cap: past it the underlying `scan` fails loud and this returns that
+/// error.
+///
+/// It lives **here**, in the DST seam crate, rather than in `wyrd-traits`, and the
+/// backstop that buys is worth stating exactly rather than generously — a future
+/// backend author will rely on whatever this says:
+///
+/// * **Where it is a build error.** Each of the three production metadata backends
+///   takes `wyrd-testkit` as a *dev-dependency* only
+///   (`crates/metadata-redb/Cargo.toml:24`, `crates/metadata-fdb/Cargo.toml:51`,
+///   `crates/metadata-tikv/Cargo.toml:46`, each under that file's
+///   `[dev-dependencies]`), so a `MetadataStore` body in any of them naming this
+///   function does not compile. That covers every crate a *real* `scan_page` will
+///   ever be written in, which is the population the required-method rule is about.
+/// * **Where it is only a convention.** `wyrd-testkit` is a regular dependency of
+///   `wyrd-coordination-mem` (`crates/coordination-mem/Cargo.toml:16`) and of
+///   `wyrd-metadata-fault-conformance`
+///   (`crates/metadata-fault-conformance/Cargo.toml:20`), and the former is a
+///   regular dependency of `wyrd-server` (`crates/server/Cargo.toml:58`) — so this
+///   function *is* linked into the shipped `wyrd` binary and is nameable from a
+///   non-dev position in those crates. Neither holds a `MetadataStore` impl today;
+///   if one ever does, review is what keeps this body out of it.
+///
+/// The same caveat the required-method decision itself carries (#634): the rule
+/// stops *silent inheritance*, it does not by itself stop a deliberate
+/// `scan()`-then-slice body.
+///
+/// It is nonetheless contract-correct for the small populations a double holds —
+/// raw byte-lexicographic order, exclusive cursor (floored at the prefix, terminal
+/// past it), `next` = the last key returned on a full page and `None` on a short
+/// one — because it resolves all three page-bound decisions through the seam's own
+/// shared helpers ([`page_limit`](wyrd_traits::page_limit),
+/// [`page_start`](wyrd_traits::page_start),
+/// [`page_cursor`](wyrd_traits::page_cursor)), the same ones the real backends use.
+/// A double delegating here can therefore be driven by any consumer that walks
+/// pages.
+///
+/// # Errors
+///
+/// [`ZeroPageLimit`](wyrd_traits::ZeroPageLimit) when the page bound resolves to
+/// zero, and whatever the double's own `scan` raises.
+pub async fn test_double_scan_page<S>(
+    store: &S,
+    prefix: &[u8],
+    after: Option<&[u8]>,
+    limit: usize,
+) -> wyrd_traits::Result<wyrd_traits::ScanPage>
+where
+    S: wyrd_traits::MetadataStore + ?Sized,
+{
+    let limit = wyrd_traits::page_limit(limit, wyrd_traits::SCAN_CAP, prefix)?;
+    let cursor = match wyrd_traits::page_start(prefix, after) {
+        wyrd_traits::PageStart::After(cursor) => Some(cursor),
+        wyrd_traits::PageStart::Prefix => None,
+        // Nothing under the prefix can follow a cursor at or past the prefix's
+        // exclusive end — terminal, and without reading the store at all.
+        wyrd_traits::PageStart::PastPrefix => return Ok((Vec::new(), None)),
+    };
+    let mut hits = store.scan(prefix).await?;
+    // A double's `scan` is typically `HashMap`-backed and returns an arbitrary
+    // order; the contract's first clause is raw byte-lexicographic order.
+    hits.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let items: Vec<_> = hits
+        .into_iter()
+        .filter(|(key, _)| cursor.is_none_or(|after| key.as_slice() > after))
+        .take(limit)
+        .collect();
+    let next = wyrd_traits::page_cursor(&items, limit);
+    Ok((items, next))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1320,233 @@ mod tests {
             parse_fdb_process_with_role(json, "cluster_controller"),
             None,
             "a role no process holds must be None — the leg then refuses to cut a guess",
+        );
+    }
+}
+
+/// Unit coverage for [`test_double_scan_page`] — the one body ~34 in-workspace
+/// `MetadataStore` doubles share (#634).
+///
+/// It lives here, in the crate that owns the helper, rather than only in the shared
+/// conformance suite that drives it end-to-end: a slip in this one function would
+/// give every double the *same* wrong paging (an inclusive cursor spins a drain loop
+/// forever), and a helper with no local test is a helper whose contract is asserted
+/// in a doc comment and checked nowhere near it. Load-light on purpose — a
+/// `BTreeMap` double and `pollster`, no simulator, no backend.
+#[cfg(test)]
+mod test_double_scan_page_tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use pollster::block_on;
+    use wyrd_traits::{
+        BoxError, CommitOutcome, MetadataStore, Result, ScanCapExceeded, WriteBatch, ZeroPageLimit,
+        SCAN_CAP,
+    };
+
+    use super::test_double_scan_page;
+
+    /// A minimal double, shaped like the ones across the workspace: an unordered
+    /// `scan` (the trait leaves order unspecified) that fails loud past its cap.
+    struct Double {
+        kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
+        scan_cap: usize,
+    }
+
+    impl Double {
+        fn seeded(keys: &[&[u8]], scan_cap: usize) -> Self {
+            let kv = keys
+                .iter()
+                .map(|k| (k.to_vec(), Bytes::from_static(b"v")))
+                .collect();
+            Self {
+                kv: Mutex::new(kv),
+                scan_cap,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MetadataStore for Double {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            Ok(self.kv.lock().unwrap().get(key).cloned())
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            let kv = self.kv.lock().unwrap();
+            // Deliberately handed back in DESCENDING order: `scan`'s order is
+            // unspecified, so the paged read must impose byte order itself.
+            let hits: Vec<(Vec<u8>, Bytes)> = kv
+                .iter()
+                .rev()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if hits.len() > self.scan_cap {
+                return Err(BoxError::from(ScanCapExceeded {
+                    cap: self.scan_cap,
+                    prefix: prefix.to_vec(),
+                }));
+            }
+            Ok(hits)
+        }
+
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            test_double_scan_page(self, prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            let mut kv = self.kv.lock().unwrap();
+            for (key, value) in &batch.puts {
+                kv.insert(key.clone(), value.clone());
+            }
+            Ok(CommitOutcome::Committed)
+        }
+    }
+
+    fn double() -> Double {
+        Double::seeded(&[b"p:1", b"p:2", b"p:3", b"p:4", b"q:1", b"o:9"], SCAN_CAP)
+    }
+
+    fn keys(page: &[(Vec<u8>, Bytes)]) -> Vec<Vec<u8>> {
+        page.iter().map(|(key, _)| key.clone()).collect()
+    }
+
+    #[test]
+    fn a_page_is_byte_ordered_prefix_scoped_and_bounded() {
+        let (page, next) = block_on(test_double_scan_page(&double(), b"p:", None, 3)).unwrap();
+        assert_eq!(
+            keys(&page),
+            vec![b"p:1".to_vec(), b"p:2".to_vec(), b"p:3".to_vec()],
+            "byte order out of an unordered `scan`, and nothing from `o:`/`q:`"
+        );
+        assert_eq!(
+            next,
+            Some(b"p:3".to_vec()),
+            "a full page carries the last key returned"
+        );
+    }
+
+    #[test]
+    fn the_cursor_is_exclusive() {
+        let (page, next) =
+            block_on(test_double_scan_page(&double(), b"p:", Some(b"p:2"), 8)).unwrap();
+        assert_eq!(
+            keys(&page),
+            vec![b"p:3".to_vec(), b"p:4".to_vec()],
+            "the cursor key itself must never come back — an inclusive cursor \
+             re-yields the boundary key on every lap and the walk never ends"
+        );
+        assert_eq!(next, None, "a short page has exhausted the prefix");
+        // A cursor that is not a stored key resumes from the next key after it.
+        let (page, _) =
+            block_on(test_double_scan_page(&double(), b"p:", Some(b"p:25"), 8)).unwrap();
+        assert_eq!(keys(&page), vec![b"p:3".to_vec(), b"p:4".to_vec()]);
+    }
+
+    #[test]
+    fn a_cursor_below_the_prefix_starts_the_page_at_the_prefix() {
+        // Not an empty page: that would report a prefix whose every key is still
+        // there as exhausted (`wyrd_traits::page_start`).
+        for below in [&b"o:"[..], &b"o:9"[..], &b"p"[..], &b""[..]] {
+            let (page, _) =
+                block_on(test_double_scan_page(&double(), b"p:", Some(below), 8)).unwrap();
+            assert_eq!(
+                keys(&page),
+                vec![
+                    b"p:1".to_vec(),
+                    b"p:2".to_vec(),
+                    b"p:3".to_vec(),
+                    b"p:4".to_vec()
+                ],
+                "cursor {below:?} lies below the prefix, so the page starts at the prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_past_the_prefix_is_an_empty_terminal_page() {
+        // The other degenerate cursor, and the opposite answer: past the prefix's
+        // exclusive end nothing under it can follow, so the page is empty AND
+        // terminal — never a cursor that would make the caller lap forever, and
+        // never a key from the neighbouring `q:` prefix.
+        for past in [&b"p;"[..], &b"q"[..], &b"q:1"[..], &b"\xff"[..]] {
+            let (page, next) =
+                block_on(test_double_scan_page(&double(), b"p:", Some(past), 8)).unwrap();
+            assert!(
+                page.is_empty() && next.is_none(),
+                "cursor {past:?} lies past the `p:` range, so the page is empty and \
+                 terminal; got {:?} / next {next:?}",
+                keys(&page)
+            );
+        }
+    }
+
+    #[test]
+    fn a_walk_returns_every_key_once_and_terminates() {
+        let store = double();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        for _ in 0..8 {
+            let (page, next) =
+                block_on(test_double_scan_page(&store, b"p:", after.as_deref(), 2)).unwrap();
+            assert!(page.len() <= 2);
+            seen.extend(keys(&page));
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                b"p:1".to_vec(),
+                b"p:2".to_vec(),
+                b"p:3".to_vec(),
+                b"p:4".to_vec()
+            ],
+            "every key exactly once, in byte order, and the walk ended"
+        );
+    }
+
+    #[test]
+    fn an_empty_page_is_terminal_and_a_zero_bound_is_refused() {
+        let (page, next) =
+            block_on(test_double_scan_page(&double(), b"p:", Some(b"p:99"), 4)).unwrap();
+        assert!(
+            page.is_empty() && next.is_none(),
+            "a cursor past the last key is an exhausted, terminal page — an empty page \
+             carrying a cursor is a non-terminal answer with no progress"
+        );
+        let err = block_on(test_double_scan_page(&double(), b"p:", None, 0))
+            .expect_err("a page bound of zero must be refused, not answered");
+        assert!(
+            err.downcast_ref::<ZeroPageLimit>().is_some(),
+            "and refused with the seam's own type; got: {err}"
+        );
+    }
+
+    #[test]
+    fn it_inherits_the_scan_cap_and_says_so() {
+        // The property that makes this a TEST-double body and not a backend one: past
+        // the store's cap the underlying `scan` fails loud and the page fails with it,
+        // which is exactly the failure `MetadataStore::scan_page` exists to escape.
+        // A backend answering this way would be a `scan()`-backed shim (#508's
+        // rejected 4th attempt).
+        let store = Double::seeded(&[b"p:1", b"p:2", b"p:3"], 2);
+        let err = block_on(test_double_scan_page(&store, b"p:", None, 1))
+            .expect_err("the underlying over-cap `scan` fails loud, and so does this");
+        assert_eq!(
+            err.downcast_ref::<ScanCapExceeded>().map(|e| e.cap),
+            Some(2),
+            "the cap breach surfaces as the seam's typed error; got: {err}"
         );
     }
 }

@@ -116,6 +116,18 @@ impl MetadataStore for MemMeta {
             .collect())
     }
 
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+    }
+
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
         let mut kv = self.kv.lock().unwrap();
         for pre in &batch.preconditions {
@@ -172,6 +184,18 @@ impl MetadataStore for CrashMeta {
 
     async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
         self.inner.scan(prefix).await
+    }
+
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {

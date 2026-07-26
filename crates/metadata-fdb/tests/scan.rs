@@ -28,6 +28,14 @@
 //! store's cap with `with_scan_cap` and drives the *production* `scan` loop into the
 //! *production* fail-loud arm.
 //!
+//! The **paginated** read (`scan_page`, #634) has its own `more()`-driven loop with the
+//! same blind spot, and the same answer: `scan_page_once` is the only body that must
+//! survive FDB returning a partial reply (`more()` with fewer rows than the page bound),
+//! and every shared conformance population fits one chunk. So the two `scan_page` binaries
+//! below drive the identical at-scale fixture — one page bounded at the whole population
+//! (it must be FILLED across chunks, then carry its cursor), the whole walk in `WALK_LIMIT`
+//! pages, and the cap escape of #634 leg B at chunk scale against a lowered cap.
+//!
 //! **Cluster-file-gated**, exactly like `tests/conformance.rs` and `tests/contention.rs`:
 //! with no `WYRD_FDB_CLUSTER_FILE` set (a laptop or a PDCA worktree with no FDB) it **skips
 //! cleanly** so `cargo xtask ci` stays green; `cargo xtask fdb-conformance` brings up the
@@ -85,6 +93,45 @@ fn a_scan_past_the_cap_fails_loud_and_returns_no_partial_results() {
         return;
     };
     run_scan_cap(cluster_file);
+}
+
+/// **One `scan_page` page spans several of FoundationDB's own reply chunks** (#634).
+///
+/// The paginated read has its own `more()`-driven loop (`scan_page_once`), and the shared
+/// conformance clauses cannot reach it for exactly the reason stated above for `scan`:
+/// their populations are a handful of keys, so the first chunk already satisfies the whole
+/// page and the loop never iterates. Demonstrated, not assumed: flip that loop's fullness
+/// test (`>=` to `<`, the mutation `cargo mutants` reports as surviving) and the whole
+/// maintainer leg stays green — while this fixture answers **138 of 600 pairs with
+/// `next: None`**, i.e. a walk that silently drops 462 keys, which is precisely the
+/// `retire:`/`orphan:` skip the primitive exists to prevent.
+///
+/// Both halves of the contract at chunk scale: the page fills to its bound across chunks
+/// and carries a resume cursor, and the walk over the same range returns every key exactly
+/// once in byte order with its own value.
+#[test]
+fn a_scan_page_that_spans_several_reply_chunks_fills_and_resumes() {
+    let Some(cluster_file) = cluster_file() else {
+        skip("at-scale scan_page");
+        return;
+    };
+    run_scan_page(cluster_file);
+}
+
+/// **The cap escape, at chunk scale** (#634 leg B on a real cluster). A population this
+/// store's `scan` refuses whole is enumerated page by page, every page inside the lowered
+/// cap even though the caller asked for `usize::MAX`, every key exactly once.
+///
+/// The shared conformance clause asserts the same property with ~25 keys, which never
+/// reaches FDB's chunk boundary; this drives it over [`DIRENTS`] × [`VALUE_BYTES`], where
+/// the cap-clamped page and the reply chunking interact.
+#[test]
+fn a_scan_page_walk_escapes_a_cap_its_scan_fails_loud_on() {
+    let Some(cluster_file) = cluster_file() else {
+        skip("at-scale scan_page cap escape");
+        return;
+    };
+    run_scan_page_cap_escape(cluster_file);
 }
 
 /// How many dirents to store under the scanned prefix. With [`VALUE_BYTES`] this is far
@@ -263,6 +310,213 @@ fn run_scan_cap(cluster_file: String) {
     });
 }
 
+/// The page bound this walk resumes with: smaller than [`DIRENTS`] so the walk really
+/// spans several pages, and larger than one FDB reply chunk of [`VALUE_BYTES`] values so
+/// each page itself spans several chunks — the loop under test.
+#[cfg(feature = "fdb")]
+const WALK_LIMIT: usize = 250;
+
+#[cfg(feature = "fdb")]
+fn run_scan_page(cluster_file: String) {
+    use std::collections::HashMap;
+
+    use wyrd_traits::{MetadataStore, WriteBatch};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    runtime.block_on(async move {
+        let prefix = fresh_prefix("scan-page");
+        let store = wyrd_metadata_fdb::FdbMetadataStore::open(&cluster_file)
+            .expect("open the FoundationDB metadata store")
+            .with_prefix(prefix.clone());
+
+        let mut batch = WriteBatch::new();
+        for i in 0..DIRENTS {
+            batch = batch.put(dirent_key(i), value(i));
+        }
+        batch = batch.put(DECOY_KEY.to_vec(), b"nope".to_vec());
+        store.commit(batch).await.expect("bulk commit");
+
+        // Ground the fixture: this range genuinely spans more than one reply chunk, so
+        // the page below is assembled BY the loop rather than satisfied in one read.
+        // The probe reads the range unbounded while `scan_page` reads it with
+        // `RangeOption::limit = DIRENTS`; that transfers, because a row limit only
+        // removes rows from the tail — it does not raise the server's per-reply byte
+        // budget, which is what makes this range chunk at all.
+        assert_the_range_really_pages(&cluster_file, &prefix).await;
+
+        // ONE page, bounded at the whole population: it must fill to its bound across
+        // several chunks. A loop that stops at the first chunk lands here.
+        let (items, next) = store
+            .scan_page(DIR_PREFIX, None, DIRENTS)
+            .await
+            .expect("a page bounded at the whole population");
+        assert_eq!(
+            items.len(),
+            DIRENTS,
+            "one page bounded at {DIRENTS} must be FILLED to {DIRENTS} across FDB's reply \
+             chunks — a fill loop that stops at the first chunk returns a short page, which \
+             the seam then labels `next: None`, and the caller stops walking a prefix that \
+             is not exhausted",
+        );
+        assert_eq!(
+            next.as_deref(),
+            items.last().map(|(k, _)| k.as_slice()),
+            "a page at its bound carries its last key as the resume cursor (0016:2657-2658)",
+        );
+        for pair in items.windows(2) {
+            assert!(
+                pair[0].0 < pair[1].0,
+                "a page is ordered by raw byte-lexicographic key",
+            );
+        }
+
+        // …and the whole walk, in pages that each span several chunks: every key exactly
+        // once, in byte order, with its own value, and it terminates.
+        let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        let mut pages = 0usize;
+        loop {
+            let (page, next) = store
+                .scan_page(DIR_PREFIX, after.as_deref(), WALK_LIMIT)
+                .await
+                .expect("one page of the walk");
+            assert!(
+                page.len() <= WALK_LIMIT,
+                "a page must not exceed the caller's limit: asked {WALK_LIMIT}, got {}",
+                page.len(),
+            );
+            for (key, value) in page {
+                assert!(
+                    seen.insert(key.clone(), value.as_ref().to_vec()).is_none(),
+                    "key {key:?} came back twice in one walk",
+                );
+                order.push(key);
+            }
+            pages += 1;
+            assert!(
+                pages <= 16,
+                "the walk over {DIRENTS} keys did not terminate"
+            );
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert!(
+            pages > 1,
+            "the walk finished in one page — raise DIRENTS or lower WALK_LIMIT, or it no \
+             longer exercises the cursor across pages",
+        );
+        assert_eq!(
+            seen.len(),
+            DIRENTS,
+            "the walk must return the COMPLETE set ({DIRENTS}) — a skipped key is an \
+             obligation retained forever (0016:2653-2660)",
+        );
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(
+            order, sorted,
+            "the walk is ordered by raw byte-lexicographic key"
+        );
+        for i in 0..DIRENTS {
+            assert_eq!(
+                seen.get(&dirent_key(i)).map(Vec::as_slice),
+                Some(value(i).as_slice()),
+                "dirent {i} missing or carrying the wrong value in the paged walk",
+            );
+        }
+        assert!(
+            !seen.contains_key(DECOY_KEY),
+            "the neighbouring-prefix decoy must be outside the bounded range",
+        );
+    });
+}
+
+#[cfg(feature = "fdb")]
+fn run_scan_page_cap_escape(cluster_file: String) {
+    use std::collections::HashSet;
+
+    use wyrd_metadata_fdb::paging::ScanCapExceeded;
+    use wyrd_traits::{MetadataStore, WriteBatch};
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    runtime.block_on(async move {
+        let prefix = fresh_prefix("scan-page-cap");
+        // Seeded with the default cap; walked with a lowered one, so the *production*
+        // page loop meets the *production* clamp (only the ceiling moves).
+        let seeder = wyrd_metadata_fdb::FdbMetadataStore::open(&cluster_file)
+            .expect("open the FoundationDB metadata store")
+            .with_prefix(prefix.clone());
+        let mut batch = WriteBatch::new();
+        for i in 0..DIRENTS {
+            batch = batch.put(dirent_key(i), value(i));
+        }
+        seeder.commit(batch).await.expect("bulk commit");
+
+        let capped = wyrd_metadata_fdb::FdbMetadataStore::open(&cluster_file)
+            .expect("open the FoundationDB metadata store")
+            .with_prefix(prefix)
+            .with_scan_cap(LOWERED_CAP);
+
+        // The bound is genuinely in force: `scan` refuses this population whole.
+        const { assert!(DIRENTS > LOWERED_CAP) };
+        let err = capped
+            .scan(DIR_PREFIX)
+            .await
+            .expect_err("an over-cap scan must fail loud, or the walk below proves nothing");
+        assert_eq!(
+            err.downcast_ref::<ScanCapExceeded>()
+                .unwrap_or_else(|| panic!(
+                    "an over-cap scan must be a typed ScanCapExceeded: {err}"
+                ))
+                .cap,
+            LOWERED_CAP,
+        );
+
+        // …and `scan_page` walks it anyway, clamped to the cap on every page.
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        let mut after: Option<Vec<u8>> = None;
+        let mut pages = 0usize;
+        loop {
+            let (page, next) = capped
+                .scan_page(DIR_PREFIX, after.as_deref(), usize::MAX)
+                .await
+                .expect("a limit above the cap is clamped to it, never refused");
+            assert!(
+                page.len() <= LOWERED_CAP,
+                "no page may exceed the store's cap ({LOWERED_CAP}), even for a caller \
+                 asking for usize::MAX; got {}",
+                page.len(),
+            );
+            for (key, _) in page {
+                assert!(seen.insert(key), "a key came back twice in the capped walk");
+            }
+            pages += 1;
+            assert!(pages <= 64, "the over-cap walk did not terminate");
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            DIRENTS,
+            "a population `scan` refuses whole must still be enumerable page by page — \
+             that is the entire reason this primitive exists (0016:2645-2652)",
+        );
+    });
+}
+
 /// Assert, against the live server, that the physical range this test scans really does
 /// span **more than one** page — i.e. that FDB reports `more()` on the first `WantAll`
 /// range read, exactly as `FdbMetadataStore::scan_once`'s loop sees it.
@@ -335,6 +589,18 @@ fn run(cluster_file: String) {
 
 #[cfg(not(feature = "fdb"))]
 fn run_scan_cap(cluster_file: String) {
+    let _ = cluster_file;
+    feature_off();
+}
+
+#[cfg(not(feature = "fdb"))]
+fn run_scan_page(cluster_file: String) {
+    let _ = cluster_file;
+    feature_off();
+}
+
+#[cfg(not(feature = "fdb"))]
+fn run_scan_page_cap_escape(cluster_file: String) {
     let _ = cluster_file;
     feature_off();
 }

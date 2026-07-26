@@ -36,6 +36,15 @@ async fn redb_backend_passes_shared_contract() {
         RedbMetadataStore::in_memory().expect("redb in-memory store")
     })
     .await;
+    // The cap-scoped half (#634): the driver lowers the cap to whatever the suite
+    // asks for, because the suite cannot reach a per-backend inherent method
+    // through the trait seam.
+    wyrd_metadata_conformance::run_all_cap_scoped(|_tag, cap| async move {
+        RedbMetadataStore::in_memory()
+            .expect("redb in-memory store")
+            .with_scan_cap(cap)
+    })
+    .await;
 }
 
 /// The second implementation — the deterministic simulated-TiKV model, with its
@@ -44,6 +53,10 @@ async fn redb_backend_passes_shared_contract() {
 #[madsim::test]
 async fn sim_tikv_backend_passes_shared_contract() {
     wyrd_metadata_conformance::run_all(|_tag| async { SimTikvMetadataStore::new() }).await;
+    wyrd_metadata_conformance::run_all_cap_scoped(|_tag, cap| async move {
+        SimTikvMetadataStore::new().with_scan_cap(cap)
+    })
+    .await;
 }
 
 /// The third implementation — the deterministic simulated-FDB model, whose commit is
@@ -60,4 +73,8 @@ async fn sim_tikv_backend_passes_shared_contract() {
 #[madsim::test]
 async fn sim_fdb_backend_passes_shared_contract() {
     wyrd_metadata_conformance::run_all(|_tag| async { SimFdbMetadataStore::new() }).await;
+    wyrd_metadata_conformance::run_all_cap_scoped(|_tag, cap| async move {
+        SimFdbMetadataStore::new().with_scan_cap(cap)
+    })
+    .await;
 }

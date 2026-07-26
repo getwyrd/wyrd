@@ -4978,6 +4978,7 @@ dependencies = [
  "wyrd-core",
  "wyrd-custodian",
  "wyrd-proto",
+ "wyrd-testkit",
  "wyrd-traits",
 ]
 
@@ -5128,6 +5129,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "pollster",
+ "wyrd-testkit",
  "wyrd-traits",
 ]
 
@@ -5259,9 +5261,13 @@ dependencies = [
 name = "wyrd-testkit"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "chrono",
+ "pollster",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
+ "wyrd-traits",
 ]
 
 [[package]]
