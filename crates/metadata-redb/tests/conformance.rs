@@ -34,6 +34,19 @@ fn trait_contract() {
     block_on(conformance::run_all(|_tag| async { store() }));
 }
 
+#[test]
+fn trait_contract_with_a_lowered_scan_cap() {
+    // The cap-scoped half of the shared contract (#634): `scan_page` must enumerate a
+    // population `scan` refuses whole, and must refuse a page bound of zero rather
+    // than answer an unbounded page. The suite cannot lower a cap through the trait
+    // seam — `with_scan_cap` is a per-backend inherent method — so the driver hands
+    // back a store lowered to whatever cap the suite asks for. Same "one runner, no
+    // per-driver clause list" discipline as `run_all` above.
+    block_on(conformance::run_all_cap_scoped(|_tag, cap| async move {
+        store().with_scan_cap(cap)
+    }));
+}
+
 // ---- DoD via the metadata model -------------------------------------------
 
 #[test]

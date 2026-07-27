@@ -6,6 +6,13 @@
 //! paging that the single-page shared conformance clause (`contract_scan_by_prefix`)
 //! cannot reach.
 //!
+//! The **paginated** read (`scan_page`, #634) fills one page from the same
+//! `PAGE_SIZE`-bounded reads and has the same blind spot — a handful of keys is one
+//! chunk, so the shared clauses never advance the cursor *within* a page — so the
+//! `scan_page` binary below drives the identical at-scale fixture: a page bounded at the
+//! whole population must be FILLED across chunks and carry its resume cursor, and the walk
+//! over the same range must return every key exactly once in byte order.
+//!
 //! **Endpoint-gated**, exactly like `tests/conformance.rs`: with no
 //! `WYRD_TIKV_PD_ENDPOINTS` set (a laptop or a PDCA worktree with no TiKV) it
 //! **skips cleanly** so `cargo xtask ci` stays green; `cargo xtask tikv-conformance`
@@ -113,9 +120,167 @@ fn run(endpoints: Vec<String>) {
     });
 }
 
+/// **One `scan_page` page spans several internal `PAGE_SIZE` chunks** (#634).
+///
+/// The paginated read fills a page with [`PAGE_SIZE`](wyrd_metadata_tikv::paging::PAGE_SIZE)
+/// -bounded reads inside one transaction, for the heap reason `scan` already pages:
+/// tikv-client carries a request's `limit` unchanged into every region's shard, so one read
+/// for a whole page materializes up to `regions × limit` pairs client-side. That fill loop
+/// is reached by nothing else — the shared conformance clauses store a handful of keys, so
+/// their pages are satisfied by the first chunk and the cursor never advances *within* a
+/// page. This binary is what makes a broken advance fail: it asks for one page bounded at
+/// a population larger than `PAGE_SIZE` and asserts the page is **filled** and carries its
+/// resume cursor, then walks the same range and asserts every key comes back exactly once
+/// in byte order.
+#[test]
+fn a_scan_page_that_spans_several_internal_chunks_fills_and_resumes() {
+    let Some(endpoints) = pd_endpoints() else {
+        eprintln!(
+            "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS not set — skipping the at-scale \
+             scan_page run (clean skip; the gate stays green without a TiKV)."
+        );
+        return;
+    };
+    run_scan_page(endpoints);
+}
+
+#[cfg(feature = "tikv")]
+fn run_scan_page(endpoints: Vec<String>) {
+    use std::collections::HashMap;
+
+    use wyrd_metadata_tikv::paging::PAGE_SIZE;
+    use wyrd_metadata_tikv::TikvMetadataStore;
+    use wyrd_traits::{MetadataStore, WriteBatch};
+
+    // Past one internal chunk, and deliberately not a multiple of it: the fill loop
+    // must handle the ragged last chunk as well as the full ones.
+    let count: usize = PAGE_SIZE as usize + PAGE_SIZE as usize / 2 + 7;
+    // The fixture's own invariant, asserted rather than assumed: a page bounded at
+    // `count` cannot be answered in one internal read, because `paging::chunk_size`
+    // caps every read at PAGE_SIZE. A `count` that quietly dropped to one chunk would
+    // leave the fill loop untested while this binary still passed.
+    assert!(
+        count > PAGE_SIZE as usize && !count.is_multiple_of(PAGE_SIZE as usize),
+        "the fixture must span more than one {PAGE_SIZE}-key chunk and end raggedly; \
+         got {count}"
+    );
+    // A page bound smaller than the population but larger than one chunk, so the WALK
+    // spans pages and each PAGE spans chunks.
+    let walk_limit: usize = PAGE_SIZE as usize + 11;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    runtime.block_on(async {
+        let namespace = format!("wyrd-scan/{}/scan-page/", std::process::id()).into_bytes();
+        let store = TikvMetadataStore::connect(endpoints)
+            .await
+            .expect("connect to TiKV")
+            .with_namespace(namespace);
+
+        let mut batch = WriteBatch::new();
+        for i in 0..count {
+            batch = batch.put(format!("dir:{i:08}").into_bytes(), format!("v{i}"));
+        }
+        batch = batch.put(b"dir;decoy".to_vec(), "nope");
+        store.commit(batch).await.expect("bulk commit");
+
+        // ONE page, bounded at the whole population: it must fill across chunks.
+        let (items, next) = store
+            .scan_page(b"dir:", None, count)
+            .await
+            .expect("a page bounded at the whole population");
+        assert_eq!(
+            items.len(),
+            count,
+            "one page bounded at {count} must be FILLED to {count} across the internal \
+             {PAGE_SIZE}-key chunks — a fill loop that stops at the first chunk returns a \
+             short page, which the seam then labels `next: None`, and the caller stops \
+             walking a prefix that is not exhausted"
+        );
+        assert_eq!(
+            next.as_deref(),
+            items.last().map(|(k, _)| k.as_slice()),
+            "a page at its bound carries its last key as the resume cursor (0016:2657-2658)"
+        );
+
+        // …and the whole walk: every key exactly once, in byte order, with its value.
+        let mut seen: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        let mut order: Vec<Vec<u8>> = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        let mut pages = 0usize;
+        loop {
+            let (page, next) = store
+                .scan_page(b"dir:", after.as_deref(), walk_limit)
+                .await
+                .expect("one page of the walk");
+            assert!(
+                page.len() <= walk_limit,
+                "a page must not exceed the caller's limit: asked {walk_limit}, got {}",
+                page.len()
+            );
+            for (key, value) in page {
+                assert!(
+                    seen.insert(key.clone(), value.as_ref().to_vec()).is_none(),
+                    "key {key:?} came back twice in one walk"
+                );
+                order.push(key);
+            }
+            pages += 1;
+            assert!(pages <= 16, "the walk over {count} keys did not terminate");
+            match next {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert!(
+            pages > 1,
+            "the walk finished in one page — raise `count` or lower `walk_limit`, or it no \
+             longer exercises the cursor across pages"
+        );
+        assert_eq!(
+            seen.len(),
+            count,
+            "the walk must return the COMPLETE set ({count}) — a skipped key is an \
+             obligation retained forever (0016:2653-2660)"
+        );
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(
+            order, sorted,
+            "the walk is ordered by raw byte-lexicographic key"
+        );
+        for i in 0..count {
+            let key = format!("dir:{i:08}").into_bytes();
+            assert_eq!(
+                seen.get(&key).map(Vec::as_slice),
+                Some(format!("v{i}").as_bytes()),
+                "key {i} missing or carrying the wrong value in the paged walk"
+            );
+        }
+        assert!(
+            !seen.contains_key(b"dir;decoy".as_slice()),
+            "the neighbouring-prefix decoy must be outside the bounded range"
+        );
+    });
+}
+
 #[cfg(not(feature = "tikv"))]
 fn run(endpoints: Vec<String>) {
     let _ = endpoints;
+    feature_off();
+}
+
+#[cfg(not(feature = "tikv"))]
+fn run_scan_page(endpoints: Vec<String>) {
+    let _ = endpoints;
+    feature_off();
+}
+
+#[cfg(not(feature = "tikv"))]
+fn feature_off() {
     eprintln!(
         "wyrd-metadata-tikv: WYRD_TIKV_PD_ENDPOINTS is set but the crate was built without \
          `--features tikv` — skipping. Run it via `cargo xtask tikv-conformance`."

@@ -79,13 +79,16 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
+use std::ops::Bound;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_traits::{
-    BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, Precondition, Result, WriteBatch,
+    page_cursor, page_limit, page_start, BoxError, CommitOutcome, CommitUnknownResult,
+    MetadataStore, PageStart, Precondition, Result, ScanCapExceeded, ScanPage, WriteBatch,
+    SCAN_CAP,
 };
 
 /// How faithfully the model renders a commit's async shape.
@@ -136,6 +139,9 @@ struct Inner {
 pub struct SimTikvMetadataStore {
     inner: Mutex<Inner>,
     fidelity: Fidelity,
+    /// Ceiling on one `scan`'s results and on one `scan_page` page, mirroring the
+    /// production backends' knob (`TikvMetadataStore::with_scan_cap`).
+    scan_cap: usize,
 }
 
 impl SimTikvMetadataStore {
@@ -149,7 +155,20 @@ impl SimTikvMetadataStore {
         Self {
             inner: Mutex::new(Inner::default()),
             fidelity,
+            scan_cap: SCAN_CAP,
         }
+    }
+
+    /// **Lower** this model's per-`scan` ceiling, clamped to [`SCAN_CAP`] — the same
+    /// knob, with the same refusal to *raise* it, that the three production backends
+    /// carry (`crates/metadata-tikv/src/lib.rs`, `metadata-fdb`, `metadata-redb`).
+    ///
+    /// It is what makes the shared cap-escape clause (#634) reachable in-simulator:
+    /// a population this `scan` refuses whole, walked to completion by `scan_page`.
+    #[must_use]
+    pub fn with_scan_cap(mut self, cap: usize) -> Self {
+        self.scan_cap = cap.min(SCAN_CAP);
+        self
     }
 
     /// A snapshot of what this store observed during the run.
@@ -200,6 +219,66 @@ fn apply(truth: &mut BTreeMap<Vec<u8>, Bytes>, batch: &WriteBatch) {
     for (key, value) in &batch.puts {
         truth.insert(key.clone(), value.clone());
     }
+}
+
+/// Every pair under `prefix`, or the fail-loud [`ScanCapExceeded`] both production
+/// backends raise past their cap (#262, ADR-0011; #516) — the model mirrors the
+/// production adapter's error semantics rather than materializing an unbounded
+/// `Vec` the real backends refuse.
+fn scan_capped(
+    truth: &BTreeMap<Vec<u8>, Bytes>,
+    prefix: &[u8],
+    cap: usize,
+) -> Result<Vec<(Vec<u8>, Bytes)>> {
+    let hits: Vec<(Vec<u8>, Bytes)> = truth
+        .range((Bound::Included(prefix.to_vec()), Bound::Unbounded))
+        .take_while(|(key, _)| key.starts_with(prefix))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    // `>` not `>=`, the boundary all three backends agreed on: exactly `cap` keys
+    // is a legal complete result.
+    if hits.len() > cap {
+        return Err(BoxError::from(ScanCapExceeded {
+            cap,
+            prefix: prefix.to_vec(),
+        }));
+    }
+    Ok(hits)
+}
+
+/// One `scan_page` page out of the model's sorted truth (#634).
+///
+/// A `BTreeMap` range slice **is** the faithful implementation for a model whose
+/// truth is byte-ordered: the contract's raw byte-lexicographic order is the map's
+/// own order, and `Bound::Excluded` is the exclusive cursor. Deliberately not a
+/// slice of [`scan_capped`] — that would inherit the cap the primitive exists to
+/// escape, which is the shape the trait forbids of a backend.
+fn page_from_truth(
+    truth: &BTreeMap<Vec<u8>, Bytes>,
+    prefix: &[u8],
+    after: Option<&[u8]>,
+    limit: usize,
+) -> ScanPage {
+    // Where the page starts is the seam's shared rule, all three arms, exactly as in
+    // the real backends: an `after` below the range must not walk out of the
+    // namespace the caller asked for — nor answer an empty, falsely-terminal page —
+    // and an `after` at or past the prefix's exclusive end is terminal.
+    let lower = match page_start(prefix, after) {
+        PageStart::After(cursor) => Bound::Excluded(cursor.to_vec()),
+        PageStart::Prefix => Bound::Included(prefix.to_vec()),
+        PageStart::PastPrefix => return (Vec::new(), None),
+    };
+    let items: Vec<(Vec<u8>, Bytes)> = truth
+        .range((lower, Bound::Unbounded))
+        .take_while(|(key, _)| key.starts_with(prefix))
+        .take(limit)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    // A short page means the prefix is exhausted; an empty one therefore never
+    // carries a cursor (no progress + not terminal is what makes a drain loop
+    // forever). Same shared decision the production backends use.
+    let next = page_cursor(&items, limit);
+    (items, next)
 }
 
 impl SimTikvMetadataStore {
@@ -293,12 +372,24 @@ impl MetadataStore for SimTikvMetadataStore {
             network_hop().await;
         }
         let inner = self.inner.lock().unwrap();
-        Ok(inner
-            .truth
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect())
+        scan_capped(&inner.truth, prefix, self.scan_cap)
+    }
+
+    /// The paginated range read (#634), over the model's own ordered truth — the
+    /// same shape the real backend gets from its cursored range primitive, and
+    /// never a slice of `scan`.
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ScanPage> {
+        let limit = page_limit(limit, self.scan_cap, prefix)?;
+        if self.fidelity == Fidelity::AwaitInsideCommit {
+            network_hop().await; // one page is one round-trip.
+        }
+        let inner = self.inner.lock().unwrap();
+        Ok(page_from_truth(&inner.truth, prefix, after, limit))
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
@@ -550,6 +641,9 @@ impl FdbInner {
 #[derive(Debug)]
 pub struct SimFdbMetadataStore {
     inner: Mutex<FdbInner>,
+    /// Ceiling on one `scan`'s results and on one `scan_page` page, mirroring the
+    /// production backend's knob (`FdbMetadataStore::with_scan_cap`).
+    scan_cap: usize,
 }
 
 impl SimFdbMetadataStore {
@@ -579,7 +673,18 @@ impl SimFdbMetadataStore {
                 ),
                 obs: FdbObservations::default(),
             }),
+            scan_cap: SCAN_CAP,
         }
+    }
+
+    /// **Lower** this model's per-`scan` ceiling, clamped to [`SCAN_CAP`] — the same
+    /// knob `FdbMetadataStore::with_scan_cap` carries, and with the same refusal to
+    /// *raise* it. It is what makes the shared cap-escape clause (#634) reachable
+    /// in-simulator.
+    #[must_use]
+    pub fn with_scan_cap(mut self, cap: usize) -> Self {
+        self.scan_cap = cap.min(SCAN_CAP);
+        self
     }
 
     /// Arm the commit-ambiguity nemesis with `code` for the next `budget` commits the
@@ -740,12 +845,27 @@ impl MetadataStore for SimFdbMetadataStore {
         network_hop().await;
         let mut inner = self.inner.lock().unwrap();
         inner.settle_in_flight(false);
-        Ok(inner
-            .truth
-            .iter()
-            .filter(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect())
+        scan_capped(&inner.truth, prefix, self.scan_cap)
+    }
+
+    /// The paginated range read (#634), over the model's own ordered truth — the
+    /// same shape the real driver gets from FDB's cursored `get_range`, and never a
+    /// slice of `scan`.
+    ///
+    /// Each page settles in-flight commits exactly as any other read does, so a
+    /// `1031` batch that lands mid-walk is visible to the walk — the "no snapshot
+    /// isolation across pages" the contract permits, rendered faithfully.
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<ScanPage> {
+        let limit = page_limit(limit, self.scan_cap, prefix)?;
+        network_hop().await;
+        let mut inner = self.inner.lock().unwrap();
+        inner.settle_in_flight(false);
+        Ok(page_from_truth(&inner.truth, prefix, after, limit))
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {

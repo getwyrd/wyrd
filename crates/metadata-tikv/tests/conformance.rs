@@ -60,6 +60,23 @@ fn run(endpoints: Vec<String>) {
                 .with_namespace(namespace)
         }
     }));
+
+    // The cap-scoped half of the same shared contract (#634): `scan_page` must
+    // enumerate a population `scan` refuses whole, and must refuse a page bound of
+    // zero. The suite cannot lower a cap through the trait seam — `with_scan_cap` is
+    // a per-backend inherent method — so the driver hands back a store lowered to
+    // whatever cap the suite asks for.
+    runtime.block_on(conformance::run_all_cap_scoped(|tag, cap| {
+        let endpoints = endpoints.clone();
+        let namespace = format!("wyrd-conformance/{}/{tag}/", std::process::id()).into_bytes();
+        async move {
+            TikvMetadataStore::connect(endpoints)
+                .await
+                .expect("connect to TiKV")
+                .with_namespace(namespace)
+                .with_scan_cap(cap)
+        }
+    }));
 }
 
 #[cfg(not(feature = "tikv"))]

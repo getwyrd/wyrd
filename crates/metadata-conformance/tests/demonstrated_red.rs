@@ -68,6 +68,18 @@ impl MetadataStore for StaleCacheStore {
             .collect())
     }
 
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+    }
+
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
         let mut truth = self.truth.lock().unwrap();
         let ok = batch
@@ -142,6 +154,18 @@ impl MetadataStore for IgnoresRequireOnDeleteStore {
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
+    }
+
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
@@ -221,6 +245,18 @@ impl MetadataStore for LeakyScanIndexStore {
                 (k.clone(), v)
             })
             .collect())
+    }
+
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
@@ -327,6 +363,18 @@ impl MetadataStore for RaceConflatingStore {
             .collect())
     }
 
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+    }
+
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
         *self.in_flight.lock().unwrap() += 1;
         // Give a concurrent sibling the chance to enter `commit` too — without this
@@ -374,7 +422,7 @@ fn race_conflating_store_passes_every_other_contract() {
     // this store's bug is invisible without concurrency, and no other clause drives
     // two commits at once. That is precisely the discriminating power
     // `contract_blind_batch_is_never_conflict` adds: without it, a backend could
-    // swallow every raced blind write and stay green across all seven other clauses.
+    // swallow every raced blind write and stay green across every other clause here.
     block_on(async {
         conformance::contract_commit_and_get(&RaceConflatingStore::default()).await;
         conformance::contract_scan_by_prefix(&RaceConflatingStore::default()).await;
@@ -424,6 +472,18 @@ impl MetadataStore for LyingCommitStore {
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
+    }
+
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`
+    // (and therefore inherits `SCAN_CAP`, which a backend may not).
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {

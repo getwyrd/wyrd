@@ -13,6 +13,10 @@ publish.workspace = true
 # it never depends on a concrete backend, so `metadata-redb`, `metadata-tikv` and
 # `metadata-fdb` can drive the identical assertions.
 wyrd-traits.workspace = true
+# The `scan_page` clauses assert each page's VALUES as well as its keys (#634), so
+# the suite names `Bytes` — the value half of the seam's own `(key, value)` pair —
+# in its expected-page fixtures. Still no backend: this is the seam's value type.
+bytes.workspace = true
 # `contract_blind_batch_is_never_conflict` (#437) has to drive TWO commits that
 # genuinely overlap — a blind batch can only *lose a race* concurrently, and the
 # race is the half of the clause a sequential interleaving cannot reach. This is
@@ -25,8 +29,11 @@ futures-util.workspace = true
 # backend — see the #419 brief's "Violating-store test double" NEEDS-HUMAN
 # note) to prove the three read-consistency properties are load-bearing.
 async-trait.workspace = true
-bytes.workspace = true
 pollster.workspace = true
+# `test_double_scan_page` — the dev-only `scan_page` body those violating stubs
+# delegate to (#634). It lives in the testkit crate, not in `wyrd-traits`, so no
+# production backend can reach it; this dev-dependency is how a test double does.
+wyrd-testkit.workspace = true
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

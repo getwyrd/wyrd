@@ -955,8 +955,13 @@ mod store {
     use bytes::Bytes;
     use foundationdb::api::{FdbApiBuilder, NetworkAutoStop};
     use foundationdb::options::{NetworkOption, StreamingMode, TransactionOption};
-    use foundationdb::{Database, FdbError, RangeOption, Transaction, TransactionCommitError};
-    use wyrd_traits::{BoxError, CommitOutcome, MetadataStore, Result, WriteBatch};
+    use foundationdb::{
+        Database, FdbError, KeySelector, RangeOption, Transaction, TransactionCommitError,
+    };
+    use wyrd_traits::{
+        page_cursor, page_is_full, page_limit, page_start, BoxError, CommitOutcome, MetadataStore,
+        PageStart, Result, ScanPage, WriteBatch,
+    };
 
     use crate::classify::{self, CommitClass};
     use crate::paging::{self, PageStep, ScanCapExceeded};
@@ -1064,9 +1069,9 @@ mod store {
     }
 
     /// The FDB client permits exactly **one** network thread per process, while `run_all`
-    /// (`crates/metadata-conformance/src/lib.rs:291`) constructs **seven** stores in one
-    /// test process. So the network is booted once, lazily, behind a `OnceLock`, and every
-    /// `FdbMetadataStore` in the process shares it.
+    /// (`crates/metadata-conformance/src/lib.rs`) constructs a fresh store **per clause**
+    /// — a dozen and growing — in one test process. So the network is booted once, lazily,
+    /// behind a `OnceLock`, and every `FdbMetadataStore` in the process shares it.
     ///
     /// The guard is deliberately never dropped: a `static` is not dropped at process exit,
     /// and `NetworkAutoStop::drop` stops the run loop — which must not happen while any
@@ -1407,6 +1412,61 @@ mod store {
                 // over-cap set can never slip through as a "complete" final page.
                 if paging::after_page(out.len(), self.scan_cap) == PageStep::CapExceeded {
                     return Err(ScanFailure::CapExceeded);
+                }
+                match range.next_range(&values) {
+                    Some(next) => range = next,
+                    None => return Ok(out),
+                }
+                iteration += 1;
+            }
+        }
+
+        /// Read **at most `limit`** pairs of one bounded range inside a single `trx`,
+        /// starting strictly after `after` — the page body behind
+        /// [`scan_page`](MetadataStore::scan_page) (#634).
+        ///
+        /// The same `more()`-driven loop as [`Self::scan_once`], bounded by
+        /// `RangeOption::limit` (which `next_range` decrements, ending the loop the
+        /// moment the page is full). No cap arm: `limit` reaches here already clamped
+        /// to `self.scan_cap`, so a page cannot breach the cap and there is nothing to
+        /// fail loud about — which is exactly the point of the paginated primitive.
+        async fn scan_page_once(
+            &self,
+            trx: &Transaction,
+            begin: Vec<u8>,
+            begin_exclusive: bool,
+            end: Vec<u8>,
+            limit: usize,
+        ) -> std::result::Result<Vec<(Vec<u8>, Bytes)>, FdbError> {
+            let mut range = RangeOption::from((begin.clone(), end));
+            if begin_exclusive {
+                // FDB's own key selector IS the exclusive cursor — "the first key
+                // greater than this one" — so no successor-key arithmetic is needed
+                // and nothing can sort between the cursor and the page's first key.
+                range.begin = KeySelector::first_greater_than(begin);
+            }
+            range.limit = Some(limit);
+            range.mode = StreamingMode::WantAll;
+
+            let mut out: Vec<(Vec<u8>, Bytes)> = Vec::new();
+            let mut iteration = 1;
+            loop {
+                let values = trx.get_range(&range, iteration, false).await?;
+                for kv in values.iter() {
+                    if let Some(logical) = keyspace::logical(&self.prefix, kv.key()) {
+                        out.push((logical, Bytes::copy_from_slice(kv.value())));
+                    }
+                }
+                // The seam's fullness rule, not a comparison spelled again here: the
+                // condition this loop stops on IS the condition `page_cursor` emits
+                // the resume cursor from ([`page_is_full`]). Spelled apart, an
+                // off-by-one stops the fill early and the short page it returns is
+                // then labelled `next: None` — a walk that silently skips the rest of
+                // the prefix, which is the exact defect a live-cluster mutation of
+                // this line demonstrated (#634, iteration-5 adversarial review).
+                if page_is_full(out.len(), limit) {
+                    out.truncate(limit);
+                    return Ok(out);
                 }
                 match range.next_range(&values) {
                     Some(next) => range = next,
@@ -1800,6 +1860,92 @@ mod store {
             }
             let last = last.expect("the retry arm records the error before exhausting the budget");
             Err(BoxError::from(RetryBudgetExhausted::new("scan", last)))
+        }
+
+        /// One bounded page of the `prefix` range, read from FDB's own cursored range
+        /// primitive — **not** a slice of [`scan`](MetadataStore::scan), which would
+        /// inherit the cap this method exists to escape (#634).
+        ///
+        /// FDB stores keys byte-identically and returns a range in key order, so the
+        /// contract's raw byte-lexicographic order is the range read itself. The
+        /// exclusive cursor is a key *selector*, not an arithmetic successor:
+        /// `first_greater_than(after)` is precisely "the first key after this one", so
+        /// the page can neither re-yield the cursor nor skip a key between them. A
+        /// cursor below the prefix falls back to the prefix's own start, so a caller
+        /// cannot walk out of the namespace it asked for; a cursor at or past the
+        /// prefix's exclusive upper bound answers an empty terminal page **without
+        /// opening a transaction**, since nothing under the prefix can follow it.
+        /// This driver is the *tolerant* substrate of the two — a `first_greater_than`
+        /// begin selector resolving past `end` reads back nothing rather than raising
+        /// `2005 inverted_range` (verified against a live single-node cluster, #634) —
+        /// so the arm is not a bug fix here; it is this backend answering the seam's
+        /// contract by the same decision every other backend uses, instead of by
+        /// accident of what `libfdb_c` happens to tolerate.
+        ///
+        /// One page is read inside **one** transaction (one read version). Across
+        /// pages the walk deliberately holds no snapshot — the contract requires none
+        /// of any backend, only that a key present throughout the walk comes back
+        /// exactly once — and a transaction held open across a caller-paced walk would
+        /// hit FDB's own 5 s limit (`1007 transaction_too_old`) instead. A retryable
+        /// error re-reads **this page** on a fresh transaction; it never stitches one
+        /// page from two read versions.
+        ///
+        /// # Errors
+        ///
+        /// [`wyrd_traits::ZeroPageLimit`] when the page bound resolves to zero
+        /// (`limit == 0`, or a store configured `with_scan_cap(0)`), or the driver's
+        /// own error once the retry budget is exhausted.
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<ScanPage> {
+            // Resolved first, and `>= 1` by construction: a page bound of zero is
+            // refused rather than answered with a page that cannot make progress.
+            let limit = page_limit(limit, self.scan_cap, prefix)?;
+            let start = self.physical(prefix);
+            let end = keyspace::prefix_upper_bound(&start)
+                .unwrap_or_else(|| keyspace::KEYSPACE_END.to_vec());
+            // The cursor is exclusive — and never starts the page outside the prefix's
+            // own range, by the seam's shared rule rather than a third hand-rolled
+            // comparison: below the range it falls back to the prefix's start, and at
+            // or past the range's exclusive end there is provably nothing to read, so
+            // the page is terminal and no inverted range is ever built.
+            let (begin, begin_exclusive) = match page_start(prefix, after) {
+                PageStart::After(key) => (self.physical(key), true),
+                PageStart::Prefix => (start, false),
+                PageStart::PastPrefix => return Ok((Vec::new(), None)),
+            };
+
+            let mut trx = self.trx()?;
+            let mut last: Option<FdbError> = None;
+            for attempt in 1..=MAX_ATTEMPTS {
+                match self
+                    .scan_page_once(&trx, begin.clone(), begin_exclusive, end.clone(), limit)
+                    .await
+                {
+                    Ok(items) => {
+                        // A short page means the range is exhausted at this instant; a
+                        // full one may have more behind it and carries the last key as
+                        // the cursor. An empty page therefore never carries one — a
+                        // non-terminal answer with no progress is what makes a drain
+                        // loop forever.
+                        let next = page_cursor(&items, limit);
+                        return Ok((items, next));
+                    }
+                    Err(err) if err.is_retryable() => {
+                        last = Some(err);
+                        if attempt == MAX_ATTEMPTS {
+                            break;
+                        }
+                        trx = trx.on_error(err).await?;
+                    }
+                    Err(err) => return Err(BoxError::from(err)),
+                }
+            }
+            let last = last.expect("the retry arm records the error before exhausting the budget");
+            Err(BoxError::from(RetryBudgetExhausted::new("scan_page", last)))
         }
 
         /// Apply `batch` atomically — the commit point.

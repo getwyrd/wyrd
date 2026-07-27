@@ -406,6 +406,11 @@ pub mod deadline {
 /// (#262 / ADR-0011): a `scan(prefix)` returns the *complete* matching set observed
 /// at one snapshot, or `Err` — it **never** returns a silently truncated `Vec` (a
 /// truncated `inode:` scan corrupts GC's never-reclaim safety set — data loss).
+///
+/// The caller-facing `scan_page` (#634) drives the **same** cursor mechanics with
+/// [`chunk_size`] and [`after_chunk`]: one page is assembled from
+/// [`PAGE_SIZE`]-bounded reads inside one transaction, so a page's *bound* is the
+/// caller's `limit` while a single round trip stays a bounded round trip.
 pub mod paging {
     /// The shared per-`scan` ceiling and its fail-loud error, re-exported from the seam
     /// crate (`wyrd_traits`) where they now live (#516).
@@ -476,6 +481,81 @@ pub mod paging {
         }
     }
 
+    /// How many rows one internal range read of a **`scan_page`** asks for: what the
+    /// page still needs, bounded by [`PAGE_SIZE`] (#634).
+    ///
+    /// The bound is a **heap** bound, and it is this backend's alone to enforce.
+    /// tikv-client shards one `ScanRequest` per region and carries the request's
+    /// `limit` **unchanged** into every shard, collecting the replies before sorting
+    /// and truncating (`tikv-client-0.4.0/src/request/shard.rs`,
+    /// `.../src/transaction/buffer.rs`). A single read for the whole page therefore
+    /// materializes up to `regions × limit` pairs client-side — and `limit` may
+    /// legitimately be the store's whole cap, since the seam clamps a large `limit`
+    /// rather than refusing it. Asking in `PAGE_SIZE` steps is exactly what the
+    /// internal `scan` loop already does for the same reason (proposal 0015 Open
+    /// questions "Large-directory `scan` buffering"), so `scan_page` is a
+    /// re-exposure of that machinery rather than a second, unbounded one.
+    ///
+    /// Never `0`, whatever the arithmetic: a request for zero rows comes back empty,
+    /// and a fill loop that treated an empty reply as "continue" would never
+    /// terminate. (`got > limit` cannot happen — the loop stops at the bound — but
+    /// the floor is asserted rather than assumed, because a liveness bug here is an
+    /// unkillable task.)
+    #[must_use]
+    pub fn chunk_size(limit: usize, got: usize) -> u32 {
+        let wanted = limit.saturating_sub(got).min(PAGE_SIZE as usize).max(1);
+        u32::try_from(wanted).unwrap_or(PAGE_SIZE)
+    }
+
+    /// What the paged `scan_page` fill loop does after reading one internal chunk.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum PageFill {
+        /// The page has reached the caller's bound — stop. `page_cursor` turns this
+        /// into the resume cursor.
+        Full,
+        /// The chunk came back **short**, so the bounded range is exhausted at this
+        /// instant: the page is terminal.
+        Exhausted,
+        /// Continue filling this page from the next (inclusive) start key.
+        Continue(Vec<u8>),
+    }
+
+    /// Decide whether one `scan_page`'s fill loop continues, has filled the page, or
+    /// has exhausted the range — given the pairs accumulated so far (`got`), the
+    /// just-read chunk's length, how many rows that chunk `asked` for, and its
+    /// physical `last_key`.
+    ///
+    /// The two boundary rules are the ones this backend already agreed on for `scan`
+    /// ([`after_page`]), re-used rather than re-invented:
+    ///
+    /// * **Full first.** Fullness is [`wyrd_traits::page_is_full`] — the *same*
+    ///   predicate the seam derives `next` from, so a filled page always carries a
+    ///   cursor and a stopped-early page can never be labelled "prefix exhausted".
+    /// * **A short chunk means exhausted.** A reply with fewer rows than it asked
+    ///   for is the range's end (including an empty one, which also has no
+    ///   `last_key` to continue from) — never a reason to keep looping.
+    ///
+    /// Unlike [`after_page`] there is **no cap arm**: a `scan_page`'s bound arrives
+    /// already clamped to the store's cap by `wyrd_traits::page_limit`, so a page
+    /// cannot breach the cap and there is nothing to fail loud about. Escaping that
+    /// failure is the paginated primitive's entire purpose (#634).
+    #[must_use]
+    pub fn after_chunk(
+        got: usize,
+        chunk_len: usize,
+        asked: u32,
+        last_key: Option<&[u8]>,
+        limit: usize,
+    ) -> PageFill {
+        if wyrd_traits::page_is_full(got, limit) {
+            return PageFill::Full;
+        }
+        match last_key {
+            Some(k) if chunk_len >= asked as usize => PageFill::Continue(next_page_start(k)),
+            _ => PageFill::Exhausted,
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -488,6 +568,48 @@ pub mod paging {
             assert!(next.as_slice() > last.as_slice());
             // ...and nothing sorts between them, so the paging skips no key.
             assert_eq!(next, b"inode:42\x00");
+        }
+
+        #[test]
+        fn next_page_start_never_steps_over_a_key_that_extends_the_cursor() {
+            // The property the `scan_page` contract's exclusive cursor rests on for
+            // THIS backend (#634): the resume key is arithmetic here, so it must sort
+            // at or below **every** key that has the cursor as a prefix. The tempting
+            // wrong arithmetic — increment the cursor's last byte — is strictly after
+            // the cursor too, and silently skips every one of those keys, forever.
+            //
+            // Pinned here, in the crate's default-compiled paging module, because the
+            // shared conformance clause that would catch it runs against a real TiKV
+            // cluster and is therefore off-Check.
+            for cursor in [&b"inode:42"[..], b"retire:", b"", b"k\xff", b"\xff\xff"] {
+                let next = next_page_start(cursor);
+                for suffix in [&b"\x00"[..], b"\x00\x00", b"0", b"a", b"\xff"] {
+                    let mut extension = cursor.to_vec();
+                    extension.extend_from_slice(suffix);
+                    assert!(
+                        next.as_slice() <= extension.as_slice(),
+                        "a page resuming at {next:?} would step over {extension:?}, \
+                         which extends the cursor {cursor:?} and is therefore still \
+                         ahead of it — the silent skip pagination exists to prevent"
+                    );
+                }
+                // …and the naive alternative really does step over one, so the loop
+                // above is discriminating rather than trivially true.
+                if cursor.last().is_some_and(|byte| *byte < 0xff) {
+                    let mut incremented = cursor.to_vec();
+                    *incremented
+                        .last_mut()
+                        .expect("the guard above proves it is non-empty") += 1;
+                    let mut smallest_extension = cursor.to_vec();
+                    smallest_extension.push(0x00);
+                    assert!(
+                        incremented.as_slice() > smallest_extension.as_slice(),
+                        "incrementing the last byte of {cursor:?} gives {incremented:?}, \
+                         which is past {smallest_extension:?} — that is the skip this \
+                         test exists to forbid, so the assertions above are not vacuous"
+                    );
+                }
+            }
         }
 
         #[test]
@@ -528,6 +650,65 @@ pub mod paging {
             // the cap: an over-cap scan can never slip through as a "complete" short
             // page and silently truncate.
             assert_eq!(after_page(7, 2, Some(b"k"), 1024, 5), PageStep::CapExceeded);
+        }
+
+        #[test]
+        fn a_chunk_asks_for_what_the_page_still_needs_bounded_by_one_round_trip() {
+            // Small pages ask for exactly what is left…
+            assert_eq!(chunk_size(5, 0), 5);
+            assert_eq!(chunk_size(5, 3), 2);
+            // …and a page far larger than one round trip is filled in PAGE_SIZE steps,
+            // never asked for whole: one request carrying `limit` is sharded per region
+            // with that same limit, so the client would materialize `regions × limit`
+            // pairs to answer one page (#634, iteration-5 adversarial review).
+            assert_eq!(chunk_size(usize::MAX, 0), PAGE_SIZE);
+            assert_eq!(chunk_size(SCAN_CAP, 0), PAGE_SIZE);
+            assert_eq!(chunk_size(SCAN_CAP, SCAN_CAP - 3), 3);
+            // The floor: a request for zero rows returns nothing, and a loop that
+            // continued on it would spin forever.
+            assert_eq!(chunk_size(5, 5), 1);
+            assert_eq!(chunk_size(0, 0), 1);
+        }
+
+        #[test]
+        fn a_full_page_stops_the_fill_loop_and_a_short_chunk_means_exhausted() {
+            // Full: the page reached the caller's bound — stop, and `page_cursor`
+            // hands back the resume key.
+            assert_eq!(
+                after_chunk(4, 4, 4, Some(b"p:last"), 4),
+                PageFill::Full,
+                "a page at its bound is full, whatever the chunk did"
+            );
+            // Short chunk (it asked for more than it got): the bounded range ended.
+            assert_eq!(after_chunk(3, 3, 4, Some(b"p:z"), 8), PageFill::Exhausted);
+            // An empty chunk is short too, and has no key to continue from.
+            assert_eq!(after_chunk(0, 0, 4, None, 8), PageFill::Exhausted);
+            // A chunk that filled its request, on a page that is not full yet:
+            // continue past its last key — the cursor advance nothing sorts between.
+            assert_eq!(
+                after_chunk(4, 4, 4, Some(b"p:4"), 9),
+                PageFill::Continue(b"p:4\x00".to_vec())
+            );
+        }
+
+        #[test]
+        fn the_fill_loop_stops_on_the_same_rule_the_seam_emits_a_cursor_from() {
+            // The coupling that keeps a stopped-early page from being labelled
+            // "prefix exhausted" (`wyrd_traits::page_is_full`): whenever this loop
+            // reports `Full`, the seam's own cursor rule agrees there is more to
+            // resume from — and whenever it keeps filling, the seam would have said
+            // the page is short. Asserted over the boundary neighbourhood rather than
+            // trusted, because the two live in different crates.
+            for limit in [1usize, 2, 5] {
+                for got in 0..=limit + 1 {
+                    let full = after_chunk(got, 0, 4, Some(b"k"), limit) == PageFill::Full;
+                    assert_eq!(
+                        full,
+                        wyrd_traits::page_is_full(got, limit),
+                        "{got} pair(s) at limit {limit}"
+                    );
+                }
+            }
         }
 
         #[test]
@@ -587,12 +768,13 @@ mod store {
     use bytes::Bytes;
     use tikv_client::{BoundRange, CheckLevel, Transaction, TransactionClient, TransactionOptions};
     use wyrd_traits::{
-        BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, Result, WriteBatch,
+        page_cursor, page_limit, page_start, BoxError, CommitOutcome, CommitUnknownResult,
+        MetadataStore, PageStart, Result, ScanPage, WriteBatch,
     };
 
     use crate::deadline::{self, OperationTimedOut};
     use crate::keyspace;
-    use crate::paging::{self, PageStep, ScanCapExceeded};
+    use crate::paging::{self, PageFill, PageStep, ScanCapExceeded};
 
     /// Best-effort-roll back a still-active transaction before surfacing `err`.
     ///
@@ -852,6 +1034,9 @@ mod store {
         /// The deadline every operation runs under (#517) — the trait's "every
         /// operation terminates" clause, which tikv-client cannot supply for us.
         deadline: Duration,
+        /// Ceiling on the total results of one `scan`, and on one `scan_page`
+        /// page; see [`paging::SCAN_CAP`] and [`Self::with_scan_cap`].
+        scan_cap: usize,
     }
 
     impl TikvMetadataStore {
@@ -879,7 +1064,25 @@ mod store {
                 client,
                 namespace: Vec::new(),
                 deadline,
+                scan_cap: paging::SCAN_CAP,
             })
+        }
+
+        /// **Lower** this store's per-`scan` result ceiling below the default
+        /// [`paging::SCAN_CAP`], which also bounds one
+        /// [`scan_page`](MetadataStore::scan_page) page. Values above the default are
+        /// clamped to it — the cap is a correctness constraint (#262), not a knob a
+        /// caller may loosen — exactly as `FdbMetadataStore::with_scan_cap` and
+        /// `RedbMetadataStore::with_scan_cap` do.
+        ///
+        /// Lowering it is what makes both arms reachable by a test against a real
+        /// cluster: the shared suite's cap-escape clause (#634) needs a population
+        /// this `scan` refuses whole, and writing 2^20 keys into a throwaway TiKV on
+        /// every run is not that test.
+        #[must_use]
+        pub fn with_scan_cap(mut self, cap: usize) -> Self {
+            self.scan_cap = cap.min(paging::SCAN_CAP);
+            self
         }
 
         /// Override the operation deadline (#517). It cannot be switched off — `0` and
@@ -1010,7 +1213,7 @@ mod store {
                         page_len,
                         last_physical.as_deref(),
                         paging::PAGE_SIZE,
-                        paging::SCAN_CAP,
+                        self.scan_cap,
                     ) {
                         PageStep::CapExceeded => {
                             // Fail loud — return NO partial Vec (#262). Roll back first
@@ -1019,7 +1222,7 @@ mod store {
                             // it cannot mask the cap-breach error the caller must see.
                             let _ = txn.rollback().await;
                             return Err(BoxError::from(ScanCapExceeded {
-                                cap: paging::SCAN_CAP,
+                                cap: self.scan_cap,
                                 prefix: prefix.to_vec(),
                             }));
                         }
@@ -1029,6 +1232,126 @@ mod store {
                 }
                 txn.rollback().await?;
                 Ok(out)
+            })
+            .await
+        }
+
+        /// One bounded page of the `prefix` range, read from the **same** cursored
+        /// range primitive `scan` pages with — [`paging::next_page_start`] and the
+        /// short-chunk-means-exhausted boundary rule ([`paging::after_chunk`], the
+        /// sibling of [`paging::after_page`]) this backend already agreed on.
+        /// `scan_page` is a re-exposure of that machinery to the caller, not a new
+        /// mechanism, and it is deliberately **not** a slice of `scan`: that would
+        /// inherit the cap the method exists to escape (#634).
+        ///
+        /// TiKV stores keys byte-identically and returns a range in key order, so the
+        /// contract's raw byte-lexicographic order is the range read itself. The
+        /// cursor is exclusive by construction — `next_page_start` is the smallest key
+        /// strictly greater than `after`, so nothing sorts between them and the page
+        /// can neither re-yield the cursor nor skip past a key.
+        ///
+        /// The page is filled by [`paging::PAGE_SIZE`]-bounded reads, not by one read
+        /// for the whole `limit`: tikv-client carries a request's `limit` unchanged
+        /// into **every** region's shard and merges the replies, so a single read for
+        /// a large page materializes up to `regions × limit` pairs client-side — and
+        /// `limit` may legitimately be the store's whole cap, since the seam clamps a
+        /// large `limit` rather than refusing it. That is the heap bound `PAGE_SIZE`
+        /// exists to hold for `scan`, and it holds here for the same reason
+        /// ([`paging::chunk_size`]).
+        ///
+        /// One page is one transaction (one read timestamp) — every chunk of the fill
+        /// loop reads inside it. Across pages the walk deliberately does **not** hold
+        /// a snapshot: the contract requires no snapshot isolation of any backend,
+        /// only that a key present throughout the walk comes back exactly once — which
+        /// the key-ordered exclusive cursor gives. Holding one transaction open across
+        /// a caller-paced walk would risk `1007`-class transaction-too-old failures
+        /// instead.
+        ///
+        /// # Errors
+        ///
+        /// [`wyrd_traits::ZeroPageLimit`] when the page bound resolves to zero
+        /// (`limit == 0`, or a store configured `with_scan_cap(0)`), the deadline's
+        /// `OperationTimedOut` (#517), or the driver's own fault.
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<ScanPage> {
+            // Resolved before the deadline is armed, and `>= 1` by construction: a
+            // page bound of zero is refused rather than answered (an empty page is
+            // either a false "exhausted" or a non-terminal answer with no progress).
+            let limit = page_limit(limit, self.scan_cap, prefix)?;
+            let start = self.physical(prefix);
+            let upper = keyspace::prefix_upper_bound(&start);
+            // The exclusive cursor, resolved by the seam's shared rule so every
+            // backend answers it identically: inside the prefix it is the smallest
+            // key strictly greater than `after` (`next_page_start`, which nothing
+            // sorts between); below the prefix it falls back to the prefix's own
+            // start, so a cursor from another namespace does not make this page an
+            // empty, falsely-terminal one; and at or past the prefix's exclusive end
+            // it is a terminal page returned here — before the deadline is armed and
+            // before a `BoundRange` exists. That last arm is load-bearing on THIS
+            // backend specifically: `cursor..end` with `cursor > end` reaches
+            // `Buffer::scan_and_fetch`, which resolves it against the transaction
+            // buffer with `BTreeMap::range`
+            // (`tikv-client-0.4.0/src/transaction/buffer.rs:129`) — a panic on a
+            // start past its end, client-side, before any RPC. A metadata read that
+            // panics is a failure mode no caller can handle, and the contract's
+            // answer to this cursor is an ordinary empty terminal page.
+            let first = match page_start(prefix, after) {
+                PageStart::After(key) => paging::next_page_start(&self.physical(key)),
+                PageStart::Prefix => start,
+                PageStart::PastPrefix => return Ok((Vec::new(), None)),
+            };
+            under_deadline("scan_page", self.deadline, async {
+                // ONE transaction (one start timestamp) across every chunk of this
+                // page — the same #261 consistent cut `scan` holds across its pages.
+                let mut txn = self.begin().await?;
+                let mut items: Vec<(Vec<u8>, Bytes)> = Vec::new();
+                let mut cursor = first;
+                loop {
+                    // What the page still needs, bounded by one round trip.
+                    let asked = paging::chunk_size(limit, items.len());
+                    let range: BoundRange = match &upper {
+                        Some(end) => (cursor.clone()..end.clone()).into(),
+                        None => (cursor.clone()..).into(),
+                    };
+                    let chunk: Vec<_> = match txn.scan(range, asked).await {
+                        Ok(chunk) => chunk.collect(),
+                        Err(e) => return Err(rollback_then(&mut txn, e).await),
+                    };
+                    let chunk_len = chunk.len();
+                    let mut last_physical: Option<Vec<u8>> = None;
+                    for pair in chunk {
+                        let physical: Vec<u8> = pair.0.into();
+                        if let Some(logical) = keyspace::logical(&self.namespace, &physical) {
+                            items.push((logical, Bytes::from(pair.1)));
+                        }
+                        last_physical = Some(physical);
+                    }
+                    // Full => the caller's bound is reached (and `page_cursor` below,
+                    // which uses the SAME fullness rule, hands back the resume key);
+                    // a short chunk => the bounded range is exhausted at this instant.
+                    match paging::after_chunk(
+                        items.len(),
+                        chunk_len,
+                        asked,
+                        last_physical.as_deref(),
+                        limit,
+                    ) {
+                        PageFill::Continue(next) => cursor = next,
+                        PageFill::Full | PageFill::Exhausted => break,
+                    }
+                }
+                txn.rollback().await?;
+                // A page that stopped short of its bound has exhausted the prefix, so
+                // it is terminal; a full one carries its last key. Every key of this
+                // bounded range carries the namespace by construction (the range ends
+                // at the prefix's upper bound), so `items.len()` *is* the number of
+                // rows consumed.
+                let next = page_cursor(&items, limit);
+                Ok((items, next))
             })
             .await
         }
