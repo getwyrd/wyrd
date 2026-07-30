@@ -46,7 +46,9 @@
 
 use std::collections::HashMap;
 
-use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
+use wyrd_core::metadata::{
+    self, ChunkHome, EcScheme, HomedChunk, InodeId, InodeRecord, InodeState,
+};
 use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
 use wyrd_core::write::encode_ec_fragment;
 use wyrd_core::{erasure, repair};
@@ -111,7 +113,10 @@ pub fn repair_priority(survivors: usize, k: usize) -> i64 {
 struct RepairPlan {
     inode_id: InodeId,
     prior: InodeRecord,
-    chunk_index: usize,
+    /// The record that carries this chunk — the inode root for a flat map, the chunk's
+    /// `seg:` record for a segmented one (proposal 0016 decision 7(f)). The repoint CAS
+    /// [`metadata::repoint_chunk`] builds targets exactly that record.
+    home: ChunkHome,
     chunk_id: ChunkId,
     k: usize,
     m: usize,
@@ -179,6 +184,9 @@ pub(crate) async fn reconcile(
     // rebuild this pass — off the repairable-backlog gauge so a never-completable repair does
     // not floor the day-one "returns to zero" signal.
     let mut repair_blocked = 0usize;
+    // Obligations this pass could not even assess, because a committed object's chunk map
+    // could not be read: neither repairable nor lost, and never drained.
+    let mut unresolvable = 0usize;
     for chunk in queue {
         match assess(ctx, &stores, chunk).await? {
             Assessment::Repairable(plan) => {
@@ -219,6 +227,13 @@ pub(crate) async fn reconcile(
             // BLOCKING #1). `emit_needs_human` carries the `reconstruction_malformed_placement`
             // counter so the corruption is not lost.
             Assessment::Malformed => emit_needs_human(chunk),
+            // The lookup could not read every committed object, so this chunk's absence
+            // from the ones it could read proves nothing. Kept OFF the repairable-backlog
+            // gauge (nothing was assessed, so nothing can be repaired to clear it) and off
+            // the data-loss signal (no fragment was found missing), raised on its own
+            // NEEDS-HUMAN level, and the obligation stays queued for the pass that follows
+            // the repair of the damaged record.
+            Assessment::Unresolvable => unresolvable += 1,
         }
     }
 
@@ -251,6 +266,7 @@ pub(crate) async fn reconcile(
     // and return to zero when it clears — the same gauge discipline as the backlog count.
     emit_unreachable(unreachable_degraded);
     emit_repair_blocked(repair_blocked);
+    emit_unresolvable(unresolvable);
     for plan in &plans {
         emit_repaired(plan.chunk_id, plan.missing.len(), now_millis);
     }
@@ -308,6 +324,13 @@ enum Assessment {
     /// over its fabricated identity tail is forbidden (ADR-0040 decision 4). Skip the
     /// chunk and flag it NEEDS-HUMAN; the obligation stays queued.
     Malformed,
+    /// The chunk was not found in any object this pass could **read**, and at least one
+    /// object could not be read ([`Found::Unresolvable`]). Not a deletion and not a loss:
+    /// the chunk may live in exactly the map that is unreadable. Skip the chunk, flag it
+    /// NEEDS-HUMAN, and **leave the obligation queued** — draining it would silently
+    /// retire the repair of a chunk that is still under-replicated, which is the one
+    /// outcome the queue exists to prevent.
+    Unresolvable,
 }
 
 /// Resolve `chunk` to its committed chunk map, then gather and **verify** its surviving
@@ -317,12 +340,16 @@ async fn assess(
     stores: &HashMap<DServerId, &dyn ChunkStore>,
     chunk: ChunkId,
 ) -> Result<Assessment> {
-    let Some((inode_id, prior, chunk_index)) = find_chunk(ctx.meta, chunk).await? else {
+    let (inode_id, prior, homed) = match find_chunk(ctx.meta, chunk).await? {
+        Found::Chunk(found) => *found,
         // The chunk is referenced by no committed chunk map — it was deleted out from
         // under the obligation. Nothing to repair.
-        return Ok(Assessment::Drain);
+        Found::Absent => return Ok(Assessment::Drain),
+        // "Not found" while an object could not be read is NOT "deleted": the chunk may
+        // live in the map that could not be read. Keep the obligation.
+        Found::Unresolvable => return Ok(Assessment::Unresolvable),
     };
-    let chunk_ref = prior.chunk_map[chunk_index].clone();
+    let chunk_ref = homed.chunk.clone();
 
     // Classify the committed placement BEFORE any scheme-specific handling
     // (ADR-0040 decision 4, "strict maintenance"). A MALFORMED vector (non-empty,
@@ -440,7 +467,8 @@ async fn assess(
     Ok(Assessment::Repairable(Box::new(RepairPlan {
         inode_id,
         prior,
-        chunk_index,
+        home: homed.home,
+        len: chunk_ref.len as usize,
         chunk_id: chunk,
         k,
         m,
@@ -448,7 +476,6 @@ async fn assess(
         survivor_domains,
         missing,
         placement,
-        len: chunk_ref.len as usize,
     })))
 }
 
@@ -566,22 +593,10 @@ async fn repair_chunk(
     // placement record, drains the obligation, and orphans the displaced fragments. The
     // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
     // racing writer / superseded custodian loses here rather than corrupting the record.
-    let mut next_chunk_map = plan.prior.chunk_map.clone();
-    next_chunk_map[plan.chunk_index].placement = new_placement;
-    let next = InodeRecord {
-        size: plan.prior.size,
-        chunk_map: next_chunk_map,
-        state: InodeState::Committed,
-        version: plan.prior.version + 1,
-        // Reconstruction rebuilds the SAME content, so it PRESERVES the object metadata
-        // (ADR-0047): a repair commit must not move `Last-Modified` or drop the content
-        // type.
-        ..plan.prior.clone()
-    };
-    let inode_key = metadata::inode_key(plan.inode_id);
-    let mut batch = WriteBatch::new()
-        .require(inode_key.clone(), metadata::encode(&plan.prior))
-        .put(inode_key, metadata::encode(&next))
+    // The repoint carries the new PLACEMENT only: the chunk's id, EC scheme and length
+    // come from the record the CAS is preconditioned on, so a repair can move fragments
+    // and never republish different content under a committed chunk id.
+    let mut batch = metadata::repoint_chunk(plan.inode_id, &plan.prior, &plan.home, new_placement)?
         .delete(repair::repair_key(chunk_id));
     for (dserver, frag) in &displaced {
         batch = batch.put(
@@ -598,28 +613,92 @@ async fn repair_chunk(
     }
 }
 
-/// Find the committed inode whose chunk map references `chunk`, returning its id, the
-/// full prior record (for the CAS), and the chunk's index within the map.
-async fn find_chunk(
-    meta: &dyn MetadataStore,
-    chunk: ChunkId,
-) -> Result<Option<(InodeId, InodeRecord, usize)>> {
+/// What a store-wide lookup for one chunk found.
+enum Found {
+    /// The chunk's committed home: the inode id, the full prior record (for the CAS), and
+    /// the record that **carries** the chunk.
+    Chunk(Box<(InodeId, InodeRecord, HomedChunk)>),
+    /// Every committed object was read, and none of them references the chunk: it was
+    /// deleted out from under the obligation.
+    Absent,
+    /// The chunk was not found — but at least one committed object could not be **read**,
+    /// so "not found" is a statement about the objects this pass could read, not about the
+    /// store. The obligation must survive: the chunk may well live in the record that
+    /// could not be read, and draining it would silently retire a repair for a chunk that
+    /// is still under-replicated (`AGENTS.md:175-177` — an unsupported entry is an error
+    /// or a queued obligation, never a silent skip).
+    Unresolvable,
+}
+
+/// Find the committed inode whose chunk map references `chunk`.
+///
+/// The map is resolved through the shared resolver (proposal 0016 decision 7(e)), so a
+/// chunk that lives in a **segmented** map's `seg:` record is found exactly as an inline
+/// one is — a repair obligation for it is never dropped as "referenced by no committed
+/// chunk map", which is what would silently drain the obligation and leave the chunk
+/// under-replicated forever.
+///
+/// An object whose map cannot be read is **contained** (`crate::resolve::contain`) and the
+/// scan continues: propagating would end this lookup at the damaged record and starve
+/// every queued repair for a healthy chunk that sorts after it — one damaged object
+/// stopping repair for the whole store. The incompleteness is not swallowed either; it
+/// comes back as [`Found::Unresolvable`], which keeps the obligation queued.
+async fn find_chunk(meta: &dyn MetadataStore, chunk: ChunkId) -> Result<Found> {
+    let mut unresolvable = false;
     for (key, value) in meta.scan(b"inode:").await? {
-        let record: InodeRecord = metadata::decode(&value)?;
+        let record: InodeRecord = match crate::resolve::classify_root(&key, &value)? {
+            crate::resolve::Root::Decoded(record) => record,
+            // Attributed, and NOT a blind spot for this lookup: only a **committed** map
+            // can reference the chunk (the skip below), so an uncommitted record this
+            // walk could not read cannot be where it lives. Treating one as a blind spot
+            // would answer [`Found::Unresolvable`] for every chunk in the store, keeping
+            // every genuinely absent obligation queued for as long as some unrelated
+            // uncommitted record stayed damaged.
+            crate::resolve::Root::UncommittedUnreadable(fault) => {
+                fault.attribute_uncommitted(crate::resolve::RECONSTRUCTION);
+                continue;
+            }
+            crate::resolve::Root::Unresolvable(fault) => {
+                fault.attribute(crate::resolve::RECONSTRUCTION);
+                unresolvable = true;
+                continue;
+            }
+        };
         if record.state != InodeState::Committed {
             continue;
         }
-        if let Some(index) = record
-            .chunk_map
-            .iter()
-            .position(|c: &ChunkRef| c.id == chunk)
-        {
+        // Through the shared maintenance resolver: a generation retired under the pass is
+        // re-resolved against the LIVE root, and that root — not this loop's snapshot —
+        // is the one the repoint CAS must name. `None` means no live committed
+        // generation, the same condition the `state` filter above skips.
+        let homed = match crate::resolve::contain(
+            &key,
+            crate::resolve::homes_of(meta, &key, &record).await,
+        )? {
+            crate::resolve::Contained::Resolved(homed) => homed,
+            crate::resolve::Contained::Unresolvable(fault) => {
+                fault.attribute(crate::resolve::RECONSTRUCTION);
+                unresolvable = true;
+                continue;
+            }
+        };
+        let Some((record, homed)) = homed else {
+            continue;
+        };
+        if let Some(found) = homed.into_iter().find(|h| h.chunk.id == chunk) {
             if let Some(inode_id) = parse_inode_key(&key) {
-                return Ok(Some((inode_id, record, index)));
+                return Ok(Found::Chunk(Box::new((inode_id, record, found))));
             }
         }
     }
-    Ok(None)
+    // Order matters: a chunk FOUND in a readable object is answered above whatever else
+    // the store holds — one damaged object must not block a repair it has nothing to do
+    // with. Only when the chunk was not found does the blind spot decide the answer.
+    Ok(if unresolvable {
+        Found::Unresolvable
+    } else {
+        Found::Absent
+    })
 }
 
 fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
@@ -681,6 +760,17 @@ fn emit_unreachable(count: usize) {
 /// MUST-FIX). It clears when capacity (a free distinct domain) returns.
 fn emit_repair_blocked(count: usize) {
     tracing::warn!(gauge.reconstruction_repair_blocked = count as u64);
+}
+
+/// Emit the **unassessable obligation count**: queued repairs this pass could not judge,
+/// because a committed object's chunk map could not be read and the chunk may live in it
+/// ([`Assessment::Unresolvable`]). A **distinct level** again — off the repairable backlog
+/// (nothing was assessed, so no repair can clear it) and off the data-loss counter (no
+/// fragment was found missing) — that rises while a record is damaged and returns to zero
+/// when it is repaired. The obligations themselves stay queued; the objects that caused the
+/// blind spot are named individually on the audit seam by [`crate::resolve`].
+fn emit_unresolvable(count: usize) {
+    tracing::warn!(gauge.reconstruction_unresolvable = count as u64);
 }
 
 /// Emit a **dispatched reconstruction** plus the **time-to-repair** sample (`0005:330`):

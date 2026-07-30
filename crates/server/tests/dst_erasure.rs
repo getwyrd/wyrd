@@ -122,14 +122,20 @@ fn loss_survival(seed: u64) {
         let data = payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        for chunk in &inode.chunk_map {
+        for chunk in inode.chunk_map.as_flat().unwrap() {
             let count = (sim.gen::<u8>() as usize) % (M as usize + 1); // 0..=m
             for index in choose_indices(&mut sim, N, count) {
                 delete(dir.path(), chunk.id, index);
             }
         }
         assert_eq!(
-            read::read_object_from(&chunks, &inode).await.unwrap(),
+            read::read_object_chunks(
+                &chunks,
+                inode.chunk_map.as_flat().expect("a flat snapshot"),
+                inode.size,
+            )
+            .await
+            .unwrap(),
             data,
             "seed {seed}: <= m losses per chunk must reconstruct"
         );
@@ -145,11 +151,17 @@ fn loss_beyond_m_is_clean_error(seed: u64) {
         let data = nonempty_payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0].clone();
+        let chunk = inode.chunk_map.as_flat().unwrap()[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             delete(dir.path(), chunk.id, index);
         }
-        let err = read::read_object_from(&chunks, &inode).await.unwrap_err();
+        let err = read::read_object_chunks(
+            &chunks,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(
                 err.downcast_ref::<read::ReadError>(),
@@ -169,14 +181,20 @@ fn corruption_excluded(seed: u64) {
         let data = payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        for chunk in &inode.chunk_map {
+        for chunk in inode.chunk_map.as_flat().unwrap() {
             let count = (sim.gen::<u8>() as usize) % (M as usize + 1); // 0..=m
             for index in choose_indices(&mut sim, N, count) {
                 corrupt(dir.path(), chunk.id, index);
             }
         }
         assert_eq!(
-            read::read_object_from(&chunks, &inode).await.unwrap(),
+            read::read_object_chunks(
+                &chunks,
+                inode.chunk_map.as_flat().expect("a flat snapshot"),
+                inode.size,
+            )
+            .await
+            .unwrap(),
             data,
             "seed {seed}: <= m corruptions per chunk must reconstruct around them"
         );
@@ -192,11 +210,17 @@ fn corruption_beyond_m_is_clean_error(seed: u64) {
         let data = nonempty_payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0].clone();
+        let chunk = inode.chunk_map.as_flat().unwrap()[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             corrupt(dir.path(), chunk.id, index);
         }
-        let err = read::read_object_from(&chunks, &inode).await.unwrap_err();
+        let err = read::read_object_chunks(
+            &chunks,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(
                 err.downcast_ref::<read::ReadError>(),
@@ -228,7 +252,8 @@ fn mixed_era_read(seed: u64) {
                 .chunk_refs()
                 .into_iter()
                 .chain(plan_rs.chunk_refs())
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
@@ -237,7 +262,13 @@ fn mixed_era_read(seed: u64) {
         let mut expected = part_none.clone();
         expected.extend_from_slice(&part_rs);
         assert_eq!(
-            read::read_object_from(&chunks, &inode).await.unwrap(),
+            read::read_object_chunks(
+                &chunks,
+                inode.chunk_map.as_flat().expect("a flat snapshot"),
+                inode.size,
+            )
+            .await
+            .unwrap(),
             expected,
             "seed {seed}: mixed-era chunk map reads byte-identical"
         );
@@ -251,7 +282,7 @@ fn mixed_era_read(seed: u64) {
 // path (`write.rs:171`), so it never exercises an empty/short vector (the #292 audit's
 // gap). This property commits the genuine pre-M3 shape directly — `ChunkRef.placement:
 // vec![]` (`core/src/metadata.rs:93`) — and proves TWO independent consumers resolve
-// it identically: the READ path (`read::read_object_from`, which calls
+// it identically: the READ path (`read::read_object_chunks`, which calls
 // `ChunkRef::placed_dserver` via `read.rs:103-105`) and a MAINTENANCE-style resolution
 // (`maintenance_resolved` below, mirroring how GC / scrub / reconstruction expand a
 // chunk map: `crates/custodian/src/gc.rs:197-204`, `reconstruction.rs:230-232`,
@@ -301,7 +332,7 @@ fn empty_placement_resolves_identically(seed: u64) {
         }
         let inode = InodeRecord {
             size: plan.size,
-            chunk_map,
+            chunk_map: chunk_map.into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
@@ -309,7 +340,13 @@ fn empty_placement_resolves_identically(seed: u64) {
 
         // READ resolves every fragment via the identity-placement fallback.
         assert_eq!(
-            read::read_object_from(&chunks, &inode).await.unwrap(),
+            read::read_object_chunks(
+                &chunks,
+                inode.chunk_map.as_flat().expect("a flat snapshot"),
+                inode.size,
+            )
+            .await
+            .unwrap(),
             data,
             "seed {seed}: empty-placement chunk map reads byte-identical via identity \
              fallback"
@@ -317,7 +354,7 @@ fn empty_placement_resolves_identically(seed: u64) {
 
         // MAINTENANCE resolves the SAME closure: every one of the chunk's fragments,
         // each at its identity D server — never the raw vector's zero entries.
-        for chunk_ref in &inode.chunk_map {
+        for chunk_ref in inode.chunk_map.as_flat().unwrap() {
             let resolved = maintenance_resolved(chunk_ref);
             assert_eq!(
                 resolved.len(),

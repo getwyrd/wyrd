@@ -207,7 +207,7 @@ async fn seed_committed(
 ) -> InodeRecord {
     let prior = InodeRecord {
         size: 0,
-        chunk_map: vec![],
+        chunk_map: vec![].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -244,7 +244,7 @@ async fn backfills_identity_placement_for_an_empty_placement_committed_chunk() {
     let chunk = rs_chunk(0xC0, 2, 1, vec![]);
     let before = seed_committed(&meta, 1, vec![chunk], 5).await;
     assert!(
-        before.chunk_map[0].placement.is_empty(),
+        before.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
         "pre-M3 shape: the committed record carries an EMPTY placement"
     );
     assert_eq!(before.version, 2);
@@ -263,10 +263,15 @@ async fn backfills_identity_placement_for_an_empty_placement_committed_chunk() {
         "exactly one version-conditional commit bumped the version"
     );
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "full-length identity placement: placement.len() == fragment_count() and \
          placement[i] == i for all i"
+    );
+    assert_eq!(
+        after.size, before.size,
+        "backfill materializes a placement; it never restates the object's extent — a \
+         rewritten size would make every reader's framing disagree with its bytes"
     );
 }
 
@@ -302,7 +307,9 @@ async fn a_racing_writer_wins_the_cas_and_backfill_retries_on_a_later_pass() {
         "the racing writer's commit landed (version 2 -> 3)"
     );
     assert!(
-        after_race.chunk_map[0].placement.is_empty(),
+        after_race.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .is_empty(),
         "placement is still EMPTY — the lost CAS prevented the clobber, backfill did \
          not (and could not) write over the racing writer's record"
     );
@@ -316,7 +323,10 @@ async fn a_racing_writer_wins_the_cas_and_backfill_retries_on_a_later_pass() {
     );
     let after = read_inode(&racing, 1).await;
     assert_eq!(after.version, 4);
-    assert_eq!(after.chunk_map[0].placement, vec![0, 1, 2]);
+    assert_eq!(
+        after.chunk_map.as_flat().unwrap()[0].placement,
+        vec![0, 1, 2]
+    );
 }
 
 // ---- (b) malformed placement is never rewritten --------------------------------------
@@ -344,7 +354,7 @@ async fn malformed_placement_is_never_rewritten() {
         "no version-conditional commit landed for the malformed chunk"
     );
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![7],
         "malformed placement left EXACTLY as committed — never rewritten (#348 posture)"
     );
@@ -374,7 +384,10 @@ async fn already_explicit_full_length_placement_is_left_untouched() {
         after.version, before.version,
         "no spurious commit / version bump"
     );
-    assert_eq!(after.chunk_map[0].placement, vec![5, 6, 7]);
+    assert_eq!(
+        after.chunk_map.as_flat().unwrap()[0].placement,
+        vec![5, 6, 7]
+    );
 }
 
 // ---- (d) ADR-0047: a backfill PRESERVES the object metadata (repair, not republish) ----
@@ -397,7 +410,7 @@ async fn backfill_preserves_object_metadata_while_filling_placement() {
     let chunk = rs_chunk(0xD0, 2, 1, vec![]); // ReedSolomon{k:2,m:1} -> fragment_count() == 3
     let record = InodeRecord {
         size: 5,
-        chunk_map: vec![chunk],
+        chunk_map: vec![chunk].into(),
         state: InodeState::Committed,
         version: 2,
         etag: Some(etag.clone()),
@@ -417,7 +430,7 @@ async fn backfill_preserves_object_metadata_while_filling_placement() {
 
     let after = read_inode(&meta, 1).await;
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the empty placement was filled to the full-length identity vector"
     );
@@ -436,6 +449,271 @@ async fn backfill_preserves_object_metadata_while_filling_placement() {
         Some(modified),
         "backfill must NOT move Last-Modified"
     );
+}
+
+// ---- the resolve that RESTARTED: every decision follows the live generation ---------
+
+/// A store whose `inode:` **scan** answers from an older cut than its `get`s do — the
+/// interleaving where a publication lands between a maintenance pass's scan and its
+/// resolve. `MetadataStore::scan` promises one consistent cut, not the latest one, so a
+/// later `get` legitimately sees a newer record (`crates/traits/src/lib.rs:770-775`).
+struct StaleScan<'a> {
+    inner: &'a MemMeta,
+    stale: Vec<(Vec<u8>, Bytes)>,
+}
+
+#[async_trait]
+impl MetadataStore for StaleScan<'_> {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        if prefix == b"inode:" {
+            return Ok(self.stale.clone());
+        }
+        self.inner.scan(prefix).await
+    }
+
+    // The required paginated read (#634): a test double needs *a* body, not a
+    // backend's — the dev-only testkit helper pages over this store's own `scan`.
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        self.inner.commit(batch).await
+    }
+}
+
+/// **A pass decides on the generation it RESOLVED, never on the snapshot it scanned.**
+///
+/// The shared resolver is total against a generation retired mid-pass: it re-reads the
+/// root and resolves the one that replaced it (proposal 0016 decision 7(h)). The
+/// replacement can have a different **shape** — here a segmented generation is superseded
+/// by a flat one — and a pass that then consulted its own stale snapshot would take the
+/// segmented skip: it would report a perfectly fillable map as **unfillable**, failing the
+/// whole pass, and the CAS it declined would have been against bytes no longer in the
+/// store. The record that carries the chunks is the record that gets classified, skipped
+/// and compare-and-swapped.
+#[tokio::test]
+async fn backfill_follows_the_live_generation_when_the_resolve_restarts() {
+    let meta = MemMeta::default();
+    // The LIVE generation: flat, committed, and carrying the empty placement this pass
+    // exists to fill.
+    let live = InodeRecord {
+        size: 5,
+        chunk_map: vec![rs_chunk(0xF0, 2, 1, vec![])].into(),
+        state: InodeState::Committed,
+        version: 3,
+        ..Default::default()
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(1), metadata::encode(&live)))
+        .await
+        .unwrap();
+
+    // The stale cut the scan hands back: the SEGMENTED generation that was superseded,
+    // whose `seg:` records the retirement has already drained.
+    let group = metadata::SegmentGroup::new("0123456789abcdef0123456789abcdef", 7).unwrap();
+    let stale = InodeRecord {
+        size: 5,
+        chunk_map: metadata::ChunkMap::Segmented(
+            metadata::SegmentedMap::new(
+                group,
+                vec![metadata::SegmentRef {
+                    index: 0,
+                    byte_offset: 0,
+                    byte_len: 5,
+                }],
+            )
+            .unwrap(),
+        ),
+        state: InodeState::Committed,
+        version: 2,
+        ..Default::default()
+    };
+    let store = StaleScan {
+        inner: &meta,
+        stale: vec![(metadata::inode_key(1), metadata::encode(&stale))],
+    };
+
+    let ctx = BackfillContext { meta: &store };
+    assert_eq!(
+        reconcile(&ctx).await.unwrap(),
+        Reconciled::Changed,
+        "the live generation is flat and fillable — a pass that judged the stale \
+         segmented snapshot would fail the whole pass as unfillable instead",
+    );
+    let after = read_inode(&meta, 1).await;
+    assert_eq!(
+        after.chunk_map.as_flat().unwrap()[0].placement,
+        vec![0, 1, 2],
+        "…and the fill landed on the generation the resolve returned",
+    );
+    assert_eq!(
+        after.version,
+        live.version + 1,
+        "one version-conditional commit, against the LIVE prior",
+    );
+}
+
+// ---- containment: one unreadable record does not stop the drain ---------------------
+
+/// **A record this pass cannot read is contained, attributed, and does not stop the
+/// store's drain.**
+///
+/// `reconcile` walks every committed record. A segmented root whose generation is
+/// incomplete cannot be resolved by anyone, and propagating that fault out of the walk
+/// would end the pass at the damaged record: every healthy record after it stays
+/// un-drained, and the population gauge an operator watches the drain by is never emitted.
+/// So the fault is contained per object and raised once, after the sweep — the typed
+/// assertion leg `segmented_map_consumers.rs` cannot make, since that file may not name
+/// the types this slice adds.
+#[tokio::test]
+async fn an_unreadable_record_does_not_stop_the_drain_and_is_reported_afterwards() {
+    let meta = MemMeta::default();
+    // A committed segmented root whose one segment record was never written: readable as a
+    // record, unresolvable as a map.
+    let group = metadata::SegmentGroup::new("fedcba9876543210fedcba9876543210", 11).unwrap();
+    let damaged = InodeRecord {
+        size: 5,
+        chunk_map: metadata::ChunkMap::Segmented(
+            metadata::SegmentedMap::new(
+                group,
+                vec![metadata::SegmentRef {
+                    index: 0,
+                    byte_offset: 0,
+                    byte_len: 5,
+                }],
+            )
+            .unwrap(),
+        ),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(1), metadata::encode(&damaged)))
+        .await
+        .unwrap();
+    // …and a healthy pre-M3 record that this pass exists to fill, seeded AFTER it so a
+    // walk that stopped at the damaged one would leave it empty.
+    seed_committed(&meta, 2, vec![rs_chunk(0xC0, 2, 1, vec![])], 5).await;
+
+    let ctx = BackfillContext { meta: &meta };
+    let err = reconcile(&ctx)
+        .await
+        .expect_err("a record the pass could not read may not be reported as swept");
+
+    // The healthy record was drained anyway — the containment's whole point.
+    assert_eq!(
+        read_inode(&meta, 2).await.chunk_map.as_flat().unwrap()[0].placement,
+        vec![0, 1, 2],
+        "one unreadable record stopped the drain of a healthy record in the same store",
+    );
+    // …and the damaged one was left exactly as it was: nothing is rewritten on the way
+    // past it.
+    assert_eq!(
+        meta.get(&metadata::inode_key(1)).await.unwrap().unwrap(),
+        metadata::encode(&damaged),
+    );
+    // The report is typed and attributes the object, so an operator has a record to
+    // repair rather than a count to interpret.
+    let reported = err
+        .downcast_ref::<wyrd_custodian::backfill::UnresolvableChunkMaps>()
+        .expect("the population is reported as its own type, not as a decode error");
+    assert_eq!(reported.records, 1);
+    assert_eq!(reported.first, "inode:1");
+}
+
+/// **An UNCOMMITTED record this pass could not read is not a member of its population,
+/// and may not fail the pass.**
+///
+/// `reconcile` fills committed records; everything else is skipped by the `state` filter.
+/// But a root whose bytes do not decode at all fails *before* that filter, and treating it
+/// as a blocker there raises [`UnresolvableChunkMaps`] over an object with nothing to
+/// fill — permanently, on every future pass over that store, so a healthy record
+/// committed after it never reads as drained either. So the state is taken from the bytes
+/// that are still readable (`metadata::inode_state_hint`, via the shared
+/// `resolve::classify_root`) BEFORE the fault is recorded.
+///
+/// The control in the same test is the *committed* spelling of the same bytes, which MUST
+/// still fail the pass: a fix that bought precision by dropping the containment would pass
+/// this test's first half and fail here. Mirrors
+/// `gc.rs:an_unreadable_uncommitted_record_does_not_freeze_the_fleets_reclamation`.
+#[tokio::test]
+async fn an_unreadable_uncommitted_record_does_not_fail_the_pass() {
+    /// A segmented root whose table spans 16 bytes while `size` says 99: structurally
+    /// invalid, so `metadata::decode` refuses it — the record class this pass meets before
+    /// any `state` filter can run.
+    fn damaged_root(state: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"size":99,"chunk_map":{{"group":{{"nonce":"0123456789abcdef0123456789abcdef","epoch":7}},"segment_count":1,"segments":[{{"index":0,"byte_offset":0,"byte_len":16}}]}},"state":"{state}","version":1}}"#
+        ))
+    }
+
+    for (state, fails, why) in [
+        (
+            "Pending",
+            false,
+            "an uncommitted record has nothing to fill, so the pass over every other \
+             record is complete and reports as such",
+        ),
+        (
+            "Committed",
+            true,
+            "a COMMITTED record whose map cannot be read has an UNKNOWN empty-placement \
+             count, so the pass may not report a swept store",
+        ),
+    ] {
+        let meta = MemMeta::default();
+        let key = metadata::inode_key(1);
+        meta.commit(WriteBatch::new().put(key.clone(), damaged_root(state)))
+            .await
+            .unwrap();
+        // The fixture carries the fault it is about: the record really is in the store and
+        // really does not decode.
+        assert!(
+            metadata::decode::<InodeRecord>(&meta.get(&key).await.unwrap().unwrap()).is_err(),
+            "fixture: the seeded {state} record must genuinely fail to decode",
+        );
+        // …and a healthy pre-M3 record that this pass exists to fill, seeded AFTER it.
+        seed_committed(&meta, 2, vec![rs_chunk(0xC0, 2, 1, vec![])], 5).await;
+
+        let ctx = BackfillContext { meta: &meta };
+        let outcome = reconcile(&ctx).await;
+
+        // The positive observable, either way: the healthy record is filled. Containment
+        // is about what the pass REPORTS, never about what it stops doing.
+        assert_eq!(
+            read_inode(&meta, 2).await.chunk_map.as_flat().unwrap()[0].placement,
+            vec![0, 1, 2],
+            "{state}: the healthy record is drained whatever the damaged one's state",
+        );
+        if fails {
+            let err = outcome.expect_err(why);
+            let reported = err
+                .downcast_ref::<wyrd_custodian::backfill::UnresolvableChunkMaps>()
+                .unwrap_or_else(|| panic!("the population is typed and names the record: {err}"));
+            assert_eq!((reported.records, reported.first.as_str()), (1, "inode:1"));
+        } else {
+            assert_eq!(
+                outcome.unwrap_or_else(|e| panic!("{why}: {e}")),
+                Reconciled::Changed,
+                "{why}",
+            );
+        }
+        // The damaged record itself is never rewritten on the way past it.
+        assert_eq!(
+            meta.get(&key).await.unwrap().unwrap(),
+            damaged_root(state),
+            "{state}: the record the pass could not read is left byte-identical",
+        );
+    }
 }
 
 // The drain-to-zero observability leg (BINDING (c)) lives in its own test binary,

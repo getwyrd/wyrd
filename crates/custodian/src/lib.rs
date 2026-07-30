@@ -27,10 +27,11 @@ pub mod leadership;
 pub mod rebalance;
 pub mod reconciliation;
 pub mod reconstruction;
+mod resolve;
 pub mod restore;
 pub mod scrub;
 
-pub use backfill::BackfillContext;
+pub use backfill::{BackfillContext, SegmentedPlacementUnfillable, UnresolvableChunkMaps};
 pub use desired_state::{
     clear_lifecycle, draining_servers, reconciliation_status, set_lifecycle, DServerLifecycle,
     ReconciliationStatus,

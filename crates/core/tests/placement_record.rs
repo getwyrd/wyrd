@@ -173,9 +173,13 @@ fn write_records_placement_read_resolves_after_reopen() {
         let meta = RedbMetadataStore::open(&db_path).unwrap();
         let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
 
-        assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
         assert_eq!(
-            inode.chunk_map[0].placement.len(),
+            inode.chunk_map.as_flat().unwrap().len(),
+            1,
+            "single-chunk object"
+        );
+        assert_eq!(
+            inode.chunk_map.as_flat().unwrap()[0].placement.len(),
             N as usize,
             "commit records one stable D-server id per fragment index"
         );
@@ -231,7 +235,8 @@ fn moved_fragment_resolved_from_record_after_reopen() {
                 scheme: RS,
                 len: chunk.len,
                 placement: placement.clone(),
-            }],
+            }]
+            .into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
@@ -250,17 +255,26 @@ fn moved_fragment_resolved_from_record_after_reopen() {
         let meta = RedbMetadataStore::open(&db_path).unwrap();
         let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
         assert_eq!(
-            inode.chunk_map[0].placement, placement,
+            inode.chunk_map.as_flat().unwrap()[0].placement,
+            placement,
             "placement record survived the metadata-store reopen"
         );
         // Guard: every recorded location genuinely diverges from `index % n`, so a green
         // read can only come from resolving the record (not from `index % n`).
         assert!(
-            (0..N).all(|i| inode.chunk_map[0].placement[i as usize] != u64::from(i)),
+            (0..N).all(
+                |i| inode.chunk_map.as_flat().unwrap()[0].placement[i as usize] != u64::from(i)
+            ),
             "every fragment is moved off its index % n home"
         );
 
-        let got = read::read_object_from(&fleet, &inode).await.unwrap();
+        let got = read::read_object_chunks(
+            &fleet,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             got, payload,
             "moved-fragment chunk reconstructed by resolving each fragment from the record"
@@ -325,17 +339,24 @@ fn empty_placement_ec_none_resolves_via_identity_fallback() {
                 scheme: EcScheme::None,
                 len: chunk.len,
                 placement: Vec::new(), // pre-M3: the genuine empty shape
-            }],
+            }]
+            .into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
         };
         assert!(
-            record.chunk_map[0].placement.is_empty(),
+            record.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
             "pre-M3 record: an empty, not full-length, placement vector"
         );
 
-        let got = read::read_object_from(&fleet, &record).await.unwrap();
+        let got = read::read_object_chunks(
+            &fleet,
+            record.chunk_map.as_flat().expect("a flat snapshot"),
+            record.size,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             got, payload,
             "EcScheme::None chunk with empty placement reads via identity fallback"
@@ -376,17 +397,24 @@ fn empty_placement_rs_6_3_resolves_via_identity_fallback() {
                 scheme: RS,
                 len: chunk.len,
                 placement: Vec::new(), // pre-M3: the genuine empty shape
-            }],
+            }]
+            .into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
         };
         assert!(
-            record.chunk_map[0].placement.is_empty(),
+            record.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
             "pre-M3 record: an empty, not full-length, placement vector"
         );
 
-        let got = read::read_object_from(&fleet, &record).await.unwrap();
+        let got = read::read_object_chunks(
+            &fleet,
+            record.chunk_map.as_flat().expect("a flat snapshot"),
+            record.size,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             got, payload,
             "rs(6,3) chunk with empty placement reads via identity fallback"
@@ -440,24 +468,31 @@ fn short_placement_rs_6_3_mixed_explicit_and_fallback() {
                 scheme: RS,
                 len: chunk.len,
                 placement: explicit.clone(), // short: length 3, not 9
-            }],
+            }]
+            .into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
         };
         assert_eq!(
-            record.chunk_map[0].placement.len(),
+            record.chunk_map.as_flat().unwrap()[0].placement.len(),
             3,
             "a genuinely SHORT vector: 3 explicit entries, not the full 9"
         );
         // Guard: every explicit entry diverges from identity, so a green read can only
         // come from honouring the recorded override (not silently falling back to i).
         assert!(
-            (0..3).all(|i| record.chunk_map[0].placement[i] != i as u64),
+            (0..3).all(|i| record.chunk_map.as_flat().unwrap()[0].placement[i] != i as u64),
             "every explicit index is moved off its identity D server"
         );
 
-        let got = read::read_object_from(&fleet, &record).await.unwrap();
+        let got = read::read_object_chunks(
+            &fleet,
+            record.chunk_map.as_flat().expect("a flat snapshot"),
+            record.size,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             got, payload,
             "short-placement rs(6,3) chunk reads via mixed explicit + identity fallback"

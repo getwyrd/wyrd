@@ -150,7 +150,8 @@ async fn commit_chunk(
             scheme: EcScheme::ReedSolomon { k, m },
             len: 5,
             placement,
-        }],
+        }]
+        .into(),
         ..Default::default()
     };
     meta.commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
@@ -170,7 +171,8 @@ async fn commit_single_chunk(meta: &MemMeta, inode: InodeId, chunk: ChunkId, dse
             scheme: EcScheme::None,
             len: 5,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         ..Default::default()
     };
     meta.commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
@@ -824,4 +826,258 @@ async fn a_displaced_fragment_is_only_under_replicated_while_k_survive_at_the_pl
     // The displaced copy is still the only copy of fragment 0, so it is still never marked.
     assert_eq!(report.displaced_kept, 1, "{report:?}");
     assert_eq!(report.stranded_marked, 0, "{report:?}");
+}
+
+// ---- containment: one unreadable record does not blank the post-restore picture ----
+
+/// **A record the pass cannot read is reported, not propagated — and the rest of the
+/// picture survives.**
+///
+/// The post-restore audit walks every committed record to answer which chunks are
+/// dangling, misplaced or under-replicated. That report is what an operator acts on after
+/// a restore, and ending the walk at one damaged record would replace all of it with
+/// nothing at exactly the moment it is needed. So the object is attributed in
+/// [`RestoreReport::unresolvable`], the walk finishes, and the report is explicitly NOT
+/// clean — the verdicts it does carry are verdicts about the objects the pass could read.
+///
+/// Nothing is marked while it holds: the reference set is incomplete, so every fragment in
+/// the fleet is protected and `stranded_marked` stays 0 (`gc.rs`'s `protects`).
+#[tokio::test]
+async fn an_unreadable_record_is_reported_and_the_rest_of_the_audit_still_runs() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+
+    // A committed segmented root whose one segment record was never written: readable as a
+    // record, unresolvable as a map.
+    let group = metadata::SegmentGroup::new("fedcba9876543210fedcba9876543210", 11).unwrap();
+    let damaged = InodeRecord {
+        size: 5,
+        version: 1,
+        state: InodeState::Committed,
+        chunk_map: metadata::ChunkMap::Segmented(
+            metadata::SegmentedMap::new(
+                group,
+                vec![metadata::SegmentRef {
+                    index: 0,
+                    byte_offset: 0,
+                    byte_len: 5,
+                }],
+            )
+            .unwrap(),
+        ),
+        ..Default::default()
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(1), metadata::encode(&damaged)))
+        .await
+        .unwrap();
+    // …and a healthy chunk in the same store whose fragments the restore left below k.
+    commit_chunk(&meta, 2, 77, 2, 1, vec![0, 1, 2]).await;
+    d0.put(frag(77, 0)).await;
+    // A stray with no committed reference at all: the pass would normally mark it, and
+    // while an object cannot be read it must not — its chunks are unknown, so nothing can
+    // show this fragment is not one of them.
+    d1.put(frag(99, 0)).await;
+
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1), (2, &d2)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+    assert_eq!(
+        report.unresolvable,
+        vec!["inode:1".to_string()],
+        "the object the pass could not read must be NAMED, or an operator has a report \
+         about part of the store and no way to know which part: {report:?}",
+    );
+    assert_eq!(
+        report.dangling,
+        vec![77],
+        "the audit of every other object still ran: one unreadable record must not cost \
+         the operator the whole post-restore picture: {report:?}",
+    );
+    assert!(
+        !report.is_clean(),
+        "a report that could not read an object is not a clean bill for the store: \
+         {report:?}",
+    );
+    assert_eq!(
+        report.stranded_marked, 0,
+        "nothing may be marked while the reference set is incomplete — a mark is the \
+         evidence GC reclaims on: {report:?}",
+    );
+}
+
+/// **An UNCOMMITTED record the audit could not read is not a hole in the audit.**
+///
+/// The post-restore report covers committed chunks, so an unreadable *uncommitted* record
+/// leaves no verdict unanswered: reporting one puts an object in
+/// [`RestoreReport::unresolvable`] and makes `is_clean()` false for a store whose picture
+/// is in fact whole — an operator told to go find damage in a restore that is complete,
+/// on every future restore of that store until the record is repaired.
+///
+/// The other half is that the audit must still be a *real* audit either way: the healthy
+/// object's dangling chunk is reported in both spellings, and the committed spelling of
+/// the same bytes is the control that keeps the containment honest.
+#[tokio::test]
+async fn an_unreadable_uncommitted_record_is_not_a_hole_in_the_audit() {
+    /// A segmented root whose table spans 16 bytes while `size` says 99: structurally
+    /// invalid, so `metadata::decode` refuses it before any `state` filter runs.
+    fn damaged_root(state: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"size":99,"chunk_map":{{"group":{{"nonce":"0123456789abcdef0123456789abcdef","epoch":7}},"segment_count":1,"segments":[{{"index":0,"byte_offset":0,"byte_len":16}}]}},"state":"{state}","version":1}}"#
+        ))
+    }
+
+    for (state, reported, why) in [
+        (
+            "Pending",
+            false,
+            "an uncommitted record carries no committed chunk, so the audit answered \
+             every question it set out to ask",
+        ),
+        (
+            "Committed",
+            true,
+            "a COMMITTED record the walk could not read leaves verdicts unanswered, so \
+             the report is explicitly not a clean bill",
+        ),
+    ] {
+        let meta = MemMeta::default();
+        let (d0, d1, d2) = (
+            MemDServer::default(),
+            MemDServer::default(),
+            MemDServer::default(),
+        );
+
+        let key = metadata::inode_key(1);
+        meta.commit(WriteBatch::new().put(key.clone(), damaged_root(state)))
+            .await
+            .unwrap();
+        assert!(
+            metadata::decode::<InodeRecord>(&meta.get(&key).await.unwrap().unwrap()).is_err(),
+            "fixture: the seeded {state} record must genuinely fail to decode",
+        );
+        // A healthy chunk in the same store whose fragments the restore left below k —
+        // the verdict the audit exists to produce.
+        commit_chunk(&meta, 2, 77, 2, 1, vec![0, 1, 2]).await;
+        d0.put(frag(77, 0)).await;
+
+        let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1), (2, &d2)];
+        let ctx = GcContext {
+            meta: &meta,
+            fleet: &fleet,
+            grace_window_millis: 1_000,
+            expired_pending: ExpiredPendingPolicy::Reclaim,
+        };
+        let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+        assert_eq!(
+            report.unresolvable,
+            if reported {
+                vec!["inode:1".to_string()]
+            } else {
+                Vec::new()
+            },
+            "{state}: {why}: {report:?}",
+        );
+        assert!(
+            !report.is_clean(),
+            "{state}: the dangling chunk alone is not clean"
+        );
+        // The audit itself ran in both spellings — the containment changes what is
+        // REPORTED, never how much of the store the pass covered.
+        assert_eq!(
+            report.dangling,
+            vec![77],
+            "{state}: every other object's verdict is still produced: {report:?}",
+        );
+    }
+}
+
+/// **`is_clean()` is an operator's exit condition, so it has to be able to say YES — and it
+/// may not say yes over a store the pass could not read.**
+///
+/// The operator command after a metadata restore prints its report and exits on `is_clean`
+/// (`crates/server/src/cli.rs`, the `restore-reconcile` verb): a predicate that never answers
+/// true leaves them chasing damage in a store that is whole, and one that answers true while an
+/// object's map could not be read hands them a clean bill for *part* of the store — the pass
+/// marked nothing on that object's account and produced no verdict for it, so every other
+/// number in the report is drawn over the objects it could read.
+///
+/// Both arms, over the same otherwise-perfect store: a fully-placed committed chunk with every
+/// fragment where the map says, and then the same store with one unresolvable object added.
+#[tokio::test]
+async fn a_clean_restore_reports_clean_and_an_unreadable_object_makes_it_not_clean() {
+    /// A **valid** segmented root — it decodes, and it is Committed — whose `seg:` records
+    /// were never written, so only *resolving* its map fails.
+    const UNRESOLVABLE_ROOT: &str = r#"{"size":16,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":7},"segment_count":1,"segments":[{"index":0,"byte_offset":0,"byte_len":16}]},"state":"Committed","version":1}"#;
+
+    for damaged in [false, true] {
+        let meta = MemMeta::default();
+        let (d0, d1, d2) = (
+            MemDServer::default(),
+            MemDServer::default(),
+            MemDServer::default(),
+        );
+        // A healthy committed chunk with every fragment exactly where its placement says:
+        // nothing dangling, nothing misplaced, nothing under-replicated, nothing stray.
+        commit_chunk(&meta, 1, 0x0C, 2, 1, vec![0, 1, 2]).await;
+        d0.put(frag(0x0C, 0)).await;
+        d1.put(frag(0x0C, 1)).await;
+        d2.put(frag(0x0C, 2)).await;
+
+        if damaged {
+            let key = metadata::inode_key(2);
+            meta.commit(WriteBatch::new().put(
+                key.clone(),
+                Bytes::from_static(UNRESOLVABLE_ROOT.as_bytes()),
+            ))
+            .await
+            .unwrap();
+            let record: InodeRecord =
+                metadata::decode(&meta.get(&key).await.unwrap().unwrap()).expect("must DECODE");
+            assert!(
+                metadata::resolve_chunk_map(&meta, &key, &record)
+                    .await
+                    .is_err(),
+                "fixture: only the RESOLVE of this root's map may fail",
+            );
+        }
+
+        let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0), (1, &d1), (2, &d2)];
+        let ctx = GcContext {
+            meta: &meta,
+            fleet: &fleet,
+            grace_window_millis: 1_000,
+            expired_pending: ExpiredPendingPolicy::Reclaim,
+        };
+        let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+        assert_eq!(
+            report.is_clean(),
+            !damaged,
+            "damaged={damaged}: a whole store must be able to REPORT whole, and a store with \
+             an object the pass could not read must not: {report:?}",
+        );
+        assert_eq!(
+            report.unresolvable.is_empty(),
+            !damaged,
+            "damaged={damaged}: …and the object is named, so the operator has something to \
+             repair rather than a verdict: {report:?}",
+        );
+        assert_eq!(
+            report.stranded_marked, 0,
+            "damaged={damaged}: nothing is marked either way — every fragment in this fleet is \
+             referenced by a live map: {report:?}",
+        );
+    }
 }

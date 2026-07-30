@@ -53,7 +53,7 @@
 #![cfg(madsim)]
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -65,10 +65,11 @@ use tracing_subscriber::prelude::*;
 use wyrd_chunk_format::CORE_HEADER_LEN;
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
-    self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
+    self, ChunkMap, ChunkMapError, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState,
+    PendingEntry, SegmentGroup, SegmentRecord, SegmentRef, SegmentedMap,
 };
 use wyrd_core::placement::Topology;
-use wyrd_core::read::{read_object, read_object_from};
+use wyrd_core::read::{read_object, read_object_chunks};
 use wyrd_core::repair;
 use wyrd_core::write::write_new_object_placed;
 use wyrd_custodian::{
@@ -80,8 +81,8 @@ use wyrd_custodian::{
 use wyrd_dst::dst_campaign_test;
 use wyrd_testkit::{SeededStorageFaults, StorageFault};
 use wyrd_traits::{
-    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
-    PlacementChunkStore, Result, WriteBatch,
+    ChunkId, ChunkStore, CommitOutcome, CommitUnknownResult, DServerId, FragmentId, Health,
+    MetadataStore, PlacementChunkStore, Result, WriteBatch,
 };
 
 // ---- in-memory trait stores (backend-agnostic; the loops are proven over the seams) ----
@@ -147,9 +148,19 @@ impl MetadataStore for MemMeta {
 /// the committed chunk map is untouched. At the store boundary a crash-before-commit and
 /// a lost CAS are indistinguishable — both leave the inode at its prior value — so this
 /// is a faithful Tier-0 crash model. Disarm to let the restarted custodian complete.
+/// It also carries the two **ordinal** faults a multi-transaction protocol needs, which
+/// the armed/disarmed one cannot express because every batch of a staged publication is
+/// version-conditional: [`CrashMeta::die_at`] drops the *n*-th and every later commit
+/// (the completer dying **between** two batches of one phase), and
+/// [`CrashMeta::unknown_at`] **applies** the *n*-th commit and then reports
+/// [`CommitUnknownResult`] — F5's ambiguous commit, where the write landed and the caller
+/// never learned it. Both are `usize::MAX` (off) unless set.
 struct CrashMeta {
     inner: MemMeta,
     armed: AtomicBool,
+    commits: AtomicUsize,
+    die_at: AtomicUsize,
+    unknown_at: AtomicUsize,
 }
 
 impl CrashMeta {
@@ -157,6 +168,9 @@ impl CrashMeta {
         Self {
             inner: MemMeta::default(),
             armed: AtomicBool::new(false),
+            commits: AtomicUsize::new(0),
+            die_at: AtomicUsize::new(usize::MAX),
+            unknown_at: AtomicUsize::new(usize::MAX),
         }
     }
 
@@ -166,6 +180,29 @@ impl CrashMeta {
 
     fn disarm(&self) {
         self.armed.store(false, Ordering::Relaxed);
+    }
+
+    /// Drop the `n`-th commit from now on (0-based) and every one after it, applying
+    /// nothing — the process is gone before the transaction was ever issued. Deliberately
+    /// **not** a [`CommitUnknownResult`]: nothing was applied, so there is nothing
+    /// indeterminate about it. The ambiguous case is [`CrashMeta::unknown_at`].
+    fn die_at(&self, n: usize) {
+        self.commits.store(0, Ordering::Relaxed);
+        self.die_at.store(n, Ordering::Relaxed);
+    }
+
+    /// Apply the `n`-th commit from now on (0-based) and then report it as an unknown
+    /// result.
+    fn unknown_at(&self, n: usize) {
+        self.commits.store(0, Ordering::Relaxed);
+        self.unknown_at.store(n, Ordering::Relaxed);
+    }
+
+    /// Clear the ordinal faults (the restarted process).
+    fn restart(&self) {
+        self.commits.store(0, Ordering::Relaxed);
+        self.die_at.store(usize::MAX, Ordering::Relaxed);
+        self.unknown_at.store(usize::MAX, Ordering::Relaxed);
     }
 }
 
@@ -200,7 +237,31 @@ impl MetadataStore for CrashMeta {
         {
             return Ok(CommitOutcome::Conflict);
         }
-        self.inner.commit(batch).await
+        let n = self.commits.fetch_add(1, Ordering::Relaxed);
+        if n >= self.die_at.load(Ordering::Relaxed) {
+            return Err(Box::new(std::io::Error::other(
+                "the completer died before this commit was issued",
+            )));
+        }
+        let outcome = self.inner.commit(batch).await?;
+        // Applied, then reported unknown: the caller must NOT read this as a clean
+        // `Conflict` — it has to re-read to learn what happened (`traits:731`).
+        //
+        // Only a commit that actually **landed** is reported that way. A `Conflict` is a
+        // definite non-commit — a precondition failed and nothing was applied — so there
+        // is nothing indeterminate about it, and dressing it as `CommitUnknownResult`
+        // would model a backend the trait forbids and hide a real conflict behind an
+        // ambiguity the caller must resolve by re-reading. The DST's fidelity to the seam
+        // is the whole point of injecting the fault here (`AGENTS.md:188-190`).
+        if n == self.unknown_at.load(Ordering::Relaxed) && outcome == CommitOutcome::Committed {
+            return Err(Box::new(CommitUnknownResult {
+                backend: "dst",
+                code: None,
+                detail: "the commit landed; the caller never learned it".to_string(),
+                may_still_commit: false,
+            }));
+        }
+        Ok(outcome)
     }
 }
 
@@ -515,7 +576,7 @@ async fn write_rs_2_1(meta: &impl MetadataStore, fleet: &Fleet<'_>) -> Vec<u8> {
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -546,7 +607,7 @@ async fn apply_storage_faults(d: &[MemDServer; 4], plan: &SeededStorageFaults) {
 /// Assert the chunk is back at **full redundancy**: every placed fragment is present and
 /// verifies its checksum, and the `n` fragments occupy `n` distinct failure domains.
 async fn assert_full_redundancy(record: &InodeRecord, d: &[MemDServer; 4]) {
-    let placement = &record.chunk_map[0].placement;
+    let placement = &record.chunk_map.as_flat().unwrap()[0].placement;
     assert_eq!(placement.len(), N, "n fragments placed");
     let mut domains = HashSet::new();
     for (index, &server) in placement.iter().enumerate() {
@@ -632,7 +693,9 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert!(
-        !record.chunk_map[0].placement.contains(&victim.into()),
+        !record.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .contains(&victim.into()),
         "the killed server no longer holds a referenced fragment"
     );
     assert_full_redundancy(&record, &d).await;
@@ -685,7 +748,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
     let crashed = read_inode(&meta).await;
     assert_eq!(crashed.version, 1, "no version-conditional commit landed");
     assert_eq!(
-        crashed.chunk_map[0].placement,
+        crashed.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the committed placement is fully old — never a torn/hybrid chunk"
     );
@@ -701,7 +764,9 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
         "the rebuilt fragment was placed before the (crashed) commit"
     );
     assert!(
-        !crashed.chunk_map[0].placement.contains(&3),
+        !crashed.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .contains(&3),
         "the placed-but-uncommitted fragment is unreferenced garbage, not part of the chunk"
     );
 
@@ -835,7 +900,8 @@ async fn commit_reference(meta: &MemMeta, dserver: DServerId) {
             scheme: EcScheme::None,
             len: 5,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -1176,7 +1242,7 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
     let after = read_inode(&meta).await;
     assert_eq!(after.version, 1, "no commit landed");
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the committed placement is fully old — never a torn/hybrid chunk"
     );
@@ -1236,7 +1302,7 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
 /// the two snapshots here do not.)
 ///
 /// The property models both racers against the **live** fleet *after* the flip has landed:
-/// - a reader that resolved the **old** placement before the commit ([`read_object_from`]
+/// - a reader that resolved the **old** placement before the commit ([`read_object_chunks`]
 ///   with the v1 inode) still reads the correct, complete object — degraded, reconstructing
 ///   around the killed fragment from its `k` survivors (which the repair never touched); and
 /// - a reader that resolves the **new** placement after the commit ([`read_object`]) reads
@@ -1260,7 +1326,7 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     // A reader that ENTERS the commit window resolves the OLD inode (v1, placement [0,1,2]).
     let old = read_inode(&meta).await;
     assert_eq!(old.version, 1);
-    assert_eq!(old.chunk_map[0].placement, vec![0, 1, 2]);
+    assert_eq!(old.chunk_map.as_flat().unwrap()[0].placement, vec![0, 1, 2]);
 
     // The repoint lands as a single atomic commit.
     let (topo, healthy) = healthy_view(victim, &d);
@@ -1284,7 +1350,10 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     // and the placement changed only at the rebuilt index — never a per-index mix.
     assert_eq!(new.version, 2, "exactly one atomic transition (v1 → v2)");
     let differing: Vec<usize> = (0..N)
-        .filter(|&i| new.chunk_map[0].placement[i] != old.chunk_map[0].placement[i])
+        .filter(|&i| {
+            new.chunk_map.as_flat().unwrap()[0].placement[i]
+                != old.chunk_map.as_flat().unwrap()[0].placement[i]
+        })
         .collect();
     assert_eq!(
         differing,
@@ -1292,14 +1361,21 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
         "the repoint flips the whole placement vector, changing only the rebuilt index"
     );
     assert_eq!(
-        new.chunk_map[0].placement[victim as usize], 3,
+        new.chunk_map.as_flat().unwrap()[0].placement[victim as usize],
+        3,
         "the rebuilt fragment moved to the free failure domain (D = server 3)"
     );
 
     // OLD reader, finishing AFTER the flip: still fully consistent — reads around the killed
     // fragment from the `k` survivors the repair never disturbed. Never a torn/mixed read.
     assert_eq!(
-        read_object_from(&fleet, &old).await.unwrap(),
+        read_object_chunks(
+            &fleet,
+            old.chunk_map.as_flat().expect("a flat snapshot"),
+            old.size,
+        )
+        .await
+        .unwrap(),
         data,
         "a reader holding the old placement still reads the correct, complete object"
     );
@@ -1308,6 +1384,1027 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
         read_object(&meta, &fleet, INODE).await.unwrap(),
         Some(data),
         "a reader resolving the new placement reads the correct, complete object"
+    );
+}
+
+/// **Property 9 — a segmented map never tears when its generation is retired (X51).**
+///
+/// Retiring a superseded/deleted generation deletes its `seg:` records (proposal 0016
+/// decision 7(f)), so a consumer that has already read the root can find a segment
+/// **absent** midway through resolving it. The protocol orders the two — the root is
+/// flipped away from a generation *before* that generation's segments are ever deleted —
+/// and decision 7(h) turns that ordering into the resolve-retry rule. Both arms are
+/// asserted here, on the interleaving itself:
+///
+/// * root **moved on** (or gone) + segment absent ⇒ the generation was concurrently
+///   retired: the resolution is dropped (a reader restarts / answers `NoSuchKey`), never
+///   a torn half-map;
+/// * root **unchanged** + segment absent ⇒ an invariant violation, **fail closed** with a
+///   typed error — a live generation never loses a segment.
+async fn prop_segmented_resolve_never_tears_on_retirement(rng: &mut ChaCha8Rng) {
+    let meta = MemMeta::default();
+    let d = servers();
+    let fleet = fleet_of(&d);
+    write_rs_2_1(&meta, &fleet).await;
+
+    // Reshape the committed object into a two-segment map: same chunks, now carried by
+    // `seg:` records with the root naming only the group and the segment table.
+    let flat = read_inode(&meta)
+        .await
+        .chunk_map
+        .as_flat()
+        .unwrap()
+        .to_vec();
+    let chunk_len = flat[0].len;
+    let group = SegmentGroup::new("0123456789abcdef0123456789abcdef", 7).unwrap();
+    let halves = [
+        SegmentRecord::new(vec![flat[0].clone()], 0).unwrap(),
+        SegmentRecord::new(vec![flat[0].clone()], chunk_len).unwrap(),
+    ];
+    let table = SegmentedMap::new(
+        group.clone(),
+        vec![
+            SegmentRef {
+                index: 0,
+                byte_offset: 0,
+                byte_len: chunk_len,
+            },
+            SegmentRef {
+                index: 1,
+                byte_offset: chunk_len,
+                byte_len: chunk_len,
+            },
+        ],
+    )
+    .unwrap();
+    let prior = read_inode(&meta).await;
+    let root = InodeRecord {
+        size: chunk_len * 2,
+        chunk_map: ChunkMap::Segmented(table),
+        ..prior
+    };
+    meta.commit(
+        WriteBatch::new()
+            .put(metadata::seg_key(&group, 0), metadata::encode(&halves[0]))
+            .put(metadata::seg_key(&group, 1), metadata::encode(&halves[1]))
+            .put(metadata::inode_key(INODE), metadata::encode(&root)),
+    )
+    .await
+    .unwrap();
+
+    // A consumer takes its snapshot of the root — it is now mid-resolve.
+    let held = read_inode(&meta).await;
+    assert!(held.chunk_map.is_segmented());
+    // The seed picks WHICH segment the retirement drain removes first.
+    let victim: u32 = rng.next_u32() % 2;
+
+    // ---- arm 0: the root moved on and EVERY segment is still readable ----
+    // The drain that deletes a retired generation's `seg:` records runs *after* the flip
+    // and is byte-budgeted (`0016:2452-2462`), so this window — root already moved, old
+    // segments all still there — is the common case, not a rare one. A resolve here reads
+    // every segment successfully and is STILL describing the generation the object no
+    // longer has. Reported as `Resolved` it would hand a maintenance pass the retired
+    // generation's fragments as the object's protected set and omit the live one's.
+    let intact_supersede = InodeRecord {
+        chunk_map: vec![flat[0].clone()].into(),
+        version: held.version + 1,
+        ..held.clone()
+    };
+    meta.commit(WriteBatch::new().put(
+        metadata::inode_key(INODE),
+        metadata::encode(&intact_supersede),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        meta.scan(&metadata::seg_range_prefix(&group))
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "fixture: BOTH of the retired generation's segments are still readable — the \
+         drain has not run yet",
+    );
+    assert_eq!(
+        metadata::resolve_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+            .await
+            .unwrap(),
+        metadata::MapResolution::Retired,
+        "a complete read of a superseded generation is stale, not resolved",
+    );
+    assert_eq!(
+        metadata::resolve_live_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+            .await
+            .unwrap()
+            .expect("a superseded generation is not an absent object")
+            .chunks
+            .as_ref(),
+        &[flat[0].clone()],
+        "the consumer resolves the LIVE generation's chunks, not the retired one's",
+    );
+
+    // ---- arm 1: the root moved on, then the drain deleted the segment ----
+    // (The protocol's order: flip/remove the root FIRST, delete `seg:` records after.)
+    let superseded = InodeRecord {
+        chunk_map: vec![flat[0].clone()].into(),
+        version: held.version + 1,
+        ..held.clone()
+    };
+    meta.commit(
+        WriteBatch::new()
+            .put(metadata::inode_key(INODE), metadata::encode(&superseded))
+            .delete(metadata::seg_key(&group, victim)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        metadata::resolve_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+            .await
+            .unwrap(),
+        metadata::MapResolution::Retired,
+        "a segment deleted after the root moved on means the generation was retired: the \
+         stale resolution is dropped, never half-returned",
+    );
+    // …and what every CONSUMER sees at that interleaving: not "no chunks" — which would
+    // take a live object out of GC's reference set and let restore mark its fragments —
+    // but the generation that replaced it, resolved against the current root.
+    let live = metadata::resolve_live_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+        .await
+        .unwrap()
+        .expect("a superseded generation is not an absent object");
+    assert_eq!(
+        live.chunks.as_ref(),
+        &[flat[0].clone()],
+        "the consumer resolves the LIVE generation, never an empty chunk list",
+    );
+    assert_eq!(
+        live.restarted.as_ref().map(|r| r.version),
+        Some(superseded.version),
+        "…and it reports the root it restarted against",
+    );
+
+    // ---- arm 2: the root is UNCHANGED and a segment is gone ----
+    // The live root still names this generation, so this is corruption, not a race.
+    meta.commit(
+        WriteBatch::new()
+            .put(metadata::inode_key(INODE), metadata::encode(&held))
+            .put(
+                metadata::seg_key(&group, victim),
+                metadata::encode(&halves[victim as usize]),
+            ),
+    )
+    .await
+    .unwrap();
+    meta.commit(WriteBatch::new().delete(metadata::seg_key(&group, victim)))
+        .await
+        .unwrap();
+    let err = metadata::resolve_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+        .await
+        .expect_err("an unchanged root with an absent segment must fail closed");
+    assert!(
+        matches!(
+            err.downcast_ref::<metadata::ChunkMapError>(),
+            Some(metadata::ChunkMapError::SegmentAbsent { index, .. }) if *index == victim
+        ),
+        "the failure names the missing segment and is typed, never a torn success: {err}",
+    );
+    // …and the READ path answers with the same discipline: an error, never short bytes.
+    assert!(
+        read_object(&meta, &fleet, INODE).await.is_err(),
+        "the read path must not serve a half-resolved segmented object",
+    );
+
+    // ---- arm 3: the same two arms, with the segment PRESENT and unreadable ----
+    // A retirement drain deletes rows, and the space a deleted row occupied is reused: a
+    // consumer racing it can just as easily find a row half-overwritten as missing. The two
+    // are the same fact about the same range, so they must settle the same way — the root
+    // decides, and only the root can. Getting this wrong makes an ordinary overwrite surface
+    // as corruption in a generation nobody will ever read again.
+    meta.commit(
+        WriteBatch::new()
+            .put(metadata::inode_key(INODE), metadata::encode(&superseded))
+            .put(metadata::seg_key(&group, victim), Bytes::from_static(b"{")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        metadata::resolve_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+            .await
+            .unwrap(),
+        metadata::MapResolution::Retired,
+        "an UNREADABLE segment under a root that has moved on is the same retirement as an \
+         absent one, and settles the same way",
+    );
+    assert_eq!(
+        metadata::resolve_live_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+            .await
+            .unwrap()
+            .expect("a superseded generation is not an absent object")
+            .chunks
+            .as_ref(),
+        &[flat[0].clone()],
+        "…so the consumer still resolves the LIVE generation rather than failing on bytes \
+         nobody will read again",
+    );
+    // …and with the root unchanged it is corruption, exactly as an absent segment is.
+    meta.commit(WriteBatch::new().put(metadata::inode_key(INODE), metadata::encode(&held)))
+        .await
+        .unwrap();
+    let err = metadata::resolve_chunk_map(&meta, &metadata::inode_key(INODE), &held)
+        .await
+        .expect_err("an unchanged root with an unreadable segment must fail closed");
+    assert!(
+        err.downcast_ref::<metadata::ChunkMapError>().is_some(),
+        "the failure is typed, so every consumer contains it to this object: {err}",
+    );
+    assert!(
+        read_object(&meta, &fleet, INODE).await.is_err(),
+        "the read path must not serve an object whose segment cannot be read",
+    );
+}
+
+/// Reshape the committed object at [`INODE`] into a segmented map over `group`, with one
+/// chunk per segment, and return the segment records. The chunks are the object's real
+/// ones, so it still reads back through the fleet.
+async fn reshape_into_segments(meta: &MemMeta, group: &SegmentGroup) -> Vec<SegmentRecord> {
+    let prior = read_inode(meta).await;
+    let flat = prior.chunk_map.as_flat().unwrap().to_vec();
+    let chunk_len = flat[0].len;
+    let halves = vec![
+        SegmentRecord::new(vec![flat[0].clone()], 0).unwrap(),
+        SegmentRecord::new(vec![flat[0].clone()], chunk_len).unwrap(),
+    ];
+    let table = SegmentedMap::new(
+        group.clone(),
+        vec![
+            SegmentRef {
+                index: 0,
+                byte_offset: 0,
+                byte_len: chunk_len,
+            },
+            SegmentRef {
+                index: 1,
+                byte_offset: chunk_len,
+                byte_len: chunk_len,
+            },
+        ],
+    )
+    .unwrap();
+    let root = InodeRecord {
+        size: chunk_len * 2,
+        chunk_map: ChunkMap::Segmented(table),
+        ..prior
+    };
+    meta.commit(
+        WriteBatch::new()
+            .put(metadata::seg_key(group, 0), metadata::encode(&halves[0]))
+            .put(metadata::seg_key(group, 1), metadata::encode(&halves[1]))
+            .put(metadata::inode_key(INODE), metadata::encode(&root)),
+    )
+    .await
+    .unwrap();
+    halves
+}
+
+/// The session record a staged publication fences on: it carries the `Completing` epoch
+/// **and** the `segments_written` cursor, the two things `0016:350` / `:2336-2338` put on
+/// one record — which is why the fence has to be restated per batch, and why the cursor
+/// CAS can ride the very batch that made the progress.
+///
+/// The epoch is a **parameter** of both helpers below, and every caller passes the epoch of
+/// the segment group it is publishing. That coupling is the protocol: the `seg:` keys are
+/// scoped by the fence epoch of the attempt that wrote them (`0016:2352-2380`), so a fixture
+/// whose second attempt mints a new group epoch while its fence values still name the first
+/// would be exercising a state no completer can be in — and would silently stop testing the
+/// scoping this property exists for.
+const SESSION_KEY: &[u8] = b"mpu:upload-dst";
+
+/// The fence epoch of the first attempt's segment group, and of the second attempt's —
+/// each named once so the group and its fence can never drift apart at a call site.
+const FENCE_EPOCH: u64 = 11;
+/// See [`FENCE_EPOCH`]: a second Complete mints a new group, at a new epoch, and its fence
+/// values move with it.
+const NEXT_FENCE_EPOCH: u64 = 12;
+
+fn session_value(epoch: u64, written: u32) -> Bytes {
+    Bytes::from(format!("Completing@{epoch}|written={written}"))
+}
+
+/// The session record's terminal value — what the **flip** moves the fence to
+/// (`session -> Completed`, `0016:2338-2345`). The flip has to *move* the fence, not
+/// merely pin it: a flip that left `Completing@E` in place would leave the rollback that
+/// deletes this attempt's segments still able to commit **after** the publication, against
+/// the very root it just published.
+fn completed_session_value(epoch: u64) -> Bytes {
+    Bytes::from(format!("Completed@{epoch}"))
+}
+
+/// **Property 10 — staged publication is atomic at the flip, its progress survives a
+/// crash BETWEEN batches, and its recovery is idempotent (proposal 0016 decision
+/// 7(b),(c),(d)).**
+///
+/// The publication is two phases across *several* transactions, so it has crash windows
+/// no single-batch commit has — one **inside** phase 1, between two segment-write
+/// batches, and one between the phases. Five interleavings, all on the same seeded
+/// fixture, over a store whose envelope is narrowed to one segment record per batch so
+/// the intra-phase window is real rather than notional:
+///
+/// * **interrupted mid-phase** — the completer dies between two segment-write batches:
+///   the batches that landed are durable, the session's `segments_written` cursor names
+///   exactly them (it rode their own commits), and the root has not moved;
+/// * **resumed** — the restarted completer reads that cursor, resumes from it, fences
+///   each remaining batch against the value its predecessor left, and finishes the phase;
+/// * **interrupted before the flip** — nothing is published, and the durable segments are
+///   the crash evidence a rollback obligation reclaims (§c), never a half-published object;
+/// * **raced** — a concurrent writer supersedes the root between the two phases: the flip
+///   loses, and the segments it had already written stay put;
+/// * **ambiguous** (`CommitUnknownResult`, F5) — the flip **landed** and the caller was
+///   told only that the outcome is unknown: that must surface as an unknown result, never
+///   collapse into a `Conflict` the caller would read as "nothing happened". The recovery
+///   re-runs the whole publication at the **same** epoch: the segment keys and bytes are
+///   identical (idempotent) and the second flip **loses** its CAS rather than publishing
+///   a second time.
+async fn prop_staged_publication_is_atomic_at_the_flip(rng: &mut ChaCha8Rng) {
+    let meta = CrashMeta::new();
+    let d = servers();
+    let fleet = fleet_of(&d);
+    write_rs_2_1(&meta, &fleet).await;
+    let prior = read_inode(&meta).await;
+
+    // A published map big enough to need several segment records — the shape the whole
+    // staged protocol exists for. The seed varies how many, so the phase boundary moves.
+    let chunks: Vec<ChunkRef> = (0..(2_500 + rng.next_u32() as u64 % 800))
+        .map(|i| ChunkRef {
+            id: ChunkId::from(0x9000_0000 + i),
+            scheme: EcScheme::None,
+            len: 8,
+            placement: vec![i % 3],
+        })
+        .collect();
+    let group = SegmentGroup::new("abcdefabcdefabcdefabcdefabcdef01", FENCE_EPOCH).unwrap();
+    // The caller's per-batch contribution: fence on the cursor this batch requires,
+    // advance it to what this batch makes durable — one record, one commit.
+    let session = |info: &metadata::SegmentBatchInfo| {
+        WriteBatch::new()
+            .require(
+                SESSION_KEY.to_vec(),
+                session_value(FENCE_EPOCH, info.first_index),
+            )
+            .put(
+                SESSION_KEY.to_vec(),
+                session_value(FENCE_EPOCH, info.written),
+            )
+    };
+    let publication = metadata::SegmentedPublication {
+        inode_id: INODE,
+        root: metadata::RootPrecondition::Supersede(&prior),
+        group: group.clone(),
+        chunks: chunks.clone(),
+        meta: metadata::ObjectMeta::default(),
+        // The session record is the publication's fence: every segment-write batch and
+        // the flip must compare-and-swap on it, so the rollback that deletes this
+        // attempt's segments cannot be overtaken by a batch fenced on something else.
+        fence_key: SESSION_KEY.to_vec(),
+        segment_batch: &session,
+        resume_from: 0,
+        // One segment record per commit, so the phase is several transactions at a
+        // fixture size a 50-seed sweep can afford (at the real 5 MB envelope the second
+        // batch first appears past ~113 000 chunks).
+        batch_budget: Some(metadata::SEGMENT_TARGET_BYTES + 1_000),
+        ops_budget: None,
+        flip: WriteBatch::new(),
+    };
+    let planned = publication.plan().unwrap().len();
+    // The FLIP's own fence: the session record as phase 1 leaves it — the value
+    // `session -> Completed` compare-and-swaps on (`0016:2338-2345`). Unfenced, the
+    // rollback that deletes this attempt's segments could land between the phase and the
+    // flip and the root CAS would still succeed, publishing a root naming records that are
+    // gone; the committer refuses an unfenced flip for exactly that reason.
+    let publication = metadata::SegmentedPublication {
+        flip: WriteBatch::new()
+            .require(
+                SESSION_KEY.to_vec(),
+                session_value(FENCE_EPOCH, planned as u32),
+            )
+            .put(SESSION_KEY.to_vec(), completed_session_value(FENCE_EPOCH)),
+        ..publication
+    };
+    assert!(
+        planned > 1,
+        "fixture: the map must need more than one segment record",
+    );
+    assert!(
+        publication.segment_batches().unwrap().len() > 1,
+        "fixture: the phase must be more than one BATCH, or no crash lands inside it",
+    );
+    meta.commit(WriteBatch::new().put(SESSION_KEY.to_vec(), session_value(FENCE_EPOCH, 0)))
+        .await
+        .unwrap();
+
+    // ---- interrupted MID-PHASE: the completer dies between two segment-write batches ----
+    meta.die_at(1);
+    publication
+        .write_segments(&meta)
+        .await
+        .expect_err("the completer died mid-phase");
+    meta.restart();
+    let durable = meta
+        .scan(&metadata::seg_range_prefix(&group))
+        .await
+        .unwrap()
+        .len();
+    assert!(
+        durable > 0 && durable < planned,
+        "fixture: the crash must land INSIDE the phase ({durable} of {planned} durable)",
+    );
+    assert_eq!(
+        meta.get(SESSION_KEY).await.unwrap(),
+        Some(session_value(FENCE_EPOCH, durable as u32)),
+        "the cursor rode the batches' own commits, so it names exactly what is durable",
+    );
+    assert_eq!(
+        read_inode(&meta).await,
+        prior,
+        "a crash inside phase 1 publishes nothing",
+    );
+
+    // ---- resumed: the restarted completer picks up at the recovered cursor ----
+    let publication = metadata::SegmentedPublication {
+        resume_from: durable as u32,
+        ..publication
+    };
+    assert_eq!(
+        publication.write_segments(&meta).await.unwrap(),
+        CommitOutcome::Committed,
+        "the resumed phase fences against the RECOVERED cursor, not against zero",
+    );
+    let after_phase_one = meta
+        .scan(&metadata::seg_range_prefix(&group))
+        .await
+        .unwrap();
+    assert_eq!(after_phase_one.len(), planned);
+    assert_eq!(
+        meta.get(SESSION_KEY).await.unwrap(),
+        Some(session_value(FENCE_EPOCH, planned as u32)),
+    );
+
+    // ---- interrupted before the flip: phase 1 is durable, the flip never runs ----
+    let root_now = read_inode(&meta).await;
+    assert_eq!(
+        root_now, prior,
+        "the root still names the prior generation: the flip IS the publication instant",
+    );
+    assert!(
+        !root_now.chunk_map.is_segmented(),
+        "an interrupted publication publishes nothing",
+    );
+
+    // ---- raced: a concurrent writer supersedes the root before this flip runs ----
+    let intruder = InodeRecord {
+        version: prior.version + 1,
+        ..prior.clone()
+    };
+    meta.commit(
+        WriteBatch::new()
+            .require(metadata::inode_key(INODE), metadata::encode(&prior))
+            .put(metadata::inode_key(INODE), metadata::encode(&intruder)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        publication.flip(&meta).await.unwrap(),
+        CommitOutcome::Conflict,
+        "the flip must lose to a concurrent supersede rather than clobber it",
+    );
+    assert_eq!(
+        read_inode(&meta).await,
+        intruder,
+        "…and leave the winner's record untouched",
+    );
+    assert_eq!(
+        meta.scan(&metadata::seg_range_prefix(&group))
+            .await
+            .unwrap()
+            .len(),
+        after_phase_one.len(),
+        "the segments already written stay put — the rollback obligation's evidence",
+    );
+
+    // ---- ambiguous: the flip LANDS and is reported as an unknown result ----
+    let publication = metadata::SegmentedPublication {
+        root: metadata::RootPrecondition::Supersede(&intruder),
+        ..publication
+    };
+    // Every segment is already durable, so the flip is the phase's only commit.
+    meta.unknown_at(0);
+    let err = publication
+        .flip(&meta)
+        .await
+        .expect_err("an unknown result is an Err, never an Ok outcome");
+    assert!(
+        err.downcast_ref::<CommitUnknownResult>().is_some(),
+        "a commit that MAY have landed must reach the caller as CommitUnknownResult — \
+         reported as a `Conflict` it would read as 'nothing happened' over a write that \
+         did: {err}",
+    );
+    meta.restart();
+
+    // The injector's own fidelity, asserted where it is used: `unknown_at` may dress a
+    // commit that LANDED as an unknown result — never one that did not. A `Conflict` is a
+    // definite non-commit (a precondition failed and nothing was applied), so reporting it
+    // as ambiguous would model a backend the trait forbids and would hide a real conflict
+    // behind a re-read that can only confirm "nothing happened" (`traits:731`). A DST whose
+    // double drifts from the seam proves properties about a system that does not exist.
+    meta.unknown_at(0);
+    assert_eq!(
+        meta.commit(
+            WriteBatch::new()
+                .require(metadata::inode_key(INODE), metadata::encode(&prior))
+                .put(metadata::inode_key(INODE), metadata::encode(&prior)),
+        )
+        .await
+        .unwrap(),
+        CommitOutcome::Conflict,
+        "a definite CAS conflict stays a Conflict at the unknown-result ordinal",
+    );
+    meta.restart();
+
+    let published = read_inode(&meta).await;
+    assert!(
+        published.chunk_map.is_segmented(),
+        "the ambiguous flip is the one that DID land: that is what makes the re-read the \
+         only way to settle it",
+    );
+    let segments_after_publish = meta
+        .scan(&metadata::seg_range_prefix(&group))
+        .await
+        .unwrap();
+    // The same-gateway recovery re-runs the WHOLE publication at the same epoch, from
+    // zero — it does not know how far it got.
+    let recovery = metadata::SegmentedPublication {
+        resume_from: 0,
+        ..publication
+    };
+    meta.commit(WriteBatch::new().put(SESSION_KEY.to_vec(), session_value(FENCE_EPOCH, 0)))
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery.publish(&meta).await.unwrap(),
+        CommitOutcome::Conflict,
+        "the recovery's flip must lose: the object is already published, and a second \
+         publication would mint a second generation over the first",
+    );
+    assert_eq!(
+        read_inode(&meta).await,
+        published,
+        "…and the published record is untouched by the recovery",
+    );
+    let mut before = segments_after_publish;
+    let mut after = meta
+        .scan(&metadata::seg_range_prefix(&group))
+        .await
+        .unwrap();
+    before.sort();
+    after.sort();
+    assert_eq!(
+        before, after,
+        "re-running the segment-write phase at the same epoch is idempotent: identical \
+         keys, identical bytes, never a second generation's records",
+    );
+    // …and the published object resolves to exactly the chunk list that was published.
+    assert_eq!(
+        metadata::resolve_chunk_map(&meta, &metadata::inode_key(INODE), &published)
+            .await
+            .unwrap()
+            .chunks(),
+        Some(chunks.as_slice()),
+    );
+
+    // ---- ambiguous INSIDE phase 1: a segment batch lands and is reported unknown ----
+    //
+    // The flip is not the only commit a staged publication can lose track of. A
+    // segment-write batch carries the caller's `segments_written` CAS on the *same*
+    // transaction (`0016:350`), so a batch that **applies** and reports
+    // `CommitUnknownResult` (F5) leaves the store one batch further on than the completer
+    // believes — durable records it never learned about, and a cursor it never learned
+    // moved. Recovery is then only safe if it is driven by what the store says rather than
+    // by what the process remembers, and if re-running the phase is genuinely idempotent.
+    //
+    // A fresh generation (its own nonce and epoch, as a second Complete would mint) so this
+    // interleaving is not confused with the published one's range — and its fence values
+    // move to that same epoch, because the `seg:` keys are scoped by the fence epoch of the
+    // attempt that wrote them (`0016:2352-2380`). A second attempt still fencing on the
+    // first's `Completing@E` would be a state no completer can reach, and the interleaving
+    // below would be testing it against a session record no rollback of that generation
+    // pins.
+    //
+    // It publishes a **new** object key rather than superseding the one above: this
+    // committer refuses to publish over a segmented generation, because retiring one is the
+    // staged `retire:bytes:{generation}` obligation the session slice owns (#636,
+    // `0016:668`) and this slice would strand it. What the interleaving is about — an
+    // ambiguous segment batch, the cursor that rode it, and whether recovery is idempotent —
+    // is the same either way, and both objects stay in the store for the assertions below.
+    let next_group =
+        metadata::SegmentGroup::new("abcdefabcdefabcdefabcdefabcdef02", NEXT_FENCE_EPOCH).unwrap();
+    const SECOND_INODE: InodeId = INODE + 1;
+    let next_session = |info: &metadata::SegmentBatchInfo| {
+        WriteBatch::new()
+            .require(
+                SESSION_KEY.to_vec(),
+                session_value(NEXT_FENCE_EPOCH, info.first_index),
+            )
+            .put(
+                SESSION_KEY.to_vec(),
+                session_value(NEXT_FENCE_EPOCH, info.written),
+            )
+    };
+    let republication = metadata::SegmentedPublication {
+        inode_id: SECOND_INODE,
+        root: metadata::RootPrecondition::Fresh,
+        group: next_group.clone(),
+        segment_batch: &next_session,
+        resume_from: 0,
+        flip: WriteBatch::new()
+            .require(
+                SESSION_KEY.to_vec(),
+                session_value(NEXT_FENCE_EPOCH, planned as u32),
+            )
+            .put(
+                SESSION_KEY.to_vec(),
+                completed_session_value(NEXT_FENCE_EPOCH),
+            ),
+        ..recovery
+    };
+    let planned_next = republication.plan().unwrap();
+    assert!(
+        republication.segment_batches().unwrap().len() > 2,
+        "fixture: the phase must have a batch to lose INSIDE it",
+    );
+    meta.commit(WriteBatch::new().put(SESSION_KEY.to_vec(), session_value(NEXT_FENCE_EPOCH, 0)))
+        .await
+        .unwrap();
+
+    meta.unknown_at(1);
+    let err = republication
+        .write_segments(&meta)
+        .await
+        .expect_err("the second batch landed and was reported unknown");
+    assert!(
+        err.downcast_ref::<CommitUnknownResult>().is_some(),
+        "a segment batch that MAY have landed must reach the completer as \
+         CommitUnknownResult, never as a Conflict it would read as 'nothing happened': {err}",
+    );
+    meta.restart();
+
+    // What the store actually has: the ambiguous batch DID land, and the cursor rode it.
+    let durable_now = meta
+        .scan(&metadata::seg_range_prefix(&next_group))
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(
+        durable_now, 2,
+        "fixture: the ambiguous batch must have applied, or there is no ambiguity to recover from",
+    );
+    assert_eq!(
+        meta.get(SESSION_KEY).await.unwrap(),
+        Some(session_value(NEXT_FENCE_EPOCH, durable_now as u32)),
+        "the cursor rode the ambiguous batch's own commit: it names what is durable, which \
+         is what makes the store — not the process's memory — the recovery's authority",
+    );
+    assert_eq!(
+        read_inode(&meta).await,
+        published,
+        "an ambiguity inside phase 1 publishes nothing",
+    );
+    assert_eq!(
+        meta.get(&metadata::inode_key(SECOND_INODE)).await.unwrap(),
+        None,
+        "…and the key this generation is being published under does not exist yet",
+    );
+
+    // Recovery (a): a completer that re-runs the phase from ZERO, not knowing how far it
+    // got, must change nothing — its first batch loses the cursor fence its predecessor
+    // already moved. Idempotency asserted on the BYTES, not on an outcome.
+    let before: Vec<(Vec<u8>, Bytes)> = {
+        let mut rows = meta
+            .scan(&metadata::seg_range_prefix(&next_group))
+            .await
+            .unwrap();
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        republication.write_segments(&meta).await.unwrap(),
+        CommitOutcome::Conflict,
+        "a re-run from zero loses to the cursor its own ambiguous batch advanced",
+    );
+    let mut after = meta
+        .scan(&metadata::seg_range_prefix(&next_group))
+        .await
+        .unwrap();
+    after.sort();
+    assert_eq!(
+        before, after,
+        "…and it wrote nothing: identical keys, identical bytes",
+    );
+
+    // Recovery (b): the completer reads the cursor and resumes from it — the phase
+    // finishes, the flip publishes, and the object resolves to the whole list.
+    let recovered = metadata::SegmentedPublication {
+        inode_id: SECOND_INODE,
+        root: metadata::RootPrecondition::Fresh,
+        group: next_group.clone(),
+        resume_from: durable_now as u32,
+        flip: WriteBatch::new()
+            .require(
+                SESSION_KEY.to_vec(),
+                session_value(NEXT_FENCE_EPOCH, planned_next.len() as u32),
+            )
+            .put(
+                SESSION_KEY.to_vec(),
+                completed_session_value(NEXT_FENCE_EPOCH),
+            ),
+        ..republication
+    };
+    assert_eq!(
+        recovered.write_segments(&meta).await.unwrap(),
+        CommitOutcome::Committed,
+        "the resumed phase completes from the recovered cursor",
+    );
+    let durable: Vec<(Vec<u8>, Bytes)> = {
+        let mut rows = meta
+            .scan(&metadata::seg_range_prefix(&next_group))
+            .await
+            .unwrap();
+        rows.sort();
+        rows
+    };
+    let mut expected: Vec<(Vec<u8>, Bytes)> = planned_next
+        .iter()
+        .map(|(segment, record)| {
+            (
+                metadata::seg_key(&next_group, segment.index),
+                metadata::encode(record),
+            )
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        durable, expected,
+        "recovery across an ambiguous batch is idempotent: the durable range is exactly \
+         the plan, with no record written twice under a second spelling",
+    );
+    assert_eq!(
+        recovered.flip(&meta).await.unwrap(),
+        CommitOutcome::Committed,
+        "…and the recovered publication publishes",
+    );
+    let republished: InodeRecord = metadata::decode(
+        &meta
+            .get(&metadata::inode_key(SECOND_INODE))
+            .await
+            .unwrap()
+            .expect("the recovered publication's root is durable"),
+    )
+    .unwrap();
+    assert_eq!(
+        republished.chunk_map.group(),
+        Some(&next_group),
+        "the root names the recovered generation",
+    );
+    assert_eq!(
+        metadata::resolve_chunk_map(&meta, &metadata::inode_key(SECOND_INODE), &republished)
+            .await
+            .unwrap()
+            .chunks(),
+        Some(chunks.as_slice()),
+        "…and it resolves to the whole chunk list, across the ambiguous batch's records",
+    );
+    // The first object is untouched by any of it: two segmented generations coexist, each
+    // resolving to its own range.
+    assert_eq!(read_inode(&meta).await, published);
+    assert_eq!(
+        metadata::resolve_chunk_map(&meta, &metadata::inode_key(INODE), &published)
+            .await
+            .unwrap()
+            .chunks(),
+        Some(chunks.as_slice()),
+    );
+
+    // ---- a recovery that meets a REPOINTED live generation restores nothing ----
+    //
+    // The window an ambiguous flip opens is wider than the flip itself: while the completer
+    // is deciding what happened, the object is **live**, and maintenance can move a fragment
+    // inside one of its `seg:` records — reconstruction or rebalance through
+    // `repoint_chunk`'s `require(seg == prior)` compare-and-swap, orphaning the placement it
+    // vacated. The recovery re-derives the SAME plan, whose records still name the OLD
+    // placement, so a phase that wrote them back would republish fragments the repoint has
+    // already orphaned: a live map naming bytes GC reclaims once the grace window passes,
+    // from a call that reports nothing worse than `Conflict`.
+    //
+    // This is the arm the publication's own range read can see — the repoint is durable
+    // before the recovery starts — so the refusal lands before anything is written. The arm
+    // it cannot see (the repoint landing *between* that read and the batch it guards) is
+    // pinned by the compare-and-swap each segment write carries, over a store that commits
+    // the same production repoint inside the window
+    // (`a_segment_phase_never_overwrites_a_row_a_live_repoint_moved`,
+    // `crates/core/src/metadata.rs`).
+    let homes = metadata::resolve_chunk_homes(&meta, &metadata::inode_key(INODE), &published)
+        .await
+        .unwrap()
+        .expect("the live generation resolves");
+    let moved = metadata::repoint_chunk(INODE, &published, &homes[0].home, vec![2]).unwrap();
+    let seg = moved.puts[0].0.clone();
+    assert_eq!(
+        meta.commit(moved).await.unwrap(),
+        CommitOutcome::Committed,
+        "fixture: the maintenance repoint lands on the live generation",
+    );
+    let repointed = meta.get(&seg).await.unwrap();
+    assert!(
+        repointed.is_some(),
+        "fixture: the repointed row is readable"
+    );
+
+    // The same recovery the ambiguous flip left this completer holding: same object, same
+    // generation, same frozen chunk list, a cursor of zero.
+    let replay = metadata::SegmentedPublication {
+        inode_id: INODE,
+        root: metadata::RootPrecondition::Supersede(&intruder),
+        group: group.clone(),
+        chunks: chunks.clone(),
+        meta: metadata::ObjectMeta::default(),
+        fence_key: SESSION_KEY.to_vec(),
+        segment_batch: &session,
+        resume_from: 0,
+        batch_budget: Some(metadata::SEGMENT_TARGET_BYTES + 1_000),
+        ops_budget: None,
+        flip: WriteBatch::new()
+            .require(
+                SESSION_KEY.to_vec(),
+                session_value(FENCE_EPOCH, planned as u32),
+            )
+            .put(SESSION_KEY.to_vec(), completed_session_value(FENCE_EPOCH)),
+    };
+    let err = replay
+        .publish(&meta)
+        .await
+        .expect_err("a recovery may not write its plan over a row maintenance has moved");
+    assert!(
+        matches!(
+            err.downcast_ref::<ChunkMapError>(),
+            Some(ChunkMapError::ResumePrefixMismatch { .. }),
+        ),
+        "the refusal names the durable record the plan disagrees with: {err}",
+    );
+    assert_eq!(
+        meta.get(&seg).await.unwrap(),
+        repointed,
+        "…and the repointed record is byte-for-byte what the repoint left: the recovery \
+         restored no stale placement",
+    );
+    assert_eq!(
+        read_inode(&meta).await,
+        published,
+        "…nor did it move the live root",
+    );
+}
+
+/// **Property 11 — a segmented repoint and a supersede/delete of the generation never
+/// both win (X47, `0016:2492`).**
+///
+/// Reconstruction and rebalance rewrite a `ChunkRef.placement` inside a `seg:` record, so
+/// their compare-and-swap must carry `require(inode == prior)` as well as
+/// `require(seg == prior)`: the inode precondition is the ONLY thing that makes a repoint
+/// lose to a supersede/delete that has already advanced the generation. Both
+/// interleavings are asserted, plus the deleted-root one.
+async fn prop_segmented_repoint_never_races_a_supersede(rng: &mut ChaCha8Rng) {
+    let meta = MemMeta::default();
+    let d = servers();
+    let fleet = fleet_of(&d);
+    write_rs_2_1(&meta, &fleet).await;
+    let group = SegmentGroup::new("0123456789abcdef0123456789abcdef", 7).unwrap();
+    reshape_into_segments(&meta, &group).await;
+    // The seed picks which segment the repoint targets.
+    let target: usize = (rng.next_u32() % 2) as usize;
+
+    let plan_repoint = |root: &InodeRecord, homes: Vec<metadata::HomedChunk>| {
+        let home = homes[target].home.clone();
+        // A repoint carries the new PLACEMENT only — the chunk's identity comes from the
+        // record the CAS is preconditioned on.
+        metadata::repoint_chunk(INODE, root, &home, vec![3, 1, 2]).unwrap()
+    };
+
+    // ---- arm 1: the supersede wins first, so the repoint must lose ----
+    let held = read_inode(&meta).await;
+    let homes = metadata::resolve_chunk_homes(&meta, &metadata::inode_key(INODE), &held)
+        .await
+        .unwrap()
+        .expect("the committed generation resolves");
+    let repoint = plan_repoint(&held, homes);
+    let seg_before = meta
+        .get(&metadata::seg_key(&group, target as u32))
+        .await
+        .unwrap()
+        .unwrap();
+    // The supersede publishes a new (flat) generation over the same key — the shape a
+    // second write installs — so the generation the repoint was planned against is gone.
+    let superseded = InodeRecord {
+        chunk_map: vec![ChunkRef {
+            id: ChunkId::from(0xFEED_u64),
+            scheme: EcScheme::None,
+            len: 1,
+            placement: vec![0],
+        }]
+        .into(),
+        size: 1,
+        version: held.version + 1,
+        ..held.clone()
+    };
+    meta.commit(
+        WriteBatch::new()
+            .require(metadata::inode_key(INODE), metadata::encode(&held))
+            .put(metadata::inode_key(INODE), metadata::encode(&superseded)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        meta.commit(repoint).await.unwrap(),
+        CommitOutcome::Conflict,
+        "a repoint planned against a generation the supersede has already replaced must \
+         LOSE — `require(inode == prior)` is what closes the X47 race",
+    );
+    assert_eq!(
+        meta.get(&metadata::seg_key(&group, target as u32))
+            .await
+            .unwrap()
+            .unwrap(),
+        seg_before,
+        "…and it must not have rewritten the retired generation's segment record",
+    );
+
+    // ---- arm 2: the repoint wins first; the supersede then reads the CURRENT placement ----
+    let meta = MemMeta::default();
+    let fleet = fleet_of(&d);
+    write_rs_2_1(&meta, &fleet).await;
+    reshape_into_segments(&meta, &group).await;
+    let held = read_inode(&meta).await;
+    let homes = metadata::resolve_chunk_homes(&meta, &metadata::inode_key(INODE), &held)
+        .await
+        .unwrap()
+        .unwrap();
+    let repoint = plan_repoint(&held, homes);
+    assert_eq!(
+        meta.commit(repoint).await.unwrap(),
+        CommitOutcome::Committed,
+        "with the generation still current the repoint wins",
+    );
+    let moved: SegmentRecord = metadata::decode(
+        &meta
+            .get(&metadata::seg_key(&group, target as u32))
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        moved.chunks()[0].placement,
+        vec![3, 1, 2],
+        "the repoint landed in the `seg:` record that carries the chunk",
+    );
+    assert_eq!(
+        read_inode(&meta).await,
+        held,
+        "…and left the ROOT byte-identical: the root is the generation fence, not the \
+         repoint target, so its version does not move",
+    );
+    // The supersede that follows re-reads the segment records at drain time — which is
+    // why decision 7(f) names them by KEY, not by a frozen placement: what it finds is
+    // the moved position, so the vacated one is what gets orphaned.
+    let drained = metadata::resolve_chunk_homes(&meta, &metadata::inode_key(INODE), &held)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        drained[target].chunk.placement,
+        vec![3, 1, 2],
+        "a retirement drain that re-reads the segment sees the CURRENT placement",
+    );
+
+    // ---- arm 3: the root is deleted; a repoint planned before it must still lose ----
+    let homes = metadata::resolve_chunk_homes(&meta, &metadata::inode_key(INODE), &held)
+        .await
+        .unwrap()
+        .unwrap();
+    let repoint = plan_repoint(&held, homes);
+    meta.commit(WriteBatch::new().delete(metadata::inode_key(INODE)))
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.commit(repoint).await.unwrap(),
+        CommitOutcome::Conflict,
+        "a repoint against a DELETED generation must lose too",
     );
 }
 
@@ -1368,6 +2465,24 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn segmented_resolve_never_tears_on_retirement() {
+        prop_segmented_resolve_never_tears_on_retirement(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn staged_publication_is_atomic_at_the_flip() {
+        prop_staged_publication_is_atomic_at_the_flip(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn segmented_repoint_never_races_a_supersede() {
+        prop_segmented_repoint_never_races_a_supersede(&mut rand_seed()).await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -1398,6 +2513,9 @@ dst_campaign_test! {
             prop_durability_emission_rises_then_returns_to_zero(&mut rng).await;
             prop_crash_mid_write_commits_nothing(&mut rng).await;
             prop_reader_flips_atomically_across_commit(&mut rng).await;
+            prop_segmented_resolve_never_tears_on_retirement(&mut rng).await;
+            prop_staged_publication_is_atomic_at_the_flip(&mut rng).await;
+            prop_segmented_repoint_never_races_a_supersede(&mut rng).await;
         }
     }
 }

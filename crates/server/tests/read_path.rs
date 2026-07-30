@@ -119,7 +119,13 @@ fn reader_sees_old_or_new_version_never_a_hybrid() {
         );
         // A reader holding the v1 snapshot still reassembles all of v1 — never a mix.
         assert_eq!(
-            read::read_object_from(&chunks, &v1).await.unwrap(),
+            read::read_object_chunks(
+                &chunks,
+                v1.chunk_map.as_flat().expect("a flat snapshot"),
+                v1.size,
+            )
+            .await
+            .unwrap(),
             b"version one is here"
         );
     });
@@ -150,7 +156,7 @@ fn checksum_mismatch_surfaces_as_an_error() {
         let path = fragment_path(
             dir.path(),
             FragmentId {
-                chunk: inode.chunk_map[0].id,
+                chunk: inode.chunk_map.as_flat().unwrap()[0].id,
                 index: 0,
             },
         );

@@ -81,8 +81,12 @@ fn rs_put_stages_n_fragments_and_reads_back_byte_identical() {
         // The chunk map records one chunk under the RS(6,3) scheme with the
         // chunk's logical length.
         let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
-        assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
-        let chunk = inode.chunk_map[0].clone();
+        assert_eq!(
+            inode.chunk_map.as_flat().unwrap().len(),
+            1,
+            "single-chunk object"
+        );
+        let chunk = inode.chunk_map.as_flat().unwrap()[0].clone();
         assert_eq!(chunk.scheme, RS, "scheme recorded in the chunk map");
         assert_eq!(chunk.len, data.len() as u64, "logical length recorded");
 
@@ -119,7 +123,16 @@ fn rs_put_stages_n_fragments_and_reads_back_byte_identical() {
             .is_none());
 
         // The object reconstructs byte-identical through the read path.
-        assert_eq!(read::read_object_from(&chunks, &inode).await.unwrap(), data);
+        assert_eq!(
+            read::read_object_chunks(
+                &chunks,
+                inode.chunk_map.as_flat().expect("a flat snapshot"),
+                inode.size,
+            )
+            .await
+            .unwrap(),
+            data
+        );
     });
 }
 
@@ -170,7 +183,13 @@ fn exactly_one_overwrite_wins_under_rs() {
             let committed = read::read_inode(&meta, 1).await.unwrap().unwrap();
             assert_eq!(committed.version, 2, "seed {seed}: bumped once");
             assert_eq!(
-                read::read_object_from(&chunks, &committed).await.unwrap(),
+                read::read_object_chunks(
+                    &chunks,
+                    committed.chunk_map.as_flat().expect("a flat snapshot"),
+                    committed.size,
+                )
+                .await
+                .unwrap(),
                 b"winner"
             );
         }
@@ -199,7 +218,7 @@ fn mixed_era_chunks_read_through_one_path() {
             .collect();
         let inode = InodeRecord {
             size: (part_none.len() + part_rs.len()) as u64,
-            chunk_map,
+            chunk_map: chunk_map.into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
@@ -208,7 +227,13 @@ fn mixed_era_chunks_read_through_one_path() {
         let mut expected = part_none.to_vec();
         expected.extend_from_slice(part_rs);
         assert_eq!(
-            read::read_object_from(&chunks, &inode).await.unwrap(),
+            read::read_object_chunks(
+                &chunks,
+                inode.chunk_map.as_flat().expect("a flat snapshot"),
+                inode.size,
+            )
+            .await
+            .unwrap(),
             expected
         );
     });
@@ -241,7 +266,11 @@ async fn put_rs(meta: &RedbMetadataStore, chunks: &FsChunkStore, data: &[u8]) ->
     .await
     .unwrap();
     let inode = read::read_inode(meta, 1).await.unwrap().unwrap();
-    assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
+    assert_eq!(
+        inode.chunk_map.as_flat().unwrap().len(),
+        1,
+        "single-chunk object"
+    );
     inode
 }
 
@@ -270,14 +299,20 @@ fn reads_survive_any_m_fragment_losses() {
             }
             let (meta, chunks, dir) = backends();
             let inode = put_rs(&meta, &chunks, &data).await;
-            let cid = inode.chunk_map[0].id;
+            let cid = inode.chunk_map.as_flat().unwrap()[0].id;
             for index in 0..9u16 {
                 if mask & (1 << index) != 0 {
                     std::fs::remove_file(frag_path(dir.path(), cid, index)).unwrap();
                 }
             }
             assert_eq!(
-                read::read_object_from(&chunks, &inode).await.unwrap(),
+                read::read_object_chunks(
+                    &chunks,
+                    inode.chunk_map.as_flat().expect("a flat snapshot"),
+                    inode.size,
+                )
+                .await
+                .unwrap(),
                 data,
                 "deleting fragments {mask:#011b} must still reconstruct"
             );
@@ -291,13 +326,19 @@ fn fewer_than_k_fragments_is_a_clean_typed_error() {
         let data = sample();
         let (meta, chunks, dir) = backends();
         let inode = put_rs(&meta, &chunks, &data).await;
-        let cid = inode.chunk_map[0].id;
+        let cid = inode.chunk_map.as_flat().unwrap()[0].id;
 
         // Delete m + 1 = 4 fragments → only 5 < k = 6 remain.
         for index in [0u16, 1, 2, 3] {
             std::fs::remove_file(frag_path(dir.path(), cid, index)).unwrap();
         }
-        let err = read::read_object_from(&chunks, &inode).await.unwrap_err();
+        let err = read::read_object_chunks(
+            &chunks,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(
                 err.downcast_ref::<read::ReadError>(),
@@ -322,12 +363,18 @@ fn checksum_failing_fragments_are_excluded_and_reconstructed_around() {
         for corrupt_count in 1..=3u16 {
             let (meta, chunks, dir) = backends();
             let inode = put_rs(&meta, &chunks, &data).await;
-            let cid = inode.chunk_map[0].id;
+            let cid = inode.chunk_map.as_flat().unwrap()[0].id;
             for index in 0..corrupt_count {
                 corrupt(dir.path(), cid, index);
             }
             assert_eq!(
-                read::read_object_from(&chunks, &inode).await.unwrap(),
+                read::read_object_chunks(
+                    &chunks,
+                    inode.chunk_map.as_flat().expect("a flat snapshot"),
+                    inode.size,
+                )
+                .await
+                .unwrap(),
                 data,
                 "corrupting {corrupt_count} fragment(s) must reconstruct around them"
             );
@@ -336,11 +383,17 @@ fn checksum_failing_fragments_are_excluded_and_reconstructed_around() {
         // Corrupting m + 1 = 4 leaves < k valid fragments → typed error.
         let (meta, chunks, dir) = backends();
         let inode = put_rs(&meta, &chunks, &data).await;
-        let cid = inode.chunk_map[0].id;
+        let cid = inode.chunk_map.as_flat().unwrap()[0].id;
         for index in 0..4u16 {
             corrupt(dir.path(), cid, index);
         }
-        let err = read::read_object_from(&chunks, &inode).await.unwrap_err();
+        let err = read::read_object_chunks(
+            &chunks,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(
                 err.downcast_ref::<read::ReadError>(),

@@ -172,7 +172,8 @@ async fn commit_reference(
             scheme: EcScheme::None,
             len: 16,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -189,7 +190,7 @@ async fn commit_reference(
 async fn commit_chunk(meta: &MemMeta, inode: InodeId, name: &str, chunk_ref: ChunkRef) {
     let record = InodeRecord {
         size: 16,
-        chunk_map: vec![chunk_ref],
+        chunk_map: vec![chunk_ref].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -973,7 +974,8 @@ async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
             scheme: EcScheme::None,
             len: 16,
             placement: vec![0],
-        }],
+        }]
+        .into(),
         state: InodeState::Pending,
         version: 1,
         ..Default::default()
@@ -1004,4 +1006,120 @@ async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
         repair::queued_repairs(&meta).await.unwrap().is_empty(),
         "no repair obligation for an in-flight write's fragment"
     );
+}
+
+// ---- containment: an INCOMPLETE reference set is not a scrubbable store ----
+
+/// **Scrub refuses to certify a store it could not read — and verifies everything it
+/// could.**
+///
+/// A committed object whose chunk map cannot be resolved contributes no fragments to the
+/// reference set this pass walks (`crate::gc::ReferenceSet::unresolvable`), so none of its
+/// fragments is ever fetched, checksummed or enqueued. That is unavoidable — the map is what
+/// says which fragments they are — but answering `Satisfied` over it is not: "every referenced
+/// fragment was verified and matched" would then be a clean bill for *part* of the store
+/// wearing the name of one for all of it, and the fragments the pass never looked at are
+/// exactly the ones whose bit rot goes unrepaired (the rubric's *Absent or unsupported
+/// entries*, `AGENTS.md:175-177` — never silent success, never a silent skip).
+///
+/// Both halves are asserted together, because either alone is satisfiable by a wrong
+/// implementation: refusing to certify is worthless if the pass stopped at the damaged object
+/// (one damaged record would then cost every healthy object its bit-rot protection), and
+/// verifying the rest is worthless if the pass then reports the store as clean. The control —
+/// the same store without the damaged object — must still report `Changed`, so the refusal is
+/// bought by the damage rather than by the fixture.
+#[tokio::test]
+async fn scrub_refuses_to_certify_a_store_it_could_not_read_and_verifies_the_rest() {
+    /// A **valid** segmented root whose `seg:` records were never written: it decodes, so
+    /// every `state` filter admits it, and only the resolve of its map fails
+    /// (`ChunkMapError::SegmentAbsent`). That is the containment arm a decode-level fixture
+    /// never reaches.
+    const UNRESOLVABLE_ROOT: &str = r#"{"size":16,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":7},"segment_count":1,"segments":[{"index":0,"byte_offset":0,"byte_len":16}]},"state":"Committed","version":1}"#;
+
+    for damaged in [false, true] {
+        enable_metric_callsites();
+        let meta = MemMeta::default();
+        let d0 = MemDServer::default();
+
+        // The healthy object, and it is rotten on disk: the pass has real work to do, so
+        // "the rest of the store is still scrubbed" is a positive observable rather than
+        // the absence of one.
+        let rotten: ChunkId = 0x5C1B;
+        d0.put_fragment(frag(rotten, 0), corrupt_fragment(rotten))
+            .await
+            .unwrap();
+        commit_reference(&meta, 1, "rotten", rotten, 0).await;
+
+        if damaged {
+            let key = metadata::inode_key(2);
+            meta.commit(WriteBatch::new().put(
+                key.clone(),
+                Bytes::from_static(UNRESOLVABLE_ROOT.as_bytes()),
+            ))
+            .await
+            .unwrap();
+            let stored = meta.get(&key).await.unwrap().unwrap();
+            let record: InodeRecord = metadata::decode(&stored).unwrap();
+            assert_eq!(
+                record.state,
+                InodeState::Committed,
+                "fixture: the damaged object must be COMMITTED and decodable — the point is \
+                 that its MAP cannot be resolved",
+            );
+            assert!(
+                metadata::resolve_chunk_map(&meta, &key, &record)
+                    .await
+                    .is_err(),
+                "fixture: the seeded root's map must genuinely fail to resolve",
+            );
+        }
+
+        let coord = MemCoordination::new();
+        let (zone, custodian) = elect(&coord).await;
+        let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+        let ctx = ScrubContext {
+            meta: &meta,
+            fleet: &fleet,
+        };
+        let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+        let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+        let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            if damaged {
+                Reconciled::Blocked
+            } else {
+                Reconciled::Changed
+            },
+            "damaged={damaged}: a pass whose reference set is incomplete may not certify the \
+             store, and a pass over a store it could read fully must still report what it did",
+        );
+        // The half that stops the refusal from being an abort: the healthy object's bit rot
+        // is a durable repair obligation either way.
+        assert!(
+            repair::queued_repairs(&meta)
+                .await
+                .unwrap()
+                .contains(&rotten),
+            "damaged={damaged}: the fragments scrub COULD read are verified and their \
+             corruption enqueued — one unreadable object may not cost every other object its \
+             bit-rot protection",
+        );
+
+        telemetry.flush().unwrap();
+        let exposed = telemetry
+            .gather_prometheus()
+            .expect("Prometheus surface configured");
+        assert_eq!(
+            exposed.contains("scrub_unresolvable_records"),
+            damaged,
+            "damaged={damaged}: the object scrub could not verify is NAMED on the durability \
+             seam — a refusal an operator cannot attribute is a stall with nothing to repair; \
+             got:\n{exposed}",
+        );
+    }
 }

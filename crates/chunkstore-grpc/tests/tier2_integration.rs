@@ -128,14 +128,18 @@ async fn write_read_byte_identical_over_real_networked_dservers() {
     // assert byte-identical (the Tier-2 success criterion).
     let inode = InodeRecord {
         size: plan.size,
-        chunk_map: plan.chunk_refs(),
+        chunk_map: plan.chunk_refs().into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
     };
-    let got = read::read_object_from(&store, &inode)
-        .await
-        .expect("any-k read over real gRPC D servers");
+    let got = read::read_object_chunks(
+        &store,
+        inode.chunk_map.as_flat().expect("a flat snapshot"),
+        inode.size,
+    )
+    .await
+    .expect("any-k read over real gRPC D servers");
 
     assert_eq!(
         got, data,

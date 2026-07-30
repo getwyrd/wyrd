@@ -99,6 +99,23 @@ pub enum ReconciliationStatus {
         /// The committed chunk ids whose malformed placement is blocking every drain.
         chunks: Vec<ChunkId>,
     },
+    /// Desired state is recorded and the server holds no *valid* referenced fragment, yet
+    /// the drain cannot be certified: one or more committed objects have a chunk map that
+    /// **cannot be resolved at all** (a segmented generation whose `seg:` records are
+    /// incomplete, proposal 0016 decision 7(e)/7(h)), so the reference set this answer is
+    /// computed from is incomplete and cannot be shown not to name this server.
+    ///
+    /// The same shape as [`Self::PendingMalformed`], one level up — an unresolvable map
+    /// hides *which chunks the object owns*, where a malformed placement hides only where
+    /// one chunk's fragments are — and the same containment: refuse to certify, **attribute**
+    /// the blocking objects in the answer, keep going. Answering `Err` instead would take
+    /// the whole fleet's drain-status surface down for one damaged object, and answering
+    /// `Satisfied` would certify a drain over bytes an object may still own.
+    PendingUnresolvable {
+        /// The blocking objects, by inode key as the store spells it (`inode:<id>`),
+        /// sorted.
+        objects: Vec<String>,
+    },
     /// Desired state is recorded **and** reality matches (**policy satisfied**) — the
     /// server holds no referenced fragment; its leftover bytes are GC-eligible orphans.
     Satisfied,
@@ -164,13 +181,25 @@ pub async fn reconciliation_status(
     if genuinely_holds {
         return Ok(ReconciliationStatus::Pending);
     }
-    // No valid reference names `dserver`. But a malformed committed placement (ADR-0040
-    // decision 4) cannot be trusted to *not* name it, and rebalance refuses to evacuate
-    // it (skip + NEEDS-HUMAN), so the drain genuinely cannot complete while one exists.
-    // Stay blocked **cluster-wide** (fail safe — deliberately not scoped to servers the
-    // corrupt vector names, since trusting its contents is what ADR-0040 forbids), but
-    // ATTRIBUTE the stall: surface the blocking chunk ids in the answer so `Pending` is
-    // never unexplained. Only once no malformed placement remains is the drain `Satisfied`.
+    // No valid reference names `dserver`. But an object whose chunk map could not be
+    // resolved at all leaves the reference set INCOMPLETE — its chunks are unknown, so it
+    // cannot be shown not to place one here — and certifying a drain over it would invite
+    // an operator to decommission a server whose bytes an object still owns. Same
+    // containment as the malformed case below, one level up: blocked cluster-wide, and
+    // ATTRIBUTED by object so the stall names what to repair. Never `Err`: this surface is
+    // read per D server, and one damaged object may not blank it for the whole fleet.
+    if !referenced.unresolvable.is_empty() {
+        return Ok(ReconciliationStatus::PendingUnresolvable {
+            objects: referenced.unresolvable.iter().cloned().collect(),
+        });
+    }
+    // A malformed committed placement (ADR-0040 decision 4) cannot be trusted to *not*
+    // name it, and rebalance refuses to evacuate it (skip + NEEDS-HUMAN), so the drain
+    // genuinely cannot complete while one exists. Stay blocked **cluster-wide** (fail safe
+    // — deliberately not scoped to servers the corrupt vector names, since trusting its
+    // contents is what ADR-0040 forbids), but ATTRIBUTE the stall: surface the blocking
+    // chunk ids in the answer so `Pending` is never unexplained. Only once no malformed
+    // placement remains is the drain `Satisfied`.
     if referenced.malformed.is_empty() {
         return Ok(ReconciliationStatus::Satisfied);
     }

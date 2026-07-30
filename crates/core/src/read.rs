@@ -51,13 +51,25 @@ pub async fn read_inode(
     }
 }
 
-/// Reassemble an object's bytes from a specific inode snapshot. Reading from an
-/// explicit snapshot is what makes a read see one whole version. Each fragment's
-/// checksum is verified by the chunk store; a mismatch or a missing fragment is
-/// an error, never a short or corrupt read.
-pub async fn read_object_from(
+/// Reassemble an object's bytes from an **already-resolved** chunk list — the byte half
+/// of a read, with resolution left to the caller. Each fragment's checksum is verified by
+/// the chunk store; a mismatch or a missing fragment is an error, never a short or corrupt
+/// read, and `size` is checked against what the chunks actually produced.
+///
+/// It takes the chunk list rather than an [`InodeRecord`] deliberately. A snapshot-only
+/// entry **cannot** resolve a segmented map — its chunks live in `seg:` records — so an
+/// entry shaped `(&record)` could only refuse one, and a `.chunk_map` consumer that
+/// understands one representation and is opaque to the other is exactly what proposal
+/// 0016 decision 7(e) forbids (`0016:2393-2399`). Taking the resolved list removes this
+/// entry from that population instead of guarding it: every caller resolves through the
+/// one resolver ([`metadata::resolve_live_chunk_map`]) and then reads whatever shape the
+/// object has. `read_object` / `read_path` and the gateway do exactly that; a caller
+/// holding a flat snapshot of its own (a test, a bench) passes `record.chunk_map`'s
+/// chunks and `record.size`.
+pub async fn read_object_chunks(
     chunks: &impl PlacementChunkStore,
-    inode: &InodeRecord,
+    chunk_map: &[ChunkRef],
+    size: u64,
 ) -> Result<Vec<u8>> {
     // No metadata store at this entry, so a corruption finding cannot be recorded
     // on the repair queue; the placement-aware entries ([`read_object`] /
@@ -65,7 +77,7 @@ pub async fn read_object_from(
     // computed (and dropped) here so this path's behaviour is otherwise unchanged.
     let mut corrupt = Vec::new();
     let mut block_fault = Vec::new();
-    read_object_collecting(chunks, inode, &mut corrupt, &mut block_fault).await
+    read_chunks_collecting(chunks, chunk_map, size, &mut corrupt, &mut block_fault).await
 }
 
 /// Reassemble an object's bytes, **collecting** the ids of chunks whose read had to
@@ -75,9 +87,10 @@ pub async fn read_object_from(
 /// appended to as the read proceeds — they carry the findings even when the read
 /// ultimately fails (a chunk below `k` survivors is still a durable repair
 /// obligation).
-async fn read_object_collecting(
+async fn read_chunks_collecting(
     chunks: &impl PlacementChunkStore,
-    inode: &InodeRecord,
+    chunk_map: &[ChunkRef],
+    size: u64,
     corrupt: &mut Vec<ChunkId>,
     block_fault: &mut Vec<ChunkId>,
 ) -> Result<Vec<u8>> {
@@ -89,12 +102,12 @@ async fn read_object_collecting(
     // through to the mismatch check below instead of attempting a
     // size-proportional (or overflowing) allocation.
     let mut bytes = Vec::new();
-    for chunk in &inode.chunk_map {
+    for chunk in chunk_map {
         bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt, block_fault).await?);
     }
-    if bytes.len() as u64 != inode.size {
+    if bytes.len() as u64 != size {
         return Err(ReadError::SizeMismatch {
-            expected: inode.size,
+            expected: size,
             found: bytes.len() as u64,
         }
         .into());
@@ -490,6 +503,22 @@ pub async fn read_object(
     if inode.state != InodeState::Committed {
         return Ok(None);
     }
+    // Resolve the map through the ONE resolver every consumer shares (proposal 0016
+    // decision 7(e)): a flat map is borrowed as-is, a segmented one is read from its
+    // bounded `seg:` range. A generation retired mid-resolve is the reader's arm of the
+    // resolve-retry rule (`0016:2463-2469`): **restart against the current root** — an
+    // overwrite is not a deletion, and answering `None` for it would be a 404 for an
+    // object that never stopped existing. `None` here means the object genuinely has no
+    // live committed generation.
+    let Some(live) =
+        metadata::resolve_live_chunk_map(meta, &metadata::inode_key(inode_id), &inode).await?
+    else {
+        return Ok(None);
+    };
+    // The size framing must come from the generation the chunks were resolved FROM, or a
+    // restart would check the new bytes against the old length.
+    let size = live.restarted.as_ref().map_or(inode.size, |root| root.size);
+    let chunk_map = live.chunks;
     // Read the object, collecting any chunk whose read excluded a checksum-failing
     // fragment or a permanent block-layer read fault, then enqueue each onto the SAME
     // repair queue scrub feeds (`0005:174-176`) — whether or not the read itself
@@ -500,7 +529,8 @@ pub async fn read_object(
     // queue either way.
     let mut corrupt = Vec::new();
     let mut block_fault = Vec::new();
-    let result = read_object_collecting(chunks, &inode, &mut corrupt, &mut block_fault).await;
+    let result =
+        read_chunks_collecting(chunks, &chunk_map, size, &mut corrupt, &mut block_fault).await;
     corrupt.sort_unstable();
     corrupt.dedup();
     for chunk in corrupt {
@@ -520,11 +550,16 @@ pub async fn read_object(
 /// object bytes — so a caller can then stream the object one chunk at a time via
 /// [`read_chunk_verified`] without ever materialising the whole object (the
 /// "stream, don't buffer" invariant, issue #364 / `0015:789`).
+///
+/// The inode **id** rides out with the record because the map is not always inline: a
+/// segmented map (proposal 0016 decision 7) is resolved through
+/// [`metadata::resolve_chunk_map`], which needs the root's identity to settle a segment
+/// that a concurrent retirement deleted (decision 7(h)).
 pub async fn committed_inode(
     meta: &impl MetadataStore,
     parent: InodeId,
     name: &str,
-) -> Result<Option<InodeRecord>> {
+) -> Result<Option<(InodeId, InodeRecord)>> {
     let Some(inode_id) = resolve(meta, parent, name).await? else {
         return Ok(None);
     };
@@ -534,7 +569,7 @@ pub async fn committed_inode(
     if inode.state != InodeState::Committed {
         return Ok(None);
     }
-    Ok(Some(inode))
+    Ok(Some((inode_id, inode)))
 }
 
 /// Read and verify a **single** chunk of a committed object, enqueuing any chunk
@@ -737,13 +772,18 @@ mod tests {
     async fn oversized_inode_size_with_empty_chunk_map_errors_cleanly_not_panics() {
         let inode = InodeRecord {
             size: u64::MAX,
-            chunk_map: Vec::new(),
+            chunk_map: metadata::ChunkMap::default(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
         };
 
-        let result = read_object_from(&UnreachableStore, &inode).await;
+        let result = read_object_chunks(
+            &UnreachableStore,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        )
+        .await;
 
         match result {
             Err(err) => {
@@ -847,6 +887,142 @@ mod tests {
         assert!(
             corrupt.is_empty(),
             "an invalid stored scheme is a validation rejection, not a corruption finding"
+        );
+    }
+
+    /// A chunk store holding fragments in memory, keyed by id — enough to read a real
+    /// object back out.
+    #[derive(Default)]
+    struct MemChunks {
+        fragments: std::sync::Mutex<std::collections::HashMap<FragmentId, Bytes>>,
+    }
+
+    #[async_trait]
+    impl ChunkStore for MemChunks {
+        async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+            self.fragments.lock().unwrap().insert(id, fragment);
+            Ok(())
+        }
+        async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+            Ok(self.fragments.lock().unwrap().get(&id).cloned())
+        }
+        async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+            Ok(self.fragments.lock().unwrap().keys().copied().collect())
+        }
+        async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+            self.fragments.lock().unwrap().remove(&id);
+            Ok(())
+        }
+        async fn health(&self) -> Result<Health> {
+            Ok(Health::Healthy)
+        }
+    }
+
+    impl PlacementChunkStore for MemChunks {}
+
+    /// **The snapshot entry is no longer opaque to a segmented object.**
+    ///
+    /// It used to take an [`InodeRecord`] and could therefore only *refuse* a segmented
+    /// map — one `.chunk_map` consumer that understood one representation and not the
+    /// other, which is what decision 7(e) forbids (`0016:2393-2399`). It now takes the
+    /// resolved chunk list, so the shape is resolved once, by the one resolver, and this
+    /// entry reads whatever the object is. Asserted positively: a **segmented** object,
+    /// published by the real committer and spanning more than one `seg:` record, reads
+    /// back byte-for-byte through the same entry a flat one does.
+    #[tokio::test]
+    async fn the_snapshot_entry_reads_a_segmented_objects_resolved_chunks() {
+        use crate::metadata::{
+            RootPrecondition, SegmentBatchInfo, SegmentGroup, SegmentedPublication,
+        };
+        use crate::write::plan_write;
+        use wyrd_metadata_redb::RedbMetadataStore;
+        use wyrd_traits::{CommitOutcome, WriteBatch};
+
+        // Enough chunks that the published map needs more than one segment record, so
+        // the read crosses a segment boundary rather than reading one record.
+        let data: Vec<u8> = (0..12_000u32).map(|i| (i % 251) as u8).collect();
+        let mut next = 0u128;
+        let plan = plan_write(&data, 8, EcScheme::None, || {
+            next += 1;
+            next
+        })
+        .expect("planning a replication(1) object cannot fail");
+
+        let chunks = MemChunks::default();
+        for planned in &plan.chunks {
+            for (index, bytes) in &planned.fragments {
+                chunks
+                    .put_fragment(
+                        FragmentId {
+                            chunk: planned.id,
+                            index: *index,
+                        },
+                        bytes.clone(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let meta = RedbMetadataStore::in_memory().unwrap();
+        const SESSION: &[u8] = b"mpu:read-path";
+        // The modelled session record: the fence epoch AND the `segments_written` cursor it
+        // carries (`0016:350`). Every batch of both phases must **move** it, not merely pin
+        // it — a batch that leaves it satisfiable lets a second completer of the same
+        // generation write over this one's segments.
+        let fence_at = |written: u32| Bytes::from(format!("Completing@1|written={written}"));
+        meta.commit(WriteBatch::new().put(SESSION.to_vec(), fence_at(0)))
+            .await
+            .unwrap();
+        let hook = |info: &SegmentBatchInfo| {
+            WriteBatch::new()
+                .require(SESSION.to_vec(), fence_at(info.first_index))
+                .put(SESSION.to_vec(), fence_at(info.written))
+        };
+        let mut publication = SegmentedPublication {
+            inode_id: 1,
+            root: RootPrecondition::Fresh,
+            group: SegmentGroup::new("0123456789abcdef0123456789abcdef", 1).unwrap(),
+            chunks: plan.chunk_refs(),
+            meta: metadata::ObjectMeta::default(),
+            fence_key: SESSION.to_vec(),
+            segment_batch: &hook,
+            resume_from: 0,
+            batch_budget: None,
+            ops_budget: None,
+            flip: WriteBatch::new(),
+        };
+        let written = publication.plan().unwrap().len() as u32;
+        publication.flip = WriteBatch::new()
+            .require(SESSION.to_vec(), fence_at(written))
+            .put(SESSION.to_vec(), Bytes::from_static(b"Completed@1"));
+        assert!(
+            publication
+                .root()
+                .unwrap()
+                .chunk_map
+                .segmented()
+                .unwrap()
+                .segment_count()
+                > 1,
+            "fixture: the map must span more than one segment record",
+        );
+        assert_eq!(
+            publication.publish(&meta).await.unwrap(),
+            CommitOutcome::Committed
+        );
+
+        let root = read_inode(&meta, 1).await.unwrap().expect("published");
+        let live = metadata::resolve_live_chunk_map(&meta, &metadata::inode_key(1), &root)
+            .await
+            .unwrap()
+            .expect("a live committed generation");
+        assert_eq!(
+            read_object_chunks(&chunks, &live.chunks, root.size)
+                .await
+                .unwrap(),
+            data,
+            "the resolved segmented map reads back byte-for-byte through the snapshot entry",
         );
     }
 }

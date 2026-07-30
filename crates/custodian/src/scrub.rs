@@ -60,7 +60,9 @@ pub struct ScrubContext<'a> {
 
 /// One scrub reconciliation pass over `ctx`. Dispatched only from
 /// [`crate::reconcile_step`] (the fenced control point) — never a parallel entry.
-/// Returns [`Reconciled::Changed`] if any chunk was enqueued for reconstruction,
+/// Returns [`Reconciled::Blocked`] if any committed object's chunk map could not be resolved
+/// (the pass verified everything else and certifies nothing over the store),
+/// [`Reconciled::Changed`] if any chunk was enqueued for reconstruction,
 /// [`Reconciled::Satisfied`] otherwise.
 pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Result<Reconciled> {
     // The reference set: every fragment a *committed* chunk map points at, keyed by
@@ -81,6 +83,25 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
     // and surfaces each one as an operator signal on the durability seam instead.
     for (&chunk, m) in &referenced.malformed {
         emit_malformed(chunk, m.expected, m.actual);
+    }
+
+    // **An INCOMPLETE reference set is not a scrubbable store.** An object whose chunk map
+    // could not be resolved contributes no fragments to the set
+    // ([`crate::gc::ReferenceSet::unresolvable`]), so this pass cannot ask any D server for
+    // them and cannot say one word about their integrity — and a fragment that is never
+    // fetched is one whose corruption or absence is never turned into a repair obligation,
+    // which is the exact loss this loop exists to prevent. It is said out loud here, per
+    // object, and it is what stops the pass from answering `Satisfied` below: "every
+    // referenced fragment was verified" over a set that is missing an object's references is
+    // a clean bill for part of the store carrying the name of one for all of it (the rubric's
+    // *Absent or unsupported entries*, `AGENTS.md:175-177`).
+    //
+    // Emitted BEFORE the fleet walk, so a transient store fault later in the pass cannot cost
+    // the operator the attribution — and the walk still runs, over every fragment that IS in
+    // the set, because containment scopes the fault to the object that has it and to nothing
+    // else.
+    for object in &referenced.unresolvable {
+        emit_unscrubbable(object);
     }
 
     // Group the reference set by placed D server so the pass is driven by WHAT IS
@@ -170,11 +191,34 @@ pub(crate) async fn reconcile(ctx: &ScrubContext<'_>, _now_millis: u64) -> Resul
         }
     }
 
-    Ok(if changed {
+    Ok(if !referenced.unresolvable.is_empty() {
+        // Refuse to certify — whatever else this pass did. The enqueues above are durable in
+        // the shared repair queue either way, so nothing is lost by reporting the blocker
+        // instead of the convergence; what would be lost by reporting `Satisfied`/`Changed` is
+        // the only signal that says this pass verified part of the store.
+        Reconciled::Blocked
+    } else if changed {
         Reconciled::Changed
     } else {
         Reconciled::Satisfied
     })
+}
+
+/// Emit a committed object scrub could **not** verify, on the durability-plane seam
+/// (ADR-0011 / ADR-0012): its chunk map could not be resolved, so none of its fragments is in
+/// the reference set this pass walks and none of them was fetched, checksummed, or enqueued.
+///
+/// The counterpart of [`crate::gc::ReferenceSet::protects`] on the read side of the same
+/// incomplete set: GC's answer is to reclaim nothing, scrub's is to certify nothing — and both
+/// name the object so the gap is repairable rather than merely known to be somewhere.
+fn emit_unscrubbable(object: &str) {
+    tracing::warn!(monotonic_counter.scrub_unresolvable_records = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.scrub.audit",
+        action = "unresolvable-chunk-map",
+        inode = %object,
+        "a committed object's chunk map could not be resolved, so none of its fragments was verified this pass; the pass scrubs every other object as usual and refuses to certify the store — operator signal",
+    );
 }
 
 /// Emit **scrub coverage** on the durability-plane seam (ADR-0011 / ADR-0012,

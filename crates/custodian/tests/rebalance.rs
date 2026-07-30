@@ -298,7 +298,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -324,7 +324,7 @@ async fn write_pre_m3_chunk(meta: &MemMeta, fleet: &Fleet<'_>, scheme: EcScheme)
     chunk_refs[0].placement = Vec::new(); // the pre-M3 shape: decoded via #[serde(default)]
     let record = InodeRecord {
         size: plan.size,
-        chunk_map: chunk_refs,
+        chunk_map: chunk_refs.into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -388,10 +388,10 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
     // bytes actually live.
     let prior = read_inode(&meta).await;
     assert!(
-        prior.chunk_map[0].placement.is_empty(),
+        prior.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
         "pre-M3 record: an empty, not full-length, placement vector"
     );
-    assert_eq!(prior.chunk_map[0].placed_dserver(0), 0);
+    assert_eq!(prior.chunk_map.as_flat().unwrap()[0].placed_dserver(0), 0);
 
     // The operator marks the IDENTITY-resolved server (0) draining.
     set_lifecycle(&meta, 0, DServerLifecycle::Draining)
@@ -427,7 +427,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![1],
         "full-length (fragment_count() == 1) placement, repointed off server 0 onto the \
          one free distinct domain (B / server 1) — never an empty or short vector"
@@ -543,7 +543,7 @@ async fn evacuation_preserves_object_metadata() {
 
     let record = read_inode(&meta).await;
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![1],
         "the fragment was re-placed off the draining server (evacuation really happened)"
     );
@@ -586,12 +586,12 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
 
     let prior = read_inode(&meta).await;
     assert!(
-        prior.chunk_map[0].placement.is_empty(),
+        prior.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
         "pre-M3 record: an empty, not full-length, placement vector"
     );
     // Identity fallback: fragment i -> server i. Drain server 1 (fragment index 1, NOT
     // the first fragment — the brief's "index > 0" leg).
-    assert_eq!(prior.chunk_map[0].placed_dserver(1), 1);
+    assert_eq!(prior.chunk_map.as_flat().unwrap()[0].placed_dserver(1), 1);
 
     set_lifecycle(&meta, 1, DServerLifecycle::Draining)
         .await
@@ -626,7 +626,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "full-length placement: survivors identity-resolved, the draining index moved"
     );
@@ -634,7 +634,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
     // Spread preserved: n = 3 fragments still span n = 3 DISTINCT failure domains — only
     // possible because `survivor_domains` was resolved through the identity fallback too
     // (over the raw empty vector it would see no survivor domains at all).
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -705,7 +705,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         (0u64..9).collect::<Vec<_>>(),
         "rs(6,3) placed across distinct domains A..I (servers 0..8)"
     );
@@ -770,11 +770,11 @@ async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() 
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2, 3, 9, 5, 6, 7, 8],
         "fragment 4 evacuated off server 4 onto the one free distinct domain J (server 9)"
     );
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -865,13 +865,13 @@ async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "the evacuated fragment was re-placed on a healthy server in a distinct domain"
     );
 
     // FULL REDUNDANCY across n=3 DISTINCT domains, spread preserved.
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -971,7 +971,7 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 1, "the placement record is untouched");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the fragment stays on the draining server rather than collapse the spread"
     );
@@ -1103,7 +1103,7 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
         "exactly ONE version-conditional commit re-placed both evacuated fragments"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![3, 4, 2],
         "fragment 0 → server 3 (domain D), fragment 1 → server 4 (domain E); survivor \
          fragment 2 stays on server 2 (domain C)"
@@ -1111,7 +1111,7 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
 
     // The chunk still spans n = 3 DISTINCT failure domains — distinctness preserved across
     // a multi-fragment move (closes the `count = 2` leg of select_distinct_domains_excluding).
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -1307,7 +1307,10 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
     let prior: InodeRecord =
         metadata::decode(&racing.get(&metadata::inode_key(1)).await.unwrap().unwrap()).unwrap();
     assert_eq!(prior.version, 1);
-    assert_eq!(prior.chunk_map[0].placement, vec![0, 1, 2]);
+    assert_eq!(
+        prior.chunk_map.as_flat().unwrap()[0].placement,
+        vec![0, 1, 2]
+    );
 
     // Arm the race: the next inode-conditional commit (the custodian's evac repoint) will
     // find the inode mutated underneath it.
@@ -1345,7 +1348,7 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         "the racing writer's commit landed (version 1 → 2)"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the placement record is the racing writer's, NOT the custodian's repoint \
          (which would be [0, 3, 2]) — a racing writer loses rather than corrupts"
@@ -1379,6 +1382,241 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         exposed.contains("rebalance_conflict"),
         "the lost-CAS conflict is emitted on the durability seam; got:\n{exposed}"
     );
+}
+
+/// **The evacuation blind-spot level counts objects that could have hidden an
+/// evacuation — and an UNCOMMITTED record could not.**
+///
+/// `plan_evacuations` plans over committed maps and skips the rest, so an unreadable
+/// uncommitted root hides no fragment on a draining server. Counting one raises
+/// `rebalance_unresolvable_records` — the operator's signal that a decommission is
+/// proceeding over an incomplete picture — for a record that could never have contributed
+/// a plan, and it stays raised for as long as the damaged record exists, which is exactly
+/// as long as the operator is being told not to trust a drain that is in fact complete.
+///
+/// The state is therefore read from the bytes that are still readable
+/// (`metadata::inode_state_hint`, via the shared `resolve::classify_root`) before the
+/// fault is counted. The committed spelling of the same bytes is the control: it must
+/// still raise the level, and the record must be named on the seam in BOTH spellings —
+/// what changes is the alarm, never the visibility.
+#[tokio::test]
+async fn the_evacuation_blind_spot_level_counts_committed_records_only() {
+    /// A segmented root whose table spans 16 bytes while `size` says 99: structurally
+    /// invalid, so `metadata::decode` refuses it before any `state` filter runs.
+    fn damaged_root(state: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"size":99,"chunk_map":{{"group":{{"nonce":"0123456789abcdef0123456789abcdef","epoch":7}},"segment_count":1,"segments":[{{"index":0,"byte_offset":0,"byte_len":16}}]}},"state":"{state}","version":1}}"#
+        ))
+    }
+
+    for (state, blind_spots, seen_as, why) in [
+        (
+            "Pending",
+            0.0,
+            "custodian_unreadable_uncommitted_record",
+            "an uncommitted record contributes no evacuation plan either way, so it is no \
+             blind spot in the drain's picture",
+        ),
+        (
+            "Committed",
+            1.0,
+            "custodian_unresolvable_chunk_map",
+            "a COMMITTED record whose map cannot be read may hold a fragment on the \
+             draining server, so the picture really is incomplete",
+        ),
+    ] {
+        enable_metric_callsites();
+        let meta = MemMeta::default();
+        let (d0, d1, d2, d3) = (
+            MemDServer::default(),
+            MemDServer::default(),
+            MemDServer::default(),
+            MemDServer::default(),
+        );
+        let fleet = Fleet {
+            servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+        };
+        let topo = four_domains();
+        // A healthy RS(2,1) object on servers 0,1,2 — the evacuation this pass must still
+        // plan and commit while the damaged record sits beside it.
+        write_rs_2_1(&meta, &fleet, &topo).await;
+
+        let key = metadata::inode_key(2);
+        meta.commit(WriteBatch::new().put(key.clone(), damaged_root(state)))
+            .await
+            .unwrap();
+        assert!(
+            metadata::decode::<InodeRecord>(&meta.get(&key).await.unwrap().unwrap()).is_err(),
+            "fixture: the seeded {state} record must genuinely fail to decode",
+        );
+        set_lifecycle(&meta, 1, DServerLifecycle::Draining)
+            .await
+            .unwrap();
+
+        let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+        let ctx = RebalanceContext {
+            meta: &meta,
+            fleet: &dyn_fleet,
+            topology: &topo,
+        };
+        let coord = MemCoordination::new();
+        let (zone, custodian) = elect(&coord).await;
+        let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+        let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+        let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+        // The positive observable in both spellings: the healthy object's fragment is
+        // evacuated off the draining server. Containment is about what the pass reports.
+        assert_eq!(
+            outcome,
+            Reconciled::Changed,
+            "{state}: the healthy object's evacuation is planned and committed",
+        );
+        assert_eq!(
+            read_inode(&meta).await.chunk_map.as_flat().unwrap()[0].placement,
+            vec![0, 3, 2],
+            "{state}: …and repointed off the draining server",
+        );
+
+        telemetry.flush().unwrap();
+        let exposed = telemetry
+            .gather_prometheus()
+            .expect("Prometheus surface configured");
+        assert_eq!(
+            gauge_value(&exposed, "rebalance_unresolvable_records"),
+            Some(blind_spots),
+            "{state}: {why}; got:\n{exposed}",
+        );
+        assert_eq!(
+            counter_value(&exposed, seen_as),
+            Some(1.0),
+            "{state}: the damaged record is named on the seam whatever its state; \
+             got:\n{exposed}",
+        );
+    }
+}
+
+/// **The blind-spot level counts the OTHER spelling of unreadable too: a record whose root
+/// decodes and whose MAP cannot be resolved.**
+///
+/// The level means "this decommission is proceeding over a picture with holes in it", and a
+/// committed segmented root whose `seg:` records are gone is exactly such a hole: its chunks
+/// are unknown, so nothing can show they are not on the draining server. It reaches the walk
+/// through a different arm from a root that does not decode — the decode succeeded, the
+/// *resolve* failed — so a level wired to the decode arm alone reads zero while the operator
+/// is being told a drain is complete over an object nobody could read.
+///
+/// The healthy object beside it is the positive observable in the same pass: its fragment is
+/// still evacuated off the draining server, so the refusal is a qualifier on the picture, not
+/// an abort.
+#[tokio::test]
+async fn the_evacuation_blind_spot_level_counts_a_record_whose_map_cannot_be_resolved() {
+    /// A **valid** segmented root — it decodes, so every `state` filter admits it — whose
+    /// `seg:` records were never written, so only resolving its map fails.
+    const UNRESOLVABLE_ROOT: &str = r#"{"size":16,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":7},"segment_count":1,"segments":[{"index":0,"byte_offset":0,"byte_len":16}]},"state":"Committed","version":1}"#;
+
+    enable_metric_callsites();
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+    let topo = four_domains();
+    write_rs_2_1(&meta, &fleet, &topo).await;
+
+    let key = metadata::inode_key(2);
+    meta.commit(WriteBatch::new().put(
+        key.clone(),
+        Bytes::from_static(UNRESOLVABLE_ROOT.as_bytes()),
+    ))
+    .await
+    .unwrap();
+    let stored = meta.get(&key).await.unwrap().unwrap();
+    let record: InodeRecord = metadata::decode(&stored).expect("fixture: the root must DECODE");
+    assert_eq!(record.state, InodeState::Committed);
+    assert!(
+        metadata::resolve_chunk_map(&meta, &key, &record)
+            .await
+            .is_err(),
+        "fixture: only the RESOLVE of this root's map may fail",
+    );
+    set_lifecycle(&meta, 1, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+
+    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+    let ctx = RebalanceContext {
+        meta: &meta,
+        fleet: &dyn_fleet,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "the healthy object's evacuation is planned and committed past the damaged one",
+    );
+    assert_eq!(
+        read_inode(&meta).await.chunk_map.as_flat().unwrap()[0].placement,
+        vec![0, 3, 2],
+        "…and repointed off the draining server",
+    );
+
+    telemetry.flush().unwrap();
+    let exposed = telemetry
+        .gather_prometheus()
+        .expect("Prometheus surface configured");
+    assert_eq!(
+        gauge_value(&exposed, "rebalance_unresolvable_records"),
+        Some(1.0),
+        "the drain is proceeding over an object whose chunks are unknown; the level is what \
+         says so; got:\n{exposed}",
+    );
+    assert_eq!(
+        counter_value(&exposed, "custodian_unresolvable_chunk_map"),
+        Some(1.0),
+        "…and the object itself is NAMED on the audit seam, or an operator has a number and \
+         nothing to repair; got:\n{exposed}",
+    );
+}
+
+/// The value of a `gauge` metric read back off the Prometheus surface (the last
+/// non-comment sample matching `name`, ignoring any label set). Mirrors
+/// `backfill_telemetry.rs`.
+fn gauge_value(exposed: &str, name: &str) -> Option<f64> {
+    exposed
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let key = fields.next()?;
+            let value = fields.next()?;
+            let metric = key.split('{').next().unwrap_or(key);
+            (metric == name)
+                .then(|| value.parse::<f64>().ok())
+                .flatten()
+        })
+        .next_back()
+}
+
+/// The value of a `monotonic_counter` metric read back off the same surface; counters are
+/// exposed with a `_total` suffix.
+fn counter_value(exposed: &str, name: &str) -> Option<f64> {
+    gauge_value(exposed, &format!("{name}_total"))
 }
 
 // ---- malformed committed placement — rebalance skips + NEEDS-HUMAN (issue #348) ----
@@ -1425,7 +1663,9 @@ async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
 
     // Corrupt the committed record into a MALFORMED placement (len 1 != fragment_count 3).
     let mut record = read_inode(&meta).await;
-    record.chunk_map[0].placement = vec![0];
+    let mut malformed = record.chunk_map.as_flat().unwrap().to_vec();
+    malformed[0].placement = vec![0];
+    record.chunk_map = malformed.into();
     meta.commit(WriteBatch::new().put(metadata::inode_key(1), metadata::encode(&record)))
         .await
         .unwrap();
@@ -1456,7 +1696,7 @@ async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
     // The committed placement is UNCHANGED — never rewritten over a fabricated vector.
     let after = read_inode(&meta).await;
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0],
         "malformed placement is left exactly as committed (never repointed) (#348)"
     );
@@ -1488,5 +1728,139 @@ async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
         },
         "a drain stays blocked while a malformed committed placement is unresolved, and \
          the answer attributes the stall to the specific corrupt chunk id (#348)"
+    );
+}
+
+// ---- an UNRESOLVABLE committed map — the drain surface refuses to certify (0016 d7(e)) ----
+
+/// **A committed object whose chunk map cannot be resolved blocks every drain, is
+/// ATTRIBUTED in the answer, and does not blank the drain surface.**
+///
+/// One level up from the malformed-placement case above. A malformed `placement` hides
+/// *where one chunk's fragments are*; a segmented root whose generation is incomplete
+/// hides *which chunks the object owns at all*, so the reference set the drain answer is
+/// computed from is incomplete and cannot be shown not to name this server. Certifying
+/// `Satisfied` over it would invite an operator to decommission a server whose bytes a live
+/// object still owns.
+///
+/// The other half is the blast radius (the brief's failure-containment table): the answer
+/// must be a **value**, not an `Err`. This surface is read per D server and can delete
+/// nothing, so one damaged object returning `Err` would take the whole fleet's drain status
+/// down — which is the store-wide outage the containment rule exists to prevent.
+///
+/// Pre-fix: `referenced_fragments` propagates the resolver's `ChunkMapError` with `?`, so
+/// `reconciliation_status` is `Err` for **every** server in the store.
+#[tokio::test]
+async fn a_drain_stays_blocked_and_attributed_while_a_map_cannot_be_resolved() {
+    let meta = MemMeta::default();
+    let (d0, d1, d2, d3) = (
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+        MemDServer::default(),
+    );
+    let fleet = Fleet {
+        servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
+    };
+    let topo = four_domains();
+    // A healthy, fully-placed object on servers 0,1,2 — the store is not empty, so
+    // "nothing is Satisfied" cannot be an artefact of an empty reference set.
+    write_rs_2_1(&meta, &fleet, &topo).await;
+
+    // A SECOND committed object whose root names a segment group with no `seg:` record
+    // behind it: resolvable by nobody (`ChunkMapError::SegmentAbsent`).
+    let group = metadata::SegmentGroup::new("0123456789abcdef0123456789abcdef", 7).unwrap();
+    let damaged = InodeRecord {
+        size: 8,
+        chunk_map: metadata::ChunkMap::Segmented(
+            metadata::SegmentedMap::new(
+                group,
+                vec![metadata::SegmentRef {
+                    index: 0,
+                    byte_offset: 0,
+                    byte_len: 8,
+                }],
+            )
+            .unwrap(),
+        ),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    };
+    meta.commit(WriteBatch::new().put(metadata::inode_key(2), metadata::encode(&damaged)))
+        .await
+        .unwrap();
+
+    // A THIRD committed object, damaged the other way an object can be: not by a record
+    // that is ABSENT but by records that are present and **unreadable** — a `seg:` record
+    // whose declared span disagrees with its chunks, under a root whose own segment table
+    // miscounts itself. Both fail at *decode*, which reaches this surface through a
+    // different path than an absent record does, so a containment that recognised only the
+    // absent spelling would blank the drain surface here for the whole fleet.
+    let nonce = "aaaabbbbccccddddeeeeffff00001111";
+    meta.commit(
+        WriteBatch::new()
+            .put(
+                format!("seg:{nonce}:7:000000").into_bytes(),
+                Bytes::from_static(
+                    br#"{"chunks":[{"id":9,"scheme":"None","len":8,"placement":[0]}],"byte_offset":0,"byte_len":9}"#,
+                ),
+            )
+            .put(
+                metadata::inode_key(3),
+                Bytes::from(format!(
+                    r#"{{"size":8,"chunk_map":{{"group":{{"nonce":"{nonce}","epoch":7}},"segment_count":2,"segments":[{{"index":0,"byte_offset":0,"byte_len":8}}]}},"state":"Committed","version":1}}"#
+                )),
+            ),
+    )
+    .await
+    .unwrap();
+
+    // Server 3 holds nothing at all, so the ONLY thing that can keep it from `Satisfied`
+    // is the objects nobody can resolve.
+    set_lifecycle(&meta, 3, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciliation_status(&meta, 3).await.unwrap(),
+        ReconciliationStatus::PendingUnresolvable {
+            objects: vec!["inode:2".to_string(), "inode:3".to_string()],
+        },
+        "a drain over an incomplete reference set must refuse to certify AND name EVERY \
+         object to repair, in every spelling of damage — and must answer at all, rather \
+         than failing the surface for every server in the fleet",
+    );
+
+    // With the unreadable-record object repaired (here: removed), the surface still refuses
+    // for the absent-record one — the two are attributed independently, not folded into one
+    // "something is wrong".
+    meta.commit(WriteBatch::new().delete(metadata::inode_key(3)))
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciliation_status(&meta, 3).await.unwrap(),
+        ReconciliationStatus::PendingUnresolvable {
+            objects: vec!["inode:2".to_string()],
+        },
+    );
+
+    // …and a server that genuinely holds a referenced fragment still answers the ordinary
+    // `Pending`: the containment does not swallow the honest answer.
+    set_lifecycle(&meta, 0, DServerLifecycle::Draining)
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciliation_status(&meta, 0).await.unwrap(),
+        ReconciliationStatus::Pending,
+    );
+
+    // The mirror that makes the first assertion non-vacuous: with the unresolvable object
+    // gone, the same server certifies.
+    meta.commit(WriteBatch::new().delete(metadata::inode_key(2)))
+        .await
+        .unwrap();
+    assert_eq!(
+        reconciliation_status(&meta, 3).await.unwrap(),
+        ReconciliationStatus::Satisfied,
     );
 }

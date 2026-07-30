@@ -160,7 +160,8 @@ async fn commit_reference(
             scheme: EcScheme::None,
             len: 5,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -340,7 +341,8 @@ async fn identity_fallback_none_empty_placement_protects_index0() {
             scheme: EcScheme::None,
             len: 5,
             placement: vec![], // pre-M3: empty placement, identity fallback applies
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -409,7 +411,8 @@ async fn identity_fallback_rs_empty_placement_protects_index_above_zero() {
             scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
             len: 5,
             placement: vec![], // pre-M3: empty, identity fallback for all 3 indices
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -478,7 +481,8 @@ async fn short_placement_vector_fallback_protects_fallback_index() {
             len: 5,
             // Short vector: index 0 → D-server 5 (explicit), indices 1 and 2 fall back.
             placement: vec![5],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -542,7 +546,8 @@ async fn identity_fallback_rs_6_3_empty_placement_protects_an_inner_index() {
             scheme: EcScheme::ReedSolomon { k: 6, m: 3 },
             len: 5,
             placement: Vec::new(), // pre-M3: empty, identity fallback for all 9 indices
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -602,7 +607,8 @@ async fn short_placement_vector_rs_6_3_fallback_protects_fallback_index() {
             len: 5,
             // Short vector: indices 0,1,2 explicit (off-identity), 3..9 fall back.
             placement: vec![50, 51, 52],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -685,7 +691,8 @@ async fn malformed_placement_gc_treats_chunk_as_fully_referenced() {
             len: 5,
             // Non-empty, len 2 != fragment_count() 6 → malformed.
             placement: vec![0, 1],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -776,4 +783,100 @@ async fn honours_the_reader_safe_grace_window() {
         d0.get_fragment(frag(chunk, 0)).await.unwrap().is_none(),
         "the orphan is reclaimed only after the reader-safe grace window"
     );
+}
+
+// ---- containment precision: an UNCOMMITTED record's fault is nobody else's ----
+
+/// **A record that could never have authorized anything may not stop the fleet from
+/// reclaiming.**
+///
+/// The reference set covers *committed* maps only, so an inode in `Pending` state is skipped
+/// whether or not it can be read (`gc.rs:referenced_fragments`). But a segmented root whose
+/// generation is damaged fails at **decode**, before that skip — and containing it there
+/// records it as a blocker, which makes the set incomplete and turns
+/// `ReferenceSet::protects` into "reclaim nothing", fleet-wide, until a human repairs a
+/// record that was never protecting bytes in the first place.
+///
+/// So the state is read from the bytes that are still readable
+/// (`metadata::inode_state_hint`) and an unambiguously **uncommitted** record is skipped and
+/// attributed rather than treated as a blocker. The fixture carries the fault it is about:
+/// the damaged record is really in the store, really undecodable, and really segmented.
+///
+/// The control in the same test is the *committed* spelling of the same bytes, which MUST
+/// still freeze the pass — that is the containment rule leg A(vii)(d) asserts, and a fix that
+/// bought precision by dropping it would pass this test's first half and fail here.
+#[tokio::test]
+async fn an_unreadable_uncommitted_record_does_not_freeze_the_fleets_reclamation() {
+    /// A segmented root at a group whose `seg:` records were never written — undecodable
+    /// only in the sense that no consumer can resolve it, and structurally invalid at
+    /// decode (its table's span disagrees with `size`), so `metadata::decode` refuses it.
+    fn damaged_root(state: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"size":99,"chunk_map":{{"group":{{"nonce":"0123456789abcdef0123456789abcdef","epoch":7}},"segment_count":1,"segments":[{{"index":0,"byte_offset":0,"byte_len":16}}]}},"state":"{state}","version":1}}"#
+        ))
+    }
+
+    for (state, reclaims, why) in [
+        (
+            "Pending",
+            true,
+            "an uncommitted record is outside the committed reference set either way, so the \
+             pass stays complete and the elapsed orphan is reclaimed",
+        ),
+        (
+            "Committed",
+            false,
+            "a COMMITTED record whose map cannot be resolved makes the reference set \
+             incomplete, and an incomplete set may not authorize any reclamation",
+        ),
+    ] {
+        let meta = MemMeta::default();
+        let d0 = MemDServer::default();
+
+        // The fixture's fault: a real record in the `inode:` namespace that really does not
+        // decode.
+        let key = metadata::inode_key(9);
+        meta.commit(WriteBatch::new().put(key.clone(), damaged_root(state)))
+            .await
+            .unwrap();
+        assert!(
+            wyrd_core::metadata::decode::<InodeRecord>(&meta.get(&key).await.unwrap().unwrap())
+                .is_err(),
+            "fixture: the seeded {state} record must genuinely fail to decode",
+        );
+
+        // An unrelated object's orphan, long past its grace window: the only thing that can
+        // keep it is the containment rule.
+        let orphan: ChunkId = 0xF6;
+        d0.put(frag(orphan, 0)).await;
+        mark_orphaned(&meta, 0, frag(orphan, 0), 0).await.unwrap();
+
+        let coord = MemCoordination::new();
+        let (zone, custodian) = elect(&coord).await;
+        let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+        let ctx = GcContext {
+            meta: &meta,
+            fleet: &fleet,
+            grace_window_millis: 50,
+            expired_pending: ExpiredPendingPolicy::Reclaim,
+        };
+
+        let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            if reclaims {
+                Reconciled::Changed
+            } else {
+                Reconciled::Satisfied
+            },
+            "{why}",
+        );
+        assert_eq!(
+            d0.get_fragment(frag(orphan, 0)).await.unwrap().is_none(),
+            reclaims,
+            "{why}",
+        );
+    }
 }

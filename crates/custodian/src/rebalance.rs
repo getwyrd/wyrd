@@ -48,11 +48,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use wyrd_core::metadata::{self, InodeId, InodeRecord, InodeState};
+use wyrd_core::metadata::{self, ChunkHome, ChunkRef, InodeId, InodeRecord, InodeState};
 use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
 use wyrd_core::repair;
 use wyrd_traits::{
-    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
+    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result,
 };
 
 use crate::desired_state;
@@ -84,7 +84,12 @@ pub struct RebalanceContext<'a> {
 struct EvacPlan {
     inode_id: InodeId,
     prior: InodeRecord,
-    chunk_index: usize,
+    /// The resolved chunk itself (its scheme is the identity the move verifies against).
+    chunk: ChunkRef,
+    /// The record that carries this chunk — the inode root for a flat map, the chunk's
+    /// `seg:` record for a segmented one. The CAS [`metadata::repoint_chunk`] builds
+    /// targets exactly that record (proposal 0016 decision 7(f)).
+    home: ChunkHome,
     chunk_id: ChunkId,
     /// The chunk's FULL fragment placement (length `n` == `fragment_count()`),
     /// resolved through the same authoritative identity-placement fallback the read
@@ -118,7 +123,18 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
     let draining_set: BTreeSet<DServerId> = draining.keys().copied().collect();
 
     // Plan an evacuation for each committed chunk with a fragment on a draining server.
-    let plans = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
+    // An object whose map cannot be read contributes no plan and stops none: it is
+    // contained per object (`crate::resolve::contain`) and counted, so a drain of servers
+    // that have nothing to do with the damaged object still makes progress.
+    let (plans, unresolvable) = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
+    // A LEVEL, every pass (0 included): it rises while objects are unreadable and returns
+    // to zero when they are repaired. This pass certifies nothing on its own — the drain's
+    // certification is [`crate::reconciliation_status`], which answers
+    // `PendingUnresolvable` and NAMES every one of these objects for exactly as long as
+    // one of them cannot be read (`desired_state.rs:184-195`). So an evacuation this pass
+    // could not plan can never be mistaken for a completed drain, and the operator's
+    // signal points at the record to repair rather than at the pass.
+    emit_unresolvable_records(unresolvable);
 
     let mut changed = false;
     for plan in &plans {
@@ -137,22 +153,69 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
 }
 
 /// Scan the committed chunk maps for fragments sitting on a draining server, building
-/// one [`EvacPlan`] per affected chunk.
+/// one [`EvacPlan`] per affected chunk, and returning the number of committed objects
+/// whose map could not be **read** at all.
+///
+/// Those are contained per object, never propagated ([`crate::resolve::contain`]): this
+/// walk decides which bytes MOVE, and a damaged object contributes no plan, so nothing of
+/// it is moved either way. Ending the walk instead would mean one unreadable record stops
+/// every *other* object's evacuation — a decommission that can never complete on a fleet
+/// where a single object is damaged, bought for no safety at all.
 async fn plan_evacuations(
     meta: &dyn MetadataStore,
     topology: &Topology,
     draining: &BTreeSet<DServerId>,
-) -> Result<Vec<EvacPlan>> {
+) -> Result<(Vec<EvacPlan>, usize)> {
     let mut plans = Vec::new();
+    let mut unresolvable = 0usize;
     for (key, value) in meta.scan(b"inode:").await? {
-        let record: InodeRecord = metadata::decode(&value)?;
+        let record: InodeRecord = match crate::resolve::classify_root(&key, &value)? {
+            crate::resolve::Root::Decoded(record) => record,
+            // Attributed, and NOT counted into the blind spot: this walk plans over
+            // committed maps only (the skip below), so an uncommitted record it could not
+            // read hides no evacuation. Counting one would raise a blind-spot level — the
+            // operator's alarm that a drain is proceeding over an incomplete picture —
+            // for a record that could never have contributed a plan.
+            crate::resolve::Root::UncommittedUnreadable(fault) => {
+                fault.attribute_uncommitted(crate::resolve::REBALANCE);
+                continue;
+            }
+            crate::resolve::Root::Unresolvable(fault) => {
+                fault.attribute(crate::resolve::REBALANCE);
+                unresolvable += 1;
+                continue;
+            }
+        };
         if record.state != InodeState::Committed {
             continue;
         }
         let Some(inode_id) = parse_inode_key(&key) else {
             continue;
         };
-        for (chunk_index, chunk) in record.chunk_map.iter().enumerate() {
+        // Resolve the map through the shared maintenance resolver (proposal 0016 decision
+        // 7(e)), carrying each chunk's HOME — the record whose compare-and-swap moves it:
+        // the inode root for a flat map, the chunk's `seg:` record for a segmented one
+        // (`metadata::repoint_chunk`). A generation retired under the pass is re-resolved
+        // against the LIVE root — and `record` is replaced by the root that resolve
+        // returned, since that is the one the repoint CAS must name. `None` means the
+        // object has no live committed generation at all (deleted), the same condition
+        // the `state != Committed` filter above skips.
+        let homed = match crate::resolve::contain(
+            &key,
+            crate::resolve::homes_of(meta, &key, &record).await,
+        )? {
+            crate::resolve::Contained::Resolved(homed) => homed,
+            crate::resolve::Contained::Unresolvable(fault) => {
+                fault.attribute(crate::resolve::REBALANCE);
+                unresolvable += 1;
+                continue;
+            }
+        };
+        let Some((record, homed)) = homed else {
+            continue;
+        };
+        for homed in homed {
+            let chunk = &homed.chunk;
             // Resolve the FULL `0..fragment_count()` index space through the shared
             // STRICT companion (`ChunkRef::checked_fragments`, `core/src/metadata.rs`,
             // ADR-0040 decision 4) — classify the committed placement BEFORE expanding it,
@@ -194,7 +257,8 @@ async fn plan_evacuations(
             plans.push(EvacPlan {
                 inode_id,
                 prior: record.clone(),
-                chunk_index,
+                chunk: chunk.clone(),
+                home: homed.home.clone(),
                 chunk_id: chunk.id,
                 placement,
                 evac,
@@ -202,7 +266,7 @@ async fn plan_evacuations(
             });
         }
     }
-    Ok(plans)
+    Ok((plans, unresolvable))
 }
 
 /// The outcome of evacuating one chunk.
@@ -263,7 +327,7 @@ async fn evacuate_chunk(
         let Some(bytes) = source_store.get_fragment(frag).await? else {
             return Ok(EvacOutcome::Aborted);
         };
-        if !repair::fragment_intact(&bytes, frag, plan.prior.chunk_map[plan.chunk_index].scheme) {
+        if !repair::fragment_intact(&bytes, frag, plan.chunk.scheme) {
             return Ok(EvacOutcome::Aborted);
         }
         target_store.put_fragment(frag, bytes).await?;
@@ -273,24 +337,18 @@ async fn evacuate_chunk(
 
     // THE binding commit: ONE version-conditional mutation that atomically repoints the
     // placement record and orphans the displaced fragments on the draining server. The
-    // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
-    // racing writer / superseded custodian loses here rather than corrupting the record.
-    let mut next_chunk_map = plan.prior.chunk_map.clone();
-    next_chunk_map[plan.chunk_index].placement = new_placement;
-    let next = InodeRecord {
-        size: plan.prior.size,
-        chunk_map: next_chunk_map,
-        state: InodeState::Committed,
-        version: plan.prior.version + 1,
-        // A rebalance re-places the SAME content, so it PRESERVES the object metadata
-        // (ADR-0047): a placement-maintenance commit must not move `Last-Modified` or drop
-        // the content type.
-        ..plan.prior.clone()
-    };
-    let inode_key = metadata::inode_key(plan.inode_id);
-    let mut batch = WriteBatch::new()
-        .require(inode_key.clone(), metadata::encode(&plan.prior))
-        .put(inode_key, metadata::encode(&next));
+    // CAS on the prior record is the second fence (`0005:200-203`, ADR-0015) — a racing
+    // writer / superseded custodian loses here rather than corrupting the record. For a
+    // SEGMENTED map the record that carries the chunk is its `seg:` record, so the CAS
+    // is `require(seg == prior)` **and** `require(inode == prior)` — the latter is what
+    // makes the move lose to a concurrent supersede/delete of the generation
+    // (`0016:354`, decision 7(f)). Object metadata is preserved either way: a
+    // placement-maintenance commit must not move `Last-Modified` or drop the content
+    // type (ADR-0047).
+    // The evacuation carries the new PLACEMENT only — the chunk's id, EC scheme and
+    // length are taken from the record the CAS is preconditioned on, so a drain move
+    // cannot change the object's content or framing on its way past.
+    let mut batch = metadata::repoint_chunk(plan.inode_id, &plan.prior, &plan.home, new_placement)?;
     for (dserver, frag) in &displaced {
         batch = batch.put(
             crate::gc::orphan_key(*dserver, *frag),
@@ -357,6 +415,19 @@ fn emit_needs_human(chunk: ChunkId) {
         chunk = %wyrd_traits::chunk_hex(chunk),
         "rebalance skipped a chunk with a malformed committed placement (wrong length); NEEDS-HUMAN, fragment left in place",
     );
+}
+
+/// Emit the number of committed objects this pass could not **read** — a level, on the
+/// durability-plane seam, emitted every pass (0 included) so it rises while records are
+/// damaged and returns to zero when they are repaired.
+///
+/// Each object is also named individually as it is met (`crate::resolve`'s audit event),
+/// so this gauge is the *size* of the blind spot and the audit trail is *which* objects
+/// make it up. The drain those objects belong to is never certified while they cannot be
+/// read: [`crate::reconciliation_status`] answers `PendingUnresolvable` and names them
+/// (`desired_state.rs:184-195`).
+fn emit_unresolvable_records(count: usize) {
+    tracing::warn!(gauge.rebalance_unresolvable_records = count as u64);
 }
 
 /// Emit a lost-CAS conflict on the same seam: the repoint raced another writer and the

@@ -27,7 +27,7 @@
 //! Dependency boundary (ADR-0010, `0005:421-422`): this loop stays over the
 //! `traits` / `core` seams plus `tracing` — **no** concrete backend.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 // The orphan-ledger key protocol lives in `core::metadata` (beside `pending_key`) so the
 // delete path that WRITES a grace record and this GC loop that READS it share one
@@ -225,6 +225,12 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
 /// chunk is recorded in `malformed` and treated as **fully referenced** instead — every
 /// fragment bearing its id is protected (fail safe), because its true placement cannot be
 /// trusted (truncation / corruption).
+///
+/// A committed object whose map cannot be **resolved at all** — a segmented root whose
+/// generation is incomplete — is the same rule one level up, and it is recorded in
+/// `unresolvable`: its chunk ids are not merely untrustworthy, they are *unknown*, so the
+/// set as a whole is incomplete and cannot authorize any reclamation
+/// ([`ReferenceSet::protects`]).
 pub(crate) struct ReferenceSet {
     /// `(dserver, fragment)` a valid committed chunk map references.
     pub placed: HashSet<(DServerId, FragmentId)>,
@@ -236,28 +242,105 @@ pub(crate) struct ReferenceSet {
     /// (`wyrd_core::repair::header_matches_identity`, the scrub/verify contract
     /// `0005:262-267`).
     pub schemes: HashMap<ChunkId, EcScheme>,
+    /// Committed objects whose chunk map could not be resolved, by inode key as the store
+    /// spells it (`inode:<id>`) — the blockers this set is **incomplete** because of.
+    ///
+    /// Rendered rather than parsed: this is attribution, it is what the audit seam emits,
+    /// and a key that did not parse would otherwise drop a blocker on the floor.
+    pub unresolvable: BTreeSet<String>,
 }
 
 impl ReferenceSet {
     /// Whether `frag` on `dserver` is protected from reclamation — either a valid placed
-    /// reference, or *any* fragment of a malformed (fully-referenced) chunk.
+    /// reference, *any* fragment of a malformed (fully-referenced) chunk, or **anything at
+    /// all** while the set is incomplete.
+    ///
+    /// That last clause is the containment rule for an object whose map cannot be resolved
+    /// (proposal 0016 decision 7(e); the brief's failure-containment table). Unlike a
+    /// malformed placement — where the chunk id is known and only its placement is not —
+    /// an unresolvable map hides *which chunks the object owns*, so no fragment in the
+    /// fleet can be shown not to be one of them. An incomplete reference set may not
+    /// authorize any reclamation, and this is where that is enforced rather than left to
+    /// each caller to remember: every deletion-capable pass already gates on this one
+    /// predicate (`gc.rs:162`, `restore.rs:239`), so the containment holds for all of them
+    /// or for none. The cost is a leak until the object is repaired; the alternative is
+    /// deleting a live object's bytes, which is the recorded #508-attempt-4 failure.
     pub fn protects(&self, dserver: DServerId, frag: FragmentId) -> bool {
-        self.placed.contains(&(dserver, frag)) || self.malformed.contains_key(&frag.chunk)
+        !self.unresolvable.is_empty()
+            || self.placed.contains(&(dserver, frag))
+            || self.malformed.contains_key(&frag.chunk)
     }
 }
 
 /// Build the [`ReferenceSet`] over every **committed** chunk map, classifying each
 /// chunk's committed placement **before** expanding it (ADR-0040 decision 4).
+///
+/// **One object's unresolvable map does not end the walk.** A segmented generation the
+/// store cannot resolve ([`wyrd_core::metadata::ChunkMapError`]) is recorded in
+/// [`ReferenceSet::unresolvable`] and attributed on the audit seam, and the walk goes on:
+/// the set is then *incomplete*, which `protects` turns into "reclaim nothing" — refuse to
+/// certify, attribute the blocker, keep going, the containment shape this repo already uses
+/// for a record it cannot trust (`ReconciliationStatus::PendingMalformed`,
+/// `crates/custodian/src/desired_state.rs:88-101`,`:196-208`).
+///
+/// Propagating instead would be safe for GC — it deletes nothing on an `Err` — and is the
+/// wrong answer for the callers that only *read* this set: `reconciliation_status` would
+/// return `Err` for **every** D server in the store, so one damaged object would blank the
+/// drain-status surface fleet-wide. Anything that is **not** the object's own fault (a
+/// store error, an undecodable record) still propagates: a walk that cannot read the
+/// metadata store has no reference set at all, incomplete or otherwise.
 pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<ReferenceSet> {
     let mut placed = HashSet::new();
     let mut malformed = HashMap::new();
     let mut schemes = HashMap::new();
-    for (_key, value) in meta.scan(b"inode:").await? {
-        let record: InodeRecord = metadata::decode(&value)?;
+    let mut unresolvable = BTreeSet::new();
+    for (key, value) in meta.scan(b"inode:").await? {
+        // The root's own decode is contained by the same rule as the resolve below, and
+        // for the same reason: a segmented root whose structure is corrupt fails HERE,
+        // before any resolver is reached, and propagating it would end the walk for every
+        // healthy object in the store. `metadata::decode` is what makes the two
+        // indistinguishable at this seam — it classifies a structural chunk-map fault as
+        // `ChunkMapError` whichever record class carried it (`crates/core/src/metadata.rs:1673`),
+        // so this arm cannot be the one a new failure spelling slips past.
+        let record: InodeRecord = match crate::resolve::classify_root(&key, &value)? {
+            crate::resolve::Root::Decoded(record) => record,
+            // **The state check comes first, even here** — and it is taken in
+            // `classify_root` rather than restated, because this set covers *committed*
+            // maps only (the skip below), so an uncommitted record's map is not in it
+            // whether or not it can be read, and recording one as a blocker would make an
+            // object that authorizes nothing stop every reclamation in the fleet
+            // ([`ReferenceSet::protects`]) until a human repaired it.
+            crate::resolve::Root::UncommittedUnreadable(fault) => {
+                fault.attribute_uncommitted(crate::resolve::GC);
+                continue;
+            }
+            crate::resolve::Root::Unresolvable(fault) => {
+                unresolvable.insert(fault.attribute(crate::resolve::GC));
+                continue;
+            }
+        };
         if record.state != InodeState::Committed {
             continue;
         }
-        for chunk in &record.chunk_map {
+        // Resolve the map through the ONE resolver every consumer shares (proposal 0016
+        // decision 7(e)): a flat map is borrowed unchanged, a SEGMENTED one is read from
+        // its bounded `seg:<nonce>:<epoch>:` range. This is the first and most
+        // safety-critical consumer — a segmented object whose chunks never enter this set
+        // is an object GC believes is unreferenced.
+        let live = match crate::resolve::contain(
+            &key,
+            crate::resolve::chunks_of(meta, &key, &record).await,
+        )? {
+            crate::resolve::Contained::Resolved(live) => live,
+            crate::resolve::Contained::Unresolvable(fault) => {
+                unresolvable.insert(fault.attribute(crate::resolve::GC));
+                continue;
+            }
+        };
+        let Some(live) = live else {
+            continue;
+        };
+        for chunk in live.chunks.iter() {
             // Classify the committed placement BEFORE expanding it via the shared strict
             // companion (`ChunkRef::checked_fragments`, `metadata.rs`, ADR-0040 decision
             // 4). A valid (empty / full-length) vector resolves through the same
@@ -293,6 +376,7 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
         placed,
         malformed,
         schemes,
+        unresolvable,
     })
 }
 

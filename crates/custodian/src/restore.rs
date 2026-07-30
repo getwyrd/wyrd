@@ -85,7 +85,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use wyrd_core::metadata::{self, InodeRecord, InodeState};
+use wyrd_core::metadata::{InodeRecord, InodeState};
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::{orphan_key, orphan_leases, referenced_fragments, GcContext};
@@ -137,15 +137,32 @@ pub struct RestoreReport {
     /// Committed chunks missing fragments but still holding **at least `k` at their placement**:
     /// readable, and the reconstruction loop will rebuild them. Reported for visibility.
     pub under_replicated: Vec<ChunkId>,
+    /// Committed objects whose chunk map could not be **read** — a segmented root whose
+    /// generation is incomplete, or a structurally corrupt record — by inode key as the
+    /// store spells it (`inode:<id>`).
+    ///
+    /// The pass keeps going past them (one damaged object may not cost an operator the
+    /// whole post-restore picture) and marks nothing on their account: while any object is
+    /// unresolvable the reference set is incomplete, so
+    /// [`ReferenceSet::protects`](crate::gc::ReferenceSet::protects) holds every fragment
+    /// in the fleet off-limits and [`RestoreReport::stranded_marked`] stays 0. They are
+    /// reported here because every other verdict in this report — dangling, misplaced,
+    /// under-replicated — is drawn over the objects the pass COULD read: a clean report
+    /// with a non-empty list here is a clean report about part of the store.
+    pub unresolvable: Vec<String>,
 }
 
 impl RestoreReport {
     /// Did the pass find anything an operator must act on or absorb?
+    ///
+    /// An [unresolvable object](RestoreReport::unresolvable) counts: the pass could not
+    /// read it, so "clean" over the rest of the store is not a clean bill for the store.
     pub fn is_clean(&self) -> bool {
         self.stranded_marked == 0
             && self.dangling.is_empty()
             && self.misplaced.is_empty()
             && self.under_replicated.is_empty()
+            && self.unresolvable.is_empty()
     }
 }
 
@@ -306,7 +323,9 @@ pub async fn reconcile_after_restore(
     // READ this chunk, and do its bytes still EXIST? A restore can break the first without
     // breaking the second, and answering only one of them is a lie in one direction or the
     // other (both spelled out below).
-    for (chunk, expected) in committed_chunks(ctx.meta).await? {
+    let (committed, unresolvable) = committed_chunks(ctx.meta).await?;
+    report.unresolvable = unresolvable;
+    for (chunk, expected) in committed {
         // READABLE is "present at the D server the committed placement NAMES" — nothing weaker.
         // Both consumers of a placement resolve it strictly, and neither scans the fleet:
         //
@@ -367,17 +386,62 @@ struct Expected {
     frags: Vec<(DServerId, FragmentId)>,
 }
 
-/// Every **committed** chunk, with its `k` and its placement. Skips malformed placements —
-/// GC treats them as fully referenced (fail safe) and so does this pass; a chunk whose
-/// placement cannot be trusted is not one to declare dangling.
-async fn committed_chunks(meta: &dyn MetadataStore) -> Result<Vec<(ChunkId, Expected)>> {
+/// Every **committed** chunk, with its `k` and its placement, plus the objects whose map
+/// could not be **read**. Skips malformed placements — GC treats them as fully referenced
+/// (fail safe) and so does this pass; a chunk whose placement cannot be trusted is not one
+/// to declare dangling.
+///
+/// An unreadable object is contained per object (`crate::resolve::contain`) and reported,
+/// never propagated: this walk is the report an operator reads *after a restore*, and
+/// ending it at the first damaged record would replace the whole picture — which chunks
+/// are dangling, misplaced, under-replicated — with nothing at all, at exactly the moment
+/// the operator needs it most. It is reported rather than silently omitted because every
+/// conclusion below is drawn from the set this returns: a "no dangling chunks" verdict over
+/// a store with an unreadable record is a verdict about a store the pass could not see
+/// (`AGENTS.md:175-177`).
+async fn committed_chunks(
+    meta: &dyn MetadataStore,
+) -> Result<(Vec<(ChunkId, Expected)>, Vec<String>)> {
     let mut out = Vec::new();
-    for (_key, value) in meta.scan(b"inode:").await? {
-        let record: InodeRecord = metadata::decode(&value)?;
+    let mut unresolvable = Vec::new();
+    for (key, value) in meta.scan(b"inode:").await? {
+        let record: InodeRecord = match crate::resolve::classify_root(&key, &value)? {
+            crate::resolve::Root::Decoded(record) => record,
+            // Attributed, and NOT reported as a gap in the audit: this walk is over
+            // committed chunks (the skip below), so an uncommitted record it could not
+            // read leaves no verdict unanswered. Reporting one would make
+            // [`RestoreReport::is_clean`] false for every restore of a store that holds a
+            // damaged uncommitted record — an operator told the picture is incomplete when
+            // it is whole.
+            crate::resolve::Root::UncommittedUnreadable(fault) => {
+                fault.attribute_uncommitted(crate::resolve::RESTORE);
+                continue;
+            }
+            crate::resolve::Root::Unresolvable(fault) => {
+                unresolvable.push(fault.attribute(crate::resolve::RESTORE));
+                continue;
+            }
+        };
         if record.state != InodeState::Committed {
             continue;
         }
-        for chunk in &record.chunk_map {
+        // Through the SAME resolver GC's reference build uses (proposal 0016 decision
+        // 7(e)) — the two must agree chunk for chunk, or this pass strands exactly the
+        // object GC then reclaims (the #508-attempt-4 failure).
+        let live = match crate::resolve::contain(
+            &key,
+            crate::resolve::chunks_of(meta, &key, &record).await,
+        )? {
+            crate::resolve::Contained::Resolved(live) => live,
+            crate::resolve::Contained::Unresolvable(fault) => {
+                unresolvable.push(fault.attribute(crate::resolve::RESTORE));
+                continue;
+            }
+        };
+        let Some(live) = live else {
+            continue;
+        };
+        for chunk in live.chunks.iter() {
             let Ok(frags) = chunk.checked_fragments() else {
                 continue;
             };
@@ -401,7 +465,13 @@ async fn committed_chunks(meta: &dyn MetadataStore) -> Result<Vec<(ChunkId, Expe
             ));
         }
     }
-    Ok(out)
+    // Keyed order, not scan order: `MetadataStore::scan` leaves order unspecified, so a
+    // report that listed the same objects in a different order on each run would be one an
+    // operator cannot diff between passes. Deduplicated for the same reason — an object
+    // whose root and whose segments both failed is one record to repair, not two.
+    unresolvable.sort();
+    unresolvable.dedup();
+    Ok((out, unresolvable))
 }
 
 /// How many fragments must survive for this chunk to be rebuildable: `k` under
@@ -514,6 +584,9 @@ fn emit_summary(report: &RestoreReport) {
         dangling = report.dangling.len(),
         misplaced = report.misplaced.len(),
         under_replicated = report.under_replicated.len(),
+        // The qualifier on every count above: they are drawn over the objects this pass
+        // could read, and this is how many it could not.
+        unresolvable = report.unresolvable.len(),
         "post-restore reconciliation complete",
     );
 }

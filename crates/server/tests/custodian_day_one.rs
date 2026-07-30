@@ -412,7 +412,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) {
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );

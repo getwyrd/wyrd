@@ -109,7 +109,7 @@ fn bench_throughput(c: &mut Criterion) {
     .expect("plan the write");
     let inode = InodeRecord {
         size: plan.size,
-        chunk_map: plan.chunk_refs(),
+        chunk_map: plan.chunk_refs().into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -136,8 +136,12 @@ fn bench_throughput(c: &mut Criterion) {
             .expect("seed the read");
         rgroup.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                rt.block_on(read::read_object_from(&cluster.store, &inode))
-                    .expect("any-k read");
+                rt.block_on(read::read_object_chunks(
+                    &cluster.store,
+                    inode.chunk_map.as_flat().expect("a flat snapshot"),
+                    inode.size,
+                ))
+                .expect("any-k read");
             });
         });
     }

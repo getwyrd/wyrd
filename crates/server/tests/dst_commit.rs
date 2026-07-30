@@ -145,7 +145,13 @@ fn never_a_hybrid(scheme: EcScheme, seed: u64) {
             "seed {seed}: live path is wholly v2"
         );
         assert_eq!(
-            read::read_object_from(&chunks, &snapshot).await.unwrap(),
+            read::read_object_chunks(
+                &chunks,
+                snapshot.chunk_map.as_flat().expect("a flat snapshot"),
+                snapshot.size,
+            )
+            .await
+            .unwrap(),
             v1,
             "seed {seed}: v1 snapshot is wholly v1"
         );

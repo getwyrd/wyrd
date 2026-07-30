@@ -40,7 +40,7 @@ use tracing::instrument::WithSubscriber;
 use tracing_subscriber::prelude::*;
 use wyrd_chunk_format::CORE_HEADER_LEN;
 use wyrd_coordination_mem::MemCoordination;
-use wyrd_core::metadata::{self, EcScheme, InodeId, InodeRecord};
+use wyrd_core::metadata::{self, EcScheme, InodeId, InodeRecord, InodeState};
 use wyrd_core::placement::Topology;
 use wyrd_core::read::read_object;
 use wyrd_core::repair;
@@ -287,7 +287,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
     assert_eq!(outcome, CommitOutcome::Committed);
     // The write placed the 3 fragments on the first three domains → servers 0,1,2.
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -381,7 +381,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "the rebuilt fragment was re-placed on a healthy D server in a distinct domain"
     );
@@ -398,7 +398,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
             "fragment {index} verifies its checksum and belongs to the chunk"
         );
     }
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
@@ -636,7 +636,7 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
     // identity fallback resolves them), so this is a faithful pre-M3 fixture: a chunk
     // committed before the `placement` field shipped decodes to precisely this shape.
     let prior = read_inode(&meta).await;
-    let mut chunk_map = prior.chunk_map.clone();
+    let mut chunk_map = prior.chunk_map.as_flat().unwrap().to_vec();
     chunk_map[0].placement = Vec::new();
     assert_eq!(
         metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
@@ -646,7 +646,9 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
     );
     let downgraded = read_inode(&meta).await;
     assert!(
-        downgraded.chunk_map[0].placement.is_empty(),
+        downgraded.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .is_empty(),
         "pre-M3 record: an empty, not full-length, placement vector"
     );
 
@@ -703,17 +705,17 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
     // THE re-placement pin: FULL-LENGTH (== fragment_count() == 3), never the raw
     // empty vector the chunk was committed with going into this repair.
     assert_eq!(
-        record.chunk_map[0].placement.len(),
-        usize::from(record.chunk_map[0].fragment_count()),
+        record.chunk_map.as_flat().unwrap()[0].placement.len(),
+        usize::from(record.chunk_map.as_flat().unwrap()[0].fragment_count()),
         "the re-placed record is full-length, not the short/empty vector it started from"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "survivors identity-resolved (0, 2); the lost fragment re-placed on the free \
          distinct domain D (server 3)"
     );
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
@@ -774,7 +776,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
     let bytes0 = d0.get_fragment(frag(0)).await.unwrap().unwrap();
     d9.put_fragment(frag(0), bytes0).await.unwrap();
     let prior = read_inode(&meta).await;
-    let mut chunk_map = prior.chunk_map.clone();
+    let mut chunk_map = prior.chunk_map.as_flat().unwrap().to_vec();
     chunk_map[0].placement = vec![9];
     assert_eq!(
         metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
@@ -784,7 +786,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
     );
     let downgraded = read_inode(&meta).await;
     assert_eq!(
-        downgraded.chunk_map[0].placement,
+        downgraded.chunk_map.as_flat().unwrap()[0].placement,
         vec![9],
         "a genuinely SHORT (malformed) vector: 1 entry, not the full 3"
     );
@@ -835,7 +837,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
         "no version-conditional commit landed for a malformed-placement chunk"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![9],
         "the malformed placement is left exactly as committed, never repointed (#348)"
     );
@@ -893,7 +895,7 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
     // malformed (len 2, `fragment_count() == 1`) placement — the truncation/corruption case.
     write_rs_2_1(&meta, &fleet).await;
     let prior = read_inode(&meta).await;
-    let mut chunk_map = prior.chunk_map.clone();
+    let mut chunk_map = prior.chunk_map.as_flat().unwrap().to_vec();
     chunk_map[0].scheme = EcScheme::None;
     chunk_map[0].placement = vec![7, 8];
     assert_eq!(
@@ -940,7 +942,7 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
         "no version-conditional commit landed for a malformed `None`-placement chunk"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![7, 8],
         "the malformed placement is left exactly as committed, never repointed (#348)"
     );
@@ -1011,7 +1013,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         (0u64..9).collect::<Vec<_>>(),
         "rs(6,3) placed across distinct domains A..I (servers 0..8)"
     );
@@ -1083,12 +1085,12 @@ async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() 
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2, 3, 9, 5, 6, 7, 8],
         "survivors identity-resolved; the lost fragment (index 4) re-placed on the free \
          distinct domain J (server 9)"
     );
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
@@ -1264,7 +1266,7 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "the rebuilt fragment was re-placed on a healthy D server in a distinct domain"
     );
@@ -1371,7 +1373,7 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
         "no version-conditional commit ran — the fragment was not re-placed"
     );
     assert_eq!(
-        read_inode(&meta).await.chunk_map[0].placement,
+        read_inode(&meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the placement record is unchanged — the transiently-faulting fragment stays put"
     );
@@ -1501,7 +1503,12 @@ async fn write_rs_2_1_as(
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode_id(meta, inode_id).await.chunk_map[0].placement,
+        read_inode_id(meta, inode_id)
+            .await
+            .chunk_map
+            .as_flat()
+            .unwrap()[0]
+            .placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -1589,7 +1596,7 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
     // Make chunk B MALFORMED: commit a short (len-1) placement vector on inode 2. Its
     // fragments stay physically present; only the committed placement is wrong-length.
     let prior_b = read_inode_id(&meta, 2).await;
-    let mut chunk_map_b = prior_b.chunk_map.clone();
+    let mut chunk_map_b = prior_b.chunk_map.as_flat().unwrap().to_vec();
     chunk_map_b[0].placement = vec![9];
     assert_eq!(
         metadata::commit_chunk_map(&meta, 2, &prior_b, chunk_map_b, prior_b.size)
@@ -1803,6 +1810,158 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
         queued.contains(&CHUNK_B),
         "the un-reconstructable chunk stays queued for a human, off the durability backlog gauge"
     );
+}
+
+/// **A repair obligation for a chunk no committed object owns drains — even while an
+/// UNCOMMITTED record in the same store cannot be read.**
+///
+/// `find_chunk` answers "absent" only if it read every committed map; an object it could
+/// not read is a blind spot, and the obligation stays queued rather than being retired
+/// over a chunk that might live in the map it could not read. But an **uncommitted**
+/// record is no such blind spot — only a committed map can own the chunk (`find_chunk`
+/// skips the rest) — so treating one as a blind spot answers `Unresolvable` for *every*
+/// chunk in the store, and every genuinely absent obligation stays queued for as long as
+/// one unrelated uncommitted record stays damaged. The queue is drained by nothing else,
+/// so that is permanent.
+///
+/// The committed spelling of the same bytes is the control: it must still keep the
+/// obligation, which is the property this containment exists for.
+///
+/// **And the obligation that stays queued is accounted for on the seam**, in both spellings of
+/// unreadable — a root that does not decode, and a root that decodes whose map cannot be
+/// resolved (a different arm of the same lookup). An obligation that never drains and is
+/// counted nowhere is a repair backlog an operator cannot explain: it is off the
+/// repairable-backlog gauge deliberately (nothing was assessed), so `reconstruction_unresolvable`
+/// is the only thing that says why the queue is not moving.
+#[tokio::test]
+async fn an_absent_chunks_obligation_drains_past_an_unreadable_uncommitted_record() {
+    /// A segmented root whose table spans 16 bytes while `size` says 99: structurally
+    /// invalid, so `metadata::decode` refuses it before any `state` filter runs.
+    fn damaged_root(state: &str) -> Bytes {
+        Bytes::from(format!(
+            r#"{{"size":99,"chunk_map":{{"group":{{"nonce":"0123456789abcdef0123456789abcdef","epoch":7}},"segment_count":1,"segments":[{{"index":0,"byte_offset":0,"byte_len":16}}]}},"state":"{state}","version":1}}"#
+        ))
+    }
+
+    /// A **valid** segmented root — it decodes, and its `state` is Committed — whose `seg:`
+    /// records were never written, so only *resolving* its map fails. The other spelling of
+    /// the same blind spot, reaching the lookup through its resolve arm.
+    fn unresolvable_root() -> Bytes {
+        Bytes::from_static(
+            br#"{"size":16,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":7},"segment_count":1,"segments":[{"index":0,"byte_offset":0,"byte_len":16}]},"state":"Committed","version":1}"#,
+        )
+    }
+
+    for (state, decodes, drains, blind_spots, why) in [
+        (
+            "Pending",
+            false,
+            true,
+            0.0,
+            "an uncommitted map cannot own the chunk, so the lookup really did cover the \
+             store and the stale obligation is retired",
+        ),
+        (
+            "Committed",
+            false,
+            false,
+            1.0,
+            "a COMMITTED map that cannot be read may be exactly where the chunk lives, so \
+             the obligation must survive rather than retire a live repair",
+        ),
+        (
+            "Committed-unresolvable-map",
+            true,
+            false,
+            1.0,
+            "a committed root whose MAP cannot be resolved is the same blind spot one arm \
+             over: the chunk may live in the segments nobody could read",
+        ),
+    ] {
+        enable_metric_callsites();
+        let meta = MemMeta::default();
+        let (d0, d1, d2, d3) = (
+            MemDServer::default(),
+            MemDServer::default(),
+            MemDServer::default(),
+            MemDServer::default(),
+        );
+
+        let key = metadata::inode_key(7);
+        let seeded = if decodes {
+            unresolvable_root()
+        } else {
+            damaged_root(state)
+        };
+        meta.commit(WriteBatch::new().put(key.clone(), seeded.clone()))
+            .await
+            .unwrap();
+        let stored = meta.get(&key).await.unwrap().unwrap();
+        match metadata::decode::<InodeRecord>(&stored) {
+            Err(_) => assert!(
+                !decodes,
+                "fixture: the seeded {state} record must genuinely fail to decode",
+            ),
+            Ok(record) => {
+                assert!(decodes, "fixture: {state} was expected not to decode");
+                assert_eq!(record.state, InodeState::Committed);
+                assert!(
+                    metadata::resolve_chunk_map(&meta, &key, &record)
+                        .await
+                        .is_err(),
+                    "fixture: {state} must fail at the RESOLVE, not at the decode",
+                );
+            }
+        }
+        // An obligation for a chunk no committed object references at all — the "deleted
+        // out from under the obligation" case, whose whole answer depends on whether the
+        // pass believes it read the store.
+        let stale: ChunkId = 0x5EA1;
+        repair::enqueue_repair(&meta, stale, "health")
+            .await
+            .unwrap();
+
+        let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+        let topo = four_domains();
+        let ctx = ReconstructionContext {
+            meta: &meta,
+            fleet: &dyn_fleet,
+            topology: &topo,
+            unreachable: &[],
+        };
+        let coord = MemCoordination::new();
+        let (zone, custodian) = elect(&coord).await;
+        let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+        let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
+        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        let queued = repair::queued_repairs(&meta).await.unwrap();
+        assert_eq!(
+            queued.contains(&stale),
+            !drains,
+            "{state}: {why}; queue was {queued:?}",
+        );
+        // The damaged record is never rewritten by the lookup that walked past it.
+        assert_eq!(
+            meta.get(&key).await.unwrap().unwrap(),
+            seeded,
+            "{state}: the record the pass could not read is left byte-identical",
+        );
+        telemetry.flush().unwrap();
+        let exposed = telemetry
+            .gather_prometheus()
+            .expect("Prometheus surface configured");
+        assert_eq!(
+            gauge_value(&exposed, "reconstruction_unresolvable"),
+            Some(blind_spots),
+            "{state}: an obligation kept because the pass could not read the store must be \
+             ACCOUNTED for — it is on no other gauge, so this is the only thing that explains \
+             a queue that will not move; got:\n{exposed}",
+        );
+    }
 }
 
 /// BINDING success identity (proposal 0005 §326-332, ADR-0011; the in-code contract at

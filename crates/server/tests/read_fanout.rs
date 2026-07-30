@@ -206,10 +206,17 @@ async fn rs_read_reconstructs_from_the_first_k_and_abandons_hung_d_servers() {
     // parallel any-k read reconstructs from the 6 that arrive first and abandons
     // the 3 hung fetches. A wall-clock budget turns the pre-fix stall into a clean
     // red (the live fan-out answers in milliseconds, far inside the budget).
-    let got = tokio::time::timeout(READ_BUDGET, read::read_object_from(&fanout, &inode))
-        .await
-        .expect("the any-k read must not stall on the hung D servers")
-        .expect("reconstructs from the 6 fragments that arrived first");
+    let got = tokio::time::timeout(
+        READ_BUDGET,
+        read::read_object_chunks(
+            &fanout,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        ),
+    )
+    .await
+    .expect("the any-k read must not stall on the hung D servers")
+    .expect("reconstructs from the 6 fragments that arrived first");
     assert_eq!(got, data, "reconstructed bytes are byte-identical");
 
     cluster.stop_all().await;
@@ -230,10 +237,17 @@ async fn below_k_readable_fragments_is_a_clean_typed_error() {
         cluster.stop(i).await;
     }
 
-    let err = tokio::time::timeout(READ_BUDGET, read::read_object_from(&fanout, &inode))
-        .await
-        .expect("below-k read must terminate, not hang")
-        .expect_err("fewer than k readable fragments cannot reconstruct");
+    let err = tokio::time::timeout(
+        READ_BUDGET,
+        read::read_object_chunks(
+            &fanout,
+            inode.chunk_map.as_flat().expect("a flat snapshot"),
+            inode.size,
+        ),
+    )
+    .await
+    .expect("below-k read must terminate, not hang")
+    .expect_err("fewer than k readable fragments cannot reconstruct");
     // A clean, typed error — no panic, no corrupt bytes.
     let read_err = err
         .downcast_ref::<ReadError>()

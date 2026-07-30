@@ -342,22 +342,40 @@ where
     /// [`ObjectRead`](wyrd_gateway_core::ObjectRead) stream so the seam names no runtime
     /// detail, and the committed object size rides alongside it for response framing.
     async fn get_object_streaming(self: Arc<Self>, key: &str) -> Result<Option<ObjectRead>> {
-        let Some(inode) = read::committed_inode(&self.meta, ROOT, key).await? else {
+        let Some((inode_id, inode)) = read::committed_inode(&self.meta, ROOT, key).await? else {
             return Ok(None);
         };
+        let this = Arc::clone(&self);
+        // Resolve the map through the ONE resolver every consumer shares (proposal 0016
+        // decision 7(e)): a segmented object's chunks live in its bounded `seg:` range,
+        // and they are read HERE — before the body stream is handed out — so the stream
+        // is either the whole object or nothing. A generation retired mid-resolve is the
+        // reader's arm of the resolve-retry rule (`0016:2463-2469`): the resolver restarts
+        // against the current root, so a concurrent OVERWRITE serves the new generation
+        // rather than a spurious `NoSuchKey`. `None` means the object genuinely has no
+        // live committed generation, which the wire layer renders `NoSuchKey`.
+        let Some(live) =
+            metadata::resolve_live_chunk_map(&self.meta, &metadata::inode_key(inode_id), &inode)
+                .await?
+        else {
+            return Ok(None);
+        };
+        // Frame the response from the generation the chunks came from (ADR-0047's
+        // metadata included): on a restart the OLD record's size/ETag would describe
+        // bytes this stream is not about to send.
+        let served = live.restarted.as_ref().unwrap_or(&inode);
         // Carry the committed object size out with the stream so the wire layer frames the
         // response (`Content-Length`): if a chunk read faults mid-stream (e.g. a fragment
         // reclaimed by a racing DELETE), the body ends early and the client detects the short
         // read as a truncation instead of a complete object (issue #364 carry-forward).
-        let size = inode.size;
+        let size = served.size;
         // Carry the committed object metadata (ADR-0047) out with the stream so the wire layer
         // can surface the ETag, the stored content type, and Last-Modified. A record written
         // before this model carries `None`, degrading to the pre-metadata wire behaviour.
-        let etag = inode.etag.clone();
-        let content_type = inode.content_type.clone();
-        let modified = inode.modified;
-        let this = Arc::clone(&self);
-        let chunk_map = inode.chunk_map;
+        let etag = served.etag.clone();
+        let content_type = served.content_type.clone();
+        let modified = served.modified;
+        let chunk_map = live.chunks.into_owned();
         // The reader task is spawned LAZILY — on the stream's first poll, not here — so a
         // caller that resolves the object and then never reads the body (the wire layer's
         // 304/412 conditional short-circuit drops the stream unread, issue #510 review) costs
@@ -416,20 +434,34 @@ where
         key: &str,
         range: ByteRange,
     ) -> Result<Option<RangeRead>> {
-        let Some(inode) = read::committed_inode(&self.meta, ROOT, key).await? else {
+        let Some((inode_id, inode)) = read::committed_inode(&self.meta, ROOT, key).await? else {
             return Ok(None);
         };
+        // The ranged walk is its OWN `.chunk_map` consumer, so it resolves through the
+        // same shared resolver: a range that spans a SEGMENT boundary must see the
+        // chunks either side of it, which walking the root's segment table alone cannot
+        // do (proposal 0016 decision 7(e)). Resolved FIRST, because a generation retired
+        // mid-resolve restarts against the current root (decision 7(h)) and the framing
+        // below — size, ETag, and the 416 boundary — must describe the generation the
+        // bytes will actually come from, not the superseded one.
+        let Some(live) =
+            metadata::resolve_live_chunk_map(&self.meta, &metadata::inode_key(inode_id), &inode)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let served = live.restarted.as_ref().unwrap_or(&inode);
         // Metadata from the SAME resolve as the stream below (ADR-0047), so the wire layer's
         // 206/416 headers name the version the bytes came from.
         let meta = ObjectMeta {
-            size: inode.size,
-            etag: inode.etag.clone(),
-            content_type: inode.content_type.clone(),
-            modified: inode.modified,
+            size: served.size,
+            etag: served.etag.clone(),
+            content_type: served.content_type.clone(),
+            modified: served.modified,
         };
-        // Resolve the range against THIS inode's size. An unsatisfiable range costs no chunk
-        // read — the wire layer maps it to a 416 carrying `meta.size`.
-        let Some((offset, len)) = resolve_byte_range(range, inode.size) else {
+        // Resolve the range against THAT generation's size. An unsatisfiable range costs no
+        // chunk read — the wire layer maps it to a 416 carrying `meta.size`.
+        let Some((offset, len)) = resolve_byte_range(range, served.size) else {
             return Ok(Some(RangeRead {
                 meta,
                 outcome: RangeOutcome::Unsatisfiable,
@@ -440,10 +472,11 @@ where
         // chunk entirely before `offset`, or at/after the span end, is skipped — its fragments
         // are never fetched, which is the whole point of a ranged read (issue #510
         // anti-wire-side-discard oracle: the counting store sees only the covering chunks).
+        let chunk_map = live.chunks;
         let end = offset.saturating_add(len); // exclusive
         let mut covering: Vec<(metadata::ChunkRef, usize, usize)> = Vec::new();
         let mut pos: u64 = 0;
-        for chunk in &inode.chunk_map {
+        for chunk in chunk_map.iter() {
             let chunk_start = pos;
             let chunk_end = pos.saturating_add(chunk.len);
             pos = chunk_end;
@@ -510,7 +543,7 @@ where
     /// (channel + spawned reader task) omitted, so a HEAD of a large object costs one
     /// metadata round-trip, not a chunk read.
     async fn head_object(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        let Some(inode) = read::committed_inode(&self.meta, ROOT, key).await? else {
+        let Some((_inode_id, inode)) = read::committed_inode(&self.meta, ROOT, key).await? else {
             return Ok(None);
         };
         Ok(Some(ObjectMeta {
@@ -720,9 +753,500 @@ fn now_millis() -> u64 {
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
+    use wyrd_chunkstore_fs::FsChunkStore;
+    use wyrd_coordination_mem::MemCoordination;
+    use wyrd_core::metadata::{ChunkMap, SegmentGroup, SegmentRecord, SegmentRef, SegmentedMap};
+    use wyrd_metadata_redb::RedbMetadataStore;
+
     /// `:32` `<<` — the gateway's default chunk size is 1 MiB; `>>` collapses it to 0.
     #[test]
     fn default_chunk_size_is_one_mib() {
         assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
+    }
+
+    // ---------------------------------------------------------------------
+    // The gateway read paths over a SEGMENTED chunk map (issue #635, proposal 0016
+    // decision 7(e)).
+    //
+    // The whole-object walk and the ranged walk are two SEPARATE `.chunk_map` consumers
+    // (`:356-362` and `:440-460`), so each gets its own positive observable: the bytes
+    // come back byte-identical, and the ranged one is asked for a span that crosses a
+    // SEGMENT boundary — the case a resolver that reads only the root's segment table, or
+    // only the first segment record, cannot serve.
+    //
+    // Co-located here rather than in an added `tests/*.rs` file: these name types this
+    // slice adds, and an added test target is compiled against the PRE-fix tree by the
+    // per-fix red→green gate, where they would be a build error.
+    // ---------------------------------------------------------------------
+
+    const KEY: &str = "bucket/segmented";
+    const CHUNK: usize = 8;
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    const EPOCH: u64 = 7;
+
+    type TestGateway = Gateway<RedbMetadataStore, FsChunkStore, MemCoordination>;
+
+    /// A gateway holding one object at `KEY`, whose committed map has been **reshaped**
+    /// into the segmented spelling: the same chunks, now carried by two `seg:` records
+    /// with the root naming only the group and the segment table.
+    async fn segmented_gateway(payload: &[u8]) -> (Arc<TestGateway>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let meta = RedbMetadataStore::in_memory().expect("redb");
+        let chunks = FsChunkStore::open(dir.path()).expect("fs store");
+        let gateway = Arc::new(
+            Gateway::new(meta, chunks, MemCoordination::new())
+                .with_chunk_size(CHUNK)
+                .with_durability(EcScheme::None),
+        );
+        gateway.put_object(KEY, payload).await.expect("PUT");
+        reshape_into_segments(&gateway, KEY, NONCE, EPOCH, true).await;
+        (gateway, dir)
+    }
+
+    /// Reshape the committed object at `key` into the **segmented** spelling under
+    /// `(nonce, epoch)`: the same chunks, now carried by two `seg:` records with the root
+    /// naming only the group and the segment table. These are the same records
+    /// `SegmentedPublication` writes, seeded directly so the split is under the test's
+    /// control (the committer itself is exercised in `core`'s own tests).
+    ///
+    /// `whole` is the damage switch. With `false` the root is published naming both
+    /// segments while `seg:<nonce>:<epoch>:000001` is **never written** — a committed
+    /// object whose map no consumer can resolve, which is the fixture the containment
+    /// rule is about: one such object may not cost every *other* object its availability.
+    async fn reshape_into_segments(
+        gateway: &TestGateway,
+        key: &str,
+        nonce: &str,
+        epoch: u64,
+        whole: bool,
+    ) {
+        let (inode_id, record) = read::committed_inode(&gateway.meta, ROOT, key)
+            .await
+            .expect("resolve")
+            .expect("committed");
+        let flat = record
+            .chunk_map
+            .as_flat()
+            .expect("the gateway publishes a flat map")
+            .to_vec();
+        assert!(flat.len() >= 4, "the fixture needs a real segment boundary");
+
+        let group = SegmentGroup::new(nonce, epoch).expect("nonce");
+        let (first, second) = flat.split_at(flat.len() / 2);
+        let first_record = SegmentRecord::new(first.to_vec(), 0).expect("segment record");
+        let second_record =
+            SegmentRecord::new(second.to_vec(), first_record.byte_len()).expect("segment record");
+        let table = SegmentedMap::new(
+            group.clone(),
+            vec![
+                SegmentRef {
+                    index: 0,
+                    byte_offset: 0,
+                    byte_len: first_record.byte_len(),
+                },
+                SegmentRef {
+                    index: 1,
+                    byte_offset: first_record.byte_len(),
+                    byte_len: second_record.byte_len(),
+                },
+            ],
+        )
+        .expect("segment table");
+        let root = metadata::InodeRecord {
+            chunk_map: ChunkMap::Segmented(table),
+            ..record
+        };
+        let mut batch = wyrd_traits::WriteBatch::new().put(
+            metadata::seg_key(&group, 0),
+            metadata::encode(&first_record),
+        );
+        if whole {
+            batch = batch.put(
+                metadata::seg_key(&group, 1),
+                metadata::encode(&second_record),
+            );
+        }
+        let batch = batch.put(metadata::inode_key(inode_id), metadata::encode(&root));
+        assert_eq!(
+            gateway.meta.commit(batch).await.expect("seed"),
+            CommitOutcome::Committed
+        );
+    }
+
+    async fn drain(mut stream: wyrd_gateway_core::ObjectStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(piece) = stream.next().await {
+            out.extend_from_slice(&piece.expect("chunk read"));
+        }
+        out
+    }
+
+    /// A store that supersedes the object **exactly in the window** a reader is exposed
+    /// to: after the root has been read and while its `seg:` range is being scanned, it
+    /// installs the next generation and deletes the segment records the reader was about
+    /// to read (the protocol's own order — root first, segments after, `0016:2458-2462`).
+    ///
+    /// This is the only way to reach the resolve-retry rule's reader arm from the gateway:
+    /// the window is between two store calls, so nothing a test can do *between* gateway
+    /// calls reproduces it.
+    struct SupersedeMidResolve {
+        inner: RedbMetadataStore,
+        next: Mutex<Option<wyrd_traits::WriteBatch>>,
+    }
+
+    #[async_trait::async_trait]
+    impl MetadataStore for SupersedeMidResolve {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            let pending = if prefix.starts_with(b"seg:") {
+                self.next.lock().expect("lock").take()
+            } else {
+                None
+            };
+            if let Some(batch) = pending {
+                assert_eq!(self.inner.commit(batch).await?, CommitOutcome::Committed);
+            }
+            self.inner.scan(prefix).await
+        }
+
+        // The required paginated read (#634): a test double needs *a* body, not a
+        // backend's — the dev-only testkit helper pages over this store's own `scan`.
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: wyrd_traits::WriteBatch) -> Result<CommitOutcome> {
+            self.inner.commit(batch).await
+        }
+    }
+
+    /// **An overwrite is not a deletion.** A GET that reads a segmented root and then
+    /// finds its segments gone must re-read the root and serve the generation that
+    /// replaced it — answering `NoSuchKey` there is a 404 for an object that never stopped
+    /// existing, on a key that was present before, during and after the request.
+    #[tokio::test]
+    async fn a_get_racing_an_overwrite_serves_the_new_generation_not_a_404() {
+        let payload: Vec<u8> = (0..64u8).collect();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let inner = RedbMetadataStore::in_memory().expect("redb");
+        let chunks = FsChunkStore::open(dir.path()).expect("fs store");
+
+        // Publish the object flat, then reshape it into the segmented spelling — and
+        // prepare (without committing) the batch that supersedes it back to the flat
+        // generation naming the SAME chunks, so the bytes a correct read returns are known.
+        let seeding = Arc::new(
+            Gateway::new(inner, chunks, MemCoordination::new())
+                .with_chunk_size(CHUNK)
+                .with_durability(EcScheme::None),
+        );
+        seeding.put_object(KEY, &payload).await.expect("PUT");
+        let (inode_id, flat_record) = read::committed_inode(&seeding.meta, ROOT, KEY)
+            .await
+            .expect("resolve")
+            .expect("committed");
+        let flat = flat_record.chunk_map.as_flat().expect("flat").to_vec();
+        let group = SegmentGroup::new(NONCE, EPOCH).expect("nonce");
+        let (first, second) = flat.split_at(flat.len() / 2);
+        let first_record = SegmentRecord::new(first.to_vec(), 0).expect("segment record");
+        let second_record =
+            SegmentRecord::new(second.to_vec(), first_record.byte_len()).expect("segment record");
+        let table = SegmentedMap::new(
+            group.clone(),
+            vec![
+                SegmentRef {
+                    index: 0,
+                    byte_offset: 0,
+                    byte_len: first_record.byte_len(),
+                },
+                SegmentRef {
+                    index: 1,
+                    byte_offset: first_record.byte_len(),
+                    byte_len: second_record.byte_len(),
+                },
+            ],
+        )
+        .expect("segment table");
+        let segmented_root = metadata::InodeRecord {
+            chunk_map: ChunkMap::Segmented(table),
+            ..flat_record.clone()
+        };
+        assert_eq!(
+            seeding
+                .meta
+                .commit(
+                    wyrd_traits::WriteBatch::new()
+                        .put(
+                            metadata::seg_key(&group, 0),
+                            metadata::encode(&first_record)
+                        )
+                        .put(
+                            metadata::seg_key(&group, 1),
+                            metadata::encode(&second_record)
+                        )
+                        .put(
+                            metadata::inode_key(inode_id),
+                            metadata::encode(&segmented_root)
+                        ),
+                )
+                .await
+                .expect("seed"),
+            CommitOutcome::Committed
+        );
+
+        // The overwrite the racing reader will meet: a NEW committed generation over the
+        // same key, published exactly as the protocol publishes one — root first, then the
+        // retired generation's segment records deleted.
+        let next_generation = metadata::InodeRecord {
+            version: flat_record.version + 1,
+            etag: Some("next-generation".to_string()),
+            ..flat_record.clone()
+        };
+        let supersede = wyrd_traits::WriteBatch::new()
+            .put(
+                metadata::inode_key(inode_id),
+                metadata::encode(&next_generation),
+            )
+            .delete(metadata::seg_key(&group, 0))
+            .delete(metadata::seg_key(&group, 1));
+
+        let Ok(seeding) = Arc::try_unwrap(seeding) else {
+            panic!("the seeding gateway is not shared");
+        };
+        let racing = Arc::new(
+            Gateway::new(
+                SupersedeMidResolve {
+                    inner: seeding.meta,
+                    next: Mutex::new(Some(supersede)),
+                },
+                seeding.chunks,
+                MemCoordination::new(),
+            )
+            .with_chunk_size(CHUNK)
+            .with_durability(EcScheme::None),
+        );
+
+        let read = Arc::clone(&racing)
+            .get_object_streaming(KEY)
+            .await
+            .expect("resolve")
+            .expect("a key that never stopped existing must not answer NoSuchKey");
+        assert_eq!(read.size, payload.len() as u64);
+        assert_eq!(
+            read.etag.as_deref(),
+            Some("next-generation"),
+            "the response is framed from the generation the bytes came from",
+        );
+        assert_eq!(
+            drain(read.stream).await,
+            payload,
+            "the restart serves the current generation's bytes, whole",
+        );
+
+        // …and the ranged path is its own consumer, with its own window.
+        let racing = Arc::new(
+            Gateway::new(
+                SupersedeMidResolve {
+                    inner: RedbMetadataStore::in_memory().expect("redb"),
+                    next: Mutex::new(None),
+                },
+                FsChunkStore::open(dir.path()).expect("fs store"),
+                MemCoordination::new(),
+            )
+            .with_chunk_size(CHUNK)
+            .with_durability(EcScheme::None),
+        );
+        racing.put_object(KEY, &payload).await.expect("PUT");
+        let (inode_id, flat_record) = read::committed_inode(&racing.meta, ROOT, KEY)
+            .await
+            .expect("resolve")
+            .expect("committed");
+        let next_generation = metadata::InodeRecord {
+            version: flat_record.version + 1,
+            etag: Some("next-generation".to_string()),
+            ..flat_record.clone()
+        };
+        assert_eq!(
+            racing
+                .meta
+                .commit(
+                    wyrd_traits::WriteBatch::new()
+                        .put(
+                            metadata::seg_key(&group, 0),
+                            metadata::encode(&first_record)
+                        )
+                        .put(
+                            metadata::seg_key(&group, 1),
+                            metadata::encode(&second_record)
+                        )
+                        .put(
+                            metadata::inode_key(inode_id),
+                            metadata::encode(&segmented_root)
+                        ),
+                )
+                .await
+                .expect("seed"),
+            CommitOutcome::Committed
+        );
+        *racing.meta.next.lock().expect("lock") = Some(
+            wyrd_traits::WriteBatch::new()
+                .put(
+                    metadata::inode_key(inode_id),
+                    metadata::encode(&next_generation),
+                )
+                .delete(metadata::seg_key(&group, 0))
+                .delete(metadata::seg_key(&group, 1)),
+        );
+        let range = Arc::clone(&racing)
+            .get_object_range(KEY, ByteRange::FromTo(28, 39))
+            .await
+            .expect("resolve")
+            .expect("a key that never stopped existing must not answer NoSuchKey");
+        assert_eq!(range.meta.etag.as_deref(), Some("next-generation"));
+        match range.outcome {
+            RangeOutcome::Satisfiable {
+                offset,
+                len,
+                stream,
+            } => {
+                assert_eq!((offset, len), (28, 12));
+                assert_eq!(drain(stream).await, payload[28..=39]);
+            }
+            RangeOutcome::Unsatisfiable => panic!("the range is inside the object"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gateway_streams_a_segmented_object_byte_identically() {
+        let payload: Vec<u8> = (0..64u8).collect();
+        let (gateway, _dir) = segmented_gateway(&payload).await;
+
+        let read = Arc::clone(&gateway)
+            .get_object_streaming(KEY)
+            .await
+            .expect("resolve")
+            .expect("committed object");
+        assert_eq!(read.size, payload.len() as u64);
+        assert_eq!(
+            drain(read.stream).await,
+            payload,
+            "the whole-object walk must resolve a segmented map across every segment",
+        );
+    }
+
+    /// **One damaged object does not take the gateway down** (the containment rule).
+    ///
+    /// A committed segmented object whose root still names its group while one `seg:`
+    /// record is absent is unresolvable, and it must **fail closed for itself alone**: a
+    /// typed error for a GET of *that* key — never torn or partial bytes — while every
+    /// other object in the same store still reads, whole-object and ranged.
+    ///
+    /// The two halves are the point. Failing closed is easy to get right and easy to get
+    /// too wide: the previous shape of this slice resolved every root from the startup
+    /// path, so one damaged object made `Gateway::recover` (`:123-124`) return `Err` and
+    /// the gateway refused to start at all — trading one object's fault for every healthy
+    /// object's availability. So `recover` is asserted here too, over the damaged store.
+    #[tokio::test]
+    async fn a_damaged_segmented_object_fails_closed_without_taking_the_store_down() {
+        let payload: Vec<u8> = (0..64u8).collect();
+        let (gateway, _dir) = segmented_gateway(&payload).await;
+
+        // A SECOND object, in the same store, damaged: its root names two segments and the
+        // second one was never written.
+        const DAMAGED: &str = "bucket/damaged";
+        let damaged_payload: Vec<u8> = (0..64u8).map(|b| b ^ 0x5a).collect();
+        gateway
+            .put_object(DAMAGED, &damaged_payload)
+            .await
+            .expect("PUT");
+        reshape_into_segments(
+            &gateway,
+            DAMAGED,
+            "fedcba9876543210fedcba9876543210",
+            11,
+            false,
+        )
+        .await;
+
+        // (a) Startup recovery is TOTAL: the id floor is derived without resolving a root,
+        // so one damaged object cannot stop the gateway from serving.
+        gateway
+            .recover()
+            .await
+            .expect("one damaged object must not stop the gateway from starting");
+
+        // (b) Every healthy object still reads — whole-object…
+        let read = Arc::clone(&gateway)
+            .get_object_streaming(KEY)
+            .await
+            .expect("resolve")
+            .expect("committed object");
+        assert_eq!(drain(read.stream).await, payload);
+        // …and ranged, across the segment boundary.
+        let range = Arc::clone(&gateway)
+            .get_object_range(KEY, ByteRange::FromTo(28, 39))
+            .await
+            .expect("resolve")
+            .expect("committed object");
+        match range.outcome {
+            RangeOutcome::Satisfiable { stream, .. } => {
+                assert_eq!(drain(stream).await, payload[28..=39]);
+            }
+            RangeOutcome::Unsatisfiable => panic!("the range is inside the object"),
+        }
+
+        // (c) …and the damaged object fails closed, per object. The map is resolved
+        // BEFORE any stream is handed out, so the failure is an error at the call and
+        // there is no half-filled body to tear.
+        let Err(err) = Arc::clone(&gateway).get_object_streaming(DAMAGED).await else {
+            panic!("an unresolvable map must not answer with bytes");
+        };
+        assert!(
+            err.downcast_ref::<metadata::ChunkMapError>().is_some(),
+            "a typed fail-closed error, not an opaque one: {err}",
+        );
+        assert!(Arc::clone(&gateway)
+            .get_object_range(DAMAGED, ByteRange::FromTo(0, 7))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn the_gateway_serves_a_range_that_spans_a_segment_boundary() {
+        let payload: Vec<u8> = (0..64u8).collect();
+        let (gateway, _dir) = segmented_gateway(&payload).await;
+
+        // The fixture is 8 chunks of 8 bytes split 4/4, so the segment boundary is at byte
+        // 32. This span straddles it.
+        let (from, to) = (28u64, 39u64);
+        let range = Arc::clone(&gateway)
+            .get_object_range(KEY, ByteRange::FromTo(from, to))
+            .await
+            .expect("resolve")
+            .expect("committed object");
+        match range.outcome {
+            RangeOutcome::Satisfiable {
+                offset,
+                len,
+                stream,
+            } => {
+                assert_eq!((offset, len), (from, to - from + 1));
+                assert_eq!(
+                    drain(stream).await,
+                    payload[from as usize..=to as usize],
+                    "the ranged walk is its own consumer: a span crossing a segment \
+                     boundary must return both sides of it",
+                );
+            }
+            RangeOutcome::Unsatisfiable => panic!("the range is inside the object"),
+        }
     }
 }

@@ -258,18 +258,18 @@ async fn a_gateway_written_object_is_a_custodian_derived_repair_obligation_and_r
             .expect("read inode")
             .expect("inode present");
         assert_eq!(
-            inode.chunk_map.len(),
+            inode.chunk_map.as_flat().unwrap().len(),
             1,
             "the payload fits in one chunk at the gateway's default chunk size"
         );
         assert_eq!(
-            inode.chunk_map[0].placement,
+            inode.chunk_map.as_flat().unwrap()[0].placement,
             vec![0u64, 1, 2],
             "the gateway's identity placement must land the RS(2,1) fragments on D-servers \
              0,1,2 (domains A,B,C) — the SAME DServerId space the custodian's fleet is \
              configured over; the shared placement contract the repair scan reads"
         );
-        inode.chunk_map[0].id
+        inode.chunk_map.as_flat().unwrap()[0].id
     }; // <- redb handle dropped again; released for the custodian below.
 
     // ---- 2. D-server 1 (domain B) loses the object's fragment (the day-one durability
