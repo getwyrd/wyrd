@@ -172,7 +172,8 @@ async fn commit_reference(
             scheme: EcScheme::None,
             len: 16,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -189,7 +190,7 @@ async fn commit_reference(
 async fn commit_chunk(meta: &MemMeta, inode: InodeId, name: &str, chunk_ref: ChunkRef) {
     let record = InodeRecord {
         size: 16,
-        chunk_map: vec![chunk_ref],
+        chunk_map: vec![chunk_ref].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -973,7 +974,8 @@ async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
             scheme: EcScheme::None,
             len: 16,
             placement: vec![0],
-        }],
+        }]
+        .into(),
         state: InodeState::Pending,
         version: 1,
         ..Default::default()

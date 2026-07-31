@@ -515,7 +515,7 @@ async fn write_rs_2_1(meta: &impl MetadataStore, fleet: &Fleet<'_>) -> Vec<u8> {
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -546,7 +546,7 @@ async fn apply_storage_faults(d: &[MemDServer; 4], plan: &SeededStorageFaults) {
 /// Assert the chunk is back at **full redundancy**: every placed fragment is present and
 /// verifies its checksum, and the `n` fragments occupy `n` distinct failure domains.
 async fn assert_full_redundancy(record: &InodeRecord, d: &[MemDServer; 4]) {
-    let placement = &record.chunk_map[0].placement;
+    let placement = &record.chunk_map.as_flat().unwrap()[0].placement;
     assert_eq!(placement.len(), N, "n fragments placed");
     let mut domains = HashSet::new();
     for (index, &server) in placement.iter().enumerate() {
@@ -632,7 +632,9 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert!(
-        !record.chunk_map[0].placement.contains(&victim.into()),
+        !record.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .contains(&victim.into()),
         "the killed server no longer holds a referenced fragment"
     );
     assert_full_redundancy(&record, &d).await;
@@ -685,7 +687,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
     let crashed = read_inode(&meta).await;
     assert_eq!(crashed.version, 1, "no version-conditional commit landed");
     assert_eq!(
-        crashed.chunk_map[0].placement,
+        crashed.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the committed placement is fully old — never a torn/hybrid chunk"
     );
@@ -701,7 +703,9 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
         "the rebuilt fragment was placed before the (crashed) commit"
     );
     assert!(
-        !crashed.chunk_map[0].placement.contains(&3),
+        !crashed.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .contains(&3),
         "the placed-but-uncommitted fragment is unreferenced garbage, not part of the chunk"
     );
 
@@ -835,7 +839,8 @@ async fn commit_reference(meta: &MemMeta, dserver: DServerId) {
             scheme: EcScheme::None,
             len: 5,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -1176,7 +1181,7 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
     let after = read_inode(&meta).await;
     assert_eq!(after.version, 1, "no commit landed");
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the committed placement is fully old — never a torn/hybrid chunk"
     );
@@ -1260,7 +1265,7 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     // A reader that ENTERS the commit window resolves the OLD inode (v1, placement [0,1,2]).
     let old = read_inode(&meta).await;
     assert_eq!(old.version, 1);
-    assert_eq!(old.chunk_map[0].placement, vec![0, 1, 2]);
+    assert_eq!(old.chunk_map.as_flat().unwrap()[0].placement, vec![0, 1, 2]);
 
     // The repoint lands as a single atomic commit.
     let (topo, healthy) = healthy_view(victim, &d);
@@ -1284,7 +1289,10 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     // and the placement changed only at the rebuilt index — never a per-index mix.
     assert_eq!(new.version, 2, "exactly one atomic transition (v1 → v2)");
     let differing: Vec<usize> = (0..N)
-        .filter(|&i| new.chunk_map[0].placement[i] != old.chunk_map[0].placement[i])
+        .filter(|&i| {
+            new.chunk_map.as_flat().unwrap()[0].placement[i]
+                != old.chunk_map.as_flat().unwrap()[0].placement[i]
+        })
         .collect();
     assert_eq!(
         differing,
@@ -1292,7 +1300,8 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
         "the repoint flips the whole placement vector, changing only the rebuilt index"
     );
     assert_eq!(
-        new.chunk_map[0].placement[victim as usize], 3,
+        new.chunk_map.as_flat().unwrap()[0].placement[victim as usize],
+        3,
         "the rebuilt fragment moved to the free failure domain (D = server 3)"
     );
 

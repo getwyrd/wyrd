@@ -36,8 +36,8 @@ use std::collections::{HashMap, HashSet};
 // `crate::gc::orphan_key` unchanged.
 pub(crate) use wyrd_core::metadata::orphan_key;
 use wyrd_core::metadata::{
-    self, parse_orphan_key, EcScheme, InodeRecord, InodeState, MalformedPlacement, PendingEntry,
-    ORPHAN_PREFIX,
+    self, parse_orphan_key, ChunkMapError, EcScheme, InodeRecord, InodeState, MalformedPlacement,
+    PendingEntry, ORPHAN_PREFIX,
 };
 use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
@@ -257,7 +257,17 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
         if record.state != InodeState::Committed {
             continue;
         }
-        for chunk in &record.chunk_map {
+        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
+        // scan exactly as an unreadable record already does via `decode(&value)?`
+        // above, rather than treating the object as owning no chunks.
+        let flat_chunk_map =
+            record
+                .chunk_map
+                .as_flat()
+                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                    operation: "gc::referenced_fragments",
+                })?;
+        for chunk in flat_chunk_map {
             // Classify the committed placement BEFORE expanding it via the shared strict
             // companion (`ChunkRef::checked_fragments`, `metadata.rs`, ADR-0040 decision
             // 4). A valid (empty / full-length) vector resolves through the same

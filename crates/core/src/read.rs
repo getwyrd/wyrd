@@ -21,7 +21,9 @@ use wyrd_chunk_format::decode;
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, PlacementChunkStore, Result};
 
 use crate::erasure;
-use crate::metadata::{self, ChunkRef, DirentRecord, EcScheme, InodeId, InodeRecord, InodeState};
+use crate::metadata::{
+    self, ChunkMapError, ChunkRef, DirentRecord, EcScheme, InodeId, InodeRecord, InodeState,
+};
 use crate::repair;
 
 /// Resolve `name` under `parent` to its inode id, or `None` if the name is
@@ -89,7 +91,13 @@ async fn read_object_collecting(
     // through to the mismatch check below instead of attempting a
     // size-proportional (or overflowing) allocation.
     let mut bytes = Vec::new();
-    for chunk in &inode.chunk_map {
+    let chunk_map = inode
+        .chunk_map
+        .as_flat()
+        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+            operation: "read_object_collecting",
+        })?;
+    for chunk in chunk_map {
         bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt, block_fault).await?);
     }
     if bytes.len() as u64 != inode.size {
@@ -737,7 +745,7 @@ mod tests {
     async fn oversized_inode_size_with_empty_chunk_map_errors_cleanly_not_panics() {
         let inode = InodeRecord {
             size: u64::MAX,
-            chunk_map: Vec::new(),
+            chunk_map: Vec::new().into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()

@@ -150,7 +150,7 @@ fn checksum_mismatch_surfaces_as_an_error() {
         let path = fragment_path(
             dir.path(),
             FragmentId {
-                chunk: inode.chunk_map[0].id,
+                chunk: inode.chunk_map.as_flat().unwrap()[0].id,
                 index: 0,
             },
         );

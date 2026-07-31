@@ -553,7 +553,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
     };
     let inode_record = InodeRecord {
         size: data.len() as u64,
-        chunk_map: vec![chunk_ref],
+        chunk_map: vec![chunk_ref].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -673,12 +673,13 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
         "committed inode must still be at version 1 after crash (no commit landed)"
     );
     assert_eq!(
-        inode_p1.chunk_map[0].placement[VICTIM_INDEX], VICTIM_INDEX as DServerId,
+        inode_p1.chunk_map.as_flat().unwrap()[0].placement[VICTIM_INDEX],
+        VICTIM_INDEX as DServerId,
         "committed placement[{VICTIM_INDEX}] must still reference the dead server {VICTIM_INDEX} \
          after crash — fully old, never a torn/hybrid chunk (`0005:385-386`)"
     );
     assert!(
-        !inode_p1.chunk_map[0]
+        !inode_p1.chunk_map.as_flat().unwrap()[0]
             .placement
             .contains(&(SPARE_INDEX as DServerId)),
         "spare server {SPARE_INDEX} must NOT appear in the committed placement after crash; \
@@ -687,7 +688,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
 
     // Summary assertion via the born-at-tier helper: orphan exists, victim still in
     // committed placement (fully old inode — the commit never landed).
-    let committed_has_victim = inode_p1.chunk_map[0]
+    let committed_has_victim = inode_p1.chunk_map.as_flat().unwrap()[0]
         .placement
         .contains(&(VICTIM_INDEX as DServerId));
     assert_garbage_not_corruption(orphan_bytes.is_some(), committed_has_victim)
@@ -743,7 +744,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
          (exactly one version-conditional commit landed)"
     );
 
-    let new_placement = &inode_p2.chunk_map[0].placement;
+    let new_placement = &inode_p2.chunk_map.as_flat().unwrap()[0].placement;
 
     // Redundancy outcome: N fragments, victim absent.
     assert_redundancy_outcome(new_placement, VICTIM_INDEX as DServerId, N)

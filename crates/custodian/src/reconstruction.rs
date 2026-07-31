@@ -46,7 +46,9 @@
 
 use std::collections::HashMap;
 
-use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState};
+use wyrd_core::metadata::{
+    self, ChunkMapError, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState,
+};
 use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
 use wyrd_core::write::encode_ec_fragment;
 use wyrd_core::{erasure, repair};
@@ -322,7 +324,15 @@ async fn assess(
         // under the obligation. Nothing to repair.
         return Ok(Assessment::Drain);
     };
-    let chunk_ref = prior.chunk_map[chunk_index].clone();
+    // `find_chunk` above already proved `prior.chunk_map` is flat (or this `assess` call
+    // never happened) — `find_chunk` is the only producer of a `prior`/`chunk_index` pair.
+    let chunk_ref = prior
+        .chunk_map
+        .as_flat()
+        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+            operation: "reconstruction::assess",
+        })?[chunk_index]
+        .clone();
 
     // Classify the committed placement BEFORE any scheme-specific handling
     // (ADR-0040 decision 4, "strict maintenance"). A MALFORMED vector (non-empty,
@@ -566,11 +576,18 @@ async fn repair_chunk(
     // placement record, drains the obligation, and orphans the displaced fragments. The
     // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
     // racing writer / superseded custodian loses here rather than corrupting the record.
-    let mut next_chunk_map = plan.prior.chunk_map.clone();
+    let mut next_chunk_map = plan
+        .prior
+        .chunk_map
+        .as_flat()
+        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+            operation: "reconstruction::repair_chunk",
+        })?
+        .to_vec();
     next_chunk_map[plan.chunk_index].placement = new_placement;
     let next = InodeRecord {
         size: plan.prior.size,
-        chunk_map: next_chunk_map,
+        chunk_map: next_chunk_map.into(),
         state: InodeState::Committed,
         version: plan.prior.version + 1,
         // Reconstruction rebuilds the SAME content, so it PRESERVES the object metadata
@@ -609,11 +626,17 @@ async fn find_chunk(
         if record.state != InodeState::Committed {
             continue;
         }
-        if let Some(index) = record
-            .chunk_map
-            .iter()
-            .position(|c: &ChunkRef| c.id == chunk)
-        {
+        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
+        // scan exactly as an unreadable record already does via `decode(&value)?`
+        // above.
+        let flat_chunk_map =
+            record
+                .chunk_map
+                .as_flat()
+                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                    operation: "reconstruction::find_chunk",
+                })?;
+        if let Some(index) = flat_chunk_map.iter().position(|c: &ChunkRef| c.id == chunk) {
             if let Some(inode_id) = parse_inode_key(&key) {
                 return Ok(Some((inode_id, record, index)));
             }

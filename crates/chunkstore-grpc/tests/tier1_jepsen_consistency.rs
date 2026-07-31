@@ -855,7 +855,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
     };
     let inode_record = InodeRecord {
         size: data.len() as u64,
-        chunk_map: vec![chunk_ref],
+        chunk_map: vec![chunk_ref].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -968,12 +968,13 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
         "committed inode must still be at version 1 after crash (no commit landed)"
     );
     assert_eq!(
-        inode_p1.chunk_map[0].placement[VICTIM_INDEX], VICTIM_INDEX as DServerId,
+        inode_p1.chunk_map.as_flat().unwrap()[0].placement[VICTIM_INDEX],
+        VICTIM_INDEX as DServerId,
         "committed placement[{VICTIM_INDEX}] must still reference the dead server \
          {VICTIM_INDEX} after crash — fully old, never a torn/hybrid chunk"
     );
     assert!(
-        !inode_p1.chunk_map[0]
+        !inode_p1.chunk_map.as_flat().unwrap()[0]
             .placement
             .contains(&(SPARE_INDEX as DServerId)),
         "spare server {SPARE_INDEX} must NOT appear in committed placement after crash; \
@@ -981,7 +982,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
     );
 
     // Summary oracle assertion — commit-point-atomic:
-    let committed_has_victim = inode_p1.chunk_map[0]
+    let committed_has_victim = inode_p1.chunk_map.as_flat().unwrap()[0]
         .placement
         .contains(&(VICTIM_INDEX as DServerId));
     assert_commit_point_atomic(orphan_bytes.is_some(), committed_has_victim)
@@ -1056,7 +1057,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
          no partial commit must have landed"
     );
     assert!(
-        inode_p2.chunk_map[0]
+        inode_p2.chunk_map.as_flat().unwrap()[0]
             .placement
             .contains(&(VICTIM_INDEX as DServerId)),
         "phase 2: victim server {VICTIM_INDEX} must still be in committed placement \
@@ -1122,7 +1123,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
     assert_exactly_once_convergence(1, inode_p3.version)
         .expect("exactly-once convergence violated after phase 3");
 
-    let new_placement = &inode_p3.chunk_map[0].placement;
+    let new_placement = &inode_p3.chunk_map.as_flat().unwrap()[0].placement;
 
     // Redundancy outcome: N fragments, dead victim absent.
     assert_redundancy_outcome(new_placement, VICTIM_INDEX as DServerId, N)
@@ -1196,7 +1197,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
     // placement is readable (ADR-0015 read-after-commit).
     // ====================================================================
 
-    let committed_placement = &inode_p4.chunk_map[0].placement;
+    let committed_placement = &inode_p4.chunk_map.as_flat().unwrap()[0].placement;
     let mut readable_servers: Vec<DServerId> = Vec::new();
 
     for (frag_index, &server_id) in committed_placement.iter().enumerate() {
@@ -1420,7 +1421,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
     };
     let inode_record = InodeRecord {
         size: data.len() as u64,
-        chunk_map: vec![chunk_ref],
+        chunk_map: vec![chunk_ref].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -1514,19 +1515,20 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
         "committed inode must still be at version 1 after crash (no commit landed)"
     );
     assert_eq!(
-        inode_p1.chunk_map[0].placement[VICTIM_INDEX], VICTIM_INDEX as DServerId,
+        inode_p1.chunk_map.as_flat().unwrap()[0].placement[VICTIM_INDEX],
+        VICTIM_INDEX as DServerId,
         "committed placement[{VICTIM_INDEX}] must still reference the dead server \
          {VICTIM_INDEX} after crash — fully old, never a torn/hybrid chunk"
     );
     assert!(
-        !inode_p1.chunk_map[0]
+        !inode_p1.chunk_map.as_flat().unwrap()[0]
             .placement
             .contains(&(SPARE_INDEX as DServerId)),
         "spare server {SPARE_INDEX} must NOT appear in committed placement after crash; \
          the orphan is collectable garbage, not recorded corruption"
     );
 
-    let committed_has_victim = inode_p1.chunk_map[0]
+    let committed_has_victim = inode_p1.chunk_map.as_flat().unwrap()[0]
         .placement
         .contains(&(VICTIM_INDEX as DServerId));
     assert_commit_point_atomic(orphan_bytes.is_some(), committed_has_victim)
@@ -1601,7 +1603,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
          no partial commit must have landed"
     );
     assert!(
-        inode_p2.chunk_map[0]
+        inode_p2.chunk_map.as_flat().unwrap()[0]
             .placement
             .contains(&(VICTIM_INDEX as DServerId)),
         "phase 2: victim server {VICTIM_INDEX} must still be in committed placement \
@@ -1660,7 +1662,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
     assert_exactly_once_convergence(1, inode_p3.version)
         .expect("exactly-once convergence violated after phase 3");
 
-    let new_placement = &inode_p3.chunk_map[0].placement;
+    let new_placement = &inode_p3.chunk_map.as_flat().unwrap()[0].placement;
 
     assert_redundancy_outcome(new_placement, VICTIM_INDEX as DServerId, N)
         .expect("redundancy outcome violated after reconstruction");
@@ -1721,7 +1723,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
     // Phase 5: read-after-commit.
     // ====================================================================
 
-    let committed_placement = &inode_p4.chunk_map[0].placement;
+    let committed_placement = &inode_p4.chunk_map.as_flat().unwrap()[0].placement;
     let mut readable_servers: Vec<DServerId> = Vec::new();
 
     for (frag_index, &server_id) in committed_placement.iter().enumerate() {

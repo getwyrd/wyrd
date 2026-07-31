@@ -29,7 +29,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
-use wyrd_core::metadata::{self, EcScheme, InodeId};
+use wyrd_core::metadata::{self, ChunkMapError, EcScheme, InodeId};
 use wyrd_core::{read, write};
 use wyrd_traits::{
     ChunkId, CommitOutcome, Coordination, MetadataStore, PlacementChunkStore, Result,
@@ -357,7 +357,15 @@ where
         let content_type = inode.content_type.clone();
         let modified = inode.modified;
         let this = Arc::clone(&self);
-        let chunk_map = inode.chunk_map;
+        // A segmented map has no resolver yet (#649-#651): fail closed rather than
+        // stream no chunks for a live object.
+        let chunk_map = inode
+            .chunk_map
+            .as_flat()
+            .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                operation: "Gateway::get_object_streaming",
+            })?
+            .to_vec();
         // The reader task is spawned LAZILY — on the stream's first poll, not here — so a
         // caller that resolves the object and then never reads the body (the wire layer's
         // 304/412 conditional short-circuit drops the stream unread, issue #510 review) costs
@@ -443,7 +451,16 @@ where
         let end = offset.saturating_add(len); // exclusive
         let mut covering: Vec<(metadata::ChunkRef, usize, usize)> = Vec::new();
         let mut pos: u64 = 0;
-        for chunk in &inode.chunk_map {
+        // A segmented map has no resolver yet (#649-#651): fail closed rather than
+        // answer an empty range for a live object.
+        let flat_chunk_map =
+            inode
+                .chunk_map
+                .as_flat()
+                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                    operation: "Gateway::get_object_range",
+                })?;
+        for chunk in flat_chunk_map {
             let chunk_start = pos;
             let chunk_end = pos.saturating_add(chunk.len);
             pos = chunk_end;

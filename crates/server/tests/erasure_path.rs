@@ -81,8 +81,12 @@ fn rs_put_stages_n_fragments_and_reads_back_byte_identical() {
         // The chunk map records one chunk under the RS(6,3) scheme with the
         // chunk's logical length.
         let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
-        assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
-        let chunk = inode.chunk_map[0].clone();
+        assert_eq!(
+            inode.chunk_map.as_flat().unwrap().len(),
+            1,
+            "single-chunk object"
+        );
+        let chunk = inode.chunk_map.as_flat().unwrap()[0].clone();
         assert_eq!(chunk.scheme, RS, "scheme recorded in the chunk map");
         assert_eq!(chunk.len, data.len() as u64, "logical length recorded");
 
@@ -199,7 +203,7 @@ fn mixed_era_chunks_read_through_one_path() {
             .collect();
         let inode = InodeRecord {
             size: (part_none.len() + part_rs.len()) as u64,
-            chunk_map,
+            chunk_map: chunk_map.into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
@@ -241,7 +245,11 @@ async fn put_rs(meta: &RedbMetadataStore, chunks: &FsChunkStore, data: &[u8]) ->
     .await
     .unwrap();
     let inode = read::read_inode(meta, 1).await.unwrap().unwrap();
-    assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
+    assert_eq!(
+        inode.chunk_map.as_flat().unwrap().len(),
+        1,
+        "single-chunk object"
+    );
     inode
 }
 
@@ -270,7 +278,7 @@ fn reads_survive_any_m_fragment_losses() {
             }
             let (meta, chunks, dir) = backends();
             let inode = put_rs(&meta, &chunks, &data).await;
-            let cid = inode.chunk_map[0].id;
+            let cid = inode.chunk_map.as_flat().unwrap()[0].id;
             for index in 0..9u16 {
                 if mask & (1 << index) != 0 {
                     std::fs::remove_file(frag_path(dir.path(), cid, index)).unwrap();
@@ -291,7 +299,7 @@ fn fewer_than_k_fragments_is_a_clean_typed_error() {
         let data = sample();
         let (meta, chunks, dir) = backends();
         let inode = put_rs(&meta, &chunks, &data).await;
-        let cid = inode.chunk_map[0].id;
+        let cid = inode.chunk_map.as_flat().unwrap()[0].id;
 
         // Delete m + 1 = 4 fragments → only 5 < k = 6 remain.
         for index in [0u16, 1, 2, 3] {
@@ -322,7 +330,7 @@ fn checksum_failing_fragments_are_excluded_and_reconstructed_around() {
         for corrupt_count in 1..=3u16 {
             let (meta, chunks, dir) = backends();
             let inode = put_rs(&meta, &chunks, &data).await;
-            let cid = inode.chunk_map[0].id;
+            let cid = inode.chunk_map.as_flat().unwrap()[0].id;
             for index in 0..corrupt_count {
                 corrupt(dir.path(), cid, index);
             }
@@ -336,7 +344,7 @@ fn checksum_failing_fragments_are_excluded_and_reconstructed_around() {
         // Corrupting m + 1 = 4 leaves < k valid fragments → typed error.
         let (meta, chunks, dir) = backends();
         let inode = put_rs(&meta, &chunks, &data).await;
-        let cid = inode.chunk_map[0].id;
+        let cid = inode.chunk_map.as_flat().unwrap()[0].id;
         for index in 0..4u16 {
             corrupt(dir.path(), cid, index);
         }

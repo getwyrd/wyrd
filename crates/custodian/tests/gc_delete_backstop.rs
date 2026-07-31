@@ -147,7 +147,8 @@ async fn delete_orphans_fragment_reclaimed_by_gc_from_the_placed_dserver() {
             scheme: EcScheme::None,
             len: 11,
             placement: vec![placed_dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -234,7 +235,8 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
             scheme: EcScheme::None,
             len: 16,
             placement: vec![placed_dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
