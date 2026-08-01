@@ -57,6 +57,11 @@ pub async fn read_inode(
 /// explicit snapshot is what makes a read see one whole version. Each fragment's
 /// checksum is verified by the chunk store; a mismatch or a missing fragment is
 /// an error, never a short or corrupt read.
+///
+/// Takes no [`MetadataStore`], so it **cannot** resolve a segmented map (whose chunks
+/// live in `seg:` records) and fails closed on one, exactly as it did before #649. The
+/// placement-aware entries below — [`read_object`] / [`read_path`] — hold the store and
+/// therefore resolve through [`metadata::resolve_chunk_map`] instead.
 pub async fn read_object_from(
     chunks: &impl PlacementChunkStore,
     inode: &InodeRecord,
@@ -83,26 +88,41 @@ async fn read_object_collecting(
     corrupt: &mut Vec<ChunkId>,
     block_fault: &mut Vec<ChunkId>,
 ) -> Result<Vec<u8>> {
-    // `inode.size` is untrusted metadata (arbitrary `u64` from stored JSON, ADR-0002)
-    // and must not size an allocation before that many bytes are actually backed by
-    // the chunk map. Grow the buffer only from bytes a chunk read has *already*
-    // produced and checksum-verified (`read_chunk`) — never from the recorded size
-    // up front. A `size: u64::MAX` inode with an empty/short chunk map then falls
-    // through to the mismatch check below instead of attempting a
-    // size-proportional (or overflowing) allocation.
-    let mut bytes = Vec::new();
+    // No store at this entry, so a segmented map cannot be resolved here: fail closed
+    // rather than answer from the root alone (#648's rule, unchanged by #649).
     let chunk_map = inode
         .chunk_map
         .as_flat()
         .ok_or(ChunkMapError::SegmentedMapUnsupported {
             operation: "read_object_collecting",
         })?;
+    read_chunks_collecting(chunks, chunk_map, inode.size, corrupt, block_fault).await
+}
+
+/// The byte half of a read, over an **already-resolved** chunk list: the shared body of
+/// the snapshot-only entry above and the placement-aware entries below, which resolve
+/// through [`metadata::resolve_chunk_map`] first and so serve either map shape.
+async fn read_chunks_collecting(
+    chunks: &impl PlacementChunkStore,
+    chunk_map: &[ChunkRef],
+    size: u64,
+    corrupt: &mut Vec<ChunkId>,
+    block_fault: &mut Vec<ChunkId>,
+) -> Result<Vec<u8>> {
+    // `size` is untrusted metadata (arbitrary `u64` from stored JSON, ADR-0002) and
+    // must not size an allocation before that many bytes are actually backed by the
+    // chunk map. Grow the buffer only from bytes a chunk read has *already* produced
+    // and checksum-verified (`read_chunk`) — never from the recorded size up front. A
+    // `size: u64::MAX` inode with an empty/short chunk map then falls through to the
+    // mismatch check below instead of attempting a size-proportional (or overflowing)
+    // allocation.
+    let mut bytes = Vec::new();
     for chunk in chunk_map {
         bytes.extend_from_slice(&read_chunk(chunks, chunk, corrupt, block_fault).await?);
     }
-    if bytes.len() as u64 != inode.size {
+    if bytes.len() as u64 != size {
         return Err(ReadError::SizeMismatch {
-            expected: inode.size,
+            expected: size,
             found: bytes.len() as u64,
         }
         .into());
@@ -498,6 +518,20 @@ pub async fn read_object(
     if inode.state != InodeState::Committed {
         return Ok(None);
     }
+    // Resolve the map through the ONE resolver every store-holding consumer shares
+    // (proposal 0016 decision 7(e)): a flat map is borrowed as-is and costs no extra
+    // read, a segmented one is read from its bounded `seg:` range. A generation retired
+    // mid-resolve restarts against the current root (decision 7(h)) — an overwrite is
+    // not a deletion, and answering `None` for one would 404 an object that never
+    // stopped existing. `None` here means no live committed generation.
+    let Some(resolved) =
+        metadata::resolve_chunk_map(meta, &metadata::inode_key(inode_id), &inode).await?
+    else {
+        return Ok(None);
+    };
+    // The size framing comes from the generation the chunks were resolved FROM, or a
+    // restart would check the new bytes against the retired root's length.
+    let size = resolved.record.size;
     // Read the object, collecting any chunk whose read excluded a checksum-failing
     // fragment or a permanent block-layer read fault, then enqueue each onto the SAME
     // repair queue scrub feeds (`0005:174-176`) — whether or not the read itself
@@ -508,7 +542,14 @@ pub async fn read_object(
     // queue either way.
     let mut corrupt = Vec::new();
     let mut block_fault = Vec::new();
-    let result = read_object_collecting(chunks, &inode, &mut corrupt, &mut block_fault).await;
+    let result = read_chunks_collecting(
+        chunks,
+        &resolved.chunks,
+        size,
+        &mut corrupt,
+        &mut block_fault,
+    )
+    .await;
     corrupt.sort_unstable();
     corrupt.dedup();
     for chunk in corrupt {
@@ -522,17 +563,22 @@ pub async fn read_object(
     Ok(Some(result?))
 }
 
-/// Resolve `name` under `parent` to its **committed** inode snapshot, or `None` if
-/// the name is unbound or its inode is not yet `COMMITTED`. The returned record
+/// Resolve `name` under `parent` to its **committed** inode id and snapshot, or `None`
+/// if the name is unbound or its inode is not yet `COMMITTED`. The returned record
 /// carries only the chunk *map* (ids/scheme/len/placement) — small metadata, not the
 /// object bytes — so a caller can then stream the object one chunk at a time via
 /// [`read_chunk_verified`] without ever materialising the whole object (the
 /// "stream, don't buffer" invariant, issue #364 / `0015:789`).
+///
+/// The inode **id** rides out with the record because the map is not always inline: a
+/// segmented one (proposal 0016 decision 7) resolves through
+/// [`metadata::resolve_chunk_map`], which needs the root's own key to settle a
+/// generation retired mid-resolve (decision 7(h)).
 pub async fn committed_inode(
     meta: &impl MetadataStore,
     parent: InodeId,
     name: &str,
-) -> Result<Option<InodeRecord>> {
+) -> Result<Option<(InodeId, InodeRecord)>> {
     let Some(inode_id) = resolve(meta, parent, name).await? else {
         return Ok(None);
     };
@@ -542,7 +588,7 @@ pub async fn committed_inode(
     if inode.state != InodeState::Committed {
         return Ok(None);
     }
-    Ok(Some(inode))
+    Ok(Some((inode_id, inode)))
 }
 
 /// Read and verify a **single** chunk of a committed object, enqueuing any chunk

@@ -70,6 +70,7 @@ use wyrd_core::metadata::{
 use wyrd_core::placement::Topology;
 use wyrd_core::read::{read_object, read_object_from};
 use wyrd_core::repair;
+use wyrd_core::write;
 use wyrd_core::write::write_new_object_placed;
 use wyrd_custodian::{
     mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
@@ -1320,6 +1321,184 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     );
 }
 
+// ---- property 9: the chunk-map RESOLVER never tears (issue #649, proposal 0016
+//      decision 7(h)) ----
+//
+// Shipped in THIS slice and exercised by the gating `cargo xtask ci` / `dst` tier over
+// the whole madsim seed sweep — deliberately NOT by the per-fix `C4-verify` check, which
+// would have to build the `--cfg madsim` tree and sweep 50 seeds to see it. Built and run
+// this cycle; not deferred work.
+
+/// A segment-group nonce for this property's fixtures: 32 lowercase hex characters.
+const RESOLVE_TEAR_NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+/// A store that, the FIRST time it is asked to page a `seg:` range, applies a pending
+/// mutation — the exact race the resolve-retry rule exists for (`0016:2452-2462`: the root
+/// always moves first): a reader that read the OLD root and is now paging its `seg:` range
+/// meets a root that has already moved on.
+struct RetireMidResolve {
+    inner: MemMeta,
+    pending: Mutex<Option<WriteBatch>>,
+}
+
+#[async_trait]
+impl MetadataStore for RetireMidResolve {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        if prefix.starts_with(b"seg:") {
+            let pending = self.pending.lock().unwrap().take();
+            if let Some(batch) = pending {
+                assert_eq!(
+                    self.inner.commit(batch).await.unwrap(),
+                    CommitOutcome::Committed
+                );
+            }
+        }
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        self.inner.commit(batch).await
+    }
+}
+
+fn seg_row(group: &metadata::SegmentGroup, index: u32) -> Vec<u8> {
+    metadata::seg_key(group, index).expect("addressable index")
+}
+
+/// Seed a genuine flat object at `INODE` (real fragments over `fleet`, `EcScheme::None` so
+/// a single fragment resolves through the identity placement onto server 0), then re-spell
+/// it as a **segmented** generation directly — raw `seg:` records plus a segmented root,
+/// written by hand, never via a committer (this slice ships no producer). Hands back the
+/// group its segments are keyed by, so the campaign can retire one of its records the way
+/// a drain would.
+async fn seed_segmented(meta: &MemMeta, fleet: &Fleet<'_>, data: &[u8]) -> metadata::SegmentGroup {
+    let mut next = 0u128;
+    let plan = write::plan_write(data, 4, EcScheme::None, || {
+        next += 1;
+        next
+    })
+    .unwrap();
+    write::intent(meta, &plan, 1_000).await.unwrap();
+    write::write_fragments(fleet, &plan).await.unwrap();
+    assert_eq!(
+        write::commit_create(meta, ROOT, "obj", INODE, &plan, 0)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    write::release(meta, &plan).await.unwrap();
+
+    let chunks = plan.chunk_refs();
+    let half = chunks.len() / 2;
+    let group = metadata::SegmentGroup::new(RESOLVE_TEAR_NONCE, 1).unwrap();
+    let first = metadata::SegmentRecord::new(chunks[..half].to_vec(), 0).unwrap();
+    let second = metadata::SegmentRecord::new(chunks[half..].to_vec(), first.byte_len()).unwrap();
+    let seg_ref = |index: u32, byte_offset: u64, byte_len: u64| metadata::SegmentRef {
+        index,
+        byte_offset,
+        byte_len,
+    };
+    let table = metadata::SegmentedMap::new(
+        group.clone(),
+        vec![
+            seg_ref(0, 0, first.byte_len()),
+            seg_ref(1, first.byte_len(), second.byte_len()),
+        ],
+    )
+    .unwrap();
+    let root = InodeRecord {
+        size: table.span(),
+        chunk_map: metadata::ChunkMap::Segmented(table),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    };
+    let batch = WriteBatch::new()
+        .put(seg_row(&group, 0), metadata::encode(&first))
+        .put(seg_row(&group, 1), metadata::encode(&second))
+        .put(metadata::inode_key(INODE), metadata::encode(&root));
+    assert_eq!(meta.commit(batch).await.unwrap(), CommitOutcome::Committed);
+    group
+}
+
+/// **The resolver never tears.** A segmented object's root is retired — superseded by a
+/// fresh flat generation — in the exact window between a reader's root read and its `seg:`
+/// range read, and on half the seeds the drain has *already reclaimed* one of the retired
+/// generation's segment records by the time that range read lands (`0016:2452-2462`: the
+/// root moves first, its records are deleted after). The resolution the reader began is
+/// retired either way, so the only whole answer left is the live generation: never a byte
+/// mix of the two, never a short read, and never `NoSuchKey` (an overwrite is not a
+/// deletion).
+///
+/// The reclaiming arm is what makes this bind the *restart*: with the old generation's map
+/// genuinely incompletable, a reader that did not re-read the root and start again could
+/// only fail or answer short — it has no old-generation answer left to succeed with by
+/// accident.
+async fn prop_segmented_resolve_never_tears(rng: &mut ChaCha8Rng) {
+    let d = servers();
+    let fleet = fleet_of(&d);
+    let meta = MemMeta::default();
+    let old_data: Vec<u8> = (0..32u16).map(|i| i as u8).collect();
+    let group = seed_segmented(&meta, &fleet, &old_data).await;
+
+    // The generation that replaces it while the reader's `seg:` range read is in flight —
+    // seed-chosen content and length, so the campaign is a pure function of the run seed.
+    let new_len = 16 + (rng.next_u32() as usize % 32);
+    let new_data: Vec<u8> = (0..new_len).map(|_| rng.next_u32() as u8).collect();
+    let mut next = 0x1000u128;
+    let new_plan = write::plan_write(&new_data, 4, EcScheme::None, || {
+        next += 1;
+        next
+    })
+    .unwrap();
+    write::write_fragments(&fleet, &new_plan).await.unwrap();
+    let new_root = InodeRecord {
+        size: new_plan.size,
+        chunk_map: new_plan.chunk_refs().into(),
+        state: InodeState::Committed,
+        version: 2,
+        ..Default::default()
+    };
+    let mut flip = WriteBatch::new().put(metadata::inode_key(INODE), metadata::encode(&new_root));
+    // The nemesis: on half the seeds the drain has already taken segment 1 of the retired
+    // generation, so its map can no longer be completed at all.
+    let reclaimed = rng.next_u32().is_multiple_of(2);
+    if reclaimed {
+        flip = flip.delete(seg_row(&group, 1));
+    }
+
+    let store = RetireMidResolve {
+        inner: meta,
+        pending: Mutex::new(Some(flip)),
+    };
+    match read_object(&store, &fleet, INODE).await.unwrap() {
+        Some(bytes) => assert_eq!(
+            bytes,
+            new_data,
+            "a resolve retired mid-read must answer the WHOLE live generation (old \
+             generation's segment reclaimed: {reclaimed}); the old bytes were {} long",
+            old_data.len()
+        ),
+        None => panic!(
+            "an overwrite is not a deletion: NoSuchKey is the wrong answer to a root \
+             retired mid-resolve"
+        ),
+    }
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -1368,6 +1547,12 @@ dst_campaign_test! {
 dst_campaign_test! {
     async fn reader_flips_atomically_across_commit() {
         prop_reader_flips_atomically_across_commit(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn segmented_resolve_never_tears() {
+        prop_segmented_resolve_never_tears(&mut rand_seed()).await;
     }
 }
 
