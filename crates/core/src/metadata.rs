@@ -12,6 +12,8 @@
 //! optimization). The four-phase write protocol that drives these operations
 //! lands with the client write path (M0.5).
 
+use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use bytes::Bytes;
@@ -468,6 +470,105 @@ pub enum ChunkMapError {
         /// The call site that met it, for diagnostics.
         operation: &'static str,
     },
+    /// A root's segment table names more segments than [`MAX_ROOT_SEGMENTS`] allows,
+    /// **while the root still names that generation**.
+    ///
+    /// Refused at **resolve** time (where the table becomes a bounded read,
+    /// [`resolve_chunk_map`]), not at decode: the ceiling is a derived capacity constant
+    /// this deployment chooses, not a structural invariant of the stored format
+    /// (ADR-0045's liberal-on-read boundary — see [`MAX_ROOT_SEGMENTS`]'s own doc). The
+    /// table is the root's own claim, so one past the ceiling is refused **before a
+    /// single row of its range is read**, never clamped to the ceiling and read partway.
+    ///
+    /// Like every other resolve anomaly it goes through the resolve-retry arbiter first:
+    /// a caller resolving a snapshot the store has since moved off restarts onto the live
+    /// root instead, so an over-ceiling *retired* root can never fail the read of an
+    /// object whose live generation is fine.
+    TooManySegments {
+        /// How many segments the table declares.
+        segments: usize,
+    },
+    /// A record under the group's `seg:` range at an index the root's segment table
+    /// does not name — an index at or past `segment_count`.
+    SegmentUnknown {
+        /// The group nonce.
+        nonce: String,
+        /// The group's fence epoch.
+        epoch: u64,
+        /// The unnamed index.
+        index: u32,
+    },
+    /// A segment the root's table names is **absent** from its group's `seg:` range
+    /// while the root still names that exact generation: a live generation never loses
+    /// a segment, so this is an invariant violation and is **fail-closed**
+    /// (`0016:2463-2471`) — never a torn or partial read.
+    SegmentAbsent {
+        /// The group nonce.
+        nonce: String,
+        /// The group's fence epoch.
+        epoch: u64,
+        /// The missing segment's index.
+        index: u32,
+    },
+    /// A segment record's own byte extent disagrees with the [`SegmentRef`] the root's
+    /// table carries for it, while the root still names that generation.
+    SegmentBoundsMismatch {
+        /// The segment's index.
+        index: u32,
+        /// The `(byte_offset, byte_len)` the root's table names.
+        root: (u64, u64),
+        /// The `(byte_offset, byte_len)` the segment record itself carries.
+        segment: (u64, u64),
+    },
+    /// A record under the group's `seg:` range whose **value** is larger than the value
+    /// ceiling every backend inherits ([`MAX_VALUE_BYTES`]), while the root still names
+    /// that generation.
+    ///
+    /// What this refusal *is*: the resolver will neither **decode** such a row nor
+    /// **retain** it, so nothing downstream of here is sized by it. What it is **not**:
+    /// a claim that no memory was spent on it. Values arrive from the seam already
+    /// materialised — [`MetadataStore::scan_page`] hands back `Vec<(Vec<u8>, Bytes)>`
+    /// and [`MetadataStore::get`] an `Option<Bytes>` — so the byte a store commits to a
+    /// caller's heap is committed before any caller can look at it. Bounding *that* is
+    /// the seam's, not this function's (the trait inherits each backend's native value
+    /// limit and surfaces it as `Err`, `crates/traits/src/lib.rs:995-999`); it is
+    /// tracked as getwyrd/wyrd#674 and is deliberately not chased with a mechanism here.
+    ///
+    /// The ceiling is the **value** ceiling `V`, twice the `V / 2` a publishable segment
+    /// value is bounded by (`0016:1467`, the `MAX_SEG_CHUNKS` row), so no record a
+    /// conforming publication could have written is ever refused by it — and like every
+    /// other resolve anomaly it goes through the resolve-retry arbiter first, so an
+    /// oversized row in a *retired* generation restarts the read instead of failing it.
+    SegmentValueOverCeiling {
+        /// The segment's index.
+        index: u32,
+        /// The value's size in bytes.
+        bytes: usize,
+        /// The ceiling it passed ([`MAX_VALUE_BYTES`]).
+        ceiling: usize,
+    },
+    /// A record under the group's `seg:` range could not be decoded at all, while the
+    /// root still names that generation.
+    SegmentRecordUndecodable {
+        /// The segment's index.
+        index: u32,
+        /// What the decode could not do with the bytes.
+        detail: String,
+    },
+    /// A resolve that kept meeting a **superseded** generation: each restart re-read the
+    /// root and found the generation it named already replaced again, past
+    /// [`MAX_RESOLVE_RESTARTS`] attempts. Fail closed — answering "this object owns no
+    /// bytes" after giving up is exactly the data-loss shape decision 7(h) forbids.
+    ///
+    /// Only a **supersede** spends an attempt. A root the re-read finds **absent** is a
+    /// deletion, not churn: nothing later exists to restart onto, so it answers "no such
+    /// object" where it is seen and never reaches this variant. Collapsing the two would
+    /// report a plain delete as an unsettled map whenever it landed on the last allowed
+    /// attempt (`0016:2452-2471`).
+    MapResolutionUnstable {
+        /// How many restarts were spent.
+        attempts: usize,
+    },
 }
 
 impl fmt::Display for ChunkMapError {
@@ -533,6 +634,52 @@ impl fmt::Display for ChunkMapError {
             Self::SegmentedMapUnsupported { operation } => write!(
                 f,
                 "{operation} met a segmented chunk map, which this build cannot yet resolve"
+            ),
+            Self::TooManySegments { segments } => write!(
+                f,
+                "segment table names {segments} segments, over the {MAX_ROOT_SEGMENTS}-segment resolve ceiling: refused before its range was read"
+            ),
+            Self::SegmentUnknown {
+                nonce,
+                epoch,
+                index,
+            } => write!(
+                f,
+                "seg:{nonce}:{epoch}:{index:0width$} exists but the root's table does not name it",
+                width = SEG_INDEX_WIDTH
+            ),
+            Self::SegmentAbsent {
+                nonce,
+                epoch,
+                index,
+            } => write!(
+                f,
+                "seg:{nonce}:{epoch}:{index:0width$} is absent while the root still names this generation",
+                width = SEG_INDEX_WIDTH
+            ),
+            Self::SegmentBoundsMismatch {
+                index,
+                root,
+                segment,
+            } => write!(
+                f,
+                "segment {index}: the root's table names ({}, {}) but the record carries ({}, {})",
+                root.0, root.1, segment.0, segment.1
+            ),
+            Self::SegmentValueOverCeiling {
+                index,
+                bytes,
+                ceiling,
+            } => write!(
+                f,
+                "segment {index}'s record is {bytes} bytes, over the {ceiling}-byte value ceiling: neither decoded nor retained"
+            ),
+            Self::SegmentRecordUndecodable { index, detail } => {
+                write!(f, "segment {index} could not be decoded: {detail}")
+            }
+            Self::MapResolutionUnstable { attempts } => write!(
+                f,
+                "the chunk map kept resolving to a retired generation after {attempts} restarts"
             ),
         }
     }
@@ -1182,8 +1329,11 @@ pub struct InodeRecord {
     pub size: u64,
     /// The ordered chunks making up the content — inline (**flat**) or named by a
     /// segment table (**segmented**, proposal 0016 decision 7). Read it through
-    /// [`ChunkMap::as_flat`] until a resolver exists (#649); never treat
-    /// [`ChunkMap::Segmented`] as an empty list.
+    /// [`resolve_chunk_map`] (or [`resolve_current_chunk_map`], for a caller whose own
+    /// snapshot may already be stale): that is the ONE way a consumer able to reach the
+    /// store turns this field into an ordered chunk list (decision 7(e)). A consumer
+    /// that cannot — no store in hand — uses [`ChunkMap::as_flat`] and fails closed on a
+    /// segmented map; never treat [`ChunkMap::Segmented`] as an empty list.
     pub chunk_map: ChunkMap,
     /// Commit state.
     pub state: InodeState,
@@ -1937,6 +2087,469 @@ pub async fn high_water_marks(store: &impl MetadataStore) -> Result<(InodeId, Ch
         }
     }
     Ok((max_inode, max_chunk))
+}
+
+// ---------------------------------------------------------------------------
+// Chunk-map RESOLUTION (proposal 0016 decision 7(e)/(h), issue #649)
+// ---------------------------------------------------------------------------
+//
+// #648 landed the segmented SHAPE with no reader: every pre-existing `.chunk_map` site
+// above treats `ChunkMap::Segmented` as `ChunkMapError::SegmentedMapUnsupported`. This
+// section is the ONE way a consumer that can reach the store turns a committed inode
+// into its ordered chunk list (decision 7(e)) — `read.rs`'s placement-aware entries and
+// the gateway's streaming/ranged reads go through it; the custodian's maintenance passes
+// still fail closed until #650/#651 adopt it.
+//
+// WHAT IS BOUNDED HERE, AND WHAT IS NOT.
+//
+// * The WORK a record can demand of a reader IS this caller's, and is bounded three
+//   ways: a table naming more than `MAX_ROOT_SEGMENTS` segments is refused *before its
+//   range is read at all*; the range read is the group's own `seg:<nonce>:<epoch>:`
+//   prefix, never a global `seg:` scan (`0016:2393-2400`); and each page asks for
+//   `SEGMENT_PAGE_LIMIT` rows — this reader's constant, never the root's claim, so no
+//   record sizes a page.
+// * The BYTES a read materialises are NOT bounded here, and cannot be: `scan_page`
+//   returns `Vec<(Vec<u8>, Bytes)>` and `get` returns `Option<Bytes>`, so a value is
+//   already in the caller's heap when it arrives (`crates/traits/src/lib.rs:1105`,
+//   `:1017`). The trait assigns that bound to the seam — a backend's native limits are
+//   inherited and surface as `Err` (`crates/traits/src/lib.rs:995-999`) — and it is
+//   tracked as getwyrd/wyrd#674. `SegmentValueOverCeiling` below is therefore exactly
+//   what its doc says: this resolver will not decode or retain an over-ceiling row. It
+//   is NOT a claim that no memory was spent on one.
+// * The TIME an await may take is the BACKEND's: "a backend must bound its own waiting
+//   rather than block a caller forever on an unreachable cluster"
+//   (`crates/traits/src/lib.rs:1000-1012`), which is why each networked driver imposes
+//   its own (`crates/metadata-fdb/src/lib.rs:78-89`,
+//   `crates/metadata-tikv/src/lib.rs:143-172`) and the embedded one needs none.
+//   `wyrd-core` holds no runtime dependency to spend a caller-side deadline from
+//   (ADR-0009; `crates/core/Cargo.toml:11-15` keeps core executor-free), and no other
+//   metadata call in this module wraps one.
+
+/// The most rows one page of a group's `seg:` range asks for — **this reader's
+/// constant**, not the root's claim.
+///
+/// A root's segment table may not size the page spent on its behalf: passing the
+/// claimed segment count would let a record set the transient cost of one round trip,
+/// which is the record bounding the reader rather than the other way round. A fixed
+/// bound caps that cost at a constant and costs at most
+/// `MAX_ROOT_SEGMENTS / SEGMENT_PAGE_LIMIT` extra round trips for the largest table the
+/// ceiling admits.
+///
+/// The walk terminates on the paging contract, not on this number: the cursor is
+/// exclusive and strictly advancing (clause 2/3, `crates/traits/src/lib.rs:1105`) and
+/// every row this resolver keeps has a distinct parsed index below the root's claim, so
+/// a group's range costs at most `claim + 1` rows however they are paged — the first row
+/// the table cannot account for ends the walk where it is found. Those clauses are not
+/// taken on trust: the shared `wyrd-metadata-conformance` suite asserts each of them on
+/// every backend (`crates/traits/src/lib.rs:1105`, `0016:2653-2666`), which is why this
+/// resolver needs no page counter of its own on top of them.
+pub const SEGMENT_PAGE_LIMIT: usize = 128;
+
+/// How many times [`resolve_current_chunk_map`] re-reads the root before giving up. Each
+/// restart means the generation just read was retired *again* under it; past this many
+/// the honest answer is a typed error, never "this object owns no bytes" (decision 7(h)).
+pub const MAX_RESOLVE_RESTARTS: usize = 3;
+
+/// One resolved chunk map: the **ordered** chunk list, and the root generation it was
+/// resolved from (proposal 0016 decision 7(e)).
+///
+/// The record rides along because it is the only honest source of a read's framing: a
+/// resolve that restarted onto the live root ([`resolve_chunk_map`], decision 7(h))
+/// answers chunks the caller's own snapshot does not describe, so a caller taking
+/// `size`/`etag`/`modified` from its snapshot would frame the new bytes with the retired
+/// generation's headers. Both fields are [`Cow`]s so the ordinary case — a flat map on a
+/// snapshot that is still live — copies neither.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedChunkMap<'a> {
+    /// The generation the chunks came from: the caller's own snapshot, or the live root
+    /// a retired resolution restarted onto.
+    pub record: Cow<'a, InodeRecord>,
+    /// That generation's ordered chunk list.
+    pub chunks: Cow<'a, [ChunkRef]>,
+}
+
+/// What resolving one generation produced: its answer, or the reason the resolution was
+/// dropped without one (decision 7(h), `0016:2452-2471`).
+///
+/// The two dropped arms are **not** the same answer, and collapsing them is a data-shape
+/// bug rather than a nicety: a superseded generation has a live successor to restart onto,
+/// a deleted one has none. Only the first is churn worth spending a restart on; the second
+/// is already the final answer every consumer reads as "no such object". Told apart here,
+/// once, so no caller has to re-derive it from a bare `None`.
+enum Resolution<T> {
+    /// The generation resolved.
+    Answer(T),
+    /// The root has moved on to a **different** generation: the read restarts onto it. An
+    /// overwrite is not a deletion, so answering "no such object" here would 404 an object
+    /// that never stopped existing.
+    Superseded,
+    /// The root is **absent**: the object has no live committed generation, and there is
+    /// no later one to restart onto. Terminal — it never spends a restart, so a delete
+    /// racing the last allowed attempt still answers "no such object" instead of
+    /// [`ChunkMapError::MapResolutionUnstable`].
+    Gone,
+}
+
+impl<T> Resolution<T> {
+    /// Carry a dropped arm across a change of answer type, mapping the answer with `f` —
+    /// so a stage that reshapes what was resolved cannot accidentally reshape *why* a
+    /// resolution was dropped.
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Resolution<U> {
+        match self {
+            Self::Answer(answer) => Resolution::Answer(f(answer)),
+            Self::Superseded => Resolution::Superseded,
+            Self::Gone => Resolution::Gone,
+        }
+    }
+}
+
+/// What the **current** root says about `group` — the re-read the resolve-retry rule turns
+/// on (`0016:2463-2471`). `Ok(None)` means the root still names this exact generation, so
+/// an anomaly under it is that generation's own fault; otherwise the generation has been
+/// dropped and the arm says **how**, because the two answers differ: overwritten
+/// ([`Resolution::Superseded`], restart) or deleted ([`Resolution::Gone`], terminal).
+///
+/// Generic in the answer type it never produces: with no `T` in scope this cannot build a
+/// [`Resolution::Answer`], so "the root re-read decided the map" is unrepresentable, and
+/// the arm composes straight into whichever stage asked.
+async fn root_dropped<T>(
+    store: &dyn MetadataStore,
+    root_key: &[u8],
+    group: &SegmentGroup,
+) -> Result<Option<Resolution<T>>> {
+    let Some(bytes) = store.get(root_key).await? else {
+        // Deleted, not overwritten. A restart would re-read the same absent root, so
+        // spending one buys nothing — and on the last allowed attempt it would report an
+        // ordinary delete as a map that will not settle.
+        return Ok(Some(Resolution::Gone));
+    };
+    let current: InodeRecord = decode(&bytes)?;
+    if current.chunk_map.segmented().map(SegmentedMap::group) == Some(group) {
+        return Ok(None);
+    }
+    // The root still exists but names something else — a different group, or a flat map.
+    Ok(Some(Resolution::Superseded))
+}
+
+/// The resolve-retry rule's arbiter (`0016:2463-2471`, decision 7(h)): given an anomaly
+/// in a group's `seg:` range, decide whether it is a **concurrent retirement** (the root
+/// moved off this generation — the dropped arm [`root_dropped`] names, restart or
+/// not-found) or an **invariant violation** on a generation the root still names
+/// (`Err(fault)`, fail closed, never a torn map).
+///
+/// Every anomaly [`read_segments`] can meet — a table past the reader's ceiling, a row
+/// the root does not name, a key the `seg:` grammar refuses, a value past the per-record
+/// ceiling, a named segment that is absent, one that will not decode, one whose extent
+/// disagrees with the root — comes through here rather than being judged where it was
+/// noticed: they share one benign cause (the generation the caller holds was retired,
+/// its records mid-deletion), and deciding any of them locally would turn an ordinary
+/// overwrite into a hard read failure for the reader racing it. That is why
+/// [`read_group_range`] hands back a described [`GroupRange::Anomaly`] instead of raising
+/// one: there is exactly ONE place in this module that answers "retired, or corrupt?".
+async fn retired_or<T>(
+    store: &dyn MetadataStore,
+    root_key: &[u8],
+    group: &SegmentGroup,
+    fault: ChunkMapError,
+) -> Result<Resolution<T>> {
+    match root_dropped(store, root_key, group).await? {
+        // The root moved off this generation while it was being read: not this reader's
+        // fault to raise, and which dropped arm it is was decided by what the re-read saw.
+        Some(dropped) => Ok(dropped),
+        // The root still names THIS generation, and either its own table is past the
+        // reader's ceiling or its range does not hold exactly what that table says it
+        // does. A live generation neither loses a segment nor grows one, so this is
+        // corruption or a protocol violation — fail closed, for this object only.
+        None => Err(fault.into()),
+    }
+}
+
+/// The outcome of walking a segment group's own range.
+enum GroupRange {
+    /// Every row under the range, keyed by its **parsed** index — none past the root's
+    /// claim.
+    Rows(BTreeMap<u32, Bytes>),
+    /// The range cannot be answered as the root's table describes it. Carried back as a
+    /// *described* anomaly rather than raised here, so [`read_segments`] settles it
+    /// through the one resolve-retry arbiter ([`retired_or`]).
+    Anomaly(ChunkMapError),
+}
+
+/// Read one segment group's own range, `seg:<nonce>:<epoch>:`, in bounded pages — the
+/// single place anything in this module reads a group's `seg:` records
+/// (`0016:2393-2400`; never a global `seg:` scan, never another group's or another
+/// epoch's).
+///
+/// [`MetadataStore::scan`] is complete-or-fail-loud at `SCAN_CAP`
+/// (`crates/traits/src/lib.rs:286`): a damaged or half-retired generation whose range
+/// holds more records than any root names would either buffer all of them or fail the
+/// whole call with a STORE error, which per-object containment cannot catch — one
+/// damaged object would then end a fleet-wide maintenance pass. So the range is read
+/// with [`MetadataStore::scan_page`] (`crates/traits/src/lib.rs:1105`, #634/PR #645),
+/// [`SEGMENT_PAGE_LIMIT`] rows at a time.
+///
+/// `accounted` — the root's own claim — is refused above [`MAX_ROOT_SEGMENTS`] **before
+/// the first page is asked for** (`0016:2432-2440`). That refusal is *described* like
+/// every other anomaly, not raised here: an over-ceiling table is one more shape a reader
+/// can meet on a generation retired under it, and deciding it locally would answer
+/// [`ChunkMapError::TooManySegments`] for an object whose live generation resolves
+/// perfectly. Settling it costs one **root** `get` ([`retired_or`]) and never a range
+/// read, so the refusal stays unread either way.
+///
+/// A row past the claim, a key this module's grammar refuses, or a value past
+/// [`MAX_VALUE_BYTES`] ends the walk where it is met — so the rows this function keeps
+/// are at most the root's claim, and the pages it asks for at most one more than
+/// `claim / SEGMENT_PAGE_LIMIT`. (What the store has already spent materialising a page
+/// it hands back is the seam's bound, not this walk's — getwyrd/wyrd#674.)
+///
+/// Rows are collected into a [`BTreeMap`] keyed by their **parsed** index — never the
+/// order a page returned them in: the paging contract states byte-lexicographic key
+/// order (`crates/traits/src/lib.rs:1105` clause 1), but the fixed-width key is a
+/// debuggability property, not a licence for this resolver to lean on it.
+async fn read_group_range(
+    store: &dyn MetadataStore,
+    group: &SegmentGroup,
+    accounted: usize,
+) -> Result<GroupRange> {
+    if accounted > MAX_ROOT_SEGMENTS {
+        return Ok(GroupRange::Anomaly(ChunkMapError::TooManySegments {
+            segments: accounted,
+        }));
+    }
+    let prefix = seg_range_prefix(group);
+    let mut rows: BTreeMap<u32, Bytes> = BTreeMap::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (page, next) = store
+            .scan_page(&prefix, after.as_deref(), SEGMENT_PAGE_LIMIT)
+            .await?;
+        for (key, value) in page {
+            // A key under the range this module's own grammar cannot parse is an anomaly
+            // of the range, NOT a verdict: `Ok(Anomaly)`, so the retired-versus-corrupt
+            // call is made once, by `read_segments`, for every shape alike.
+            let (nonce, epoch, index) = match parse_seg_key(&key) {
+                Ok(parsed) => parsed,
+                Err(malformed) => return Ok(GroupRange::Anomaly(malformed)),
+            };
+            // The range prefix already pins both, so a mismatch means the store answered
+            // with a row outside the prefix it was asked for: the resolver pins the group
+            // itself rather than trusting a backend's prefix handling, or another epoch's
+            // segment could be spliced into this generation's map.
+            if nonce != *group.nonce() || epoch != group.epoch() {
+                return Ok(GroupRange::Anomaly(ChunkMapError::SegmentKeyMalformed {
+                    key: String::from_utf8_lossy(&key).into_owned(),
+                }));
+            }
+            // Checked BEFORE the row is kept, so the walk ends at the first row the
+            // root's table cannot account for instead of reading the rest of the range.
+            if usize::try_from(index).unwrap_or(usize::MAX) >= accounted {
+                return Ok(GroupRange::Anomaly(ChunkMapError::SegmentUnknown {
+                    nonce: group.nonce().to_string(),
+                    epoch: group.epoch(),
+                    index,
+                }));
+            }
+            // A row no conforming publication wrote (`0016:1467` bounds a segment value
+            // to V/2) and the tightest backend in play would have refused to store
+            // (`crates/traits/src/lib.rs:995-999`): this resolver neither decodes nor
+            // retains it. Described, not raised — an oversized row is one more shape a
+            // retired generation can show a reader.
+            if value.len() > MAX_VALUE_BYTES {
+                return Ok(GroupRange::Anomaly(
+                    ChunkMapError::SegmentValueOverCeiling {
+                        index,
+                        bytes: value.len(),
+                        ceiling: MAX_VALUE_BYTES,
+                    },
+                ));
+            }
+            rows.insert(index, value);
+        }
+        // Clause 3 of the paging contract: `next` is `None` only when the prefix is
+        // exhausted, and the cursor is exclusive, so the walk strictly advances.
+        match next {
+            Some(cursor) => after = Some(cursor),
+            None => return Ok(GroupRange::Rows(rows)),
+        }
+    }
+}
+
+/// Decode one `seg:` value into its [`SegmentRecord`], attributing any failure —
+/// structural or plain-unparsable bytes alike — to this one segment's index via
+/// [`ChunkMapError::SegmentRecordUndecodable`], so [`retired_or`] has one typed anomaly
+/// to arbitrate regardless of *why* the record could not be read.
+fn decode_segment_record(
+    index: u32,
+    value: &[u8],
+) -> std::result::Result<SegmentRecord, ChunkMapError> {
+    decode::<SegmentRecord>(value).map_err(|err| {
+        let detail = match err.downcast::<ChunkMapError>() {
+            Ok(typed) => typed.to_string(),
+            Err(err) => err.to_string(),
+        };
+        ChunkMapError::SegmentRecordUndecodable { index, detail }
+    })
+}
+
+/// Read a segmented map's segments through the bounded per-group range
+/// ([`read_group_range`]), settling every anomaly it can show through the single
+/// resolve-retry arbiter ([`retired_or`]) rather than a bare refusal at whichever check
+/// noticed it first. [`Resolution::Superseded`] / [`Resolution::Gone`] are the retired
+/// arms, kept apart all the way out (a delete is not churn).
+async fn read_segments(
+    store: &dyn MetadataStore,
+    root_key: &[u8],
+    map: &SegmentedMap,
+) -> Result<Resolution<BTreeMap<u32, SegmentRecord>>> {
+    let group = map.group();
+    let rows = match read_group_range(store, group, map.segment_count() as usize).await? {
+        GroupRange::Anomaly(fault) => return retired_or(store, root_key, group, fault).await,
+        GroupRange::Rows(rows) => rows,
+    };
+    let mut found: BTreeMap<u32, SegmentRecord> = BTreeMap::new();
+    for (index, value) in rows {
+        match decode_segment_record(index, &value) {
+            Ok(record) => {
+                found.insert(index, record);
+            }
+            Err(fault) => return retired_or(store, root_key, group, fault).await,
+        }
+    }
+    for segment in map.segments() {
+        let Some(record) = found.get(&segment.index) else {
+            let absent = ChunkMapError::SegmentAbsent {
+                nonce: group.nonce().to_string(),
+                epoch: group.epoch(),
+                index: segment.index,
+            };
+            return retired_or(store, root_key, group, absent).await;
+        };
+        if record.byte_offset() != segment.byte_offset || record.byte_len() != segment.byte_len {
+            let mismatch = ChunkMapError::SegmentBoundsMismatch {
+                index: segment.index,
+                root: (segment.byte_offset, segment.byte_len),
+                segment: (record.byte_offset(), record.byte_len()),
+            };
+            return retired_or(store, root_key, group, mismatch).await;
+        }
+    }
+    // A resolution that read every segment can still be STALE: the root is read at one
+    // instant and the `seg:` range at another, and a supersede that flipped the root in
+    // between leaves the retired generation's records in place until the drain reaches
+    // them (`0016:2452-2462` — the root always moves first). So the same re-read that
+    // settles an absent segment also settles a COMPLETE read — one extra `get` per
+    // segmented resolve, and only for the segmented shape (a flat map is one value, read
+    // atomically with the root).
+    if let Some(dropped) = root_dropped(store, root_key, group).await? {
+        return Ok(dropped);
+    }
+    Ok(Resolution::Answer(found))
+}
+
+/// Resolve one **snapshot's** chunk map to its ordered chunk list, or the arm saying that
+/// generation was retired under the read (decision 7(h)). A flat map resolves to a borrow
+/// of the record and reads nothing.
+async fn resolve_snapshot<'a>(
+    store: &dyn MetadataStore,
+    root_key: &[u8],
+    record: &'a InodeRecord,
+) -> Result<Resolution<Cow<'a, [ChunkRef]>>> {
+    let map = match &record.chunk_map {
+        ChunkMap::Flat(chunks) => return Ok(Resolution::Answer(Cow::Borrowed(chunks))),
+        ChunkMap::Segmented(map) => map,
+    };
+    Ok(read_segments(store, root_key, map).await?.map(|segments| {
+        let mut chunks = Vec::new();
+        // Ordered by the segment's own parsed index — `BTreeMap`'s iteration order — so
+        // the object's bytes are assembled in the order its table names, never the order a
+        // page happened to answer in.
+        for (_index, segment) in segments {
+            chunks.extend(segment.into_chunks());
+        }
+        Cow::Owned(chunks)
+    }))
+}
+
+/// Resolve a caller's own **committed snapshot** to its ordered chunk list — the entry
+/// for a consumer that has just read the root itself
+/// ([`read_object`](crate::read::read_object), the gateway's streaming and ranged reads).
+///
+/// A flat map costs no read at all; a segmented one costs the bounded range
+/// `seg:<nonce>:<epoch>:` plus the one re-read that settles it (decision 7(e)).
+/// `root_key` is the inode's own key ([`inode_key`]): the resolver needs the root's
+/// *identity*, not just its decoded value, because an anomaly is settled by re-reading it
+/// — an API taking only a store and an already-decoded record could not tell a concurrent
+/// retirement from corruption.
+///
+/// If that generation was **superseded mid-resolve** the resolution is dropped and the
+/// read restarts against the live root ([`resolve_current_chunk_map`]): an overwrite is
+/// not a deletion, so answering "no such object" — or, worse, a torn half-map — for one is
+/// the data loss decision 7(h) exists to prevent. If instead the root turned out to be
+/// **gone**, the object was deleted under the read: that is already the final answer, so it
+/// is returned as one rather than restarted onto a root just observed absent. `Ok(None)`
+/// therefore means exactly one thing either way: the object has no live committed
+/// generation.
+pub async fn resolve_chunk_map<'a>(
+    store: &dyn MetadataStore,
+    root_key: &[u8],
+    record: &'a InodeRecord,
+) -> Result<Option<ResolvedChunkMap<'a>>> {
+    match resolve_snapshot(store, root_key, record).await? {
+        Resolution::Answer(chunks) => Ok(Some(ResolvedChunkMap {
+            record: Cow::Borrowed(record),
+            chunks,
+        })),
+        Resolution::Superseded => resolve_current_chunk_map(store, root_key).await,
+        Resolution::Gone => Ok(None),
+    }
+}
+
+/// Resolve the chunk map of the root the store holds **now**, reading the root itself —
+/// for a caller whose own record may already be stale (a maintenance pass's scan
+/// snapshot), and the restart [`resolve_chunk_map`] takes when its caller's generation
+/// was retired under it.
+///
+/// `Ok(None)` means there is no **live committed generation**: the root is absent
+/// (deleted) or not `Committed` — the same condition every consumer already reads as "no
+/// such object". A generation **superseded** mid-resolve is retried up to
+/// [`MAX_RESOLVE_RESTARTS`] times, then fails closed with a typed error: giving up must
+/// never be spelled "this object owns no bytes". A **deletion** met mid-resolve is not
+/// churn and spends no attempt — there is no successor generation to restart onto, so it
+/// answers `Ok(None)` where it is seen, on the last allowed attempt exactly as on the
+/// first.
+pub async fn resolve_current_chunk_map(
+    store: &dyn MetadataStore,
+    root_key: &[u8],
+) -> Result<Option<ResolvedChunkMap<'static>>> {
+    for _ in 0..MAX_RESOLVE_RESTARTS {
+        let Some(bytes) = store.get(root_key).await? else {
+            return Ok(None);
+        };
+        let record: InodeRecord = decode(&bytes)?;
+        if record.state != InodeState::Committed {
+            return Ok(None);
+        }
+        match resolve_snapshot(store, root_key, &record).await? {
+            Resolution::Answer(chunks) => {
+                return Ok(Some(ResolvedChunkMap {
+                    chunks: Cow::Owned(chunks.into_owned()),
+                    record: Cow::Owned(record),
+                }))
+            }
+            // Deleted under the resolve: the same answer the absent-root check above
+            // gives, and it must be given HERE — deferring it to another attempt would
+            // spend a restart that cannot succeed, and on the last one would report a
+            // plain delete as `MapResolutionUnstable`.
+            Resolution::Gone => return Ok(None),
+            // Overwritten under the resolve: re-read the root and resolve whatever
+            // generation replaced it.
+            Resolution::Superseded => {}
+        }
+    }
+    Err(ChunkMapError::MapResolutionUnstable {
+        attempts: MAX_RESOLVE_RESTARTS,
+    }
+    .into())
 }
 
 #[cfg(test)]

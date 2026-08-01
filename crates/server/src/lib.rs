@@ -29,7 +29,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
-use wyrd_core::metadata::{self, ChunkMapError, EcScheme, InodeId};
+use wyrd_core::metadata::{self, EcScheme, InodeId};
 use wyrd_core::{read, write};
 use wyrd_traits::{
     ChunkId, CommitOutcome, Coordination, MetadataStore, PlacementChunkStore, Result,
@@ -342,33 +342,39 @@ where
     /// [`ObjectRead`](wyrd_gateway_core::ObjectRead) stream so the seam names no runtime
     /// detail, and the committed object size rides alongside it for response framing.
     async fn get_object_streaming(self: Arc<Self>, key: &str) -> Result<Option<ObjectRead>> {
-        let Some(inode) = read::committed_inode(&self.meta, ROOT, key).await? else {
+        let Some((inode_id, inode)) = read::committed_inode(&self.meta, ROOT, key).await? else {
             return Ok(None);
         };
+        // Resolve the map through the ONE resolver every store-holding consumer shares
+        // (proposal 0016 decision 7(e)): a flat map costs no extra read, a segmented one is
+        // read from its bounded `seg:` range. A generation retired mid-resolve restarts
+        // against the CURRENT root (decision 7(h)) — an overwrite is not a deletion, so a
+        // concurrent one serves the new generation rather than a spurious `NoSuchKey`.
+        let Some(resolved) =
+            metadata::resolve_chunk_map(&self.meta, &metadata::inode_key(inode_id), &inode).await?
+        else {
+            return Ok(None);
+        };
+        // Frame the response from the generation the chunks actually came from: on a
+        // restart the snapshot above describes bytes this stream is not about to send.
+        let served = &resolved.record;
         // Carry the committed object size out with the stream so the wire layer frames the
         // response (`Content-Length`): if a chunk read faults mid-stream (e.g. a fragment
         // reclaimed by a racing DELETE), the body ends early and the client detects the short
         // read as a truncation instead of a complete object (issue #364 carry-forward).
-        let size = inode.size;
+        let size = served.size;
         // Carry the committed object metadata (ADR-0047) out with the stream so the wire layer
         // can surface the ETag, the stored content type, and Last-Modified. A record written
         // before this model carries `None`, degrading to the pre-metadata wire behaviour.
-        let etag = inode.etag.clone();
-        let content_type = inode.content_type.clone();
-        let modified = inode.modified;
+        let etag = served.etag.clone();
+        let content_type = served.content_type.clone();
+        let modified = served.modified;
         let this = Arc::clone(&self);
-        // A segmented map has no resolver yet (#649-#651): fail closed rather than
-        // stream no chunks for a live object.
-        // `into_flat`, not `as_flat().to_vec()`: the inode is owned, so the chunk list
-        // (and every placement vector in it) moves into the reader task instead of being
-        // deep-cloned on the primary read path.
-        let chunk_map =
-            inode
-                .chunk_map
-                .into_flat()
-                .ok_or(ChunkMapError::SegmentedMapUnsupported {
-                    operation: "Gateway::get_object_streaming",
-                })?;
+        // `into_owned`, not a deep copy: the resolver hands back a `Cow`, so a flat map on a
+        // live snapshot moves its chunk list (and every placement vector in it) into the
+        // reader task instead of being cloned on the primary read path (#648 follow-up
+        // `bbdb7c5`, preserved through the resolver seam).
+        let chunk_map = resolved.chunks.into_owned();
         // The reader task is spawned LAZILY — on the stream's first poll, not here — so a
         // caller that resolves the object and then never reads the body (the wire layer's
         // 304/412 conditional short-circuit drops the stream unread, issue #510 review) costs
@@ -427,43 +433,47 @@ where
         key: &str,
         range: ByteRange,
     ) -> Result<Option<RangeRead>> {
-        let Some(inode) = read::committed_inode(&self.meta, ROOT, key).await? else {
+        let Some((inode_id, inode)) = read::committed_inode(&self.meta, ROOT, key).await? else {
             return Ok(None);
         };
+        // The ranged walk is its OWN `.chunk_map` consumer, so it resolves through the same
+        // shared resolver: a range spanning a SEGMENT boundary must see the chunks either
+        // side of it, which the root's segment table alone cannot give (decision 7(e)).
+        // Resolved FIRST, because a generation retired mid-resolve restarts against the
+        // current root (decision 7(h)) and the framing below — size, ETag, and the 416
+        // boundary — must describe the generation the bytes will actually come from.
+        let Some(resolved) =
+            metadata::resolve_chunk_map(&self.meta, &metadata::inode_key(inode_id), &inode).await?
+        else {
+            return Ok(None);
+        };
+        let served = &resolved.record;
         // Metadata from the SAME resolve as the stream below (ADR-0047), so the wire layer's
         // 206/416 headers name the version the bytes came from.
         let meta = ObjectMeta {
-            size: inode.size,
-            etag: inode.etag.clone(),
-            content_type: inode.content_type.clone(),
-            modified: inode.modified,
+            size: served.size,
+            etag: served.etag.clone(),
+            content_type: served.content_type.clone(),
+            modified: served.modified,
         };
-        // Resolve the range against THIS inode's size. An unsatisfiable range costs no chunk
-        // read — the wire layer maps it to a 416 carrying `meta.size`.
-        let Some((offset, len)) = resolve_byte_range(range, inode.size) else {
+        // Resolve the range against THAT generation's size. An unsatisfiable range costs no
+        // chunk read — the wire layer maps it to a 416 carrying `meta.size`.
+        let Some((offset, len)) = resolve_byte_range(range, served.size) else {
             return Ok(Some(RangeRead {
                 meta,
                 outcome: RangeOutcome::Unsatisfiable,
             }));
         };
-        // Walk the chunk map once, collecting ONLY the chunks that overlap the requested span,
-        // each with its intra-chunk trim (`skip` bytes off the front, `take` bytes kept). A
-        // chunk entirely before `offset`, or at/after the span end, is skipped — its fragments
-        // are never fetched, which is the whole point of a ranged read (issue #510
-        // anti-wire-side-discard oracle: the counting store sees only the covering chunks).
+        // Walk the resolved chunk list once, collecting ONLY the chunks that overlap the
+        // requested span, each with its intra-chunk trim (`skip` bytes off the front, `take`
+        // bytes kept). A chunk entirely before `offset`, or at/after the span end, is skipped
+        // — its fragments are never fetched, which is the whole point of a ranged read (issue
+        // #510 anti-wire-side-discard oracle: the counting store sees only the covering
+        // chunks).
         let end = offset.saturating_add(len); // exclusive
         let mut covering: Vec<(metadata::ChunkRef, usize, usize)> = Vec::new();
         let mut pos: u64 = 0;
-        // A segmented map has no resolver yet (#649-#651): fail closed rather than
-        // answer an empty range for a live object.
-        let flat_chunk_map =
-            inode
-                .chunk_map
-                .as_flat()
-                .ok_or(ChunkMapError::SegmentedMapUnsupported {
-                    operation: "Gateway::get_object_range",
-                })?;
-        for chunk in flat_chunk_map {
+        for chunk in resolved.chunks.iter() {
             let chunk_start = pos;
             let chunk_end = pos.saturating_add(chunk.len);
             pos = chunk_end;
@@ -530,7 +540,9 @@ where
     /// (channel + spawned reader task) omitted, so a HEAD of a large object costs one
     /// metadata round-trip, not a chunk read.
     async fn head_object(&self, key: &str) -> Result<Option<ObjectMeta>> {
-        let Some(inode) = read::committed_inode(&self.meta, ROOT, key).await? else {
+        // The inode id is not needed here: HEAD never resolves the chunk map (a segmented
+        // root's own fields answer it), which is what keeps it one metadata round-trip.
+        let Some((_inode_id, inode)) = read::committed_inode(&self.meta, ROOT, key).await? else {
             return Ok(None);
         };
         Ok(Some(ObjectMeta {
