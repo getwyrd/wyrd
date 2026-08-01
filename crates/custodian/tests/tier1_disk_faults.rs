@@ -402,7 +402,8 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
             },
             len: data.len() as u64,
             placement: vec![0, 1, 2], // fragment i → D-server i
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -625,14 +626,16 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
 
     // Fragment 1 (rebuilt) must have been re-placed on d3 (server 3, domain D).
     assert_eq!(
-        updated.chunk_map[0].placement[1], 3,
+        updated.chunk_map.as_flat().unwrap()[0].placement[1],
+        3,
         "rebuilt fragment 1 must be re-placed on d3 (server 3, domain D); \
          actual placement: {:?}",
-        updated.chunk_map[0].placement
+        updated.chunk_map.as_flat().unwrap()[0].placement
     );
     eprintln!(
         "tier1: inode at version {}, placement: {:?}",
-        updated.version, updated.chunk_map[0].placement
+        updated.version,
+        updated.chunk_map.as_flat().unwrap()[0].placement
     );
 
     // ── 15. Verify full redundancy ─────────────────────────────────────────────

@@ -47,7 +47,7 @@
 //! `core` seams plus `tracing` — no D-server fleet, no failure-domain topology, no
 //! concrete backend.
 
-use wyrd_core::metadata::{self, InodeId, InodeRecord, InodeState};
+use wyrd_core::metadata::{self, ChunkMapError, InodeId, InodeRecord, InodeState};
 use wyrd_traits::{ChunkId, CommitOutcome, MetadataStore, Result, WriteBatch};
 
 use crate::reconciliation::Reconciled;
@@ -89,8 +89,18 @@ pub async fn reconcile(ctx: &BackfillContext<'_>) -> Result<Reconciled> {
         // classifier): collect the indices of chunks whose committed placement is
         // EMPTY, surfacing any MALFORMED one as an operator signal along the way.
         // Neither classification mutates `record.chunk_map` — a read-only pass.
+        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
+        // scan exactly as an unreadable record already does via `decode(&value)?`
+        // above, rather than silently skipping the object's chunks.
+        let flat_chunk_map =
+            record
+                .chunk_map
+                .as_flat()
+                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                    operation: "backfill::reconcile",
+                })?;
         let mut to_fill = Vec::new();
-        for (index, chunk) in record.chunk_map.iter().enumerate() {
+        for (index, chunk) in flat_chunk_map.iter().enumerate() {
             match chunk.checked_fragments() {
                 Ok(_) if chunk.placement.is_empty() => to_fill.push(index),
                 // Ok(_) and non-empty: already an explicit full-length vector —
@@ -108,7 +118,7 @@ pub async fn reconcile(ctx: &BackfillContext<'_>) -> Result<Reconciled> {
         // Materialize the explicit full-length identity vector for each empty chunk
         // — the same resolution `placed_dserver` already applies implicitly, now
         // made durable (`core/src/metadata.rs:119-124`).
-        let mut next_chunk_map = record.chunk_map.clone();
+        let mut next_chunk_map = flat_chunk_map.to_vec();
         for &index in &to_fill {
             let n = next_chunk_map[index].fragment_count();
             next_chunk_map[index].placement = (0..n).map(u64::from).collect();
@@ -121,7 +131,7 @@ pub async fn reconcile(ctx: &BackfillContext<'_>) -> Result<Reconciled> {
         // CAS; this record is simply re-examined on a later pass, never clobbered.
         let next = InodeRecord {
             size: record.size,
-            chunk_map: next_chunk_map,
+            chunk_map: next_chunk_map.into(),
             state: InodeState::Committed,
             version: record.version + 1,
             // Backfill re-commits the SAME content (a repair), so it PRESERVES the object
@@ -167,6 +177,10 @@ async fn emit_remaining(meta: &dyn MetadataStore) -> Result<()> {
         }
         remaining += record
             .chunk_map
+            .as_flat()
+            .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                operation: "backfill::emit_remaining",
+            })?
             .iter()
             .filter(|chunk| chunk.placement.is_empty())
             .count() as u64;

@@ -287,7 +287,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
     assert_eq!(outcome, CommitOutcome::Committed);
     // The write placed the 3 fragments on the first three domains → servers 0,1,2.
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -381,7 +381,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "the rebuilt fragment was re-placed on a healthy D server in a distinct domain"
     );
@@ -398,7 +398,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
             "fragment {index} verifies its checksum and belongs to the chunk"
         );
     }
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
@@ -636,7 +636,7 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
     // identity fallback resolves them), so this is a faithful pre-M3 fixture: a chunk
     // committed before the `placement` field shipped decodes to precisely this shape.
     let prior = read_inode(&meta).await;
-    let mut chunk_map = prior.chunk_map.clone();
+    let mut chunk_map = prior.chunk_map.as_flat().unwrap().to_vec();
     chunk_map[0].placement = Vec::new();
     assert_eq!(
         metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
@@ -646,7 +646,9 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
     );
     let downgraded = read_inode(&meta).await;
     assert!(
-        downgraded.chunk_map[0].placement.is_empty(),
+        downgraded.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .is_empty(),
         "pre-M3 record: an empty, not full-length, placement vector"
     );
 
@@ -703,17 +705,17 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
     // THE re-placement pin: FULL-LENGTH (== fragment_count() == 3), never the raw
     // empty vector the chunk was committed with going into this repair.
     assert_eq!(
-        record.chunk_map[0].placement.len(),
-        usize::from(record.chunk_map[0].fragment_count()),
+        record.chunk_map.as_flat().unwrap()[0].placement.len(),
+        usize::from(record.chunk_map.as_flat().unwrap()[0].fragment_count()),
         "the re-placed record is full-length, not the short/empty vector it started from"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "survivors identity-resolved (0, 2); the lost fragment re-placed on the free \
          distinct domain D (server 3)"
     );
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
@@ -774,7 +776,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
     let bytes0 = d0.get_fragment(frag(0)).await.unwrap().unwrap();
     d9.put_fragment(frag(0), bytes0).await.unwrap();
     let prior = read_inode(&meta).await;
-    let mut chunk_map = prior.chunk_map.clone();
+    let mut chunk_map = prior.chunk_map.as_flat().unwrap().to_vec();
     chunk_map[0].placement = vec![9];
     assert_eq!(
         metadata::commit_chunk_map(&meta, 1, &prior, chunk_map, prior.size)
@@ -784,7 +786,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
     );
     let downgraded = read_inode(&meta).await;
     assert_eq!(
-        downgraded.chunk_map[0].placement,
+        downgraded.chunk_map.as_flat().unwrap()[0].placement,
         vec![9],
         "a genuinely SHORT (malformed) vector: 1 entry, not the full 3"
     );
@@ -835,7 +837,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
         "no version-conditional commit landed for a malformed-placement chunk"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![9],
         "the malformed placement is left exactly as committed, never repointed (#348)"
     );
@@ -893,7 +895,7 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
     // malformed (len 2, `fragment_count() == 1`) placement — the truncation/corruption case.
     write_rs_2_1(&meta, &fleet).await;
     let prior = read_inode(&meta).await;
-    let mut chunk_map = prior.chunk_map.clone();
+    let mut chunk_map = prior.chunk_map.as_flat().unwrap().to_vec();
     chunk_map[0].scheme = EcScheme::None;
     chunk_map[0].placement = vec![7, 8];
     assert_eq!(
@@ -940,7 +942,7 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
         "no version-conditional commit landed for a malformed `None`-placement chunk"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![7, 8],
         "the malformed placement is left exactly as committed, never repointed (#348)"
     );
@@ -1011,7 +1013,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         (0u64..9).collect::<Vec<_>>(),
         "rs(6,3) placed across distinct domains A..I (servers 0..8)"
     );
@@ -1083,12 +1085,12 @@ async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() 
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2, 3, 9, 5, 6, 7, 8],
         "survivors identity-resolved; the lost fragment (index 4) re-placed on the free \
          distinct domain J (server 9)"
     );
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| healthy_topo.domain_of(*id).unwrap().clone())
@@ -1264,7 +1266,7 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "the rebuilt fragment was re-placed on a healthy D server in a distinct domain"
     );
@@ -1371,7 +1373,7 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
         "no version-conditional commit ran — the fragment was not re-placed"
     );
     assert_eq!(
-        read_inode(&meta).await.chunk_map[0].placement,
+        read_inode(&meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the placement record is unchanged — the transiently-faulting fragment stays put"
     );
@@ -1501,7 +1503,12 @@ async fn write_rs_2_1_as(
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode_id(meta, inode_id).await.chunk_map[0].placement,
+        read_inode_id(meta, inode_id)
+            .await
+            .chunk_map
+            .as_flat()
+            .unwrap()[0]
+            .placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -1589,7 +1596,7 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
     // Make chunk B MALFORMED: commit a short (len-1) placement vector on inode 2. Its
     // fragments stay physically present; only the committed placement is wrong-length.
     let prior_b = read_inode_id(&meta, 2).await;
-    let mut chunk_map_b = prior_b.chunk_map.clone();
+    let mut chunk_map_b = prior_b.chunk_map.as_flat().unwrap().to_vec();
     chunk_map_b[0].placement = vec![9];
     assert_eq!(
         metadata::commit_chunk_map(&meta, 2, &prior_b, chunk_map_b, prior_b.size)

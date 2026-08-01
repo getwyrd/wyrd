@@ -298,7 +298,7 @@ async fn write_rs_2_1(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "RS(2,1) placed across distinct domains A,B,C (servers 0,1,2)"
     );
@@ -324,7 +324,7 @@ async fn write_pre_m3_chunk(meta: &MemMeta, fleet: &Fleet<'_>, scheme: EcScheme)
     chunk_refs[0].placement = Vec::new(); // the pre-M3 shape: decoded via #[serde(default)]
     let record = InodeRecord {
         size: plan.size,
-        chunk_map: chunk_refs,
+        chunk_map: chunk_refs.into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -388,10 +388,10 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
     // bytes actually live.
     let prior = read_inode(&meta).await;
     assert!(
-        prior.chunk_map[0].placement.is_empty(),
+        prior.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
         "pre-M3 record: an empty, not full-length, placement vector"
     );
-    assert_eq!(prior.chunk_map[0].placed_dserver(0), 0);
+    assert_eq!(prior.chunk_map.as_flat().unwrap()[0].placed_dserver(0), 0);
 
     // The operator marks the IDENTITY-resolved server (0) draining.
     set_lifecycle(&meta, 0, DServerLifecycle::Draining)
@@ -427,7 +427,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![1],
         "full-length (fragment_count() == 1) placement, repointed off server 0 onto the \
          one free distinct domain (B / server 1) — never an empty or short vector"
@@ -543,7 +543,7 @@ async fn evacuation_preserves_object_metadata() {
 
     let record = read_inode(&meta).await;
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![1],
         "the fragment was re-placed off the draining server (evacuation really happened)"
     );
@@ -586,12 +586,12 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
 
     let prior = read_inode(&meta).await;
     assert!(
-        prior.chunk_map[0].placement.is_empty(),
+        prior.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
         "pre-M3 record: an empty, not full-length, placement vector"
     );
     // Identity fallback: fragment i -> server i. Drain server 1 (fragment index 1, NOT
     // the first fragment — the brief's "index > 0" leg).
-    assert_eq!(prior.chunk_map[0].placed_dserver(1), 1);
+    assert_eq!(prior.chunk_map.as_flat().unwrap()[0].placed_dserver(1), 1);
 
     set_lifecycle(&meta, 1, DServerLifecycle::Draining)
         .await
@@ -626,7 +626,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "full-length placement: survivors identity-resolved, the draining index moved"
     );
@@ -634,7 +634,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
     // Spread preserved: n = 3 fragments still span n = 3 DISTINCT failure domains — only
     // possible because `survivor_domains` was resolved through the identity fallback too
     // (over the raw empty vector it would see no survivor domains at all).
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -705,7 +705,7 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
     .unwrap();
     assert_eq!(outcome, CommitOutcome::Committed);
     assert_eq!(
-        read_inode(meta).await.chunk_map[0].placement,
+        read_inode(meta).await.chunk_map.as_flat().unwrap()[0].placement,
         (0u64..9).collect::<Vec<_>>(),
         "rs(6,3) placed across distinct domains A..I (servers 0..8)"
     );
@@ -770,11 +770,11 @@ async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() 
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2, 3, 9, 5, 6, 7, 8],
         "fragment 4 evacuated off server 4 onto the one free distinct domain J (server 9)"
     );
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -865,13 +865,13 @@ async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 2, "exactly one version-conditional commit");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 3, 2],
         "the evacuated fragment was re-placed on a healthy server in a distinct domain"
     );
 
     // FULL REDUNDANCY across n=3 DISTINCT domains, spread preserved.
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -971,7 +971,7 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 1, "the placement record is untouched");
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the fragment stays on the draining server rather than collapse the spread"
     );
@@ -1103,7 +1103,7 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
         "exactly ONE version-conditional commit re-placed both evacuated fragments"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![3, 4, 2],
         "fragment 0 → server 3 (domain D), fragment 1 → server 4 (domain E); survivor \
          fragment 2 stays on server 2 (domain C)"
@@ -1111,7 +1111,7 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
 
     // The chunk still spans n = 3 DISTINCT failure domains — distinctness preserved across
     // a multi-fragment move (closes the `count = 2` leg of select_distinct_domains_excluding).
-    let domains: std::collections::HashSet<_> = record.chunk_map[0]
+    let domains: std::collections::HashSet<_> = record.chunk_map.as_flat().unwrap()[0]
         .placement
         .iter()
         .map(|id| topo.domain_of(*id).unwrap().clone())
@@ -1307,7 +1307,10 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
     let prior: InodeRecord =
         metadata::decode(&racing.get(&metadata::inode_key(1)).await.unwrap().unwrap()).unwrap();
     assert_eq!(prior.version, 1);
-    assert_eq!(prior.chunk_map[0].placement, vec![0, 1, 2]);
+    assert_eq!(
+        prior.chunk_map.as_flat().unwrap()[0].placement,
+        vec![0, 1, 2]
+    );
 
     // Arm the race: the next inode-conditional commit (the custodian's evac repoint) will
     // find the inode mutated underneath it.
@@ -1345,7 +1348,7 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         "the racing writer's commit landed (version 1 → 2)"
     );
     assert_eq!(
-        record.chunk_map[0].placement,
+        record.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the placement record is the racing writer's, NOT the custodian's repoint \
          (which would be [0, 3, 2]) — a racing writer loses rather than corrupts"
@@ -1425,7 +1428,9 @@ async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
 
     // Corrupt the committed record into a MALFORMED placement (len 1 != fragment_count 3).
     let mut record = read_inode(&meta).await;
-    record.chunk_map[0].placement = vec![0];
+    let mut corrupted = record.chunk_map.as_flat().unwrap().to_vec();
+    corrupted[0].placement = vec![0];
+    record.chunk_map = corrupted.into();
     meta.commit(WriteBatch::new().put(metadata::inode_key(1), metadata::encode(&record)))
         .await
         .unwrap();
@@ -1456,7 +1461,7 @@ async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
     // The committed placement is UNCHANGED — never rewritten over a fabricated vector.
     let after = read_inode(&meta).await;
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0],
         "malformed placement is left exactly as committed (never repointed) (#348)"
     );

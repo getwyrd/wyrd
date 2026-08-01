@@ -122,7 +122,7 @@ fn loss_survival(seed: u64) {
         let data = payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        for chunk in &inode.chunk_map {
+        for chunk in inode.chunk_map.as_flat().unwrap() {
             let count = (sim.gen::<u8>() as usize) % (M as usize + 1); // 0..=m
             for index in choose_indices(&mut sim, N, count) {
                 delete(dir.path(), chunk.id, index);
@@ -145,7 +145,7 @@ fn loss_beyond_m_is_clean_error(seed: u64) {
         let data = nonempty_payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0].clone();
+        let chunk = inode.chunk_map.as_flat().unwrap()[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             delete(dir.path(), chunk.id, index);
         }
@@ -169,7 +169,7 @@ fn corruption_excluded(seed: u64) {
         let data = payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        for chunk in &inode.chunk_map {
+        for chunk in inode.chunk_map.as_flat().unwrap() {
             let count = (sim.gen::<u8>() as usize) % (M as usize + 1); // 0..=m
             for index in choose_indices(&mut sim, N, count) {
                 corrupt(dir.path(), chunk.id, index);
@@ -192,7 +192,7 @@ fn corruption_beyond_m_is_clean_error(seed: u64) {
         let data = nonempty_payload(&mut sim, 48);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0].clone();
+        let chunk = inode.chunk_map.as_flat().unwrap()[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             corrupt(dir.path(), chunk.id, index);
         }
@@ -228,7 +228,8 @@ fn mixed_era_read(seed: u64) {
                 .chunk_refs()
                 .into_iter()
                 .chain(plan_rs.chunk_refs())
-                .collect(),
+                .collect::<Vec<_>>()
+                .into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
@@ -301,7 +302,7 @@ fn empty_placement_resolves_identically(seed: u64) {
         }
         let inode = InodeRecord {
             size: plan.size,
-            chunk_map,
+            chunk_map: chunk_map.into(),
             state: InodeState::Committed,
             version: 1,
             ..Default::default()
@@ -317,7 +318,7 @@ fn empty_placement_resolves_identically(seed: u64) {
 
         // MAINTENANCE resolves the SAME closure: every one of the chunk's fragments,
         // each at its identity D server — never the raw vector's zero entries.
-        for chunk_ref in &inode.chunk_map {
+        for chunk_ref in inode.chunk_map.as_flat().unwrap() {
             let resolved = maintenance_resolved(chunk_ref);
             assert_eq!(
                 resolved.len(),

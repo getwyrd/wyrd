@@ -150,7 +150,8 @@ async fn commit_reference(
             scheme: EcScheme::None,
             len: 5,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()

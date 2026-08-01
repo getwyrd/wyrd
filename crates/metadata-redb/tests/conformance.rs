@@ -177,7 +177,8 @@ fn version_cas_rejects_a_stale_writer() {
             let committed: InodeRecord =
                 metadata::decode(&s.get(&metadata::inode_key(id)).await.unwrap().unwrap()).unwrap();
             assert_eq!(
-                committed.chunk_map, map_a,
+                committed.chunk_map.as_flat().unwrap(),
+                map_a,
                 "seed {seed}: winner's map persisted"
             );
             assert_eq!(

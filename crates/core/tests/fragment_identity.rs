@@ -132,7 +132,7 @@ impl PlacementChunkStore for MemChunks {}
 async fn commit_inode(meta: &MemMeta, chunk: ChunkRef, size: u64) {
     let record = InodeRecord {
         size,
-        chunk_map: vec![chunk],
+        chunk_map: vec![chunk].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()

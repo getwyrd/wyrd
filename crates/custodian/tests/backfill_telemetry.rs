@@ -116,7 +116,7 @@ async fn seed_committed(
 ) -> InodeRecord {
     let prior = InodeRecord {
         size: 0,
-        chunk_map: vec![],
+        chunk_map: vec![].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -178,6 +178,8 @@ async fn emitted_remaining_count_reaches_zero_once_backfill_covers_the_store() {
         let record = read_inode(&meta, id).await;
         remaining_before += record
             .chunk_map
+            .as_flat()
+            .unwrap()
             .iter()
             .filter(|c| c.placement.is_empty())
             .count();
@@ -213,7 +215,12 @@ async fn emitted_remaining_count_reaches_zero_once_backfill_covers_the_store() {
     for id in 1..=3u64 {
         let record = read_inode(&meta, id).await;
         assert!(
-            record.chunk_map.iter().all(|c| !c.placement.is_empty()),
+            record
+                .chunk_map
+                .as_flat()
+                .unwrap()
+                .iter()
+                .all(|c| !c.placement.is_empty()),
             "inode {id}: every committed chunk carries an explicit placement post-pass"
         );
     }

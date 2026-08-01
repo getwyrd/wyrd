@@ -128,7 +128,7 @@ async fn write_read_byte_identical_over_real_networked_dservers() {
     // assert byte-identical (the Tier-2 success criterion).
     let inode = InodeRecord {
         size: plan.size,
-        chunk_map: plan.chunk_refs(),
+        chunk_map: plan.chunk_refs().into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()

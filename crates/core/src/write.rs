@@ -271,7 +271,7 @@ pub async fn commit_create(
 ) -> Result<CommitOutcome> {
     let record = InodeRecord {
         size: plan.size,
-        chunk_map: plan.chunk_refs(),
+        chunk_map: plan.chunk_refs().into(),
         state: InodeState::Committed,
         version: 1,
         // A create is a content publication (ADR-0047): stamp the object metadata the

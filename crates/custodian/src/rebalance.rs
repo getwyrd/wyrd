@@ -48,7 +48,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use wyrd_core::metadata::{self, InodeId, InodeRecord, InodeState};
+use wyrd_core::metadata::{self, ChunkMapError, InodeId, InodeRecord, InodeState};
 use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
 use wyrd_core::repair;
 use wyrd_traits::{
@@ -152,7 +152,17 @@ async fn plan_evacuations(
         let Some(inode_id) = parse_inode_key(&key) else {
             continue;
         };
-        for (chunk_index, chunk) in record.chunk_map.iter().enumerate() {
+        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
+        // scan exactly as an unreadable record already does via `decode(&value)?`
+        // above.
+        let flat_chunk_map =
+            record
+                .chunk_map
+                .as_flat()
+                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                    operation: "rebalance::plan_evacuations",
+                })?;
+        for (chunk_index, chunk) in flat_chunk_map.iter().enumerate() {
             // Resolve the FULL `0..fragment_count()` index space through the shared
             // STRICT companion (`ChunkRef::checked_fragments`, `core/src/metadata.rs`,
             // ADR-0040 decision 4) — classify the committed placement BEFORE expanding it,
@@ -240,6 +250,16 @@ async fn evacuate_chunk(
         Err(_) => return Ok(EvacOutcome::Aborted),
     };
 
+    // A segmented map has no resolver yet (#649-#651): fail closed rather than treat
+    // the object as owning no chunks.
+    let prior_chunk_map =
+        plan.prior
+            .chunk_map
+            .as_flat()
+            .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                operation: "rebalance::evacuate_chunk",
+            })?;
+
     // Copy each evacuated fragment to its new home FIRST — before the commit, so a crash
     // here leaves only collectable garbage, never a torn chunk (`0005:298-299`).
     let mut new_placement = plan.placement.clone();
@@ -263,7 +283,7 @@ async fn evacuate_chunk(
         let Some(bytes) = source_store.get_fragment(frag).await? else {
             return Ok(EvacOutcome::Aborted);
         };
-        if !repair::fragment_intact(&bytes, frag, plan.prior.chunk_map[plan.chunk_index].scheme) {
+        if !repair::fragment_intact(&bytes, frag, prior_chunk_map[plan.chunk_index].scheme) {
             return Ok(EvacOutcome::Aborted);
         }
         target_store.put_fragment(frag, bytes).await?;
@@ -275,11 +295,11 @@ async fn evacuate_chunk(
     // placement record and orphans the displaced fragments on the draining server. The
     // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
     // racing writer / superseded custodian loses here rather than corrupting the record.
-    let mut next_chunk_map = plan.prior.chunk_map.clone();
+    let mut next_chunk_map = prior_chunk_map.to_vec();
     next_chunk_map[plan.chunk_index].placement = new_placement;
     let next = InodeRecord {
         size: plan.prior.size,
-        chunk_map: next_chunk_map,
+        chunk_map: next_chunk_map.into(),
         state: InodeState::Committed,
         version: plan.prior.version + 1,
         // A rebalance re-places the SAME content, so it PRESERVES the object metadata
