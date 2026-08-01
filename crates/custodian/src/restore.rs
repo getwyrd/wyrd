@@ -180,6 +180,23 @@ pub async fn reconcile_after_restore(
     ctx: &GcContext<'_>,
     now_millis: u64,
 ) -> Result<RestoreReport> {
+    // The SAME committed reference set GC and scrub gate on. From this slice on it is built
+    // through the shared resolver, so a **segmented** object's chunks are in it here too, and a
+    // committed record the build cannot read is contained rather than raised
+    // (`gc::ReferenceSet::unresolvable`).
+    //
+    // This pass is nonetheless still fail-closed over an incomplete set, on both halves and
+    // without a line of its own: the mark gate below withholds every fragment while the set is
+    // incomplete (`gc::ReferenceSet::protects`), so nothing an unreadable object might own is
+    // ever marked for GC; and the report half re-reads the same records through
+    // [`committed_chunks`] (called unconditionally below), which propagates that record's own
+    // decode failure. So an unreadable committed record still ends this pass with an error,
+    // exactly as it did before the resolver was wired in, and no `RestoreReport` is ever
+    // returned over a set that has a known hole in it.
+    // deferred: #651 — the *contained* answer for this surface (report every object it could
+    // read, name the one it could not, and say the run is not certified, as
+    // `gc::reconcile`/`scrub::reconcile` now answer `Reconciled::Blocked`) belongs to the slice
+    // that owns restore; #650 scopes itself to the two passes that read this set today.
     let referenced = referenced_fragments(ctx.meta).await?;
     let already = orphan_leases(ctx.meta).await?;
     let pending = pending_chunks(ctx.meta).await?;

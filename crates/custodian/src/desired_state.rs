@@ -83,7 +83,10 @@ pub enum ReconciliationStatus {
     /// No drain/decommission desired state is recorded for this server.
     NotRequested,
     /// Desired state is recorded (**policy changed**) but reality has not yet
-    /// converged — the server still holds at least one **referenced** fragment.
+    /// converged — the server still holds at least one **referenced** fragment, or the
+    /// committed reference set could not be built in full (a committed object whose chunk
+    /// map is unreadable, `crate::gc::ReferenceSet::unresolvable`) and so cannot show that
+    /// it does not.
     Pending,
     /// Desired state is recorded and the server holds no *valid* referenced fragment,
     /// yet the drain **cannot** be certified satisfied: one or more committed chunk maps
@@ -162,6 +165,27 @@ pub async fn reconciliation_status(
         .iter()
         .any(|(server, _)| *server == dserver);
     if genuinely_holds {
+        return Ok(ReconciliationStatus::Pending);
+    }
+    // ...and a set that could not be fully BUILT cannot certify either. A committed object
+    // whose chunk map this build could not read (`gc::ReferenceSet::unresolvable`) contributes
+    // no fragments at all, so `placed` above is silent about it and nothing here can show that
+    // the bytes on `dserver` are not its. Answering `Satisfied` would be the reclamation
+    // decision in report form — "you may decommission this box" — over exactly the incomplete
+    // set GC refuses to reclaim a byte on (`gc::ReferenceSet::protects`), and that is the
+    // permanent, data-losing outcome C-1 forbids (`docs/principles.md` §5).
+    //
+    // `Pending` is the EXISTING "recorded, not yet converged" answer, and it is deliberately
+    // all this slice (#650) changes here: before it, an unreadable committed record made this
+    // query fail outright — `referenced_fragments` propagated the decode error, and refused a
+    // segmented map's shape — so keeping the answer non-certifying preserves a fail-closed
+    // contract rather than adding a surface.
+    // deferred: #651 — the ATTRIBUTED answer for this surface (naming the unreadable objects
+    // in the status itself, as `PendingMalformed` names chunk ids) lands with the drain /
+    // evacuation-walk slice that owns `desired_state`; the blocking record is already named on
+    // the durability seam by each pass that reads the set (`gc::emit_unresolvable`,
+    // `scrub::emit_unscrubbable`).
+    if !referenced.unresolvable.is_empty() {
         return Ok(ReconciliationStatus::Pending);
     }
     // No valid reference names `dserver`. But a malformed committed placement (ADR-0040

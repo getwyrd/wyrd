@@ -1007,3 +1007,75 @@ async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
         "no repair obligation for an in-flight write's fragment"
     );
 }
+
+// ---- issue #650 (certification honesty): scrub answers the SAME thing GC answers about
+//      the same incomplete reference set ----
+
+/// **A store scrub could only partly read is not a scrubbed store.** A committed
+/// **segmented** root whose `seg:` records were never written cannot be resolved (#649's
+/// resolver reports `ChunkMapError::SegmentAbsent` once it has confirmed against the live
+/// root that this is no benign supersede/delete race), so none of that object's fragments
+/// enters the reference set this pass walks: scrub never fetches them, never checksums
+/// them, and never turns their corruption or absence into a repair obligation.
+///
+/// Answering `Satisfied` there would be a clean bill for part of the store wearing the name
+/// of one for all of it. Scrub therefore returns [`Reconciled::Blocked`] — the identical
+/// answer GC gives for the identical condition
+/// (`crates/custodian/tests/gc.rs`'s
+/// `a_segmented_root_gc_cannot_resolve_blocks_certification_and_reclaims_nothing`), because
+/// two passes disagreeing about one set is a state an operator cannot resolve from outside.
+///
+/// And the containment is per object, not per store: the healthy object beside it is still
+/// walked, verified, and enqueued for repair on its corrupt fragment. Flippable: drop the
+/// `unresolvable` clause from `scrub::reconcile`'s outcome and the pass reports `Changed`,
+/// certifying a store it never finished reading.
+#[tokio::test]
+async fn an_unreadable_committed_map_blocks_certification_but_still_scrubs_the_rest() {
+    enable_metric_callsites();
+    // Two segments tiling `size` under one segment group, neither `seg:` record ever
+    // written. Raw stored bytes: nothing publishes a segmented root yet (#653 owns the
+    // staged-publication committer), so the honest fixture is the value a later writer — or
+    // a rolled-back binary — will leave in this store.
+    const SEGMENTED_ROOT: &[u8] = br#"{"size":12,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":1},"segment_count":2,"segments":[{"index":0,"byte_offset":0,"byte_len":5},{"index":1,"byte_offset":5,"byte_len":7}]},"state":"Committed","version":1}"#;
+
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+    // `inode:1` sorts BEFORE `inode:2`, so the unreadable root is met FIRST: the healthy
+    // object below is only reached at all if the reference build walks past it.
+    meta.commit(WriteBatch::new().put(metadata::inode_key(1), SEGMENTED_ROOT))
+        .await
+        .unwrap();
+
+    // The healthy object, in the same store and the same pass: a committed reference whose
+    // placed fragment is corrupt, so "scrub still did its job here" has a positive
+    // observable (an enqueued repair) rather than merely "no error".
+    let healthy: ChunkId = 0x650A;
+    d0.put_fragment(frag(healthy, 0), corrupt_fragment(healthy))
+        .await
+        .unwrap();
+    commit_reference(&meta, 2, "healthy", healthy, 0).await;
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = ScrubContext {
+        meta: &meta,
+        fleet: &fleet,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+        .await
+        .expect("one unreadable object is contained, not an error that ends the pass");
+    assert_eq!(
+        outcome,
+        Reconciled::Blocked,
+        "scrub must not certify a store whose reference set it could only partly build — \
+         and must answer exactly what GC answers about the same set"
+    );
+    assert_eq!(
+        repair::queued_repairs(&meta).await.unwrap(),
+        vec![healthy],
+        "the healthy object is still walked and verified past the damaged one: its corrupt \
+         fragment is a durable repair obligation, exactly as in a pass with no blocker"
+    );
+}
