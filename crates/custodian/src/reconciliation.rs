@@ -22,6 +22,43 @@ pub enum Reconciled {
     Satisfied,
     /// Reality diverged and the step converged it (a stand-in until the loops land).
     Changed,
+    /// The loop ran over everything it could read and **refuses to certify the rest**: at
+    /// least one committed object's chunk map could not be read
+    /// (`crate::gc::ReferenceSet::unresolvable`), so the reference set the loop reasoned
+    /// over is incomplete.
+    ///
+    /// A third outcome rather than a flavour of the other two, because it is a different
+    /// **claim**. `Satisfied` says every referenced fragment was checked and matched — over
+    /// an incomplete set that is a clean bill for part of the store, wearing the name of one
+    /// for all of it (the rubric's *Absent or unsupported entries*: never silent success,
+    /// never a silent skip). `Changed` says the loop converged something, which a refusal
+    /// did not.
+    ///
+    /// It is deliberately **not** an error: the fault is one object's, it is attributed on
+    /// the durability seam, and every other object in the store is still protected, verified
+    /// and reclaimed exactly as usual — the containment shape this repo already uses for a
+    /// record it cannot trust (`ReconciliationStatus::PendingMalformed`,
+    /// `crates/custodian/src/desired_state.rs`). An `Err` here would end the step for every
+    /// healthy object instead, and [`reconcile_step`] would stop before the loops that
+    /// follow it ever ran.
+    Blocked,
+}
+
+impl Reconciled {
+    /// The outcome of a step whose loops reported `self` and `other` — the **least
+    /// certified** of the two, so a step never claims more than its weakest loop did.
+    ///
+    /// `Blocked` outranks `Changed`, and `Changed` outranks `Satisfied`. A blocked loop
+    /// beside a converging one is still a step that cannot certify the store: the enqueues
+    /// and reclamations the other loop made are durable in the store either way, while the
+    /// refusal is the only thing that tells the caller its picture has a hole in it.
+    fn least_certified(self, other: Reconciled) -> Reconciled {
+        match (self, other) {
+            (Reconciled::Blocked, _) | (_, Reconciled::Blocked) => Reconciled::Blocked,
+            (Reconciled::Changed, _) | (_, Reconciled::Changed) => Reconciled::Changed,
+            (Reconciled::Satisfied, Reconciled::Satisfied) => Reconciled::Satisfied,
+        }
+    }
 }
 
 /// A reconciliation step was refused or could not complete: either the actor was
@@ -59,8 +96,10 @@ impl std::error::Error for ReconcileError {}
 /// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`), `rebalance`
 /// runs the **rebalance loop** — drain/decommission evacuation ([`rebalance::reconcile`],
 /// `0005:297-303`) — and all `None` exercises the fence alone (no maintenance inputs
-/// wired). When several are supplied the step runs each independent loop and reports
-/// [`Reconciled::Changed`] if **any** converged.
+/// wired). When several are supplied the step runs each independent loop and reports the
+/// **least certified** of their outcomes ([`Reconciled::least_certified`]):
+/// [`Reconciled::Blocked`] if any loop refused to certify, else [`Reconciled::Changed`] if
+/// any converged.
 #[allow(clippy::too_many_arguments)]
 pub async fn reconcile_step(
     zone: &FencedZone,
@@ -76,40 +115,32 @@ pub async fn reconcile_step(
 
     let mut outcome = Reconciled::Satisfied;
     if let Some(ctx) = gc {
-        if gc::reconcile(ctx, now_millis)
-            .await
-            .map_err(ReconcileError::Store)?
-            == Reconciled::Changed
-        {
-            outcome = Reconciled::Changed;
-        }
+        outcome = outcome.least_certified(
+            gc::reconcile(ctx, now_millis)
+                .await
+                .map_err(ReconcileError::Store)?,
+        );
     }
     if let Some(ctx) = scrub {
-        if scrub::reconcile(ctx, now_millis)
-            .await
-            .map_err(ReconcileError::Store)?
-            == Reconciled::Changed
-        {
-            outcome = Reconciled::Changed;
-        }
+        outcome = outcome.least_certified(
+            scrub::reconcile(ctx, now_millis)
+                .await
+                .map_err(ReconcileError::Store)?,
+        );
     }
     if let Some(ctx) = reconstruction {
-        if reconstruction::reconcile(ctx, now_millis)
-            .await
-            .map_err(ReconcileError::Store)?
-            == Reconciled::Changed
-        {
-            outcome = Reconciled::Changed;
-        }
+        outcome = outcome.least_certified(
+            reconstruction::reconcile(ctx, now_millis)
+                .await
+                .map_err(ReconcileError::Store)?,
+        );
     }
     if let Some(ctx) = rebalance {
-        if rebalance::reconcile(ctx, now_millis)
-            .await
-            .map_err(ReconcileError::Store)?
-            == Reconciled::Changed
-        {
-            outcome = Reconciled::Changed;
-        }
+        outcome = outcome.least_certified(
+            rebalance::reconcile(ctx, now_millis)
+                .await
+                .map_err(ReconcileError::Store)?,
+        );
     }
     Ok(outcome)
 }

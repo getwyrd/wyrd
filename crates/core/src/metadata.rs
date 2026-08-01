@@ -555,6 +555,26 @@ pub enum ChunkMapError {
         /// What the decode could not do with the bytes.
         detail: String,
     },
+    /// The **root record itself** could not be decoded, on one of the re-reads a resolve
+    /// makes of it: the settle-read that decides whether an anomaly is a concurrent
+    /// retirement, or the re-read a restart begins with ([`resolve_current_chunk_map`]).
+    ///
+    /// The [`Self::SegmentRecordUndecodable`] rule one level up, and it exists for the same
+    /// reason: a record whose own bytes will not parse is **this object's** fault and no
+    /// store's, so it is described as a chunk-map anomaly rather than escaping as whatever
+    /// error the decoder happened to raise. A maintenance pass classifies by that
+    /// distinction — an object-local fault contains to the object, a store fault ends the
+    /// pass — and an untyped decode error reaching it reads as a fleet-wide store outage,
+    /// which stops every *healthy* object's protection over one damaged record
+    /// (`crates/custodian/src/gc.rs`'s reference build).
+    ///
+    /// Fail closed, never "this object owns no bytes": the caller's own first decode of a
+    /// root is its own to classify, and this covers only the re-reads the resolver makes
+    /// underneath it.
+    RootRecordUndecodable {
+        /// What the decode could not do with the bytes.
+        detail: String,
+    },
     /// A resolve that kept meeting a **superseded** generation: each restart re-read the
     /// root and found the generation it named already replaced again, past
     /// [`MAX_RESOLVE_RESTARTS`] attempts. Fail closed — answering "this object owns no
@@ -676,6 +696,9 @@ impl fmt::Display for ChunkMapError {
             ),
             Self::SegmentRecordUndecodable { index, detail } => {
                 write!(f, "segment {index} could not be decoded: {detail}")
+            }
+            Self::RootRecordUndecodable { detail } => {
+                write!(f, "the object's root record could not be decoded: {detail}")
             }
             Self::MapResolutionUnstable { attempts } => write!(
                 f,
@@ -2198,6 +2221,11 @@ impl<T> Resolution<T> {
 /// dropped and the arm says **how**, because the two answers differ: overwritten
 /// ([`Resolution::Superseded`], restart) or deleted ([`Resolution::Gone`], terminal).
 ///
+/// A root whose own bytes will not **decode** is neither answer: nothing can be said about
+/// which generation it names. That is the object's own fault and no store's, so it fails
+/// closed as [`ChunkMapError::RootRecordUndecodable`] ([`decode_root_record`]) — typed, so
+/// a maintenance pass contains it to this object instead of reading it as a store outage.
+///
 /// Generic in the answer type it never produces: with no `T` in scope this cannot build a
 /// [`Resolution::Answer`], so "the root re-read decided the map" is unrepresentable, and
 /// the arm composes straight into whichever stage asked.
@@ -2212,7 +2240,7 @@ async fn root_dropped<T>(
         // ordinary delete as a map that will not settle.
         return Ok(Some(Resolution::Gone));
     };
-    let current: InodeRecord = decode(&bytes)?;
+    let current = decode_root_record(&bytes)?;
     if current.chunk_map.segmented().map(SegmentedMap::group) == Some(group) {
         return Ok(None);
     }
@@ -2363,6 +2391,25 @@ async fn read_group_range(
     }
 }
 
+/// Decode a **root** record the resolver re-read for itself, attributing any failure —
+/// structural or plain-unparsable bytes alike — to that object via
+/// [`ChunkMapError::RootRecordUndecodable`].
+///
+/// The [`decode_segment_record`] rule for the other record a resolve reads, and it is here
+/// for the same reason: every fault this module raises about an object's own bytes leaves
+/// it as a *typed* chunk-map anomaly, so a consumer that must tell "this object is
+/// unreadable" (contain it, keep walking) from "the store is failing" (end the pass) can.
+/// A raw decoder error escaping here is indistinguishable from a backend outage at that
+/// consumer, and reads as the wider fault — the whole store's, not the one record's.
+fn decode_root_record(value: &[u8]) -> std::result::Result<InodeRecord, ChunkMapError> {
+    decode::<InodeRecord>(value).map_err(|err| ChunkMapError::RootRecordUndecodable {
+        detail: match err.downcast::<ChunkMapError>() {
+            Ok(typed) => typed.to_string(),
+            Err(err) => err.to_string(),
+        },
+    })
+}
+
 /// Decode one `seg:` value into its [`SegmentRecord`], attributing any failure —
 /// structural or plain-unparsable bytes alike — to this one segment's index via
 /// [`ChunkMapError::SegmentRecordUndecodable`], so [`retired_or`] has one typed anomaly
@@ -2506,6 +2553,11 @@ pub async fn resolve_chunk_map<'a>(
 /// churn and spends no attempt — there is no successor generation to restart onto, so it
 /// answers `Ok(None)` where it is seen, on the last allowed attempt exactly as on the
 /// first.
+///
+/// A root the restart lands on whose bytes will not **decode** — the object was replaced
+/// under the read by a record this build cannot parse — is likewise typed
+/// ([`ChunkMapError::RootRecordUndecodable`]), so it stays this object's fault at every
+/// consumer rather than arriving as an unattributable error.
 pub async fn resolve_current_chunk_map(
     store: &dyn MetadataStore,
     root_key: &[u8],
@@ -2514,7 +2566,9 @@ pub async fn resolve_current_chunk_map(
         let Some(bytes) = store.get(root_key).await? else {
             return Ok(None);
         };
-        let record: InodeRecord = decode(&bytes)?;
+        // Typed, not raw: the root this restart landed on is one object's record, so bytes
+        // that will not parse are that object's fault — see [`decode_root_record`].
+        let record = decode_root_record(&bytes)?;
         if record.state != InodeState::Committed {
             return Ok(None);
         }

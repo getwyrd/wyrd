@@ -31,11 +31,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
-    self, ChunkMapError, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
+    self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
 use wyrd_custodian::{
     mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
-    ReconcileError, Reconciled,
+    Reconciled,
 };
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
@@ -785,29 +785,36 @@ async fn honours_the_reader_safe_grace_window() {
     );
 }
 
-// ---- issue #648 (criterion 2 over an unresolvable shape): a committed chunk map GC
-// cannot read aborts the pass instead of exposing its fragments to reclamation ----
+// ---- issue #650 (criterion 2 over an unreadable map): a committed chunk map GC cannot
+// read blocks certification and exposes no fragment to reclamation ----
 
-/// A **segmented** committed root names its chunks in `seg:` records no resolver reads
-/// until #649, so GC cannot compute which fragments the object owns. Reading that root as
-/// "owns no chunks" would leave every one of them unreferenced — and any that carries a
-/// lapsed orphan grace record (a crashed earlier delete, a superseded generation) would go
-/// straight to `delete_fragment`: a **live** object's bytes destroyed by a maintenance
-/// pass, silently and permanently. So the pass **aborts on the shape**, exactly as it
-/// already does on a record that will not decode (`gc::referenced_fragments`), and
-/// reclaims nothing — including the unrelated, plainly collectable orphan below, which is
-/// what proves the abort happens *before* the reclaim walk rather than inside it.
+/// A **segmented** committed root names its chunks in `seg:` records under its own group;
+/// here those records were never written at all, so the resolver (#649) reads the group's
+/// bounded range, finds it empty, confirms against the live root that this is no benign
+/// supersede/delete race, and reports [`wyrd_core::metadata::ChunkMapError::SegmentAbsent`].
+/// GC cannot compute which fragments the object owns. Reading that root as "owns no chunks"
+/// would leave every one of them unreferenced — and any that carries a lapsed orphan grace
+/// record (a crashed earlier delete, a superseded generation) would go straight to
+/// `delete_fragment`: a **live** object's bytes destroyed by a maintenance pass, silently
+/// and permanently.
 ///
-/// Flippable: read the shape as an empty chunk list instead — swap
-/// `as_flat().ok_or(...)` for `as_flat().unwrap_or_default()` in
-/// `gc::referenced_fragments` — and the pass runs to completion, deleting both fragments;
-/// every assertion below goes red.
+/// So the object is recorded as a blocker (`gc::ReferenceSet::unresolvable`), the set is
+/// **incomplete**, and while it is, `gc::ReferenceSet::protects` withholds every fragment
+/// in the fleet — including the unrelated, plainly collectable orphan below, which is what
+/// proves the containment is fleet-wide rather than scoped to this object's own fragment.
+/// The pass itself still **completes**: `Ok(Reconciled::Blocked)`, never an `Err` that would
+/// end the step for every healthy object and stop the loops that follow it
+/// ([`reconcile_step`]).
+///
+/// Flippable: read the shape as an empty chunk list instead of resolving it, and the pass
+/// certifies `Satisfied` while deleting both fragments; every assertion below goes red.
 #[tokio::test]
-async fn a_segmented_root_aborts_the_pass_before_any_fragment_is_reclaimed() {
+async fn a_segmented_root_gc_cannot_resolve_blocks_certification_and_reclaims_nothing() {
     // A committed root in the segmented shape, as its raw stored bytes: nothing publishes
     // one yet (`metadata::create` refuses to, until #653's staged-publication committer),
     // so the honest fixture is the value a later writer — or a rolled-back binary — will
-    // leave in this store. Two segments tiling `size` under one segment group.
+    // leave in this store. Two segments tiling `size` under one segment group, and neither
+    // `seg:` record was ever written — the real gap this rule exists for.
     const SEGMENTED_ROOT: &[u8] = br#"{"size":12,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":1},"segment_count":2,"segments":[{"index":0,"byte_offset":0,"byte_len":5},{"index":1,"byte_offset":5,"byte_len":7}]},"state":"Committed","version":1}"#;
 
     let meta = MemMeta::default();
@@ -826,7 +833,7 @@ async fn a_segmented_root_aborts_the_pass_before_any_fragment_is_reclaimed() {
         .await
         .unwrap();
     // A second orphan belonging to no committed map at all: collectable on any pass that
-    // actually runs, so its survival distinguishes "aborted" from "found nothing to do".
+    // actually runs, so its survival distinguishes "contained" from "found nothing to do".
     let unrelated_chunk: ChunkId = 0xF7;
     d0.put(frag(unrelated_chunk, 0)).await;
     mark_orphaned(&meta, 0, frag(unrelated_chunk, 0), 0)
@@ -844,20 +851,16 @@ async fn a_segmented_root_aborts_the_pass_before_any_fragment_is_reclaimed() {
     };
 
     // now = 1_000_000: every grace window above is long elapsed.
-    let err = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
         .await
-        .expect_err("a committed map GC cannot resolve must abort the pass");
-    let ReconcileError::Store(inner) = err else {
-        panic!("an unresolvable chunk map is a store-shape refusal, not a fence error: {err:?}")
-    };
+        .expect("one unreadable object is contained, not an error that ends the step");
+    // The POSITIVE match on the outcome this slice adds. (The bundle's added discriminator
+    // file cannot name `Blocked` — it must compile against the pre-fix tree — so this is
+    // where the exact contract is bound; `cargo xtask ci` runs it.)
     assert_eq!(
-        *inner
-            .downcast::<ChunkMapError>()
-            .expect("the typed refusal survives the loop's error seam"),
-        ChunkMapError::SegmentedMapUnsupported {
-            operation: "gc::referenced_fragments"
-        },
-        "the operator signal must name the shape GC stopped on"
+        outcome,
+        Reconciled::Blocked,
+        "an incomplete reference set must refuse to certify convergence"
     );
     assert!(
         d0.get_fragment(frag(seg_chunk, 0)).await.unwrap().is_some(),
@@ -868,6 +871,7 @@ async fn a_segmented_root_aborts_the_pass_before_any_fragment_is_reclaimed() {
             .await
             .unwrap()
             .is_some(),
-        "the pass aborts before the reclaim walk: nothing at all is deleted"
+        "the containment is fleet-wide while the set is incomplete: nothing at all is \
+         reclaimed, not even an orphan of no committed map"
     );
 }
