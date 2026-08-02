@@ -70,6 +70,7 @@ use wyrd_core::metadata::{
 use wyrd_core::placement::Topology;
 use wyrd_core::read::{read_object, read_object_from};
 use wyrd_core::repair;
+use wyrd_core::write;
 use wyrd_core::write::write_new_object_placed;
 use wyrd_custodian::{
     mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
@@ -1320,6 +1321,399 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     );
 }
 
+// ---- property 9: the chunk-map RESOLVER never tears (issue #649, proposal 0016
+//      decision 7(h)) ----
+//
+// Shipped in THIS slice and exercised by the gating `cargo xtask ci` / `dst` tier over
+// the whole madsim seed sweep — deliberately NOT by the per-fix `C4-verify` check, which
+// would have to build the `--cfg madsim` tree and sweep 50 seeds to see it. Built and run
+// this cycle; not deferred work.
+
+/// A segment-group nonce for this property's fixtures: 32 lowercase hex characters.
+const RESOLVE_TEAR_NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+/// A store that, the FIRST time it is asked to page a `seg:` range, applies a pending
+/// mutation — the exact race the resolve-retry rule exists for (`0016:2452-2462`: the root
+/// always moves first): a reader that read the OLD root and is now paging its `seg:` range
+/// meets a root that has already moved on.
+struct RetireMidResolve {
+    inner: MemMeta,
+    pending: Mutex<Option<WriteBatch>>,
+}
+
+#[async_trait]
+impl MetadataStore for RetireMidResolve {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        if prefix.starts_with(b"seg:") {
+            let pending = self.pending.lock().unwrap().take();
+            if let Some(batch) = pending {
+                assert_eq!(
+                    self.inner.commit(batch).await.unwrap(),
+                    CommitOutcome::Committed
+                );
+            }
+        }
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        self.inner.commit(batch).await
+    }
+}
+
+fn seg_row(group: &metadata::SegmentGroup, index: u32) -> Vec<u8> {
+    metadata::seg_key(group, index).expect("addressable index")
+}
+
+/// Every `(dserver, fragment)` a committed chunk list places — the same expansion the
+/// reference build performs, so an expectation built from it is in the units GC reasons in.
+fn fragments_of(chunks: &[metadata::ChunkRef]) -> Vec<(DServerId, FragmentId)> {
+    chunks
+        .iter()
+        .flat_map(|chunk| {
+            chunk.fragments().map(move |(index, dserver)| {
+                (
+                    dserver,
+                    FragmentId {
+                        chunk: chunk.id,
+                        index,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+/// The fragments of whichever generation the store holds **now**, as the production resolver
+/// itself reports it (`None` when its map cannot be read) — the store's own answer, never a
+/// restatement of the fixture.
+async fn live_fragments(meta: &MemMeta, root_key: &[u8]) -> Option<Vec<(DServerId, FragmentId)>> {
+    match metadata::resolve_current_chunk_map(meta, root_key).await {
+        Ok(Some(resolved)) => Some(fragments_of(&resolved.chunks)),
+        Ok(None) => panic!("the object is live here"),
+        Err(_) => None,
+    }
+}
+
+/// Seed a genuine flat object at `INODE` (real fragments over `fleet`, `EcScheme::None` so
+/// a single fragment resolves through the identity placement onto server 0), then re-spell
+/// it as a **segmented** generation directly — raw `seg:` records plus a segmented root,
+/// written by hand, never via a committer (this slice ships no producer). Hands back the
+/// group its segments are keyed by, so the campaign can retire one of its records the way
+/// a drain would.
+async fn seed_segmented(meta: &MemMeta, fleet: &Fleet<'_>, data: &[u8]) -> metadata::SegmentGroup {
+    let mut next = 0u128;
+    let plan = write::plan_write(data, 4, EcScheme::None, || {
+        next += 1;
+        next
+    })
+    .unwrap();
+    write::intent(meta, &plan, 1_000).await.unwrap();
+    write::write_fragments(fleet, &plan).await.unwrap();
+    assert_eq!(
+        write::commit_create(meta, ROOT, "obj", INODE, &plan, 0)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    write::release(meta, &plan).await.unwrap();
+
+    let chunks = plan.chunk_refs();
+    let half = chunks.len() / 2;
+    let group = metadata::SegmentGroup::new(RESOLVE_TEAR_NONCE, 1).unwrap();
+    let first = metadata::SegmentRecord::new(chunks[..half].to_vec(), 0).unwrap();
+    let second = metadata::SegmentRecord::new(chunks[half..].to_vec(), first.byte_len()).unwrap();
+    let seg_ref = |index: u32, byte_offset: u64, byte_len: u64| metadata::SegmentRef {
+        index,
+        byte_offset,
+        byte_len,
+    };
+    let table = metadata::SegmentedMap::new(
+        group.clone(),
+        vec![
+            seg_ref(0, 0, first.byte_len()),
+            seg_ref(1, first.byte_len(), second.byte_len()),
+        ],
+    )
+    .unwrap();
+    let root = InodeRecord {
+        size: table.span(),
+        chunk_map: metadata::ChunkMap::Segmented(table),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    };
+    let batch = WriteBatch::new()
+        .put(seg_row(&group, 0), metadata::encode(&first))
+        .put(seg_row(&group, 1), metadata::encode(&second))
+        .put(metadata::inode_key(INODE), metadata::encode(&root));
+    assert_eq!(meta.commit(batch).await.unwrap(), CommitOutcome::Committed);
+    group
+}
+
+/// **The resolver never tears.** A segmented object's root is retired — superseded by a
+/// fresh flat generation — in the exact window between a reader's root read and its `seg:`
+/// range read, and on half the seeds the drain has *already reclaimed* one of the retired
+/// generation's segment records by the time that range read lands (`0016:2452-2462`: the
+/// root moves first, its records are deleted after). The resolution the reader began is
+/// retired either way, so the only whole answer left is the live generation: never a byte
+/// mix of the two, never a short read, and never `NoSuchKey` (an overwrite is not a
+/// deletion).
+///
+/// The reclaiming arm is what makes this bind the *restart*: with the old generation's map
+/// genuinely incompletable, a reader that did not re-read the root and start again could
+/// only fail or answer short — it has no old-generation answer left to succeed with by
+/// accident.
+async fn prop_segmented_resolve_never_tears(rng: &mut ChaCha8Rng) {
+    let d = servers();
+    let fleet = fleet_of(&d);
+    let meta = MemMeta::default();
+    let old_data: Vec<u8> = (0..32u16).map(|i| i as u8).collect();
+    let group = seed_segmented(&meta, &fleet, &old_data).await;
+
+    // The generation that replaces it while the reader's `seg:` range read is in flight —
+    // seed-chosen content and length, so the campaign is a pure function of the run seed.
+    let new_len = 16 + (rng.next_u32() as usize % 32);
+    let new_data: Vec<u8> = (0..new_len).map(|_| rng.next_u32() as u8).collect();
+    let mut next = 0x1000u128;
+    let new_plan = write::plan_write(&new_data, 4, EcScheme::None, || {
+        next += 1;
+        next
+    })
+    .unwrap();
+    write::write_fragments(&fleet, &new_plan).await.unwrap();
+    let new_root = InodeRecord {
+        size: new_plan.size,
+        chunk_map: new_plan.chunk_refs().into(),
+        state: InodeState::Committed,
+        version: 2,
+        ..Default::default()
+    };
+    let mut flip = WriteBatch::new().put(metadata::inode_key(INODE), metadata::encode(&new_root));
+    // The nemesis: on half the seeds the drain has already taken segment 1 of the retired
+    // generation, so its map can no longer be completed at all.
+    let reclaimed = rng.next_u32().is_multiple_of(2);
+    if reclaimed {
+        flip = flip.delete(seg_row(&group, 1));
+    }
+
+    let store = RetireMidResolve {
+        inner: meta,
+        pending: Mutex::new(Some(flip)),
+    };
+    match read_object(&store, &fleet, INODE).await.unwrap() {
+        Some(bytes) => assert_eq!(
+            bytes,
+            new_data,
+            "a resolve retired mid-read must answer the WHOLE live generation (old \
+             generation's segment reclaimed: {reclaimed}); the old bytes were {} long",
+            old_data.len()
+        ),
+        None => panic!(
+            "an overwrite is not a deletion: NoSuchKey is the wrong answer to a root \
+             retired mid-resolve"
+        ),
+    }
+}
+
+// ---- property 10: GC's reference build over a SEGMENTED map — never reclaims a live
+//      segmented object's bytes, and never certifies a store it could only partly read
+//      (issue #650, proposal 0016 decision 7(e)) ----
+//
+// The deletion-capable pass is the one that cannot be wrong here: it holds
+// `delete_fragment`. Seeded, because the two ways a resolve can go sideways are both RACES
+// — a generation retired under the build (property 9's nemesis, here met by the pass that
+// deletes rather than the one that reads) and a generation left incomplete — and the arm is
+// drawn from the run seed, so the campaign stays a pure function of it.
+
+/// A genuinely collectable orphan, on a server the segmented object does not use, past its
+/// grace window: reclaiming it is the POSITIVE observable that the pass ran at all, so
+/// "nothing of the segmented object was deleted" cannot pass by the pass having done
+/// nothing.
+const SEG_ORPHAN: ChunkId = 0x650;
+
+async fn prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies(
+    rng: &mut ChaCha8Rng,
+) {
+    let d = servers();
+    let fleet = fleet_of(&d);
+    let meta = MemMeta::default();
+    let data: Vec<u8> = (0..32u16).map(|i| i as u8).collect();
+    let group = seed_segmented(&meta, &fleet, &data).await;
+
+    let grace = 50u64;
+    let now = 1_000 + (rng.next_u32() as u64 % 1_000);
+    let orphan = FragmentId {
+        chunk: SEG_ORPHAN,
+        index: 0,
+    };
+    d[3].put_fragment(orphan, Bytes::from_static(b"garbage"))
+        .await
+        .unwrap();
+    mark_orphaned(&meta, 3, orphan, now - grace - 1)
+        .await
+        .unwrap();
+
+    // The segmented generation's own fragments, as the RESOLVER reports them, read while
+    // everything is still readable — every arm starts from this generation.
+    let root_key = metadata::inode_key(INODE);
+    let seeded = live_fragments(&meta, &root_key)
+        .await
+        .expect("the seeded segmented generation resolves before any arm disturbs it");
+
+    // The seed picks which race (if any) the reference build meets.
+    let arm = rng.next_u32() % 3;
+    // Arm 2 leaves the LIVE generation incomplete: one of its segment records is gone while
+    // the root still names the group, so the map cannot be read at all and the build must
+    // fail closed rather than conclude the object owns no chunks.
+    if arm == 2 {
+        assert_eq!(
+            meta.commit(WriteBatch::new().delete(seg_row(&group, 1)))
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+    }
+
+    // Arm 1 retires the generation under the build — the root moves first, and on this arm
+    // the drain has already taken one of the retired generation's records, so the resolution
+    // in flight cannot be completed and only a restart onto the live root can answer.
+    let mut new_plan = None;
+    let mut flip = WriteBatch::new();
+    if arm == 1 {
+        let mut next = 0x1000u128;
+        let plan = write::plan_write(&data, 4, EcScheme::None, || {
+            next += 1;
+            next
+        })
+        .unwrap();
+        write::write_fragments(&fleet, &plan).await.unwrap();
+        let new_root = InodeRecord {
+            size: plan.size,
+            chunk_map: plan.chunk_refs().into(),
+            state: InodeState::Committed,
+            version: 2,
+            ..Default::default()
+        };
+        flip = flip
+            .put(metadata::inode_key(INODE), metadata::encode(&new_root))
+            .delete(seg_row(&group, 1));
+        new_plan = Some(plan);
+    }
+
+    // The fragments that belong to the generation which is LIVE **while the pass runs** —
+    // the successor on the retirement arm, since its root flip lands inside the pass, and the
+    // seeded generation otherwise. Getting this wrong is how the arm stops binding: expecting
+    // the RETIRED generation's fragments would pass on a build that never restarted onto the
+    // live root at all.
+    let live: Vec<(DServerId, FragmentId)> = match &new_plan {
+        Some(plan) => fragments_of(&plan.chunk_refs()),
+        None => seeded.clone(),
+    };
+
+    // DELETION EVIDENCE on every one of them: a grace record that lapsed before this pass's
+    // clock, so each live fragment is one unreferenced verdict away from `delete_fragment`.
+    // Without it the survival assertions below are vacuous — GC deletes only what it has a
+    // deadline for, so a build that never resolved the object (or never restarted onto the
+    // live generation) would leave them alone anyway and the arm would pass on a defect.
+    for &(dserver, frag) in &live {
+        mark_orphaned(&meta, dserver, frag, now - grace - 1)
+            .await
+            .unwrap();
+    }
+
+    let store = RetireMidResolve {
+        inner: meta,
+        pending: Mutex::new(Some(flip)),
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-gc-segmented").await;
+    let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] =
+        [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    let ctx = GcContext {
+        meta: &store,
+        fleet: &dyn_fleet,
+        grace_window_millis: grace,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
+        .await
+        .expect("a segmented map is resolved, or contained — never an error that ends the pass");
+
+    if arm == 2 {
+        // Incomplete: the pass may not certify, and may not reclaim a byte — not even the
+        // orphan, which no fragment can be shown not to be one of the unreadable object's.
+        assert_eq!(
+            outcome,
+            Reconciled::Blocked,
+            "a reference set the build could not finish must not report convergence"
+        );
+        assert!(
+            d[3].get_fragment(orphan).await.unwrap().is_some(),
+            "an incomplete reference set authorizes NO reclamation, fleet-wide"
+        );
+        // ...and the damaged object's OWN bytes are still there, each carrying a lapsed grace
+        // record: on this arm nothing at all names them, and the only thing between them and
+        // `delete_fragment` is the refusal to reclaim on a set that could not be finished.
+        for &(dserver, frag) in &live {
+            assert!(
+                d[dserver as usize]
+                    .get_fragment(frag)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a live object's fragment is never reclaimed on the strength of a reference \
+                 set the build could not finish (server {dserver})"
+            );
+        }
+        return;
+    }
+
+    assert_eq!(
+        outcome,
+        Reconciled::Changed,
+        "with the map readable the pass reclaims the genuine orphan and says so"
+    );
+    assert!(
+        d[3].get_fragment(orphan).await.unwrap().is_none(),
+        "the genuine, past-grace orphan IS reclaimed — the pass really ran (arm {arm})"
+    );
+    for (dserver, frag) in live {
+        assert!(
+            d[dserver as usize]
+                .get_fragment(frag)
+                .await
+                .unwrap()
+                .is_some(),
+            "a fragment the live generation's chunk map references is NEVER reclaimed, even \
+             carrying a lapsed grace record (arm {arm}, server {dserver})"
+        );
+    }
+    if let Some(plan) = new_plan {
+        // The retired generation's root is gone, so the restart resolved the NEW map: the
+        // fragments asserted above are the live ones, not the retired object's.
+        assert_eq!(
+            read_inode(&store).await.chunk_map.as_flat().unwrap(),
+            plan.chunk_refs().as_slice(),
+            "the build resolved the live generation after the retirement, not the retired one"
+        );
+    }
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -1372,6 +1766,19 @@ dst_campaign_test! {
 }
 
 dst_campaign_test! {
+    async fn segmented_resolve_never_tears() {
+        prop_segmented_resolve_never_tears(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies() {
+        prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies(&mut rand_seed())
+            .await;
+    }
+}
+
+dst_campaign_test! {
     async fn durability_emission_rises_then_returns_to_zero() {
         prop_durability_emission_rises_then_returns_to_zero(&mut rand_seed()).await;
     }
@@ -1407,6 +1814,7 @@ dst_campaign_test! {
             prop_durability_emission_rises_then_returns_to_zero(&mut rng).await;
             prop_crash_mid_write_commits_nothing(&mut rng).await;
             prop_reader_flips_atomically_across_commit(&mut rng).await;
+            prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies(&mut rng).await;
         }
     }
 }
