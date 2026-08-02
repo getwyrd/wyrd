@@ -85,7 +85,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use wyrd_core::metadata::{self, InodeRecord, InodeState};
+use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::{orphan_key, orphan_leases, referenced_fragments, GcContext};
@@ -377,7 +377,17 @@ async fn committed_chunks(meta: &dyn MetadataStore) -> Result<Vec<(ChunkId, Expe
         if record.state != InodeState::Committed {
             continue;
         }
-        for chunk in &record.chunk_map {
+        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
+        // scan exactly as an unreadable record already does via `decode(&value)?`
+        // above.
+        let flat_chunk_map =
+            record
+                .chunk_map
+                .as_flat()
+                .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                    operation: "restore::committed_chunks",
+                })?;
+        for chunk in flat_chunk_map {
             let Ok(frags) = chunk.checked_fragments() else {
                 continue;
             };

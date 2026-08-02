@@ -207,7 +207,7 @@ async fn seed_committed(
 ) -> InodeRecord {
     let prior = InodeRecord {
         size: 0,
-        chunk_map: vec![],
+        chunk_map: vec![].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -244,7 +244,7 @@ async fn backfills_identity_placement_for_an_empty_placement_committed_chunk() {
     let chunk = rs_chunk(0xC0, 2, 1, vec![]);
     let before = seed_committed(&meta, 1, vec![chunk], 5).await;
     assert!(
-        before.chunk_map[0].placement.is_empty(),
+        before.chunk_map.as_flat().unwrap()[0].placement.is_empty(),
         "pre-M3 shape: the committed record carries an EMPTY placement"
     );
     assert_eq!(before.version, 2);
@@ -263,7 +263,7 @@ async fn backfills_identity_placement_for_an_empty_placement_committed_chunk() {
         "exactly one version-conditional commit bumped the version"
     );
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "full-length identity placement: placement.len() == fragment_count() and \
          placement[i] == i for all i"
@@ -302,7 +302,9 @@ async fn a_racing_writer_wins_the_cas_and_backfill_retries_on_a_later_pass() {
         "the racing writer's commit landed (version 2 -> 3)"
     );
     assert!(
-        after_race.chunk_map[0].placement.is_empty(),
+        after_race.chunk_map.as_flat().unwrap()[0]
+            .placement
+            .is_empty(),
         "placement is still EMPTY — the lost CAS prevented the clobber, backfill did \
          not (and could not) write over the racing writer's record"
     );
@@ -316,7 +318,10 @@ async fn a_racing_writer_wins_the_cas_and_backfill_retries_on_a_later_pass() {
     );
     let after = read_inode(&racing, 1).await;
     assert_eq!(after.version, 4);
-    assert_eq!(after.chunk_map[0].placement, vec![0, 1, 2]);
+    assert_eq!(
+        after.chunk_map.as_flat().unwrap()[0].placement,
+        vec![0, 1, 2]
+    );
 }
 
 // ---- (b) malformed placement is never rewritten --------------------------------------
@@ -344,7 +349,7 @@ async fn malformed_placement_is_never_rewritten() {
         "no version-conditional commit landed for the malformed chunk"
     );
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![7],
         "malformed placement left EXACTLY as committed — never rewritten (#348 posture)"
     );
@@ -374,7 +379,10 @@ async fn already_explicit_full_length_placement_is_left_untouched() {
         after.version, before.version,
         "no spurious commit / version bump"
     );
-    assert_eq!(after.chunk_map[0].placement, vec![5, 6, 7]);
+    assert_eq!(
+        after.chunk_map.as_flat().unwrap()[0].placement,
+        vec![5, 6, 7]
+    );
 }
 
 // ---- (d) ADR-0047: a backfill PRESERVES the object metadata (repair, not republish) ----
@@ -397,7 +405,7 @@ async fn backfill_preserves_object_metadata_while_filling_placement() {
     let chunk = rs_chunk(0xD0, 2, 1, vec![]); // ReedSolomon{k:2,m:1} -> fragment_count() == 3
     let record = InodeRecord {
         size: 5,
-        chunk_map: vec![chunk],
+        chunk_map: vec![chunk].into(),
         state: InodeState::Committed,
         version: 2,
         etag: Some(etag.clone()),
@@ -417,7 +425,7 @@ async fn backfill_preserves_object_metadata_while_filling_placement() {
 
     let after = read_inode(&meta, 1).await;
     assert_eq!(
-        after.chunk_map[0].placement,
+        after.chunk_map.as_flat().unwrap()[0].placement,
         vec![0, 1, 2],
         "the empty placement was filled to the full-length identity vector"
     );

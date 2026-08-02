@@ -277,7 +277,7 @@ fn any_k_arrive_first(seed: u64) {
         let data = nonempty_payload(&mut sim, MAX_PAYLOAD);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
         assert_eq!(
-            inode.chunk_map.len(),
+            inode.chunk_map.as_flat().unwrap().len(),
             1,
             "single chunk keeps the race crisp"
         );
@@ -313,7 +313,7 @@ fn below_k_is_a_clean_typed_error(seed: u64) {
         let data = nonempty_payload(&mut sim, MAX_PAYLOAD);
         let inode = put(&meta, &chunks, &data, 0x10, RS).await;
 
-        let chunk = inode.chunk_map[0].clone();
+        let chunk = inode.chunk_map.as_flat().unwrap()[0].clone();
         for index in choose_indices(&mut sim, N, M as usize + 1) {
             delete(dir.path(), chunk.id, index);
         }
@@ -347,7 +347,7 @@ fn none_scheme_is_a_single_fetch(seed: u64) {
         let (meta, chunks, dir) = backends();
         let data = nonempty_payload(&mut sim, MAX_PAYLOAD);
         let inode = put(&meta, &chunks, &data, 0x20, EcScheme::None).await;
-        assert_eq!(inode.chunk_map.len(), 1, "single chunk");
+        assert_eq!(inode.chunk_map.as_flat().unwrap().len(), 1, "single chunk");
 
         let (store, probe) = ArrivalStore::new(dir.path(), arrival_yields(&mut sim, N as usize));
         let got = read::read_object_from(&store, &inode).await.unwrap();

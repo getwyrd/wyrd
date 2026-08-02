@@ -121,6 +121,8 @@ fn expect_ambiguous(err: &BoxError) -> CommitUnknownResult {
 fn orphan_records_for(prior: &InodeRecord) -> usize {
     prior
         .chunk_map
+        .as_flat()
+        .unwrap()
         .iter()
         .map(|chunk| usize::from(chunk.fragment_count()))
         .sum()
@@ -158,9 +160,11 @@ async fn assert_batch_applied_whole(
 /// The settled inode's chunk map must be a **whole** writer's plan (or the untouched
 /// prior's), never a hybrid of several. A merged map is a member of neither set.
 fn assert_chunk_map_is_whole(settled: &InodeRecord, prior: &InodeRecord, plans: &[Vec<ChunkRef>]) {
-    let whole = std::iter::once(&prior.chunk_map).chain(plans.iter());
+    let prior_flat = prior.chunk_map.as_flat().unwrap();
+    let settled_flat = settled.chunk_map.as_flat().unwrap();
+    let whole = std::iter::once(prior_flat).chain(plans.iter().map(Vec::as_slice));
     assert!(
-        whole.into_iter().any(|map| *map == settled.chunk_map),
+        whole.into_iter().any(|map| map == settled_flat),
         "the settled inode's chunk map matches neither the prior nor any single writer's \
          plan — it is a torn/hybrid of several writers"
     );
@@ -265,7 +269,9 @@ async fn ambiguous_cas_settles_over(meta: Arc<SimFdbMetadataStore>, observer: Ob
                 match observer {
                     // Correct: the store's settled state decides. Chunk ids are disjoint per
                     // writer, so an exact chunk-map match means *this* writer's commit landed.
-                    Observer::SettlingReRead => settled.chunk_map == *chunk_map,
+                    Observer::SettlingReRead => {
+                        settled.chunk_map.as_flat().unwrap() == chunk_map.as_slice()
+                    }
                     // Violating: assume it did not land.
                     Observer::AssumeNotCommitted => false,
                 }
@@ -811,7 +817,9 @@ async fn contended_cas_under_1031_over(
                 );
                 match observer {
                     // Correct: the store's terminal, resolver-checked state decides.
-                    ContendedObserver::SettleThenReRead => settled.chunk_map == *chunk_map,
+                    ContendedObserver::SettleThenReRead => {
+                        settled.chunk_map.as_flat().unwrap() == chunk_map.as_slice()
+                    }
                     // Violating: assume every timed-out commit landed.
                     ContendedObserver::AssumeEveryTimeoutLanded => true,
                 }
@@ -965,7 +973,7 @@ async fn deferred_1031_settles_against_current_truth(meta: Arc<SimFdbMetadataSto
     // may conflict — that seed is not the one this scenario needs.
     let _ = write::commit_overwrite(&*meta, 1, &prior, &b, ORPHANED_AT).await;
     let after_b = read::read_inode(&*meta, 1).await.unwrap().unwrap();
-    if after_b.chunk_map != b.chunk_refs() {
+    if after_b.chunk_map.as_flat().unwrap() != b.chunk_refs() {
         return false;
     }
 
@@ -987,7 +995,7 @@ async fn deferred_1031_settles_against_current_truth(meta: Arc<SimFdbMetadataSto
 
     // THE INVARIANT: A's stale batch is rejected at the resolver; B's win is untouched.
     assert_eq!(
-        settled.chunk_map,
+        settled.chunk_map.as_flat().unwrap(),
         b.chunk_refs(),
         "a 1031 batch that lands at the deferral must be re-checked against CURRENT truth and \
          REJECTED when a later writer already won — it clobbered the winner instead"

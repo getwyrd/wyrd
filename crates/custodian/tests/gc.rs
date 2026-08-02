@@ -31,11 +31,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
-    self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
+    self, ChunkMapError, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
 use wyrd_custodian::{
     mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
-    Reconciled,
+    ReconcileError, Reconciled,
 };
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
@@ -160,7 +160,8 @@ async fn commit_reference(
             scheme: EcScheme::None,
             len: 5,
             placement: vec![dserver],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -340,7 +341,8 @@ async fn identity_fallback_none_empty_placement_protects_index0() {
             scheme: EcScheme::None,
             len: 5,
             placement: vec![], // pre-M3: empty placement, identity fallback applies
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -409,7 +411,8 @@ async fn identity_fallback_rs_empty_placement_protects_index_above_zero() {
             scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
             len: 5,
             placement: vec![], // pre-M3: empty, identity fallback for all 3 indices
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -478,7 +481,8 @@ async fn short_placement_vector_fallback_protects_fallback_index() {
             len: 5,
             // Short vector: index 0 → D-server 5 (explicit), indices 1 and 2 fall back.
             placement: vec![5],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -542,7 +546,8 @@ async fn identity_fallback_rs_6_3_empty_placement_protects_an_inner_index() {
             scheme: EcScheme::ReedSolomon { k: 6, m: 3 },
             len: 5,
             placement: Vec::new(), // pre-M3: empty, identity fallback for all 9 indices
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -602,7 +607,8 @@ async fn short_placement_vector_rs_6_3_fallback_protects_fallback_index() {
             len: 5,
             // Short vector: indices 0,1,2 explicit (off-identity), 3..9 fall back.
             placement: vec![50, 51, 52],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -685,7 +691,8 @@ async fn malformed_placement_gc_treats_chunk_as_fully_referenced() {
             len: 5,
             // Non-empty, len 2 != fragment_count() 6 → malformed.
             placement: vec![0, 1],
-        }],
+        }]
+        .into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -775,5 +782,92 @@ async fn honours_the_reader_safe_grace_window() {
     assert!(
         d0.get_fragment(frag(chunk, 0)).await.unwrap().is_none(),
         "the orphan is reclaimed only after the reader-safe grace window"
+    );
+}
+
+// ---- issue #648 (criterion 2 over an unresolvable shape): a committed chunk map GC
+// cannot read aborts the pass instead of exposing its fragments to reclamation ----
+
+/// A **segmented** committed root names its chunks in `seg:` records no resolver reads
+/// until #649, so GC cannot compute which fragments the object owns. Reading that root as
+/// "owns no chunks" would leave every one of them unreferenced — and any that carries a
+/// lapsed orphan grace record (a crashed earlier delete, a superseded generation) would go
+/// straight to `delete_fragment`: a **live** object's bytes destroyed by a maintenance
+/// pass, silently and permanently. So the pass **aborts on the shape**, exactly as it
+/// already does on a record that will not decode (`gc::referenced_fragments`), and
+/// reclaims nothing — including the unrelated, plainly collectable orphan below, which is
+/// what proves the abort happens *before* the reclaim walk rather than inside it.
+///
+/// Flippable: read the shape as an empty chunk list instead — swap
+/// `as_flat().ok_or(...)` for `as_flat().unwrap_or_default()` in
+/// `gc::referenced_fragments` — and the pass runs to completion, deleting both fragments;
+/// every assertion below goes red.
+#[tokio::test]
+async fn a_segmented_root_aborts_the_pass_before_any_fragment_is_reclaimed() {
+    // A committed root in the segmented shape, as its raw stored bytes: nothing publishes
+    // one yet (`metadata::create` refuses to, until #653's staged-publication committer),
+    // so the honest fixture is the value a later writer — or a rolled-back binary — will
+    // leave in this store. Two segments tiling `size` under one segment group.
+    const SEGMENTED_ROOT: &[u8] = br#"{"size":12,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":1},"segment_count":2,"segments":[{"index":0,"byte_offset":0,"byte_len":5},{"index":1,"byte_offset":5,"byte_len":7}]},"state":"Committed","version":1}"#;
+
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+    meta.commit(WriteBatch::new().put(metadata::inode_key(2), SEGMENTED_ROOT))
+        .await
+        .unwrap();
+
+    // The fault the fixture carries: a fragment on d0 that this object owns, under a
+    // long-lapsed orphan grace record. GC cannot tell that it does — the chunk ids live in
+    // the unreadable `seg:` records, which is the whole hazard — so the reference set is
+    // the only thing that could protect it, and it cannot be computed for this root.
+    let seg_chunk: ChunkId = 0xF6;
+    d0.put(frag(seg_chunk, 0)).await;
+    mark_orphaned(&meta, 0, frag(seg_chunk, 0), 0)
+        .await
+        .unwrap();
+    // A second orphan belonging to no committed map at all: collectable on any pass that
+    // actually runs, so its survival distinguishes "aborted" from "found nothing to do".
+    let unrelated_chunk: ChunkId = 0xF7;
+    d0.put(frag(unrelated_chunk, 0)).await;
+    mark_orphaned(&meta, 0, frag(unrelated_chunk, 0), 0)
+        .await
+        .unwrap();
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 0,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    // now = 1_000_000: every grace window above is long elapsed.
+    let err = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
+        .await
+        .expect_err("a committed map GC cannot resolve must abort the pass");
+    let ReconcileError::Store(inner) = err else {
+        panic!("an unresolvable chunk map is a store-shape refusal, not a fence error: {err:?}")
+    };
+    assert_eq!(
+        *inner
+            .downcast::<ChunkMapError>()
+            .expect("the typed refusal survives the loop's error seam"),
+        ChunkMapError::SegmentedMapUnsupported {
+            operation: "gc::referenced_fragments"
+        },
+        "the operator signal must name the shape GC stopped on"
+    );
+    assert!(
+        d0.get_fragment(frag(seg_chunk, 0)).await.unwrap().is_some(),
+        "a fragment of an object whose chunk map GC cannot read is NEVER reclaimed"
+    );
+    assert!(
+        d0.get_fragment(frag(unrelated_chunk, 0))
+            .await
+            .unwrap()
+            .is_some(),
+        "the pass aborts before the reclaim walk: nothing at all is deleted"
     );
 }

@@ -118,7 +118,7 @@ impl PlacementChunkStore for MemChunks {}
 async fn commit_inode(meta: &MemMeta, inode: InodeId, chunk: ChunkRef, size: u64) {
     let record = InodeRecord {
         size,
-        chunk_map: vec![chunk],
+        chunk_map: vec![chunk].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -321,7 +321,7 @@ async fn commit_chunk_map_bumps_version_by_one() {
     let id: InodeId = 7;
     let prior = InodeRecord {
         size: 0,
-        chunk_map: vec![],
+        chunk_map: vec![].into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()
@@ -360,7 +360,7 @@ async fn commit_chunk_map_preserves_object_metadata_across_a_repair() {
     // create/overwrite leaves behind — never all-`None` for a published object).
     let prior = InodeRecord {
         size: 42,
-        chunk_map: vec![],
+        chunk_map: vec![].into(),
         state: InodeState::Committed,
         version: 3,
         etag: Some("d1f2e3c4b5a60718".to_string()),
@@ -491,7 +491,7 @@ async fn commit_chunk_map_superseding_stamps_a_fresh_modified() {
     // A prior publication carrying its OWN distinct metadata trio.
     let prior = InodeRecord {
         size: 10,
-        chunk_map: vec![],
+        chunk_map: vec![].into(),
         state: InodeState::Committed,
         version: 5,
         etag: Some("aaaaaaaaaaaaaaaa".to_string()),
@@ -541,7 +541,7 @@ async fn commit_chunk_map_superseding_leased_stamps_a_fresh_modified() {
     let id: InodeId = 12;
     let prior = InodeRecord {
         size: 10,
-        chunk_map: vec![],
+        chunk_map: vec![].into(),
         state: InodeState::Committed,
         version: 2,
         etag: Some("cccccccccccccccc".to_string()),

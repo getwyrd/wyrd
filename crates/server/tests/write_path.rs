@@ -52,7 +52,7 @@ async fn pending_count(meta: &RedbMetadataStore) -> usize {
 async fn read_object(meta: &RedbMetadataStore, chunks: &FsChunkStore, inode_id: u64) -> Vec<u8> {
     let inode = read_inode(meta, inode_id).await.expect("inode");
     let mut out = Vec::new();
-    for chunk in &inode.chunk_map {
+    for chunk in inode.chunk_map.as_flat().unwrap() {
         let fragment = chunks
             .get_fragment(FragmentId {
                 chunk: chunk.id,
@@ -93,7 +93,10 @@ fn write_produces_an_atomically_committed_readable_file() {
         assert_eq!(inode.state, InodeState::Committed);
         assert_eq!(inode.version, 1);
         assert_eq!(inode.size, data.len() as u64);
-        assert_eq!(inode.chunk_map.len(), data.len().div_ceil(CHUNK));
+        assert_eq!(
+            inode.chunk_map.as_flat().unwrap().len(),
+            data.len().div_ceil(CHUNK)
+        );
 
         let dirent: DirentRecord = metadata::decode(
             &meta
@@ -247,7 +250,7 @@ fn exactly_one_overwrite_wins_under_a_concurrent_writer() {
             let committed = read_inode(&meta, 1).await.unwrap();
             assert_eq!(committed.version, 2, "seed {seed}: bumped once");
             assert_eq!(
-                committed.chunk_map,
+                committed.chunk_map.as_flat().unwrap(),
                 plan_a.chunk_refs(),
                 "seed {seed}: winner persisted"
             );

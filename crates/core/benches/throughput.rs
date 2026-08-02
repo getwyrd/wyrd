@@ -109,7 +109,7 @@ fn bench_throughput(c: &mut Criterion) {
     .expect("plan the write");
     let inode = InodeRecord {
         size: plan.size,
-        chunk_map: plan.chunk_refs(),
+        chunk_map: plan.chunk_refs().into(),
         state: InodeState::Committed,
         version: 1,
         ..Default::default()

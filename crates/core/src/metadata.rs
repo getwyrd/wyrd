@@ -12,9 +12,11 @@
 //! optimization). The four-phase write protocol that drives these operations
 //! lands with the client write path (M0.5).
 
+use std::fmt;
+
 use bytes::Bytes;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as DeError, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use wyrd_traits::{
     ChunkId, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
 };
@@ -238,6 +240,913 @@ pub struct MalformedPlacement {
     pub actual: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Chunk-map segmentation (proposal 0016 decision 7(a), `0016:2314-2331`)
+// ---------------------------------------------------------------------------
+//
+// A published chunk map is ONE metadata value, and a value has a size ceiling — 100 KB
+// on FoundationDB, the tightest backend in play (`crates/traits/src/lib.rs:746-752`). A
+// bare inline `Vec<ChunkRef>` therefore caps an object's chunk count far below the
+// >10 GiB launch requirement. A large map is instead SEGMENTED: the root keeps the
+// group identity plus one `SegmentRef` per segment, and segment `i`'s chunks live in
+// the record `seg:<nonce>:<epoch>:<index>` (`0016:354`).
+//
+// The two shapes are discriminated by JSON type — a flat map is a JSON array, exactly
+// the pre-existing encoding — so every legacy record decodes and re-encodes
+// byte-identically and every `require(key, encode(prior))` CAS in this module keeps
+// matching the bytes already in the store (see the `skip_serializing_if` rationale on
+// `InodeRecord::etag`, `:277-286`).
+//
+// This slice lands the shape, its decode-time invariants and its `seg:`/`seggrp:` key
+// helpers only — no resolver, no producer (#649 onward). So every pre-existing
+// `.chunk_map` site in this module treats `ChunkMap::Segmented` as the typed error
+// [`ChunkMapError::SegmentedMapUnsupported`], never as an empty chunk list: a consumer
+// that cannot yet resolve a segmented map must fail closed for that object rather than
+// answer "this object owns no chunks" (an answer indistinguishable from a genuinely
+// empty object, and how a live object's fragments would go unreferenced).
+
+/// The number of decimal digits a `seg:` key's segment index is zero-padded to, so the
+/// key's byte-lexicographic order equals index order. [`parse_seg_key`] rejects any
+/// other width rather than admitting two spellings of one segment.
+pub const SEG_INDEX_WIDTH: usize = 6;
+
+/// The largest segment index the `seg:` key grammar can address — the whole key space
+/// [`SEG_INDEX_WIDTH`] opens, `999_999`.
+///
+/// This is a **format**-level bound, not a capacity policy like [`MAX_ROOT_SEGMENTS`],
+/// and that is why it *is* enforced at decode ([`SegmentedMap::new`]) while the capacity
+/// ceiling is not: a segment past it has no canonical key at all, so nothing — no
+/// resolver, no GC pass, no reconstruction, at any capacity setting — could ever address
+/// its record. Admitting such a root as a value would hand every consumer a map it can
+/// only half-resolve, which is exactly the "this object owns no chunks" answer this
+/// module refuses to give (C-1). Widening the key space is a stored-format change with a
+/// migration, never a constant tweak.
+pub const MAX_SEGMENT_INDEX: u32 = 10u32.pow(SEG_INDEX_WIDTH as u32) - 1;
+
+/// The length of a segment-group nonce in lowercase-hex characters (128 bits).
+pub const SEG_NONCE_HEX_LEN: usize = 32;
+
+/// Key prefix for **segment records** — one segment of a published, segmented chunk map
+/// (`0016:354`). Disjoint from every other namespace.
+pub const SEG_PREFIX: &[u8] = b"seg:";
+
+/// Key prefix for the **segment-group reservation** marker (`0016:499-527`).
+pub const SEGGRP_PREFIX: &[u8] = b"seggrp:";
+
+/// The value of a `seggrp:<nonce>` marker record: its **presence** is the whole
+/// meaning, so the value is the empty JSON object.
+pub const SEGGRP_MARKER: &[u8] = b"{}";
+
+/// The most segments one root may name (`0016:2432-2440`).
+///
+/// Its **budget rule** is `0016:1467`: `max_segref_bytes × MAX_ROOT_SEGMENTS ≤ V / 2` —
+/// a worst-case segment table fits [`MAX_ROOT_VALUE_BYTES`], i.e. HALF the value ceiling,
+/// not merely inside it. The other half is the reserve the caller's object metadata and
+/// any later field addition are spent from, so raising this constant means re-measuring
+/// the encoded worst case against [`MAX_ROOT_VALUE_BYTES`]
+/// (`crates/core/tests/segmented_map_record.rs` measures exactly that, on
+/// `encode(...).len()`, with and without a reserve-filling metadata block).
+///
+/// A **capacity** guard, enforced where a segment table becomes work — the publication
+/// that writes one and the ranged read that would spend it (#649/#653) — and
+/// deliberately **not** at decode: rejecting a stored record on a derived capacity
+/// constant would turn a durable object unreadable if the constant ever moved
+/// (ADR-0045's liberal-on-read boundary). A stored table past this ceiling therefore
+/// still decodes, and fails closed only when something tries to resolve it.
+///
+/// Contrast [`MAX_SEGMENT_INDEX`], which *is* a decode invariant: this constant is a
+/// number this deployment chooses, that one is the addressable key space of the stored
+/// format itself.
+pub const MAX_ROOT_SEGMENTS: usize = 512;
+
+/// The value ceiling every backend inherits — FoundationDB's, the tightest in play
+/// (`crates/traits/src/lib.rs:746-752`). **Decimal**, not the binary rounding of "100
+/// KB": FoundationDB's hard limit is 100 000 bytes, not `100 * 1024`.
+pub const MAX_VALUE_BYTES: usize = 100_000;
+
+/// The byte budget the **segment table and the root's own fields** must fit: half
+/// [`MAX_VALUE_BYTES`], the 2× headroom `0016:1467` requires of [`MAX_ROOT_SEGMENTS`]
+/// (`max_segref_bytes × MAX_ROOT_SEGMENTS ≤ V / 2`).
+///
+/// The **other half is a reserve**, and it is spent on things the record shape does not
+/// choose: the ADR-0047 object metadata a client supplies (`etag`, `content_type`,
+/// `modified` — `content_type` is verbatim from the request header, so its width is the
+/// caller's), and whatever field a later revision adds. Sizing the segment table against
+/// the *whole* ceiling instead would leave a root that is legal today and unwritable the
+/// moment either grows — and a root that cannot be re-written is an object whose
+/// placement can never be repaired (every repair is `require(inode, encode(prior)) +
+/// put(inode, encode(next))`), so the headroom is a durability property rather than
+/// tidiness.
+///
+/// The split is measured, not asserted in prose: `crates/core/tests/segmented_map_record.rs`
+/// encodes a worst-case `MAX_ROOT_SEGMENTS` root and requires (a) the table root inside
+/// this budget and (b) that same root carrying object metadata filling the whole reserve
+/// still inside [`MAX_VALUE_BYTES`]. A record whose metadata exceeds the reserve is
+/// refused by the tightest backend when it is *published* — a clean create failure, the
+/// same one an equally large flat record already meets today, and not a durability
+/// hazard: an object that was published fits, and repairs re-encode the same fields.
+/// Bounding a caller-supplied header belongs to the protocol gateway, not to the record
+/// shape. The `const` assertion below keeps the two halves tied if either is edited.
+pub const MAX_ROOT_VALUE_BYTES: usize = 50_000;
+
+const _: () = assert!(MAX_ROOT_VALUE_BYTES * 2 <= MAX_VALUE_BYTES);
+
+/// A structural violation of the segmented chunk-map shape.
+///
+/// Every variant is raised **at decode** (a stored record is parsed into a value that
+/// cannot be malformed — ADR-0045, parse-don't-validate) or by a caller that met
+/// [`ChunkMap::Segmented`] at a site this slice has not wired a resolver for yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkMapError {
+    /// A segment-group nonce that is not exactly [`SEG_NONCE_HEX_LEN`] lowercase hex
+    /// characters — it would key a `seg:` range no writer can reproduce.
+    NonceNotHex {
+        /// The rejected nonce.
+        nonce: String,
+    },
+    /// A segmented map naming no segments: an empty map is the flat shape, not this
+    /// one.
+    NoSegments,
+    /// `segment_count` disagrees with the number of `segments` present.
+    SegmentCountMismatch {
+        /// The `segment_count` the record declares.
+        declared: u32,
+        /// How many `SegmentRef`s it actually carries.
+        actual: usize,
+    },
+    /// The segment indices are not exactly `0..segment_count` in ascending order — a
+    /// duplicate, a gap, or an out-of-order entry.
+    SegmentIndexOutOfOrder {
+        /// The position in the `segments` list.
+        position: usize,
+        /// The index found there.
+        found: u32,
+    },
+    /// A segment index past [`MAX_SEGMENT_INDEX`] — the `seg:` key grammar cannot
+    /// address it, so its record is unreachable for every consumer, forever. Because
+    /// indices are exactly `0..segment_count`, this is equally the format's maximum
+    /// **segment count**: a root naming more segments than the key space holds is
+    /// rejected as a whole rather than decoded into a map only part of which resolves.
+    SegmentIndexUnaddressable {
+        /// The first index that has no canonical key.
+        index: u32,
+        /// The largest index the key space can address ([`MAX_SEGMENT_INDEX`]).
+        max: u32,
+    },
+    /// The segments do not tile the object contiguously from byte 0: this one's
+    /// `byte_offset` is not the end of its predecessor (a gap, an overlap, or a
+    /// non-monotonic offset).
+    SegmentsNotContiguous {
+        /// The offending segment's index.
+        index: u32,
+        /// The offset the tiling requires.
+        expected: u64,
+        /// The offset the record carries.
+        found: u64,
+    },
+    /// A segment covering no bytes — it can hold no chunk, so it can only be
+    /// corruption.
+    EmptySegment {
+        /// The offending segment's index.
+        index: u32,
+    },
+    /// A root segment table whose byte spans **overflow `u64`** when tiled.
+    SegmentSpanOverflow {
+        /// The segment at which the running offset overflowed.
+        index: u32,
+    },
+    /// A **segment record** carrying no chunks, or no bytes.
+    EmptySegmentRecord {
+        /// The first byte of the object the empty record claimed to cover.
+        byte_offset: u64,
+        /// How many chunks it carried (0, or a list whose lengths sum to 0).
+        chunks: usize,
+    },
+    /// A **segment record** whose own extent does not exist: `byte_offset + byte_len`
+    /// overflows `u64`, so the record claims a last byte no offset can address.
+    SegmentSpanUnrepresentable {
+        /// The first byte the record claims.
+        byte_offset: u64,
+        /// The length it claims from there.
+        byte_len: u64,
+    },
+    /// A segment record whose chunks' lengths do not sum to its declared `byte_len`.
+    SegmentLengthMismatch {
+        /// The declared byte length.
+        declared: u64,
+        /// The sum of the record's chunk lengths.
+        chunks: u64,
+    },
+    /// A segment record whose chunk lengths **overflow `u64`** when summed. The sum is
+    /// checked rather than wrapped: an unchecked aggregate would wrap in a release
+    /// build to a small total that could then *match* a forged `byte_len` — admitting a
+    /// structurally impossible record as a value.
+    SegmentLengthOverflow {
+        /// How many chunks the record carries.
+        chunks: usize,
+    },
+    /// A key under the `seg:` prefix that is not a well-formed segment key (a
+    /// wrong-width index, a missing field, a non-canonical epoch).
+    SegmentKeyMalformed {
+        /// The rejected key, lossily rendered.
+        key: String,
+    },
+    /// A segmented root whose segment table does not span exactly
+    /// [`InodeRecord::size`] bytes. The table is the object's byte index, so a
+    /// disagreement is structural corruption, not a contextual detail.
+    SizeSpanMismatch {
+        /// The `size` the root declares.
+        size: u64,
+        /// The bytes its segment table actually spans.
+        span: u64,
+    },
+    /// A caller met [`ChunkMap::Segmented`] at a `.chunk_map` site this slice has not
+    /// wired a resolver for (#649-#651): nothing publishes a segmented map yet, so this
+    /// is unreachable in production today, but every read site fails closed here rather
+    /// than silently treating the map as empty.
+    SegmentedMapUnsupported {
+        /// The call site that met it, for diagnostics.
+        operation: &'static str,
+    },
+}
+
+impl fmt::Display for ChunkMapError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NonceNotHex { nonce } => write!(
+                f,
+                "segment-group nonce is not {SEG_NONCE_HEX_LEN} lowercase hex characters: {nonce:?}"
+            ),
+            Self::NoSegments => write!(f, "segmented chunk map names no segments"),
+            Self::SegmentCountMismatch { declared, actual } => write!(
+                f,
+                "segment_count {declared} disagrees with {actual} segments present"
+            ),
+            Self::SegmentIndexOutOfOrder { position, found } => write!(
+                f,
+                "segment index {found} at position {position}: indices must be 0..segment_count, ascending, with no gap or duplicate"
+            ),
+            Self::SegmentIndexUnaddressable { index, max } => write!(
+                f,
+                "segment index {index} exceeds the {SEG_INDEX_WIDTH}-digit `seg:` key space (max {max}): its record could never be addressed"
+            ),
+            Self::SegmentsNotContiguous {
+                index,
+                expected,
+                found,
+            } => write!(
+                f,
+                "segment {index} starts at byte {found}, not {expected}: segments must tile the object contiguously"
+            ),
+            Self::EmptySegment { index } => write!(f, "segment {index} covers no bytes"),
+            Self::SegmentSpanOverflow { index } => write!(
+                f,
+                "segment table overflows u64 at segment {index}: the tiling cannot be represented"
+            ),
+            Self::EmptySegmentRecord {
+                byte_offset,
+                chunks,
+            } => write!(
+                f,
+                "segment record at byte {byte_offset} carries {chunks} chunks covering no bytes"
+            ),
+            Self::SegmentSpanUnrepresentable {
+                byte_offset,
+                byte_len,
+            } => write!(
+                f,
+                "a segment record at byte {byte_offset} claiming {byte_len} bytes ends past u64: its extent cannot be represented"
+            ),
+            Self::SegmentLengthMismatch { declared, chunks } => write!(
+                f,
+                "segment declares byte_len {declared} but its chunks total {chunks} bytes"
+            ),
+            Self::SegmentLengthOverflow { chunks } => write!(
+                f,
+                "segment's {chunks} chunk lengths overflow u64 when summed — rejected, never wrapped"
+            ),
+            Self::SegmentKeyMalformed { key } => write!(f, "malformed segment key: {key:?}"),
+            Self::SizeSpanMismatch { size, span } => write!(
+                f,
+                "inode declares size {size} but its segment table spans {span} bytes"
+            ),
+            Self::SegmentedMapUnsupported { operation } => write!(
+                f,
+                "{operation} met a segmented chunk map, which this build cannot yet resolve"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChunkMapError {}
+
+/// A **validated** segment-group nonce: exactly [`SEG_NONCE_HEX_LEN`] lowercase hex
+/// characters, and therefore carrying none of the `:` separators the `seg:` key grammar
+/// is built out of.
+///
+/// It is a type rather than a `&str` because the key helpers below **mint key ranges**
+/// from it, and a range is what a cleanup pass deletes. Given a bare string,
+/// `seg_group_prefix("<nonce>:<epoch>")` — a spelling nothing would have rejected —
+/// renders `seg:<nonce>:<epoch>:`, which is byte-for-byte the *epoch* range
+/// [`seg_range_prefix`] mints for that group's live generation. A pass sweeping "every
+/// epoch of this group" would then delete a live generation's segment records, orphaning
+/// every fragment they name: the permanent, data-losing failure mode C-1 forbids
+/// (`docs/principles.md` §5). Parsing the rule into the type (ADR-0045,
+/// parse-don't-validate) is what makes an unvalidated prefix unrepresentable rather than
+/// merely unlikely — and the fixed width is what makes one group's prefix unable to
+/// reach another's keys at all.
+///
+/// `Serialize` is `transparent`, so the stored form is the plain JSON string it always
+/// was — the type is a compile-time rule, not a wire change. There is deliberately no
+/// `Deserialize`: the only decode path is [`SegmentGroup`]'s, which routes through the
+/// validating constructor, so no derive can produce one of these unvalidated.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SegmentNonce(String);
+
+impl SegmentNonce {
+    /// The validating constructor — the **only** way to obtain a `SegmentNonce`, and the
+    /// single home of the nonce rule (both [`SegmentGroup::new`] and [`parse_seg_key`]
+    /// route through it, so a stored key and a stored record can never disagree about
+    /// what a nonce is).
+    pub fn new(nonce: impl Into<String>) -> std::result::Result<Self, ChunkMapError> {
+        let nonce = nonce.into();
+        if nonce.len() != SEG_NONCE_HEX_LEN
+            || !nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ChunkMapError::NonceNotHex { nonce });
+        }
+        Ok(Self(nonce))
+    }
+
+    /// The nonce as its 32 hex characters.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SegmentNonce {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The identity of one **segment group**: an independent 128-bit nonce minted with the
+/// publishing session, paired with the `Completing` fence **epoch** of the attempt that
+/// wrote the segments (`0016:2352-2380`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct SegmentGroup {
+    nonce: SegmentNonce,
+    epoch: u64,
+}
+
+impl SegmentGroup {
+    /// The validating constructor — the **only** way to obtain a `SegmentGroup`, so a
+    /// nonce that could not key a reproducible `seg:` range is never representable
+    /// (ADR-0045, parse-don't-validate).
+    pub fn new(nonce: impl Into<String>, epoch: u64) -> std::result::Result<Self, ChunkMapError> {
+        Ok(Self {
+            nonce: SegmentNonce::new(nonce)?,
+            epoch,
+        })
+    }
+
+    /// The group nonce (32 lowercase hex characters), validated — so it can be handed
+    /// straight to [`seg_group_prefix`] / [`seggrp_key`].
+    pub fn nonce(&self) -> &SegmentNonce {
+        &self.nonce
+    }
+
+    /// The `Completing` fence epoch that wrote this generation's segments.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl<'de> Deserialize<'de> for SegmentGroup {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            nonce: String,
+            epoch: u64,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        SegmentGroup::new(raw.nonce, raw.epoch).map_err(DeError::custom)
+    }
+}
+
+/// One segment of a published map, as the **root** records it: which segment it is and
+/// the byte span of the object it covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentRef {
+    /// The segment's index, which is also the fixed-width tail of its `seg:` key.
+    pub index: u32,
+    /// The first byte of the object this segment covers.
+    pub byte_offset: u64,
+    /// How many bytes it covers.
+    pub byte_len: u64,
+}
+
+/// The **segmented** shape of an [`InodeRecord::chunk_map`]: the group identity plus
+/// the ordered segment table (`0016:2314-2330`).
+///
+/// The **structural** invariants — `segment_count == segments.len()`, indices exactly
+/// `0..count` in ascending order and inside the addressable key space
+/// ([`MAX_SEGMENT_INDEX`], which is therefore also the format's segment-count maximum),
+/// a contiguous byte tiling from 0 — are enforced by [`Self::new`], which the
+/// `Deserialize` impl routes through, so a malformed stored record is an **error at
+/// decode** and never a value a consumer could half-resolve. The **capacity** bound
+/// ([`MAX_ROOT_SEGMENTS`]) deliberately is not one of them (see its doc comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentedMap {
+    group: SegmentGroup,
+    segments: Vec<SegmentRef>,
+}
+
+impl SegmentedMap {
+    /// The validating constructor. See the type's invariants.
+    pub fn new(
+        group: SegmentGroup,
+        segments: Vec<SegmentRef>,
+    ) -> std::result::Result<Self, ChunkMapError> {
+        if segments.is_empty() {
+            return Err(ChunkMapError::NoSegments);
+        }
+        let mut next_offset: u64 = 0;
+        for (position, segment) in segments.iter().enumerate() {
+            // The FORMAT's own maximum, checked FIRST — before the ordering rule, so an
+            // unaddressable index is reported as what it is at any position, and so the
+            // check is reachable without a million-entry table. A segment past the key
+            // space has no canonical `seg:` key, so admitting the root would hand a
+            // consumer a table whose tail it could never resolve. This is also the
+            // format's maximum segment COUNT: indices are exactly `0..count`, so a root
+            // naming more segments than the key space holds cannot get past here.
+            // Unlike `MAX_ROOT_SEGMENTS` the bound is not a tunable, so enforcing it at
+            // decode cannot strand a durable object.
+            checked_segment_index(segment.index)?;
+            if segment.index as usize != position {
+                return Err(ChunkMapError::SegmentIndexOutOfOrder {
+                    position,
+                    found: segment.index,
+                });
+            }
+            if segment.byte_offset != next_offset {
+                return Err(ChunkMapError::SegmentsNotContiguous {
+                    index: segment.index,
+                    expected: next_offset,
+                    found: segment.byte_offset,
+                });
+            }
+            if segment.byte_len == 0 {
+                return Err(ChunkMapError::EmptySegment {
+                    index: segment.index,
+                });
+            }
+            next_offset = next_offset.checked_add(segment.byte_len).ok_or(
+                ChunkMapError::SegmentSpanOverflow {
+                    index: segment.index,
+                },
+            )?;
+        }
+        Ok(Self { group, segments })
+    }
+
+    /// The bytes this table spans — the end of its last segment, which is also the
+    /// object's `size` (checked at decode, [`ChunkMapError::SizeSpanMismatch`]). Never
+    /// overflows: [`Self::new`] rejected a tiling that could not be represented.
+    pub fn span(&self) -> u64 {
+        self.segments
+            .last()
+            .map_or(0, |last| last.byte_offset.saturating_add(last.byte_len))
+    }
+
+    /// The group this map's segments are keyed by.
+    pub fn group(&self) -> &SegmentGroup {
+        &self.group
+    }
+
+    /// The ordered segment table.
+    pub fn segments(&self) -> &[SegmentRef] {
+        &self.segments
+    }
+
+    /// How many segments the map has — always `segments().len()`, which is what the
+    /// encoded `segment_count` field carries.
+    pub fn segment_count(&self) -> u32 {
+        self.segments.len() as u32
+    }
+
+    /// Validate a decoded `(group, segment_count, segments)` triple into a map — the
+    /// **whole** structural check of the segmented shape, in one place and returning a
+    /// typed error. The `Deserialize` impl routes through it (stringifying the error,
+    /// as serde's `Error::custom` requires).
+    ///
+    /// The format's **segment-count maximum** needs no separate test here: it is
+    /// [`MAX_SEGMENT_INDEX`] + 1, and [`Self::new`] rejects the first index past that
+    /// space — which a root exceeding the count must contain, since the indices are
+    /// exactly `0..segment_count`.
+    fn from_wire(
+        group: SegmentGroup,
+        segment_count: u32,
+        segments: Vec<SegmentRef>,
+    ) -> std::result::Result<Self, ChunkMapError> {
+        if segment_count as usize != segments.len() {
+            return Err(ChunkMapError::SegmentCountMismatch {
+                declared: segment_count,
+                actual: segments.len(),
+            });
+        }
+        Self::new(group, segments)
+    }
+}
+
+/// The wire shape of [`SegmentedMap`] on **encode**, field order included:
+/// `{"group":{"nonce":…,"epoch":…},"segment_count":…,"segments":[…]}`.
+#[derive(Serialize)]
+struct SegmentedMapWireOut<'a> {
+    group: &'a SegmentGroup,
+    segment_count: u32,
+    segments: &'a [SegmentRef],
+}
+
+/// The wire shape of [`SegmentedMap`] on **decode** — same fields, owned.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SegmentedMapWireIn {
+    group: SegmentGroup,
+    segment_count: u32,
+    segments: Vec<SegmentRef>,
+}
+
+impl Serialize for SegmentedMap {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        SegmentedMapWireOut {
+            group: &self.group,
+            segment_count: self.segment_count(),
+            segments: &self.segments,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SegmentedMap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let wire = SegmentedMapWireIn::deserialize(deserializer)?;
+        SegmentedMap::from_wire(wire.group, wire.segment_count, wire.segments)
+            .map_err(DeError::custom)
+    }
+}
+
+/// An inode's chunk map: the ordered chunk list itself (**flat**), or the segment table
+/// that names it (**segmented**) — proposal 0016 decision 7(a).
+///
+/// Discriminated by JSON type, so the flat shape is **byte-identical to the pre-0016
+/// encoding in both directions** and every `require(key, encode(prior))` CAS in this
+/// module keeps matching the bytes already in the store. Making the two shapes one
+/// value (rather than a flat list plus an optional sidecar) is what stops a consumer
+/// from resolving one shape and silently seeing nothing in the other.
+///
+/// **A consumer never reads this field directly to get an object's chunks** once a
+/// resolver exists (#649); until then, [`Self::as_flat`] is the only sanctioned read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkMap {
+    /// The ordered chunk list inline — a JSON array, exactly as every record before
+    /// proposal 0016 wrote it.
+    Flat(Vec<ChunkRef>),
+    /// The chunks live in `seg:<nonce>:<epoch>:<index>` records; the root carries the
+    /// group identity and the segment table.
+    Segmented(SegmentedMap),
+}
+
+impl ChunkMap {
+    /// The inline chunk list, or `None` when the map is segmented (whose chunks live in
+    /// `seg:` records this slice has no resolver for yet).
+    pub fn as_flat(&self) -> Option<&[ChunkRef]> {
+        match self {
+            Self::Flat(chunks) => Some(chunks),
+            Self::Segmented(_) => None,
+        }
+    }
+
+    /// The inline chunk list **by value**, or `None` when the map is segmented — the
+    /// owning counterpart of [`Self::as_flat`] for a consumer that holds the map (a
+    /// streamed read moving the list into its reader task) and would otherwise deep-clone
+    /// every placement vector just to get an owned copy.
+    pub fn into_flat(self) -> Option<Vec<ChunkRef>> {
+        match self {
+            Self::Flat(chunks) => Some(chunks),
+            Self::Segmented(_) => None,
+        }
+    }
+
+    /// The segment table, or `None` when the map is flat.
+    pub fn segmented(&self) -> Option<&SegmentedMap> {
+        match self {
+            Self::Flat(_) => None,
+            Self::Segmented(map) => Some(map),
+        }
+    }
+
+    /// Whether the map is segmented.
+    pub fn is_segmented(&self) -> bool {
+        matches!(self, Self::Segmented(_))
+    }
+}
+
+impl Default for ChunkMap {
+    fn default() -> Self {
+        Self::Flat(Vec::new())
+    }
+}
+
+impl From<Vec<ChunkRef>> for ChunkMap {
+    /// The one-line conversion every **flat** construction site goes through, so the
+    /// shape change stays mechanical at the call sites.
+    fn from(chunks: Vec<ChunkRef>) -> Self {
+        Self::Flat(chunks)
+    }
+}
+
+impl Serialize for ChunkMap {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            Self::Flat(chunks) => chunks.serialize(serializer),
+            Self::Segmented(map) => map.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChunkMap {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct ByJsonType;
+
+        impl<'de> Visitor<'de> for ByJsonType {
+            type Value = ChunkMap;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a flat chunk array or a segmented chunk-map object")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> std::result::Result<ChunkMap, A::Error> {
+                Deserialize::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(ChunkMap::Flat)
+            }
+
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<ChunkMap, A::Error> {
+                Deserialize::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(ChunkMap::Segmented)
+            }
+        }
+
+        deserializer.deserialize_any(ByJsonType)
+    }
+}
+
+/// One **segment record** (`seg:<nonce>:<epoch>:<index>`, `0016:354`): that segment's
+/// chunks and the byte span of the object they cover.
+///
+/// The `byte_len == sum(chunk.len)` invariant is enforced at decode, so the root's
+/// segment table and the record can never disagree about how much of the object a
+/// segment holds. The fields are **private** and there is no field-wise constructor:
+/// the invariant holds for every value that exists (ADR-0045 / parse-don't-validate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentRecord {
+    chunks: Vec<ChunkRef>,
+    byte_offset: u64,
+    byte_len: u64,
+}
+
+impl SegmentRecord {
+    /// Build a segment record over `chunks` starting at `byte_offset`, deriving
+    /// `byte_len` from the chunks themselves.
+    ///
+    /// **Checked**, not summed: a chunk list whose lengths overflow `u64` is rejected
+    /// ([`ChunkMapError::SegmentLengthOverflow`]) rather than wrapping in a release
+    /// build — a wrapped total is a `byte_len` the decode check would then happily
+    /// confirm.
+    pub fn new(
+        chunks: Vec<ChunkRef>,
+        byte_offset: u64,
+    ) -> std::result::Result<Self, ChunkMapError> {
+        let byte_len = checked_chunk_bytes(&chunks)?;
+        Self::checked(chunks, byte_offset, byte_len)
+    }
+
+    /// The record's structural invariants, in one place: the chunk lengths total
+    /// `byte_len` (the caller has already derived or read it), the segment is **not
+    /// empty**, and the span it claims — `byte_offset + byte_len` — is representable.
+    fn checked(
+        chunks: Vec<ChunkRef>,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> std::result::Result<Self, ChunkMapError> {
+        if chunks.is_empty() || byte_len == 0 {
+            return Err(ChunkMapError::EmptySegmentRecord {
+                byte_offset,
+                chunks: chunks.len(),
+            });
+        }
+        if byte_offset.checked_add(byte_len).is_none() {
+            return Err(ChunkMapError::SegmentSpanUnrepresentable {
+                byte_offset,
+                byte_len,
+            });
+        }
+        Ok(Self {
+            chunks,
+            byte_offset,
+            byte_len,
+        })
+    }
+
+    /// Validate a decoded `(chunks, byte_offset, byte_len)` triple into a record — the
+    /// decode's whole structural check, returning a typed error.
+    fn from_wire(
+        chunks: Vec<ChunkRef>,
+        byte_offset: u64,
+        byte_len: u64,
+    ) -> std::result::Result<Self, ChunkMapError> {
+        let total = checked_chunk_bytes(&chunks)?;
+        if total != byte_len {
+            return Err(ChunkMapError::SegmentLengthMismatch {
+                declared: byte_len,
+                chunks: total,
+            });
+        }
+        Self::checked(chunks, byte_offset, byte_len)
+    }
+
+    /// This segment's ordered chunks.
+    pub fn chunks(&self) -> &[ChunkRef] {
+        &self.chunks
+    }
+
+    /// The chunks, consumed.
+    pub fn into_chunks(self) -> Vec<ChunkRef> {
+        self.chunks
+    }
+
+    /// The first byte of the object this segment covers.
+    pub fn byte_offset(&self) -> u64 {
+        self.byte_offset
+    }
+
+    /// How many bytes it covers — the sum of its chunks' lengths.
+    pub fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+}
+
+/// The total byte length of `chunks`, **checked**: overflow is an error, never a wrap.
+/// One definition, used by both the constructor and the decode check, so the two can
+/// never disagree about what "the chunks total" means.
+fn checked_chunk_bytes(chunks: &[ChunkRef]) -> std::result::Result<u64, ChunkMapError> {
+    chunks
+        .iter()
+        .try_fold(0u64, |total, chunk| total.checked_add(chunk.len))
+        .ok_or(ChunkMapError::SegmentLengthOverflow {
+            chunks: chunks.len(),
+        })
+}
+
+/// The wire shape of [`SegmentRecord`], field order included.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SegmentRecordWire {
+    chunks: Vec<ChunkRef>,
+    byte_offset: u64,
+    byte_len: u64,
+}
+
+impl Serialize for SegmentRecord {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        SegmentRecordWire {
+            chunks: self.chunks.clone(),
+            byte_offset: self.byte_offset,
+            byte_len: self.byte_len,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SegmentRecord {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let wire = SegmentRecordWire::deserialize(deserializer)?;
+        SegmentRecord::from_wire(wire.chunks, wire.byte_offset, wire.byte_len)
+            .map_err(DeError::custom)
+    }
+}
+
+/// Key for one segment record: `seg:<nonce>:<epoch>:<index>`, the index zero-padded to
+/// [`SEG_INDEX_WIDTH`] digits.
+///
+/// **Fallible**, because the padding is not a formatting nicety: an index past
+/// [`MAX_SEGMENT_INDEX`] would render `SEG_INDEX_WIDTH + 1` digits, which
+/// [`parse_seg_key`] then rejects — a key that writes but never reads back. Refusing it
+/// here keeps `parse_seg_key(seg_key(g, i)?) == (nonce, epoch, i)` total over every key
+/// this module can produce. Decode enforces the same bound
+/// ([`ChunkMapError::SegmentIndexUnaddressable`]), so a table that reached a value has
+/// no index this can refuse.
+pub fn seg_key(group: &SegmentGroup, index: u32) -> std::result::Result<Vec<u8>, ChunkMapError> {
+    checked_segment_index(index)?;
+    let mut key = seg_range_prefix(group);
+    key.extend_from_slice(format!("{index:0width$}", width = SEG_INDEX_WIDTH).as_bytes());
+    Ok(key)
+}
+
+/// The addressability rule for a segment index, **in one place**: an index the `seg:`
+/// key grammar can both render at [`SEG_INDEX_WIDTH`] digits and parse back.
+///
+/// One definition, used by [`seg_key`] (which must not mint a key that reads back as
+/// malformed) and by [`SegmentedMap::new`] (which must not admit a table naming a segment
+/// no key can reach), so the two can never disagree about what "addressable" means.
+fn checked_segment_index(index: u32) -> std::result::Result<(), ChunkMapError> {
+    if index > MAX_SEGMENT_INDEX {
+        return Err(ChunkMapError::SegmentIndexUnaddressable {
+            index,
+            max: MAX_SEGMENT_INDEX,
+        });
+    }
+    Ok(())
+}
+
+/// The **bounded per-object range** a segmented map resolves through:
+/// `seg:<nonce>:<epoch>:` (`0016:2463-2469`). Never a global `seg:` scan.
+pub fn seg_range_prefix(group: &SegmentGroup) -> Vec<u8> {
+    format!("seg:{}:{}:", group.nonce(), group.epoch()).into_bytes()
+}
+
+/// The prefix naming **every** epoch of one segment group: `seg:<nonce>:`.
+///
+/// Takes a [`SegmentNonce`], not a string, because this is the range a cleanup pass
+/// deletes: a nonce carrying a `:` would render another generation's *epoch* range
+/// (`seg:<nonce>:<epoch>:`) and take a live group's segments with it. See
+/// [`SegmentNonce`].
+pub fn seg_group_prefix(nonce: &SegmentNonce) -> Vec<u8> {
+    format!("seg:{nonce}:").into_bytes()
+}
+
+/// Key for a segment-group reservation marker: `seggrp:<nonce>`.
+pub fn seggrp_key(nonce: &SegmentNonce) -> Vec<u8> {
+    format!("seggrp:{nonce}").into_bytes()
+}
+
+/// Parse a [`seg_key`] back into `(nonce, epoch, index)`, **strictly**: the index must
+/// be exactly [`SEG_INDEX_WIDTH`] ASCII digits, so one segment has exactly one key and
+/// a stray record cannot smuggle itself into a resolution under a second spelling.
+pub fn parse_seg_key(key: &[u8]) -> std::result::Result<(SegmentNonce, u64, u32), ChunkMapError> {
+    let malformed = || ChunkMapError::SegmentKeyMalformed {
+        key: String::from_utf8_lossy(key).into_owned(),
+    };
+    let rest = std::str::from_utf8(key)
+        .ok()
+        .and_then(|k| k.strip_prefix("seg:"))
+        .ok_or_else(malformed)?;
+    let mut parts = rest.split(':');
+    let nonce = parts.next().ok_or_else(malformed)?;
+    let epoch = parts.next().ok_or_else(malformed)?;
+    let index = parts.next().ok_or_else(malformed)?;
+    if parts.next().is_some() || index.len() != SEG_INDEX_WIDTH {
+        return Err(malformed());
+    }
+    // The parsed nonce comes back VALIDATED, so what a caller derives from a stored key
+    // — the group's `seg:` range, its `seggrp:` marker — cannot be minted from a
+    // spelling this grammar would have refused.
+    let nonce = SegmentNonce::new(nonce).map_err(|_| malformed())?;
+    // The epoch is CANONICAL decimal, parsed strictly rather than through `from_str`:
+    // `u64::from_str` accepts `+7` and `007`, so a segment could be addressed by keys
+    // that differ in bytes but agree in value — two spellings of one segment, which is
+    // exactly what the fixed-width index rule exists to forbid.
+    let epoch = parse_canonical_u64(epoch).ok_or_else(malformed)?;
+    if !index.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(malformed());
+    }
+    let index: u32 = index.parse().map_err(|_| malformed())?;
+    Ok((nonce, epoch, index))
+}
+
+/// A `u64` in **canonical** decimal: ASCII digits only (no sign), and no leading zero
+/// unless the value *is* `0`. `None` for every other spelling.
+fn parse_canonical_u64(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
+}
+
 /// Object metadata surfaced on the wire beyond byte size (ADR-0047): the content
 /// `etag`, the client's declared `content_type`, and the content-publication time
 /// (`modified`). Set together at **content publication** (create / overwrite) and
@@ -260,12 +1169,22 @@ pub struct ObjectMeta {
 }
 
 /// An inode: attributes, the ordered chunk map, state, and version.
+///
+/// Decoding goes through [`InodeRecordWire`] so one **cross-field** structural
+/// invariant is enforced at decode rather than admitted as a value (ADR-0045,
+/// parse-don't-validate): a **segmented** map's segment table must span exactly
+/// `size` bytes. A flat map keeps today's liberal treatment: its chunk list is the
+/// bytes, so there is no second statement to disagree with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "InodeRecordWire")]
 pub struct InodeRecord {
     /// Logical content length in bytes.
     pub size: u64,
-    /// The ordered chunks making up the content.
-    pub chunk_map: Vec<ChunkRef>,
+    /// The ordered chunks making up the content — inline (**flat**) or named by a
+    /// segment table (**segmented**, proposal 0016 decision 7). Read it through
+    /// [`ChunkMap::as_flat`] until a resolver exists (#649); never treat
+    /// [`ChunkMap::Segmented`] as an empty list.
+    pub chunk_map: ChunkMap,
     /// Commit state.
     pub state: InodeState,
     /// Monotonic per-inode version; the commit point bumps it under CAS.
@@ -299,12 +1218,102 @@ pub struct InodeRecord {
     pub modified: Option<u64>,
 }
 
+/// The wire shape of [`InodeRecord`] — identical field-for-field, so decoding is
+/// unchanged for every record ever written; it exists only to give the decode a
+/// place to enforce the size-vs-segment-table invariant before the value exists.
+#[derive(Deserialize)]
+struct InodeRecordWire {
+    size: u64,
+    chunk_map: ChunkMap,
+    state: InodeState,
+    version: u64,
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    modified: Option<u64>,
+}
+
+impl TryFrom<InodeRecordWire> for InodeRecord {
+    type Error = ChunkMapError;
+
+    fn try_from(wire: InodeRecordWire) -> std::result::Result<Self, ChunkMapError> {
+        let record = Self {
+            size: wire.size,
+            chunk_map: wire.chunk_map,
+            state: wire.state,
+            version: wire.version,
+            etag: wire.etag,
+            content_type: wire.content_type,
+            modified: wire.modified,
+        };
+        record.checked_shape()?;
+        Ok(record)
+    }
+}
+
 impl InodeRecord {
+    /// The record's **cross-field structural invariant**, in one place: a segmented
+    /// map's segment table spans exactly `size`. Both the decode (via
+    /// `TryFrom<InodeRecordWire>`) and [`InodeRecord::new_empty`]'s callers go through
+    /// the same rule, so a value this module refuses to *read* is one no committer
+    /// here can leave unreadable behind it.
+    fn checked_shape(&self) -> std::result::Result<(), ChunkMapError> {
+        if let ChunkMap::Segmented(map) = &self.chunk_map {
+            let span = map.span();
+            if span != self.size {
+                return Err(ChunkMapError::SizeSpanMismatch {
+                    size: self.size,
+                    span,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The gate **every durable inode write in this module passes** before the record
+    /// reaches a [`WriteBatch`] — the write-side mirror of the decode.
+    ///
+    /// `size` and `chunk_map` are independent public fields and `Serialize` is derived
+    /// (it must stay derived: the flat encoding is byte-identical to what is already
+    /// stored, `:277-286`), so a caller *can* hand [`create`] a record whose segment
+    /// table disagrees with `size`. Encoding that record would put bytes in the store
+    /// that this very type refuses to decode — a permanently unreadable object, which is
+    /// precisely the failure mode C-1 forbids. So the check happens where the record
+    /// becomes durable:
+    ///
+    /// 1. [`Self::checked_shape`] — never persist what cannot be read back; then
+    /// 2. the segmented shape has **no producer in this build** (#653 lands the staged
+    ///    publication committer that writes the `seg:` records first). A root published
+    ///    without them names segments that do not exist, so it is refused here rather
+    ///    than written and half-resolved later.
+    ///
+    /// Both steps report through distinct variants — [`ChunkMapError::SizeSpanMismatch`]
+    /// and [`ChunkMapError::SegmentedMapUnsupported`] — so dropping either is visible,
+    /// and #653 lifts only step 2.
+    ///
+    /// [`create`] and [`create_leased`] are the sites that take a **caller-built**
+    /// record, so they are the sites that call this. The `commit_chunk_map*` helpers
+    /// build their own `next` from a `Vec<ChunkRef>`, which is [`ChunkMap::Flat`] by
+    /// construction and has no cross-field invariant to break; what they guard instead
+    /// is the **`prior` they supersede**, which may be any stored shape.
+    fn checked_for_publication(
+        &self,
+        operation: &'static str,
+    ) -> std::result::Result<(), ChunkMapError> {
+        self.checked_shape()?;
+        if self.chunk_map.is_segmented() {
+            return Err(ChunkMapError::SegmentedMapUnsupported { operation });
+        }
+        Ok(())
+    }
+
     /// A freshly-created, empty inode at version 1, awaiting content.
     pub fn new_empty() -> Self {
         Self {
             size: 0,
-            chunk_map: Vec::new(),
+            chunk_map: ChunkMap::default(),
             state: InodeState::Pending,
             version: 1,
             etag: None,
@@ -363,6 +1372,9 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 /// Atomically create an inode and the dirent that names it. Fails with
 /// [`CommitOutcome::Conflict`] if the name (or the inode id) already exists, so a
 /// just-created file is never duplicated or clobbered.
+///
+/// Errors (before touching the store) on a record this build must not make durable —
+/// see [`InodeRecord::checked_for_publication`].
 pub async fn create(
     store: &impl MetadataStore,
     parent: InodeId,
@@ -370,6 +1382,7 @@ pub async fn create(
     id: InodeId,
     record: &InodeRecord,
 ) -> Result<CommitOutcome> {
+    record.checked_for_publication("create")?;
     let batch = WriteBatch::new()
         .require_absent(inode_key(id))
         .require_absent(dirent_key(parent, name))
@@ -404,6 +1417,7 @@ pub async fn create_leased(
     pending_chunks: &[ChunkId],
     now_millis: u64,
 ) -> Result<CommitOutcome> {
+    record.checked_for_publication("create_leased")?;
     let Some(guards) = live_lease_guards(store, pending_chunks, now_millis).await? else {
         return Ok(CommitOutcome::Conflict);
     };
@@ -516,7 +1530,13 @@ pub async fn unlink(
     // fragment on, not `index`), so GC can reclaim it after a crash before the eager
     // reclaim runs.
     if let Some(inode) = &inode {
-        for chunk in &inode.chunk_map {
+        let chunks = inode
+            .chunk_map
+            .as_flat()
+            .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                operation: "unlink",
+            })?;
+        for chunk in chunks {
             for (index, dserver) in chunk.fragments() {
                 let frag = FragmentId {
                     chunk: chunk.id,
@@ -537,6 +1557,14 @@ pub async fn unlink(
 /// version **conditional on the prior record** (full-value compare-and-set). A
 /// writer holding a stale `prior` loses with [`CommitOutcome::Conflict`];
 /// exactly one concurrent writer wins.
+///
+/// A **segmented** `prior` is refused rather than replaced: its chunks live in `seg:`
+/// records keyed by the prior generation's group, and this build has no resolver to
+/// enumerate them and no committer to retire them (#649/#653). Overwriting the root with
+/// a flat map would leave those records — and the fragments they name — referenced by
+/// nothing, which is the unreferenced-live-bytes failure C-1 forbids. The superseding
+/// commits below fail closed on the same shape through [`ChunkMap::as_flat`], since they
+/// must additionally orphan every fragment the prior map placed.
 pub async fn commit_chunk_map(
     store: &impl MetadataStore,
     id: InodeId,
@@ -544,9 +1572,15 @@ pub async fn commit_chunk_map(
     chunk_map: Vec<ChunkRef>,
     size: u64,
 ) -> Result<CommitOutcome> {
+    if prior.chunk_map.is_segmented() {
+        return Err(ChunkMapError::SegmentedMapUnsupported {
+            operation: "commit_chunk_map",
+        }
+        .into());
+    }
     let next = InodeRecord {
         size,
-        chunk_map,
+        chunk_map: chunk_map.into(),
         state: InodeState::Committed,
         version: prior.version + 1,
         // Reconstruction/backfill re-commits the SAME content, so it PRESERVES the
@@ -590,7 +1624,7 @@ pub async fn commit_chunk_map_superseding(
 ) -> Result<CommitOutcome> {
     let next = InodeRecord {
         size,
-        chunk_map,
+        chunk_map: chunk_map.into(),
         state: InodeState::Committed,
         version: prior.version + 1,
         // A content **overwrite** is a fresh publication (ADR-0047), so it stamps the new
@@ -604,7 +1638,13 @@ pub async fn commit_chunk_map_superseding(
     let mut batch = WriteBatch::new()
         .require(key.clone(), encode(prior))
         .put(key, encode(&next));
-    for chunk in &prior.chunk_map {
+    for chunk in prior
+        .chunk_map
+        .as_flat()
+        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+            operation: "commit_chunk_map_superseding",
+        })?
+    {
         for (index, dserver) in chunk.fragments() {
             let frag = FragmentId {
                 chunk: chunk.id,
@@ -634,6 +1674,13 @@ pub async fn commit_chunk_map_superseding(
 /// — never a publish, and never a stranded orphan record — and an already-absent or
 /// already-lapsed lease refuses up front with the same `Conflict`.
 /// [`commit_chunk_map_superseding`] is this with no leases to guard.
+///
+/// **Shape first, lease second.** A segmented `prior` is refused *before* the leases are
+/// read, so the caller gets [`ChunkMapError::SegmentedMapUnsupported`] at every lease
+/// state. Checking the lease first would report an unresolvable shape as
+/// [`CommitOutcome::Conflict`] whenever the lease had also lapsed — and a `Conflict` is
+/// the *retry* answer (a racing writer won; re-read and try again), so a caller obeying it
+/// would spin against a shape no retry can fix, instead of failing closed for that object.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_chunk_map_superseding_leased(
     store: &impl MetadataStore,
@@ -646,12 +1693,18 @@ pub async fn commit_chunk_map_superseding_leased(
     now_millis: u64,
     meta: &ObjectMeta,
 ) -> Result<CommitOutcome> {
+    let prior_chunks = prior
+        .chunk_map
+        .as_flat()
+        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+            operation: "commit_chunk_map_superseding_leased",
+        })?;
     let Some(guards) = live_lease_guards(store, pending_chunks, now_millis).await? else {
         return Ok(CommitOutcome::Conflict);
     };
     let next = InodeRecord {
         size,
-        chunk_map,
+        chunk_map: chunk_map.into(),
         state: InodeState::Committed,
         version: prior.version + 1,
         // A content **overwrite** is a fresh publication (ADR-0047): stamp the new object
@@ -664,7 +1717,7 @@ pub async fn commit_chunk_map_superseding_leased(
     let mut batch = WriteBatch::new()
         .require(key.clone(), encode(prior))
         .put(key, encode(&next));
-    for chunk in &prior.chunk_map {
+    for chunk in prior_chunks {
         for (index, dserver) in chunk.fragments() {
             let frag = FragmentId {
                 chunk: chunk.id,
@@ -853,7 +1906,13 @@ pub async fn high_water_marks(store: &impl MetadataStore) -> Result<(InodeId, Ch
             max_inode = max_inode.max(id);
         }
         let record: InodeRecord = decode(&value)?;
-        for chunk in &record.chunk_map {
+        let chunks = record
+            .chunk_map
+            .as_flat()
+            .ok_or(ChunkMapError::SegmentedMapUnsupported {
+                operation: "high_water_marks",
+            })?;
+        for chunk in chunks {
             if chunk.id < IN_PROCESS_CHUNK_CEILING {
                 max_chunk = max_chunk.max(chunk.id);
             }
@@ -940,6 +1999,782 @@ mod tests {
         assert_eq!(
             resolved,
             vec![(0, 10), (1, 11), (2, 2), (3, 3), (4, 4), (5, 5)]
+        );
+    }
+}
+
+/// The #648 rules `crates/core/tests/segmented_map_record.rs` cannot reach — either
+/// because they need a patch-added symbol (`parse_seg_key`, `SegmentRecord`,
+/// `MAX_SEGMENT_INDEX`, `ChunkMapError`) or because they assert **which** typed reason
+/// refused a record, which the boxed trait error only yields on downcast. That file
+/// imports nothing this patch adds, so it can stay an assertion-red on `origin/main`;
+/// these live co-located instead, where `C4-ci` runs them.
+///
+/// Covered here: the two decode invariants the brief names (a wrong-width `seg:` key
+/// index; a segment record whose chunk lengths do not sum to its declared span), the
+/// key-space bound that is also the format's segment-count maximum, the canonical-epoch
+/// key grammar, and the **write-side** guards — no record this build cannot read back or
+/// cannot publish completely may reach the store.
+#[cfg(test)]
+mod segmented_shape_invariants {
+    use super::*;
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A well-formed segmented root: two segments tiling `size` (0..5, 5..12) under one
+    /// group. The same byte string the acceptance target uses.
+    const SEGMENTED_ROOT_OK: &[u8] = br#"{"size":12,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":1},"segment_count":2,"segments":[{"index":0,"byte_offset":0,"byte_len":5},{"index":1,"byte_offset":5,"byte_len":7}]},"state":"Committed","version":1}"#;
+
+    /// A pre-0016 flat record, exactly as it is already stored.
+    const FLAT_ROOT: &[u8] = br#"{"size":3,"chunk_map":[{"id":8,"scheme":"None","len":3,"placement":[]}],"state":"Committed","version":3}"#;
+
+    /// The typed reason behind a `WriteBatch`-path failure. The trait surface boxes its
+    /// errors (`wyrd_traits::BoxError`), so a caller that must *act* on the shape —
+    /// #653's publisher, a maintenance pass — recovers the variant by downcast; asserting
+    /// on it here is what pins WHICH rule refused, not merely that something did.
+    fn chunk_map_error<T: std::fmt::Debug>(result: Result<T>) -> ChunkMapError {
+        let err = result.expect_err("the call must fail closed");
+        *err.downcast::<ChunkMapError>()
+            .expect("a refused chunk-map shape surfaces as a typed ChunkMapError")
+    }
+
+    /// A **real** metadata backend (redb, in-memory mode), not a fake: these tests assert
+    /// that a refused record never reaches a store, which only means something against an
+    /// implementation that would otherwise have kept it.
+    fn store() -> wyrd_metadata_redb::RedbMetadataStore {
+        wyrd_metadata_redb::RedbMetadataStore::in_memory().expect("in-memory redb store")
+    }
+
+    #[test]
+    fn wrong_width_segment_index_key_is_malformed() {
+        let group = SegmentGroup::new(NONCE, 1).unwrap();
+        // A well-formed key zero-pads the index to SEG_INDEX_WIDTH (6) digits.
+        assert!(parse_seg_key(&seg_key(&group, 7).unwrap()).is_ok());
+        // One digit short: "seg:<nonce>:1:00007" (5 digits) instead of "000007".
+        let wrong_width = format!("seg:{NONCE}:1:00007");
+        assert_eq!(
+            parse_seg_key(wrong_width.as_bytes()),
+            Err(ChunkMapError::SegmentKeyMalformed {
+                key: wrong_width.clone()
+            })
+        );
+    }
+
+    #[test]
+    fn segment_record_chunk_lengths_not_summing_to_byte_len_is_err() {
+        // Two chunks totalling 8 bytes, but the record declares byte_len 9 — checked,
+        // not summed, so this can never be masked by a wrapped total.
+        let bytes = br#"{"chunks":[{"id":1,"scheme":"None","len":5,"placement":[]},{"id":1,"scheme":"None","len":3,"placement":[]}],"byte_offset":0,"byte_len":9}"#;
+        let record: std::result::Result<SegmentRecord, _> = decode(bytes);
+        assert!(
+            record.is_err(),
+            "a segment record whose chunk lengths do not sum to byte_len must be Err"
+        );
+        // The same rule, typed: the decode routes through `from_wire`, which reports
+        // WHICH totals disagreed rather than a bare parse failure.
+        let chunks = vec![
+            ChunkRef {
+                id: 1,
+                scheme: EcScheme::None,
+                len: 5,
+                placement: vec![],
+            },
+            ChunkRef {
+                id: 1,
+                scheme: EcScheme::None,
+                len: 3,
+                placement: vec![],
+            },
+        ];
+        assert_eq!(
+            SegmentRecord::from_wire(chunks, 0, 9),
+            Err(ChunkMapError::SegmentLengthMismatch {
+                declared: 9,
+                chunks: 8
+            })
+        );
+    }
+
+    #[test]
+    fn segment_key_round_trips_over_the_whole_addressable_index_space() {
+        // A multi-digit epoch on purpose: the epoch is parsed as CANONICAL decimal, and a
+        // rule that rejected every multi-digit spelling would still pass a `1`-epoch test.
+        let group = SegmentGroup::new(NONCE, 42).unwrap();
+        let nonce = SegmentNonce::new(NONCE).unwrap();
+        assert_eq!(group.nonce(), &nonce);
+        assert_eq!(group.nonce().as_str(), NONCE);
+        assert_eq!(group.epoch(), 42);
+        for index in [0, 7, MAX_SEGMENT_INDEX] {
+            let key = seg_key(&group, index).expect("an addressable index has a key");
+            assert_eq!(
+                parse_seg_key(&key),
+                Ok((nonce.clone(), 42, index)),
+                "seg_key -> parse_seg_key must be the identity on every addressable index"
+            );
+            assert!(
+                key.starts_with(&seg_range_prefix(&group)),
+                "every segment key lies inside its group+epoch range prefix"
+            );
+        }
+        // Byte-lexicographic order equals index order — the reason the index is padded.
+        assert!(seg_key(&group, 9).unwrap() < seg_key(&group, 10).unwrap());
+        assert_eq!(
+            seg_range_prefix(&group),
+            format!("seg:{NONCE}:42:").into_bytes()
+        );
+        assert_eq!(
+            seg_group_prefix(&nonce),
+            format!("seg:{NONCE}:").into_bytes()
+        );
+        assert_eq!(seggrp_key(&nonce), format!("seggrp:{NONCE}").into_bytes());
+    }
+
+    #[test]
+    fn a_group_prefix_can_never_alias_another_generations_epoch_range() {
+        // The failure this closes: a `seg:` range is what a cleanup pass DELETES, so a
+        // prefix minted from an unvalidated string is a delete aimed at someone else's
+        // records. `seg_group_prefix("<nonce>:<epoch>")` would render
+        // `seg:<nonce>:<epoch>:` — byte-for-byte the live epoch range of that group —
+        // and a sweep of "every epoch of this group" would take a live generation's
+        // segments, and every fragment they name, with it (C-1).
+        let nonce = SegmentNonce::new(NONCE).unwrap();
+        // 1. The aliasing spelling is not a nonce at all, so it cannot reach a helper.
+        let aliasing = format!("{NONCE}:7");
+        assert_eq!(
+            SegmentNonce::new(aliasing.clone()),
+            Err(ChunkMapError::NonceNotHex {
+                nonce: aliasing.clone()
+            }),
+            "a nonce carrying the key grammar's separator must be refused, not rendered \
+             into someone else's range"
+        );
+        assert_eq!(
+            SegmentGroup::new(aliasing.clone(), 1),
+            Err(ChunkMapError::NonceNotHex { nonce: aliasing }),
+            "the group constructor enforces the same single rule"
+        );
+        // Every other spelling that could widen or shift a range: short, long, uppercase
+        // (a second spelling of the same 128 bits), non-hex, empty, and a truncation that
+        // is a strict PREFIX of a live nonce.
+        for bad in [
+            "",
+            "0123456789abcdef0123456789abcde",   // 31 — one short
+            "0123456789abcdef0123456789abcdef0", // 33 — one long
+            "0123456789ABCDEF0123456789abcdef",  // uppercase
+            "0123456789abcdef0123456789abcdeg",  // non-hex digit
+            "0123456789abcdef0123456789abcd:f",  // separator smuggled mid-nonce
+        ] {
+            assert!(
+                SegmentNonce::new(bad).is_err(),
+                "{bad:?} must not be usable as a nonce"
+            );
+        }
+        // 2. A prefix built from a VALIDATED nonce addresses that group and nothing else.
+        // Fixed width plus a hex-only alphabet is what makes this true: no valid nonce is
+        // a prefix of another, so no group prefix can reach another group's keys.
+        let other = SegmentNonce::new("fedcba9876543210fedcba9876543210").unwrap();
+        let group_prefix = seg_group_prefix(&nonce);
+        assert_eq!(
+            group_prefix.iter().filter(|b| **b == b':').count(),
+            2,
+            "a group prefix names a group, never a generation: `seg:<nonce>:`"
+        );
+        for epoch in [0, 7, u64::MAX] {
+            let mine = SegmentGroup::new(NONCE, epoch).unwrap();
+            let theirs = SegmentGroup::new(other.as_str(), epoch).unwrap();
+            assert_eq!(
+                seg_range_prefix(&mine)
+                    .iter()
+                    .filter(|b| **b == b':')
+                    .count(),
+                3,
+                "an epoch range names one generation: `seg:<nonce>:<epoch>:`"
+            );
+            assert_ne!(
+                group_prefix,
+                seg_range_prefix(&mine),
+                "a group prefix must never equal an epoch range prefix"
+            );
+            assert!(
+                seg_key(&mine, 0).unwrap().starts_with(&group_prefix),
+                "every epoch of MY group lies under my group prefix"
+            );
+            assert!(
+                !seg_key(&theirs, 0).unwrap().starts_with(&group_prefix),
+                "no other group's segment key may lie under my group prefix"
+            );
+            assert!(
+                !seg_key(&mine, 0)
+                    .unwrap()
+                    .starts_with(&seg_group_prefix(&other)),
+                "and mine must not lie under theirs"
+            );
+        }
+        assert_ne!(seggrp_key(&nonce), seggrp_key(&other));
+    }
+
+    #[test]
+    fn a_segment_index_past_the_key_space_is_neither_a_key_nor_a_value() {
+        let group = SegmentGroup::new(NONCE, 1).unwrap();
+        let past = MAX_SEGMENT_INDEX + 1;
+        // It has no key: rendering it would produce SEG_INDEX_WIDTH + 1 digits, which
+        // `parse_seg_key` rejects — a key that writes but never reads back.
+        assert_eq!(
+            seg_key(&group, past),
+            Err(ChunkMapError::SegmentIndexUnaddressable {
+                index: past,
+                max: MAX_SEGMENT_INDEX
+            })
+        );
+        // And it is no value either: a root naming it is refused at decode rather than
+        // becoming a map whose tail nothing could ever resolve. This is equally the
+        // format's segment-COUNT maximum — indices are exactly `0..segment_count`.
+        assert_eq!(
+            SegmentedMap::new(
+                SegmentGroup::new(NONCE, 1).unwrap(),
+                vec![SegmentRef {
+                    index: past,
+                    byte_offset: 0,
+                    byte_len: 5,
+                }],
+            ),
+            Err(ChunkMapError::SegmentIndexUnaddressable {
+                index: past,
+                max: MAX_SEGMENT_INDEX
+            })
+        );
+        let root = format!(
+            r#"{{"size":5,"chunk_map":{{"group":{{"nonce":"{NONCE}","epoch":1}},"segment_count":1,"segments":[{{"index":{past},"byte_offset":0,"byte_len":5}}]}},"state":"Committed","version":1}}"#
+        );
+        assert!(
+            decode::<InodeRecord>(root.as_bytes()).is_err(),
+            "a root whose segment index has no `seg:` key must not decode"
+        );
+        // The last addressable index is NOT rejected — the bound is the key space, not
+        // one short of it.
+        assert!(seg_key(&group, MAX_SEGMENT_INDEX).is_ok());
+    }
+
+    #[test]
+    fn only_canonical_epoch_spellings_address_a_segment() {
+        // `u64::from_str` would accept `+7` and `007`; either would give one segment two
+        // keys that differ in bytes but agree in value.
+        for epoch in ["007", "+7", "", "7 ", "0x7"] {
+            let key = format!("seg:{NONCE}:{epoch}:000007");
+            assert_eq!(
+                parse_seg_key(key.as_bytes()),
+                Err(ChunkMapError::SegmentKeyMalformed { key: key.clone() }),
+                "a non-canonical epoch spelling must not resolve to a segment"
+            );
+        }
+        // `0` itself is canonical, and so is any multi-digit epoch.
+        for (epoch, value) in [("0", 0u64), ("42", 42), ("18446744073709551615", u64::MAX)] {
+            let key = format!("seg:{NONCE}:{epoch}:000007");
+            assert_eq!(
+                parse_seg_key(key.as_bytes()),
+                Ok((SegmentNonce::new(NONCE).unwrap(), value, 7))
+            );
+        }
+    }
+
+    #[test]
+    fn a_decoded_segment_record_reports_the_span_its_chunks_cover() {
+        let bytes = br#"{"chunks":[{"id":1,"scheme":"None","len":5,"placement":[]},{"id":2,"scheme":"None","len":3,"placement":[]}],"byte_offset":11,"byte_len":8}"#;
+        let record: SegmentRecord = decode(bytes).expect("a well-formed segment record decodes");
+        assert_eq!(record.byte_offset(), 11);
+        assert_eq!(record.byte_len(), 8);
+        assert_eq!(record.chunks().len(), 2);
+        assert_eq!(record.chunks()[1].id, 2);
+        // Re-encoding is the identity, so a `require(key, encode(prior))` CAS over a
+        // segment record matches the bytes the store holds.
+        assert_eq!(encode(&record).as_ref(), &bytes[..]);
+        // The same list, consumed — what a resolver splices into the object's map.
+        assert_eq!(record.clone().into_chunks(), record.chunks().to_vec());
+        // `new` derives byte_len from the chunks themselves, agreeing with the decode.
+        assert_eq!(SegmentRecord::new(record.chunks().to_vec(), 11), Ok(record));
+    }
+
+    #[test]
+    fn a_segment_record_covering_no_bytes_is_err() {
+        // Chunks present, but they cover nothing: a segment that can hold no byte of the
+        // object is corruption, not an empty-but-valid record.
+        let bytes = br#"{"chunks":[{"id":1,"scheme":"None","len":0,"placement":[]}],"byte_offset":0,"byte_len":0}"#;
+        assert!(
+            decode::<SegmentRecord>(bytes).is_err(),
+            "a segment record covering no bytes must be Err"
+        );
+        assert_eq!(
+            SegmentRecord::new(
+                vec![ChunkRef {
+                    id: 1,
+                    scheme: EcScheme::None,
+                    len: 0,
+                    placement: vec![],
+                }],
+                0,
+            ),
+            Err(ChunkMapError::EmptySegmentRecord {
+                byte_offset: 0,
+                chunks: 1
+            })
+        );
+        // And so is one carrying no chunks at all.
+        assert_eq!(
+            SegmentRecord::new(vec![], 4),
+            Err(ChunkMapError::EmptySegmentRecord {
+                byte_offset: 4,
+                chunks: 0
+            })
+        );
+    }
+
+    /// A `ChunkRef` of `len` bytes — the shape the overflow arithmetic below reads.
+    fn chunk_of_len(id: ChunkId, len: u64) -> ChunkRef {
+        ChunkRef {
+            id,
+            scheme: EcScheme::None,
+            len,
+            placement: vec![],
+        }
+    }
+
+    #[test]
+    fn every_span_arithmetic_that_leaves_u64_is_refused_not_wrapped() {
+        // WHY these three cases exist at all: each of the sums below is `checked_add`,
+        // and the alternative is not a panic — an unchecked sum WRAPS in a release build
+        // to a small total that the very next equality check would then confirm. A record
+        // whose chunk lengths wrap to its declared `byte_len`, or a table whose tiling
+        // wraps back to `size`, would decode as a VALUE: a map that under-reports the
+        // bytes its object owns, which is how a live object's fragments go unreferenced
+        // (C-1). Each path is exercised at the boundary it guards.
+
+        // 1. The ROOT's tiling: segment 0 covers the whole u64 space, so segment 1 —
+        //    contiguous, non-empty, correctly indexed, i.e. past every earlier check —
+        //    pushes the running offset over the end.
+        assert_eq!(
+            SegmentedMap::new(
+                SegmentGroup::new(NONCE, 1).unwrap(),
+                vec![
+                    SegmentRef {
+                        index: 0,
+                        byte_offset: 0,
+                        byte_len: u64::MAX,
+                    },
+                    SegmentRef {
+                        index: 1,
+                        byte_offset: u64::MAX,
+                        byte_len: 1,
+                    },
+                ],
+            ),
+            Err(ChunkMapError::SegmentSpanOverflow { index: 1 })
+        );
+        // The same table as stored bytes, under the FORGED `size` a wrapping (or
+        // saturating) implementation would confirm: an inode carrying it does not decode
+        // either.
+        let root = format!(
+            r#"{{"size":{max},"chunk_map":{{"group":{{"nonce":"{NONCE}","epoch":1}},"segment_count":2,"segments":[{{"index":0,"byte_offset":0,"byte_len":{max}}},{{"index":1,"byte_offset":{max},"byte_len":1}}]}},"state":"Committed","version":1}}"#,
+            max = u64::MAX,
+        );
+        assert!(
+            decode::<InodeRecord>(root.as_bytes()).is_err(),
+            "a root whose tiling leaves u64 must not decode — a wrapped span would agree \
+             with a forged `size`"
+        );
+        // The last table that DOES fit is admitted: the bound is the end of the space,
+        // not one short of it.
+        assert!(SegmentedMap::new(
+            SegmentGroup::new(NONCE, 1).unwrap(),
+            vec![
+                SegmentRef {
+                    index: 0,
+                    byte_offset: 0,
+                    byte_len: u64::MAX - 1,
+                },
+                SegmentRef {
+                    index: 1,
+                    byte_offset: u64::MAX - 1,
+                    byte_len: 1,
+                },
+            ],
+        )
+        .is_ok());
+
+        // 2. The RECORD's own extent: its chunks total 2 bytes and it starts one byte
+        //    below the end, so the last byte it claims has no offset.
+        let offset = u64::MAX - 1;
+        assert_eq!(
+            SegmentRecord::new(vec![chunk_of_len(1, 2)], offset),
+            Err(ChunkMapError::SegmentSpanUnrepresentable {
+                byte_offset: offset,
+                byte_len: 2
+            })
+        );
+        let bytes = format!(
+            r#"{{"chunks":[{{"id":1,"scheme":"None","len":2,"placement":[]}}],"byte_offset":{offset},"byte_len":2}}"#
+        );
+        assert!(
+            decode::<SegmentRecord>(bytes.as_bytes()).is_err(),
+            "a stored segment record whose extent ends past u64 must not decode"
+        );
+        // One byte earlier the extent is representable, so this is the boundary and not a
+        // blanket refusal of large offsets.
+        assert!(SegmentRecord::new(vec![chunk_of_len(1, 2)], offset - 1).is_ok());
+
+        // 3. The RECORD's chunk lengths: two chunks that leave u64 when summed. Wrapped,
+        //    they would total 0 — which `byte_len: 0` would then "confirm".
+        let overflowing = vec![chunk_of_len(1, u64::MAX), chunk_of_len(2, 1)];
+        assert_eq!(
+            SegmentRecord::new(overflowing.clone(), 0),
+            Err(ChunkMapError::SegmentLengthOverflow { chunks: 2 })
+        );
+        assert_eq!(
+            SegmentRecord::from_wire(overflowing, 0, 0),
+            Err(ChunkMapError::SegmentLengthOverflow { chunks: 2 }),
+            "the decode path must reject the sum BEFORE comparing it with the declared \
+             byte_len — a wrapped total of 0 would match this record's own claim"
+        );
+        let bytes = format!(
+            r#"{{"chunks":[{{"id":1,"scheme":"None","len":{max},"placement":[]}},{{"id":2,"scheme":"None","len":1,"placement":[]}}],"byte_offset":0,"byte_len":0}}"#,
+            max = u64::MAX,
+        );
+        assert!(
+            decode::<SegmentRecord>(bytes.as_bytes()).is_err(),
+            "a stored segment record whose chunk lengths leave u64 must not decode"
+        );
+        // And the largest total that fits is still a record.
+        assert!(SegmentRecord::new(vec![chunk_of_len(1, u64::MAX)], 0).is_ok());
+    }
+
+    #[test]
+    fn a_decoded_root_exposes_which_shape_it_is() {
+        let segmented: InodeRecord =
+            decode(SEGMENTED_ROOT_OK).expect("a well-formed segmented root decodes");
+        assert!(segmented.chunk_map.is_segmented());
+        assert!(
+            segmented.chunk_map.as_flat().is_none(),
+            "a segmented map must never answer `as_flat` — that answer is \
+             indistinguishable from an object owning no chunks"
+        );
+        let map = segmented
+            .chunk_map
+            .segmented()
+            .expect("the segmented map is reachable");
+        assert_eq!(map.group().nonce().as_str(), NONCE);
+        assert_eq!(map.group().epoch(), 1);
+        assert_eq!(map.segment_count(), 2);
+        assert_eq!(map.segments().len(), 2);
+        assert_eq!(map.segments()[1].byte_offset, 5);
+        assert_eq!(map.span(), segmented.size);
+
+        let flat: InodeRecord = decode(FLAT_ROOT).expect("a legacy flat root decodes");
+        assert!(!flat.chunk_map.is_segmented());
+        assert!(flat.chunk_map.segmented().is_none());
+        assert_eq!(flat.chunk_map.as_flat().map(<[ChunkRef]>::len), Some(1));
+    }
+
+    #[test]
+    fn create_refuses_a_record_it_could_not_read_back() {
+        // The failure this closes: `size` and `chunk_map` are independent public fields,
+        // so a caller CAN present a segmented record whose table disagrees with `size` —
+        // and `encode` would write bytes that this very type then refuses to decode. An
+        // object nothing can read is the permanent, data-losing failure mode C-1 forbids,
+        // so the record is refused BEFORE it reaches the store.
+        let store = store();
+        let mut record: InodeRecord = decode(SEGMENTED_ROOT_OK).unwrap();
+        record.size = 99;
+        assert_eq!(
+            chunk_map_error(pollster::block_on(create(&store, 1, "obj", 2, &record))),
+            ChunkMapError::SizeSpanMismatch { size: 99, span: 12 }
+        );
+        assert!(
+            pollster::block_on(store.get(&inode_key(2)))
+                .unwrap()
+                .is_none(),
+            "the refused record must not have reached the store"
+        );
+    }
+
+    #[test]
+    fn create_refuses_a_segmented_record_this_build_cannot_publish() {
+        // Well-formed, and still refused: the segments live in `seg:` records only #653's
+        // staged-publication committer writes. Publishing the root alone would name
+        // segments that do not exist — a map every reader must fail closed on.
+        let store = store();
+        let record: InodeRecord = decode(SEGMENTED_ROOT_OK).unwrap();
+        assert_eq!(
+            chunk_map_error(pollster::block_on(create(&store, 1, "obj", 2, &record))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "create"
+            }
+        );
+        assert_eq!(
+            chunk_map_error(pollster::block_on(create_leased(
+                &store,
+                1,
+                "obj",
+                2,
+                &record,
+                &[],
+                0
+            ))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "create_leased"
+            }
+        );
+        assert!(
+            pollster::block_on(store.get(&inode_key(2)))
+                .unwrap()
+                .is_none(),
+            "the refused record must not have reached the store"
+        );
+        // A flat record travels the same path unchanged.
+        let flat: InodeRecord = decode(FLAT_ROOT).unwrap();
+        assert_eq!(
+            pollster::block_on(create(&store, 1, "flat", 3, &flat)).unwrap(),
+            CommitOutcome::Committed
+        );
+    }
+
+    #[test]
+    fn every_chunk_map_commit_refuses_a_segmented_prior_instead_of_stranding_its_segments() {
+        // Replacing a segmented root with a flat map would leave that generation's `seg:`
+        // records — and every fragment they name — referenced by nothing, with no
+        // resolver (#649) to enumerate them and no committer (#653) to retire them.
+        // `commit_chunk_map_superseding` is the same refusal one step worse: it also
+        // *orphans* the prior map's fragments in the same commit, so proceeding would
+        // publish the overwrite while deadlining nothing — the prior generation's bytes
+        // would survive with no chunk map naming them and no grace record to reclaim
+        // them, leaked for good.
+        let store = store();
+        let prior: InodeRecord = decode(SEGMENTED_ROOT_OK).unwrap();
+        let key = inode_key(2);
+        pollster::block_on(store.commit(WriteBatch::new().put(key.clone(), SEGMENTED_ROOT_OK)))
+            .unwrap();
+        let next_map = || {
+            vec![ChunkRef {
+                id: 9,
+                scheme: EcScheme::None,
+                len: 12,
+                placement: vec![],
+            }]
+        };
+        assert_eq!(
+            chunk_map_error(pollster::block_on(commit_chunk_map(
+                &store,
+                2,
+                &prior,
+                next_map(),
+                12
+            ))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "commit_chunk_map"
+            }
+        );
+        assert_eq!(
+            chunk_map_error(pollster::block_on(commit_chunk_map_superseding(
+                &store,
+                2,
+                &prior,
+                next_map(),
+                12,
+                7,
+                &ObjectMeta::default(),
+            ))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "commit_chunk_map_superseding"
+            }
+        );
+        assert_eq!(
+            pollster::block_on(store.get(&key)).unwrap().as_deref(),
+            Some(SEGMENTED_ROOT_OK),
+            "the stored root must be exactly as it was"
+        );
+        assert!(
+            pollster::block_on(store.scan(ORPHAN_PREFIX))
+                .unwrap()
+                .is_empty(),
+            "an overwrite that did not commit may not deadline a fragment for reclamation"
+        );
+    }
+
+    #[test]
+    fn a_segmented_prior_outranks_the_lease_state_it_is_committed_under() {
+        // ORDER, not merely outcome. `commit_chunk_map_superseding_leased` reads the
+        // pending leases and answers `Ok(Conflict)` when one is absent or lapsed. Were
+        // that read to happen BEFORE the prior's shape is judged, a segmented prior
+        // committed under a swept lease would come back as `Conflict` — the RETRY answer
+        // ("a racing writer won; re-read and try again") — for a shape no retry can
+        // resolve. The caller would spin, and the shape it must fail closed on would
+        // never surface. So the shape is judged first and the typed error is the answer
+        // at EVERY lease state.
+        let store = store();
+        let prior: InodeRecord = decode(SEGMENTED_ROOT_OK).unwrap();
+        let key = inode_key(2);
+        pollster::block_on(store.commit(WriteBatch::new().put(key.clone(), SEGMENTED_ROOT_OK)))
+            .unwrap();
+        let chunk: ChunkId = 9;
+        let now = 10;
+        // `None` — no `pending:` entry at all (a sweep already reaped it); `Some(10)` —
+        // present but lapsed at exactly the sweep's reap boundary (`expiry <= now`);
+        // `Some(11)` — live. The first two are the states that short-circuit to
+        // `Conflict`.
+        for lease_expiry_millis in [None, Some(now), Some(now + 1)] {
+            match lease_expiry_millis {
+                Some(lease_expiry_millis) => pollster::block_on(put_pending(
+                    &store,
+                    chunk,
+                    &PendingEntry {
+                        lease_expiry_millis,
+                    },
+                )),
+                None => pollster::block_on(sweep_pending(&store, &[chunk])),
+            }
+            .unwrap();
+            let next_map = vec![ChunkRef {
+                id: chunk,
+                scheme: EcScheme::None,
+                len: 12,
+                placement: vec![],
+            }];
+            assert_eq!(
+                chunk_map_error(pollster::block_on(commit_chunk_map_superseding_leased(
+                    &store,
+                    2,
+                    &prior,
+                    next_map,
+                    12,
+                    0,
+                    &[chunk],
+                    now,
+                    &ObjectMeta::default(),
+                ))),
+                ChunkMapError::SegmentedMapUnsupported {
+                    operation: "commit_chunk_map_superseding_leased"
+                },
+                "a segmented prior must be a typed refusal, never the retriable `Conflict` \
+                 an absent or lapsed lease answers with (lease expiry {lease_expiry_millis:?})"
+            );
+        }
+        assert_eq!(
+            pollster::block_on(store.get(&key)).unwrap().as_deref(),
+            Some(SEGMENTED_ROOT_OK),
+            "the stored root must be exactly as it was"
+        );
+    }
+
+    #[test]
+    fn unlink_refuses_a_segmented_inode_rather_than_unbind_fragments_it_cannot_orphan() {
+        // The DESTRUCTIVE metadata path, and the one where "read a shape you cannot
+        // resolve as an empty chunk list" is unrecoverable. `unlink` deletes the dirent
+        // AND the inode, and in the SAME commit writes one orphan grace record per
+        // fragment the removed map placed (`unlink`, above) — the deadline the custodian
+        // GC reclaims from, and the ledger `high_water_marks` re-mints past. A map's chunks
+        // live in `seg:` records nothing in this build can enumerate (#649), so an unlink
+        // that proceeded would unbind the object while orphaning NOTHING: every fragment
+        // it owns would end up referenced by no chunk map and deadlined by no grace
+        // record, which is exactly the unreferenced-but-undeadlined state GC keeps
+        // forever. Permanently leaked bytes that no record names — the failure mode C-1
+        // forbids. So the shape is judged BEFORE the commit and the binding survives.
+        let store = store();
+        let key = inode_key(2);
+        let name = dirent_key(1, "obj");
+        let dirent = encode(&DirentRecord { inode: 2 });
+        pollster::block_on(
+            store.commit(
+                WriteBatch::new()
+                    .put(key.clone(), SEGMENTED_ROOT_OK)
+                    .put(name.clone(), dirent.clone()),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            chunk_map_error(pollster::block_on(unlink(&store, 1, "obj", 7))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "unlink"
+            }
+        );
+        assert_eq!(
+            pollster::block_on(store.get(&key)).unwrap().as_deref(),
+            Some(SEGMENTED_ROOT_OK),
+            "the inode must survive a delete that could not orphan the fragments it owns"
+        );
+        assert_eq!(
+            pollster::block_on(store.get(&name)).unwrap(),
+            Some(dirent),
+            "the name must still bind: the delete is atomic, so it did not happen at all"
+        );
+        assert!(
+            pollster::block_on(store.scan(ORPHAN_PREFIX))
+                .unwrap()
+                .is_empty(),
+            "no fragment may be deadlined for reclamation by a delete that did not commit"
+        );
+
+        // A flat sibling travels the identical path unchanged — unbound, removed, and its
+        // one placed fragment deadlined at the caller's logical instant. Without this leg
+        // the assertions above would hold just as well for a guard that refused EVERY
+        // unlink, which would be its own permanent failure (no object could be deleted).
+        let flat: InodeRecord = decode(FLAT_ROOT).unwrap();
+        assert_eq!(
+            pollster::block_on(create(&store, 1, "flat", 3, &flat)).unwrap(),
+            CommitOutcome::Committed
+        );
+        let unlinked = pollster::block_on(unlink(&store, 1, "flat", 7))
+            .unwrap()
+            .expect("the bound name resolves to a record");
+        assert_eq!(unlinked.outcome, CommitOutcome::Committed);
+        assert!(
+            pollster::block_on(store.get(&inode_key(3)))
+                .unwrap()
+                .is_none(),
+            "the flat inode is removed"
+        );
+        assert!(
+            pollster::block_on(store.get(&dirent_key(1, "flat")))
+                .unwrap()
+                .is_none(),
+            "and its name is unbound — the pair the refused unlink above left intact"
+        );
+        assert_eq!(
+            pollster::block_on(store.get(&orphan_key(0, FragmentId { chunk: 8, index: 0 })))
+                .unwrap()
+                .as_deref(),
+            Some(b"7".as_slice()),
+            "the flat map's fragment is deadlined at the unlink's logical instant"
+        );
+    }
+
+    #[test]
+    fn high_water_marks_refuses_a_segmented_root_rather_than_re_mint_its_chunk_ids() {
+        // `Gateway::recover` resumes the in-process chunk-id counter from this scan, so
+        // that a restart never re-mints an id whose fragments are still on disk (issue
+        // #364 durability finding 1). A segmented root read as "owns no chunks" would
+        // contribute nothing to `max_chunk`, so the next PUT could mint an id that
+        // object's fragments already occupy and overwrite them on the shared chunk store
+        // — a live object's bytes lost with no error raised anywhere. The scan therefore
+        // fails closed: recovery stops rather than hand out an id it cannot prove is free.
+        let segmented_store = store();
+        pollster::block_on(
+            segmented_store.commit(WriteBatch::new().put(inode_key(2), SEGMENTED_ROOT_OK)),
+        )
+        .unwrap();
+        assert_eq!(
+            chunk_map_error(pollster::block_on(high_water_marks(&segmented_store))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "high_water_marks"
+            }
+        );
+        // The same scan over the same key WITHOUT the unreadable shape still reports the
+        // marks, so the refusal above is the segmented root's and not the scan's.
+        let flat_store = store();
+        pollster::block_on(flat_store.commit(WriteBatch::new().put(inode_key(2), FLAT_ROOT)))
+            .unwrap();
+        assert_eq!(
+            pollster::block_on(high_water_marks(&flat_store)).unwrap(),
+            (2, 8),
+            "the flat record's inode and chunk ids are the marks"
         );
     }
 }

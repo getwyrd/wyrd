@@ -131,7 +131,7 @@ async fn rs_write_fans_out_to_distinct_d_servers_and_commits() {
     assert_eq!(outcome, CommitOutcome::Committed, "the commit is atomic");
 
     let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
-    let chunk_id = inode.chunk_map[0].id;
+    let chunk_id = inode.chunk_map.as_flat().unwrap()[0].id;
 
     // Each of the 9 fragments landed on its own distinct D server: a direct client
     // to endpoint i holds index i and nothing else.

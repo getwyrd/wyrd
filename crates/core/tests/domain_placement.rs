@@ -216,8 +216,9 @@ fn write_records_distinct_domain_placement_not_identity() {
         assert_eq!(outcome, CommitOutcome::Committed);
 
         let inode = read::read_inode(&meta, 1).await.unwrap().unwrap();
-        assert_eq!(inode.chunk_map.len(), 1, "single-chunk object");
-        let placement = &inode.chunk_map[0].placement;
+        let chunk_map = inode.chunk_map.as_flat().unwrap();
+        assert_eq!(chunk_map.len(), 1, "single-chunk object");
+        let placement = &chunk_map[0].placement;
         assert_eq!(placement.len(), N as usize, "one D-server id per fragment");
 
         // (1) The committed placement is NOT the identity `index % n` vector — the
