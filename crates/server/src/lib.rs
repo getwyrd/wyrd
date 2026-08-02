@@ -359,13 +359,15 @@ where
         let this = Arc::clone(&self);
         // A segmented map has no resolver yet (#649-#651): fail closed rather than
         // stream no chunks for a live object.
+        // `into_flat`, not `as_flat().to_vec()`: the inode is owned, so the chunk list
+        // (and every placement vector in it) moves into the reader task instead of being
+        // deep-cloned on the primary read path.
         let chunk_map = inode
             .chunk_map
-            .as_flat()
+            .into_flat()
             .ok_or(ChunkMapError::SegmentedMapUnsupported {
                 operation: "Gateway::get_object_streaming",
-            })?
-            .to_vec();
+            })?;
         // The reader task is spawned LAZILY — on the stream's first poll, not here — so a
         // caller that resolves the object and then never reads the body (the wire layer's
         // 304/412 conditional short-circuit drops the stream unread, issue #510 review) costs

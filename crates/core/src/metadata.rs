@@ -832,6 +832,17 @@ impl ChunkMap {
         }
     }
 
+    /// The inline chunk list **by value**, or `None` when the map is segmented — the
+    /// owning counterpart of [`Self::as_flat`] for a consumer that holds the map (a
+    /// streamed read moving the list into its reader task) and would otherwise deep-clone
+    /// every placement vector just to get an owned copy.
+    pub fn into_flat(self) -> Option<Vec<ChunkRef>> {
+        match self {
+            Self::Flat(chunks) => Some(chunks),
+            Self::Segmented(_) => None,
+        }
+    }
+
     /// The segment table, or `None` when the map is flat.
     pub fn segmented(&self) -> Option<&SegmentedMap> {
         match self {
