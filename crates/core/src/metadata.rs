@@ -2030,86 +2030,166 @@ fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
         .ok()
 }
 
-/// Parse the chunk id out of a `pending:<id>` key (the inverse of [`pending_key`]).
-fn parse_pending_chunk_key(key: &[u8]) -> Option<ChunkId> {
-    std::str::from_utf8(key)
-        .ok()?
-        .strip_prefix("pending:")?
-        .parse()
-        .ok()
+/// The `action` of an [`attribute_unaccounted_inode_row`] event for a row whose **value**
+/// does not decode into an [`InodeRecord`] at all.
+const UNDECODABLE_INODE_RECORD: &str = "undecodable-inode-record";
+/// The `action` for a row whose value decodes into a **segmented** root — a shape this walk
+/// has no resolver for, so it can account for the record's id but for nothing inside it
+/// (the [`ChunkMapError::SegmentedMapUnsupported`] this walk used to *refuse* over).
+///
+/// It has none *and needs none*: with the chunk mark gone this walk derives nothing from any
+/// record's map, so reaching for [`resolve_chunk_map`] here would spend a store round trip
+/// per segmented record at startup to produce a value nobody reads — the exact shape issue
+/// #652 removes. The record is named instead, which is what the walk owes it.
+const UNRESOLVED_SEGMENTED_ROOT: &str = "unresolved-segmented-inode-root";
+/// The `action` for a row under the `inode:` prefix whose **key** is not an `inode:<id>`
+/// key, so it names no id [`high_water_marks`] could recover.
+const UNPARSABLE_INODE_KEY: &str = "unparsable-inode-key";
+
+/// Attribute a row of the `inode:` namespace that startup recovery could not fully account
+/// for, on the durability plane's audit seam (ADR-0011/ADR-0012): a counter the
+/// `tracing`→OTel bridge aggregates plus an event naming the offending key. Same split
+/// between metric event and audit event as the read path's fault reporter
+/// (`crates/core/src/read.rs:212-240`).
+///
+/// This is the other half of containment. [`high_water_marks`] does not stop on such a row —
+/// stopping costs every *healthy* object its availability — but "does not stop" must never
+/// mean "silently skipped": the row is named, so an operator holds an explicit repair
+/// obligation (`docs/principles.md` §5 C-1; the same shape the custodian's GC walk gives the
+/// same namespace through `ReferenceSet::unresolvable`, `crates/custodian/src/gc.rs:378-382`).
+///
+/// Emitted **at most once per row**, and deliberately: records are repaired one at a time, so
+/// a summary count would say a store is damaged without saying which key to look at, while a
+/// row named twice would inflate the counter beside it and hand an operator two repair
+/// obligations for one stored row. [`high_water_marks`] therefore stops at a row's *first*
+/// unaccountable fact — a key that names no id makes its value moot, since nothing in that
+/// value could raise the mark. The counter beside the event is the aggregate view, and it
+/// counts **rows**.
+///
+/// The key is rendered with [`slice::escape_ascii`], never `String::from_utf8_lossy`: lossy
+/// rendering collapses every invalid byte to one replacement character, so two distinct
+/// damaged keys can print identically — and a repair obligation an operator cannot resolve
+/// to a single row is not one. Escaping is injective, so the event names exactly one row.
+fn attribute_unaccounted_inode_row(action: &str, key: &[u8], detail: impl std::fmt::Display) {
+    tracing::warn!(
+        monotonic_counter.recovery_unaccounted_inode_row = 1_u64,
+        action
+    );
+    tracing::warn!(
+        target: "wyrd.metadata.recovery.audit",
+        action,
+        key = %key.escape_ascii(),
+        detail = %detail,
+        "startup recovery could not account for a row of the `inode:` namespace: it is \
+         attributed here and the walk continues, so one damaged record does not cost every \
+         healthy object its availability",
+    );
 }
 
-/// The high-water marks of the **in-process id allocators** over the persisted metadata:
-/// the largest inode id any record uses, and the largest **in-process-scheme** chunk id
-/// (those below `2^64`) any committed chunk map, pending-ledger entry, **or orphan-ledger
-/// grace record** references.
+/// The high-water mark of the persisted **inode allocator** over the stored metadata: the
+/// largest inode id the `inode:` namespace still names.
 ///
-/// A single-process gateway (`wyrd_server::Gateway`) allocates inode and chunk ids from
-/// in-memory counters; on a restart over a **non-empty** store those counters must resume
-/// *above* everything already on disk. Otherwise a new-key PUT reuses a committed inode id
-/// — a bogus "concurrent writer won" conflict, because [`create`] is `require_absent` on the
-/// inode key — and an overwrite mints a chunk id that already backs a committed object,
-/// clobbering its fragments on the shared chunk store (issue #364 durability finding 1).
-/// This scan supplies those marks so `Gateway::recover` can bump the counters. An empty
-/// store yields `(0, 0)` and allocation starts at 1, unchanged.
+/// A gateway allocates inode ids from the shared, persisted `meta:next_inode` counter
+/// (`server::cli::alloc_inode`); on a restart over a **non-empty** store — or an in-place
+/// upgrade from a store an older single-process gateway wrote with no such counter — that
+/// counter must resume *above* everything already on disk. Otherwise a new-key PUT reuses a
+/// committed inode id, which [`create`]'s `require_absent` on the inode key turns into a
+/// bogus "concurrent writer won" conflict (issue #364 durability finding 1). This walk
+/// supplies the mark so `Gateway::recover` can seed the counter
+/// (`crates/server/src/lib.rs:133-141`). An empty store yields `0` and allocation starts at
+/// 1, unchanged.
 ///
-/// The `orphan:` scan closes a third re-mint hazard: after `PUT → DELETE → restart` the
-/// deleted object's inode key is gone ([`unlink`] removes it) and its chunk was already
-/// committed (so no `pending:` entry survives), yet its fragments are still on disk under a
-/// live [`orphan_key`] grace record until the custodian GC's reader-safe window elapses
-/// (`crates/custodian/src/gc.rs:134-141`). Were that chunk id not counted here, `recover`
-/// would re-mint it for the next object — and GC's reference gate keys on `(dserver, chunk,
-/// index)` (`ReferenceSet::protects`, `gc.rs:200`), so the stale orphan record then either
-/// leaks the old bytes permanently (the id now looks referenced) or reclaims a fragment the
-/// re-minting object has just written but not yet committed (data loss). Projecting the
-/// orphan record's chunk id into `max_chunk` makes re-mint step past every id whose orphan
-/// record / on-disk fragments are still live (issue #364 durability finding, iter-8 review).
+/// **It is total over the content it walks: no arrangement of stored records makes it
+/// refuse** (issue #652). `Gateway::recover` runs it *before the gateway serves anything*,
+/// so an `Err` here is not one damaged object's failure — it costs **every healthy object**
+/// its availability, and nothing but manual repair leaves that state (`docs/principles.md`
+/// §5 C-1). Hence:
 ///
-/// Chunk ids are projected to the `< 2^64` in-process space on purpose: the cluster client
-/// mode derives chunk ids as `(inode << 64) | seq` (`server::cli::chunk_id_minter`) and
-/// resumes *its* allocator from the durable `meta:next_inode` counter, so those disjoint,
-/// above-`2^64` ids are not the in-process counter's to recover from (and never collide with
-/// it — the in-process counter only ever mints ids below `2^64`).
-pub async fn high_water_marks(store: &impl MetadataStore) -> Result<(InodeId, ChunkId)> {
-    const IN_PROCESS_CHUNK_CEILING: ChunkId = 1 << 64;
+/// * The mark comes from each row's **key**, read *before* the value beside it is looked at,
+///   so a record this walk cannot read **still contributes its own floor**. The two legal
+///   answers for an unreadable record are *fail closed for that record* or *contribute its
+///   true floor* — never a quiet zero, which is the one answer an allocator would trust and
+///   act on.
+/// * A value this walk cannot account for is **attributed**
+///   ([`attribute_unaccounted_inode_row`], above) and the walk **continues**, instead of
+///   `?`-propagating: bytes that do not decode at all, and a structurally valid **segmented**
+///   root, which this walk has no resolver for. #648 enforces the segmented root's structural
+///   invariants at decode (ADR-0045), which widens the set of values that can fail the
+///   decode, so the hazard is live rather than latent. This is the containment this same
+///   `inode:` namespace already gets from the custodian's GC walk
+///   (`crates/custodian/src/gc.rs:378-382`), for the reason its module doc gives at
+///   `gc.rs:22-31`: "the one object's fault is contained: it is attributed, and the walk —
+///   and every other object's protection — continues".
+/// * A fault that is **not** a record's own — the `scan` itself failing — still propagates
+///   (`?`). A walk that cannot read the metadata store has no mark at all, and containing
+///   that as "one record is unreadable" would be the wrong answer for every record in it
+///   (the split `gc.rs:355-359` already draws).
+///
+/// One residual is **not** this walk's to close, and predates it: a store that already holds
+/// `inode:<u64::MAX>` names an id with **no successor**, so the floor its caller derives
+/// (`mark + 1`, `crates/server/src/lib.rs:141`) saturates and the allocator is left at the
+/// ceiling with `alloc_inode`'s `id + 1` unguarded (`crates/server/src/cli.rs:1662`). That is
+/// the *exhausted allocator*, not an unreadable record: the mark has always come from the key
+/// ([`parse_inode_key`]), so a perfectly decodable record at that key reaches the identical
+/// state on this tree today. Making the allocator fail closed there rather than wrap is
+/// allocator safety and belongs to the function that hands ids out —
+/// deferred: getwyrd/wyrd#687.
+///
+/// **There is no chunk-id mark, deliberately — it is not to be restored, re-derived or
+/// wired** (issue #652). This function used to return one beside the inode mark, and
+/// `Gateway::recover` bound it to a discarded, unused name. Both halves were written by the
+/// *same* commit, `fdd34f1` (#487, 2026-07-08): before it, `mint_chunk_id` was a plain
+/// counter from 0 and `recover` genuinely consumed the floor; after it, chunk ids are
+/// `(chunk_epoch << 64) | seq` over a per-gateway random epoch whose top bit is set, so every
+/// minted id is ≥ 2^127, two processes draw disjoint ranges with no shared counter, and
+/// `next_chunk_seq` is seeded from nothing (`crates/server/src/lib.rs:246-258`, ADR-0019).
+/// The cluster path never needed it either: `server::cli::chunk_id_minter` mints
+/// `(inode_id << 64) | seq` with `inode_id ≥ 1`, so every id it produces is ≥ 2^64
+/// (`crates/server/src/cli.rs:1809-1816`). Nothing in the tree mints into the `< 2^64` space
+/// the old mark recovered, so there is no consumer to wire it to — and a number nobody reads
+/// is not a safety property. Removing it also removes the two further complete scans
+/// (`pending:`, `orphan:`) whose only product was that discarded value, and with them the
+/// last reason for this walk to resolve any record's chunk map at all.
+pub async fn high_water_marks(store: &impl MetadataStore) -> Result<InodeId> {
     let mut max_inode: InodeId = 0;
-    let mut max_chunk: ChunkId = 0;
     for (key, value) in store.scan(b"inode:").await? {
-        if let Some(id) = parse_inode_key(&key) {
-            max_inode = max_inode.max(id);
-        }
-        let record: InodeRecord = decode(&value)?;
-        let chunks = record
-            .chunk_map
-            .as_flat()
-            .ok_or(ChunkMapError::SegmentedMapUnsupported {
-                operation: "high_water_marks",
-            })?;
-        for chunk in chunks {
-            if chunk.id < IN_PROCESS_CHUNK_CEILING {
-                max_chunk = max_chunk.max(chunk.id);
-            }
+        // The KEY first and unconditionally: the mark must never depend on anything this
+        // walk might fail to read out of the value beside it.
+        let Some(id) = parse_inode_key(&key) else {
+            // A row under this prefix that is not `inode:<id>` names no id the allocator
+            // can mint ([`inode_key`] is the sole writer of the prefix and ids are `u64`),
+            // so skipping it cannot put the mark below a live id — but it is still a row
+            // this walk cannot account for, so it is named rather than dropped in silence.
+            //
+            // Named ONCE, then the row is done: whatever its value holds, no id inside it
+            // could raise the mark, so reading it further could only add a second event and
+            // a second counter tick for one stored row — one repair obligation per row.
+            attribute_unaccounted_inode_row(
+                UNPARSABLE_INODE_KEY,
+                &key,
+                "not an `inode:<id>` key, so it names no recoverable id",
+            );
+            continue;
+        };
+        max_inode = max_inode.max(id);
+        // The VALUE is read ONLY to attribute what this walk cannot account for — never to
+        // derive the mark. Startup is the one pass that sees every record, so a record no
+        // reader can decode, and one whose chunk map this build has no resolver for, are
+        // both named here instead of surfacing later as one object's unexplained failure.
+        // Failing on either, as this walk used to, is what let one record stop the gateway.
+        match decode::<InodeRecord>(&value) {
+            Ok(record) if record.chunk_map.as_flat().is_none() => attribute_unaccounted_inode_row(
+                UNRESOLVED_SEGMENTED_ROOT,
+                &key,
+                ChunkMapError::SegmentedMapUnsupported {
+                    operation: "high_water_marks",
+                },
+            ),
+            Ok(_) => {}
+            Err(fault) => attribute_unaccounted_inode_row(UNDECODABLE_INODE_RECORD, &key, fault),
         }
     }
-    for (key, _value) in store.scan(b"pending:").await? {
-        if let Some(chunk) = parse_pending_chunk_key(&key) {
-            if chunk < IN_PROCESS_CHUNK_CEILING {
-                max_chunk = max_chunk.max(chunk);
-            }
-        }
-    }
-    // Orphan grace records (`orphan:<dserver>:<chunk>:<index>`): a deleted object's
-    // fragments still live on disk under this ledger until GC's grace window elapses, so
-    // their chunk id is not yet free to re-mint even though no `inode:`/`pending:` key
-    // references it any more (see the doc comment above; issue #364).
-    for (key, _value) in store.scan(ORPHAN_PREFIX).await? {
-        if let Some((_dserver, frag)) = parse_orphan_key(&key) {
-            if frag.chunk < IN_PROCESS_CHUNK_CEILING {
-                max_chunk = max_chunk.max(frag.chunk);
-            }
-        }
-    }
-    Ok((max_inode, max_chunk))
+    Ok(max_inode)
 }
 
 // ---------------------------------------------------------------------------
@@ -3336,13 +3416,13 @@ mod segmented_shape_invariants {
         // resolve as an empty chunk list" is unrecoverable. `unlink` deletes the dirent
         // AND the inode, and in the SAME commit writes one orphan grace record per
         // fragment the removed map placed (`unlink`, above) — the deadline the custodian
-        // GC reclaims from, and the ledger `high_water_marks` re-mints past. A map's chunks
-        // live in `seg:` records nothing in this build can enumerate (#649), so an unlink
-        // that proceeded would unbind the object while orphaning NOTHING: every fragment
-        // it owns would end up referenced by no chunk map and deadlined by no grace
-        // record, which is exactly the unreferenced-but-undeadlined state GC keeps
-        // forever. Permanently leaked bytes that no record names — the failure mode C-1
-        // forbids. So the shape is judged BEFORE the commit and the binding survives.
+        // GC reclaims from. A map's chunks live in `seg:` records nothing in this build can
+        // enumerate (#649), so an unlink that proceeded would unbind the object while
+        // orphaning NOTHING: every fragment it owns would end up referenced by no chunk map
+        // and deadlined by no grace record, which is exactly the
+        // unreferenced-but-undeadlined state GC keeps forever. Permanently leaked bytes
+        // that no record names — the failure mode C-1 forbids. So the shape is judged
+        // BEFORE the commit and the binding survives.
         let store = store();
         let key = inode_key(2);
         let name = dirent_key(1, "obj");
@@ -3413,35 +3493,48 @@ mod segmented_shape_invariants {
         );
     }
 
+    /// The unit-level statement of [`high_water_marks`]'s totality — the acceptance target
+    /// `crates/server/tests/gateway_recover_totality.rs` binds the same property end to end
+    /// through `Gateway::recover()`, including the attribution this test does not read.
+    ///
+    /// This **replaces** `high_water_marks_refuses_a_segmented_root_rather_than_re_mint_its_
+    /// chunk_ids`, and the replacement is deliberate rather than a dropped guard. That test
+    /// reasoned that a segmented root read as "owns no chunks" would contribute nothing to
+    /// `max_chunk`, letting the next PUT mint an id the root's fragments already occupy. The
+    /// premise expired with #487 (`fdd34f1`, 2026-07-08, merged): the hazard needs a minter
+    /// allocating in the `< 2^64` space that scan recovered, and #487 removed the last one —
+    /// `mint_chunk_id` now mints ≥ 2^127 (`crates/server/src/lib.rs:246-258`) and the cluster
+    /// path's `chunk_id_minter` ≥ 2^64 (`crates/server/src/cli.rs:1809-1816`), while the same
+    /// commit rewrote `recover` to discard the floor. The chunk mark itself is now gone
+    /// (issue #652) — a number nobody reads is not a safety property. Its live half is kept
+    /// here, inverted to what totality requires: the segmented root must be **contained**,
+    /// contributing its key-derived id rather than ending the walk.
     #[test]
-    fn high_water_marks_refuses_a_segmented_root_rather_than_re_mint_its_chunk_ids() {
-        // `Gateway::recover` resumes the in-process chunk-id counter from this scan, so
-        // that a restart never re-mints an id whose fragments are still on disk (issue
-        // #364 durability finding 1). A segmented root read as "owns no chunks" would
-        // contribute nothing to `max_chunk`, so the next PUT could mint an id that
-        // object's fragments already occupy and overwrite them on the shared chunk store
-        // — a live object's bytes lost with no error raised anywhere. The scan therefore
-        // fails closed: recovery stops rather than hand out an id it cannot prove is free.
-        let segmented_store = store();
-        pollster::block_on(
-            segmented_store.commit(WriteBatch::new().put(inode_key(2), SEGMENTED_ROOT_OK)),
-        )
-        .unwrap();
+    fn high_water_marks_is_total_over_records_it_cannot_read() {
+        // An empty store still yields 0, so the mark below is the records' own and not a
+        // constant this walk invents.
+        assert_eq!(pollster::block_on(high_water_marks(&store())).unwrap(), 0);
+
+        // A healthy flat record, a structurally valid SEGMENTED root this function has no
+        // resolver for, raw bytes that are not a record at all, and a row under the prefix
+        // whose key names no id — the segmented root and the undecodable value both at ids
+        // ABOVE the healthy one, so the mark can only be right if each contributed its own
+        // key-derived id, and the unparsable key last, so a walk that stopped there would
+        // still be caught.
+        let damaged = store();
+        for (key, value) in [
+            (inode_key(2), FLAT_ROOT),
+            (inode_key(17), SEGMENTED_ROOT_OK),
+            (inode_key(41), b"not a metadata record".as_slice()),
+            (b"inode:not-an-id".to_vec(), FLAT_ROOT),
+        ] {
+            pollster::block_on(damaged.commit(WriteBatch::new().put(key, value))).unwrap();
+        }
         assert_eq!(
-            chunk_map_error(pollster::block_on(high_water_marks(&segmented_store))),
-            ChunkMapError::SegmentedMapUnsupported {
-                operation: "high_water_marks"
-            }
-        );
-        // The same scan over the same key WITHOUT the unreadable shape still reports the
-        // marks, so the refusal above is the segmented root's and not the scan's.
-        let flat_store = store();
-        pollster::block_on(flat_store.commit(WriteBatch::new().put(inode_key(2), FLAT_ROOT)))
-            .unwrap();
-        assert_eq!(
-            pollster::block_on(high_water_marks(&flat_store)).unwrap(),
-            (2, 8),
-            "the flat record's inode and chunk ids are the marks"
+            pollster::block_on(high_water_marks(&damaged)).unwrap(),
+            41,
+            "every stored record contributes its key-derived id and none ends the walk — a \
+             record this build cannot read must raise the floor, never silently lower it",
         );
     }
 }
