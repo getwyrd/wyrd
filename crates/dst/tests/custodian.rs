@@ -55,6 +55,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -73,8 +74,8 @@ use wyrd_core::repair;
 use wyrd_core::write;
 use wyrd_core::write::write_new_object_placed;
 use wyrd_custodian::{
-    mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
-    Reconciled, ReconstructionContext, ScrubContext,
+    mark_orphaned, reconcile_after_restore, reconcile_step, Custodian, ExpiredPendingPolicy,
+    FencedZone, GcContext, Reconciled, ReconstructionContext, ScrubContext,
 };
 // The DST determinism barrier preamble (ADR-0035): declaring every campaign property
 // through this macro installs the permissive global `tracing` default unbypassably.
@@ -84,6 +85,15 @@ use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
     PlacementChunkStore, Result, WriteBatch,
 };
+
+// The DST tier's **second** `MetadataStore` implementation — the deterministic
+// simulated-TiKV model whose every read and commit spans real madsim await boundaries
+// (`network_hop`). Property 11 below needs those boundaries: they are what lets a genuinely
+// concurrent writer land *between* the post-restore pass's two readings of the committed
+// namespace, which an in-memory store that never yields cannot produce.
+#[path = "support/mod.rs"]
+mod support;
+use support::SimTikvMetadataStore;
 
 // ---- in-memory trait stores (backend-agnostic; the loops are proven over the seams) ----
 
@@ -1714,6 +1724,426 @@ async fn prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies
     }
 }
 
+// ---- property 11: the post-restore pass's TWO readings of the committed namespace never
+//      license a mark between them (issue #651) ----
+//
+// `reconcile_after_restore` is deletion-capable at one remove: an `orphan:` record is the
+// evidence GC requires before it reclaims bytes, so a mark this pass writes IS the front half
+// of a deletion. The pass reads the committed namespace **twice** — once for the reference set
+// its mark gate consults, once for the per-reference verdicts it reports — and a writer can
+// land between the two: an object that COMMITS (its fragments referenced by the later reading
+// and not the earlier) or a record that stops DECODING (a hole one reading met and the other
+// never did).
+//
+// The per-slice tests in `crates/custodian/tests` drive that through Tokio doubles that publish
+// at a hard-coded seam (the instant the first scan is answered): they pin the decision, but they
+// choose the schedule. Here the readings are separated by REAL await boundaries — the simulated
+// TiKV model's network hops, the DST tier's second `MetadataStore` implementation — and the
+// writer is a genuinely concurrent task whose landing point comes from the run seed, so the
+// simulator chooses the schedule and sweeps it.
+//
+// The property is the one the pass's own docs state: a conclusion and the reading it rests on
+// are ONE. No fragment is marked while any reading in the pass found a record it could not read,
+// and a fragment EITHER reading protects is never marked. It is written implementation-neutrally
+// — every assertion is conditioned on what the pass's own readings returned — so a pass that
+// read the namespace once would satisfy it too.
+
+/// The chunk of the object that is committed and readable for the whole run: one fragment on
+/// server 0, referenced by a record that exists before the pass starts.
+const RESTORE_HELD: ChunkId = 0x6511;
+/// The chunk of the object whose RECORD commits while the pass runs. Its fragment is on server 1
+/// from the start, so the pass's two readings can disagree about whether anything references it.
+const RESTORE_LATE: ChunkId = 0x6512;
+/// A genuine stray: bytes on server 2 that no record ever references and no ledger accounts for.
+/// A reading that FINISHED must mark it — the positive observable that stops every "nothing was
+/// marked" assertion below from passing on a pass that did nothing at all.
+const RESTORE_STRAY: ChunkId = 0x6513;
+/// The inode the late-committing object is published under ([`INODE`] is the readable one).
+const LATE_INODE: InodeId = 2;
+/// How far past the pass's start the concurrent writer's landing point is drawn from, in
+/// simulated milliseconds. One `network_hop` is 1 ms and the pass's two `inode:` readings are
+/// three hops apart, so this span spans "before the second reading", the tie with it, and "after
+/// the whole pass" — and the coverage property below **proves** the middle one is reached rather
+/// than assuming it.
+const RESTORE_NEMESIS_SPAN: u32 = 6;
+
+/// A recording tap over the DST tier's simulated-TiKV store: every trait call is forwarded
+/// unchanged — including the network hops that make a concurrent task's landing point matter —
+/// and each `inode:` scan's ANSWER is kept.
+///
+/// What it records is what the PRODUCTION pass's own readings returned, so the assertions below
+/// are conditioned on what the pass actually saw rather than on the fixture's intended timing:
+/// under a scheduler that resolves ties from the seed, "when did the writer land" is not a fact
+/// the test may assume. Instance state only (never a `static`), so it lives inside the simulated
+/// world and cannot leak across seeds or threads (ADR-0035).
+struct RecordingMeta {
+    inner: SimTikvMetadataStore,
+    inode_readings: Mutex<Vec<NamespaceReading>>,
+}
+
+/// One reading of the committed namespace: the key/value pairs a single `inode:` scan answered
+/// the pass with.
+type NamespaceReading = Vec<(Vec<u8>, Bytes)>;
+
+impl RecordingMeta {
+    fn new() -> Self {
+        Self {
+            inner: SimTikvMetadataStore::new(),
+            inode_readings: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// How many readings of the committed namespace the pass made. A pass that reads it once has
+    /// no divergence to reconcile, which the coverage property is careful not to punish.
+    fn readings(&self) -> usize {
+        self.inode_readings.lock().unwrap().len()
+    }
+
+    /// The indices of the `inode:` readings that returned `key` holding exactly `value` — "which
+    /// of the pass's readings saw this record", asked of the answers the store actually gave.
+    fn readings_that_saw(&self, key: &[u8], value: &[u8]) -> Vec<usize> {
+        self.inode_readings
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, reading)| reading.iter().any(|(k, v)| k == key && v == value))
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
+#[async_trait]
+impl MetadataStore for RecordingMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        let answer = self.inner.scan(prefix).await?;
+        if prefix == b"inode:" {
+            self.inode_readings.lock().unwrap().push(answer.clone());
+        }
+        Ok(answer)
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        self.inner.commit(batch).await
+    }
+}
+
+/// What the concurrent writer does while the pass runs — the two ways this pass's own two
+/// readings of the committed namespace can disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nemesis {
+    /// A second object COMMITS mid-pass. Its fragment is already on disk, so a reading that
+    /// missed the record sees bytes nothing references while the other sees them referenced —
+    /// and marking on the older reading hands GC a live object's only copy.
+    LateCommit,
+    /// A committed record STOPS DECODING mid-pass. One reading then has a hole in it the other
+    /// never met, and concluding over the whole pass marks fragments while reporting a record
+    /// the run could not read.
+    Damage,
+}
+
+/// What the pass's readings saw of the writer's landing — the interleaving that actually
+/// happened, as observed at the store seam rather than assumed from the fixture.
+struct Interleaving {
+    /// How many times the pass read the committed namespace.
+    readings: usize,
+    /// Which of those readings returned the writer's record.
+    saw: Vec<usize>,
+}
+
+/// A committed record whose single un-erasure-coded chunk places fragment 0 on `dserver` — the
+/// smallest committed reference the mark gate must honour.
+fn flat_committed(chunk: ChunkId, dserver: DServerId) -> InodeRecord {
+    InodeRecord {
+        size: 5,
+        chunk_map: vec![ChunkRef {
+            id: chunk,
+            scheme: EcScheme::None,
+            len: 5,
+            placement: vec![dserver],
+        }]
+        .into(),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    }
+}
+
+fn frag_of(chunk: ChunkId) -> FragmentId {
+    FragmentId { chunk, index: 0 }
+}
+
+/// Whether `frag` on `dserver` carries an `orphan:` record — the mark itself, and the only
+/// durable trace this pass leaves. "Still on disk" proves nothing here (the pass deletes
+/// nothing); the record is the pass saying *these bytes may be reclaimed*.
+async fn is_marked(meta: &dyn MetadataStore, dserver: DServerId, frag: FragmentId) -> bool {
+    meta.get(&metadata::orphan_key(dserver, frag))
+        .await
+        .unwrap()
+        .is_some()
+}
+
+/// One run of the post-restore pass against a writer landing `delay_millis` into it, with the
+/// full invariant set asserted over what the pass's readings actually saw. Returns the
+/// interleaving that occurred, so the coverage property can prove the divergence window is
+/// genuinely reached instead of assuming it.
+async fn restore_under_a_concurrent_writer(nemesis: Nemesis, delay_millis: u64) -> Interleaving {
+    let d = servers();
+    let meta = Arc::new(RecordingMeta::new());
+    let now = 10_000;
+
+    // Three fragments on disk before the pass starts: one referenced throughout, one whose
+    // record is still to come, and one nothing will ever reference.
+    let held = frag_of(RESTORE_HELD);
+    let late = frag_of(RESTORE_LATE);
+    let stray = frag_of(RESTORE_STRAY);
+    d[0].put_fragment(held, Bytes::from_static(b"held"))
+        .await
+        .unwrap();
+    d[1].put_fragment(late, Bytes::from_static(b"late"))
+        .await
+        .unwrap();
+    d[2].put_fragment(stray, Bytes::from_static(b"stray"))
+        .await
+        .unwrap();
+
+    let held_record = flat_committed(RESTORE_HELD, 0);
+    let held_key = metadata::inode_key(INODE);
+    let held_bytes = metadata::encode(&held_record);
+    assert_eq!(
+        metadata::create(&*meta, ROOT, "held", INODE, &held_record)
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+
+    let late_record = flat_committed(RESTORE_LATE, 1);
+    let damaged = Bytes::from_static(b"these bytes are not an inode record");
+    // The key/value each reading is asked about afterwards: exactly what the writer lands.
+    let (watch_key, watch_value) = match nemesis {
+        Nemesis::LateCommit => (
+            metadata::inode_key(LATE_INODE),
+            metadata::encode(&late_record),
+        ),
+        Nemesis::Damage => (held_key.clone(), damaged.clone()),
+    };
+
+    // The genuinely concurrent writer. madsim schedules it against the pass at the await
+    // boundaries the store's network hops open, and `delay_millis` is where the campaign's seed
+    // (or the coverage walk) puts its landing point — never a seam the double hard-codes.
+    let writer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let held_key = held_key.clone();
+        async move {
+            madsim::time::sleep(Duration::from_millis(delay_millis)).await;
+            let outcome = match nemesis {
+                Nemesis::LateCommit => {
+                    metadata::create(&*meta, ROOT, "late", LATE_INODE, &late_record).await
+                }
+                Nemesis::Damage => meta.commit(WriteBatch::new().put(held_key, damaged)).await,
+            };
+            assert_eq!(
+                outcome.unwrap(),
+                CommitOutcome::Committed,
+                "the concurrent writer's own commit must land, or this run tests nothing"
+            );
+        }
+    });
+
+    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    let ctx = GcContext {
+        meta: &*meta,
+        fleet: &fleet,
+        grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    // (1) CONTAINED. A record the pass cannot read may not turn the whole answer into an `Err`:
+    //     one damaged object would otherwise blank the post-restore picture for every object the
+    //     pass COULD read, at the moment an operator needs it most.
+    let report = reconcile_after_restore(&ctx, now).await.expect(
+        "a record this pass cannot read is contained, never an error that blanks the report",
+    );
+    writer
+        .await
+        .expect("the concurrent writer ran to completion");
+
+    let interleaving = Interleaving {
+        readings: meta.readings(),
+        saw: meta.readings_that_saw(&watch_key, &watch_value),
+    };
+    let saw = &interleaving.saw;
+
+    // (2) THE MARKS AND THE REPORT REST ON ONE READING. Two readings that disagree are two
+    //     conclusions, and the operator is shown one of them: a pass may not both authorize a
+    //     deletion and report a record it could not read.
+    assert!(
+        report.stranded_marked == 0 || report.unresolvable.is_empty(),
+        "the pass marked {} fragment(s) AND reported a record it could not read ({:?}) — the \
+         mark half acted as though the reading were complete while the report half says it was \
+         not (nemesis {nemesis:?}, landing at {delay_millis} ms, readings that saw it: {saw:?})",
+        report.stranded_marked,
+        report.unresolvable,
+    );
+
+    // (3) A FRAGMENT EITHER READING PROTECTS IS NEVER MARKED. The object committed in the
+    //     instant between the two readings is absent from the older one and present in the
+    //     newer; marking on the older hands GC its only copy after the grace window.
+    if nemesis == Nemesis::LateCommit && !saw.is_empty() {
+        assert!(
+            !is_marked(&*meta, 1, late).await,
+            "reading(s) {saw:?} of THIS pass returned the record that places {late:?}, and the \
+             pass marked that fragment collectable anyway — GC deletes a live object's only copy \
+             once the grace window elapses (landing at {delay_millis} ms)"
+        );
+    }
+
+    // (4) EITHER READING'S HOLE WITHHOLDS EVERY MARK, AND THE RECORD IS NAMED. An unreadable map
+    //     hides WHICH chunks its object owns, so no fragment in the fleet can be shown not to be
+    //     one of them — and an operator who cannot learn which record blocked the pass cannot
+    //     repair it.
+    if nemesis == Nemesis::Damage && !saw.is_empty() {
+        assert_eq!(
+            report.stranded_marked, 0,
+            "reading(s) {saw:?} met a record this pass could not read, and it marked {} \
+             fragment(s) anyway (landing at {delay_millis} ms): {report:?}",
+            report.stranded_marked
+        );
+        // `inode:1` is printable ASCII, so the escaped name the report carries is the key itself.
+        assert!(
+            report
+                .unresolvable
+                .iter()
+                .any(|name| name.as_bytes() == held_key.as_slice()),
+            "the blocking record is not NAMED in the report — a stall an operator cannot exit \
+             (landing at {delay_millis} ms): {:?}",
+            report.unresolvable
+        );
+        assert!(
+            !is_marked(&*meta, 2, stray).await,
+            "not even a genuine stray may be marked under a reading with a hole in it: no \
+             fragment can be shown not to belong to the object the pass could not read"
+        );
+    }
+
+    // (5) The readable object's own fragment is never marked, on any schedule: referenced while
+    //     both readings could see it, and withheld with everything else once one could not.
+    assert!(
+        !is_marked(&*meta, 0, held).await,
+        "the fragment of the object this pass could read is marked collectable (nemesis \
+         {nemesis:?}, landing at {delay_millis} ms, readings that saw the writer: {saw:?})"
+    );
+
+    if report.unresolvable.is_empty() {
+        // (6) POSITIVE OBSERVABLE — a reading that FINISHED marks the genuine stray. Without it
+        //     every "nothing was marked" assertion above would also pass on a pass that did
+        //     nothing at all.
+        assert!(
+            report.stranded_marked >= 1 && is_marked(&*meta, 2, stray).await,
+            "the pass read the whole committed namespace and left a fragment nothing references \
+             unmarked — the leak this pass exists to close: {report:?}"
+        );
+    } else {
+        // ...and where it did NOT finish, the withholding is a WITHHOLDING rather than a pass
+        // that died: repair the record the run named, re-run over the same store and the same
+        // fleet, and what was held back is marked at once.
+        assert_eq!(
+            meta.commit(WriteBatch::new().put(held_key.clone(), held_bytes))
+                .await
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        let repaired = reconcile_after_restore(&ctx, now)
+            .await
+            .expect("the repaired store reads whole");
+        assert!(
+            repaired.unresolvable.is_empty()
+                && repaired.stranded_marked >= 1
+                && is_marked(&*meta, 2, stray).await,
+            "after the named record is repaired the pass must mark what it withheld — otherwise \
+             the containment above is indistinguishable from a pass that never ran: {repaired:?}"
+        );
+        assert!(
+            !is_marked(&*meta, 0, held).await,
+            "the repaired object's fragment is referenced again, and is never marked"
+        );
+    }
+
+    interleaving
+}
+
+/// The campaign leg: the seed picks which disagreement the writer causes and where it lands,
+/// so 50 seeds sweep the schedule space around the pass's two readings.
+async fn prop_restore_two_readings_never_license_a_mark(rng: &mut ChaCha8Rng) {
+    let nemesis = if rng.next_u32().is_multiple_of(2) {
+        Nemesis::LateCommit
+    } else {
+        Nemesis::Damage
+    };
+    let delay = u64::from(rng.next_u32() % (RESTORE_NEMESIS_SPAN + 1));
+    restore_under_a_concurrent_writer(nemesis, delay).await;
+}
+
+/// **The window this property exists for is genuinely REACHED.** A concurrency test that never
+/// reaches the interleaving it is written about is a green light with nothing behind it, so this
+/// leg walks the writer's whole landing span in one run — asserting the full invariant set at
+/// every point — and then asserts the two schedules the campaign depends on actually occurred:
+/// one where only the LATER reading saw the writer's record (the divergence the mark gate has to
+/// reconcile) and one where NEITHER did (the writer landing past the pass, the runbook's
+/// writers-stopped case).
+///
+/// The divergence clause is conditioned on the pass having made more than one reading: a pass
+/// that reads the committed namespace ONCE has no divergence to cover, and this leg then reduces
+/// to the invariant walk rather than punishing the better implementation.
+async fn prop_restore_two_readings_cover_the_divergence_window() {
+    let mut readings = 0;
+    let mut divergent: Vec<(Nemesis, u64)> = Vec::new();
+    let mut past_the_pass: Vec<(Nemesis, u64)> = Vec::new();
+    for nemesis in [Nemesis::LateCommit, Nemesis::Damage] {
+        for delay in 0..=u64::from(RESTORE_NEMESIS_SPAN) {
+            let seen = restore_under_a_concurrent_writer(nemesis, delay).await;
+            assert!(
+                !seen.saw.contains(&0) || seen.saw.len() == seen.readings,
+                "a record is committed (or damaged) once and stays that way, so a reading before \
+                 the writer landed cannot have seen what a later one missed: {:?}",
+                seen.saw
+            );
+            readings = readings.max(seen.readings);
+            match seen.saw.len() {
+                0 => past_the_pass.push((nemesis, delay)),
+                n if n < seen.readings => divergent.push((nemesis, delay)),
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        !past_the_pass.is_empty(),
+        "no landing point in 0..={RESTORE_NEMESIS_SPAN} ms left the pass's readings untouched — \
+         the span no longer covers the whole pass, so the sweep is stuck in one regime"
+    );
+    if readings > 1 {
+        assert!(
+            !divergent.is_empty(),
+            "no landing point in 0..={RESTORE_NEMESIS_SPAN} ms fell BETWEEN the pass's {readings} \
+             readings, so the divergence this property exists for was never exercised: the \
+             invariants above passed without the schedule that can break them"
+        );
+    }
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -1784,6 +2214,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn restore_two_readings_never_license_a_mark() {
+        prop_restore_two_readings_never_license_a_mark(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn restore_two_readings_cover_the_divergence_window() {
+        prop_restore_two_readings_cover_the_divergence_window().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -1815,6 +2257,7 @@ dst_campaign_test! {
             prop_crash_mid_write_commits_nothing(&mut rng).await;
             prop_reader_flips_atomically_across_commit(&mut rng).await;
             prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies(&mut rng).await;
+            prop_restore_two_readings_never_license_a_mark(&mut rng).await;
         }
     }
 }

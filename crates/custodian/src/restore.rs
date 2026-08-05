@@ -83,12 +83,14 @@
 //! the trigger is a human who knows a restore happened — and who has stopped the writers, as
 //! the runbook says.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
-use crate::gc::{orphan_key, orphan_leases, referenced_fragments, GcContext};
+use crate::gc::{
+    object_name, orphan_key, orphan_leases, referenced_fragments, GcContext, ReferenceSet,
+};
 
 /// How many orphan marks to commit at once.
 ///
@@ -137,15 +139,51 @@ pub struct RestoreReport {
     /// Committed chunks missing fragments but still holding **at least `k` at their placement**:
     /// readable, and the reconstruction loop will rebuild them. Reported for visibility.
     pub under_replicated: Vec<ChunkId>,
+    /// Committed objects whose chunk map this pass could **not read** — a segmented generation
+    /// whose `seg:` records are incomplete, or a record that will not decode — named by
+    /// `inode:` key as the store spells it ([`crate::gc::ReferenceSet::unresolvable`], escaped
+    /// rather than rendered lossily so two damaged records never arrive under one name).
+    /// Ordered by that key.
+    ///
+    /// The pass keeps going past them and marks **nothing** on their account: while any object
+    /// is unresolvable the reference set is incomplete, so every fragment in the fleet is held
+    /// off-limits and [`RestoreReport::stranded_marked`] stays 0.
+    ///
+    /// They are reported because every *other* verdict here — dangling, misplaced,
+    /// under-replicated — is drawn over the objects the pass COULD read: a clean report with a
+    /// non-empty list here is a clean report about **part** of the store, and an operator
+    /// reading it as a clean bill would decommission on it.
+    pub unresolvable: Vec<String>,
 }
 
 impl RestoreReport {
-    /// Did the pass find anything an operator must act on or absorb?
+    /// Did the pass find anything an operator must act on or absorb — **and** did its reading
+    /// finish?
+    ///
+    /// The strict superset of [`Self::needs_human`]: it also counts the work this pass DID
+    /// (fragments marked collectable) and the work the repair loop will do (under-replicated
+    /// chunks), neither of which is a human's. Written **in terms of** that predicate rather
+    /// than beside it, so the two cannot drift as fields are added.
+    ///
+    /// An [unresolvable object](RestoreReport::unresolvable) counts: "clean" is a claim about a
+    /// reading that FINISHED, and this one did not — so a store the pass could only partly read
+    /// is never certified clean (`docs/principles.md` §5 C-1).
     pub fn is_clean(&self) -> bool {
-        self.stranded_marked == 0
-            && self.dangling.is_empty()
-            && self.misplaced.is_empty()
-            && self.under_replicated.is_empty()
+        self.stranded_marked == 0 && self.under_replicated.is_empty() && !self.needs_human()
+    }
+
+    /// Does this run need a **human** — the question `wyrd custodian --reconcile-after-restore`
+    /// turns into its exit status (`crates/server/src/cli.rs`'s `restore_verdict`)?
+    ///
+    /// The three findings no loop resolves on its own: chunks that can no longer be read at all,
+    /// chunks whose bytes are somewhere the restored map does not look, and committed objects
+    /// this pass could not read. Marks and under-replication are deliberately **not** here — the
+    /// first is this pass doing its job and the second is the reconstruction loop's, so failing
+    /// a restore script on either would train an operator to ignore the status. It lives on the
+    /// report rather than in the command because a caller that never prints the summary still
+    /// needs the same verdict, and would otherwise re-derive it slightly differently.
+    pub fn needs_human(&self) -> bool {
+        !self.dangling.is_empty() || !self.misplaced.is_empty() || !self.unresolvable.is_empty()
     }
 }
 
@@ -161,6 +199,54 @@ impl RestoreReport {
 ///    that can no longer be read *or rebuilt* are reported as [`RestoreReport::dangling`].
 ///
 /// Deletes nothing. Marks only. Run it with **writers stopped**, after a restore.
+///
+/// # An object it cannot read is CONTAINED, and the run is not certified
+///
+/// A committed object whose chunk map cannot be read (an incomplete segmented generation, a
+/// record that will not decode) does not end the pass and does not blank its answer: it is
+/// named in [`RestoreReport::unresolvable`], every object the pass *could* read is still
+/// reported, nothing is marked anywhere in the fleet while it remains, and
+/// [`RestoreReport::is_clean`] is false — the operator gets the post-restore picture *and* the
+/// record to repair, instead of an `Err` carrying neither. A fault that is **not** one object's
+/// map — a metadata store failing under the read — still propagates, exactly as it does for GC
+/// and scrub.
+///
+/// Each such record is **named on the durability seam the moment a read meets it**, before the
+/// next store read — `gc::reconcile`'s placement for the same set. That is what a propagating
+/// store fault must not take with it: the pass can still end in `Err` (the store, not one
+/// object, failed), but a record it had already identified as unreadable stays attributed, so
+/// the operator has something to repair rather than an error naming nothing.
+///
+/// # The marks and the report rest on ONE reading
+///
+/// This pass reads the committed namespace twice: once to build the reference set the mark half
+/// gates on ([`referenced_fragments`]), once for the per-reference expectations the report half
+/// judges against ([`committed_chunks`]). They are two reads of the same records an instant
+/// apart, and they can disagree — a record damaged between them, an object committed between
+/// them. A mark is an authorization to delete, so a disagreement may never be resolved in the
+/// direction that deletes, and an operator shown one conclusion drawn from two disagreeing
+/// readings has no way to tell which one it rests on. The two are therefore treated as **one**,
+/// in both directions:
+///
+/// - **either** read's hole withholds every mark in the fleet, and the names in the report are
+///   the **union** of both; and
+/// - a fragment **either** read protects is never marked — placed by a valid committed
+///   placement, or bearing the id of a chunk whose placement is malformed. An object that
+///   commits, or a placement that changes, between the two reads is protected by the read that
+///   saw it ([`AppearedSince`]), so the mark half can never act on a reference set the report
+///   half has already moved past.
+///
+/// Both clauses cost the same thing — a stray that survives to the next run of an idempotent
+/// pass — and buy the one outcome this pass must never produce: GC handed a live object's only
+/// copy. A commit that lands after *both* reads remains the runbook's business, not this pass's
+/// (it is an operator one-shot, run with writers stopped); what is this pass's own is that the
+/// two readings it makes of its own accord never license a mark between them.
+///
+/// Marking is deletion-capable at one remove, so the rule is pinned under the **deterministic
+/// simulator** as well as by the per-pass tests: the seeded Tier-0 property
+/// `restore_two_readings_never_license_a_mark` (`crates/dst/tests/custodian.rs`, ADR-0009) lands
+/// a genuinely concurrent writer between these two reads at an instant drawn from the run seed,
+/// over a store whose every read and commit spans a simulated network hop.
 ///
 /// # The fleet must be COMPLETE
 ///
@@ -180,28 +266,57 @@ pub async fn reconcile_after_restore(
     ctx: &GcContext<'_>,
     now_millis: u64,
 ) -> Result<RestoreReport> {
-    // The SAME committed reference set GC and scrub gate on. From this slice on it is built
-    // through the shared resolver, so a **segmented** object's chunks are in it here too, and a
-    // committed record the build cannot read is contained rather than raised
-    // (`gc::ReferenceSet::unresolvable`).
+    // The SAME committed reference set GC and scrub gate on, built through the shared resolver
+    // — so a **segmented** object's chunks are in it here too, and a committed record the build
+    // cannot read is contained rather than raised (`gc::ReferenceSet::unresolvable`).
     //
-    // This pass is nonetheless still fail-closed over an incomplete set, on both halves and
-    // without a line of its own: the mark gate below withholds every fragment while the set is
-    // incomplete (`gc::ReferenceSet::protects`), so nothing an unreadable object might own is
-    // ever marked for GC; and the report half re-reads the same records through
-    // [`committed_chunks`] (called unconditionally below), which propagates that record's own
-    // decode failure. So an unreadable committed record still ends this pass with an error,
-    // exactly as it did before the resolver was wired in, and no `RestoreReport` is ever
-    // returned over a set that has a known hole in it.
-    // deferred: #651 — the *contained* answer for this surface (report every object it could
-    // read, name the one it could not, and say the run is not certified, as
-    // `gc::reconcile`/`scrub::reconcile` now answer `Reconciled::Blocked`) belongs to the slice
-    // that owns restore; #650 scopes itself to the two passes that read this set today.
+    // The MARK half is fail-closed over an incomplete set: the gate below withholds every
+    // fragment while either read found a hole, so nothing an unreadable object might own is ever
+    // marked for GC.
+    //
+    // The REPORT half is CONTAINED rather than fatal, and that is this slice's work (#651): it
+    // reports every object it could read, names the ones it could not, and refuses to call the
+    // run clean. Until now it re-read the same records and `?`d out on the first it could not
+    // parse — so a store holding a single unreadable or segmented object produced no report AT
+    // ALL: not the stranded count, not the dangling or misplaced chunks of the objects it could
+    // read, at exactly the moment an operator needs them most.
     let referenced = referenced_fragments(ctx.meta).await?;
+    // ATTRIBUTED THE INSTANT IT IS KNOWN, per object, before the next store read — the placement
+    // `gc::reconcile` uses for the same set (`gc.rs`, its `unresolvable` loop sits between the
+    // reference build and the fleet walk). Batching these names behind the reads below would
+    // mean a genuine, unrelated store fault in any of them — one `?` away — ends the pass with
+    // an `Err` carrying nothing, and the record the operator must repair, ALREADY KNOWN by
+    // then, never reaches them at all. Attribution that a later transient fault can swallow is
+    // not attribution.
+    let mut unreadable = BTreeSet::new();
+    attribute_unresolvable(&referenced.unresolvable, &mut unreadable);
     let already = orphan_leases(ctx.meta).await?;
     let pending = pending_chunks(ctx.meta).await?;
+    // Read UP FRONT, before a fragment is marked: the mark gate below has to know about a hole
+    // THIS read found before it decides anything (see the one-reading rule in this function's
+    // docs). It is the same list this pass has always materialized, taken here rather than at
+    // the walk below — and what it could not read is attributed on the same terms, at once.
+    let committed = committed_chunks(ctx.meta).await?;
+    attribute_unresolvable(&committed.unresolvable, &mut unreadable);
+    // ...and what THAT read protects which the reference build did not — normally nothing at all
+    // (see [`AppearedSince`] and the one-reading rule in this function's docs). The mark gate
+    // below consults both, so an object that committed between the two reads cannot have its live
+    // fragments marked on the strength of the older one.
+    let appeared = appeared_since(&referenced, &committed);
 
-    let mut report = RestoreReport::default();
+    let mut report = RestoreReport {
+        // Either read's hole makes this report partial: the mark half is drawn from
+        // `referenced`, the verdicts below from `committed`. So the names are the UNION — a
+        // record only one of them could read is still a record this run cannot speak for —
+        // deduplicated and in the store's own key order, whichever read met each of them.
+        unresolvable: unreadable.iter().map(|key| object_name(key)).collect(),
+        ..Default::default()
+    };
+    // ONE READING, ONE CONCLUSION. `gc::ReferenceSet::protects` already withholds every fragment
+    // in the fleet while the reference BUILD found a hole; this extends the same withholding to
+    // a hole the verdict read found, so the pass can never both mark a fragment and report a
+    // record it could not read. Whichever read met the damage, the answer is the same one.
+    let incomplete = !report.unresolvable.is_empty();
     let mut marks = WriteBatch::new();
     // The fragments queued in the CURRENT batch, held back until it commits. Counting or
     // auditing a mark before its transaction lands would let a failed commit (an FDB
@@ -225,9 +340,11 @@ pub async fn reconcile_after_restore(
 
     // Where the RESTORED map says each fragment lives. A restore rewinds the placement record
     // along with everything else, so this is the map's opinion — which the bytes may have moved
-    // on from (below).
+    // on from (below). Over BOTH readings, on the same rule as the gate: a placement only the
+    // report read saw is still the map's opinion. `appeared.placed` holds only what
+    // `referenced.placed` does not, so no holder is listed twice.
     let mut canonical: HashMap<FragmentId, Vec<DServerId>> = HashMap::new();
-    for &(dserver, frag) in &referenced.placed {
+    for &(dserver, frag) in referenced.placed.iter().chain(appeared.placed.iter()) {
         canonical.entry(frag).or_default().push(dserver);
     }
 
@@ -235,8 +352,16 @@ pub async fn reconcile_after_restore(
     for (dserver, frag) in on_disk {
         // SAFETY GATE, identical to GC's: never mark a fragment the restored map points at —
         // nor any fragment of a malformed-placement chunk, whose true placement cannot be
-        // trusted (fail safe).
-        if referenced.protects(dserver, frag) {
+        // trusted (fail safe) — nor anything at all while either read of the committed
+        // namespace found a record it could not read. An unreadable map hides WHICH chunks its
+        // object owns, so no fragment in the fleet can be shown not to be one of them.
+        //
+        // Over BOTH readings of that namespace, never the older one alone: a fragment the report
+        // read finds referenced is referenced, whichever read of this pass met the record that
+        // says so. Otherwise an object committed in the instant between the two reads — absent
+        // from `referenced` and present in `committed` — would have its live fragments marked
+        // collectable, and GC would take the only copy after the grace window.
+        if incomplete || referenced.protects(dserver, frag) || appeared.protects(dserver, frag) {
             continue;
         }
 
@@ -323,7 +448,7 @@ pub async fn reconcile_after_restore(
     // READ this chunk, and do its bytes still EXIST? A restore can break the first without
     // breaking the second, and answering only one of them is a lie in one direction or the
     // other (both spelled out below).
-    for (chunk, expected) in committed_chunks(ctx.meta).await? {
+    for &(chunk, ref expected) in &committed.chunks {
         // READABLE is "present at the D server the committed placement NAMES" — nothing weaker.
         // Both consumers of a placement resolve it strictly, and neither scans the fleet:
         //
@@ -384,28 +509,159 @@ struct Expected {
     frags: Vec<(DServerId, FragmentId)>,
 }
 
-/// Every **committed** chunk, with its `k` and its placement. Skips malformed placements —
-/// GC treats them as fully referenced (fail safe) and so does this pass; a chunk whose
-/// placement cannot be trusted is not one to declare dangling.
-async fn committed_chunks(meta: &dyn MetadataStore) -> Result<Vec<(ChunkId, Expected)>> {
-    let mut out = Vec::new();
-    for (_key, value) in meta.scan(b"inode:").await? {
-        let record: InodeRecord = metadata::decode(&value)?;
+/// What the report half could read of the committed namespace, and what it could not.
+struct CommittedChunks {
+    /// One entry per committed chunk **reference**, in scan order. Each is judged against ITS
+    /// OWN placement: grouping by chunk id would let one object's healthy copy answer for
+    /// another object's missing one — the second object is unreadable (the read path fetches
+    /// strictly by ITS placement) while the merged verdict reads "under-replicated, the repair
+    /// loop will handle it", and the command exits 0 over a down object.
+    chunks: Vec<(ChunkId, Expected)>,
+    /// Chunk ids whose committed placement is **malformed** (ADR-0040 decision 4). Not judged —
+    /// a placement that cannot be trusted is not one to declare dangling, the same fail-safe skip
+    /// this pass has always made — but recorded, because a chunk *this* read found and the
+    /// reference build did not still protects every fragment bearing its id from the mark half
+    /// ([`AppearedSince`]).
+    malformed: HashSet<ChunkId>,
+    /// The committed objects whose chunk map could not be read at all, keyed by `inode:` key
+    /// exactly as the store spells it and valued by the fault — the shape
+    /// [`crate::gc::ReferenceSet::unresolvable`] uses, for the same reason (a rendered name is
+    /// not injective, so two damaged records could collapse into one entry and one would go
+    /// unreported).
+    unresolvable: BTreeMap<Vec<u8>, String>,
+}
+
+/// What the report read of the committed namespace protects that the reference build did not —
+/// the **divergence between this pass's two readings**, and nothing else.
+///
+/// Empty whenever they agree, which is every run of this operator one-shot as the runbook
+/// prescribes it (writers stopped). It exists for the runs where they do not: an object that
+/// commits, or a placement a repair repoints, between [`referenced_fragments`] and
+/// [`committed_chunks`] is absent from [`crate::gc::ReferenceSet::protects`] and present in the
+/// verdicts drawn below it, and marking its fragments on the strength of the older reading would
+/// hand GC bytes the newer one says are live. Only the difference is kept, never a second copy of
+/// the placement set: it is exactly what the older reading cannot speak for.
+#[derive(Default)]
+struct AppearedSince {
+    /// `(dserver, fragment)` a valid committed placement points at in the report read alone.
+    placed: HashSet<(DServerId, FragmentId)>,
+    /// Chunk ids the report read alone found malformed — treated as **fully referenced**, exactly
+    /// as [`crate::gc::ReferenceSet`] treats one its own read found (ADR-0040 decision 4): the
+    /// placement cannot be trusted, so every fragment bearing the id is off-limits.
+    malformed: HashSet<ChunkId>,
+}
+
+impl AppearedSince {
+    /// Whether the report read protects `frag` on `dserver` where the reference build did not —
+    /// the second half of the mark gate, by the same two rules
+    /// [`crate::gc::ReferenceSet::protects`] applies to the first (a valid placed reference, or
+    /// any fragment of a malformed-placement chunk).
+    fn protects(&self, dserver: DServerId, frag: FragmentId) -> bool {
+        self.placed.contains(&(dserver, frag)) || self.malformed.contains(&frag.chunk)
+    }
+}
+
+/// Difference the report read against the reference build: everything the former protects and the
+/// latter never saw.
+///
+/// The incompleteness half of the same disagreement is handled by the caller (either read's hole
+/// withholds the whole fleet), so this is only about references that EXIST in one reading — the
+/// direction where acting on the older one deletes live data rather than merely over-reporting.
+fn appeared_since(referenced: &ReferenceSet, committed: &CommittedChunks) -> AppearedSince {
+    let mut appeared = AppearedSince::default();
+    for (_chunk, expected) in &committed.chunks {
+        for pair in &expected.frags {
+            if !referenced.placed.contains(pair) {
+                appeared.placed.insert(*pair);
+            }
+        }
+    }
+    for chunk in &committed.malformed {
+        if !referenced.malformed.contains_key(chunk) {
+            appeared.malformed.insert(*chunk);
+        }
+    }
+    appeared
+}
+
+/// Every **committed** chunk this pass could read, with its `k` and its placement — plus the
+/// objects it could not read at all.
+///
+/// Each committed record is resolved through the ONE resolver every consumer shares
+/// ([`metadata::resolve_chunk_map`], proposal 0016 decision 7(e)), so a **segmented** object's
+/// chunks are judged here like any other instead of ending the pass; and a record that will not
+/// decode, or a generation the resolver cannot read, is CONTAINED — recorded in
+/// [`CommittedChunks::unresolvable`] and skipped, with the walk going on. A fault that is not
+/// this object's own (a store failing under the read) still propagates, by exactly the downcast
+/// rule [`referenced_fragments`] uses: a walk that cannot reach the metadata store has no answer
+/// for any object, not one unreadable object.
+///
+/// Malformed placements are skipped, which is the same fail-safe skip this pass always applied:
+/// GC treats such a chunk as fully referenced rather than trusting a placement vector it cannot
+/// (ADR-0040 decision 4), and a chunk whose placement cannot be trusted is not one to declare
+/// dangling.
+///
+/// The network bound on the resolve await is the `MetadataStore` IMPLEMENTATION's, not this
+/// caller's (#508/#636) — the same rule [`referenced_fragments`] follows for the same call, and
+/// the same rule the `meta.scan(b"inode:")` here has always followed. It is fail-closed either
+/// way: an error there either propagates or contains the object, never "this object owns no
+/// bytes".
+///
+/// This is the pass's **second** reading of the committed namespace, and what it protects that
+/// the first did not is reconciled by [`appeared_since`] before a single mark is written. That
+/// reconciliation is exercised under the simulator by the seeded Tier-0 property
+/// `restore_two_readings_never_license_a_mark` (`crates/dst/tests/custodian.rs`), not only by the
+/// per-pass doubles.
+///
+/// deferred: #681 — this repeats [`referenced_fragments`]'s decode/resolve/contain shape over
+/// the same records because the two halves need different granularity (a fleet-wide protection
+/// set there, per-reference expectations here). The maintenance walk that both would share is
+/// that slice's; this one is restore's own scan, upgraded in place from "fail closed on the
+/// first record I cannot read" to "contain it and keep reporting".
+async fn committed_chunks(meta: &dyn MetadataStore) -> Result<CommittedChunks> {
+    let mut chunks = Vec::new();
+    let mut malformed = HashSet::new();
+    let mut unresolvable = BTreeMap::new();
+    for (key, value) in meta.scan(b"inode:").await? {
+        // The record's own bytes are in hand, so a decode failure is THIS object's fault and no
+        // store's — contained, and conservatively without first asking whether the record was
+        // committed (reading `state` out of bytes that will not decode needs a lenient peek
+        // this crate owns no decoder for; blocking until the record is repaired is the
+        // fail-closed direction).
+        let record: InodeRecord = match metadata::decode(&value) {
+            Ok(record) => record,
+            Err(fault) => {
+                unresolvable.insert(key.clone(), fault.to_string());
+                continue;
+            }
+        };
         if record.state != InodeState::Committed {
             continue;
         }
-        // A segmented map has no resolver yet (#649-#651): fail closed for the whole
-        // scan exactly as an unreadable record already does via `decode(&value)?`
-        // above.
-        let flat_chunk_map =
-            record
-                .chunk_map
-                .as_flat()
-                .ok_or(ChunkMapError::SegmentedMapUnsupported {
-                    operation: "restore::committed_chunks",
-                })?;
-        for chunk in flat_chunk_map {
+        // `Ok(None)` is no live committed generation under this key (deleted or retired since
+        // the scan read it): nothing left to report on, skipped exactly as an uncommitted
+        // record is above.
+        let resolved = match metadata::resolve_chunk_map(meta, &key, &record).await {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => continue,
+            Err(err) => match err.downcast::<ChunkMapError>() {
+                // The resolver's own typed verdict that THIS generation cannot be read —
+                // recovered by downcast because the trait seam boxes every error. Contained.
+                Ok(fault) => {
+                    unresolvable.insert(key.clone(), fault.to_string());
+                    continue;
+                }
+                // Not a chunk-map anomaly: a store fault under the read, which is not this
+                // object's fault and is not folded into "this object is unreadable".
+                Err(err) => return Err(err),
+            },
+        };
+        for chunk in resolved.chunks.iter() {
             let Ok(frags) = chunk.checked_fragments() else {
+                // Skipped as a verdict (above), KEPT as a protection: this read found the chunk,
+                // and if the reference build did not, its fragments have nothing else standing
+                // between them and a mark.
+                malformed.insert(chunk.id);
                 continue;
             };
             let frags: Vec<(DServerId, FragmentId)> = frags
@@ -419,7 +675,7 @@ async fn committed_chunks(meta: &dyn MetadataStore) -> Result<Vec<(ChunkId, Expe
                     )
                 })
                 .collect();
-            out.push((
+            chunks.push((
                 chunk.id,
                 Expected {
                     k: reconstruction_threshold(chunk),
@@ -428,7 +684,36 @@ async fn committed_chunks(meta: &dyn MetadataStore) -> Result<Vec<(ChunkId, Expe
             ));
         }
     }
-    Ok(out)
+    Ok(CommittedChunks {
+        chunks,
+        malformed,
+        unresolvable,
+    })
+}
+
+/// Name every object `faults` could not read on the durability seam, and record it in `named` —
+/// the union this pass reports, keyed by the store's own key bytes.
+///
+/// Called once per read of the committed namespace, **the moment that read returns**: the mark
+/// gate is driven by `referenced_fragments` and the verdicts by [`committed_chunks`], so a record
+/// either could not read leaves this run unable to speak for that object — and neither read's
+/// names may wait on the other's. Emitting them per object as they become known, ahead of every
+/// store read that follows, is `gc::reconcile`'s placement for the same set and for the same
+/// reason: a store fault a `?` later ends the pass with an `Err`, and a name this pass ALREADY
+/// HELD must not go down with it. The operator's next move is repairing that record.
+///
+/// Attribution is once per object, not once per read: `named` is the set already emitted, so a
+/// record BOTH reads met is reported and counted once, under one name.
+///
+/// Named through [`crate::gc::object_name`], which escapes rather than replaces — two damaged
+/// records must never arrive under one name, or a repair guided by it fixes one and leaves the
+/// other blocking the fleet.
+fn attribute_unresolvable(faults: &BTreeMap<Vec<u8>, String>, named: &mut BTreeSet<Vec<u8>>) {
+    for (key, fault) in faults {
+        if named.insert(key.clone()) {
+            emit_unresolvable(&object_name(key), fault);
+        }
+    }
 }
 
 /// How many fragments must survive for this chunk to be rebuildable: `k` under
@@ -529,7 +814,31 @@ fn emit_displaced(dserver: DServerId, frag: FragmentId, expected_on: &[DServerId
     );
 }
 
+/// A committed object whose chunk map this pass could **not read**, named and attributed on the
+/// durability-plane seam (ADR-0011 / ADR-0012), exactly as GC and scrub name the same record on
+/// theirs: nothing of it was marked (the mark gate withholds the whole fleet while the reference
+/// set is incomplete), and every verdict in the report excludes it.
+///
+/// Emitted as soon as a read of the committed namespace meets the record — so this name survives
+/// even when a later store fault ends the whole pass with an `Err` and no report is returned at
+/// all. That case is the seam's alone to carry: the operator has one thing to do about an
+/// unreadable record, and it starts with knowing which one it is.
+fn emit_unresolvable(object: &str, fault: &str) {
+    tracing::warn!(monotonic_counter.restore_unresolvable_records = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "unresolvable-chunk-map",
+        inode = %object,
+        fault = %fault,
+        "post-restore: a committed object's chunk map could not be read; nothing was marked on its account and every count in this report is drawn over the objects that COULD be read — this run is NOT a clean bill for the store until this record is repaired",
+    );
+}
+
 /// The pass's own verdict, so a restore's true cost lands in one line an operator can read.
+///
+/// It says **complete** only when the reading finished. Over a store with an unreadable
+/// committed record in it the same line would otherwise be the certification the rest of this
+/// pass refuses to give, in the one place an operator greps for it.
 fn emit_summary(report: &RestoreReport) {
     tracing::info!(
         target: "wyrd.custodian.restore.audit",
@@ -541,6 +850,18 @@ fn emit_summary(report: &RestoreReport) {
         dangling = report.dangling.len(),
         misplaced = report.misplaced.len(),
         under_replicated = report.under_replicated.len(),
-        "post-restore reconciliation complete",
+        // The qualifier on every count above: they are drawn over the objects this pass could
+        // read, and this is how many it could not.
+        unresolvable = report.unresolvable.len(),
+        // The pass's own two-word verdict, so the predicate the report offers its callers is the
+        // one its audit trail states rather than a third rendering of the same fields.
+        clean = report.is_clean(),
+        needs_human = report.needs_human(),
+        "post-restore reconciliation {}",
+        if report.unresolvable.is_empty() {
+            "complete"
+        } else {
+            "INCOMPLETE — every count above covers only the objects this pass could read"
+        },
     );
 }

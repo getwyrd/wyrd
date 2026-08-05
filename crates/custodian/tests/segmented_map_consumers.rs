@@ -7,9 +7,14 @@
 //! `crates/custodian/src/{gc,scrub,reconciliation}.rs`, plus the one non-regression the shared
 //! reference build forces on `desired_state` (a drain that used to fail closed with an error
 //! over an unreadable record must not start certifying `Satisfied`). Restore / reconstruction
-//! / rebalance / backfill and their containment legs are #651's; they are not pulled forward,
-//! and this file names none of their symbols, so #651 can add its own binding legs without
-//! touching it.
+//! / rebalance / backfill and their containment legs are #651's and later's; they are not
+//! pulled forward, and this file names no symbol of theirs.
+//!
+//! #651 landed the drain surface's **attributed** refusal, which is the answer those two
+//! `desired_state` legs assert — so they now pin `PendingUnresolvable { objects }` (the record
+//! names) where they pinned a bare `Pending`. The property is the one this file always
+//! guarded: the drain-status surface never certifies over an incomplete reference set. Its own
+//! binding legs live in `crates/custodian/tests/segmented_map_restore.rs`.
 //!
 //! Every leg drives the real fenced control point
 //! [`reconcile_step`](wyrd_custodian::reconcile_step), never a parallel entry — exactly the
@@ -704,26 +709,25 @@ async fn one_unreadable_committed_inode_blocks_every_certifying_answer_and_recla
 
     // The third reader of this set — the drain-status surface — must not certify either.
     // "This server holds nothing referenced" over an incomplete set is the same claim as the
-    // reclaim, in the form an operator acts on by decommissioning the box. Before this slice an
-    // unreadable committed record made this query FAIL outright (`referenced_fragments`
-    // propagated the decode error / the segmented-map refusal), so the binding property here is
-    // that routing the build through the resolver does not turn that fail-closed answer into a
-    // certification: it stays the existing, non-certifying `Pending`.
+    // reclaim, in the form an operator acts on by decommissioning the box.
     //
-    // Naming the blocker IN THE ANSWER (as `PendingMalformed` names chunk ids) is the drain
-    // surface's own attribution work and belongs to the slice that owns `desired_state` (#651,
-    // deferred — see `desired_state::reconciliation_status`); the record is already named on
-    // this pass's audit seam, asserted above.
+    // #651 made that refusal ATTRIBUTED (as `PendingMalformed` names chunk ids): the blocking
+    // record is named in the answer itself, so a stalled drain has a way out. It is a distinct
+    // variant from `Pending` on purpose — `Pending` means an evacuation is running and will
+    // finish, this means nothing will finish until a named record is repaired, because
+    // rebalance cannot evacuate fragments of a map it cannot read.
     set_lifecycle(&meta, 0, DServerLifecycle::Draining)
         .await
         .unwrap();
     let status = reconciliation_status(&meta, 0).await.unwrap();
     assert_eq!(
         status,
-        ReconciliationStatus::Pending,
+        ReconciliationStatus::PendingUnresolvable {
+            objects: vec!["inode:1".to_owned()], // DAMAGED_INODE, as the store spells its key
+        },
         "a drain over an incomplete reference set must never be certified `Satisfied` — that \
          tells an operator to decommission a server an unreadable object may still own bytes \
-         on; got {status:?}"
+         on — and the refusal must NAME the record to repair; got {status:?}"
     );
 }
 
@@ -1085,16 +1089,26 @@ async fn two_blockers_whose_keys_are_not_utf8_are_each_attributed_under_their_ow
     );
 
     // ...and the surface an operator acts on by decommissioning a box still refuses to certify
-    // while any of them is unreadable (the attributed answer is #651's — see
-    // `desired_state::reconciliation_status`).
+    // while any of them is unreadable — carrying all THREE names (#651), for the same reason
+    // the audit trail must: a repair guided by a name that stands for two records fixes one and
+    // leaves the other blocking the fleet. Ordered by the store's own key bytes (`\` = 0x5c
+    // before 0xfe before 0xff), and injective — the escape's own `\` is doubled, so the literal
+    // `inode:\xff` key is not spelled like the one whose final byte is 0xff.
     set_lifecycle(&meta, 0, DServerLifecycle::Draining)
         .await
         .unwrap();
     let status = reconciliation_status(&meta, 0).await.unwrap();
     assert_eq!(
         status,
-        ReconciliationStatus::Pending,
-        "a drain must not be certified while a committed record cannot be read; got {status:?}"
+        ReconciliationStatus::PendingUnresolvable {
+            objects: vec![
+                r"inode:\\xff".to_owned(),
+                r"inode:\xfe".to_owned(),
+                r"inode:\xff".to_owned(),
+            ],
+        },
+        "a drain must not be certified while a committed record cannot be read, and every \
+         blocker must arrive under its own name; got {status:?}"
     );
 }
 
