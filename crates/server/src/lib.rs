@@ -114,14 +114,30 @@ where
     /// Chunk ids need **no** recovery: they are coordination-free (a per-gateway random
     /// [`chunk_epoch`](Self::chunk_epoch), ADR-0019), so a fresh process draws a disjoint id
     /// range and can never replay a committed chunk id. A fresh store leaves the allocator at
-    /// its default (next id 1), exactly as [`new`](Gateway::new) leaves it.
+    /// its default (next id 1), exactly as [`new`](Gateway::new) leaves it. Since #487 that
+    /// has been true of *every* minter in the tree, so [`metadata::high_water_marks`] no
+    /// longer computes a chunk-id floor for this call to discard (issue #652).
     ///
     /// The composition root calls this after `new` and before serving
     /// (`server::cli::serve_s3`, `cli.rs:1415`). Idempotent and monotone: it only ever
     /// *raises* the persisted counter, so a concurrent allocation already past the mark is
     /// never rewound.
+    ///
+    /// **It is total over the store's contents** (issue #652): it runs before this gateway
+    /// serves anything, so an `Err` here costs *every healthy object* its availability and
+    /// nothing but manual repair leaves that state (`docs/principles.md` §5 C-1). Neither a
+    /// record [`metadata::high_water_marks`] cannot read nor a `meta:next_inode` counter
+    /// [`seed_next_inode_floor`](crate::cli::seed_next_inode_floor) cannot read ends it —
+    /// each is attributed on the `wyrd.metadata.recovery.audit` seam and recovery continues,
+    /// still seeding the allocator above every inode id whose bytes are on disk.
     pub async fn recover(&self) -> Result<()> {
-        let (max_inode, _max_chunk) = metadata::high_water_marks(&self.meta).await?;
+        let max_inode = metadata::high_water_marks(&self.meta).await?;
+        // `saturating_add` only binds when the mark is already `u64::MAX` — an id space with
+        // no successor to seed, which is the exhausted allocator rather than an unreadable
+        // record, and is reachable on this tree today through an ordinary decodable record at
+        // that key (the mark has always come from the key). Making the hand-out side fail
+        // closed there instead of computing `id + 1` (`cli.rs:1662`) is allocator safety —
+        // deferred: getwyrd/wyrd#687.
         crate::cli::seed_next_inode_floor(&self.meta, max_inode.saturating_add(1)).await
     }
 
@@ -233,8 +249,9 @@ where
     /// monotonic [`next_chunk_seq`](Self::next_chunk_seq) forms the low 64 bits, so an id never
     /// repeats within a process: an **overwrite** (which reuses the inode but stores a new
     /// version's fragments) mints fresh ids rather than re-minting the prior version's. The
-    /// epoch's top bit is set, so every id is ≥ 2^127 — clear of the `< 2^64` in-process space
-    /// [`metadata::high_water_marks`] scans and of the cluster path's `(inode << 64) | seq` ids.
+    /// epoch's top bit is set, so every id is ≥ 2^127 — clear of the `< 2^64` space no minter
+    /// in this tree allocates from (which is why recovery computes no chunk-id floor at all,
+    /// issue #652) and of the cluster path's `(inode << 64) | seq` ids.
     fn mint_chunk_id(&self) -> ChunkId {
         let seq = self.next_chunk_seq.fetch_add(1, Ordering::Relaxed);
         (u128::from(self.chunk_epoch) << 64) | u128::from(seq)
@@ -247,8 +264,8 @@ where
 /// **processes** seeded from the same persisted state still draw **independent** epochs, so
 /// their chunk-id ranges are disjoint and neither can overwrite a chunk the other committed —
 /// the multi-writer invariant (issue #477), without a shared allocator. Setting the top bit
-/// keeps every minted id ≥ 2^127, clear of the `< 2^64` in-process space
-/// [`metadata::high_water_marks`] recovers and of the cluster path's `(inode << 64) | seq` ids.
+/// keeps every minted id ≥ 2^127, clear of the `< 2^64` space no minter in this tree
+/// allocates from (issue #652) and of the cluster path's `(inode << 64) | seq` ids.
 ///
 /// The entropy comes from [`std::collections::hash_map::RandomState`], which the standard
 /// library seeds from the OS RNG (the same source that keys `HashMap` against collision

@@ -1788,27 +1788,175 @@ pub async fn alloc_inode<M: MetadataStore>(meta: &M) -> Result<u64, BoxError> {
 /// committed (issue #364 durability finding 1). Idempotent and monotone: it only ever *raises*
 /// the counter, and a concurrent allocator already past `floor` leaves it untouched. Generic
 /// over `M` so the redb and TiKV backends share it, exactly as [`alloc_inode`] does.
+///
+/// **Total over the persisted counter's bytes** (issue #652). This runs inside
+/// [`crate::Gateway::recover`], before the gateway serves anything, so a counter value it
+/// cannot read must not end recovery: that would cost every healthy object its availability
+/// over one damaged key, and nothing but manual repair leaves that state
+/// (`docs/principles.md` §5 C-1). An unreadable counter states no floor to compare against,
+/// so it is attributed on the same audit seam the `inode:` walk uses
+/// (`wyrd.metadata.recovery.audit`, `crates/core/src/metadata.rs:2069-2083`) — quoting the
+/// bytes it read, bounded and escaped, because a repair that destroys evidence without
+/// recording it is not attributable — and **repaired** to `floor` under a compare-and-set on
+/// those exact bytes. That guard is what keeps the repair monotone under contention: an
+/// allocator that wrote a *readable* counter between this read and this commit wins, and the
+/// retry then finds its value at or above the floor and leaves it alone, so the repair can
+/// never rewind a live allocator.
+///
+/// The attribution is emitted **after** that compare-and-set resolves, and reports which way it
+/// resolved ([`COUNTER_REPLACED`] / [`COUNTER_SUPERSEDED`]). Emitting it before the commit would
+/// make the losing path claim a destructive repair that never happened — an audit record that
+/// over-states what the store did is worse than none, because containment here *is* the
+/// attribution.
+///
+/// "Readable" means **exactly** what [`alloc_inode`] means by it — the same
+/// `from_utf8(…).parse::<u64>()` (`cli.rs:1655`), deliberately not a stricter or more liberal
+/// grammar of its own. The two functions read one key, so a value only one of them accepts
+/// would have this one repairing a counter the allocator is about to hand ids out of, or
+/// leaving one the allocator will fail on — the split-brain reading of a single number.
+///
+/// `floor` is the one number in hand that is ≥ every inode id whose record is still on disk
+/// (`metadata::high_water_marks`), which is what keeps the repair an over-, never an
+/// under-approximation of the *stored* content. What no floor derived from stored records can
+/// witness is an id that is **no longer stored**: one whose object was deleted
+/// (`metadata::unlink` removes the inode key) or that was handed out and has committed
+/// nothing yet. So this is the best answer available over bytes nobody can read, not a
+/// reconstruction of the lost counter — and that residual is not new: since #364 finding 1
+/// the absent-counter path below has seeded exactly this floor over a store with no counter
+/// at all. Two facts bound it. Re-issuing such an id cannot re-mint a *chunk* id on the path
+/// that calls this: the gateway's minter is a per-process random epoch and never derives an id
+/// from the inode (`crate::Gateway::mint_chunk_id`, `lib.rs:246-258`, ADR-0019), and this
+/// function's only production caller is `Gateway::recover` (`lib.rs:141`). The path that
+/// *does* derive chunk ids from the inode ([`chunk_id_minter`], below) allocates through
+/// [`alloc_inode`], which only ever reads-and-increments a readable counter and never seeds
+/// one, so it cannot be rewound by this repair — only by an operator pointing both
+/// compositions at one store, which is the pre-existing #364 residual and not this call's to
+/// close.
+///
+/// Closing that residual is **allocator-side** work rather than recovery's, and it is tracked
+/// as such. The two answers are a reservation the hand-out path honours, or an allocation that
+/// fails closed over an id whose inode key still exists (`require_absent(inode_key(…))`); and
+/// if a re-issued id must additionally never re-address a deleted object's still-live orphan
+/// fragments, that check belongs to the minter that derives chunk ids from the inode
+/// ([`chunk_id_minter`]), which allocates through [`alloc_inode`] and never reads this seed.
+/// All of it lives where ids are handed out, not where a floor is recovered —
+/// deferred: getwyrd/wyrd#687.
+///
+/// Leaving the bytes in place instead is the quiet failure and a larger one: [`alloc_inode`]
+/// parses this same key (`cli.rs:1653-1657`), so every subsequent new-key PUT would fail on
+/// it and the started gateway would be permanently write-dead until a human invents a
+/// counter — the number the store's own `inode:` records already prove.
 pub async fn seed_next_inode_floor<M: MetadataStore>(meta: &M, floor: u64) -> Result<(), BoxError> {
+    // Never persist a counter below `alloc_inode`'s own first id: id 0 is `ROOT`, which no
+    // allocation may hand out. `floor` is `max_inode + 1` (>= 1) from every caller in the
+    // tree, so this only binds a hypothetical `floor == 0` on the repair path below.
+    let repair_to = floor.max(1);
     loop {
         let current = meta.get(NEXT_INODE_KEY).await?;
-        // An absent counter means "the next id is 1" — `alloc_inode`'s own default.
-        let have: u64 = match &current {
-            Some(bytes) => std::str::from_utf8(bytes)?.parse()?,
-            None => 1,
+        // An absent counter means "the next id is 1" — `alloc_inode`'s own default. Bytes
+        // that do not parse mean the persisted counter states NOTHING: `None` here, which
+        // never satisfies the floor test below, so the compare-and-set always runs and
+        // repairs it.
+        let mut unreadable: Option<&[u8]> = None;
+        let have: Option<u64> = match &current {
+            Some(bytes) => match std::str::from_utf8(bytes).ok().and_then(|s| s.parse().ok()) {
+                Some(id) => Some(id),
+                None => {
+                    unreadable = Some(bytes);
+                    None
+                }
+            },
+            None => Some(1),
         };
-        if have >= floor {
+        if have.is_some_and(|have| have >= floor) {
             return Ok(());
         }
         let guard = match &current {
             Some(bytes) => WriteBatch::new().require(NEXT_INODE_KEY.to_vec(), bytes.clone()),
             None => WriteBatch::new().require_absent(NEXT_INODE_KEY.to_vec()),
         };
-        let batch = guard.put(NEXT_INODE_KEY.to_vec(), floor.to_string().into_bytes());
-        if meta.commit(batch).await? == CommitOutcome::Committed {
+        let batch = guard.put(NEXT_INODE_KEY.to_vec(), repair_to.to_string().into_bytes());
+        let replaced = meta.commit(batch).await? == CommitOutcome::Committed;
+        // Attribute AFTER the compare-and-set, reporting which way it went. Naming the bytes
+        // before the commit would have the losing path assert a destructive repair that never
+        // happened — the peer's value stands and this recovery changed nothing.
+        if let Some(bytes) = unreadable {
+            attribute_unreadable_next_inode(
+                bytes,
+                repair_to,
+                if replaced {
+                    COUNTER_REPLACED
+                } else {
+                    COUNTER_SUPERSEDED
+                },
+            );
+        }
+        if replaced {
             return Ok(());
         }
         // Lost the race with a concurrent allocator/seed — re-read and re-check the floor.
+        // The re-read is what makes progress: whoever won wrote a value, so the next pass
+        // either clears the floor test or compare-and-sets against those bytes. Every
+        // writer of this key in the tree ([`alloc_inode`] and this function) only ever
+        // raises a numeric counter, so the sequence of winning values strictly increases
+        // and the loop cannot cycle.
+        //
+        // What it deliberately does not carry is an attempt budget or a backoff. Each await
+        // above is bounded by the `MetadataStore` implementation that owns the network, not
+        // by this caller (`crates/traits/src/lib.rs:1000-1012`), and how long *startup*
+        // should keep re-trying a contended counter — plus what giving up would mean, since
+        // a budgeted give-up must return either `Err` (ending the totality this function
+        // restores) or `Ok` below the floor (ending the floor invariant) — is
+        // allocator-contention policy rather than recovery totality —
+        // deferred: getwyrd/wyrd#687.
     }
+}
+
+/// How many bytes of an unreadable `meta:next_inode` value the audit event quotes.
+///
+/// A destructive repair records what it replaced, but the seam imposes no ceiling on a
+/// value's size (`crates/traits/src/lib.rs:995-999` leaves that to the backend), so the
+/// quote is bounded: enough to recognise a torn counter, never enough for a damaged value to
+/// become a log flood. The full length is reported beside it.
+const DAMAGED_COUNTER_QUOTE_BYTES: usize = 64;
+
+/// The `outcome` of an [`attribute_unreadable_next_inode`] event when **this** recovery's
+/// compare-and-set replaced the unreadable bytes it names with `repair_to`.
+const COUNTER_REPLACED: &str = "replaced-by-this-recovery";
+/// The `outcome` when the compare-and-set was **lost**: a concurrent writer replaced those
+/// bytes first, so this recovery names what it read and changed nothing. Reported distinctly
+/// because an audit record that claims a destructive repair which did not happen is worse than
+/// no record at all — it sends an operator looking for a write no one made.
+const COUNTER_SUPERSEDED: &str = "superseded-by-a-concurrent-writer";
+
+/// Attribute a `meta:next_inode` value startup recovery could not read, on the durability
+/// plane's audit seam — the same seam and shape the `inode:` walk uses for a row it cannot
+/// account for (`crates/core/src/metadata.rs:2069-2083`).
+///
+/// Called **after** the compare-and-set resolves, with `outcome` saying which way it went
+/// ([`COUNTER_REPLACED`] / [`COUNTER_SUPERSEDED`]), so the event states what the store actually
+/// did rather than what the caller was about to attempt.
+///
+/// The key and the quoted bytes are rendered with [`slice::escape_ascii`] rather than
+/// `String::from_utf8_lossy`: lossy rendering maps every invalid byte onto one replacement
+/// character, so two different damaged values print the same and the operator cannot tell
+/// which store state the event describes. Escaping is injective.
+fn attribute_unreadable_next_inode(value: &[u8], repair_to: u64, outcome: &str) {
+    let quote = &value[..value.len().min(DAMAGED_COUNTER_QUOTE_BYTES)];
+    tracing::warn!(monotonic_counter.recovery_unreadable_inode_counter = 1_u64);
+    tracing::warn!(
+        target: "wyrd.metadata.recovery.audit",
+        action = "unreadable-next-inode-counter",
+        key = %NEXT_INODE_KEY.escape_ascii(),
+        unreadable = %quote.escape_ascii(),
+        unreadable_len = value.len(),
+        repair_to,
+        outcome,
+        "the persisted inode counter does not parse as a u64: it is attributed here with the \
+         bytes it held and the floor recovered from the `inode:` records, and `outcome` says \
+         whether this recovery replaced them or a concurrent writer got there first — so one \
+         damaged key neither stops the gateway from starting nor leaves it write-dead",
+    );
 }
 
 /// Mint chunk ids `inode_id << 64 | seq` — unique across objects and stable
