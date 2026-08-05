@@ -1193,45 +1193,11 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
                 wall_clock_millis(),
             )
             .await?;
-            eprintln!(
-                "wyrd custodian: post-restore reconciliation complete — {} stranded fragment(s) \
-                 marked collectable ({} already marked, {} left to a pending lease, {} displaced \
-                 and kept); {} chunk(s) DANGLING (unreadable AND unreconstructible — the restore \
-                 resurrected maps whose bytes were already reclaimed), {} MISPLACED (bytes \
-                 present but not where the restored map looks — unreadable until the placement is \
-                 fixed), {} under-replicated (the repair loop rebuilds these).",
-                report.stranded_marked,
-                report.already_marked,
-                report.pending_skipped,
-                report.displaced_kept,
-                report.dangling.len(),
-                report.misplaced.len(),
-                report.under_replicated.len(),
-            );
-            if !report.dangling.is_empty() {
-                eprintln!(
-                    "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are LOST. Restoring past a delete \
-                     resurrects the map after GC took the bytes; no reconstruction can rebuild \
-                     them. See the audit log for each chunk id.",
-                    report.dangling.len()
-                );
+            let verdict = restore_verdict(&report);
+            for line in &verdict.lines {
+                eprintln!("{line}");
             }
-            if !report.misplaced.is_empty() {
-                eprintln!(
-                    "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are UNREADABLE but NOT lost. Their \
-                     fragments are on D servers the restored placement does not name (a repair \
-                     moved them after the restore point). Reads and the repair loop both fetch by \
-                     placement, so neither will find them. Restage those fragments onto the placed \
-                     D servers — or repoint the placement — then re-run this pass. Do NOT go to a \
-                     backup: the data is here. See the audit log for each chunk id.",
-                    report.misplaced.len()
-                );
-            }
-            // EXIT NON-ZERO on either. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green: a
-            // restore script checking the status code would record a run that lost data — or one
-            // whose chunks cannot be read — as a healthy one, which is the single worst thing this
-            // command could do. The pass itself succeeded; the restore did not.
-            if !report.dangling.is_empty() || !report.misplaced.is_empty() {
+            if verdict.needs_human {
                 return Ok::<ExitCode, BoxError>(ExitCode::FAILURE);
             }
             return Ok::<ExitCode, BoxError>(ExitCode::SUCCESS);
@@ -1259,6 +1225,140 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
         .await?;
         Ok::<ExitCode, BoxError>(ExitCode::SUCCESS)
     })
+}
+
+/// What the post-restore one-shot tells the operator: every line it prints, and whether the run
+/// **needs a human** — which is also the command's exit status.
+struct RestoreVerdict {
+    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding.
+    lines: Vec<String>,
+    /// Exit non-zero. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green.
+    needs_human: bool,
+}
+
+/// Turn a [`RestoreReport`] into what the operator sees and the status a script reads.
+///
+/// Split out of [`cmd_custodian`] so the exit status and the text that explains it are decided
+/// **together, in one place**, over a report alone — no backend, no fleet, no store — which is
+/// what lets a test pin the pair (`restore_needs_human_agrees_with_every_paragraph_it_prints`
+/// below).
+///
+/// The status is [`RestoreReport::needs_human`] — the report's OWN predicate, not a second one
+/// re-derived here. That is the point: a finding added to the report reaches the exit code by
+/// definition rather than by whoever edits this function remembering to widen an `||` chain, and
+/// the test below pins each finding's paragraph to it so the text cannot drift from the status
+/// either.
+///
+/// EXIT NON-ZERO on any of them. A restore script checking the status code would otherwise
+/// record a run that lost data — or one whose chunks could not be read — as a healthy one, which
+/// is the single worst thing this command could do. The pass itself succeeded; the restore did
+/// not.
+fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
+    let mut lines = vec![format!(
+        "wyrd custodian: post-restore reconciliation {} — {} stranded fragment(s) marked \
+         collectable ({} already marked, {} left to a pending lease, {} displaced and kept); {} \
+         chunk(s) DANGLING (unreadable AND unreconstructible — the restore resurrected maps \
+         whose bytes were already reclaimed), {} MISPLACED (bytes present but not where the \
+         restored map looks — unreadable until the placement is fixed), {} under-replicated (the \
+         repair loop rebuilds these); {} committed object(s) UNREADABLE (their chunk maps could \
+         not be read, so every count here is drawn over the rest of the store).",
+        // NOT "complete" over a store the pass could only partly read: "complete" is a claim
+        // about a reading that FINISHED, and an operator scanning this line for one word must
+        // not find it while a record is still unreadable.
+        if report.unresolvable.is_empty() {
+            "complete"
+        } else {
+            "INCOMPLETE"
+        },
+        report.stranded_marked,
+        report.already_marked,
+        report.pending_skipped,
+        report.displaced_kept,
+        report.dangling.len(),
+        report.misplaced.len(),
+        report.under_replicated.len(),
+        report.unresolvable.len(),
+    )];
+    if !report.dangling.is_empty() {
+        lines.push(format!(
+            "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are LOST. Restoring past a delete \
+             resurrects the map after GC took the bytes; no reconstruction can rebuild them. See \
+             the audit log for each chunk id.",
+            report.dangling.len()
+        ));
+    }
+    if !report.misplaced.is_empty() {
+        lines.push(format!(
+            "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are UNREADABLE but NOT lost. Their \
+             fragments are on D servers the restored placement does not name (a repair moved \
+             them after the restore point). Reads and the repair loop both fetch by placement, \
+             so neither will find them. Restage those fragments onto the placed D servers — or \
+             repoint the placement — then re-run this pass. Do NOT go to a backup: the data is \
+             here. See the audit log for each chunk id.",
+            report.misplaced.len()
+        ));
+    }
+    if !report.unresolvable.is_empty() {
+        lines.push(format!(
+            // NAMED HERE, not deferred to a log. The operator's next move is repairing these
+            // records, and a CLI-only operator — the one running this command off a runbook,
+            // mid-restore, on a box whose log collector may not even be up — cannot act on a
+            // count. `report.unresolvable` already carries every name (`restore.rs`), so
+            // printing them costs nothing but the line width they take.
+            //
+            // The fleet-wide claim POINTS AT the marked count printed a line up rather than
+            // restating it, so the two can never contradict each other. It is 0 by construction
+            // — the pass withholds every mark while either read of the committed namespace
+            // found a hole (`restore.rs`'s one-reading rule) — and this is where an operator
+            // checks that for themselves rather than taking it on trust.
+            "wyrd custodian: NEEDS-HUMAN — {} committed object(s) could not be READ: {}. Their \
+             chunk maps are missing segments or will not decode, so this run says nothing about \
+             the chunks they own and marked nothing anywhere in the fleet ({} stranded \
+             fragment(s) marked, above) — while any object is unreadable no fragment can be shown \
+             to be a stray. Repair or remove the record(s) named here and re-run this pass; until \
+             then the counts above cover the REST of the store only and this run is NOT a clean \
+             bill. The audit log carries each one too (`action=unresolvable-chunk-map`).",
+            report.unresolvable.len(),
+            named_records(&report.unresolvable),
+            report.stranded_marked,
+        ));
+    }
+    RestoreVerdict {
+        // The report's own predicate, deliberately — including the case this command used to
+        // miss: a report the pass could only partly compute, over which the exit code said
+        // "healthy".
+        needs_human: report.needs_human(),
+        lines,
+    }
+}
+
+/// How many blocking records [`restore_verdict`] names inline before it counts the rest.
+///
+/// A bound, not a filter: the paragraph is one stderr line an operator reads mid-restore, and a
+/// store whose whole `inode:` namespace is damaged would otherwise print its every key into it.
+/// Every name is still carried in full by [`RestoreReport::unresolvable`] and by the audit trail
+/// (`action=unresolvable-chunk-map`), and the remainder is stated as a count rather than dropped
+/// — so the line is never a silent truncation, and repairing the ones it names and re-running is
+/// the operator's loop out of the tail.
+const NAMED_UNREADABLE_RECORDS: usize = 20;
+
+/// Name the blocking records for the operator, in the order the pass reported them (the store's
+/// own key order), capped at [`NAMED_UNREADABLE_RECORDS`] with the remainder counted.
+///
+/// The names are `inode:` keys as the store spells them, escaped by the pass itself
+/// (`custodian::gc::object_name`) so two damaged records never arrive under one name — a repair
+/// guided by an ambiguous name fixes one record and leaves the other blocking the store.
+fn named_records(names: &[String]) -> String {
+    let shown = names
+        .iter()
+        .take(NAMED_UNREADABLE_RECORDS)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(", ");
+    match names.len().saturating_sub(NAMED_UNREADABLE_RECORDS) {
+        0 => shown,
+        rest => format!("{shown}, and {rest} more (the audit log names every one)"),
+    }
 }
 
 /// Open the SAME metadata store the cluster wrote to and run ONE post-restore reconciliation
@@ -2606,5 +2706,135 @@ mod tests {
     #[test]
     fn default_chunk_size_is_one_mib() {
         assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
+    }
+
+    /// THE HOLLOW GREEN this command must never print (#651): the exit status and the text are
+    /// **one** decision, and each finding ALONE must both print its NEEDS-HUMAN paragraph and
+    /// flip the status. One finding at a time, because a chain of `||`s is green for the wrong
+    /// reason whenever a sibling finding is also set — and "the exit code ignores this one class"
+    /// is exactly what a restore script would file as a healthy run.
+    ///
+    /// Pinned on the report alone: no backend, no fleet, no store.
+    #[test]
+    fn restore_needs_human_agrees_with_every_paragraph_it_prints() {
+        let dangling = RestoreReport {
+            dangling: vec![1],
+            ..Default::default()
+        };
+        let misplaced = RestoreReport {
+            misplaced: vec![2],
+            ..Default::default()
+        };
+        // Two blockers, under the names the pass reports them by (`gc::object_name` escapes a
+        // non-UTF-8 key rather than replacing its bytes), so "named" below means each of them and
+        // not "one of them was mentioned".
+        let unreadable = RestoreReport {
+            unresolvable: vec!["inode:7".to_owned(), r"inode:\xff".to_owned()],
+            ..Default::default()
+        };
+        // ...and the findings that are NOT a human's: this pass marking strays is it doing its
+        // job, under-replication is the reconstruction loop's. Failing a restore script on either
+        // would train an operator to ignore the status. It is also what stops the rule above
+        // being satisfiable by failing every run.
+        let routine = RestoreReport {
+            stranded_marked: 4,
+            under_replicated: vec![3],
+            ..Default::default()
+        };
+        for (report, human) in [
+            (&dangling, true),
+            (&misplaced, true),
+            (&unreadable, true),
+            (&routine, false),
+        ] {
+            let verdict = restore_verdict(report);
+            let printed = verdict.lines.join("\n");
+            // The status is the REPORT's own predicate — a finding added to the report reaches
+            // the exit code by definition, not by whoever edits this function remembering to
+            // widen an `||` chain.
+            assert_eq!(
+                (verdict.needs_human, report.needs_human()),
+                (human, human),
+                "exit status disagrees with the finding: {report:?} / {printed}"
+            );
+            assert_eq!(
+                printed.contains("NEEDS-HUMAN"),
+                human,
+                "a paragraph without the status behind it, or the reverse: {report:?} / {printed}"
+            );
+            // `is_clean` is the strict superset: nothing that needs a human is ever clean.
+            assert!(!(human && report.is_clean()), "{report:?}");
+            // "complete" is a claim about a reading that FINISHED, and an operator greps this
+            // line for exactly that word — so it appears iff nothing was unreadable, and the
+            // blocking record is NAMED where they read it rather than left to a log.
+            assert_eq!(
+                printed.contains("post-restore reconciliation complete"),
+                report.unresolvable.is_empty(),
+                "{printed}"
+            );
+            // ...and the UNREADABLE paragraph's fleet-wide claim quotes the marked count
+            // printed a line above rather than restating it, so the two can never contradict
+            // each other (never assert a fact the report cannot carry).
+            assert_eq!(
+                printed.contains(&format!(
+                    "({} stranded fragment(s) marked, above)",
+                    report.stranded_marked
+                )),
+                !report.unresolvable.is_empty(),
+                "{printed}"
+            );
+            // Every record the pass could not read is NAMED in what the operator is shown, not
+            // merely counted. A count tells them a repair is needed and not which record to
+            // repair, and the operator this command is written for is mid-restore at a terminal
+            // — the log collector is one of the things a restore brings back up.
+            for object in &report.unresolvable {
+                assert!(
+                    printed.contains(object.as_str()),
+                    "the blocking record {object} is not named in what the operator reads: \
+                     {printed}"
+                );
+            }
+        }
+    }
+
+    /// The bound on that naming, from both sides: up to [`NAMED_UNREADABLE_RECORDS`] blockers are
+    /// named inline, and any beyond it are **counted** rather than dropped — so the line stays one
+    /// an operator can read when a whole namespace is damaged, and never claims to have named
+    /// records it did not. The audit trail and [`RestoreReport::unresolvable`] carry the full list
+    /// either way.
+    #[test]
+    fn restore_verdict_names_the_blocking_records_and_counts_the_ones_it_cannot_fit() {
+        let over = 3;
+        let names: Vec<String> = (0..NAMED_UNREADABLE_RECORDS + over)
+            .map(|id| format!("inode:{id}"))
+            .collect();
+        let report = RestoreReport {
+            unresolvable: names.clone(),
+            ..Default::default()
+        };
+        let printed = restore_verdict(&report).lines.join("\n");
+
+        for object in names.iter().take(NAMED_UNREADABLE_RECORDS) {
+            assert!(
+                printed.contains(object.as_str()),
+                "{object} is within the bound and must be named: {printed}"
+            );
+        }
+        assert!(
+            !printed.contains(names.last().unwrap().as_str()),
+            "the bound must actually bind — otherwise a store whose whole namespace is damaged \
+             prints every key into one line: {printed}"
+        );
+        assert!(
+            printed.contains(&format!("and {over} more")),
+            "records past the bound must be COUNTED, never silently dropped: {printed}"
+        );
+        assert!(
+            printed.contains(&format!(
+                "{} committed object(s) could not be READ",
+                names.len()
+            )),
+            "...and the total is the report's own, not the number that fitted: {printed}"
+        );
     }
 }

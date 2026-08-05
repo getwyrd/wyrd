@@ -37,6 +37,31 @@ use wyrd_traits::{
 #[derive(Default)]
 struct MemMeta {
     kv: Mutex<HashMap<Vec<u8>, Bytes>>,
+    /// A committed record to serve **readable on the first `inode:` scan and unreadable on
+    /// every later one** — a record damaged (or a snapshot superseded) in the instant between
+    /// the pass's two reads of the committed namespace (`decay_after_first_read`).
+    decaying: Mutex<Option<Vec<u8>>>,
+    /// Records to publish into the store **the moment the first `inode:` scan has been served**
+    /// — an object that commits in the instant between the pass's two reads of that namespace
+    /// (`commit_after_first_read`). Invisible to the first read, present in every later one.
+    late: Mutex<Vec<(Vec<u8>, Bytes)>>,
+    inode_scans: Mutex<usize>,
+}
+
+impl MemMeta {
+    fn decay_after_first_read(self, inode: InodeId) -> Self {
+        *self.decaying.lock().unwrap() = Some(metadata::inode_key(inode));
+        self
+    }
+
+    /// Publish `record` under `inode` once the first `inode:` scan has been answered.
+    fn commit_after_first_read(self, inode: InodeId, record: &InodeRecord) -> Self {
+        self.late
+            .lock()
+            .unwrap()
+            .push((metadata::inode_key(inode), metadata::encode(record)));
+        self
+    }
 }
 
 #[async_trait]
@@ -46,14 +71,32 @@ impl MetadataStore for MemMeta {
     }
 
     async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
-        Ok(self
+        let mut rows: Vec<(Vec<u8>, Bytes)> = self
             .kv
             .lock()
             .unwrap()
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
-            .collect())
+            .collect();
+        if prefix.starts_with(b"inode:") {
+            let mut scans = self.inode_scans.lock().unwrap();
+            *scans += 1;
+            if let (2.., Some(decaying)) = (*scans, self.decaying.lock().unwrap().as_deref()) {
+                for (_key, value) in rows.iter_mut().filter(|(key, _)| key == decaying) {
+                    *value = Bytes::from_static(b"not a record");
+                }
+            }
+            if *scans == 1 {
+                // The first read has been answered; the writer's commit lands NOW, so every
+                // later read of this namespace sees an object the first one could not.
+                let mut kv = self.kv.lock().unwrap();
+                for (key, value) in self.late.lock().unwrap().drain(..) {
+                    kv.insert(key, value);
+                }
+            }
+        }
+        Ok(rows)
     }
 
     // The required paginated read (#634): a test double needs *a* body, not a
@@ -159,10 +202,10 @@ async fn commit_chunk(
         .unwrap();
 }
 
-/// Commit an inode holding one **single-fragment** (`EcScheme::None`) chunk on `dserver`.
+/// A committed record holding one **single-fragment** (`EcScheme::None`) chunk on `dserver`.
 /// No redundancy: the lone fragment IS the data, and `k` is 1.
-async fn commit_single_chunk(meta: &MemMeta, inode: InodeId, chunk: ChunkId, dserver: DServerId) {
-    let record = InodeRecord {
+fn single_chunk_record(chunk: ChunkId, dserver: DServerId) -> InodeRecord {
+    InodeRecord {
         size: 5,
         version: 1,
         state: InodeState::Committed,
@@ -174,7 +217,12 @@ async fn commit_single_chunk(meta: &MemMeta, inode: InodeId, chunk: ChunkId, dse
         }]
         .into(),
         ..Default::default()
-    };
+    }
+}
+
+/// Commit [`single_chunk_record`] under `inode`, now.
+async fn commit_single_chunk(meta: &MemMeta, inode: InodeId, chunk: ChunkId, dserver: DServerId) {
+    let record = single_chunk_record(chunk, dserver);
     meta.commit(WriteBatch::new().put(metadata::inode_key(inode), metadata::encode(&record)))
         .await
         .unwrap();
@@ -271,6 +319,16 @@ async fn a_referenced_fragment_is_never_marked() {
              never-reclaim-live-data invariant, breached one step earlier"
         );
     }
+    // THE TRUE BRANCH, on the only store that has a right to it: everything this pass looked at
+    // is intact, it read all of it, and it did nothing. Every other assertion in this crate is
+    // that `is_clean` is FALSE — so without this one it could be `false` unconditionally and the
+    // whole suite would still pass, while the operator command exited non-zero on every healthy
+    // restore and trained its reader to ignore the status (#651). `needs_human`'s false branch is
+    // pinned beside its true ones, in `cli.rs`'s own tests.
+    assert!(
+        report.is_clean(),
+        "a store the pass read in full and found nothing wrong with IS a clean bill: {report:?}"
+    );
 }
 
 /// Idempotence, and specifically that re-running does not RESET a grace clock. A fragment
@@ -826,4 +884,183 @@ async fn a_displaced_fragment_is_only_under_replicated_while_k_survive_at_the_pl
     // The displaced copy is still the only copy of fragment 0, so it is still never marked.
     assert_eq!(report.displaced_kept, 1, "{report:?}");
     assert_eq!(report.stranded_marked, 0, "{report:?}");
+}
+
+// ---- the object the pass could not read: contained, named, and never certified (#651) ----
+
+/// A committed record this pass cannot read makes the reference set **incomplete**, and the
+/// pass then owes the operator three things at once: the report it *could* compute, the NAME of
+/// each record that stopped it, and a refusal to call the run clean.
+///
+/// Two records, because the pass reads the committed namespace twice — once for the mark gate's
+/// reference set, once for the report's per-reference expectations — and BOTH holes are this
+/// run's. `inode:2` will not decode on either read; `inode:3` decodes on the first and not on
+/// the second, as a record damaged in the instant between them does. Naming only the first
+/// read's would let marks be written under a reading the report beside them already disowns:
+/// two readings, two conclusions, and the operator is shown one of them.
+///
+/// These assertions live here rather than in the added discriminator
+/// (`tests/segmented_map_restore.rs`) because they name shapes this patch introduces, and the
+/// per-fix red leg reverts production — a compile error there would score a red as "a symbol is
+/// missing" instead of "the behaviour was wrong". The discriminator pins the same rule as a
+/// conjunction, in base-visible entries only (`marks_and_report_rest_on_one_reading`).
+#[tokio::test]
+async fn every_unreadable_committed_record_is_named_and_stops_the_run_being_certified() {
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+
+    // A healthy object, entirely intact, so nothing about the store itself is wrong.
+    commit_single_chunk(&meta, 1, 41, 0).await;
+    d0.put(frag(41, 0)).await;
+    // ...a committed record no read of this pass can decode...
+    meta.commit(WriteBatch::new().put(metadata::inode_key(2), Bytes::from_static(b"not a record")))
+        .await
+        .unwrap();
+    // ...and one that only the FIRST read gets to see intact.
+    commit_single_chunk(&meta, 3, 44, 0).await;
+    d0.put(frag(44, 0)).await;
+    // A genuine, unreferenced, evidence-free stray — precisely what this pass exists to mark
+    // (`a_stranded_fragment_is_marked_so_gc_can_finally_reclaim_it`). It is the positive
+    // observable for the containment below: "nothing was marked" means something only when
+    // there was something to mark.
+    d0.put(frag(7, 0)).await;
+    let meta = meta.decay_after_first_read(3);
+
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    let report = reconcile_after_restore(&ctx, NOW)
+        .await
+        .expect("an unreadable record must not blank the whole post-restore report");
+
+    assert_eq!(
+        report.unresolvable,
+        vec!["inode:2".to_owned(), "inode:3".to_owned()],
+        "every record either read could not read must be NAMED, by the `inode:` key as the store \
+         spells it — an unattributed refusal is a stall with no way out: {report:?}"
+    );
+    assert!(
+        !report.is_clean() && report.needs_human(),
+        "'clean' is a claim about a reading that FINISHED, and no loop resolves this one — it is \
+         the predicate `wyrd custodian --reconcile-after-restore` exits non-zero on \
+         (`crates/server/src/cli.rs`'s `restore_verdict`): {report:?}"
+    );
+    assert_eq!(
+        report.stranded_marked, 0,
+        "the stray would be marked on a complete reference set; the containment is fleet-wide, \
+         and it is held by BOTH reads: {report:?}"
+    );
+    assert!(
+        meta.get(&metadata::orphan_key(0, frag(7, 0)))
+            .await
+            .unwrap()
+            .is_none(),
+        "...and no `orphan:` record may be written for it either — that record IS the mark"
+    );
+}
+
+/// The other direction of the same rule (#651): the pass's two readings of the committed
+/// namespace can disagree by a reference EXISTING in one of them, not only by a hole. An object
+/// that commits — or a placement a repair repoints — in the instant between them is absent from
+/// the reference set the mark half gates on and present in the expectations the report half
+/// judges. Marking its fragments on the strength of the older reading hands GC the only copy of a
+/// file that was committed moments ago: the never-mark-live-data invariant, breached through the
+/// pass's own two reads rather than through a wrong rule.
+///
+/// Two shapes at once, because the mark gate protects by two rules and both must span both
+/// readings: a valid placement (the fragment is referenced) and a MALFORMED one (the placement
+/// cannot be trusted, so every fragment bearing the chunk's id is off-limits — ADR-0040 decision
+/// 4, exactly as `gc::ReferenceSet` treats one its own read found).
+///
+/// The genuine stray is the control: the containment must be the *divergence's*, not a blanket
+/// refusal to mark anything whenever a store answers two scans differently — that would quietly
+/// undo the leak this pass exists to close.
+#[tokio::test]
+async fn an_object_committed_between_the_two_readings_is_never_marked() {
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+
+    // An object the pass sees on both readings, so the reference set is complete and marking is
+    // authorized at all (nothing is withheld fleet-wide here).
+    commit_single_chunk(&meta, 1, 41, 0).await;
+    d0.put(frag(41, 0)).await;
+    // The stray this pass exists to mark: unreferenced by every reading, evidence-free.
+    let stray = frag(7, 0);
+    d0.put(stray).await;
+
+    // ...and the two objects that commit between the readings, their bytes already on disk (the
+    // fan-out lands before the map does). `late` is a valid single-fragment placement; `torn`'s
+    // placement is non-empty and the wrong length for its scheme — malformed, the shape a
+    // truncated/corrupted record has.
+    let late = frag(55, 0);
+    let torn = frag(56, 0);
+    d0.put(late).await;
+    d0.put(torn).await;
+    let meta = meta
+        .commit_after_first_read(2, &single_chunk_record(late.chunk, 0))
+        .commit_after_first_read(
+            3,
+            &InodeRecord {
+                size: 5,
+                version: 1,
+                state: InodeState::Committed,
+                chunk_map: vec![ChunkRef {
+                    id: torn.chunk,
+                    scheme: EcScheme::None,
+                    len: 5,
+                    placement: vec![0, 0],
+                }]
+                .into(),
+                ..Default::default()
+            },
+        );
+
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+    for (fragment, why) in [
+        (
+            late,
+            "a valid committed placement the report read found names this fragment",
+        ),
+        (
+            torn,
+            "the chunk's placement is malformed on the read that found it, so every fragment \
+             bearing its id is off-limits (fail safe)",
+        ),
+    ] {
+        assert!(
+            meta.get(&metadata::orphan_key(0, fragment))
+                .await
+                .unwrap()
+                .is_none(),
+            "{fragment:?} was marked collectable under a reading that did not know about it — GC \
+             takes it after the grace window, and it is the only copy: {why}. {report:?}"
+        );
+    }
+    assert_eq!(
+        report.stranded_marked, 1,
+        "exactly the one genuine stray: the containment covers what the two readings disagree \
+         about, and nothing else — a pass that stops marking altogether here has re-opened the \
+         leak it exists to close: {report:?}"
+    );
+    assert!(
+        meta.get(&metadata::orphan_key(0, stray))
+            .await
+            .unwrap()
+            .is_some(),
+        "...and that stray really is the one marked: {report:?}"
+    );
 }

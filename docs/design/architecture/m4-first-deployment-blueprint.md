@@ -596,8 +596,8 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #    missing fragments, and the pass would report LIVE DATA AS LOST. It refuses to run on a
 #    partial fleet rather than guess.
 #
-#    It exits NON-ZERO if the restore cost you anything, and distinguishes two very
-#    different bills — read which one before you act:
+#    It exits NON-ZERO if the restore cost you anything — or if it could not read all of the
+#    metadata — and distinguishes three different bills; read which one before you act:
 #      DANGLING  — fewer than k fragments exist ANYWHERE: the file is LOST. You restored past
 #                  a delete, and GC had already taken the bytes. Nothing can rebuild it.
 #      MISPLACED — the bytes EXIST, but not where the restored map points: a repair moved
@@ -606,6 +606,16 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #                  strictly through the placement. This is NOT data loss. Do not reach for
 #                  an older backup: restage those fragments onto the D servers the map names
 #                  (the audit log gives each chunk id), then re-run the pass.
+#      UNREADABLE — a committed object whose chunk map the pass could not READ at all (its
+#                  segments are missing, or the record will not decode). The pass NAMES the
+#                  records to repair — in the paragraph it prints (the first 20 of them, with
+#                  any remainder counted) and every one of them in the audit log — and keeps
+#                  going, so the counts above still hold for every OTHER object; they are not
+#                  a bill for the whole store, and the summary says INCOMPLETE, not
+#                  "complete", while one remains. It also reports how many fragments it
+#                  marked, which is 0 while any object is unreadable: such a map hides which
+#                  chunks it owns, so no fragment can be shown to be a stray. Repair or remove
+#                  those records, then re-run.
 
 # 8. Resume writers, then run a scrub pass (see below).
 ```
