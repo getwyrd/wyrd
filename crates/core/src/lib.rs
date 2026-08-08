@@ -10,6 +10,7 @@
 
 pub mod erasure;
 pub mod metadata;
+pub mod multipart;
 pub mod placement;
 pub mod read;
 pub mod repair;
