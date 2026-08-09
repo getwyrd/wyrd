@@ -963,10 +963,14 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
         .await
         .unwrap();
 
+    // No move: collapsing the chunk's spread would violate durability (gate-zero). And a pass
+    // that made no move may not certify the drain (#710): the fragment is still on the
+    // draining server, so an operator reading `Satisfied` would be told the box is safe to
+    // pull. `Blocked` is the same word every other loop answers work it did not do with.
     assert_eq!(
         outcome,
-        Reconciled::Satisfied,
-        "no move: collapsing the chunk's spread would violate durability (gate-zero)"
+        Reconciled::Blocked,
+        "the drain certified an evacuation that never happened"
     );
     let record = read_inode(&meta).await;
     assert_eq!(record.version, 1, "the placement record is untouched");
@@ -1332,11 +1336,15 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         .with_subscriber(subscriber)
         .await
         .unwrap();
-    // No chunk converged: the only candidate move lost its CAS race.
+    // No chunk converged: the only candidate move lost its CAS race — and a move that did not
+    // persist does not certify (#710). A lost CAS leaves the fragment exactly where the drain
+    // found it, which is the same fact as an abort or a ceiling refusal however differently
+    // each is named, so the pass reports the weaker, true claim rather than a converging drain.
     assert_eq!(
         outcome,
-        Reconciled::Satisfied,
-        "the only evacuation lost the CAS, so no placement was repointed this pass"
+        Reconciled::Blocked,
+        "the only evacuation lost the CAS, so no placement was repointed — yet the drain \
+         certified"
     );
 
     // SAFETY: the placement record reflects the RACING WRITER (version bumped, placement

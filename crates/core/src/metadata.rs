@@ -353,6 +353,34 @@ pub const MAX_ROOT_VALUE_BYTES: usize = 50_000;
 
 const _: () = assert!(MAX_ROOT_VALUE_BYTES * 2 <= MAX_VALUE_BYTES);
 
+/// Whether an already-encoded **flat** record crosses the value ceiling every backend
+/// inherits ([`MAX_VALUE_BYTES`]): `Some` names the ceiling it crossed (the caller's audit
+/// line reports it beside the record's own length), `None` means the write may proceed.
+///
+/// The check a placement-maintenance write path (reconstruction / rebalance) makes on its
+/// own `encode(&next)` **before it writes anything at all**, so a repoint that would not
+/// survive on the tightest backend is REFUSED — classified, persisting nothing, and
+/// distinguishable by the caller from a lost CAS ([`CommitOutcome::Conflict`]): a lost CAS
+/// is worth retrying next pass, this shape never is until something shrinks the record.
+/// Without it the write either reaches [`MetadataStore::commit`] as a raw backend `Err`
+/// indistinguishable from a transient fault, or — on a store with no native enforcement —
+/// commits a record that can then never be re-written, and `:333-341` above is what that
+/// costs: *a root that cannot be re-written is an object whose placement can never be
+/// repaired* (every repair is `require(inode, encode(prior)) + put(inode, encode(next))`).
+///
+/// Bound by the FULL ceiling ([`MAX_VALUE_BYTES`]), not the [`MAX_ROOT_VALUE_BYTES`] half:
+/// that half exists to budget a **segmented** root's segment table against the reserve its
+/// object metadata is spent from, and a flat record has no segment table — its whole value
+/// *is* the record. A segmented root's placement write is #682's, and it is the one that
+/// must weigh [`MAX_ROOT_VALUE_BYTES`].
+///
+/// A record landing EXACTLY on [`MAX_VALUE_BYTES`] is admissible and is **not** refused —
+/// the same `>` boundary the resolver's read side refuses a stored row on (`:2493`), so
+/// nothing refused here is a record a conforming write could have stored.
+pub fn flat_value_ceiling_crossed(encoded: &[u8]) -> Option<usize> {
+    (encoded.len() > MAX_VALUE_BYTES).then_some(MAX_VALUE_BYTES)
+}
+
 /// A structural violation of the segmented chunk-map shape.
 ///
 /// Every variant is raised **at decode** (a stored record is parsed into a value that
@@ -2733,6 +2761,24 @@ mod tests {
                 expected: 6,
                 actual: 2,
             })
+        );
+    }
+
+    #[test]
+    fn the_value_ceiling_admits_the_boundary_and_refuses_only_past_it() {
+        // BOTH sides pinned here, in the crate that owns the constant — the maintenance
+        // loops that call this live in another crate, so a boundary drifting by one byte
+        // would be invisible to this crate's own tests, and either direction of that drift
+        // is a durability fault. Refusing AT the ceiling makes a legal record unwritable (an
+        // object whose placement can never be repaired, `:333-341`); admitting one byte past
+        // it commits a value the tightest backend refuses, the same fault by the other road.
+        assert_eq!(
+            flat_value_ceiling_crossed(&vec![b'x'; MAX_VALUE_BYTES]),
+            None
+        );
+        assert_eq!(
+            flat_value_ceiling_crossed(&vec![b'x'; MAX_VALUE_BYTES + 1]),
+            Some(MAX_VALUE_BYTES)
         );
     }
 

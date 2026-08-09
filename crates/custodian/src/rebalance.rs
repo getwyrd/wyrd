@@ -31,7 +31,7 @@
 //! **copied**, not reconstructed; the shared piece is the failure-domain selector and
 //! the atomic repoint, not the decode.
 //!
-//! Three load-bearing invariants:
+//! Four load-bearing invariants:
 //!
 //! - **Spread wins** (`0005:302-303`, durability is gate-zero): where a move cannot keep
 //!   the chunk on `n` distinct domains (no free distinct domain remains off the draining
@@ -40,6 +40,13 @@
 //! - **Never propagate corruption**: a fragment that is missing or checksum-failing on
 //!   the draining server is **not** moved (that is a loss for the reconstruction loop,
 //!   not a clean drain move) — only an intact fragment is copied.
+//! - **A move that did not persist neither certifies nor counts** (#710): a repoint whose
+//!   re-encoded record would cross the backend value ceiling
+//!   ([`metadata::flat_value_ceiling_crossed`]) is **refused before anything is written** —
+//!   committing one would leave an object whose placement can never be repaired again — and
+//!   a pass that refused, aborted or lost the CAS on a planned move answers
+//!   [`Reconciled::Blocked`], never `Satisfied`: the fragment is still on the draining
+//!   server, and an operator reading a satisfied drain pulls the box.
 //! - **One damaged object never stops the drain, and an incomplete pass never certifies
 //!   one** (#696): every committed record is read through the ONE resolver every other
 //!   consumer shares ([`metadata::resolve_chunk_map`], proposal 0016 decision 7(e)), a
@@ -119,9 +126,10 @@ struct EvacPlan {
 /// One rebalance reconciliation pass over `ctx` at logical time `now_millis`.
 /// Dispatched only from [`crate::reconcile_step`] (the fenced control point) — never a
 /// parallel entry. Returns [`Reconciled::Blocked`] if the pass met a committed object it
-/// could not read or an evacuation it may not perform ([`EvacScan::withheld`]),
-/// [`Reconciled::Changed`] if any chunk's placement record was repointed, and
-/// [`Reconciled::Satisfied`] otherwise.
+/// could not read, an evacuation it may not perform ([`EvacScan::withheld`]), or a planned
+/// move that did **not** persist ([`EvacOutcome::persisted`]); [`Reconciled::Changed`] if
+/// every planned move landed and at least one placement record was repointed; and
+/// [`Reconciled::Satisfied`] only where reality already matched the desired state.
 pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Result<Reconciled> {
     let stores: HashMap<DServerId, &dyn ChunkStore> = ctx.fleet.iter().copied().collect();
 
@@ -140,26 +148,53 @@ pub(crate) async fn reconcile(ctx: &RebalanceContext<'_>, now_millis: u64) -> Re
     let scan = plan_evacuations(ctx.meta, ctx.topology, &draining_set).await?;
 
     let mut changed = false;
+    // Set by any planned move that did NOT persist — the drain's one certification rule,
+    // which #696 deliberately left to this slice. It is the whole rule: a fragment still
+    // sitting on the draining server is still sitting on the draining server, whether the
+    // move was aborted for want of a free distinct domain, refused for crossing the value
+    // ceiling, or lost its CAS. The pass names each of them differently below — it may
+    // certify over none of them.
+    let mut unmoved = false;
     for plan in &scan.plans {
-        match evacuate_chunk(ctx, &stores, plan, &draining_set, now_millis).await? {
+        let outcome = evacuate_chunk(ctx, &stores, plan, &draining_set, now_millis).await?;
+        // Apply the ONE certification rule to the outcome itself, and apply it FIRST — ahead
+        // of the arms that merely name it, so the drain's answer neither depends on an arm nor
+        // can be dropped by one. An arm forgetting to withhold certification is the whole
+        // defect this closes (`EvacOutcome::Aborted => {}` certified a move that never
+        // happened), so the rule is read off the outcome exactly once, before any of them.
+        unmoved |= !outcome.persisted();
+        // Then name what it was on the durability seam.
+        match outcome {
             EvacOutcome::Committed => changed = true,
             EvacOutcome::Conflict => emit_conflict(plan.chunk_id),
-            // deferred: #682 — an ordinary abort (no free distinct domain, an off-fleet /
-            // missing / checksum-failing fragment) is swallowed here exactly as it is on
-            // the base: this child makes only the refusal IT introduces non-certifying,
-            // and whether an abort should also withhold certification is decided with the
-            // segmented write path, whose refusals it would then have to answer for.
+            EvacOutcome::Refused { bytes, ceiling } => {
+                emit_ceiling_refused(plan.chunk_id, bytes, ceiling)
+            }
+            // An ordinary abort (no free distinct domain, an off-fleet / missing /
+            // checksum-failing fragment) keeps the base's silence here — the selector's own
+            // refusal is already the operator's signal for it, and it is transient — but it
+            // no longer certifies the drain: the rule above already withheld that, whatever
+            // this arm does or does not say. The `deferred: #682` marker #696 left on
+            // this arm is DISCHARGED, not dropped: the refusal this slice adds lands in this
+            // same `match`, so leaving the arm silent would have re-created the very defect
+            // it records for the new outcome on the day that outcome was born.
             EvacOutcome::Aborted => {}
         }
     }
 
-    Ok(if scan.withheld {
+    Ok(if scan.withheld || unmoved {
         // Refuse to certify. Whatever was evacuated above is durable either way — every
         // plan was built from a record this pass READ, and a refusal wrote nothing. What
         // answering `Changed` / `Satisfied` would destroy is the only signal that this pass
         // could not finish the drain: an operator reading either is being told the
         // evacuation is converging, and a decommission acts on that (`docs/principles.md`
         // §5 C-1). The same shape GC answers an incomplete reference set with.
+        //
+        // `Blocked` outranks `Changed` ([`Reconciled::least_certified`]), so a pass that
+        // moved one chunk and could not move another still reports the weaker — and true —
+        // claim: this drain has not finished. The operator's per-server query
+        // ([`crate::desired_state::reconciliation_status`]) stays the authority on *which*
+        // server is still referenced; this is one loop's answer about its own pass.
         Reconciled::Blocked
     } else if changed {
         Reconciled::Changed
@@ -185,8 +220,11 @@ struct EvacScan {
     /// * a **malformed** committed placement — skipped + NEEDS-HUMAN ([`emit_needs_human`],
     ///   ADR-0040 decision 4), and already blocked **cluster-wide** at the operator's own
     ///   drain query by [`crate::desired_state::ReconciliationStatus::PendingMalformed`],
-    ///   which is a different surface from one loop's convergence answer;
-    /// * an ordinary [`EvacOutcome::Aborted`] — deferred: #682, see the work loop above.
+    ///   which is a different surface from one loop's convergence answer.
+    ///
+    /// A move that did not persist ([`EvacOutcome::persisted`]) is **not** folded in here
+    /// either — that is a property of one *move*, which the work loop above tracks itself,
+    /// not of this scan of the namespace. Both withhold the same certification.
     withheld: bool,
 }
 
@@ -353,7 +391,36 @@ enum EvacOutcome {
     Conflict,
     /// The move could not proceed — spread could not be preserved (no free distinct
     /// domain), or a fragment was missing / corrupt / off-fleet; nothing was committed.
+    /// Every cause here is **transient**: it clears when a domain frees up, a server
+    /// returns to the fleet view, or the fragment is reconstructed.
     Aborted,
+    /// The repoint would have crossed the backend value ceiling
+    /// ([`metadata::flat_value_ceiling_crossed`]), so it was refused before anything at all
+    /// was written — no fragment copy, no record. Distinct from [`Self::Conflict`] and
+    /// [`Self::Aborted`] precisely because those are transient: this shape fails again every
+    /// pass until the record shrinks, so it is the object's own defect and an operator
+    /// signal ([`emit_ceiling_refused`]).
+    Refused {
+        /// The re-encoded record's own length.
+        bytes: usize,
+        /// The ceiling it crossed.
+        ceiling: usize,
+    },
+}
+
+impl EvacOutcome {
+    /// Whether the move **persisted**. Only a landed commit did; a lost CAS, a ceiling
+    /// refusal and an abort all left the fragment exactly where the drain found it.
+    ///
+    /// ONE rule, asked of the outcome itself rather than re-decided in each arm of the work
+    /// loop, because the defect this closes is precisely a per-arm decision going missing: a
+    /// pass that answered [`Reconciled::Satisfied`] over moves that never happened told an
+    /// operator the box was safe to remove (`docs/principles.md` §5 C-1). A variant added
+    /// later is non-certifying until it says otherwise here, instead of certifying silently
+    /// by falling through — which is how [`Self::Aborted`] came to certify at all.
+    fn persisted(&self) -> bool {
+        matches!(self, Self::Committed)
+    }
 }
 
 /// Evacuate `plan`'s fragment(s) off the draining server(s): copy each to a healthy
@@ -387,10 +454,17 @@ async fn evacuate_chunk(
     // [`plan_evacuations`] and never reaches this far.
     let prior_chunk_map = &plan.prior_chunks;
 
-    // Copy each evacuated fragment to its new home FIRST — before the commit, so a crash
-    // here leaves only collectable garbage, never a torn chunk (`0005:298-299`).
+    // Resolve every fragment this move would copy — its source and target stores, and its
+    // intact bytes — WITHOUT writing any of them yet.
+    //
+    // Every failure in this loop is TRANSIENT (a server outside this pass's fleet view, a
+    // fragment missing or checksum-failing on the draining server): the move aborts and is
+    // re-assessed next pass. They are resolved BEFORE the ceiling refusal below so that a
+    // move which could not have proceeded anyway is never reported as the permanent
+    // "this record must shrink" defect — a compound failure is named by the recoverable
+    // cause, not by the one that pages a human. The refusal still runs before any write.
     let mut new_placement = plan.placement.clone();
-    let mut displaced = Vec::new();
+    let mut copies = Vec::new();
     for (slot, &index) in plan.evac.iter().enumerate() {
         let source = plan.placement[index];
         let target = new_servers[slot];
@@ -413,15 +487,16 @@ async fn evacuate_chunk(
         if !repair::fragment_intact(&bytes, frag, prior_chunk_map[plan.chunk_index].scheme) {
             return Ok(EvacOutcome::Aborted);
         }
-        target_store.put_fragment(frag, bytes).await?;
-        displaced.push((source, frag));
+        copies.push((source, *target_store, frag, bytes));
         new_placement[index] = target;
     }
 
-    // THE binding commit: ONE version-conditional mutation that atomically repoints the
-    // placement record and orphans the displaced fragments on the draining server. The
-    // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
-    // racing writer / superseded custodian loses here rather than corrupting the record.
+    // The record THE binding commit below would leave behind, built here from the selector's
+    // answer alone — no store touched yet — so the move is judged on it before anything is
+    // written. That commit is ONE version-conditional mutation that atomically repoints the
+    // placement record and orphans the displaced fragments on the draining server; the CAS on
+    // the prior inode record is the second fence (`0005:200-203`, ADR-0015), so a racing
+    // writer / superseded custodian loses there rather than corrupting the record.
     let mut next_chunk_map = prior_chunk_map.to_vec();
     next_chunk_map[plan.chunk_index].placement = new_placement;
     let next = InodeRecord {
@@ -434,10 +509,36 @@ async fn evacuate_chunk(
         // the content type.
         ..plan.prior.clone()
     };
+
+    // REFUSE, AND WRITE NOTHING AT ALL. A repoint whose re-encoded record would cross the
+    // value ceiling the tightest backend enforces must never be attempted: on a store with
+    // native enforcement it returns a raw `Err` indistinguishable from a transient fault,
+    // and on one without it, it COMMITS a record every later repair of the object then fails
+    // to overwrite (`crates/core/src/metadata.rs:333-341`). Judged here — after the
+    // transient checks above, and still ahead of the fragment copies below — so a refusal
+    // leaves no unreferenced copy on the target for GC to hold with no grace evidence for
+    // it. The very bytes weighed are the bytes committed, so no re-encode can drift past
+    // the check.
+    let next_bytes = metadata::encode(&next);
+    if let Some(ceiling) = metadata::flat_value_ceiling_crossed(&next_bytes) {
+        return Ok(EvacOutcome::Refused {
+            bytes: next_bytes.len(),
+            ceiling,
+        });
+    }
+
+    // Copy each evacuated fragment to its new home FIRST — before the commit, so a crash
+    // here leaves only collectable garbage, never a torn chunk (`0005:298-299`).
+    let mut displaced = Vec::new();
+    for (source, target_store, frag, bytes) in copies {
+        target_store.put_fragment(frag, bytes).await?;
+        displaced.push((source, frag));
+    }
+
     let inode_key = metadata::inode_key(plan.inode_id);
     let mut batch = WriteBatch::new()
         .require(inode_key.clone(), metadata::encode(&plan.prior))
-        .put(inode_key, metadata::encode(&next));
+        .put(inode_key, next_bytes);
     for (dserver, frag) in &displaced {
         batch = batch.put(
             crate::gc::orphan_key(*dserver, *frag),
@@ -557,5 +658,26 @@ fn emit_conflict(chunk: ChunkId) {
         action = "conflict",
         chunk = %wyrd_traits::chunk_hex(chunk),
         "rebalance lost the version-conditional commit; copied fragments are collectable garbage",
+    );
+}
+
+/// Emit a move **refused** because the repointed record would cross the backend value
+/// ceiling ([`metadata::flat_value_ceiling_crossed`]) on the same seam. Like
+/// [`emit_refused`]'s segmented refusal, nothing at all was written — not even a fragment
+/// copy — and the drain is not certified.
+///
+/// Distinct from [`emit_conflict`] and from a plain abort, which are transient and worth
+/// retrying next pass: this chunk's object will refuse every move until its record shrinks,
+/// so a drain waiting on it never converges on its own. That is the operator's signal — the
+/// box cannot be emptied by waiting (`crates/core/src/metadata.rs:333-341`).
+fn emit_ceiling_refused(chunk: ChunkId, bytes: usize, ceiling: usize) {
+    tracing::warn!(monotonic_counter.rebalance_ceiling_refused = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.rebalance.audit",
+        action = "refused-ceiling",
+        chunk = %wyrd_traits::chunk_hex(chunk),
+        bytes,
+        ceiling,
+        "rebalance refused a move whose repointed record would cross the backend value ceiling; NOTHING was written and this pass does not certify the drain — NEEDS-HUMAN: the object's record must shrink before the fragment can leave the draining server",
     );
 }
