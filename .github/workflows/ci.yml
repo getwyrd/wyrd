@@ -104,7 +104,7 @@ jobs:
       # `cargo xtask ci` shells out to all three (hard-failing in CI if any is
       # missing — see xtask).
       - name: Install cargo-deny + cargo-machete + typos
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.85.9
         with:
           tool: cargo-deny,cargo-machete,typos-cli
 
@@ -220,7 +220,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install typos
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.85.9
         with:
           tool: typos-cli
       - name: Spell-check (source + docs)
