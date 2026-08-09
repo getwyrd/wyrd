@@ -139,8 +139,9 @@ struct RepairPlan {
 /// parallel entry. Returns [`Reconciled::Changed`] if any chunk's placement record was
 /// repointed, [`Reconciled::Satisfied`] otherwise — and [`Reconciled::Blocked`] when the pass
 /// cannot certify what it did not do: a committed object it could not read (its reading has a
-/// hole in it, see [`read_committed`]) or a repair it refused because the chunk's committed
-/// reference lives in a `seg:` record (#682 owns that write path).
+/// hole in it, see [`read_committed`]), a repair it refused because the chunk's committed
+/// reference lives in a `seg:` record (#682 owns that write path), or one it refused because
+/// the repointed record would not survive the backend value ceiling ([`RepairOutcome::Refused`]).
 pub(crate) async fn reconcile(
     ctx: &ReconstructionContext<'_>,
     now_millis: u64,
@@ -268,11 +269,12 @@ pub(crate) async fn reconcile(
     // and, per chunk the pass is reconstructing, the dispatched-repair counter and the
     // time-to-repair sample. Every non-success is offset on its own counter so the
     // up-front count nets back to true successes: a repair that loses the CAS race is
-    // recorded on `reconstruction_conflict`, and one that cannot proceed (the selector
+    // recorded on `reconstruction_conflict`, one that cannot proceed (the selector
     // chose a server outside the fleet view, so nothing is committed) on
-    // `reconstruction_aborted` — so successful repairs are
-    // `reconstruction_repaired − conflict − aborted`. Both offsets leave the obligation
-    // queued, to be re-assessed next pass.
+    // `reconstruction_aborted`, and one refused because the repointed record would cross the
+    // backend value ceiling on `reconstruction_ceiling_refused` — so successful repairs are
+    // `reconstruction_repaired − conflict − aborted − ceiling_refused`. Every offset leaves
+    // the obligation queued, to be re-assessed next pass.
     //
     // The under-replicated count is the *repairable backlog* level (the `Repairable` set,
     // which equals `plans.len()` this pass): it deliberately EXCLUDES both `Unrepairable`
@@ -300,12 +302,20 @@ pub(crate) async fn reconcile(
     // next pass — exactly as on `origin/main`, where every plan is likewise assessed before
     // any repair commits.
     let mut changed = false;
+    // A repair this pass REFUSED because the repointed record would not survive the backend
+    // value ceiling: it wrote nothing at all, the obligation stays queued, and — exactly like
+    // the segmented refusal the reading records — the pass may not certify over it.
+    let mut ceiling_refused = false;
     for plan in &plans {
         let object = &reading.objects[plan.object];
         match repair_chunk(ctx, &stores, object, plan, now_millis).await? {
             RepairOutcome::Committed => changed = true,
             RepairOutcome::Conflict => emit_conflict(plan.chunk_id),
             RepairOutcome::Aborted => emit_aborted(plan.chunk_id),
+            RepairOutcome::Refused { bytes, ceiling } => {
+                ceiling_refused = true;
+                emit_ceiling_refused(plan.chunk_id, bytes, ceiling);
+            }
         }
     }
 
@@ -328,7 +338,10 @@ pub(crate) async fn reconcile(
         ctx.meta.commit(batch).await?;
     }
 
-    Ok(if reading.incomplete || !reading.refused.is_empty() {
+    // A hole in what this pass may claim: an object it could not read, a repair it may not
+    // perform, or one it refused because the record it would leave behind could not survive.
+    let hole = reading.incomplete || !reading.refused.is_empty() || ceiling_refused;
+    Ok(if hole {
         // **This pass certifies only over the reading it performed.** It either could not
         // read every committed object, or held back a repair it may not perform — either way
         // its picture of the store's redundancy has a hole in it. What it DID repair is
@@ -787,8 +800,22 @@ enum RepairOutcome {
     Conflict,
     /// The repair could not proceed (e.g. the selector chose a server outside the
     /// fleet view); nothing was committed. Offset on `reconstruction_aborted` so an
-    /// aborted plan is not mistaken for a success (see [`emit_aborted`]).
+    /// aborted plan is not mistaken for a success (see [`emit_aborted`]). Every cause here
+    /// is **transient**: it clears when the server returns to this pass's fleet view.
     Aborted,
+    /// The repoint would have crossed the backend value ceiling
+    /// ([`metadata::flat_value_ceiling_crossed`]), so it was refused before anything at all
+    /// was written — no rebuilt fragment, no record. Distinct from [`Self::Conflict`] and
+    /// [`Self::Aborted`] precisely because those are transient: this shape fails again every
+    /// pass until the record shrinks, so it is the object's own defect, an operator signal,
+    /// and — like the segmented refusal — a repair this pass may not certify over
+    /// (see [`emit_ceiling_refused`]).
+    Refused {
+        /// The re-encoded record's own length.
+        bytes: usize,
+        /// The ceiling it crossed.
+        ceiling: usize,
+    },
 }
 
 /// Rebuild `plan`'s missing fragment(s), re-place them in distinct failure domains, and
@@ -823,10 +850,18 @@ async fn repair_chunk(
         &plan.survivor_domains,
     )?;
 
-    // Write the rebuilt fragments to their new D servers FIRST — before the commit, so a
-    // crash here leaves only collectable garbage, never a torn chunk (`0005:277`).
+    // Resolve where every rebuilt fragment goes and encode it, WITHOUT writing any of them
+    // yet.
+    //
+    // The failure in this loop is TRANSIENT (a target outside this pass's fleet view): the
+    // repair aborts and is re-assessed next pass. It is resolved BEFORE the ceiling refusal
+    // below so that a repair which could not have been placed anyway is never reported as the
+    // permanent "this record must shrink" defect — a compound failure is named by the
+    // recoverable cause, not by the one that pages a human. The refusal still runs before any
+    // write.
     let mut new_placement = plan.placement.clone();
     let mut displaced = Vec::new();
+    let mut writes = Vec::new();
     for (slot, &index) in plan.missing.iter().enumerate() {
         let target = new_servers[slot];
         let Some(target_store) = stores.get(&target) else {
@@ -841,7 +876,7 @@ async fn repair_chunk(
             chunk: chunk_id,
             index: index as u16,
         };
-        target_store.put_fragment(frag, frag_bytes).await?;
+        writes.push((*target_store, frag, frag_bytes));
 
         let old = plan.placement[index];
         if old != target {
@@ -850,10 +885,12 @@ async fn repair_chunk(
         new_placement[index] = target;
     }
 
-    // THE binding commit: ONE version-conditional mutation that atomically repoints the
-    // placement record, drains the obligation, and orphans the displaced fragments. The
-    // CAS on the prior inode record is the second fence (`0005:200-203`, ADR-0015) — a
-    // racing writer / superseded custodian loses here rather than corrupting the record.
+    // The record THE binding commit below would leave behind, built here from the rebuild's
+    // own targets — no store touched yet — so the repair is judged on it before anything is
+    // written. That commit is ONE version-conditional mutation that atomically repoints the
+    // placement record, drains the obligation, and orphans the displaced fragments; the CAS on
+    // the prior inode record is the second fence (`0005:200-203`, ADR-0015), so a racing
+    // writer / superseded custodian loses there rather than corrupting the record.
     let Some(prior_chunk_map) = object.prior.chunk_map.as_flat() else {
         // Unreachable by construction — a plan exists only for a generation the reading found
         // FLAT, and the reading is the only producer of one. Fail-SAFE rather than fatal all
@@ -874,10 +911,33 @@ async fn repair_chunk(
         // type.
         ..object.prior.clone()
     };
+
+    // REFUSE, AND WRITE NOTHING AT ALL. A repoint whose re-encoded record would cross the
+    // value ceiling the tightest backend enforces must never be attempted: on a store with
+    // native enforcement it returns a raw `Err` indistinguishable from a transient fault,
+    // and on one without it, it COMMITS a record every later repair of the object then fails
+    // to overwrite (`crates/core/src/metadata.rs:333-341`). Judged here — after the transient
+    // check above, and still ahead of the fragment writes below — so a refusal leaves no
+    // unreferenced shard for GC to hold with no grace evidence for it. The very bytes weighed
+    // are the bytes committed, so no re-encode can drift past the check.
+    let next_bytes = metadata::encode(&next);
+    if let Some(ceiling) = metadata::flat_value_ceiling_crossed(&next_bytes) {
+        return Ok(RepairOutcome::Refused {
+            bytes: next_bytes.len(),
+            ceiling,
+        });
+    }
+
+    // Write the rebuilt fragments to their new D servers FIRST — before the commit, so a
+    // crash here leaves only collectable garbage, never a torn chunk (`0005:277`).
+    for (target_store, frag, frag_bytes) in writes {
+        target_store.put_fragment(frag, frag_bytes).await?;
+    }
+
     let inode_key = metadata::inode_key(object.inode_id);
     let mut batch = WriteBatch::new()
         .require(inode_key.clone(), metadata::encode(&object.prior))
-        .put(inode_key, metadata::encode(&next))
+        .put(inode_key, next_bytes)
         .delete(repair::repair_key(chunk_id));
     for (dserver, frag) in &displaced {
         batch = batch.put(
@@ -960,8 +1020,9 @@ fn emit_repair_blocked(count: usize) {
 /// reconstructing. The sample is the logical instant of the repair pass; a per-obligation
 /// enqueue stamp (a precise elapsed window) is a later refinement of the shared queue's
 /// value encoding. A dispatched repair that loses its CAS is recorded separately on
-/// [`emit_conflict`], and one that cannot proceed (no commit) on [`emit_aborted`], so
-/// successful repairs are `reconstruction_repaired − conflict − aborted`.
+/// [`emit_conflict`], one that cannot proceed (no commit) on [`emit_aborted`], and one
+/// refused for crossing the backend value ceiling on [`emit_ceiling_refused`], so
+/// successful repairs are `reconstruction_repaired − conflict − aborted − ceiling_refused`.
 fn emit_repaired(chunk: ChunkId, rebuilt: usize, now_millis: u64) {
     tracing::info!(monotonic_counter.reconstruction_repaired = 1_u64);
     tracing::info!(histogram.reconstruction_time_to_repair_millis = now_millis);
@@ -1068,9 +1129,9 @@ fn emit_conflict(chunk: ChunkId) {
 /// Emit an **aborted** repair on the same seam: the dispatched repair could not proceed
 /// (the selector chose a server outside the fleet view), so nothing was committed. Like
 /// [`emit_conflict`], this offsets the up-front [`emit_repaired`] increment — the
-/// obligation stays queued and the durability-plane success identity stays
-/// `reconstruction_repaired − conflict − aborted`, so an aborted plan never inflates the
-/// successful-repair count.
+/// obligation stays queued and the durability-plane success identity holds
+/// (`reconstruction_repaired − conflict − aborted − ceiling_refused`), so an aborted plan
+/// never inflates the successful-repair count.
 fn emit_aborted(chunk: ChunkId) {
     tracing::info!(monotonic_counter.reconstruction_aborted = 1_u64);
     tracing::info!(
@@ -1078,5 +1139,28 @@ fn emit_aborted(chunk: ChunkId) {
         action = "aborted",
         chunk = %wyrd_traits::chunk_hex(chunk),
         "reconstruction could not place the rebuilt shard(s); nothing was committed and the obligation stays queued",
+    );
+}
+
+/// Emit a repair **refused** because the repointed record would cross the backend value
+/// ceiling ([`metadata::flat_value_ceiling_crossed`]) on the same seam: nothing at all was
+/// written — not the record and not the rebuilt shard(s) — and the obligation stays queued.
+///
+/// It offsets the up-front [`emit_repaired`] increment exactly as [`emit_conflict`] and
+/// [`emit_aborted`] do, joining rather than inflating the documented identity
+/// (`reconstruction_repaired − conflict − aborted − ceiling_refused` = successful repairs;
+/// ADR-0011 §2 names this file as the source of truth for their exact emission). It is
+/// **warn**, not info, because unlike those two it is not transient: this object's placement
+/// can never be repaired again until its record shrinks, so the backlog it leaves behind
+/// never drains on its own — the operator's signal.
+fn emit_ceiling_refused(chunk: ChunkId, bytes: usize, ceiling: usize) {
+    tracing::warn!(monotonic_counter.reconstruction_ceiling_refused = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.reconstruction.audit",
+        action = "refused-ceiling",
+        chunk = %wyrd_traits::chunk_hex(chunk),
+        bytes,
+        ceiling,
+        "reconstruction refused a repair whose repointed record would cross the backend value ceiling; NOTHING was written, the obligation stays queued and this pass does not certify — NEEDS-HUMAN: the object's record must shrink before its placement can be repaired",
     );
 }
