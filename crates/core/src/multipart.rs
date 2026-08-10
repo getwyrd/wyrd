@@ -2,14 +2,22 @@
 //! spelled in (proposal 0016,
 //! `docs/design/proposals/draft/0016-multipart-commit-protocol.md`).
 //!
-//! This is slice 1 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). It is
+//! This is slices 1–2 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). It is
 //! deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
 //! `async fn`. After this module a reader can name every key the protocol will ever write
-//! (`0016` §1, `:333-527`) and parse it back — nothing more. The record **values** those
-//! keys address (`mpu:`'s session shape, `part:`'s chunk list, the `Budget` profile tuple,
-//! `encode_record`/`decode_record`) are the next child's; the outcome enums, the answer
-//! table and `multipart_etag` are the child after that's (`0016` decision 3, `:894-1037`,
-//! `0016:3064-3070`).
+//! (`0016` §1, `:333-527`), parse it back, **and decode the one record value admission turns
+//! on** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
+//! derivations that profile establishes, `0016:348`, `:1469-1470`). The remaining record
+//! values (`mpu:`'s session shape, `part:`'s chunk list) are the next children's; the outcome
+//! enums, the answer table and `multipart_etag` are the child after that's (`0016` decision 3,
+//! `:894-1037`, `0016:3064-3070`).
+//!
+//! There is **no** `encode_record`/`decode_record` envelope, and this header's earlier forward
+//! reference to one is withdrawn: `0016` §1 gives every value a **key-determined** shape
+//! (`:333-356`) and a stored value carries no type tag, so a per-record arm would have nothing
+//! to dispatch on. Each record type instead validates inside its own `Deserialize` over the
+//! store-wide codec [`crate::metadata::encode`] / [`crate::metadata::decode`] — the shape
+//! [`AdmissionRecord`] lands here and every later child repeats.
 //!
 //! # The keyed classes (`0016` §1, `:333-527`)
 //!
@@ -54,8 +62,9 @@
 //!
 //! # Nothing here is written yet — where the living-architecture update belongs
 //!
-//! This module is the key **grammar** only: it has no writer, no store call and no
-//! production consumer (the first writers are the store round trips, #656–#659). The living
+//! This module is the key **grammar** plus the admission ledger's record **shape**: it has no
+//! writer, no store call and no production consumer (the first writers are the store round
+//! trips, #656–#659). The living
 //! architecture doc describes the system **as it is** (`docs/design/README.md:28`), and its
 //! metadata model (`docs/design/architecture/05-building-block-view.md:183-195`) therefore
 //! gains these namespaces with the slice that first *persists* one — documenting records no
@@ -67,7 +76,7 @@ use std::fmt;
 
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use wyrd_traits::ChunkId;
+use wyrd_traits::{ChunkId, SCAN_CAP};
 
 use crate::metadata::{self, InodeId};
 
@@ -76,8 +85,12 @@ use crate::metadata::{self, InodeId};
 //    (ADR-0045; `0016:390-414`)
 // ===========================================================================
 
-/// A structural violation of a multipart **key** — never a silently-corrected default
-/// (ADR-0045, parse-don't-validate; `0016:390-414`).
+/// A structural violation of a multipart **key**, or of a stored multipart **record value**
+/// — never a silently-corrected default (ADR-0045, parse-don't-validate; `0016:390-414`).
+///
+/// Every value-level variant names **one** rule, so a consumer can tell which rule a stored
+/// record broke without parsing a message; that is what lets [`decode_admission_record`]
+/// attribute a torn `mpuctl` to the exact relation it violates rather than to "undecodable".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordError {
     /// A key whose prefix, field count or field syntax does not parse — including a key
@@ -116,6 +129,79 @@ pub enum RecordError {
         /// The rejected text.
         digest: String,
     },
+    /// A record **value** whose bytes are not a well-formed record of its class at all: not
+    /// JSON, the wrong shape, a field missing or of the wrong type or outside its wire type's
+    /// range, or — under `deny_unknown_fields` — a field this build does not know.
+    MalformedRecordValue {
+        /// The record class expected (`mpuctl`).
+        namespace: &'static str,
+        /// The decoder's own message, for the operator signal.
+        detail: String,
+    },
+    /// **G1** — a profile whose `max_part_chunks` is `0` (`0016:1466`, `> 0`). The
+    /// **totality precondition** of the whole record rather than a peer of the rules below:
+    /// at zero the `U_ref` of `0016:1469` is `0`, so the `MAX_SESSIONS` quotient of
+    /// `0016:1470` has no divisor and the ledger's identity is undefined, not merely wrong.
+    MaxPartChunksZero,
+    /// **G2** — a profile whose `max_inflight_parts` is `0` (`0016:1471`, range `[1, …]`): no
+    /// slot can ever be reserved, so no part can ever be committed and no session can ever
+    /// progress.
+    MaxInflightPartsZero,
+    /// **G3** — a profile promising more parts per session than the `part:`/`psum:`/`sidx:`
+    /// key grammar can address ([`MAX_PART_NUMBER`]): the session's later parts would name
+    /// records no parser could read. A **format** bound of the encoding, never a live knob —
+    /// `0016`'s knob table states no operator range for `MAX_PARTS_PER_SESSION` at all.
+    PartsPerSessionUnaddressable {
+        /// The cap found.
+        max_parts_per_session: u32,
+    },
+    /// **G4** — a profile with more parts in flight than the session may ever hold
+    /// (`0016:1471` clamp 1).
+    InflightPartsExceedParts {
+        /// The in-flight cap found.
+        max_inflight_parts: u32,
+        /// The per-session part cap it exceeds.
+        max_parts_per_session: u32,
+    },
+    /// **G5** — a profile whose worst-case owned `sidx:` population per session,
+    /// `max_inflight_parts × max_part_chunks`, is past `SCAN_CAP/2` (`0016:1471`, `:2098`):
+    /// the per-session `scan("sidx:<id>:")` every teardown depends on would fail
+    /// complete-or-fail-loud, stranding that session's residue with no pass that enumerates
+    /// it.
+    StagingRangeUnscannable {
+        /// The owned population that profile can reach, exact.
+        owned_sidx: u128,
+    },
+    /// **G6** — a profile whose staged-chunk ceiling is below one maximal part (`0016:1468`,
+    /// the lower end of the settled range): at least one maximal part must remain stageable,
+    /// or the ceiling refuses the very first part every session must be able to commit.
+    StagedChunksBelowPart {
+        /// The staged ceiling found.
+        max_staged_chunks: u32,
+        /// The per-part chunk cap it is below.
+        max_part_chunks: u32,
+    },
+    /// **G7** — a profile whose reference budget `W_ref` is below one session's own
+    /// worst-case footprint `U_ref` (`0016:1473`, the range `[U_ref, deployment RAM]`): the
+    /// derivation yields a ledger that can never admit a session.
+    BudgetBelowFootprint {
+        /// The budget found.
+        w_ref: u64,
+        /// The per-session footprint it is below (`0016:1469`), exact — this is the one
+        /// quantity a torn record can drive past `u64`, so it is reported at the width it was
+        /// computed at rather than saturated into the field's.
+        u_ref: u128,
+    },
+    /// **G8** — a `mpuctl` whose stored `max_sessions` is not what its **own** profile
+    /// derives (`0016:1470`). The identity this record exists for: `max_sessions` is derived,
+    /// never chosen, and a stored limit disagreeing with the profile beside it admits
+    /// sessions past the memory bound the reconcile pass is sized for (`0016:2593`, X64).
+    MaxSessionsNotDerived {
+        /// The limit the record carries.
+        stored: u64,
+        /// What its own profile derives.
+        derived: u64,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -143,6 +229,48 @@ impl fmt::Display for RecordError {
             Self::DigestNotHex { digest } => write!(
                 f,
                 "{digest:?} is not 64 lowercase-hex characters (a SHA-256 digest)"
+            ),
+            Self::MalformedRecordValue { namespace, detail } => {
+                write!(f, "malformed {namespace} record value: {detail}")
+            }
+            Self::MaxPartChunksZero => write!(f, "`max_part_chunks` is zero, so U_ref is zero"),
+            Self::MaxInflightPartsZero => {
+                write!(f, "`max_inflight_parts` is zero: no slot can be reserved")
+            }
+            Self::PartsPerSessionUnaddressable {
+                max_parts_per_session,
+            } => write!(
+                f,
+                "`max_parts_per_session` {max_parts_per_session} is past the format bound \
+                 {MAX_PART_NUMBER} the part: key grammar can address"
+            ),
+            Self::InflightPartsExceedParts {
+                max_inflight_parts,
+                max_parts_per_session,
+            } => write!(
+                f,
+                "`max_inflight_parts` {max_inflight_parts} exceeds `max_parts_per_session` \
+                 {max_parts_per_session}"
+            ),
+            Self::StagingRangeUnscannable { owned_sidx } => write!(
+                f,
+                "owned sidx: entries per session {owned_sidx} is past SCAN_CAP/2 ({SCAN_HALF})"
+            ),
+            Self::StagedChunksBelowPart {
+                max_staged_chunks,
+                max_part_chunks,
+            } => write!(
+                f,
+                "`max_staged_chunks` {max_staged_chunks} is below one maximal part's \
+                 `max_part_chunks` {max_part_chunks}"
+            ),
+            Self::BudgetBelowFootprint { w_ref, u_ref } => write!(
+                f,
+                "`w_ref` {w_ref} is below one session's worst-case footprint U_ref {u_ref}"
+            ),
+            Self::MaxSessionsNotDerived { stored, derived } => write!(
+                f,
+                "stored `max_sessions` {stored} is not the {derived} its own profile derives"
             ),
         }
     }
@@ -851,4 +979,378 @@ pub fn parse_retire_key(key: &[u8]) -> Result<(RetireMode, RetireToken), RecordE
         _ => return Err(malformed()),
     };
     Ok((mode, token))
+}
+
+// ===========================================================================
+// 5. The admission ledger — the `mpuctl` record VALUE (`0016:348`)
+// ===========================================================================
+
+/// Half [`SCAN_CAP`] — the cardinality ceiling `0016` states two of this record's rules
+/// against: the per-session owned-`sidx:` population (`0016:1471`, `:2098`) and the
+/// `MAX_SESSIONS` clamp that keeps the reaper's `scan("mpu:")` inside one complete-or-fail
+/// scan (`0016:1470`).
+///
+/// [`SCAN_CAP`] earns a place at **decode** where a live capacity knob does not: it is a
+/// **seam** constant, documented in the trait crate as "a correctness constraint, not a
+/// tuning knob" (`crates/traits/src/lib.rs:272-286`) — one number every backend of the trait
+/// must agree on, not a number a deployment chooses. Refusing a stored record against it is
+/// therefore refusing it against the format's own arithmetic, and no operator action can make
+/// a durable ledger unreadable (`0016:390-402`, the boundary
+/// [`crate::metadata::MAX_ROOT_SEGMENTS`] draws for the other direction).
+const SCAN_HALF: u64 = (SCAN_CAP as u64) / 2;
+
+/// The budget **profile** tuple `mpuctl` stores and every admitter and custodian compares
+/// whole (`0016:348`): `(W_ref, MAX_PART_CHUNKS, MAX_PARTS_PER_SESSION, MAX_INFLIGHT_PARTS,
+/// MAX_STAGED_CHUNKS)`. Stored rather than derived per gateway because equal quotients can
+/// hide unequal footprints, so a rolling configuration change cannot leave two gateways
+/// enforcing different bounds (`0016:2605`, X76; `0016:2593`, X64).
+///
+/// The fields are private behind the one fallible conversion every surface funnels through
+/// (`TryFrom<BudgetWire>`, the rules `Budget::checked_rules` states), so no `Budget` exists
+/// whose own derivations are undefined: [`Budget::u_ref`] and [`Budget::max_sessions`] are
+/// total for every value of this type, and a tuple that would make them otherwise is an error
+/// at the boundary rather than a value inside the program (ADR-0045, parse-don't-validate). A
+/// writer-side constructor is deliberately absent — the first writers are the store round
+/// trips (#656–#659), and a knob-range check over an operator's *configuration* is a
+/// different boundary, #508's and #655's (`0016:1458-1466`).
+///
+/// The wire shape is **closed** (`deny_unknown_fields`) for the reason [`AdmissionRecord`]
+/// records: this tuple is part of the value CAS compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "BudgetWire")]
+pub struct Budget {
+    w_ref: u64,
+    max_part_chunks: u32,
+    max_parts_per_session: u32,
+    max_inflight_parts: u32,
+    max_staged_chunks: u32,
+}
+
+impl Budget {
+    /// `W_ref` — the reconcile pass's staged-reference memory budget, in chunk-refs.
+    pub const fn w_ref(&self) -> u64 {
+        self.w_ref
+    }
+
+    /// `MAX_PART_CHUNKS` — chunk-refs one `part:` record may hold.
+    pub const fn max_part_chunks(&self) -> u32 {
+        self.max_part_chunks
+    }
+
+    /// `MAX_PARTS_PER_SESSION` — committed parts one session may hold.
+    pub const fn max_parts_per_session(&self) -> u32 {
+        self.max_parts_per_session
+    }
+
+    /// `MAX_INFLIGHT_PARTS` — the `slot:` key space, hence parts in flight per session.
+    pub const fn max_inflight_parts(&self) -> u32 {
+        self.max_inflight_parts
+    }
+
+    /// `MAX_STAGED_CHUNKS` — chunk-refs a session may hold in committed `part:` records.
+    pub const fn max_staged_chunks(&self) -> u32 {
+        self.max_staged_chunks
+    }
+
+    /// The worst-case **owned `sidx:` population of one session** — `MAX_INFLIGHT_PARTS ×
+    /// MAX_PART_CHUNKS`, the quantity `0016` bounds by `SCAN_CAP/2` (`0016:1471`, `:2098`) and
+    /// charges twice in [`Budget::u_ref_exact`]'s second term (`0016:1469`).
+    ///
+    /// **One definition, used by both**, so the rule (G5) and the charge can never disagree
+    /// about what "in-flight owned refs" means — the reason `checked_chunk_bytes` exists for
+    /// the other cross-checked quantity in this repo (`metadata.rs:1208-1218`).
+    fn inflight_owned_refs(&self) -> u128 {
+        u128::from(self.max_inflight_parts) * u128::from(self.max_part_chunks)
+    }
+
+    /// `U_ref` in **exact** integers, verbatim `0016:1469`:
+    ///
+    /// ```text
+    /// U_ref = min( (MAX_PARTS_PER_SESSION + MAX_INFLIGHT_PARTS) x MAX_PART_CHUNKS ,
+    ///              MAX_STAGED_CHUNKS + 2 x MAX_INFLIGHT_PARTS x MAX_PART_CHUNKS )
+    /// ```
+    ///
+    /// The first term is the raw part-number space; the second is the enforced staged ceiling
+    /// plus the bounded commit overshoot plus the in-flight owned entries — each part charged
+    /// its **full** `max_part_chunks`, because a part is not one unit (`0016:1469`). Which
+    /// term binds is a property of the profile, not a formality: at maximal parts the raw term
+    /// charges far more than Complete would let the session publish, which is why the ceiling
+    /// term exists at all.
+    ///
+    /// **The `u128` width is load-bearing rather than defensive.** A decoder evaluates this
+    /// over bytes it has not yet judged (G7 does, on a candidate), so both terms are computed
+    /// from values a torn record may set to their field maxima: at `max_staged_chunks =
+    /// u32::MAX` the second term leaves `u32`, and at maximal `max_part_chunks` the first
+    /// leaves `u64` — while the `min` can make the leaving term irrelevant, so a record that
+    /// names it may still be legal and must still decode. Same-width arithmetic answers those
+    /// two cases with a panic (debug overflow checks) or a wrapped verdict (release); `u128`
+    /// answers both with the mathematical value, and every operand here is at most `2^65`, so
+    /// the width itself cannot overflow. ADR-0045 names checked arithmetic for the same reason
+    /// on `InodeRecord` version increments and `PendingEntry` lease timestamps
+    /// (`docs/design/adr/0045-metadata-validation-boundaries.md:73-74`).
+    fn u_ref_exact(&self) -> u128 {
+        let raw = (u128::from(self.max_parts_per_session) + u128::from(self.max_inflight_parts))
+            * u128::from(self.max_part_chunks);
+        let ceiling = u128::from(self.max_staged_chunks) + 2 * self.inflight_owned_refs();
+        raw.min(ceiling)
+    }
+
+    /// `U_ref` — this profile's worst-case per-session staged-reference footprint
+    /// (`Budget::u_ref_exact`, `0016:1469`).
+    ///
+    /// Total, and `u64` rather than the `u128` it is computed in: G7 refuses any tuple whose
+    /// `U_ref` exceeds its own `w_ref`, and `w_ref` is a `u64`, so every `Budget` that exists
+    /// has a `U_ref` inside the width its budget is stated in. The narrowing therefore states
+    /// a type invariant the way [`crate::metadata::encode`] states serialization's
+    /// (`metadata.rs:1562-1566`) — not a fallible step with a hidden failure mode.
+    pub fn u_ref(&self) -> u64 {
+        u64::try_from(self.u_ref_exact()).expect("G7 bounds every Budget's U_ref by its w_ref")
+    }
+
+    /// `MAX_SESSIONS = min( ⌊W_ref / U_ref⌋ , SCAN_CAP/2 )` — **derived, never chosen**
+    /// (`0016:1470`).
+    ///
+    /// Both terms bind. The quotient is the memory bound the reconcile pass is sized for
+    /// (`Σ_sessions U_ref ≤ W_ref` by construction); the `SCAN_CAP/2` term is a clamp the
+    /// implementation applies rather than an operator range check, because `W_ref` is sized
+    /// from host RAM and `U_ref` from the caps — a legal pairing (a large `W_ref` with small
+    /// parts) makes the quotient exceed `SCAN_CAP` and break the reaper's `scan("mpu:")`.
+    /// The clamp is what makes the two bounds compose.
+    ///
+    /// Total: G1 ∧ G2 put `U_ref ≥ 1`, so the division always has a divisor.
+    pub fn max_sessions(&self) -> u64 {
+        (self.w_ref / self.u_ref()).min(SCAN_HALF)
+    }
+
+    /// The profile's whole rule set, in one place and applied wherever a [`Budget`] can come
+    /// into existence — the shape `InodeRecord::checked_shape` uses for the other cross-field
+    /// record invariant in this repo (`metadata.rs:1458-1474`).
+    ///
+    /// **These are record rules, not a configuration validator.** Every one relates the
+    /// tuple's own stored components to each other or to a constant of the **format** that
+    /// cannot move under a stored record — [`MAX_PART_NUMBER`] and `SCAN_CAP/2`. The knob
+    /// *ranges* `0016` settles for an operator's choice (the `max_chunkref_bytes`
+    /// value-ceiling that puts `MAX_PART_CHUNKS` in 165–381, the `B_ops` clamp, the
+    /// `MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS` ceiling on `MAX_STAGED_CHUNKS`) are deliberately
+    /// **absent**: those constants have no definition on this base, they are #508's and
+    /// #625's to value, and `0016:1466`/`:1468` enforce them where work is admitted
+    /// (`UploadPart`, part commit). A decode that consulted one would make a durable ledger
+    /// unreadable the day a deployment moved it — what `0016:390-402` and
+    /// [`crate::metadata::MAX_ROOT_SEGMENTS`] both forbid, and this ledger is the record every
+    /// teardown path must read to decrement `count`.
+    ///
+    /// `max_parts_per_session ≥ 1` and `max_inflight_parts ≤ MAX_SLOT_INDEX + 1` are
+    /// deliberately **not** rules of their own: G2 ∧ G4 implies the first, and G3 ∧ G4 binds
+    /// the second tighter than [`MAX_SLOT_INDEX`] would ([`MAX_PART_NUMBER`] is `999_999`).
+    fn checked_rules(&self) -> Result<(), RecordError> {
+        // G1 (`0016:1466`, `> 0`) — the totality precondition, checked FIRST and before any
+        // derivation: at zero, `U_ref` is zero and `MAX_SESSIONS`' quotient has no divisor.
+        if self.max_part_chunks == 0 {
+            return Err(RecordError::MaxPartChunksZero);
+        }
+        // G2 (`0016:1471`, the range `[1, …]`) — the second half of that precondition.
+        if self.max_inflight_parts == 0 {
+            return Err(RecordError::MaxInflightPartsZero);
+        }
+        // G3 — the `part:` key space, the only bound `0016`'s knob table leaves for this cap.
+        if self.max_parts_per_session > MAX_PART_NUMBER {
+            return Err(RecordError::PartsPerSessionUnaddressable {
+                max_parts_per_session: self.max_parts_per_session,
+            });
+        }
+        // G4 (`0016:1471` clamp 1).
+        if self.max_inflight_parts > self.max_parts_per_session {
+            return Err(RecordError::InflightPartsExceedParts {
+                max_inflight_parts: self.max_inflight_parts,
+                max_parts_per_session: self.max_parts_per_session,
+            });
+        }
+        // G5 (`0016:1471`, `:2098`) — the same owned-`sidx:` product `U_ref`'s ceiling term
+        // charges, exact in `u128`, so no wrap can defeat the comparison.
+        let owned_sidx = self.inflight_owned_refs();
+        if owned_sidx > u128::from(SCAN_HALF) {
+            return Err(RecordError::StagingRangeUnscannable { owned_sidx });
+        }
+        // G6 (`0016:1468`, the lower end of the settled range).
+        if self.max_staged_chunks < self.max_part_chunks {
+            return Err(RecordError::StagedChunksBelowPart {
+                max_staged_chunks: self.max_staged_chunks,
+                max_part_chunks: self.max_part_chunks,
+            });
+        }
+        // G7 (`0016:1473`, `W_ref`'s range `[U_ref, deployment RAM]`) — against the exact
+        // `u128` footprint, so one past `u64` compares as the number it is rather than as a
+        // saturated stand-in. It is also what makes [`Budget::u_ref`]'s narrowing total.
+        let u_ref = self.u_ref_exact();
+        if u128::from(self.w_ref) < u_ref {
+            return Err(RecordError::BudgetBelowFootprint {
+                w_ref: self.w_ref,
+                u_ref,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The wire shape of [`Budget`], field order and names exactly as `0016:348` states them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetWire {
+    w_ref: u64,
+    max_part_chunks: u32,
+    max_parts_per_session: u32,
+    max_inflight_parts: u32,
+    max_staged_chunks: u32,
+}
+
+impl TryFrom<BudgetWire> for Budget {
+    type Error = RecordError;
+
+    fn try_from(wire: BudgetWire) -> Result<Self, RecordError> {
+        // The candidate is a local value, returned only once every rule holds — so no caller
+        // can hold a `Budget` that broke one, and the rules can be stated over the same
+        // derivations the type exposes rather than over a parallel copy of them.
+        let budget = Self {
+            w_ref: wire.w_ref,
+            max_part_chunks: wire.max_part_chunks,
+            max_parts_per_session: wire.max_parts_per_session,
+            max_inflight_parts: wire.max_inflight_parts,
+            max_staged_chunks: wire.max_staged_chunks,
+        };
+        budget.checked_rules()?;
+        Ok(budget)
+    }
+}
+
+/// The **admission ledger** singleton, the value under [`MPUCTL_KEY`]: one record, three
+/// fields, CAS'd **whole**, so the count and the limit it was checked against can never be
+/// read apart (`0016:348`, decision 6).
+///
+/// `max_sessions` is checked against `profile` at decode because it is **derived**
+/// ([`Budget::max_sessions`], `0016:1470`) and never independently chosen. Admission enforces
+/// the **stored** limit — deliberately, so every gateway in the fleet agrees on one number
+/// (`0016:2593`, X64) — which is exactly why the stored number may not be free: a torn ledger
+/// naming a larger `max_sessions` than its own profile derives would be trusted fleet-wide,
+/// and `Σ_sessions U_ref ≤ W_ref`, the bound the whole reconcile pass is sized for, would be
+/// exceeded on hosts that never observe the overrun (an OOM landing on the maintenance plane
+/// rather than on the gateway that caused it).
+///
+/// `count` is deliberately **not** checked against `max_sessions`. Occupancy above a lowered
+/// cap is legitimate live state, not a torn identity: a profile lowered while sessions are
+/// live leaves the ledger over its new cap until the population drains, and admission simply
+/// refuses to grow it. Refusing it at decode would make the ledger unreadable exactly when
+/// every teardown path needs to read it to decrement `count` — wedging multipart fleet-wide
+/// with no path that clears it (`0016:390-402`; the same liberal-on-read boundary
+/// [`crate::metadata::MAX_ROOT_SEGMENTS`] draws). The line this record class settles: two
+/// stored spellings of **one** quantity (`max_sessions` versus what `profile` derives) are a
+/// decode error; one quantity merely being large relative to another (`count` versus
+/// `max_sessions`) is not.
+///
+/// # Serialization identity, stated with its domain
+///
+/// For bytes **this codec wrote**, decode→encode is byte-identical: every field is required,
+/// none is optional, defaulted or skipped, and the wire shape is **closed**
+/// (`deny_unknown_fields`), so [`crate::metadata::encode`] re-emits exactly the names, order
+/// and numbers it read. That is the property a whole-record CAS needs, and the reason the
+/// shape is closed rather than tolerant: a dropped-on-read field would be silent, and the two
+/// CAS shapes this repo already contains punish it differently but both durably — the
+/// `inode:` commits precondition on the **re-encoded** prior (`metadata.rs:1794`, `:1919`;
+/// ADR-0047), where the re-encode would no longer equal the stored bytes and every later CAS
+/// would `Conflict` forever, while the `pending:` commits precondition on the **raw bytes they
+/// read** (`metadata.rs:2012`), where the CAS succeeds and the put silently writes the record
+/// back without the field. `0016:348` does not say which shape `mpuctl` takes (that is
+/// #656–#659's), so the closed shape forecloses both — a loud typed decode error at the one
+/// place a human can read it (ADR-0045). Its cost is that a future additive field to this
+/// record is a versioned format change, exactly as `0016:390-402` says a format maximum is.
+///
+/// What that identity does **not** claim: decode is not a canonicalisation check. A foreign
+/// spelling of the same value — fields reordered, whitespace inserted — still decodes, to the
+/// same value, and re-encodes in this codec's spelling rather than in its own; JSON, not this
+/// record, is what makes those spellings equal. So a CAS preconditioned on the *re-encoded*
+/// prior holds exactly while every `mpuctl` writer goes through [`crate::metadata::encode`] —
+/// an obligation of the slices that add the writer (#656–#659), and the reason the alternative
+/// precondition (the raw bytes just read, `metadata.rs:2012`) is equally available to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "AdmissionRecordWire")]
+pub struct AdmissionRecord {
+    count: u64,
+    max_sessions: u64,
+    profile: Budget,
+}
+
+impl AdmissionRecord {
+    /// How many `mpu:` records exist, in any state (`0016:348`).
+    pub const fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// The governing limit those increments were admitted against.
+    pub const fn max_sessions(&self) -> u64 {
+        self.max_sessions
+    }
+
+    /// The budget tuple that establishes [`Self::max_sessions`].
+    pub const fn profile(&self) -> &Budget {
+        &self.profile
+    }
+}
+
+/// The wire shape of [`AdmissionRecord`], field order and names exactly as `0016:348` states
+/// them. Its `profile` is the **unvalidated** [`BudgetWire`], deliberately: the profile's own
+/// rules are applied by [`Budget`]'s conversion inside this record's conversion, where the
+/// typed [`RecordError`] survives — a nested validating `Deserialize` would have been
+/// stringified by serde's `custom` funnel before [`decode_admission_record`] could see it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionRecordWire {
+    count: u64,
+    max_sessions: u64,
+    profile: BudgetWire,
+}
+
+/// The ledger's own rule, over a profile [`Budget`]'s conversion has already judged — the one
+/// place an [`AdmissionRecord`] can come into existence:
+///
+/// * **G8** `max_sessions == profile.max_sessions()` (`0016:1470`).
+impl TryFrom<AdmissionRecordWire> for AdmissionRecord {
+    type Error = RecordError;
+
+    fn try_from(wire: AdmissionRecordWire) -> Result<Self, RecordError> {
+        let profile = Budget::try_from(wire.profile)?;
+        let derived = profile.max_sessions();
+        let stored = wire.max_sessions;
+        if stored != derived {
+            return Err(RecordError::MaxSessionsNotDerived { stored, derived });
+        }
+        Ok(Self {
+            count: wire.count,
+            max_sessions: stored,
+            profile,
+        })
+    }
+}
+
+/// Decode the `mpuctl` value ([`MPUCTL_KEY`]) with its rejection **attributed**: the rule a
+/// stored ledger broke comes back as its own [`RecordError`] variant, not as prose.
+///
+/// The peer of [`crate::metadata`]'s per-record decoders (`decode_segment_record`,
+/// `metadata.rs:2536-2547`), and public for the same reason: the store round trips that read
+/// `mpuctl` (#656–#659) need the fault typed, because "this ledger is torn" and "the store is
+/// failing" are different operator actions and a stringified error is indistinguishable from a
+/// backend outage.
+///
+/// It reaches the wire struct through the store-wide [`crate::metadata::decode`] and then
+/// applies the record's rules directly, rather than decoding into [`AdmissionRecord`] and
+/// recovering the type afterwards: serde's `Error::custom` funnel turns a domain error into a
+/// `serde_json::Error` on the way out, so a `downcast` after the fact cannot see it. Decoding
+/// through [`AdmissionRecord`]'s own `Deserialize` — what [`crate::metadata::decode`] does for
+/// any consumer holding the type — applies the **same** rules and differs only in that the
+/// failure arrives untyped.
+pub fn decode_admission_record(value: &[u8]) -> Result<AdmissionRecord, RecordError> {
+    let wire: AdmissionRecordWire =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "mpuctl",
+            detail: err.to_string(),
+        })?;
+    AdmissionRecord::try_from(wire)
 }
