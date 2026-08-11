@@ -74,6 +74,16 @@ ignore = [
     # reaches us only as a test-only transitive dependency of `madsim` (the DST
     # tier, `wyrd-dst`), never in shipped code. Revisit if madsim moves off it.
     "RUSTSEC-2025-0141",
+    # lru < 0.18.2: `LruCache::pop()` is not panic-safe — a panicking key `Drop`
+    # can leave dangling list pointers (use-after-free). It reaches us only as a
+    # DEV-dependency (`wyrd-server (dev) -> aws-sdk-s3 -> lru`), never in shipped
+    # code, and the UB additionally needs a key type with a panicking `Drop` under
+    # `catch_unwind` — not how the S3 SDK uses its cache. We cannot take the fixed
+    # 0.18.2: aws-sdk-s3 pins `lru ^0.16.3` (raise requested in
+    # awslabs/aws-sdk-rust#1451). REMOVAL TRIGGER: when a Dependabot aws-sdk-s3
+    # bump lifts `lru` past 0.18.2, this entry goes stale and cargo-deny warns
+    # `advisory-not-detected` on every run — delete it then.
+    "RUSTSEC-2026-0253",
 ]
 
 [licenses]
