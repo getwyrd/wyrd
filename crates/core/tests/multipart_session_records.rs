@@ -9,7 +9,9 @@
 //! constructor (the first writer is the store round trip, #656–#659), exactly as
 //! `Budget`/`AdmissionRecord` have none — see their doc for why. Bytes are written out by
 //! hand and fed to two surfaces per validated record: the module's own attributed `decode_*`
-//! (S2) and the store-wide `metadata::decode::<T>` (S1), asserted to agree.
+//! (S2) and the store-wide `metadata::decode::<T>` (S1), asserted to agree — except on
+//! canonicality, the one rule only the byte-holding S2 seam can check (its legs call
+//! `decode_*` directly; see the canonical-bytes section at the end).
 //!
 //! **Serialization identity is asserted on every accepted witness, not test by test.** The
 //! `decode_both` helper below re-encodes whatever it decoded and compares it byte-for-byte
@@ -25,7 +27,10 @@
 //! `placement` length does not match its scheme's fragment count still decodes). Nine
 //! demonstrations total, each isolated so it violates only its own rule. The remaining tests
 //! (round trips, the identity witnesses, the overflow half of 1k) are additional evidence, not
-//! part of that count.
+//! part of that count — as are the two post-review rule sets (#725): the canonical-bytes gate
+//! (a foreign spelling of an accepted value is `NoncanonicalRecordValue`, one leg per record
+//! class) and the `segments_written` key-space bound (`SegmentCursorUnaddressable`, with its
+//! boundary witness).
 //!
 //! No `#![cfg(...)]` here — this file always compiles and always runs.
 
@@ -154,6 +159,10 @@ fn part_summary_bytes(chunks: u32, len: u64, digest: &str, committed_at: u64) ->
 /// Decode `bytes` through the module's attributed decoder `typed_decode` (S2) **and** the
 /// store-wide [`metadata::decode`] (S1), assert the two agree, and — for a value either
 /// accepts — assert that re-encoding it reproduces the bytes it was read from.
+///
+/// Only for witnesses S1 and S2 judge alike — every canonical spelling, accepted or refused.
+/// The canonical-bytes legs bypass this helper on purpose: S2 refuses a foreign spelling of
+/// an accepted value (`NoncanonicalRecordValue`), S1 cannot see the bytes to.
 ///
 /// One generic over all three record types, so no record can be given a weaker check than its
 /// siblings; the bound is the one `multipart_keys.rs:281` already uses for the same reason.
@@ -677,4 +686,119 @@ fn leg_1i_chunk_ref_wrong_placement_length_still_decodes() {
         }]
     );
     assert_eq!(record.chunks()[0].fragment_count(), 3);
+}
+
+// ===========================================================================
+// Canonical bytes (#725 review) — serde reads a foreign spelling of the same value (fields
+// reordered, whitespace inserted, an equivalent `\u` escape) without complaint, so each
+// attributed decoder re-encodes what it decoded and requires the input bytes back
+// (`RecordError::NoncanonicalRecordValue`): the accepted set is exactly the encoder's image,
+// byte for byte, which is what a whole-record CAS on exact bytes turns on (`0016:555-558`).
+// These legs call the `decode_*` surface directly, NOT `decode_both`: canonicality is the one
+// rule S1 (`metadata::decode`) cannot check — it hands serde the parse and never sees the
+// bytes again — so S1 and S2 deliberately disagree on exactly these witnesses.
+// ===========================================================================
+
+/// Fields reordered — the same session record with `object` spelled before `parent`. Every
+/// field survives and every rule of the class holds, so only the canonical-bytes gate can
+/// refuse it.
+#[test]
+fn noncanonical_field_order_is_rejected_for_session() {
+    let bytes = format!(
+        "{{\"object\":\"{OBJECT}\",\"parent\":{PARENT},\
+         \"created_at_millis\":1000,\"clock_source\":\"wall\",\"epoch\":{EPOCH},\
+         \"attempts\":{ATTEMPTS},\"state\":{OPEN_JSON}}}"
+    )
+    .into_bytes();
+    assert_eq!(
+        decode_session_record(&bytes),
+        Err(RecordError::NoncanonicalRecordValue { namespace: "mpu:" })
+    );
+}
+
+/// Whitespace inserted — one space after one colon in an otherwise canonical slot record.
+#[test]
+fn noncanonical_whitespace_is_rejected_for_slot() {
+    let attempt = hex32("bb");
+    let bytes = format!(
+        "{{\"part_number\": 7,\"attempt_id\":\"{attempt}\",\
+         \"reserved_at_millis\":100,\"lease_expiry_millis\":200}}"
+    )
+    .into_bytes();
+    assert_eq!(
+        decode_slot_record(&bytes),
+        Err(RecordError::NoncanonicalRecordValue { namespace: "slot:" })
+    );
+}
+
+/// Fields reordered one level in — a part record whose nested chunk spells `len` before
+/// `scheme`. The outer record is canonical, isolating the gate's reach into nested values.
+#[test]
+fn noncanonical_nested_chunk_order_is_rejected_for_part() {
+    let digest = hex64("a4");
+    let chunk = "{\"id\":1,\"len\":100,\"scheme\":\"None\",\"placement\":[]}";
+    let bytes = part(chunk, 100, &digest, 1);
+    assert_eq!(
+        decode_part_record(&bytes),
+        Err(RecordError::NoncanonicalRecordValue { namespace: "part:" })
+    );
+}
+
+/// An equivalent escape — a part summary whose digest spells its first `a` as the JSON
+/// escape `\u0061`. JSON calls the strings equal; the encoder never writes the escape, so
+/// the bytes are a spelling no CAS built from decode→encode could match.
+#[test]
+fn noncanonical_escape_spelling_is_rejected_for_part_summary() {
+    let digest = hex64("a5");
+    let escaped = format!("\\u0061{}", &digest[1..]);
+    let bytes = part_summary_bytes(3, 150, &escaped, 900);
+    assert_eq!(
+        decode_part_summary(&bytes),
+        Err(RecordError::NoncanonicalRecordValue { namespace: "psum:" })
+    );
+}
+
+// ===========================================================================
+// The segment-write cursor's key-space bound (#725 review) — `segments_written` counts
+// written `seg:` records, and the fixed-width key grammar can address only
+// `MAX_SEGMENT_INDEX + 1` of them (`metadata.rs:275-286`), so a cursor past that counts
+// writes that structurally cannot exist. The bound is the **format** maximum, never the
+// mutable `MAX_ROOT_SEGMENTS` capacity knob — the same line the part-number and slot-index
+// bounds draw (`0016:390-402`).
+// ===========================================================================
+
+/// The boundary is addressable: a `Completing` session claiming every addressable segment
+/// written — `segments_written == MAX_SEGMENT_INDEX + 1` — still decodes (and round-trips).
+#[test]
+fn completing_cursor_at_key_space_boundary_still_decodes() {
+    let cursor = metadata::MAX_SEGMENT_INDEX + 1;
+    let state = format!(
+        "{{\"kind\":\"Completing\",\"fenced_at_millis\":9,\"segments_written\":{cursor},\
+         \"publish_target\":{}}}",
+        publish_target_json(PARENT, OBJECT, EPOCH)
+    );
+    let record = decode_both(&session(EPOCH, &state), decode_session_record)
+        .expect("a cursor naming exactly the whole key space decodes");
+    assert!(matches!(
+        record.state(),
+        SessionState::Completing { segments_written, .. } if *segments_written == cursor
+    ));
+}
+
+/// One past it is refused — with everything else about the witness well-formed (the publish
+/// target agrees with the session's own key and epoch), so only the cursor rule can reject.
+#[test]
+fn completing_cursor_past_key_space_is_rejected() {
+    let cursor = metadata::MAX_SEGMENT_INDEX + 2;
+    let state = format!(
+        "{{\"kind\":\"Completing\",\"fenced_at_millis\":9,\"segments_written\":{cursor},\
+         \"publish_target\":{}}}",
+        publish_target_json(PARENT, OBJECT, EPOCH)
+    );
+    assert_eq!(
+        decode_both(&session(EPOCH, &state), decode_session_record),
+        Err(RecordError::SegmentCursorUnaddressable {
+            segments_written: cursor
+        })
+    );
 }

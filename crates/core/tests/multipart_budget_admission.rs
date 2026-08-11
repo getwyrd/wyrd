@@ -99,12 +99,13 @@ fn round_trip_preserves_every_field() {
 /// and the shape is closed, so the re-encode is the stored bytes — what a whole-record CAS on
 /// the re-encoded prior needs (`metadata.rs:1794`, the `inode:` shape).
 ///
-/// What it is **not** is a canonicalisation check. A foreign spelling of the same value —
-/// fields reordered, whitespace inserted — still decodes, to the *same* value, and re-encodes
-/// in this codec's spelling. That is JSON's doing, not this record's, and it is pinned here
-/// rather than left implicit: it is what makes "byte-identical" a claim about records this
-/// codec wrote, and what obliges #656–#659 to write `mpuctl` through `metadata::encode` (or to
-/// precondition on the raw bytes they read, `metadata.rs:2012`, as `pending:` does).
+/// And it **is** a canonicalisation check (#725 review — this leg pinned the opposite until
+/// then): a foreign spelling of the same value — fields reordered, whitespace inserted — is
+/// refused by the attributed decoder as [`RecordError::NoncanonicalRecordValue`], because it
+/// is stored bytes no decode→encode caller could ever CAS against (`metadata.rs:1794`) or
+/// would silently rewrite (`metadata.rs:2012`). The refusal lives at the `decode_*` seam
+/// alone — the store-wide `metadata::decode` (S1) hands serde the parse and never sees the
+/// bytes, so this witness bypasses `decode_both` and pins the asymmetry explicitly.
 #[test]
 fn re_encoding_a_record_this_codec_wrote_is_byte_identical() {
     let bytes = legal_ledger();
@@ -114,9 +115,15 @@ fn re_encoding_a_record_this_codec_wrote_is_byte_identical() {
     let foreign = br#"{ "max_sessions": 4, "profile": {"max_part_chunks": 165, "w_ref": 72600,
          "max_staged_chunks": 20000, "max_inflight_parts": 10, "max_parts_per_session": 100},
          "count": 3 }"#;
-    let same_value = decode_both(foreign).expect("a foreign spelling of the same value decodes");
-    assert_eq!(same_value, record);
-    assert_eq!(metadata::encode(&same_value).as_ref(), bytes.as_slice());
+    assert_eq!(
+        decode_admission_record(foreign),
+        Err(RecordError::NoncanonicalRecordValue {
+            namespace: "mpuctl"
+        })
+    );
+    let s1_value = metadata::decode::<AdmissionRecord>(foreign)
+        .expect("S1 still reads the foreign spelling; only the byte-holding seam can refuse it");
+    assert_eq!(s1_value, record);
 }
 
 // ===========================================================================

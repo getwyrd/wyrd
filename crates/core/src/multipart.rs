@@ -139,6 +139,17 @@ pub enum RecordError {
         /// The decoder's own message, for the operator signal.
         detail: String,
     },
+    /// A record **value** that parses and passes every rule of its class, but whose bytes are
+    /// not this codec's own spelling of the value they carry — fields reordered, whitespace
+    /// inserted, an equivalent `\u` escape. JSON calls the spellings equal; a whole-record CAS
+    /// on **exact bytes** (`0016:555-558`) does not, so a value only a foreign spelling can
+    /// produce is one no decode→encode caller could ever CAS against: two stored spellings of
+    /// one record are the same hazard for `require` that two key spellings are for
+    /// `require_absent` (the module's own canonical-key rule above).
+    NoncanonicalRecordValue {
+        /// The record class expected.
+        namespace: &'static str,
+    },
     /// **G1** — a profile whose `max_part_chunks` is `0` (`0016:1466`, `> 0`). The
     /// **totality precondition** of the whole record rather than a peer of the rules below:
     /// at zero the `U_ref` of `0016:1469` is `0`, so the `MAX_SESSIONS` quotient of
@@ -227,6 +238,20 @@ pub enum RecordError {
         /// `publish_target`'s epoch.
         target_epoch: u64,
     },
+    /// A `Completing` session whose `segments_written` cursor counts more segments than the
+    /// fixed-width `seg:` key grammar can address — [`crate::metadata::MAX_SEGMENT_INDEX`]` +
+    /// 1` records, indices `0..=MAX_SEGMENT_INDEX` (`metadata.rs:275-286`, the same
+    /// format-bound-vs-capacity-knob line [`RecordError::PartsPerSessionUnaddressable`] draws
+    /// for parts). No recovery can have written a segment record past that index, so a cursor
+    /// claiming it describes writes that structurally cannot exist — trusted, it would let a
+    /// resumed completer skip the whole segment-write phase and flip a root whose segment
+    /// records are missing. The mutable capacity knob `MAX_ROOT_SEGMENTS` is deliberately
+    /// **not** enforced here, for the same reason `attempts` does not consult
+    /// `MAX_COMPLETE_ATTEMPTS`: lowering a knob must never make stored sessions unreadable.
+    SegmentCursorUnaddressable {
+        /// The cursor found.
+        segments_written: u32,
+    },
     /// A `PartRecord` chunk's stored `EcScheme::ReedSolomon` is not one
     /// [`crate::erasure::supported`] can encode/decode — `k == 0`, `m == 0`, or any other pair
     /// the coder rejects (ADR-0045's invariant table, the #285 class read applies at
@@ -296,6 +321,11 @@ impl fmt::Display for RecordError {
             Self::MalformedRecordValue { namespace, detail } => {
                 write!(f, "malformed {namespace} record value: {detail}")
             }
+            Self::NoncanonicalRecordValue { namespace } => write!(
+                f,
+                "{namespace} record value decodes but is not this codec's spelling of it: a \
+                 CAS on its re-encoded bytes could never match the store"
+            ),
             Self::MaxPartChunksZero => write!(f, "`max_part_chunks` is zero, so U_ref is zero"),
             Self::MaxInflightPartsZero => {
                 write!(f, "`max_inflight_parts` is zero: no slot can be reserved")
@@ -352,6 +382,12 @@ impl fmt::Display for RecordError {
                 f,
                 "publish_target epoch {target_epoch} disagrees with the session's own epoch \
                  {session_epoch}"
+            ),
+            Self::SegmentCursorUnaddressable { segments_written } => write!(
+                f,
+                "`segments_written` {segments_written} is past the {} segment records the \
+                 `seg:` key grammar can address",
+                metadata::MAX_SEGMENT_INDEX as u64 + 1
             ),
             Self::ChunkSchemeUnsupported { chunk_id, k, m } => write!(
                 f,
@@ -1364,13 +1400,14 @@ impl TryFrom<BudgetWire> for Budget {
 /// place a human can read it (ADR-0045). Its cost is that a future additive field to this
 /// record is a versioned format change, exactly as `0016:390-402` says a format maximum is.
 ///
-/// What that identity does **not** claim: decode is not a canonicalisation check. A foreign
-/// spelling of the same value — fields reordered, whitespace inserted — still decodes, to the
-/// same value, and re-encodes in this codec's spelling rather than in its own; JSON, not this
-/// record, is what makes those spellings equal. So a CAS preconditioned on the *re-encoded*
-/// prior holds exactly while every `mpuctl` writer goes through [`crate::metadata::encode`] —
-/// an obligation of the slices that add the writer (#656–#659), and the reason the alternative
-/// precondition (the raw bytes just read, `metadata.rs:2012`) is equally available to them.
+/// The other half of that identity is byte-level and lives at the decode entry point:
+/// [`decode_admission_record`] re-encodes what it decoded and requires the input bytes back
+/// (`require_canonical`), so a foreign spelling of the same value — fields reordered,
+/// whitespace inserted — is refused as [`RecordError::NoncanonicalRecordValue`] rather than
+/// decoded to a value whose re-encoding no longer matches the store. JSON calls those
+/// spellings equal; the whole-record CAS does not, and the gate is what frees #656–#659's
+/// writer from ever depending on which precondition shape (`metadata.rs:1794` vs `:2012`) it
+/// takes against bytes some other writer spelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "AdmissionRecordWire")]
 pub struct AdmissionRecord {
@@ -1453,7 +1490,38 @@ pub fn decode_admission_record(value: &[u8]) -> Result<AdmissionRecord, RecordEr
             namespace: "mpuctl",
             detail: err.to_string(),
         })?;
-    AdmissionRecord::try_from(wire)
+    require_canonical(AdmissionRecord::try_from(wire)?, value, "mpuctl")
+}
+
+/// The canonical-bytes gate every `decode_*` in this module closes with: re-encode what
+/// decoded and require the input bytes back, or the value is refused as
+/// [`RecordError::NoncanonicalRecordValue`].
+///
+/// This is what turns each decoder's accepted set into **exactly** the encoder's image, byte
+/// for byte — the property a whole-record CAS turns on (`0016:555-558`): serde reads a foreign
+/// spelling of the same value (fields reordered, whitespace inserted, an equivalent `\u`
+/// escape) without complaint, and every such spelling is a stored record that a decode→encode
+/// caller could never CAS against (`require(key, encode(prior))`, `metadata.rs:1794`, `:1919`,
+/// would `Conflict` forever) or would silently rewrite (`require(key, current)` on the raw
+/// bytes, `metadata.rs:2012`). Two spellings of one record are the `require` hazard that two
+/// spellings of one key are for `require_absent`, and this module already refuses the latter
+/// (the canonical-key rule in the header) — so stored bytes only this codec's own writer could
+/// have produced are the only bytes it will vouch for.
+///
+/// It lives at the `decode_*` seam and **only** there, because only that seam holds the bytes:
+/// the store-wide [`crate::metadata::decode`] surface (S1) hands serde the parse and never
+/// sees the input again, so canonicality is the one rule of these records S1 cannot check —
+/// the reason the identity tests reach these entry points for it.
+fn require_canonical<T: Serialize>(
+    record: T,
+    value: &[u8],
+    namespace: &'static str,
+) -> Result<T, RecordError> {
+    if metadata::encode(&record).as_ref() == value {
+        Ok(record)
+    } else {
+        Err(RecordError::NoncanonicalRecordValue { namespace })
+    }
 }
 
 // ===========================================================================
@@ -1531,7 +1599,9 @@ pub enum SessionState {
     Completing {
         /// When the fence landed (logical milliseconds); `W_completing` is measured from it.
         fenced_at_millis: u64,
-        /// The segment-write cursor (`0016` §3).
+        /// The segment-write cursor (`0016` §3). Bounded at decode by the `seg:` key
+        /// grammar's [`crate::metadata::MAX_SEGMENT_INDEX`]` + 1` — see
+        /// [`RecordError::SegmentCursorUnaddressable`].
         segments_written: u32,
         /// The dirent identity and fence epoch this attempt is publishing under.
         publish_target: PublishTarget,
@@ -1626,10 +1696,11 @@ struct SessionRecordWire {
 /// spelling. Which shape a session transition uses is #656–#659's to choose, so this record
 /// forecloses both.
 ///
-/// What that identity does **not** claim, as [`AdmissionRecord`]'s doc also records: decode is
-/// not a canonicalisation check. A foreign JSON spelling of the same value — fields reordered,
-/// whitespace inserted — still decodes, to the same value, and re-encodes in this codec's
-/// spelling; JSON, not this record, is what makes those spellings equal.
+/// The byte-level half, as for [`AdmissionRecord`]: decode **is** a canonicalisation check.
+/// [`decode_session_record`] re-encodes what it decoded and requires the input bytes back
+/// (`require_canonical`), so a foreign JSON spelling of the same value — fields reordered,
+/// whitespace inserted — is [`RecordError::NoncanonicalRecordValue`], never a value whose
+/// re-encoding a CAS could not match against the store.
 ///
 /// No writer-side constructor: the first writer is the store round trip (#656–#659), and a
 /// `SessionRecord` this module minted directly could not be relied on to hold the identity
@@ -1702,11 +1773,24 @@ impl SessionRecord {
 ///
 /// * **1c** `publish_target.parent`/`name` must equal the session's own `parent`/`object`.
 /// * **1c-epoch** `publish_target.epoch` must equal the session's own `epoch`.
+/// * `segments_written` must not exceed the `seg:` key grammar's
+///   [`crate::metadata::MAX_SEGMENT_INDEX`]` + 1` records — the format bound, never the
+///   `MAX_ROOT_SEGMENTS` capacity knob (see [`RecordError::SegmentCursorUnaddressable`]).
 impl TryFrom<SessionRecordWire> for SessionRecord {
     type Error = RecordError;
 
     fn try_from(wire: SessionRecordWire) -> Result<Self, RecordError> {
-        if let SessionState::Completing { publish_target, .. } = &wire.state {
+        if let SessionState::Completing {
+            segments_written,
+            publish_target,
+            ..
+        } = &wire.state
+        {
+            if *segments_written > metadata::MAX_SEGMENT_INDEX + 1 {
+                return Err(RecordError::SegmentCursorUnaddressable {
+                    segments_written: *segments_written,
+                });
+            }
             if publish_target.parent != wire.parent || publish_target.name != wire.object {
                 return Err(RecordError::PublishTargetKeyMismatch {
                     session_parent: wire.parent,
@@ -1747,7 +1831,7 @@ pub fn decode_session_record(value: &[u8]) -> Result<SessionRecord, RecordError>
             namespace: "mpu:",
             detail: err.to_string(),
         })?;
-    SessionRecord::try_from(wire)
+    require_canonical(SessionRecord::try_from(wire)?, value, "mpu:")
 }
 
 // ===========================================================================
@@ -1836,7 +1920,7 @@ pub fn decode_slot_record(value: &[u8]) -> Result<SlotRecord, RecordError> {
             namespace: "slot:",
             detail: err.to_string(),
         })?;
-    SlotRecord::try_from(wire)
+    require_canonical(SlotRecord::try_from(wire)?, value, "slot:")
 }
 
 // ===========================================================================
@@ -2075,7 +2159,7 @@ pub fn decode_part_record(value: &[u8]) -> Result<PartRecord, RecordError> {
             namespace: "part:",
             detail: err.to_string(),
         })?;
-    PartRecord::try_from(wire)
+    require_canonical(PartRecord::try_from(wire)?, value, "part:")
 }
 
 /// A committed part's **summary**, the `psum:<upload-id>:<part-number>` value (`0016:352`):
@@ -2101,8 +2185,10 @@ pub struct PartSummary {
 /// its own, but a malformed value should still surface [`RecordError::MalformedRecordValue`]
 /// rather than a bare [`crate::metadata::decode`] error escaping untyped.
 pub fn decode_part_summary(value: &[u8]) -> Result<PartSummary, RecordError> {
-    metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
-        namespace: "psum:",
-        detail: err.to_string(),
-    })
+    let summary: PartSummary =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "psum:",
+            detail: err.to_string(),
+        })?;
+    require_canonical(summary, value, "psum:")
 }
