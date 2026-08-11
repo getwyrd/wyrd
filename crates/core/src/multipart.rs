@@ -76,9 +76,10 @@ use std::fmt;
 
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
-use wyrd_traits::{ChunkId, SCAN_CAP};
+use wyrd_traits::{ChunkId, DServerId, SCAN_CAP};
 
-use crate::metadata::{self, InodeId};
+use crate::erasure;
+use crate::metadata::{self, ChunkRef, EcScheme, InodeId};
 
 // ===========================================================================
 // 1. Errors — every structural violation is a typed error, never a value
@@ -137,6 +138,17 @@ pub enum RecordError {
         namespace: &'static str,
         /// The decoder's own message, for the operator signal.
         detail: String,
+    },
+    /// A record **value** that parses and passes every rule of its class, but whose bytes are
+    /// not this codec's own spelling of the value they carry — fields reordered, whitespace
+    /// inserted, an equivalent `\u` escape. JSON calls the spellings equal; a whole-record CAS
+    /// on **exact bytes** (`0016:555-558`) does not, so a value only a foreign spelling can
+    /// produce is one no decode→encode caller could ever CAS against: two stored spellings of
+    /// one record are the same hazard for `require` that two key spellings are for
+    /// `require_absent` (the module's own canonical-key rule above).
+    NoncanonicalRecordValue {
+        /// The record class expected.
+        namespace: &'static str,
     },
     /// **G1** — a profile whose `max_part_chunks` is `0` (`0016:1466`, `> 0`). The
     /// **totality precondition** of the whole record rather than a peer of the rules below:
@@ -202,6 +214,82 @@ pub enum RecordError {
         /// What its own profile derives.
         derived: u64,
     },
+    /// A `Completing` session's `publish_target` names a different `(parent, name)` than the
+    /// session's own `parent`/`object` (`0016:350`, `:561-563`). `publish_target` is the dirent
+    /// identity the fence will flip, never a frozen inode id — a record whose two spellings
+    /// disagree would publish one client's upload under another key.
+    PublishTargetKeyMismatch {
+        /// The session's own parent bucket inode.
+        session_parent: InodeId,
+        /// The session's own object name.
+        session_object: String,
+        /// `publish_target.parent`.
+        target_parent: InodeId,
+        /// `publish_target.name`.
+        target_name: String,
+    },
+    /// A session's `publish_target` carries a fence epoch that disagrees with the session's
+    /// own `epoch` — the F18 class (`0016:350`, `:560-563`): `publish_target`'s epoch is what
+    /// makes the `Completing` fence's segment-group nonce deterministic **for that attempt**,
+    /// so a record whose two epochs disagree addresses another attempt's segment-group.
+    PublishTargetEpochMismatch {
+        /// The session's own epoch.
+        session_epoch: u64,
+        /// `publish_target`'s epoch.
+        target_epoch: u64,
+    },
+    /// A `Completing` session whose `segments_written` cursor counts more segments than the
+    /// fixed-width `seg:` key grammar can address — [`crate::metadata::MAX_SEGMENT_INDEX`]` +
+    /// 1` records, indices `0..=MAX_SEGMENT_INDEX` (`metadata.rs:275-286`, the same
+    /// format-bound-vs-capacity-knob line [`RecordError::PartsPerSessionUnaddressable`] draws
+    /// for parts). No recovery can have written a segment record past that index, so a cursor
+    /// claiming it describes writes that structurally cannot exist — trusted, it would let a
+    /// resumed completer skip the whole segment-write phase and flip a root whose segment
+    /// records are missing. The mutable capacity knob `MAX_ROOT_SEGMENTS` is deliberately
+    /// **not** enforced here, for the same reason `attempts` does not consult
+    /// `MAX_COMPLETE_ATTEMPTS`: lowering a knob must never make stored sessions unreadable.
+    SegmentCursorUnaddressable {
+        /// The cursor found.
+        segments_written: u32,
+    },
+    /// A `PartRecord` chunk's stored `EcScheme::ReedSolomon` is not one
+    /// [`crate::erasure::supported`] can encode/decode — `k == 0`, `m == 0`, or any other pair
+    /// the coder rejects (ADR-0045's invariant table, the #285 class read applies at
+    /// `crate::read::ReadError::InvalidEcScheme`, mirrored here at decode so untrusted stored
+    /// geometry never reaches the read path at all).
+    ChunkSchemeUnsupported {
+        /// The chunk whose stored scheme is invalid.
+        chunk_id: ChunkId,
+        /// The rejected data-fragment count.
+        k: u8,
+        /// The parity-fragment count that accompanied it.
+        m: u8,
+    },
+    /// A `SlotRecord` born already lapsed: `lease_expiry_millis <= reserved_at_millis`
+    /// (`0016:349`). A slot in this shape is reapable the instant it is written, so a live
+    /// part attempt can have its staging reclaimed out from under it.
+    SlotLeaseAlreadyLapsed {
+        /// When the slot was reserved.
+        reserved_at_millis: u64,
+        /// The lease expiry the record carries, at or before `reserved_at_millis`.
+        lease_expiry_millis: u64,
+    },
+    /// A `PartRecord` whose own `len` does not equal the checked sum of its `chunks`' logical
+    /// lengths (`0016:351`) — mirrors [`crate::metadata::SegmentRecord`]'s
+    /// `SegmentLengthMismatch` (`metadata.rs:1170-1185`) for the analogous record here.
+    PartLengthMismatch {
+        /// The `len` the record declares.
+        declared: u64,
+        /// The checked sum of `chunks`' logical lengths.
+        chunks: u64,
+    },
+    /// The checked sum of a `PartRecord`'s `chunks`' logical lengths overflows `u64` — a typed
+    /// error rather than a silent wrap that a same-width comparison against `len` could then
+    /// happily confirm. Mirrors `SegmentLengthOverflow` (`metadata.rs:1208-1218`).
+    PartLengthOverflow {
+        /// How many chunks the absurd list carries.
+        chunks: usize,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -233,6 +321,11 @@ impl fmt::Display for RecordError {
             Self::MalformedRecordValue { namespace, detail } => {
                 write!(f, "malformed {namespace} record value: {detail}")
             }
+            Self::NoncanonicalRecordValue { namespace } => write!(
+                f,
+                "{namespace} record value decodes but is not this codec's spelling of it: a \
+                 CAS on its re-encoded bytes could never match the store"
+            ),
             Self::MaxPartChunksZero => write!(f, "`max_part_chunks` is zero, so U_ref is zero"),
             Self::MaxInflightPartsZero => {
                 write!(f, "`max_inflight_parts` is zero: no slot can be reserved")
@@ -272,6 +365,50 @@ impl fmt::Display for RecordError {
                 f,
                 "stored `max_sessions` {stored} is not the {derived} its own profile derives"
             ),
+            Self::PublishTargetKeyMismatch {
+                session_parent,
+                session_object,
+                target_parent,
+                target_name,
+            } => write!(
+                f,
+                "publish_target ({target_parent}, {target_name:?}) disagrees with the \
+                 session's own ({session_parent}, {session_object:?})"
+            ),
+            Self::PublishTargetEpochMismatch {
+                session_epoch,
+                target_epoch,
+            } => write!(
+                f,
+                "publish_target epoch {target_epoch} disagrees with the session's own epoch \
+                 {session_epoch}"
+            ),
+            Self::SegmentCursorUnaddressable { segments_written } => write!(
+                f,
+                "`segments_written` {segments_written} is past the {} segment records the \
+                 `seg:` key grammar can address",
+                metadata::MAX_SEGMENT_INDEX as u64 + 1
+            ),
+            Self::ChunkSchemeUnsupported { chunk_id, k, m } => write!(
+                f,
+                "chunk {chunk_id:032x}: invalid stored EC scheme rs({k},{m}); unsupported by \
+                 the erasure coder"
+            ),
+            Self::SlotLeaseAlreadyLapsed {
+                reserved_at_millis,
+                lease_expiry_millis,
+            } => write!(
+                f,
+                "slot lease_expiry_millis {lease_expiry_millis} is at or before its own \
+                 reserved_at_millis {reserved_at_millis}"
+            ),
+            Self::PartLengthMismatch { declared, chunks } => write!(
+                f,
+                "declared `len` {declared} does not equal the chunks' summed length {chunks}"
+            ),
+            Self::PartLengthOverflow { chunks } => {
+                write!(f, "summing {chunks} chunks' logical lengths overflows u64")
+            }
         }
     }
 }
@@ -1263,13 +1400,14 @@ impl TryFrom<BudgetWire> for Budget {
 /// place a human can read it (ADR-0045). Its cost is that a future additive field to this
 /// record is a versioned format change, exactly as `0016:390-402` says a format maximum is.
 ///
-/// What that identity does **not** claim: decode is not a canonicalisation check. A foreign
-/// spelling of the same value — fields reordered, whitespace inserted — still decodes, to the
-/// same value, and re-encodes in this codec's spelling rather than in its own; JSON, not this
-/// record, is what makes those spellings equal. So a CAS preconditioned on the *re-encoded*
-/// prior holds exactly while every `mpuctl` writer goes through [`crate::metadata::encode`] —
-/// an obligation of the slices that add the writer (#656–#659), and the reason the alternative
-/// precondition (the raw bytes just read, `metadata.rs:2012`) is equally available to them.
+/// The other half of that identity is byte-level and lives at the decode entry point:
+/// [`decode_admission_record`] re-encodes what it decoded and requires the input bytes back
+/// (`require_canonical`), so a foreign spelling of the same value — fields reordered,
+/// whitespace inserted — is refused as [`RecordError::NoncanonicalRecordValue`] rather than
+/// decoded to a value whose re-encoding no longer matches the store. JSON calls those
+/// spellings equal; the whole-record CAS does not, and the gate is what frees #656–#659's
+/// writer from ever depending on which precondition shape (`metadata.rs:1794` vs `:2012`) it
+/// takes against bytes some other writer spelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "AdmissionRecordWire")]
 pub struct AdmissionRecord {
@@ -1352,5 +1490,705 @@ pub fn decode_admission_record(value: &[u8]) -> Result<AdmissionRecord, RecordEr
             namespace: "mpuctl",
             detail: err.to_string(),
         })?;
-    AdmissionRecord::try_from(wire)
+    require_canonical(AdmissionRecord::try_from(wire)?, value, "mpuctl")
+}
+
+/// The canonical-bytes gate every `decode_*` in this module closes with: re-encode what
+/// decoded and require the input bytes back, or the value is refused as
+/// [`RecordError::NoncanonicalRecordValue`].
+///
+/// This is what turns each decoder's accepted set into **exactly** the encoder's image, byte
+/// for byte — the property a whole-record CAS turns on (`0016:555-558`): serde reads a foreign
+/// spelling of the same value (fields reordered, whitespace inserted, an equivalent `\u`
+/// escape) without complaint, and every such spelling is a stored record that a decode→encode
+/// caller could never CAS against (`require(key, encode(prior))`, `metadata.rs:1794`, `:1919`,
+/// would `Conflict` forever) or would silently rewrite (`require(key, current)` on the raw
+/// bytes, `metadata.rs:2012`). Two spellings of one record are the `require` hazard that two
+/// spellings of one key are for `require_absent`, and this module already refuses the latter
+/// (the canonical-key rule in the header) — so stored bytes only this codec's own writer could
+/// have produced are the only bytes it will vouch for.
+///
+/// It lives at the `decode_*` seam and **only** there, because only that seam holds the bytes:
+/// the store-wide [`crate::metadata::decode`] surface (S1) hands serde the parse and never
+/// sees the input again, so canonicality is the one rule of these records S1 cannot check —
+/// the reason the identity tests reach these entry points for it.
+fn require_canonical<T: Serialize>(
+    record: T,
+    value: &[u8],
+    namespace: &'static str,
+) -> Result<T, RecordError> {
+    if metadata::encode(&record).as_ref() == value {
+        Ok(record)
+    } else {
+        Err(RecordError::NoncanonicalRecordValue { namespace })
+    }
+}
+
+// ===========================================================================
+// 6. The session record — the `mpu:<upload-id>` value (`0016:350`)
+// ===========================================================================
+
+/// The target dirent identity a `Completing` session's fence will flip: parent bucket inode +
+/// object name — **never** a frozen inode id (`0016:350`, `:561-563`), plus the `Completing`
+/// fence epoch `E` that makes the attempt's segment-group nonce deterministic. Stamped onto
+/// the session record the moment it fences into `Completing`.
+///
+/// A plain value with no invariant of its own: its component types ([`InodeId`], `String`,
+/// `u64`) each validate their own shape, and the **identity** it must hold against the session
+/// that carries it — parent/name/epoch must agree with the session's own — is a cross-record
+/// relation, checked in [`SessionRecord`]'s own decode (legs 1c, 1c-epoch), not here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishTarget {
+    /// The bucket inode the publish will bind the name under.
+    pub parent: InodeId,
+    /// The object name the publish will bind.
+    pub name: String,
+    /// The `Completing` fence epoch this attempt is writing under.
+    pub epoch: u64,
+}
+
+/// What a `Completed` session's fence actually published (`0016:350`): the generation it
+/// created or superseded, and a fingerprint of the *ordered* `(part_number, digest)` list the
+/// winning Complete named, so a retried `CompleteMultipartUpload` against the same upload id
+/// can be told apart from a genuinely different assembly (iteration-10 finding 9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Completion {
+    /// The published inode.
+    pub inode: InodeId,
+    /// The published generation's version.
+    pub version: u64,
+    /// The published content's ETag (ADR-0047 — the change token, never MD5).
+    pub etag: Digest,
+    /// When the flip landed (logical milliseconds).
+    pub completed_at_millis: u64,
+    /// A digest of the ordered `(part_number, digest)` list the winning Complete named.
+    pub complete_fingerprint: Digest,
+}
+
+/// A session's lifecycle state (`0016:350`, the state machine at `:528-602`) — decoded on its
+/// own, independent of the rest of [`SessionRecord`], so a malformed state shape is attributed
+/// before any cross-field identity check runs (the Defect field's "each validating inside its
+/// own `Deserialize`").
+///
+/// Only `Completing` carries the fence stamps — `0016:350` states them as landing "on
+/// Completing also": `fenced_at_millis`, `segments_written` and `publish_target`. A value
+/// carrying one under any other state, or missing one while claiming `Completing`, is a
+/// decode error, never a silently-defaulted value (leg 1j; `0016:403-415` names this exact
+/// example: a `Completing`-only `fenced_at_millis` on an `Open` session). Derived
+/// `Deserialize` gives both directions for free: a struct variant with required fields
+/// rejects a value missing one, and `deny_unknown_fields` on the enum rejects a field that
+/// does not belong to the resolved variant — including one that belongs to a *different*
+/// variant, which is exactly the forbidden-field case leg 1j demonstrates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum SessionState {
+    /// Accepting `UploadPart`s; no write to this record.
+    ///
+    /// **Deliberately a zero-field struct variant, not a unit variant.** Serde's generated
+    /// `Deserialize` for an internally-tagged **unit** variant does not consult the rest of
+    /// the map at all once the tag matches, so a stray sibling field is silently ignored even
+    /// under the enum's own `deny_unknown_fields` — verified against this exact serde version
+    /// before relying on it (a unit `Open` let `{"kind":"Open","fenced_at_millis":9}` decode).
+    /// An empty struct variant does not have that gap: it goes through the same
+    /// per-field-name check every non-empty variant does, so an unexpected sibling is
+    /// `unknown field`, which is what leg 1j needs.
+    Open {},
+    /// Fenced for `Complete`: segments are being written (or awaiting the flip) at `epoch`.
+    Completing {
+        /// When the fence landed (logical milliseconds); `W_completing` is measured from it.
+        fenced_at_millis: u64,
+        /// The segment-write cursor (`0016` §3). Bounded at decode by the `seg:` key
+        /// grammar's [`crate::metadata::MAX_SEGMENT_INDEX`]` + 1` — see
+        /// [`RecordError::SegmentCursorUnaddressable`].
+        segments_written: u32,
+        /// The dirent identity and fence epoch this attempt is publishing under.
+        publish_target: PublishTarget,
+    },
+    /// Fenced for teardown without publishing; draining. Same zero-field-variant reasoning as
+    /// `Open`.
+    Aborting {},
+    /// Published; draining.
+    Completed {
+        /// What the fence actually published.
+        completion: Completion,
+    },
+}
+
+/// The **one** spelling of an absent `content_type` this record accepts: the field omitted
+/// (`#[serde(default)]` on the wire below), never a present-but-`null` field.
+///
+/// `Option<String>`'s own `Deserialize` accepts both and maps them to the same `None`, which
+/// would make two stored spellings of one quantity — the line [`AdmissionRecord`]'s doc
+/// already settles as a decode error for `max_sessions`. Here it is worse than redundant: the
+/// record is CAS'd whole (`0016:555-558`) and [`crate::metadata::encode`] **omits** an absent
+/// `content_type` (the `skip_serializing_if` on [`SessionRecord`]'s field), so `null` is a
+/// spelling this codec can decode but can never re-emit — decode→encode would silently rewrite
+/// the stored bytes, which is exactly the identity a whole-record CAS turns on. Requiring a
+/// string when the key is present makes the accepted set **exactly** the encoder's own output,
+/// so `encode(decode(bytes)) == bytes` holds for every value that decodes at all, not merely
+/// for the shapes this codec happens to write.
+///
+/// [`crate::metadata::InodeRecord`]'s own optional trio stops at `skip_serializing_if`
+/// (`metadata.rs:1406-1419`) because it must keep decoding records written before those fields
+/// existed; this record class has **no** stored corpus to stay compatible with — its first
+/// writer is #656–#659 — so the stricter shape costs nothing and closes the spelling.
+///
+/// It never returns `None`: serde calls it only for a **present** key, and absence is the
+/// `#[serde(default)]` beside it. The `Option` in the signature is the field's type, not a
+/// second absence channel.
+fn de_content_type<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some).map_err(|err| {
+        DeError::custom(format!(
+            "content_type: {err} (an absent content type is spelled by omitting the field)"
+        ))
+    })
+}
+
+/// The wire shape of [`SessionRecord`] — every field the session carries regardless of state,
+/// plus `state` itself, whose own [`SessionState`] `Deserialize` enforces which of the
+/// state-dependent fields may accompany it (leg 1j). `deny_unknown_fields` closes the shape
+/// against a field this build does not know (leg 1m), and `de_content_type` closes the one
+/// field that is genuinely optional against its second spelling.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRecordWire {
+    parent: InodeId,
+    object: String,
+    #[serde(default, deserialize_with = "de_content_type")]
+    content_type: Option<String>,
+    created_at_millis: u64,
+    clock_source: String,
+    epoch: u64,
+    attempts: u32,
+    state: SessionState,
+}
+
+/// A multipart upload **session**, the `mpu:<upload-id>` value (`0016:350`): target bucket
+/// (`parent`) + object name, `content_type`, `created_at_millis`, `clock_source`, `epoch`,
+/// `attempts`, and the lifecycle [`SessionState`].
+///
+/// # Serialization identity
+///
+/// **`encode(decode(bytes)) == bytes` for every value this record accepts** — the property a
+/// whole-record CAS on the session turns on: every transition is a compare-and-set on the
+/// session record's **exact current bytes** (`0016:555-558`). It is stated over the accepted
+/// set rather than over the shapes this codec happens to write, so no accepted value can be
+/// one whose re-encode differs from what the store holds.
+///
+/// Seven of the eight fields are required, so their spelling is forced. `content_type` is
+/// genuinely optional (`0016:350`) and is the whole of the argument:
+///
+/// * absent is spelled by **omitting** the field — `skip_serializing_if` below, the
+///   convention [`crate::metadata::InodeRecord`] states at length for its own optional trio
+///   (`metadata.rs:1394-1419`) and `AGENTS.md:170-172` makes a repo rule. Emitting
+///   `"content_type":null` for an absent value instead would put bytes in the store that a
+///   later decode→encode could not reproduce;
+/// * and `null` — `Option`'s other spelling of the same `None` — is refused at decode
+///   (`de_content_type`), because it is the mirror hole: a spelling accepted on read that
+///   the encoder can never write back.
+///
+/// Both halves are needed. Under this repo's two CAS shapes a rewrite-on-decode is durable
+/// either way: `require(key, encode(prior))` (`metadata.rs:1794`, `:1919`) turns it into a
+/// permanent `Conflict`, and `require(key, current)` on the raw bytes read
+/// (`metadata.rs:2012`) lets the CAS win and silently write the record back in the other
+/// spelling. Which shape a session transition uses is #656–#659's to choose, so this record
+/// forecloses both.
+///
+/// The byte-level half, as for [`AdmissionRecord`]: decode **is** a canonicalisation check.
+/// [`decode_session_record`] re-encodes what it decoded and requires the input bytes back
+/// (`require_canonical`), so a foreign JSON spelling of the same value — fields reordered,
+/// whitespace inserted — is [`RecordError::NoncanonicalRecordValue`], never a value whose
+/// re-encoding a CAS could not match against the store.
+///
+/// No writer-side constructor: the first writer is the store round trip (#656–#659), and a
+/// `SessionRecord` this module minted directly could not be relied on to hold the identity
+/// [`decode_session_record`] enforces — precisely the reason [`AdmissionRecord`] and
+/// [`Budget`] omit one too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SessionRecordWire")]
+pub struct SessionRecord {
+    parent: InodeId,
+    object: String,
+    /// Omitted when absent, never emitted as `null`: see this type's "Serialization
+    /// identity". The decode half is `de_content_type`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    created_at_millis: u64,
+    clock_source: String,
+    epoch: u64,
+    attempts: u32,
+    state: SessionState,
+}
+
+impl SessionRecord {
+    /// The bucket inode the session targets.
+    pub const fn parent(&self) -> InodeId {
+        self.parent
+    }
+
+    /// The object name the session targets.
+    pub fn object(&self) -> &str {
+        &self.object
+    }
+
+    /// The client's declared content type, if any.
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    /// When the session was created (logical milliseconds).
+    pub const fn created_at_millis(&self) -> u64 {
+        self.created_at_millis
+    }
+
+    /// The clock source that stamped this session's timestamps (`0016:1957-1990`).
+    pub fn clock_source(&self) -> &str {
+        &self.clock_source
+    }
+
+    /// The session's current epoch; every transition is a fenced CAS that bumps it.
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Complete fences attempted so far. `MAX_COMPLETE_ATTEMPTS` (decision 3) is a live
+    /// **knob**, so it is enforced where a fence is *admitted*, never here: a decode that
+    /// consulted it would make every session written under a higher cap unreadable the day it
+    /// was lowered — including to the teardown path (`0016:390-402`).
+    pub const fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// The session's lifecycle state.
+    pub const fn state(&self) -> &SessionState {
+        &self.state
+    }
+}
+
+/// The session's own cross-field rule, over a [`SessionState`] whose own shape
+/// [`SessionState`]'s `Deserialize` has already judged — the one place a [`SessionRecord`] can
+/// come into existence:
+///
+/// * **1c** `publish_target.parent`/`name` must equal the session's own `parent`/`object`.
+/// * **1c-epoch** `publish_target.epoch` must equal the session's own `epoch`.
+/// * `segments_written` must not exceed the `seg:` key grammar's
+///   [`crate::metadata::MAX_SEGMENT_INDEX`]` + 1` records — the format bound, never the
+///   `MAX_ROOT_SEGMENTS` capacity knob (see [`RecordError::SegmentCursorUnaddressable`]).
+impl TryFrom<SessionRecordWire> for SessionRecord {
+    type Error = RecordError;
+
+    fn try_from(wire: SessionRecordWire) -> Result<Self, RecordError> {
+        if let SessionState::Completing {
+            segments_written,
+            publish_target,
+            ..
+        } = &wire.state
+        {
+            if *segments_written > metadata::MAX_SEGMENT_INDEX + 1 {
+                return Err(RecordError::SegmentCursorUnaddressable {
+                    segments_written: *segments_written,
+                });
+            }
+            if publish_target.parent != wire.parent || publish_target.name != wire.object {
+                return Err(RecordError::PublishTargetKeyMismatch {
+                    session_parent: wire.parent,
+                    session_object: wire.object,
+                    target_parent: publish_target.parent,
+                    target_name: publish_target.name.clone(),
+                });
+            }
+            if publish_target.epoch != wire.epoch {
+                return Err(RecordError::PublishTargetEpochMismatch {
+                    session_epoch: wire.epoch,
+                    target_epoch: publish_target.epoch,
+                });
+            }
+        }
+        Ok(Self {
+            parent: wire.parent,
+            object: wire.object,
+            content_type: wire.content_type,
+            created_at_millis: wire.created_at_millis,
+            clock_source: wire.clock_source,
+            epoch: wire.epoch,
+            attempts: wire.attempts,
+            state: wire.state,
+        })
+    }
+}
+
+/// Decode the `mpu:` value ([`mpu_key`]) with its rejection attributed, the peer of
+/// [`decode_admission_record`] for this record — necessary rather than cosmetic, because
+/// [`SessionRecord`]'s `#[serde(try_from = ...)]` funnels its [`RecordError`] through serde's
+/// `Error::custom` on the way out of a plain [`crate::metadata::decode`] call, stringifying it
+/// before a `downcast` could recover the variant (the reason `decode_admission_record` reaches
+/// its own wire struct directly instead of decoding into the validated type).
+pub fn decode_session_record(value: &[u8]) -> Result<SessionRecord, RecordError> {
+    let wire: SessionRecordWire =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "mpu:",
+            detail: err.to_string(),
+        })?;
+    require_canonical(SessionRecord::try_from(wire)?, value, "mpu:")
+}
+
+// ===========================================================================
+// 7. The slot record — the `slot:<upload-id>:<index>` value (`0016:349`)
+// ===========================================================================
+
+/// The wire shape of [`SlotRecord`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SlotRecordWire {
+    part_number: PartNumber,
+    attempt_id: AttemptId,
+    reserved_at_millis: u64,
+    lease_expiry_millis: u64,
+}
+
+/// One **in-flight part slot**, the `slot:<upload-id>:<index>` value (`0016:349`): which part
+/// number claimed this index, the attempt id that stamped it (so an ambiguous reserve is
+/// settled by re-reading rather than re-reserving a different index), and the reservation's
+/// lease window.
+///
+/// Every field is required and the wire shape is closed, so decode→encode is byte-identical —
+/// see [`SessionRecord`]'s "Serialization identity" for why that matters to a whole-record CAS.
+///
+/// No writer-side constructor — see [`SessionRecord`]'s doc for why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SlotRecordWire")]
+pub struct SlotRecord {
+    part_number: PartNumber,
+    attempt_id: AttemptId,
+    reserved_at_millis: u64,
+    lease_expiry_millis: u64,
+}
+
+impl SlotRecord {
+    /// The part number this slot was reserved for.
+    pub const fn part_number(&self) -> PartNumber {
+        self.part_number
+    }
+
+    /// The attempt id that claimed it.
+    pub fn attempt_id(&self) -> &AttemptId {
+        &self.attempt_id
+    }
+
+    /// When the slot was reserved (logical milliseconds).
+    pub const fn reserved_at_millis(&self) -> u64 {
+        self.reserved_at_millis
+    }
+
+    /// When the reservation's lease expires.
+    pub const fn lease_expiry_millis(&self) -> u64 {
+        self.lease_expiry_millis
+    }
+}
+
+/// The slot's own rule — the one place a [`SlotRecord`] can come into existence:
+///
+/// * **1i (slot half)** `lease_expiry_millis > reserved_at_millis`: a slot born already
+///   lapsed is reapable the instant it is written (`0016:349`).
+impl TryFrom<SlotRecordWire> for SlotRecord {
+    type Error = RecordError;
+
+    fn try_from(wire: SlotRecordWire) -> Result<Self, RecordError> {
+        if wire.lease_expiry_millis <= wire.reserved_at_millis {
+            return Err(RecordError::SlotLeaseAlreadyLapsed {
+                reserved_at_millis: wire.reserved_at_millis,
+                lease_expiry_millis: wire.lease_expiry_millis,
+            });
+        }
+        Ok(Self {
+            part_number: wire.part_number,
+            attempt_id: wire.attempt_id,
+            reserved_at_millis: wire.reserved_at_millis,
+            lease_expiry_millis: wire.lease_expiry_millis,
+        })
+    }
+}
+
+/// Decode the `slot:` value ([`slot_key`]) with its rejection attributed — the peer of
+/// [`decode_admission_record`]/[`decode_session_record`] for this record, and necessary for
+/// the same reason.
+pub fn decode_slot_record(value: &[u8]) -> Result<SlotRecord, RecordError> {
+    let wire: SlotRecordWire =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "slot:",
+            detail: err.to_string(),
+        })?;
+    require_canonical(SlotRecord::try_from(wire)?, value, "slot:")
+}
+
+// ===========================================================================
+// 8. The part record and its summary — `part:`/`psum:<upload-id>:<part-number>`
+//    (`0016:351-352`)
+// ===========================================================================
+
+/// Refuse a chunk whose stored `EcScheme` is not one [`crate::erasure`] can encode/decode —
+/// the nested structural check leg 1i's `PartRecord` half demands (ADR-0045's invariant table:
+/// `EcScheme::ReedSolomon` → `erasure::supported(k, m)`), applied to every chunk a
+/// `PartRecord` carries so untrusted stored geometry never reaches the read path (the #285
+/// class this mirrors at `crate::read::ReadError::InvalidEcScheme`). `EcScheme::None` has no
+/// `(k, m)` pair to check and is always valid.
+fn checked_chunk_scheme(chunk: &ChunkRef) -> Result<(), RecordError> {
+    if let EcScheme::ReedSolomon { k, m } = chunk.scheme {
+        if !erasure::supported(k as usize, m as usize) {
+            return Err(RecordError::ChunkSchemeUnsupported {
+                chunk_id: chunk.id,
+                k,
+                m,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The total logical length of `chunks`, **checked**: overflow is an error, never a wrap — the
+/// definition this decode check applies (mirrors [`crate::metadata`]'s `checked_chunk_bytes`,
+/// `metadata.rs:1208-1218`, the same cross-check for the analogous `SegmentRecord`).
+fn checked_chunk_len(chunks: &[ChunkRef]) -> Result<u64, RecordError> {
+    chunks
+        .iter()
+        .try_fold(0u64, |total, chunk| total.checked_add(chunk.len))
+        .ok_or(RecordError::PartLengthOverflow {
+            chunks: chunks.len(),
+        })
+}
+
+/// The wire shape of one chunk of a [`PartRecord`] — a **closed** mirror of
+/// [`crate::metadata::ChunkRef`], read in its place so the nested value is judged by exactly
+/// the rules the record around it is (ADR-0045; the invariant this child restores).
+///
+/// [`crate::metadata::ChunkRef`]'s own `Deserialize` is deliberately **tolerant** in two ways
+/// that are right for the record class it was written for and wrong for this one
+/// (`metadata.rs:114-140`):
+///
+/// * `placement` is `#[serde(default)]` — "additive metadata on a never-yet-deployed schema"
+///   (`metadata.rs:120-124`), so an `inode:` written before the field decodes with an empty
+///   vector. Nothing skips it on the way out, so a chunk that arrived **without** `placement`
+///   re-encodes **with** `"placement":[]`;
+/// * the shape is **open** — an unknown field inside a chunk object is silently dropped, and
+///   re-encodes gone.
+///
+/// Both are the same fault this module refuses one level up (leg 1m, and [`SessionRecord`]'s
+/// "Serialization identity"): a value accepted on read whose re-encode is not the bytes read.
+/// A `part:` record is CAS'd whole exactly as the session is, so under
+/// `require(key, encode(prior))` (`metadata.rs:1794`, `:1919`) that chunk wedges every later
+/// commit on a permanent `Conflict`, and under `require(key, current)`
+/// (`metadata.rs:2012`) the CAS wins and the put silently rewrites the record — dropping a
+/// field a later build wrote, or inserting one the stored bytes never had.
+///
+/// This class has **no** stored corpus to stay compatible with — its first writer is the part
+/// commit of #656–#659, and [`crate::metadata::encode`] always emits `placement` for a
+/// `ChunkRef` (there is no `skip_serializing_if` on it) — so requiring the field and closing
+/// the shape makes the accepted set **exactly** the encoder's own output. It is deliberately
+/// not a change to `ChunkRef` itself: `inode:`/`seg:` records have a stored corpus that turns
+/// on that tolerance, and this child's scope pins `metadata.rs` untouched.
+///
+/// **Geometry is judged, length is not.** `placement`'s *length* is still unchecked here — the
+/// standing contextual check, liberal on read (ADR-0045, `AGENTS.md:146-149`,
+/// `0016:416-429`): a present-but-wrong-length vector decodes, because it re-encodes exactly
+/// as it arrived. Absence and presence are different questions from length.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChunkRefWire {
+    id: ChunkId,
+    scheme: EcSchemeWire,
+    len: u64,
+    placement: Vec<DServerId>,
+}
+
+impl From<ChunkRefWire> for ChunkRef {
+    fn from(wire: ChunkRefWire) -> Self {
+        Self {
+            id: wire.id,
+            scheme: wire.scheme.into(),
+            len: wire.len,
+            placement: wire.placement,
+        }
+    }
+}
+
+/// The wire shape of [`crate::metadata::EcScheme`], closed for the reason [`ChunkRefWire`]
+/// is: the variant names and field names are `EcScheme`'s own, so this is the same value
+/// space, but an unknown field inside `ReedSolomon` is a decode error here rather than a
+/// silently dropped one. Same reasoning one level down; without it the closure above would
+/// stop at the chunk object and leave the scheme object open.
+///
+/// **How this mirror fails if `EcScheme` moves.** A new *field* on [`ChunkRefWire`]'s source
+/// type breaks the build at that struct's conversion (a missing field), the way
+/// `InodeRecordWire`'s does (`metadata.rs:1439-1455`). A new **variant** here does not: a
+/// `part:` value naming it would be an `unknown variant` decode rejection until this mirror
+/// learns it. That is loud, typed and attributed — the same failure a versioned format change
+/// has (`0016:390-402`) — never a silently dropped or re-spelled scheme, which is the outcome
+/// this type exists to prevent.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum EcSchemeWire {
+    None,
+    ReedSolomon { k: u8, m: u8 },
+}
+
+impl From<EcSchemeWire> for EcScheme {
+    fn from(wire: EcSchemeWire) -> Self {
+        match wire {
+            EcSchemeWire::None => Self::None,
+            EcSchemeWire::ReedSolomon { k, m } => Self::ReedSolomon { k, m },
+        }
+    }
+}
+
+/// The wire shape of [`PartRecord`]. Its chunks are read through the **closed** [`ChunkRefWire`]
+/// rather than [`crate::metadata::ChunkRef`] directly — see that type for why.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PartRecordWire {
+    chunks: Vec<ChunkRefWire>,
+    len: u64,
+    digest: Digest,
+    committed_at_millis: u64,
+    session_epoch: u64,
+}
+
+/// A **committed part**, the `part:<upload-id>:<part-number>` value (`0016:351`): its ordered
+/// chunk list, logical length, digest, commit time, and the session epoch the fenced commit
+/// wrote it under.
+///
+/// Every field is required — none optional, defaulted or skipped — and the wire shape is
+/// closed, so decode→encode is byte-identical here without the argument [`SessionRecord`]'s
+/// "Serialization identity" has to make for its one optional field. **That claim covers the
+/// `chunks` list too, and only because it is read through the module's own closed
+/// `ChunkRefWire` rather than through [`crate::metadata::ChunkRef`] directly** (see that wire
+/// type's doc): `ChunkRef`'s own `Deserialize` defaults an omitted `placement` and ignores an
+/// unknown field, both of which re-encode differently from the bytes they were read from — the
+/// identity a whole-record CAS turns on, one level in.
+///
+/// No writer-side constructor — see [`SessionRecord`]'s doc for why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PartRecordWire")]
+pub struct PartRecord {
+    chunks: Vec<ChunkRef>,
+    len: u64,
+    digest: Digest,
+    committed_at_millis: u64,
+    session_epoch: u64,
+}
+
+impl PartRecord {
+    /// This part's ordered chunks, each already validated structurally (leg 1i).
+    pub fn chunks(&self) -> &[ChunkRef] {
+        &self.chunks
+    }
+
+    /// The part's logical length in bytes — the checked sum of `chunks`' lengths (leg 1k).
+    pub const fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the part carries no bytes — read off the `len` leg 1k has already reconciled
+    /// with `chunks`. A zero-length part is a **value**, not a decode error: ADR-0045's
+    /// `ChunkRef` row asks for a length consistent with the scheme, not a non-zero one, and
+    /// the erasure encoder handles a zero-length chunk (`erasure.rs:79-83`, `shard_size`'s
+    /// `.max(1)`). Present because [`Self::len`] is (clippy's `len_without_is_empty`).
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The part's content digest.
+    pub const fn digest(&self) -> &Digest {
+        &self.digest
+    }
+
+    /// When the part was committed.
+    pub const fn committed_at_millis(&self) -> u64 {
+        self.committed_at_millis
+    }
+
+    /// The session epoch this commit was fenced under.
+    pub const fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+}
+
+/// The part's own rules, applied to chunks whose own [`Deserialize`] has already judged their
+/// shape — the one place a [`PartRecord`] can come into existence:
+///
+/// * **1i (`PartRecord` half)** every chunk's `EcScheme` passes `checked_chunk_scheme` —
+///   structural, at decode. A chunk's `placement` length is deliberately **not** checked
+///   here: it is the standing *contextual* check, liberal on read (ADR-0045,
+///   `AGENTS.md:146-149`, `0016:416-429`), so a `ChunkRef` whose `placement` length does not
+///   match its scheme's fragment count still decodes.
+/// * **1k** `len` equals the `checked_chunk_len` sum of `chunks`, overflow-checked —
+///   mirrors [`crate::metadata::SegmentRecord`]'s own `from_wire` `checked_chunk_bytes`
+///   comparison (`metadata.rs:1170-1185`, `:1208-1218`).
+impl TryFrom<PartRecordWire> for PartRecord {
+    type Error = RecordError;
+
+    fn try_from(wire: PartRecordWire) -> Result<Self, RecordError> {
+        let chunks: Vec<ChunkRef> = wire.chunks.into_iter().map(ChunkRef::from).collect();
+        for chunk in &chunks {
+            checked_chunk_scheme(chunk)?;
+        }
+        let total = checked_chunk_len(&chunks)?;
+        if total != wire.len {
+            return Err(RecordError::PartLengthMismatch {
+                declared: wire.len,
+                chunks: total,
+            });
+        }
+        Ok(Self {
+            chunks,
+            len: wire.len,
+            digest: wire.digest,
+            committed_at_millis: wire.committed_at_millis,
+            session_epoch: wire.session_epoch,
+        })
+    }
+}
+
+/// Decode the `part:` value ([`part_key`]) with its rejection attributed — the peer of
+/// [`decode_admission_record`]/[`decode_session_record`]/[`decode_slot_record`] for this
+/// record, and necessary for the same reason.
+pub fn decode_part_record(value: &[u8]) -> Result<PartRecord, RecordError> {
+    let wire: PartRecordWire =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "part:",
+            detail: err.to_string(),
+        })?;
+    require_canonical(PartRecord::try_from(wire)?, value, "part:")
+}
+
+/// A committed part's **summary**, the `psum:<upload-id>:<part-number>` value (`0016:352`):
+/// everything about the part except its chunk list, a few tens of bytes, written in the same
+/// batch as the `part:` record it summarizes so the pair is always consistent. No invariant of
+/// its own — the `chunks`/`len` agreement it restates is [`PartRecord`]'s own commit-time
+/// obligation, not a relation this record can check in isolation from the part it pairs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartSummary {
+    /// How many chunks the summarized part holds.
+    pub chunks: u32,
+    /// The summarized part's logical length.
+    pub len: u64,
+    /// The summarized part's digest.
+    pub digest: Digest,
+    /// When the summarized part was committed.
+    pub committed_at_millis: u64,
+}
+
+/// Decode the `psum:` value ([`psum_key`]) with its rejection attributed, for the same reason
+/// the other per-record decoders in this section exist — [`PartSummary`] has no `TryFrom` of
+/// its own, but a malformed value should still surface [`RecordError::MalformedRecordValue`]
+/// rather than a bare [`crate::metadata::decode`] error escaping untyped.
+pub fn decode_part_summary(value: &[u8]) -> Result<PartSummary, RecordError> {
+    let summary: PartSummary =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "psum:",
+            detail: err.to_string(),
+        })?;
+    require_canonical(summary, value, "psum:")
 }
