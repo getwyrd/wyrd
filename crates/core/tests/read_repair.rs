@@ -92,7 +92,12 @@ struct MemChunks {
 
 #[async_trait]
 impl ChunkStore for MemChunks {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -134,8 +139,13 @@ struct IntegrityFaultingStore {
 
 #[async_trait]
 impl ChunkStore for IntegrityFaultingStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
@@ -217,6 +227,7 @@ async fn ec_read_excludes_corrupt_fragment_and_enqueues_for_repair() {
                     index: index as u16,
                 },
                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
+                None,
             )
             .await
             .unwrap();
@@ -230,6 +241,7 @@ async fn ec_read_excludes_corrupt_fragment_and_enqueues_for_repair() {
                 index: 0,
             },
             Bytes::from(rotten),
+            None,
         )
         .await
         .unwrap();
@@ -290,6 +302,7 @@ async fn unrecoverable_read_still_enqueues_the_corrupt_chunk() {
                 index: 0,
             },
             Bytes::from(rotten),
+            None,
         )
         .await
         .unwrap();
@@ -350,6 +363,7 @@ async fn none_read_rejects_a_misplaced_but_intact_fragment() {
                 index: 0,
             },
             fragment(foreign_chunk, foreign_payload),
+            None,
         )
         .await
         .unwrap();
@@ -421,6 +435,7 @@ async fn ec_read_enqueues_integrity_fault_shard_for_repair_and_reconstructs() {
                     index: index as u16,
                 },
                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
+                None,
             )
             .await
             .unwrap();
@@ -493,7 +508,7 @@ async fn none_read_enqueues_integrity_fault_fragment_for_repair() {
     // returns them — it always returns `IntegrityFault` for `fault_id`.
     let inner = MemChunks::default();
     inner
-        .put_fragment(fault_id, fragment(chunk_id, payload))
+        .put_fragment(fault_id, fragment(chunk_id, payload), None)
         .await
         .unwrap();
     let chunks = IntegrityFaultingStore { inner, fault_id };
@@ -566,6 +581,7 @@ async fn ec_read_treats_a_misplaced_but_intact_fragment_as_absent() {
                 index: 0,
             },
             encode_ec_fragment(chunk_id, 0, k, m, &shards[0]),
+            None,
         )
         .await
         .unwrap();
@@ -577,6 +593,7 @@ async fn ec_read_treats_a_misplaced_but_intact_fragment_as_absent() {
                 index: 1,
             },
             fragment(foreign_chunk, &vec![0xFF; shard_len]),
+            None,
         )
         .await
         .unwrap();
@@ -617,8 +634,13 @@ struct TransientlyFailingStore {
 
 #[async_trait]
 impl ChunkStore for TransientlyFailingStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
         if id == self.fail_id {
@@ -726,6 +748,7 @@ async fn a_corrupt_fragment_is_reported_with_its_index_and_its_placed_dserver() 
                     index: index as u16,
                 },
                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
+                None,
             )
             .await
             .unwrap();
@@ -740,6 +763,7 @@ async fn a_corrupt_fragment_is_reported_with_its_index_and_its_placed_dserver() 
                 index: 0,
             },
             Bytes::from(rotten),
+            None,
         )
         .await
         .unwrap();
@@ -820,6 +844,7 @@ async fn a_transient_dserver_failure_is_no_longer_silent() {
                     index: index as u16,
                 },
                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
+                None,
             )
             .await
             .unwrap();

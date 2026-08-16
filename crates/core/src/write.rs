@@ -245,7 +245,7 @@ pub async fn write_fragments(chunks: &impl PlacementChunkStore, plan: &WritePlan
                 .get(*index as usize)
                 .copied()
                 .unwrap_or_else(|| DServerId::from(*index));
-            chunks.put_fragment_at(dserver, id, fragment.clone())
+            chunks.put_fragment_at(dserver, id, fragment.clone(), None)
         })
     });
     futures_util::future::try_join_all(puts).await?;
@@ -444,7 +444,7 @@ async fn intent_and_write_chunk(
             .get(*index as usize)
             .copied()
             .unwrap_or_else(|| DServerId::from(*index));
-        chunks.put_fragment_at(dserver, frag_id, fragment.clone())
+        chunks.put_fragment_at(dserver, frag_id, fragment.clone(), None)
     });
     futures_util::future::try_join_all(puts).await?;
     Ok(PlannedChunk {

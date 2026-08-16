@@ -234,7 +234,12 @@ struct CrashStore<'a> {
 
 #[async_trait]
 impl ChunkStore for CrashStore<'_> {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
         if self.armed.load(Ordering::Relaxed) {
             // The write dies in flight: nothing is stored, and the fault surfaces to the
             // reconciler exactly as a real backend's interrupted write would.
@@ -242,7 +247,7 @@ impl ChunkStore for CrashStore<'_> {
                 "simulated mid-write crash: the rebuilt fragment write never completed",
             )));
         }
-        self.inner.put_fragment(id, fragment).await
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
@@ -271,7 +276,12 @@ struct MemDServer {
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -312,9 +322,14 @@ impl<'a> Fleet<'a> {
 
 #[async_trait]
 impl ChunkStore for Fleet<'_> {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
         if let Some(store) = self.store(DServerId::from(id.index)) {
-            store.put_fragment(id, fragment).await?;
+            store.put_fragment(id, fragment, deadline_millis).await?;
         }
         Ok(())
     }
@@ -362,9 +377,10 @@ impl PlacementChunkStore for Fleet<'_> {
         dserver: DServerId,
         id: FragmentId,
         fragment: Bytes,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
         if let Some(store) = self.store(dserver) {
-            store.put_fragment(id, fragment).await?;
+            store.put_fragment(id, fragment, deadline_millis).await?;
         }
         Ok(())
     }
@@ -548,7 +564,9 @@ async fn apply_storage_faults(d: &[MemDServer; 4], plan: &SeededStorageFaults) {
                 // Flip the first payload byte (past the self-describing header) so the
                 // crc32c no longer matches — bit rot the checksum must catch.
                 bytes[CORE_HEADER_LEN as usize] ^= 0xff;
-                d[i].put_fragment(f, Bytes::from(bytes)).await.unwrap();
+                d[i].put_fragment(f, Bytes::from(bytes), None)
+                    .await
+                    .unwrap();
             }
         }
     }
@@ -882,7 +900,7 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
         chunk: LIVE,
         index: 0,
     };
-    d[0].put_fragment(live, Bytes::from_static(b"live"))
+    d[0].put_fragment(live, Bytes::from_static(b"live"), None)
         .await
         .unwrap();
     commit_reference(&meta, 0).await;
@@ -895,6 +913,7 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
             index: 0,
         },
         Bytes::from_static(b"leak"),
+        None,
     )
     .await
     .unwrap();
@@ -917,10 +936,10 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
         chunk: ORPH_NEW,
         index: 0,
     };
-    d[2].put_fragment(old, Bytes::from_static(b"old"))
+    d[2].put_fragment(old, Bytes::from_static(b"old"), None)
         .await
         .unwrap();
-    d[3].put_fragment(new, Bytes::from_static(b"new"))
+    d[3].put_fragment(new, Bytes::from_static(b"new"), None)
         .await
         .unwrap();
     mark_orphaned(&meta, 2, old, reclaimable_at).await.unwrap();
@@ -1570,7 +1589,7 @@ async fn prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies
         chunk: SEG_ORPHAN,
         index: 0,
     };
-    d[3].put_fragment(orphan, Bytes::from_static(b"garbage"))
+    d[3].put_fragment(orphan, Bytes::from_static(b"garbage"), None)
         .await
         .unwrap();
     mark_orphaned(&meta, 3, orphan, now - grace - 1)
@@ -1910,13 +1929,13 @@ async fn restore_under_a_concurrent_writer(nemesis: Nemesis, delay_millis: u64) 
     let held = frag_of(RESTORE_HELD);
     let late = frag_of(RESTORE_LATE);
     let stray = frag_of(RESTORE_STRAY);
-    d[0].put_fragment(held, Bytes::from_static(b"held"))
+    d[0].put_fragment(held, Bytes::from_static(b"held"), None)
         .await
         .unwrap();
-    d[1].put_fragment(late, Bytes::from_static(b"late"))
+    d[1].put_fragment(late, Bytes::from_static(b"late"), None)
         .await
         .unwrap();
-    d[2].put_fragment(stray, Bytes::from_static(b"stray"))
+    d[2].put_fragment(stray, Bytes::from_static(b"stray"), None)
         .await
         .unwrap();
 

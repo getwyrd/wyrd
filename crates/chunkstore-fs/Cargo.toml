@@ -11,6 +11,12 @@ publish.workspace = true
 [dependencies]
 wyrd-traits.workspace = true
 wyrd-chunk-format.workspace = true
+# The Clock seam (ADR-0009/ADR-0024): the fragment-write authorization deadline
+# (`W_write`, issue #638) is compared against this store's own clock at the point it
+# publishes a write, so expiry is exercised under a manual/simulated clock instead of
+# a bare `SystemTime::now()` (#619). Same production dependency `coordination-mem`
+# takes for lease expiry.
+wyrd-testkit.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 # Off-reactor offload of the blocking `std::fs` syscalls (issue #204): the async

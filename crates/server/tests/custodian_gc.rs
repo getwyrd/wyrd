@@ -177,7 +177,12 @@ impl MemDServer {
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -224,9 +229,14 @@ impl<'a> Fleet<'a> {
 
 #[async_trait]
 impl ChunkStore for Fleet<'_> {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
         if let Some(store) = self.store(DServerId::from(id.index)) {
-            store.put_fragment(id, fragment).await?;
+            store.put_fragment(id, fragment, deadline_millis).await?;
         }
         Ok(())
     }
@@ -274,9 +284,10 @@ impl PlacementChunkStore for Fleet<'_> {
         dserver: DServerId,
         id: FragmentId,
         fragment: Bytes,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
         if let Some(store) = self.store(dserver) {
-            store.put_fragment(id, fragment).await?;
+            store.put_fragment(id, fragment, deadline_millis).await?;
         }
         Ok(())
     }
@@ -612,6 +623,7 @@ async fn armed_deployed_role_reclaims_expired_pending_lease_garbage() {
             index: 0,
         },
         Bytes::from_static(b"leased fan-out fragment 0"),
+        None,
     )
     .await
     .unwrap();
@@ -621,6 +633,7 @@ async fn armed_deployed_role_reclaims_expired_pending_lease_garbage() {
             index: 1,
         },
         Bytes::from_static(b"leased fan-out fragment 1"),
+        None,
     )
     .await
     .unwrap();
@@ -692,6 +705,7 @@ async fn deployed_role_defers_expired_pending_garbage_by_default() {
             index: 0,
         },
         Bytes::from_static(b"in-flight fan-out fragment 0"),
+        None,
     )
     .await
     .unwrap();
@@ -701,6 +715,7 @@ async fn deployed_role_defers_expired_pending_garbage_by_default() {
             index: 1,
         },
         Bytes::from_static(b"in-flight fan-out fragment 1"),
+        None,
     )
     .await
     .unwrap();
@@ -893,6 +908,7 @@ async fn deployed_role_defers_gc_when_the_operator_fleet_is_startup_partial() {
                 index: idx,
             },
             Bytes::from(format!("leased fan-out fragment {idx}")),
+            None,
         )
         .await
         .unwrap();

@@ -76,8 +76,20 @@ impl<C: ChunkStore> FanoutChunkStore<C> {
 
 #[async_trait]
 impl<C: ChunkStore> ChunkStore for FanoutChunkStore<C> {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.route(id.index).put_fragment(id, fragment).await
+    /// Routes to the placed backend and forwards `deadline_millis` **unchanged** (issue
+    /// #638). The fan-out is deliberately *not* an enforcement point: it is still
+    /// caller-side, and a second gateway — or a retry — reaches the D server's service
+    /// directly, so a deadline honoured only here would bound nothing (proposal 0016
+    /// decision 5).
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.route(id.index)
+            .put_fragment(id, fragment, deadline_millis)
+            .await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
@@ -149,8 +161,11 @@ impl<C: ChunkStore> PlacementChunkStore for FanoutChunkStore<C> {
         dserver: DServerId,
         id: FragmentId,
         fragment: Bytes,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
-        self.route_dserver(dserver).put_fragment(id, fragment).await
+        self.route_dserver(dserver)
+            .put_fragment(id, fragment, deadline_millis)
+            .await
     }
 }
 
@@ -162,10 +177,14 @@ mod tests {
 
     /// An in-memory `ChunkStore` with a fixed reported health, cheap to clone so a
     /// test can keep a handle after the store is moved into the fan-out and inspect
-    /// which backend a put landed on.
+    /// which backend a put landed on — and, since issue #638, *what deadline it was
+    /// routed with*.
     #[derive(Clone)]
     struct MemStore {
         frags: Arc<Mutex<HashMap<FragmentId, Bytes>>>,
+        /// The `deadline_millis` of the last `put_fragment` this backend received, so a
+        /// test can assert the fan-out forwards it rather than dropping it on the floor.
+        last_deadline: Arc<Mutex<Option<Option<u64>>>>,
         health: Health,
     }
 
@@ -173,6 +192,7 @@ mod tests {
         fn with_health(health: Health) -> Self {
             Self {
                 frags: Arc::new(Mutex::new(HashMap::new())),
+                last_deadline: Arc::new(Mutex::new(None)),
                 health,
             }
         }
@@ -182,11 +202,22 @@ mod tests {
         fn has(&self, id: FragmentId) -> bool {
             self.frags.lock().unwrap().contains_key(&id)
         }
+        /// The deadline the last put carried: `None` = no put reached this backend,
+        /// `Some(None)` = a put with no deadline, `Some(Some(d))` = a put with `d`.
+        fn last_deadline(&self) -> Option<Option<u64>> {
+            *self.last_deadline.lock().unwrap()
+        }
     }
 
     #[async_trait]
     impl ChunkStore for MemStore {
-        async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+        async fn put_fragment(
+            &self,
+            id: FragmentId,
+            fragment: Bytes,
+            deadline_millis: Option<u64>,
+        ) -> Result<()> {
+            *self.last_deadline.lock().unwrap() = Some(deadline_millis);
             self.frags.lock().unwrap().insert(id, fragment);
             Ok(())
         }
@@ -233,14 +264,14 @@ mod tests {
         let fanout = FanoutChunkStore::new(vec![a.clone(), b.clone()]);
 
         fanout
-            .put_fragment(fid(1), Bytes::from_static(b"x"))
+            .put_fragment(fid(1), Bytes::from_static(b"x"), None)
             .await
             .unwrap();
         assert!(b.has(fid(1)), "index 1 routes to store[1] (1 % 2)");
         assert!(!a.has(fid(1)), "index 1 is not on store[0]");
 
         fanout
-            .put_fragment(fid(2), Bytes::from_static(b"y"))
+            .put_fragment(fid(2), Bytes::from_static(b"y"), None)
             .await
             .unwrap();
         assert!(a.has(fid(2)), "index 2 wraps to store[0] (2 % 2)");
@@ -252,11 +283,11 @@ mod tests {
     async fn list_fragments_unions_every_backend() {
         let fanout = FanoutChunkStore::new(vec![MemStore::healthy(), MemStore::healthy()]);
         fanout
-            .put_fragment(fid(0), Bytes::from_static(b"x"))
+            .put_fragment(fid(0), Bytes::from_static(b"x"), None)
             .await
             .unwrap();
         fanout
-            .put_fragment(fid(1), Bytes::from_static(b"y"))
+            .put_fragment(fid(1), Bytes::from_static(b"y"), None)
             .await
             .unwrap();
 
@@ -329,7 +360,7 @@ mod tests {
         // The fragment already lives where a custodian's evacuation placed it: on the
         // backend the moved placement names, written directly so this test isolates
         // the READ side (`get_fragment_at`) from any write-side routing.
-        b.put_fragment(id, Bytes::from_static(b"moved-fragment"))
+        b.put_fragment(id, Bytes::from_static(b"moved-fragment"), None)
             .await
             .unwrap();
 
@@ -371,7 +402,7 @@ mod tests {
             // have left it — independent of `put_fragment_at`, so this isolates the
             // read side.
             stores[dserver as usize]
-                .put_fragment(id, Bytes::from(format!("frag-{index}")))
+                .put_fragment(id, Bytes::from(format!("frag-{index}")), None)
                 .await
                 .unwrap();
         }
@@ -403,7 +434,7 @@ mod tests {
         let moved_dserver: DServerId = 1;
 
         fanout
-            .put_fragment_at(moved_dserver, id, Bytes::from_static(b"x"))
+            .put_fragment_at(moved_dserver, id, Bytes::from_static(b"x"), None)
             .await
             .unwrap();
 
@@ -415,5 +446,46 @@ mod tests {
             !a.has(id),
             "must NOT fall back to stores[index % n] (store[0])"
         );
+    }
+
+    /// `:84` / `:159` (issue #638) — routing must carry the write's authorization deadline
+    /// to the backend **unchanged**, on both entry points. The deadline is enforced by the
+    /// store this routes to, so a wrapper that swallowed it (passing `None` onwards) would
+    /// silently disable `W_write` for every write that goes through a fan-out — and no
+    /// existing assertion would notice, because the write would simply succeed.
+    #[tokio::test]
+    async fn routing_forwards_the_authorization_deadline_unchanged() {
+        let a = MemStore::healthy();
+        let b = MemStore::healthy();
+        let fanout = FanoutChunkStore::new(vec![a.clone(), b.clone()]);
+
+        fanout
+            .put_fragment(fid(1), Bytes::from_static(b"x"), Some(1_234))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.last_deadline(),
+            Some(Some(1_234)),
+            "put_fragment must hand the deadline to the routed backend, not drop it"
+        );
+
+        fanout
+            .put_fragment_at(1, fid(0), Bytes::from_static(b"y"), Some(5_678))
+            .await
+            .unwrap();
+        assert_eq!(
+            b.last_deadline(),
+            Some(Some(5_678)),
+            "put_fragment_at must forward the deadline too — the placement-resolved path is \
+             what the custodian and reconstruction writers use"
+        );
+
+        // And an absent deadline stays absent (additive compatibility): a fan-out must not
+        // invent one.
+        fanout
+            .put_fragment(fid(0), Bytes::from_static(b"z"), None)
+            .await
+            .unwrap();
+        assert_eq!(a.last_deadline(), Some(None));
     }
 }

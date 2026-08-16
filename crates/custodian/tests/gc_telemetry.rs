@@ -103,7 +103,12 @@ impl MemDServer {
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }

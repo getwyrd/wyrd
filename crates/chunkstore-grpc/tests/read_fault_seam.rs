@@ -59,7 +59,12 @@ struct EioStore;
 
 #[async_trait]
 impl ChunkStore for EioStore {
-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> WyrdResult<()> {
+    async fn put_fragment(
+        &self,
+        _id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> WyrdResult<()> {
         Ok(())
     }
 
@@ -88,7 +93,12 @@ struct GenericErrStore;
 
 #[async_trait]
 impl ChunkStore for GenericErrStore {
-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> WyrdResult<()> {
+    async fn put_fragment(
+        &self,
+        _id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> WyrdResult<()> {
         Ok(())
     }
 

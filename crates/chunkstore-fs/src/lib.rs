@@ -15,16 +15,27 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_chunk_format::{decode, FragmentError};
+use wyrd_testkit::{Clock, SystemClock};
 use wyrd_traits::{
     ChunkId, ChunkStore, FragmentId, Health, IntegrityFault, PlacementChunkStore, Result,
+    WriteDeadlineExpired,
 };
 
 /// A [`ChunkStore`] that keeps each fragment as a file under a root directory.
-pub struct FsChunkStore {
+///
+/// Generic over the [`Clock`] that decides fragment-write deadline expiry (issue #638):
+/// the real [`SystemClock`] by default, a test-controlled clock through
+/// [`FsChunkStore::open_with_clock`] — the seam AGENTS.md § Review rubric prescribes for
+/// code that needs controllable time (ADR-0024), rather than a bare `SystemTime::now()`
+/// (#619). This store, as the write's **acceptor**, is one of the two evaluation sites
+/// `δ_clock` bounds the skew between in `G_orphan > W_write + δ_clock` (`0016:1478`); the
+/// other is the authorizer that chose the deadline.
+pub struct FsChunkStore<C: Clock = SystemClock> {
     root: PathBuf,
     /// Monotonic sequence that makes each write's scratch file name unique
     /// *within this store*, so two concurrent writes of the same [`FragmentId`]
@@ -36,26 +47,44 @@ pub struct FsChunkStore {
     /// every concurrent writer a private scratch path with no shared *global*
     /// mutable state (which would couple otherwise-independent simulation nodes).
     scratch_seq: AtomicU64,
+    /// The clock the fragment-write deadline is compared against, held behind an
+    /// [`Arc`] so the write can carry it into the blocking closure that renders the
+    /// verdict immediately before the publishing rename (issue #638), without
+    /// demanding `Clone` of a caller's clock.
+    clock: Arc<C>,
 }
 
-impl FsChunkStore {
+impl FsChunkStore<SystemClock> {
     /// Open a store rooted at `root`, creating the directory if it does not
-    /// exist.
+    /// exist. Write deadlines are judged against the real wall clock.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_clock(root, SystemClock)
+    }
+}
+
+impl<C: Clock> FsChunkStore<C> {
+    /// Like [`FsChunkStore::open`], but judges fragment-write deadlines against
+    /// `clock` — the injection point for a manual/simulated clock, so deadline
+    /// expiry is exercised deterministically instead of by real waiting (ADR-0024,
+    /// issue #638).
+    pub fn open_with_clock(root: impl Into<PathBuf>, clock: C) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root)?;
         let store = Self {
             root,
             scratch_seq: AtomicU64::new(0),
+            clock: Arc::new(clock),
         };
-        // Clear write scratch orphaned by a crash before this store was opened.
+        // Clear write scratch orphaned by a crash before this store was opened, and
+        // the empty chunk directories a failed, refused or reclaimed write leaves.
         // Unique per-write scratch names (issue #203) no longer self-clean the
         // way a single fixed `<index>.tmp` did (the next write of the same id
         // overwrote it), so without reaping a hard crash would let them
         // accumulate as litter. Open is the safe place: one D server owns this
         // root (ADR-0034, Model A) and no write on this just-constructed store is
-        // in flight yet, so reaping cannot race a live put's scratch.
-        store.reap_stale_temps();
+        // in flight yet, so reaping cannot race a live put's scratch — nor, since
+        // issue #638, a live put's chunk directory.
+        store.reap_write_residue();
         Ok(store)
     }
 
@@ -71,7 +100,7 @@ impl FsChunkStore {
     /// it (issue #203). The atomic rename onto `<index>.frag` is the sole
     /// publish/serialization point; the `.tmp` suffix keeps the scratch invisible
     /// to `list_fragments` (which parses only `.frag`) and matchable by
-    /// [`Self::reap_stale_temps`].
+    /// [`Self::reap_write_residue`].
     fn temp_path(&self, id: FragmentId) -> PathBuf {
         let seq = self.scratch_seq.fetch_add(1, Ordering::Relaxed);
         self.root
@@ -79,15 +108,30 @@ impl FsChunkStore {
             .join(scratch_file_name(id.index, seq))
     }
 
-    /// Remove stale write scratch (`*.tmp`) left under chunk directories by a
-    /// process that crashed mid-write, before the atomic rename published the
-    /// fragment. Best-effort and only over recognised `<32-hex>` chunk dirs: an
-    /// entry that cannot be read or removed is left in place (it is harmless —
-    /// scratch is invisible to `list_fragments`, which parses only `.frag`).
-    /// Called from `open`, where one D server owns the root (ADR-0034) and no
-    /// write on this store is in flight, so it can never delete a concurrent
-    /// put's in-flight scratch.
-    fn reap_stale_temps(&self) {
+    /// Remove what an unfinished write leaves under the root: stale scratch
+    /// (`*.tmp`) from a process that crashed mid-write, before the atomic rename
+    /// published the fragment, and the chunk directories left **empty** by a
+    /// failed write, by a refused one (issue #638) or by the reclaim of a chunk's
+    /// last fragment.
+    ///
+    /// Best-effort and only over recognised `<32-hex>` chunk dirs: an entry that
+    /// cannot be read or removed is left in place (it is harmless — neither scratch
+    /// nor an empty directory is visible to `list_fragments`, which parses only
+    /// `.frag`). The directory removal is `remove_dir`, never `remove_dir_all`, so
+    /// the kernel's atomic emptiness test — not this code's belief about what the
+    /// directory holds — decides: a directory holding any fragment survives. It costs
+    /// one `rmdir` per chunk directory on a walk that already opens each of them, so
+    /// the marginal startup cost is one syscall per chunk.
+    ///
+    /// **Why here and nowhere else.** Collecting empty directories is the one part
+    /// of write cleanup that touches state *shared* between concurrent writes, so it
+    /// runs at the single point where this store has no write in flight by
+    /// construction: `open`, where one D server owns the root (ADR-0034, Model A).
+    /// The alternative — collecting them on the refusal path, where the write that
+    /// emptied the directory notices — races every live writer creating the same
+    /// chunk, and no number of create retries closes that race (issue #638; see
+    /// `restore_pre_write_state`).
+    fn reap_write_residue(&self) {
         let Ok(chunk_dirs) = fs::read_dir(&self.root) else {
             return;
         };
@@ -109,6 +153,11 @@ impl FsChunkStore {
                     let _ = fs::remove_file(entry.path());
                 }
             }
+            // Now that this chunk's scratch is gone, the directory goes too **iff**
+            // it holds nothing else — `remove_dir` fails `DirectoryNotEmpty` over a
+            // single surviving `.frag`, so a chunk that still has fragments keeps
+            // its directory.
+            let _ = fs::remove_dir(chunk_entry.path());
         }
     }
 
@@ -127,6 +176,42 @@ impl FsChunkStore {
             });
         }
         Ok(())
+    }
+}
+
+/// Undo what a **refused** write put on disk, so no fragment of it is on the store and no
+/// residue of it is left behind (issue #638, the `WriteEffect::NotApplied` postcondition).
+///
+/// It removes **exactly one thing: this write's own scratch file** — the private
+/// `<index>.<seq>.tmp` whose name no other write can name ([`FsChunkStore::temp_path`],
+/// issue #203). Its errors are **returned, never swallowed**: the caller reports a rollback
+/// failure as a backend fault instead of the definite "nothing landed" verdict, because that
+/// verdict over leftover bytes is a silent skip (AGENTS.md § Review rubric, *Absent or
+/// unsupported entries*). Only `NotFound` is not a failure — the state we wanted is the state
+/// we have.
+///
+/// **What it deliberately does not touch is the chunk directory**, and that is the whole
+/// safety property of this function: a refusal mutates **no path any other write can be
+/// using**, so no number of concurrent refusals — one, three, a thousand, staggered any way
+/// the scheduler likes — can interfere with a live write. A rollback that also removed the
+/// (shared) chunk directory could strip it from under a concurrent live writer between its
+/// `create_dir_all` and its data write, failing a *live* write on behalf of an *expired* one;
+/// bounding that with N create retries only moves the failure to N+1 racing refusals, which
+/// is a margin, not a fix. Not writing the shared path removes the race instead of racing it.
+///
+/// The directory an expired write may leave behind is empty, inert and pre-existing in kind:
+/// the store already leaves one behind whenever a data write or a rename fails
+/// (`put_fragment`) and whenever [`ChunkStore::delete_fragment`] reclaims a chunk's last
+/// fragment. It is not a fragment — `get_fragment` reads `None` through it and
+/// `list_fragments` cannot see it (it parses `.frag`) — so it is not part of the postcondition
+/// this function establishes. Empty chunk directories are collected by
+/// [`FsChunkStore::reap_write_residue`] at `open`, the one point where no write of this store
+/// is in flight and the collection therefore cannot race anybody.
+fn restore_pre_write_state(scratch: &Path) -> std::io::Result<()> {
+    match fs::remove_file(scratch) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -176,8 +261,13 @@ where
 }
 
 #[async_trait]
-impl ChunkStore for FsChunkStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+impl<C: Clock + Send + Sync + 'static> ChunkStore for FsChunkStore<C> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
         // Verify integrity and that the fragment belongs under this id before
         // acknowledging the write. A verify failure here is a **malformed fragment
         // the caller offered** — surfaced as a seam-level `IntegrityFault` so the
@@ -188,10 +278,28 @@ impl ChunkStore for FsChunkStore {
             detail: e.to_string(),
         })?;
 
+        // **Fast-path refusal** (issue #638): a write already past its deadline on
+        // arrival costs no I/O and leaves not even a chunk directory behind. It is an
+        // optimisation, *not* the bound — everything after it (the blocking pool's
+        // queue, the chunk-directory creation, the scratch write) can consume arbitrary
+        // time. The bound is the pre-publication verdict inside the closure below.
+        if let Some(deadline_millis) = deadline_millis {
+            if let Some(refusal) =
+                WriteDeadlineExpired::if_elapsed(id, deadline_millis, self.clock.now_millis())
+            {
+                return Err(Box::new(refusal));
+            }
+        }
+
         // Compute the paths on the reactor (no I/O — a per-call atomic bump and
         // path joins), then perform every blocking syscall off the reactor.
         let final_path = self.fragment_path(id);
         let temp = self.temp_path(id);
+        // The store's clock travels into the blocking closure so the deadline is
+        // judged *there*, immediately before the publish point (issue #638) — the same
+        // clock this lifecycle read above, never a second time source (AGENTS.md
+        // § Review rubric, "one clock per correctness lifecycle").
+        let clock = Arc::clone(&self.clock);
         offload(move || -> Result<()> {
             // Write to a per-call private scratch file, then atomically rename it
             // onto the final path: the rename is the only publish point, so a
@@ -199,13 +307,20 @@ impl ChunkStore for FsChunkStore {
             // bytes and last-writer-wins is a no-op (same id ⇒ identical bytes). On
             // a failed write/rename we remove our *own* scratch (its name is
             // unique, so this never touches a concurrent write's file); a hard
-            // crash before the rename leaves it for `reap_stale_temps` to clear at
+            // crash before the rename leaves it for `reap_write_residue` to clear at
             // the next open.
             //
             // The chunk directory exists after the first fragment of the chunk, so
             // attempt the scratch write straight away and create the directory only
             // on the genuine first-fragment `NotFound` — sparing the steady-state
             // write the per-call `create_dir_all` stat (issue #204).
+            //
+            // One recovery is enough, and issue #638's refusals do not change that: a
+            // refused write's rollback removes only its own private scratch and never the
+            // shared chunk directory (`restore_pre_write_state`), so no concurrent refusal
+            // can take this directory away between the `create_dir_all` and the write below.
+            // A `NotFound` that survives the create is therefore a real I/O fault and
+            // surfaces as one, rather than being retried against.
             match fs::write(&temp, &fragment) {
                 Ok(()) => {}
                 Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -222,9 +337,90 @@ impl ChunkStore for FsChunkStore {
                     return Err(e.into());
                 }
             }
+            // **THE VERDICT** (issue #638, proposal 0016 decision 5). Every segment of
+            // this write that can consume unbounded time is now *behind* us — the D
+            // server's accept queue, the blocking pool's queue, the chunk-directory
+            // creation, and the fragment's data write. Ahead of us is `fs::rename`
+            // alone: the single atomic step that publishes, on a file that is already
+            // written, within one directory. So this reading is the latest instant at
+            // which the store can still *refuse*, and it is the bound: a write that sat
+            // anywhere upstream is **refused rather than queued** (`0016:1560`), and its
+            // scratch goes with it, so nothing was ever published.
+            //
+            // The refusal is deliberately **before** the publication and not after it, and
+            // that ordering is what makes `WriteEffect::NotApplied` *true*:
+            //
+            // * A refusal here has published nothing, so there is no reader-visible
+            //   interval and no crash residue. Kill the process at any point in this
+            //   closure and the store holds either the pre-write state or (before the
+            //   rename) a scratch file `reap_write_residue` clears at the next open —
+            //   never a fragment whose write was refused.
+            // * Deciding to *retract* after the rename could not achieve that. The store
+            //   would have to unlink the published file — not atomic with the rename, so a
+            //   crash in between leaves exactly the bytes the refusal claims do not exist,
+            //   and an unlink by path can destroy a concurrent same-id writer's
+            //   already-acknowledged fragment. (The post-rename check below therefore
+            //   *reports* rather than retracts: a different verdict, not a late refusal.)
+            //
+            // What this verdict does *not* establish is that the `rename` below returns
+            // before the deadline — a syscall's own latency is not the caller's to control,
+            // and on a hung device (the NAS profile) it can straddle the deadline. That is
+            // checked separately, after the rename, and is why `Ok(())` from this store
+            // means "published strictly before the deadline" rather than "publication
+            // started in time".
+            if let Some(deadline_millis) = deadline_millis {
+                if let Some(refusal) =
+                    WriteDeadlineExpired::if_elapsed(id, deadline_millis, clock.now_millis())
+                {
+                    // A refusal must take its own bytes back off the disk, and it must say
+                    // so honestly: if the rollback fails, the caller gets the **backend
+                    // fault** rather than the definite "nothing landed" verdict, because
+                    // `WriteEffect::NotApplied` over leftover scratch is a silent skip
+                    // (AGENTS.md § Review rubric, *Absent or unsupported entries*) and the
+                    // residue then accumulates unseen. It takes back *only* its own private
+                    // scratch: a refusal never touches the shared chunk directory, so it can
+                    // never knock over a concurrent live writer creating it.
+                    restore_pre_write_state(&temp)
+                        .map_err(|source| FsChunkStoreError::RefusalNotRolledBack { id, source })?;
+                    return Err(Box::new(refusal));
+                }
+            }
+
             if let Err(e) = fs::rename(&temp, &final_path) {
                 let _ = fs::remove_file(&temp);
                 return Err(e.into());
+            }
+
+            // **THE PUBLICATION IS VERIFIED, NOT ASSUMED** (issue #638). `rename(2)` is the
+            // one step of this write whose duration the store cannot bound: it admits no
+            // predicate, it cannot be cancelled, and on a hung device it can return long
+            // after the verdict above was taken. One more read of the *same* clock is what
+            // keeps `Ok(())` from asserting only that publication *began* in time — exactly
+            // the "bounds acceptance, not effect" gap 0016 rejects for caller-side timeouts
+            // (`0016:1557-1564`), one layer down. So `Ok(())` here means the store *saw* a
+            // reading inside the window with the fragment already published.
+            //
+            // The failing side is reported as `WriteEffect::Unknown`, not as a late landing,
+            // and the distinction is the point: this reading dates the *read*, not the
+            // syscall — a `rename` that returned comfortably in time followed by a
+            // descheduled thread produces exactly the same evidence as one that overran. The
+            // store therefore says what it knows (it could not verify the timing) instead of
+            // asserting the worse reading, and the caller's remedy is a re-read.
+            //
+            // The bytes stay where they landed. Unlinking them would be worse in both
+            // directions: it is not atomic with the rename, so a crash in between leaves the
+            // very bytes a retraction claims to have removed; and it deletes by *path*, so a
+            // concurrent same-id writer that published in between loses an already
+            // acknowledged fragment. Bytes that did land late are garbage their position's
+            // evidence covers (`0016:1547-1550`); an erased live fragment is unrecoverable.
+            if let Some(deadline_millis) = deadline_millis {
+                if let Some(unverified) = WriteDeadlineExpired::if_publication_unverified(
+                    id,
+                    deadline_millis,
+                    clock.now_millis(),
+                ) {
+                    return Err(Box::new(unverified));
+                }
             }
             Ok(())
         })
@@ -331,7 +527,7 @@ impl ChunkStore for FsChunkStore {
 /// addressed by `FragmentId`, so it is a single-D-server [`PlacementChunkStore`] and
 /// uses the trait's identity defaults (the placement record is advisory here — the
 /// store routes by `FragmentId`). Proposal 0005, M3.1.
-impl PlacementChunkStore for FsChunkStore {}
+impl<C: Clock + Send + Sync + 'static> PlacementChunkStore for FsChunkStore<C> {}
 
 /// Errors specific to the filesystem chunk store; surfaced through the trait's
 /// boxed error.
@@ -347,6 +543,21 @@ pub enum FsChunkStoreError {
         /// The id recorded in the fragment header.
         found: FragmentId,
     },
+    /// A write was refused as past its authorization deadline (issue #638) but the store
+    /// could **not** put itself back the way the write found it — the scratch file, or a
+    /// chunk directory the write created, is still there.
+    ///
+    /// This is deliberately **not** a `wyrd_traits::WriteDeadlineExpired`: that class
+    /// promises "nothing of this write is on the store", which is exactly what did not
+    /// happen here. Returning it anyway would report a clean refusal over residue — a
+    /// silent skip that lets the litter accumulate unnoticed — so the caller gets a backend
+    /// fault instead, and `wyrd_traits::is_write_deadline_expired` says `false` for it.
+    RefusalNotRolledBack {
+        /// The fragment write that was refused.
+        id: FragmentId,
+        /// Why the rollback failed.
+        source: std::io::Error,
+    },
 }
 
 impl fmt::Display for FsChunkStoreError {
@@ -359,6 +570,14 @@ impl fmt::Display for FsChunkStoreError {
                  chunk {:032x} index {}",
                 expected.chunk, expected.index, found.chunk, found.index
             ),
+            FsChunkStoreError::RefusalNotRolledBack { id, source } => write!(
+                f,
+                "fragment write for chunk {:032x} index {} was past its authorization \
+                 deadline, but the store could not remove what it had already written: \
+                 {source}. The write was NOT published, and scratch may remain on disk — \
+                 this is a backend fault, not the clean deadline refusal",
+                id.chunk, id.index
+            ),
         }
     }
 }
@@ -368,6 +587,7 @@ impl std::error::Error for FsChunkStoreError {
         match self {
             FsChunkStoreError::NotAFragment(e) => Some(e),
             FsChunkStoreError::IdMismatch { .. } => None,
+            FsChunkStoreError::RefusalNotRolledBack { source, .. } => Some(source),
         }
     }
 }

@@ -12,7 +12,7 @@ use wyrd_proto::v0::{
 };
 use wyrd_traits::{
     BlockReadFault, BoxError, ChunkStore, ErrorClass, FragmentId, Health, IntegrityFault, Result,
-    TransientFault,
+    TransientFault, WriteDeadlineExpired, WriteEffect,
 };
 
 use crate::conv;
@@ -144,6 +144,56 @@ fn classify_get_status(id: FragmentId, status: Status) -> BoxError {
     }
 }
 
+/// Classify a `put_fragment` error status (issue #638) into the D server's two **deadline
+/// outcomes**, which a caller tells apart from a genuine backend fault by
+/// `wyrd_traits::is_write_deadline_expired` — exactly the trick `classify_get_status` plays
+/// for `get_fragment`'s fault categories:
+///
+/// * `FAILED_PRECONDITION` → [`WriteEffect::NotApplied`]: the D server refused a write whose
+///   authorization deadline had elapsed *before* it published anything (proposal 0016
+///   decision 5). Nothing landed, and that is definite.
+/// * `ABORTED` → [`WriteEffect::Unknown`]: the D server began publishing in time but could
+///   not verify the publication completed before the deadline. The bytes **may** be on that
+///   server, so the caller must not count the write and must not record that nothing landed
+///   either. Reconstructing this as the clean refusal would be the one wire lie that
+///   matters — a caller would record "nothing landed" over possibly-durable bytes.
+///
+/// The outcome's `detail` is the **server's own** rendering (its deadline and its clock
+/// reading), carried verbatim: this side never read that clock, so it must not fabricate the
+/// readings — only restore the *class* and the *effect*.
+///
+/// `put_fragment`'s other special status, `INVALID_ARGUMENT` (a malformed fragment), keeps
+/// surfacing through the wire `Status` code as it did before this issue, and everything else
+/// falls to [`transport_error`]'s generic mapping (the transient trio plus the fail-safe
+/// terminal default).
+///
+/// **Gated on `deadline_millis` — the request this reply answers must have carried one.**
+/// Neither code is exclusive to this protocol: `:47` already documents `ABORTED` as a
+/// concurrency conflict whose retry belongs to the layer owning the precondition, and
+/// `FAILED_PRECONDITION` is `get_fragment`'s block-read fault. Wyrd's own D server emits
+/// neither for any other reason on this RPC (`server.rs:118`), but a foreign implementation
+/// of the same service, or a proxy in the path, can — and decoding on the code alone would
+/// then manufacture a deadline verdict out of an unrelated fault. That is the one direction
+/// that must not be got wrong: `NotApplied` tells the caller **nothing landed**, so a
+/// fabricated one records "definitely not written" over bytes that may well be durable.
+/// A request with no deadline has no deadline outcome by construction, so its statuses go
+/// to [`transport_error`] exactly as they did before this issue.
+fn classify_put_status(id: FragmentId, status: Status, deadline_millis: Option<u64>) -> BoxError {
+    if deadline_millis.is_none() {
+        return transport_error(status);
+    }
+    let effect = match status.code() {
+        Code::FailedPrecondition => WriteEffect::NotApplied,
+        Code::Aborted => WriteEffect::Unknown,
+        _ => return transport_error(status),
+    };
+    Box::new(WriteDeadlineExpired {
+        id,
+        effect,
+        detail: status.message().to_string(),
+    })
+}
+
 /// A [`ChunkStore`] implemented over a gRPC channel to one D server.
 ///
 /// The trait's `&self` methods clone the inner tonic client per call — tonic
@@ -205,16 +255,42 @@ impl GrpcChunkStore {
 
 #[async_trait]
 impl ChunkStore for GrpcChunkStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    /// `deadline_millis` travels to the D server as `FragmentPutRequest.deadline_millis`
+    /// (issue #638) and is enforced **there**, at the last instant before the D server's
+    /// store publishes the write — with the accept queue behind it, which is why a write
+    /// parked in that queue is refused rather than applied late — and *verified* once that
+    /// publication has completed, so an `Ok(())` from this method means the D server
+    /// published the fragment strictly before its deadline. This is the half of
+    /// `W_write` a caller cannot provide for itself (proposal 0016 `:1557-1564`).
+    /// The caller-side half — a bounded, fail-closed await — is the
+    /// channel's own request timeout, wired at composition by
+    /// [`GrpcChunkStore::connect_with_timeout`] (`crates/server/src/cli.rs:1441`); a
+    /// second per-call bound here was reviewed and rejected as a duplicate
+    /// (`results/issue_508/review-rejected.md:10`), and cancelling the await *at* the
+    /// deadline would additionally destroy the verdict this field exists to deliver —
+    /// the server's definite "not applied", which a client-side timeout can never
+    /// distinguish from "may still land".
+    ///
+    /// **Mixed-version caveat:** an old D server ignores the field, so a new client
+    /// talking to one degrades to today's unenforced behaviour rather than failing. There
+    /// is no capability exchange yet — a mixed-version fleet does **not** get the
+    /// guarantee.
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
         let mut client = self.client.clone();
         let request = FragmentPutRequest {
             id: Some(conv::to_wire_fragment_id(id)),
             fragment: fragment.to_vec(),
+            deadline_millis,
         };
         client
             .put_fragment(Request::new(request))
             .await
-            .map_err(transport_error)?;
+            .map_err(|status| classify_put_status(id, status, deadline_millis))?;
         Ok(())
     }
 
@@ -305,6 +381,50 @@ mod tests {
                 class_of(code),
                 ErrorClass::Terminal,
                 "{code:?} is not in the transient or integrity sets — the default is terminal"
+            );
+        }
+    }
+
+    /// A write that carried NO deadline can have no deadline outcome, whatever status comes
+    /// back. Neither code is exclusive to this protocol — `ABORTED` is the generic
+    /// concurrency conflict (`:47`) and `FAILED_PRECONDITION` is `get_fragment`'s block-read
+    /// fault — so a foreign server or a proxy in the path can emit either for its own
+    /// reasons. Decoding on the code alone manufactured a deadline verdict out of that:
+    /// `NotApplied` asserts **nothing landed**, which over possibly-durable bytes is the
+    /// one wire lie that costs a caller correctness.
+    ///
+    /// Red without the gate: `classify_put_status` reads only `status.code()`, so both
+    /// assertions below see a `WriteDeadlineExpired`.
+    #[test]
+    fn a_write_with_no_deadline_never_decodes_a_deadline_outcome() {
+        let id = FragmentId {
+            chunk: 0x638,
+            index: 0,
+        };
+        for code in [Code::FailedPrecondition, Code::Aborted] {
+            let err = classify_put_status(id, Status::new(code, "unrelated"), None);
+            assert!(
+                !wyrd_traits::is_write_deadline_expired(err.as_ref()),
+                "{code:?} on a request with no deadline must fall through to the generic \
+                 mapping, not reconstruct a deadline outcome"
+            );
+        }
+    }
+
+    /// The other half of the gate: with a deadline actually sent, both codes still decode
+    /// into their outcomes — `FAILED_PRECONDITION` the definite refusal, `ABORTED` the
+    /// indeterminate one. Pins that the fix narrowed the decode rather than removing it.
+    #[test]
+    fn a_write_with_a_deadline_still_decodes_both_outcomes() {
+        let id = FragmentId {
+            chunk: 0x638,
+            index: 0,
+        };
+        for code in [Code::FailedPrecondition, Code::Aborted] {
+            let err = classify_put_status(id, Status::new(code, "expired"), Some(1));
+            assert!(
+                wyrd_traits::is_write_deadline_expired(err.as_ref()),
+                "{code:?} on a deadline-carrying request is a deadline outcome"
             );
         }
     }

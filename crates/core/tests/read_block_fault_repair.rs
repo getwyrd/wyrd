@@ -101,7 +101,12 @@ struct MemChunks {
 
 #[async_trait]
 impl ChunkStore for MemChunks {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -139,8 +144,13 @@ struct BlockFaultingStore {
 
 #[async_trait]
 impl ChunkStore for BlockFaultingStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
@@ -233,6 +243,7 @@ async fn ec_read_around_block_fault_still_enqueues_repair_with_non_corruption_re
                     index: index as u16,
                 },
                 encode_ec_fragment(chunk_id, index as u16, k, m, shard),
+                None,
             )
             .await
             .unwrap();
@@ -335,7 +346,7 @@ async fn none_scheme_block_fault_fails_the_read_but_still_enqueues_repair() {
     // cannot read the sector: every fetch returns `BlockReadFault`.
     let inner = MemChunks::default();
     inner
-        .put_fragment(frag_id, fragment(chunk_id, data))
+        .put_fragment(frag_id, fragment(chunk_id, data), None)
         .await
         .unwrap();
     let chunks = BlockFaultingStore {

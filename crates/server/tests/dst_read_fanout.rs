@@ -191,8 +191,13 @@ impl ArrivalStore {
 
 #[async_trait]
 impl ChunkStore for ArrivalStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {

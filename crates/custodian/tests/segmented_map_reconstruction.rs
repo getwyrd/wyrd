@@ -142,7 +142,12 @@ struct MemDServer {
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -305,7 +310,7 @@ async fn seed(meta: &MemMeta, d0: &MemDServer, inode: InodeId, what: Seed<'_>) {
                 let shards = erasure::encode(K.into(), M.into(), &data).expect("shards encode");
                 let frag = FragmentId { chunk, index: 0 };
                 let bytes = encode_ec_fragment(chunk, 0, K, M, &shards[0]);
-                d0.put_fragment(frag, bytes).await.unwrap();
+                d0.put_fragment(frag, bytes, None).await.unwrap();
             }
             let refs: Vec<ChunkRef> = chunks.iter().copied().map(chunk_ref).collect();
             (ChunkMap::from(refs), chunks.len() as u64 * CHUNK_LEN)

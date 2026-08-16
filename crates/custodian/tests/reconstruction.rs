@@ -117,7 +117,12 @@ struct MemDServer {
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -158,11 +163,16 @@ impl<'a> Fleet<'a> {
 
 #[async_trait]
 impl ChunkStore for Fleet<'_> {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
         // Unused: the write path places via `put_fragment_at`. Route to id-as-server so
         // the trait is total.
         if let Some(store) = self.store(DServerId::from(id.index)) {
-            store.put_fragment(id, fragment).await?;
+            store.put_fragment(id, fragment, deadline_millis).await?;
         }
         Ok(())
     }
@@ -210,9 +220,10 @@ impl PlacementChunkStore for Fleet<'_> {
         dserver: DServerId,
         id: FragmentId,
         fragment: Bytes,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
         if let Some(store) = self.store(dserver) {
-            store.put_fragment(id, fragment).await?;
+            store.put_fragment(id, fragment, deadline_millis).await?;
         }
         Ok(())
     }
@@ -547,7 +558,9 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
     // shard — the scrub / read finding. It must be EXCLUDED (never decoded), not absorbed.
     let mut rotten = d1.get_fragment(frag(1)).await.unwrap().unwrap().to_vec();
     rotten[CORE_HEADER_LEN as usize] ^= 0xff;
-    d1.put_fragment(frag(1), Bytes::from(rotten)).await.unwrap();
+    d1.put_fragment(frag(1), Bytes::from(rotten), None)
+        .await
+        .unwrap();
     repair::enqueue_repair(&meta, CHUNK, "scrub").await.unwrap();
 
     // Reconstruction over the full (alive) fleet: the corrupt fragment is treated as
@@ -774,7 +787,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
     // placement `vec![9]` (len 1 != fragment_count 3): the fabricated tail would resolve
     // indices 1,2 by identity to servers 1,2 — but a maintenance loop must never trust it.
     let bytes0 = d0.get_fragment(frag(0)).await.unwrap().unwrap();
-    d9.put_fragment(frag(0), bytes0).await.unwrap();
+    d9.put_fragment(frag(0), bytes0, None).await.unwrap();
     let prior = read_inode(&meta).await;
     let mut chunk_map = prior.chunk_map.as_flat().unwrap().to_vec();
     chunk_map[0].placement = vec![9];
@@ -1122,8 +1135,13 @@ struct FaultGetStore {
 
 #[async_trait]
 impl ChunkStore for FaultGetStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {

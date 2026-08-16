@@ -43,7 +43,12 @@ impl FaultStore {
 
 #[async_trait]
 impl ChunkStore for FaultStore {
-    async fn put_fragment(&self, id: FragmentId, _fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         if self.fail_index == Some(id.index) {
             return Err(format!("injected put failure at fragment {}", id.index).into());
         }

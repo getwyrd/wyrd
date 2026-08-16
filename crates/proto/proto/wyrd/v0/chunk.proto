@@ -26,6 +26,40 @@ message FragmentPutRequest {
   FragmentId id = 1;
   // The stored fragment bytes, exactly as specified by chunk-format (ADR-0019).
   bytes fragment = 2;
+  // The write's authorization deadline (epoch milliseconds), enforced by the D
+  // server itself against its own clock — proposal 0016 decision 5's `W_write`
+  // (issue #638):
+  // `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`. A
+  // caller-side timeout alone bounds only how long the writer waits, not when an
+  // already-accepted write takes effect, so the deadline travels with the write.
+  // The server judges it at the last instant before it publishes — with the accept
+  // queue, the thread-pool queue and the data write already behind it — and refuses
+  // rather than queues, so a refused write leaves nothing stored, even across a
+  // crash: nothing of it was ever published. It then re-reads its clock once the
+  // publishing step has completed, and does NOT acknowledge a write it could not
+  // verify was published inside the window; the two outcomes are distinguishable on
+  // the wire, because they say different things about the bytes:
+  //   FAILED_PRECONDITION — refused before publication: nothing landed, definitely.
+  //   ABORTED             — the server could not verify the publication landed in
+  //                         window: it may hold the bytes, in window or not, so the
+  //                         caller must not count the write and must not record that
+  //                         nothing landed either — it re-reads. It is deliberately
+  //                         NOT reported as a definite late landing: a clock reading
+  //                         taken after the publishing step dates the reading, so a
+  //                         timely publication followed by a descheduled thread is
+  //                         indistinguishable from one that overran.
+  //                         (DEADLINE_EXCEEDED is deliberately not used for this
+  //                         either: intermediaries and client channel deadlines
+  //                         generate it, so it could not be told apart from an RPC
+  //                         that never arrived.)
+  //
+  // **Additive and optional** (explicit proto3 presence, not zero-means-absent):
+  // an absent field is today's unbounded behaviour, so every existing writer is
+  // unaffected. Mixed-fleet caveat, stated honestly: an **old** D server ignores
+  // this field, so a new client talking to one degrades to unenforced (no
+  // capability exchange exists yet); a new server sees no field from an old client
+  // and behaves exactly as before.
+  optional uint64 deadline_millis = 3;
 }
 
 message FragmentPutResponse {}

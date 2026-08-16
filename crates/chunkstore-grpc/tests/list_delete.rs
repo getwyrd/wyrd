@@ -87,7 +87,7 @@ async fn list_and_delete_round_trip(store: &impl ChunkStore) {
     let ids = [fid(chunk_a, 0), fid(chunk_a, 3), fid(chunk_b, 0)];
     for &id in &ids {
         store
-            .put_fragment(id, fragment(id, b"a fragment to be walked"))
+            .put_fragment(id, fragment(id, b"a fragment to be walked"), None)
             .await
             .unwrap();
     }

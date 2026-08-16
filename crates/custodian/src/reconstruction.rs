@@ -931,7 +931,7 @@ async fn repair_chunk(
     // Write the rebuilt fragments to their new D servers FIRST — before the commit, so a
     // crash here leaves only collectable garbage, never a torn chunk (`0005:277`).
     for (target_store, frag, frag_bytes) in writes {
-        target_store.put_fragment(frag, frag_bytes).await?;
+        target_store.put_fragment(frag, frag_bytes, None).await?;
     }
 
     let inode_key = metadata::inode_key(object.inode_id);
