@@ -535,7 +535,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
             index: index as u16,
         };
         clients[index]
-            .put_fragment(frag_id, fragment_bytes)
+            .put_fragment(frag_id, fragment_bytes, None)
             .await
             .unwrap_or_else(|e| panic!("put_fragment index {index} to server {index}: {e}"));
     }

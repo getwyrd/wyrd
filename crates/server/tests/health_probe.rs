@@ -107,8 +107,13 @@ struct ControllableStore {
 
 #[async_trait]
 impl ChunkStore for ControllableStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
@@ -999,7 +1004,7 @@ async fn health_check_answers_while_the_data_plane_is_saturated() {
         b"a fragment that never gets read while the slot is held",
     );
     data_client
-        .put_fragment(id, frag)
+        .put_fragment(id, frag, None)
         .await
         .expect("seed the fragment");
     let admitted = tokio::spawn(async move { data_client.get_fragment(id).await });

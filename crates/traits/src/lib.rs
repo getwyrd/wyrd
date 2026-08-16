@@ -769,14 +769,20 @@ impl fmt::Display for ErrorClass {
 /// | [`BlockReadFault`] / a raw `EIO` ([`is_block_read_fault`]) | [`Terminal`](ErrorClass::Terminal) |
 /// | [`ScanCapExceeded`]      | [`Terminal`](ErrorClass::Terminal)           |
 /// | [`ZeroPageLimit`]        | [`Terminal`](ErrorClass::Terminal)           |
+/// | [`WriteDeadlineExpired`] | [`WriteDeadlineExpired::error_class`] — [`Terminal`](ErrorClass::Terminal) for a refusal, [`Indeterminate`](ErrorClass::Indeterminate) when the store could not establish the publication's timing |
 /// | anything else            | [`Terminal`](ErrorClass::Terminal)           |
 ///
-/// The last five rows are one arm — the **fail-safe default** — rather than five explicit
-/// checks that would return what the default already returns. That default is the whole
-/// safety argument: retry logic must act only on a *known-transient* signal, because
-/// defaulting the unknown to transient turns every unrecognised fault into a retry storm
-/// against a backend that will never answer differently. Each row is pinned by a unit test
-/// below, so the mapping is binding even where it is not spelled out in code.
+/// The [`BlockReadFault`] / [`ScanCapExceeded`] / [`ZeroPageLimit`] / "anything else" rows
+/// are one arm — the **fail-safe default** — rather than explicit checks that would return
+/// what the default already returns. That default is the whole safety argument: retry logic
+/// must act only on a *known-transient* signal, because defaulting the unknown to transient
+/// turns every unrecognised fault into a retry storm against a backend that will never
+/// answer differently. [`WriteDeadlineExpired`] is the one row that cannot ride the default:
+/// its [`Unknown`](WriteEffect::Unknown) case is genuinely *not* terminal — the bytes may
+/// have landed — so collapsing it into the default would tell a caller "nothing happened"
+/// when something may have, the exact mistake [`ErrorClass`]'s third outcome exists to
+/// prevent. Each row is pinned by a unit test below, so the mapping is binding even where
+/// it is not spelled out in code.
 pub fn classify(err: &(dyn std::error::Error + 'static)) -> ErrorClass {
     let mut next = Some(err);
     while let Some(e) = next {
@@ -789,9 +795,258 @@ pub fn classify(err: &(dyn std::error::Error + 'static)) -> ErrorClass {
         if e.is::<TransientFault>() {
             return ErrorClass::Transient;
         }
+        if let Some(deadline) = e.downcast_ref::<WriteDeadlineExpired>() {
+            return deadline.error_class();
+        }
         next = e.source();
     }
     ErrorClass::Terminal
+}
+
+/// A [`ChunkStore::put_fragment`] the store would not acknowledge because its authorization
+/// deadline had elapsed — refused before publication, or published after the deadline had
+/// passed. Proposal 0016 decision 5's server-enforced `W_write` bound (issue #638,
+/// `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`).
+///
+/// A caller-side `await` timeout alone bounds only how long the *writer waits*, not when
+/// an already-accepted write *takes effect*: a write parked between acceptance and
+/// application could otherwise land arbitrarily late — after the reaper's `orphan:` grace
+/// elapsed and the evidence protecting it was reclaimed (0016 outcome (a), the leak the
+/// strict margin `G_orphan > W_write + δ_clock` (`0016:1478`) exists to prevent). So the
+/// acceptor enforces the deadline itself, at the last instant before it publishes, and
+/// **refuses rather than queues** (`0016:1560`) — this is what it raises instead.
+///
+/// It carries **what is known about the bytes** ([`effect`](Self::effect)), because a store
+/// judges the deadline at two instants and only one of them can promise a clean refusal:
+/// [`NotApplied`](WriteEffect::NotApplied) before it publishes (the ordinary case — a
+/// definite, unconditional "the write did not take effect, and nothing of it is on the
+/// store", which holds across a crash and which a caller-side timeout can never give), and
+/// [`Unknown`](WriteEffect::Unknown) when the store could not *certify* that the publishing
+/// step completed before the deadline. The second is what makes `Ok(())` mean something: a
+/// store MUST NOT acknowledge a publication it did not verify landed in time, so a
+/// successful `put_fragment` is a **checked** end-to-end claim rather than an assumption
+/// that the publish syscall was quick (`0016:1557-1564` — the bound is on when the write
+/// *takes effect*, not on when it was accepted).
+///
+/// This is an **expected, non-fault** outcome — the write was too late, the backend is
+/// healthy — so, exactly like [`IntegrityFault`] / [`BlockReadFault`] / [`ScanCapExceeded`],
+/// it lives in the seam crate: **every** backend raises the *same* type, and a caller tells
+/// "refused, too late" apart from "the disk is broken" the same way on any of them
+/// ([`is_write_deadline_expired`]). Its [`classify`] row is [`error_class`](Self::error_class).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteDeadlineExpired {
+    /// The fragment write that was refused.
+    pub id: FragmentId,
+    /// What is known about the write's bytes — the difference between "certainly nothing
+    /// landed" and "the store cannot say". A caller MUST branch on this rather than assume
+    /// the clean case: see [`WriteEffect`].
+    pub effect: WriteEffect,
+    /// Detail for the durability audit trail: the deadline the write carried and what the
+    /// **acceptor's** clock read when it refused — the two evaluation sites `δ_clock`
+    /// bounds the skew between. Rendered by [`WriteDeadlineExpired::if_elapsed`] /
+    /// [`WriteDeadlineExpired::if_publication_unverified`] at the store that enforced it,
+    /// and carried verbatim across the wire when the gRPC client reconstructs the class (the
+    /// same shape [`IntegrityFault`] uses, for the same reason: the reconstruction must not
+    /// fabricate readings it never took).
+    pub detail: String,
+}
+
+/// What a [`WriteDeadlineExpired`] establishes about the write's bytes (issue #638).
+///
+/// The distinction is not cosmetic: one value promises the store is untouched, the other
+/// promises nothing at all. Collapsing them would make the clean promise a lie in exactly
+/// the case where it matters — and, in the other direction, an implementation that reported
+/// the *uncertain* case as a definite lateness would be asserting something its evidence
+/// does not support (a clock read that follows a syscall dates the read, not the syscall).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteEffect {
+    /// **Nothing landed.** The store judged the write too late *before* it published
+    /// anything and restored its pre-write state (no fragment, no scratch), so the fragment
+    /// is not observable through [`ChunkStore::get_fragment`] and never was. This holds
+    /// across a crash — there is no interval in which the bytes were readable — because the
+    /// implementation contract requires the judgment to precede publication. If a store
+    /// cannot restore that state it must report the cleanup failure as a **backend fault**
+    /// instead of this verdict, so `NotApplied` is never returned over residue.
+    NotApplied,
+    /// **The store cannot say whether the write took effect in its window.** It began
+    /// publishing while the write was still live, but the publishing step (a `rename`, an
+    /// object-store `PUT`, …) is a step whose duration the store neither bounds nor cancels,
+    /// and the first clock reading it could take once that step returned was already at or
+    /// past the deadline. So the fragment may be on the store, in window or late, and the
+    /// caller may not count the write either way — its only remedy is to re-read, exactly
+    /// like [`CommitUnknownResult`].
+    ///
+    /// **It is deliberately not called "published late".** The reading that produced it
+    /// dates the *observation*, not the publication: a thread descheduled after a perfectly
+    /// timely `rename` takes the same reading as one whose `rename` genuinely straddled the
+    /// deadline, and the store has no way to tell them apart. Naming the outcome after the
+    /// worse of the two would assert a fact the evidence does not carry, and would make an
+    /// in-window write look like a leak to every consumer that reads the label.
+    ///
+    /// The store deliberately does **not** unlink whatever landed: retraction is not atomic
+    /// with the publication (a crash in between leaves the bytes anyway) and it deletes by
+    /// *path*, so it can destroy a concurrent same-id writer's already-acknowledged
+    /// fragment — trading an uncertain write for certain data loss. Reporting is the sound
+    /// half; bytes that did land late are garbage their position's evidence covers
+    /// (`0016:1547-1550`, position coverage), while an erased live fragment is unrecoverable.
+    Unknown,
+}
+
+impl WriteEffect {
+    /// Whether the store's bytes **may** be present — true only for
+    /// [`Unknown`](WriteEffect::Unknown). [`NotApplied`](WriteEffect::NotApplied) is the
+    /// definite negative, so this is the predicate a caller uses to decide whether it must
+    /// re-read before concluding anything about durable state.
+    #[must_use]
+    pub fn may_have_landed(self) -> bool {
+        matches!(self, WriteEffect::Unknown)
+    }
+}
+
+impl WriteDeadlineExpired {
+    /// The **one** place the seam decides whether a write is too late: `Some(refusal)` iff
+    /// the acceptor's clock has reached `deadline_millis`, `None` while the write is still
+    /// live. Every backend calls this rather than re-deriving the comparison, so
+    /// `chunkstore-fs`, the gRPC D server and any future store cannot disagree about what
+    /// the deadline *means* (the reason a caller may not get a weaker guarantee by holding
+    /// a local store, issue #638 leg E). *Where* a backend calls it is the backend's own
+    /// obligation and is fixed by [`ChunkStore::put_fragment`]'s contract: immediately
+    /// before the step that publishes.
+    ///
+    /// The comparison is `now >= deadline` — **inclusive**, i.e. the deadline instant
+    /// itself is already too late. That is the fail-closed direction, and it matches GC's
+    /// own inclusive grace test (`crates/custodian/src/gc.rs:174`), so the arithmetic
+    /// `G_orphan > W_write + δ_clock` (`0016:1478`) composes without a boundary tick that
+    /// belongs to neither side.
+    ///
+    /// It takes `now_millis` rather than reading a clock: the seam crate owns no clock, and
+    /// the read belongs to the lifecycle that applies the write (the store's own clock —
+    /// AGENTS.md § Review rubric, "one clock per correctness lifecycle").
+    pub fn if_elapsed(id: FragmentId, deadline_millis: u64, now_millis: u64) -> Option<Self> {
+        (now_millis >= deadline_millis).then(|| Self {
+            id,
+            effect: WriteEffect::NotApplied,
+            detail: format!(
+                "authorization deadline {deadline_millis} ms (epoch) had elapsed when the \
+                 store reached the point of publishing the write; the store's clock read \
+                 {now_millis} ms"
+            ),
+        })
+    }
+
+    /// The **post-publication** half of the same comparison: `Some(unknown)` iff the store's
+    /// clock had already reached `deadline_millis` at the first reading it could take once
+    /// its publishing step *returned*.
+    ///
+    /// This is what keeps `Ok(())` from being an assumption. The pre-publication verdict
+    /// ([`if_elapsed`](Self::if_elapsed)) can only establish that publication had not yet
+    /// *begun* too late; the publishing step is a syscall (or an RPC) whose own latency no
+    /// caller controls, and on a slow or hung device it can straddle the deadline. Calling
+    /// this immediately after that step — the same clock, one more read — is how a store
+    /// learns it **cannot certify** the landing, and the contract then forbids acknowledging
+    /// the write ([`ChunkStore::put_fragment`]). Without it, `Ok(())` would mean "publication
+    /// started in time", which is precisely the "bounds acceptance, not effect" gap 0016
+    /// rejects for caller-side timeouts (`0016:1557-1564`).
+    ///
+    /// What it does **not** establish is that the publication *was* late — a clock read
+    /// timestamps the read, not the syscall that preceded it, so a timely `rename` followed
+    /// by a descheduled thread is indistinguishable here from one that genuinely overran.
+    /// Hence [`WriteEffect::Unknown`] and [`ErrorClass::Indeterminate`]: the store reports
+    /// what it knows (nothing, about the timing) rather than the worse of the two readings.
+    /// The fail-closed direction is `Ok(())` only on a *verified* in-window landing, so the
+    /// uncertainty is charged to the write, never to the caller's safety argument.
+    pub fn if_publication_unverified(
+        id: FragmentId,
+        deadline_millis: u64,
+        now_millis: u64,
+    ) -> Option<Self> {
+        (now_millis >= deadline_millis).then(|| Self {
+            id,
+            effect: WriteEffect::Unknown,
+            detail: format!(
+                "the store could not verify that this write was published before its \
+                 authorization deadline {deadline_millis} ms (epoch): the first clock reading \
+                 taken after its publishing step returned was {now_millis} ms. The bytes may \
+                 or may not be on the store, and may or may not have landed in window"
+            ),
+        })
+    }
+
+    /// This outcome's [`ErrorClass`] — the row [`classify`] returns for it.
+    ///
+    /// [`NotApplied`](WriteEffect::NotApplied) is [`Terminal`](ErrorClass::Terminal):
+    /// re-sending the *same* expired authorization can never succeed, so the caller must
+    /// re-authorize rather than retry. [`Unknown`](WriteEffect::Unknown) is
+    /// [`Indeterminate`](ErrorClass::Indeterminate) for the reason [`CommitUnknownResult`]
+    /// is — the call failed *and* durable state may have changed, so calling it terminal
+    /// would tell a caller "nothing happened" when something may have
+    /// ([`ErrorClass`]'s "the partition is not binary, and that is load-bearing").
+    #[must_use]
+    pub fn error_class(&self) -> ErrorClass {
+        match self.effect {
+            WriteEffect::NotApplied => ErrorClass::Terminal,
+            WriteEffect::Unknown => ErrorClass::Indeterminate,
+        }
+    }
+}
+
+impl fmt::Display for WriteDeadlineExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The verdict and the remedy are read off the **same** effect, because the two
+        // outcomes need opposite next moves and a single suffix can only be right for one of
+        // them: `NotApplied` is definite ("nothing landed"), so the caller re-authorizes and
+        // writes again; `Unknown` says durable state may have changed, so the caller must
+        // **re-read** first — re-authorizing over it would either duplicate a write that did
+        // land or, worse, record it as never written. This is `CommitUnknownResult`'s own
+        // register ("the caller must re-read to establish what happened") and the reason
+        // `WriteEffect::may_have_landed` exists.
+        let (verdict, remedy) = match self.effect {
+            WriteEffect::NotApplied => (
+                "refused and NOT applied",
+                "re-authorize and write again, do not retry this authorization",
+            ),
+            WriteEffect::Unknown => (
+                "NOT acknowledged: its publication could not be verified",
+                "re-read to establish what landed before counting this write either way",
+            ),
+        };
+        write!(
+            f,
+            "fragment write {verdict} (chunk {:032x} index {}): {} \
+             (proposal 0016 decision 5's W_write — {remedy})",
+            self.id.chunk, self.id.index, self.detail,
+        )
+    }
+}
+
+impl std::error::Error for WriteDeadlineExpired {}
+
+/// Whether `err` is a [`WriteDeadlineExpired`] refusal anywhere in its source chain — the
+/// seam-level classifier a caller uses to tell an **expected** "refused, too late" apart
+/// from a genuine backend fault, mirroring [`is_integrity_fault`] /
+/// [`is_block_read_fault`]. Walks [`source`](std::error::Error::source) so a backend (or
+/// the gRPC client) may wrap the refusal in its own type and still be classified.
+pub fn is_write_deadline_expired(err: &(dyn std::error::Error + 'static)) -> bool {
+    write_deadline_outcome(err).is_some()
+}
+
+/// The [`WriteDeadlineExpired`] in `err`'s source chain, if any — the accessor a consumer
+/// that must branch on [`WriteEffect`] uses, rather than re-implementing the chain walk (the
+/// gRPC D server does, to give the two effects distinct wire codes). Same walk as
+/// [`is_write_deadline_expired`], which is defined in terms of it so the two can never
+/// disagree about what counts as a deadline outcome.
+#[must_use]
+pub fn write_deadline_outcome<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a WriteDeadlineExpired> {
+    let mut next = Some(err);
+    while let Some(e) = next {
+        if let Some(found) = e.downcast_ref::<WriteDeadlineExpired>() {
+            return Some(found);
+        }
+        next = e.source();
+    }
+    None
 }
 
 /// A coarse health signal a backend reports about itself.
@@ -819,7 +1074,82 @@ pub enum Health {
 pub trait ChunkStore: Send + Sync {
     /// Persist a fragment's bytes under `id`. Implementations verify the
     /// fragment's self-describing checksums before acknowledging.
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()>;
+    ///
+    /// `deadline_millis` is the write's **authorization deadline** in epoch
+    /// milliseconds — proposal 0016 decision 5's `W_write` (issue #638,
+    /// `docs/design/proposals/draft/0016-multipart-commit-protocol.md:1551-1576`).
+    /// A caller-side timeout bounds only how long the writer *waits*, so the
+    /// deadline travels with the write and **the implementation itself must
+    /// enforce it**:
+    ///
+    /// * It **refuses** a write whose deadline has elapsed, returning
+    ///   [`WriteDeadlineExpired`] ([`WriteDeadlineExpired::if_elapsed`] is the shared
+    ///   comparison, so every backend means the same thing by "too late").
+    /// * The judgment happens at the implementation's **publication point**: the last
+    ///   instant before the single step that makes the fragment visible, with every
+    ///   segment that can consume unbounded time — an accept queue, a thread-pool
+    ///   queue, directory creation, the data write — already behind it. That is what
+    ///   makes the deadline a bound on when the write *takes effect* and not merely on
+    ///   when it was accepted; a write that sat anywhere upstream is refused rather than
+    ///   queued (`0016:1560`). An implementation may *also* refuse an already-expired
+    ///   write on entry — that costs no I/O — but that check is an optimisation, never
+    ///   the bound.
+    /// * The judgment MUST **precede** publication, not follow it. This is the
+    ///   crash-safety clause, and it is why the ordering is normative rather than an
+    ///   implementation detail: an implementation that publishes first and then retracts
+    ///   has a window in which the bytes are readable and, if the process dies inside
+    ///   it, durably present — so [`WriteEffect::NotApplied`] would be a lie exactly
+    ///   when it matters; its retraction is also not atomic with the publication, so it
+    ///   can destroy a *concurrent* same-id writer's acknowledged fragment. Judging
+    ///   first has neither hazard.
+    /// * A [`NotApplied`](WriteEffect::NotApplied) refusal MUST leave the store
+    ///   **exactly as if the write had never arrived**: the fragment MUST NOT be
+    ///   observable through [`ChunkStore::get_fragment`], and no scratch and no
+    ///   part-written object may be left behind. Refusing the caller while *keeping* the
+    ///   bytes is precisely the leak (0016 outcome (a)) the deadline exists to prevent.
+    ///   An implementation that **cannot** restore that state (the unlink was denied, the
+    ///   object-store delete failed) MUST report that failure as a **backend fault** — a
+    ///   fault a caller distinguishes from a refusal by [`is_write_deadline_expired`] —
+    ///   and MUST NOT return the definite [`NotApplied`](WriteEffect::NotApplied) verdict
+    ///   over residue it did not remove. Reporting a clean refusal it did not achieve is
+    ///   a silent skip (AGENTS.md § Review rubric, *Absent or unsupported entries*), and
+    ///   it is what lets the residue accumulate unnoticed. Container state an
+    ///   implementation *shares* with concurrent writes (a chunk directory, a bucket
+    ///   prefix) is **not** part of the write's bytes and MUST NOT be removed by the
+    ///   refusal: a container left empty is invisible through this trait — nothing is
+    ///   observable through [`ChunkStore::get_fragment`] or
+    ///   [`ChunkStore::list_fragments`] because of it — whereas removing it can strip it
+    ///   from under a live writer that is creating the same container, failing a *live*
+    ///   write on behalf of an expired one. That hazard is not bounded by retrying the
+    ///   creation: N retries lose to N+1 racing refusals. An implementation that collects
+    ///   empty containers does it where no write of that store is in flight (`FsChunkStore`
+    ///   does it at `open`) and by an operation atomic in the container's emptiness, so
+    ///   collection can never take a container somebody is putting bytes into.
+    /// * Publication itself is **verified, not assumed**. The publishing step takes
+    ///   non-zero time — a `rename(2)`, an object `PUT` — and neither its duration nor
+    ///   its cancellation is under the store's control, so on a hung device it can
+    ///   straddle the deadline. The implementation therefore re-reads its clock
+    ///   immediately **after** that step
+    ///   ([`WriteDeadlineExpired::if_publication_unverified`]) and, unless that reading
+    ///   is still inside the window, returns [`Unknown`](WriteEffect::Unknown) rather
+    ///   than `Ok(())`. So `Ok(())` means *the fragment was published strictly before its
+    ///   deadline*, checked at both ends of the publishing step — not "publication
+    ///   started in time", which is the very "bounds acceptance, not effect" gap 0016
+    ///   rejects for caller-side timeouts. An implementation MUST NOT report that case as
+    ///   a definite late landing: the reading dates the observation, not the syscall (see
+    ///   [`WriteEffect::Unknown`]). The bytes, if any, stay where they are — retracting
+    ///   them is the worse trade, for the reasons recorded on that variant.
+    ///
+    /// `None` means the caller supplied no deadline: the write is unbounded —
+    /// **exactly the pre-#638 behaviour** — which is what keeps every existing
+    /// writer (the ordinary write path, backfill, reconstruction, rebalance)
+    /// working unchanged.
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()>;
 
     /// Fetch a fragment's bytes, or `Ok(None)` if this store holds no fragment
     /// for `id`. Implementations verify integrity before returning bytes.
@@ -888,14 +1218,17 @@ pub trait PlacementChunkStore: ChunkStore {
     }
 
     /// Place fragment `id` on the D server `dserver`. The default ignores `dserver`
-    /// and delegates to [`ChunkStore::put_fragment`].
+    /// and delegates to [`ChunkStore::put_fragment`], forwarding `deadline_millis`
+    /// **unchanged** — routing a write must never strip its authorization deadline
+    /// (issue #638), since the store it routes to is the site that enforces it.
     async fn put_fragment_at(
         &self,
         _dserver: DServerId,
         id: FragmentId,
         fragment: Bytes,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
-        self.put_fragment(id, fragment).await
+        self.put_fragment(id, fragment, deadline_millis).await
     }
 }
 
@@ -1487,6 +1820,165 @@ mod error_class_tests {
         assert!(
             !ErrorClass::Indeterminate.is_transient() && !ErrorClass::Indeterminate.is_terminal(),
             "an undetermined commit is neither — that is why the partition is not binary"
+        );
+    }
+
+    /// `:if_elapsed` — the **one** comparison every backend shares (issue #638), pinned at
+    /// its boundary. A write is live strictly *before* its deadline and too late from the
+    /// deadline instant on (the fail-closed direction, matching GC's inclusive grace test at
+    /// `crates/custodian/src/gc.rs:174` so `G_orphan > W_write + δ_clock` has no tick that
+    /// belongs to neither side). Mutating `>=` to `>` — the tempting "one more tick" — is
+    /// caught here.
+    #[test]
+    fn a_write_is_live_before_its_deadline_and_refused_from_the_deadline_instant_on() {
+        assert!(
+            WriteDeadlineExpired::if_elapsed(frag(), 1_000, 999).is_none(),
+            "one millisecond before its deadline the write is still live"
+        );
+        assert!(
+            WriteDeadlineExpired::if_elapsed(frag(), 1_000, 1_000).is_some(),
+            "the deadline instant itself is already too late (fail-closed)"
+        );
+        let refusal = WriteDeadlineExpired::if_elapsed(frag(), 1_000, 5_000)
+            .expect("well past the deadline is refused");
+        assert_eq!(refusal.id, frag());
+        // Both evaluation sites' readings survive into the audit trail: the authorizer's
+        // deadline and the acceptor's own clock (what `δ_clock` bounds the skew between).
+        let rendered = refusal.to_string();
+        assert!(
+            rendered.contains("1000") && rendered.contains("5000"),
+            "the refusal must record the deadline AND the acceptor's clock reading: {rendered}"
+        );
+        assert!(
+            rendered.contains("NOT applied"),
+            "an operator must be able to read off that the write did not happen: {rendered}"
+        );
+    }
+
+    /// A deadline refusal is classifiable across the seam (issue #638 leg F): recognised by
+    /// type — through a wrapper, so a backend or the gRPC client may add context — and
+    /// **never** confused with a genuine backend fault. It classifies `Terminal` (re-sending
+    /// the same expired authorization can never succeed) but, unlike a fault, it says the
+    /// write definitively did not happen.
+    #[test]
+    fn a_deadline_refusal_is_typed_distinguishable_and_terminal() {
+        let refusal = WriteDeadlineExpired::if_elapsed(frag(), 1_000, 2_000).expect("expired");
+        assert!(is_write_deadline_expired(&refusal));
+        let wrapped = Wrapper(Box::new(refusal.clone()));
+        assert!(
+            is_write_deadline_expired(&wrapped),
+            "the classifier must walk the source chain, like is_integrity_fault"
+        );
+        assert_eq!(classify(&refusal), ErrorClass::Terminal);
+
+        // The other direction: genuine backend faults must never read as a deadline
+        // refusal, or a caller would silently treat a broken disk as "just too late".
+        for fault in [
+            Box::new(IntegrityFault {
+                id: frag(),
+                detail: "checksum mismatch".into(),
+            }) as BoxError,
+            Box::new(BlockReadFault::new(frag(), "dead sector")),
+            Box::new(std::io::Error::from_raw_os_error(5)),
+            Box::new(TransientFault::new("the D server did not answer")),
+        ] {
+            assert!(
+                !is_write_deadline_expired(fault.as_ref()),
+                "a genuine backend fault is not a deadline refusal: {fault}"
+            );
+        }
+        assert!(
+            !is_integrity_fault(&refusal) && !is_block_read_fault(&refusal),
+            "and a deadline refusal is not a fault: {refusal}"
+        );
+    }
+
+    /// `:if_publication_unverified` — the **post-publication** half of the bound (issue
+    /// #638). It shares `if_elapsed`'s boundary exactly (a publication whose following
+    /// reading is one millisecond before the deadline is verified in window; one taken *at*
+    /// the deadline is not), and it renders a different verdict, because the two say
+    /// different things about the bytes.
+    #[test]
+    fn a_publication_the_store_could_not_time_is_reported_as_unknown_not_as_late() {
+        assert!(
+            WriteDeadlineExpired::if_publication_unverified(frag(), 1_000, 999).is_none(),
+            "publication verified inside the window: the write is acknowledged"
+        );
+        let unknown = WriteDeadlineExpired::if_publication_unverified(frag(), 1_000, 1_000)
+            .expect("the deadline instant itself is already too late (fail-closed)");
+        assert_eq!(unknown.effect, WriteEffect::Unknown);
+        assert!(
+            unknown.effect.may_have_landed(),
+            "the caller must be able to see that durable bytes may exist"
+        );
+        let rendered = unknown.to_string();
+        assert!(
+            rendered.contains("could not verify") && rendered.contains("NOT acknowledged"),
+            "the operator-facing rendering must not read as a clean refusal: {rendered}"
+        );
+        // The negative half, and the reason this variant is not called `PublishedLate`: a
+        // reading taken after the syscall dates the reading, so the rendering must not
+        // assert a late landing it cannot evidence.
+        assert!(
+            !rendered.contains("landed late"),
+            "an unverified publication must not be reported as a definite late landing — a \
+             timely rename followed by a descheduled thread reads identically: {rendered}"
+        );
+
+        // **The remedy is read off the effect, not stamped on every outcome.** `Unknown`
+        // means durable state may have changed, so the caller's next move is a *re-read*;
+        // telling it to re-authorize would send it to write again over bytes that may
+        // already be there, or to record as unwritten a fragment that landed. The clean
+        // refusal's rendering says the opposite thing, and the pair is asserted together so
+        // neither can be collapsed back into one suffix.
+        assert!(
+            rendered.contains("re-read"),
+            "an indeterminate outcome must send the caller to re-read: {rendered}"
+        );
+        assert!(
+            !rendered.contains("re-authorize"),
+            "and must NOT send it to re-authorize, which is the definite case's remedy: \
+             {rendered}"
+        );
+        let refused = WriteDeadlineExpired::if_elapsed(frag(), 1_000, 1_000)
+            .expect("expired")
+            .to_string();
+        assert!(
+            refused.contains("re-authorize") && !refused.contains("re-read"),
+            "a definite refusal's remedy is the other one — nothing landed, so there is \
+             nothing to re-read: {refused}"
+        );
+    }
+
+    /// The two effects are the same *class* of outcome (both `is_write_deadline_expired`,
+    /// neither a backend fault) but **not** the same [`ErrorClass`]: a clean refusal is
+    /// terminal, an unverified publication is indeterminate, because durable state may have
+    /// changed. A caller that treated `Unknown` as terminal would record "nothing happened"
+    /// over bytes that may be on the store — the mistake the third class exists to prevent.
+    #[test]
+    fn the_two_deadline_effects_classify_differently() {
+        let refused = WriteDeadlineExpired::if_elapsed(frag(), 1_000, 2_000).expect("expired");
+        let unknown = WriteDeadlineExpired::if_publication_unverified(frag(), 1_000, 2_000)
+            .expect("unverified publication");
+
+        assert_eq!(refused.effect, WriteEffect::NotApplied);
+        assert!(!refused.effect.may_have_landed());
+        assert_eq!(classify(&refused), ErrorClass::Terminal);
+
+        assert_eq!(classify(&unknown), ErrorClass::Indeterminate);
+        assert!(
+            !classify(&unknown).is_terminal() && !classify(&unknown).is_transient(),
+            "an unverified publication is neither: it must not be retried blind, and it is \
+             not known to have left the store untouched"
+        );
+        assert_eq!(
+            classify(&Wrapper(Box::new(unknown.clone()))),
+            ErrorClass::Indeterminate,
+            "the class must survive a backend wrapping it, like every other seam type"
+        );
+        assert!(
+            is_write_deadline_expired(&unknown) && !is_integrity_fault(&unknown),
+            "it is still the deadline class, not a fault: {unknown}"
         );
     }
 }

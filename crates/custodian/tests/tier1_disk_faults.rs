@@ -381,7 +381,7 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         };
         // put_fragment verifies the checksum — valid fragments from plan_write pass.
         stores_for_write[i]
-            .put_fragment(frag_id, frag_bytes.clone())
+            .put_fragment(frag_id, frag_bytes.clone(), None)
             .await
             .unwrap_or_else(|e| panic!("put_fragment index {i} failed: {e}"));
     }

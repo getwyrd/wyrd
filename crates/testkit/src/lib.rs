@@ -77,6 +77,65 @@ impl Clock for ManualClock {
     }
 }
 
+/// A [`Clock`] that hands out a **scripted sequence** of readings — one per read, then
+/// repeating the last — so a test can make time pass *between* two clock reads inside the
+/// code under test, with no real waiting and no race.
+///
+/// [`ManualClock`] cannot express that: advancing it requires a moment when the test holds
+/// control, and the interesting window (between a store admitting a write and the instant it
+/// reaches its publication point, issue #638) is precisely a window in which it does not.
+/// Scripting the readings puts the *elapsing* inside the production call: reading 1 says the
+/// write is live, reading 2 says its deadline has passed. A guard that exists only on entry
+/// therefore lets the write land and the test goes red, which is the property being pinned.
+///
+/// It scripts *readings*, so it pins **how many** clock reads the code takes and what each
+/// one says — not **where** they happen. A test that must show a read falls on a particular
+/// side of a specific syscall needs a clock anchored to an observable effect of that syscall
+/// instead (`chunkstore-fs/tests/conformance.rs` builds one over the store's own directory).
+#[derive(Debug, Clone)]
+pub struct SteppedClock {
+    readings: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<u64>>>,
+    last: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SteppedClock {
+    /// A clock that returns `readings` in order, one per [`Clock::now_millis`] call, and
+    /// keeps returning the final one afterwards.
+    ///
+    /// # Panics
+    /// Panics on an empty script — a clock that cannot answer its first read is a test bug.
+    pub fn new(readings: impl IntoIterator<Item = u64>) -> Self {
+        let readings: std::collections::VecDeque<u64> = readings.into_iter().collect();
+        let first = *readings.front().expect("a SteppedClock needs a reading");
+        Self {
+            readings: std::sync::Arc::new(std::sync::Mutex::new(readings)),
+            last: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(first)),
+        }
+    }
+
+    /// How many readings are still unconsumed — lets a test assert the code under test
+    /// really took the reads its script assumed (an unconsumed tail means it did not).
+    pub fn remaining(&self) -> usize {
+        self.readings.lock().expect("stepped clock").len()
+    }
+}
+
+impl Clock for SteppedClock {
+    fn now_millis(&self) -> u64 {
+        let mut readings = self.readings.lock().expect("stepped clock");
+        match readings.pop_front() {
+            Some(reading) => {
+                self.last
+                    .store(reading, std::sync::atomic::Ordering::Relaxed);
+                reading
+            }
+            // The script is exhausted: time stops rather than wrapping or panicking, so a
+            // later read (a retry, another call) sees the last scripted instant.
+            None => self.last.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
 /// Abstract durable storage. Production code performs disk I/O through this seam
 /// so the simulator can model latency, reordering, and faults deterministically.
 pub trait Disk {
@@ -873,6 +932,31 @@ mod tests {
     fn no_faults_injects_nothing() {
         let mut faults = NoFaults;
         assert!(!faults.should_fail(FaultPoint::DiskWrite));
+    }
+
+    /// [`SteppedClock`] hands out its script in order, then holds the last reading —
+    /// and `remaining()` reports the *unconsumed tail*, which is how a test pins that
+    /// the code under test really took the reads its script assumed (issue #638). A
+    /// `remaining()` that answered a constant would silently make those assertions
+    /// vacuous, so the count is pinned at every step, not just at zero.
+    #[test]
+    fn a_stepped_clock_reports_each_reading_once_and_counts_what_is_left() {
+        let clock = SteppedClock::new([9_500, 10_500]);
+        assert_eq!(clock.remaining(), 2, "nothing consumed yet");
+        assert_eq!(clock.now_millis(), 9_500);
+        assert_eq!(clock.remaining(), 1, "one reading consumed");
+        assert_eq!(clock.now_millis(), 10_500);
+        assert_eq!(clock.remaining(), 0, "the script is exhausted");
+        assert_eq!(
+            clock.now_millis(),
+            10_500,
+            "past the end, time stops at the last reading rather than wrapping"
+        );
+        assert_eq!(clock.remaining(), 0);
+        // A clone shares the script, so the handle a test keeps sees what the code
+        // under test consumed.
+        let handle = clock.clone();
+        assert_eq!(handle.remaining(), 0);
     }
 
     #[test]

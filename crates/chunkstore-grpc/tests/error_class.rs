@@ -148,7 +148,7 @@ async fn a_genuine_integrity_fault_classifies_integrity_over_grpc() {
 
     let id = fid(0xC0DE_0000_0000_0000_0000_0000_0000_0577, 0);
     client
-        .put_fragment(id, fragment(id, b"healthy until it rots"))
+        .put_fragment(id, fragment(id, b"healthy until it rots"), None)
         .await
         .unwrap();
     let path = fragment_path(dir.path(), id);
@@ -325,7 +325,7 @@ async fn transient_and_terminal_are_distinguishable_across_the_seam() {
     let (client, dir, server) = stand_up().await;
     let id = fid(0xBEEF, 0);
     client
-        .put_fragment(id, fragment(id, b"rots in a moment"))
+        .put_fragment(id, fragment(id, b"rots in a moment"), None)
         .await
         .unwrap();
     let path = fragment_path(dir.path(), id);
@@ -412,7 +412,12 @@ struct BrieflyUnavailableStore;
 
 #[async_trait::async_trait]
 impl ChunkStore for BrieflyUnavailableStore {
-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> wyrd_traits::Result<()> {
+    async fn put_fragment(
+        &self,
+        _id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> wyrd_traits::Result<()> {
         unreachable!("this test only drives get_fragment")
     }
 
@@ -444,8 +449,13 @@ struct ParkedStore {
 
 #[async_trait::async_trait]
 impl ChunkStore for ParkedStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> wyrd_traits::Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> wyrd_traits::Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, _id: FragmentId) -> wyrd_traits::Result<Option<Bytes>> {

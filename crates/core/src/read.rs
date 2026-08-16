@@ -728,7 +728,12 @@ mod tests {
 
     #[async_trait]
     impl ChunkStore for UnreachableStore {
-        async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
+        async fn put_fragment(
+            &self,
+            _id: FragmentId,
+            _fragment: Bytes,
+            _deadline_millis: Option<u64>,
+        ) -> Result<()> {
             unreachable!("no write path is exercised by this read-only regression")
         }
 
@@ -759,7 +764,12 @@ mod tests {
 
     #[async_trait]
     impl ChunkStore for EmptyChunks {
-        async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
+        async fn put_fragment(
+            &self,
+            _id: FragmentId,
+            _fragment: Bytes,
+            _deadline_millis: Option<u64>,
+        ) -> Result<()> {
             Ok(())
         }
         async fn get_fragment(&self, _id: FragmentId) -> Result<Option<Bytes>> {

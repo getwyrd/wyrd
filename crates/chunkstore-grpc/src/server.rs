@@ -69,17 +69,61 @@ impl<S: ChunkStore + 'static> ChunkStoreRpc for ChunkStoreService<S> {
     ) -> std::result::Result<Response<FragmentPutResponse>, Status> {
         let request = request.into_inner();
         let id = conv::from_wire_fragment_id(request.id)?;
-        // The store verifies the fragment's checksums before acknowledging
-        // (write step 2). A malformed/failing-integrity fragment is the **client's**
-        // fault — surface it as `INVALID_ARGUMENT`, not `INTERNAL`, so the caller
-        // does not retry bytes that can never verify; a true I/O failure stays
-        // internal.
+        // `deadline_millis` is additive-optional on the wire (issue #638): absent is
+        // today's unbounded behaviour, so a pre-#638 client is unaffected. The
+        // deadline is **passed to the store**, which enforces it at the point it
+        // publishes the write and verifies that the publication completed in time —
+        // deliberately not checked here. A check in this handler
+        // would bound only when the D server *accepted* the write, leaving the gap
+        // 0016 decision 5 is about (this handler's future can be dropped by a client
+        // reset while the store's blocking write runs on to its publish point), and it
+        // would give an embedded caller that holds the store directly (`FsChunkStore`,
+        // leg E) a weaker guarantee than a networked one.
         self.inner
-            .put_fragment(id, Bytes::from(request.fragment))
+            .put_fragment(id, Bytes::from(request.fragment), request.deadline_millis)
             .await
             .map_err(|e| {
+                // The store verifies the fragment's checksums before acknowledging
+                // (write step 2). A malformed/failing-integrity fragment is the
+                // **client's** fault — surface it as `INVALID_ARGUMENT`, not
+                // `INTERNAL`, so the caller does not retry bytes that can never
+                // verify; a true I/O failure stays internal.
                 if wyrd_traits::is_integrity_fault(e.as_ref()) {
                     Status::invalid_argument(e.to_string())
+                } else if let Some(deadline) = wyrd_traits::write_deadline_outcome(e.as_ref()) {
+                    // The deadline outcome (issue #638) is an **expected, non-fault**
+                    // one — the write was too late, this D server is healthy — so it
+                    // rides its own codes, distinct from `INVALID_ARGUMENT`'s "bad
+                    // bytes" and from the transient/internal fault path, and
+                    // reconstructs client-side as a typed
+                    // `wyrd_traits::WriteDeadlineExpired` (`client.rs`'s
+                    // `classify_put_status`).
+                    //
+                    // **Two codes, because the two effects say different things about the
+                    // bytes** and collapsing them would make the wire lie in the one case
+                    // that matters:
+                    //
+                    // * `FAILED_PRECONDITION` — `NotApplied`: the gRPC code for "the
+                    //   system is not in the state this operation requires and the client
+                    //   should not retry until that changes", here not until the write is
+                    //   re-authorized. Unambiguous on this RPC: `put_fragment` has never
+                    //   produced it (its `BlockReadFault` meaning is `get_fragment`'s
+                    //   alone).
+                    // * `ABORTED` — `Unknown`: the store began publishing in time but
+                    //   could not verify the publication landed in window, so the bytes'
+                    //   state is undetermined. `DEADLINE_EXCEEDED` would read better and
+                    //   is deliberately **not** used: intermediaries and tonic's own
+                    //   channel deadline generate it, so a client could not tell "that D
+                    //   server may hold your bytes" from "the RPC never arrived". Nothing
+                    //   else on this RPC produces `ABORTED`.
+                    match deadline.effect {
+                        wyrd_traits::WriteEffect::NotApplied => {
+                            Status::new(Code::FailedPrecondition, e.to_string())
+                        }
+                        wyrd_traits::WriteEffect::Unknown => {
+                            Status::new(Code::Aborted, e.to_string())
+                        }
+                    }
                 } else {
                     transient_or_internal(&e)
                 }

@@ -879,7 +879,12 @@ mod streaming_behaviour {
 
     #[async_trait]
     impl ChunkStore for RecordingChunkStore {
-        async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+        async fn put_fragment(
+            &self,
+            id: FragmentId,
+            fragment: Bytes,
+            _deadline_millis: Option<u64>,
+        ) -> Result<()> {
             let mut first = self.first_write_at.lock().unwrap();
             if first.is_none() {
                 *first = Some(self.pieces_pulled.load(Ordering::SeqCst));

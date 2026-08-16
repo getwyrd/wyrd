@@ -54,6 +54,10 @@ wyrd-coordination-mem.workspace = true
 # `MetadataStore` doubles of the Tier-1/Tier-2 scenarios delegate to (#634). It
 # lives in the testkit crate, not in `wyrd-traits`, so no production backend can
 # reach it; this dev-dependency is how a test double does.
+# The same crate carries the Clock seam (ADR-0024): the write-deadline tests (issue
+# #638) drive the hosted store's own clock — a manual/scripted one — so a deadline
+# elapsing between the D server accepting a write and applying it is deterministic,
+# not slept through.
 wyrd-testkit.workspace = true
 
 # Inherit the workspace lint policy (single source of truth in the root

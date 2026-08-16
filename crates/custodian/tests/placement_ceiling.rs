@@ -222,7 +222,11 @@ async fn seed(
         let id = frag(chunk.id, index as u16);
         let shard = &shards[index];
         let bytes = write::encode_ec_fragment(id.chunk, id.index, K as u8, M as u8, shard);
-        fleet.store(*dserver).put_fragment(id, bytes).await.unwrap();
+        fleet
+            .store(*dserver)
+            .put_fragment(id, bytes, None)
+            .await
+            .unwrap();
     }
 }
 

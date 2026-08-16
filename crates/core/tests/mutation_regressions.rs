@@ -87,7 +87,12 @@ struct MemChunks {
 
 #[async_trait]
 impl ChunkStore for MemChunks {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -277,6 +282,7 @@ async fn read_with_fewer_than_k_fragments_reports_insufficient() {
                 index: 0,
             },
             write::encode_ec_fragment(chunk_id, 0, k, m, &shards[0]),
+            None,
         )
         .await
         .unwrap();

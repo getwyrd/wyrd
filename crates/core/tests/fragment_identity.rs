@@ -100,7 +100,12 @@ struct MemChunks {
 
 #[async_trait]
 impl ChunkStore for MemChunks {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -184,6 +189,7 @@ async fn ec_read_rejects_a_same_chunk_wrong_index_fragment() {
                 index: 0,
             },
             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
+            None,
         )
         .await
         .unwrap();
@@ -195,6 +201,7 @@ async fn ec_read_rejects_a_same_chunk_wrong_index_fragment() {
                 index: 1,
             },
             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
+            None,
         )
         .await
         .unwrap();
@@ -271,6 +278,7 @@ async fn ec_read_rejects_a_fragment_whose_ec_tuple_disagrees_with_scheme() {
                 index: 0,
             },
             Bytes::from(wrong_ec),
+            None,
         )
         .await
         .unwrap();
@@ -282,6 +290,7 @@ async fn ec_read_rejects_a_fragment_whose_ec_tuple_disagrees_with_scheme() {
                 index: 1,
             },
             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
+            None,
         )
         .await
         .unwrap();
@@ -355,6 +364,7 @@ async fn ec_read_rejects_a_same_scheme_type_wrong_geometry_fragment() {
                 index: 0,
             },
             encode_ec_fragment(chunk_id, 0, 3, 1, &shards[1]),
+            None,
         )
         .await
         .unwrap();
@@ -366,6 +376,7 @@ async fn ec_read_rejects_a_same_scheme_type_wrong_geometry_fragment() {
                 index: 1,
             },
             encode_ec_fragment(chunk_id, 1, k, m, &shards[1]),
+            None,
         )
         .await
         .unwrap();

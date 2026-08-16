@@ -75,7 +75,12 @@ impl ChunkStore for Fleet {
     // Supertrait obligation. The placement-aware read never calls these (it uses
     // `*_at`); a stateless `index % n` caller would route here — and find nothing for a
     // moved fragment, the gap the placement record exists to close.
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.server(self.index_route(id.index))
             .lock()
             .unwrap()
@@ -126,6 +131,7 @@ impl PlacementChunkStore for Fleet {
         dserver: DServerId,
         id: FragmentId,
         fragment: Bytes,
+        _deadline_millis: Option<u64>,
     ) -> Result<()> {
         self.server(dserver).lock().unwrap().insert(id, fragment);
         Ok(())
@@ -219,6 +225,7 @@ fn moved_fragment_resolved_from_record_after_reopen() {
                         index: *index,
                     },
                     bytes.clone(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -317,6 +324,7 @@ fn empty_placement_ec_none_resolves_via_identity_fallback() {
                     index: *index,
                 },
                 bytes.clone(),
+                None,
             )
             .await
             .unwrap();
@@ -368,6 +376,7 @@ fn empty_placement_rs_6_3_resolves_via_identity_fallback() {
                         index: *index,
                     },
                     bytes.clone(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -433,6 +442,7 @@ fn short_placement_rs_6_3_mixed_explicit_and_fallback() {
                         index: *index,
                     },
                     bytes.clone(),
+                    None,
                 )
                 .await
                 .unwrap();

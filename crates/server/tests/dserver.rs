@@ -148,7 +148,7 @@ async fn d_servers_register_serve_and_are_discovered() {
     let client = GrpcChunkStore::connect(endpoints[0].clone()).await.unwrap();
     let id = fid(0xabc_def, 4);
     let frag = fragment(id, b"a fragment to a discovered D server");
-    client.put_fragment(id, frag.clone()).await.unwrap();
+    client.put_fragment(id, frag.clone(), None).await.unwrap();
     assert_eq!(
         client.get_fragment(id).await.unwrap().as_deref(),
         Some(frag.as_ref()),
@@ -183,8 +183,13 @@ struct GateStore {
 
 #[async_trait]
 impl ChunkStore for GateStore {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
-        self.inner.put_fragment(id, fragment).await
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
     }
 
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {

@@ -90,7 +90,12 @@ struct MemDServer(Mutex<HashMap<FragmentId, Bytes>>);
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.0.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -279,7 +284,7 @@ impl Fixture {
         let bytes = Bytes::from(encode_fragment(&header, b"drain"));
         let store = &self.d[dserver as usize];
         let id = FragmentId { chunk, index: 0 };
-        store.put_fragment(id, bytes).await.unwrap();
+        store.put_fragment(id, bytes, None).await.unwrap();
     }
 
     async fn holds(&self, dserver: DServerId, chunk: ChunkId) -> bool {

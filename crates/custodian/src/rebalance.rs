@@ -531,7 +531,7 @@ async fn evacuate_chunk(
     // here leaves only collectable garbage, never a torn chunk (`0005:298-299`).
     let mut displaced = Vec::new();
     for (source, target_store, frag, bytes) in copies {
-        target_store.put_fragment(frag, bytes).await?;
+        target_store.put_fragment(frag, bytes, None).await?;
         displaced.push((source, frag));
     }
 

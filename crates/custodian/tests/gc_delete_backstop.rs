@@ -101,7 +101,12 @@ struct MemDServer {
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -137,7 +142,7 @@ async fn delete_orphans_fragment_reclaimed_by_gc_from_the_placed_dserver() {
     let placed_dserver: DServerId = 1;
     let chunk: ChunkId = 0xDE_1E;
     let frag = FragmentId { chunk, index: 0 };
-    d1.put_fragment(frag, Bytes::from_static(b"object bytes"))
+    d1.put_fragment(frag, Bytes::from_static(b"object bytes"), None)
         .await
         .unwrap();
     let record = InodeRecord {
@@ -225,7 +230,7 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
         chunk: old_chunk,
         index: 0,
     };
-    d1.put_fragment(old_frag, Bytes::from_static(b"old object bytes"))
+    d1.put_fragment(old_frag, Bytes::from_static(b"old object bytes"), None)
         .await
         .unwrap();
     let v1 = InodeRecord {
@@ -253,7 +258,7 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
         chunk: new_chunk,
         index: 0,
     };
-    d1.put_fragment(new_frag, Bytes::from_static(b"new object bytes"))
+    d1.put_fragment(new_frag, Bytes::from_static(b"new object bytes"), None)
         .await
         .unwrap();
     let new_map = vec![ChunkRef {

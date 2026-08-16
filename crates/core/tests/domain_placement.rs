@@ -76,7 +76,12 @@ impl Fleet {
 impl ChunkStore for Fleet {
     // Supertrait obligation. The placement-aware path uses `*_at`; a stateless
     // `index % n` caller would route here and miss a moved fragment.
-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        _id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         Err("Fleet: write must address a D server by id (use put_fragment_at)".into())
     }
 
@@ -118,6 +123,7 @@ impl PlacementChunkStore for Fleet {
         dserver: DServerId,
         id: FragmentId,
         fragment: Bytes,
+        _deadline_millis: Option<u64>,
     ) -> Result<()> {
         self.servers
             .get(&dserver)

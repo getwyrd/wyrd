@@ -20,6 +20,7 @@ fn requests_are_fragment_addressed() {
             index: 7,
         }),
         fragment: vec![0xab, 0xcd],
+        deadline_millis: None,
     };
     assert_eq!(req.id.unwrap().index, 7);
 

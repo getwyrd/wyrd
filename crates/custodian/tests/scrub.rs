@@ -105,7 +105,12 @@ struct MemDServer {
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         self.frags.lock().unwrap().insert(id, fragment);
         Ok(())
     }
@@ -240,7 +245,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
 
     // A referenced, intact fragment scrub must verify and pass.
     let chunk: ChunkId = 0xA1;
-    d0.put_fragment(frag(chunk, 0), valid_fragment(chunk))
+    d0.put_fragment(frag(chunk, 0), valid_fragment(chunk), None)
         .await
         .unwrap();
     commit_reference(&meta, 1, "intact", chunk, 0).await;
@@ -249,7 +254,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
     // map) — GC's concern, NOT a scrub finding even though it is also "valid" bytes
     // here. Scrub must skip it: it verifies only what the chunk map references.
     let orphan: ChunkId = 0xB2;
-    d0.put_fragment(frag(orphan, 0), corrupt_fragment(orphan))
+    d0.put_fragment(frag(orphan, 0), corrupt_fragment(orphan), None)
         .await
         .unwrap();
 
@@ -286,7 +291,7 @@ async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
     // A committed chunk map references (chunk, 0) on d0, but its stored bytes carry
     // an injected bit-flip — its payload checksum no longer verifies.
     let chunk: ChunkId = 0xC3;
-    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk))
+    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk), None)
         .await
         .unwrap();
     commit_reference(&meta, 1, "rotten", chunk, 0).await;
@@ -355,7 +360,7 @@ async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstru
     // payload checksum verifies, yet its header names `foreign`, not `chunk`.
     let chunk: ChunkId = 0xC8;
     let foreign: ChunkId = 0x9999;
-    d0.put_fragment(frag(chunk, 0), valid_fragment(foreign))
+    d0.put_fragment(frag(chunk, 0), valid_fragment(foreign), None)
         .await
         .unwrap();
     commit_reference(&meta, 1, "misplaced", chunk, 0).await;
@@ -410,13 +415,13 @@ async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
     // One intact and one corrupt referenced fragment, so both the coverage metric
     // (two fragments walked + verified) and the corruption metric (one finding) emit.
     let intact: ChunkId = 0xD4;
-    d0.put_fragment(frag(intact, 0), valid_fragment(intact))
+    d0.put_fragment(frag(intact, 0), valid_fragment(intact), None)
         .await
         .unwrap();
     commit_reference(&meta, 1, "intact", intact, 0).await;
 
     let rotten: ChunkId = 0xE5;
-    d0.put_fragment(frag(rotten, 0), corrupt_fragment(rotten))
+    d0.put_fragment(frag(rotten, 0), corrupt_fragment(rotten), None)
         .await
         .unwrap();
     commit_reference(&meta, 2, "rotten", rotten, 0).await;
@@ -476,7 +481,12 @@ struct TransientDServer {
 
 #[async_trait]
 impl ChunkStore for TransientDServer {
-    async fn put_fragment(&self, _id: FragmentId, _fragment: Bytes) -> Result<()> {
+    async fn put_fragment(
+        &self,
+        _id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -513,7 +523,7 @@ async fn fschunkstore_corruption_is_enqueued_and_the_pass_continues() {
     let intact: ChunkId = 0xF3;
     for chunk in [rotten_a, rotten_b, intact] {
         store
-            .put_fragment(frag(chunk, 0), valid_fragment(chunk))
+            .put_fragment(frag(chunk, 0), valid_fragment(chunk), None)
             .await
             .unwrap();
     }
@@ -664,7 +674,7 @@ async fn detects_corruption_on_an_empty_placement_none_chunk() {
     let d0 = MemDServer::default();
 
     let chunk: ChunkId = 0xF9_00;
-    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk))
+    d0.put_fragment(frag(chunk, 0), corrupt_fragment(chunk), None)
         .await
         .unwrap();
     commit_chunk(
@@ -714,7 +724,7 @@ async fn detects_corruption_on_an_empty_placement_rs_chunk_above_index_zero() {
     let d1 = MemDServer::default();
 
     let chunk: ChunkId = 0xF9_01;
-    d1.put_fragment(frag(chunk, 1), corrupt_fragment(chunk))
+    d1.put_fragment(frag(chunk, 1), corrupt_fragment(chunk), None)
         .await
         .unwrap();
     commit_chunk(
@@ -781,7 +791,7 @@ async fn short_placement_is_malformed_scrub_fails_safe() {
     let d2 = MemDServer::default();
 
     let chunk: ChunkId = 0xF9_02;
-    d2.put_fragment(frag(chunk, 2), corrupt_fragment(chunk))
+    d2.put_fragment(frag(chunk, 2), corrupt_fragment(chunk), None)
         .await
         .unwrap();
     commit_chunk(
@@ -844,7 +854,7 @@ async fn detects_corruption_in_a_full_rs_6_3_placement() {
             valid_fragment(chunk)
         };
         server
-            .put_fragment(frag(chunk, index as u16), bytes)
+            .put_fragment(frag(chunk, index as u16), bytes, None)
             .await
             .unwrap();
     }
@@ -1050,7 +1060,7 @@ async fn an_unreadable_committed_map_blocks_certification_but_still_scrubs_the_r
     // placed fragment is corrupt, so "scrub still did its job here" has a positive
     // observable (an enqueued repair) rather than merely "no error".
     let healthy: ChunkId = 0x650A;
-    d0.put_fragment(frag(healthy, 0), corrupt_fragment(healthy))
+    d0.put_fragment(frag(healthy, 0), corrupt_fragment(healthy), None)
         .await
         .unwrap();
     commit_reference(&meta, 2, "healthy", healthy, 0).await;
