@@ -166,7 +166,22 @@ fn classify_get_status(id: FragmentId, status: Status) -> BoxError {
 /// surfacing through the wire `Status` code as it did before this issue, and everything else
 /// falls to [`transport_error`]'s generic mapping (the transient trio plus the fail-safe
 /// terminal default).
-fn classify_put_status(id: FragmentId, status: Status) -> BoxError {
+///
+/// **Gated on `deadline_millis` — the request this reply answers must have carried one.**
+/// Neither code is exclusive to this protocol: `:47` already documents `ABORTED` as a
+/// concurrency conflict whose retry belongs to the layer owning the precondition, and
+/// `FAILED_PRECONDITION` is `get_fragment`'s block-read fault. Wyrd's own D server emits
+/// neither for any other reason on this RPC (`server.rs:118`), but a foreign implementation
+/// of the same service, or a proxy in the path, can — and decoding on the code alone would
+/// then manufacture a deadline verdict out of an unrelated fault. That is the one direction
+/// that must not be got wrong: `NotApplied` tells the caller **nothing landed**, so a
+/// fabricated one records "definitely not written" over bytes that may well be durable.
+/// A request with no deadline has no deadline outcome by construction, so its statuses go
+/// to [`transport_error`] exactly as they did before this issue.
+fn classify_put_status(id: FragmentId, status: Status, deadline_millis: Option<u64>) -> BoxError {
+    if deadline_millis.is_none() {
+        return transport_error(status);
+    }
     let effect = match status.code() {
         Code::FailedPrecondition => WriteEffect::NotApplied,
         Code::Aborted => WriteEffect::Unknown,
@@ -275,7 +290,7 @@ impl ChunkStore for GrpcChunkStore {
         client
             .put_fragment(Request::new(request))
             .await
-            .map_err(|status| classify_put_status(id, status))?;
+            .map_err(|status| classify_put_status(id, status, deadline_millis))?;
         Ok(())
     }
 
@@ -366,6 +381,50 @@ mod tests {
                 class_of(code),
                 ErrorClass::Terminal,
                 "{code:?} is not in the transient or integrity sets — the default is terminal"
+            );
+        }
+    }
+
+    /// A write that carried NO deadline can have no deadline outcome, whatever status comes
+    /// back. Neither code is exclusive to this protocol — `ABORTED` is the generic
+    /// concurrency conflict (`:47`) and `FAILED_PRECONDITION` is `get_fragment`'s block-read
+    /// fault — so a foreign server or a proxy in the path can emit either for its own
+    /// reasons. Decoding on the code alone manufactured a deadline verdict out of that:
+    /// `NotApplied` asserts **nothing landed**, which over possibly-durable bytes is the
+    /// one wire lie that costs a caller correctness.
+    ///
+    /// Red without the gate: `classify_put_status` reads only `status.code()`, so both
+    /// assertions below see a `WriteDeadlineExpired`.
+    #[test]
+    fn a_write_with_no_deadline_never_decodes_a_deadline_outcome() {
+        let id = FragmentId {
+            chunk: 0x638,
+            index: 0,
+        };
+        for code in [Code::FailedPrecondition, Code::Aborted] {
+            let err = classify_put_status(id, Status::new(code, "unrelated"), None);
+            assert!(
+                !wyrd_traits::is_write_deadline_expired(err.as_ref()),
+                "{code:?} on a request with no deadline must fall through to the generic \
+                 mapping, not reconstruct a deadline outcome"
+            );
+        }
+    }
+
+    /// The other half of the gate: with a deadline actually sent, both codes still decode
+    /// into their outcomes — `FAILED_PRECONDITION` the definite refusal, `ABORTED` the
+    /// indeterminate one. Pins that the fix narrowed the decode rather than removing it.
+    #[test]
+    fn a_write_with_a_deadline_still_decodes_both_outcomes() {
+        let id = FragmentId {
+            chunk: 0x638,
+            index: 0,
+        };
+        for code in [Code::FailedPrecondition, Code::Aborted] {
+            let err = classify_put_status(id, Status::new(code, "expired"), Some(1));
+            assert!(
+                wyrd_traits::is_write_deadline_expired(err.as_ref()),
+                "{code:?} on a deadline-carrying request is a deadline outcome"
             );
         }
     }
