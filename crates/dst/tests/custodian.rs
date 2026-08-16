@@ -1589,7 +1589,7 @@ async fn prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies
         chunk: SEG_ORPHAN,
         index: 0,
     };
-    d[3].put_fragment(orphan, Bytes::from_static(b"garbage"))
+    d[3].put_fragment(orphan, Bytes::from_static(b"garbage"), None)
         .await
         .unwrap();
     mark_orphaned(&meta, 3, orphan, now - grace - 1)
@@ -1929,13 +1929,13 @@ async fn restore_under_a_concurrent_writer(nemesis: Nemesis, delay_millis: u64) 
     let held = frag_of(RESTORE_HELD);
     let late = frag_of(RESTORE_LATE);
     let stray = frag_of(RESTORE_STRAY);
-    d[0].put_fragment(held, Bytes::from_static(b"held"))
+    d[0].put_fragment(held, Bytes::from_static(b"held"), None)
         .await
         .unwrap();
-    d[1].put_fragment(late, Bytes::from_static(b"late"))
+    d[1].put_fragment(late, Bytes::from_static(b"late"), None)
         .await
         .unwrap();
-    d[2].put_fragment(stray, Bytes::from_static(b"stray"))
+    d[2].put_fragment(stray, Bytes::from_static(b"stray"), None)
         .await
         .unwrap();
 
