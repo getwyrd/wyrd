@@ -78,6 +78,19 @@ That axis has known bugs on it already:
 - **[#674][i674]** — a read's byte footprint at the `MetadataStore` seam is unbounded. A
   growth-shaped problem, and one that needs a large keyspace before it bites.
 
+**How many of those the gating run actually reaches, stated plainly.** #560's path is disclaimed
+two bullets up — the S3 gateway streams and does not take it. #625 needs multipart, which is
+`unsupported(#508)` for the whole matrix, so an abandoned upload cannot be created at all. #674
+lives in the `listing` scenario, not the gating `endurance` one. So of three bugs cited, the
+**7-day gating run reaches none directly**; what it reaches is the *class* — leaks, growth and
+reclamation over wall-clock — of which these three are the currently-known instances.
+
+That is a weaker claim than the list implies on first reading, and it is the honest one. The
+argument for building this is not "these three bugs will be caught by the gate"; it is that **no
+mechanism exists to find the next one**, and every instance so far was found by reading code
+rather than by running anything. A gate that reaches the class is worth having even when today's
+known instances sit outside it — but the motivation should not borrow their credibility.
+
 **There is no measured client bar.** [#512][i512] says it plainly: "usable S3" is asserted, not
 tested. The existing interop tests (`crates/server/tests/s3_http_wire.rs`) cover the
 PUT/GET/DELETE floor through `aws-sdk-s3`, already a dev-dependency
@@ -148,8 +161,29 @@ so an operator can validate their own deployment. That makes it the tarball's se
 `deploy/dist/README.md` currently opens "One `wyrd` binary serves every role as a subcommand",
 which stays true — it describes Wyrd's *roles*. The validation tool is deliberately not one of
 them, and must not become a `wyrd` subcommand: sharing a binary would share a dependency
-closure and destroy the property §9 exists to enforce. `install.sh`, the dist staging, and the
-pinned layout contract in `xtask/tests/dist_templates.rs` all grow a second entry.
+closure and destroy the property §9 exists to enforce.
+
+**Shipping it is a larger change than "the staging grows an entry", which an earlier revision
+implied.** `cargo xtask dist` does not assemble a tarball from build outputs — it "extracts the
+binary out of the image (`docker create` + `docker cp`), so the tarball's `bin/wyrd` is
+bit-identical to the image's `/usr/local/bin/wyrd`" (`xtask/src/dist.rs:6-7`). The production
+Dockerfile builds `--bin wyrd` and describes itself as hosting "just the `wyrd` binary";
+`install.sh` installs one path and uninstalls one path; `.github/workflows/release.yml`
+smoke-tests `/usr/local/bin/wyrd` and asserts its absence after uninstall. So a second binary
+touches the Dockerfile, the dist extraction, the installer, the uninstaller and the release
+workflow.
+
+It also poses a question this proposal does not answer: **should the production OCI image carry a
+validation tool at all?** Shipping it in the tarball and keeping it out of the image is coherent —
+operators install from the tarball — but it breaks the bit-identical guarantee dist currently
+relies on, so the two artifacts would need separate assembly paths. That is a packaging decision
+for whoever owns the release pipeline.
+
+One further caveat: `xtask/tests/dist_templates.rs` is "container-free by design … every template
+assertion is a file read + substring check", with the real build deferred to the release workflow.
+So it can pin *templates* naming a second binary, but it cannot observe a tarball. Any
+definition of done phrased as "the tarball contains both binaries" is unverifiable by the gate it
+would name.
 
 ### 3. The capability matrix
 
@@ -174,7 +208,7 @@ is the day you want to hear about it, not the day you find the empty objects.
 | `DeleteObject` | required | floor |
 | `DeleteObjects` (bulk `POST ?delete`) | required | [#509][i509]; body cap 8 MiB, `lib.rs:439` |
 | `ListObjectsV2` (+ v1 shim, prefix/delimiter/pagination) | required | [#507][i507] |
-| `CopyObject` | `unsupported(#504)` | rejected at `lib.rs:1730` |
+| `CopyObject` | `unsupported(#766)` | rejected at `lib.rs:1730`; [#504][i504] closed the *reject*, [#766][i766] is the feature |
 | `CreateMultipartUpload` | `unsupported(#508)` | via [#668][i668] |
 | `UploadPart` | `unsupported(#508)` | via [#669][i669] |
 | `CompleteMultipartUpload` | `unsupported(#508)` | via [#670][i670] |
@@ -190,12 +224,14 @@ is the day you want to hear about it, not the day you find the empty objects.
 | `ls` | `ListObjectsV2` with `delimiter=/` | required |
 | `rm --recursive` | paginated `ListObjectsV2` + `DeleteObjects` batched at 1000 | required |
 | `sync` | `ListObjectsV2` + size/mtime compare + `PutObject`/`GetObject` | required |
-| `mv` | `CopyObject` + `DeleteObject` | **blocked on [#504][i504]** |
+| `mv` | `CopyObject` + `DeleteObject` | **blocked on [#766][i766]** |
 | `rb` | `DeleteBucket` | **blocked on [#511][i511]** |
 
 Two operations the Alpha bar names in everyday terms map onto gaps, and the matrix is where
 that becomes visible rather than surprising. **"Rename" is not an S3 operation** — it is
-copy-then-delete, so `mv` cannot work until [#504][i504]'s implementation half lands.
+copy-then-delete, so `mv` cannot work until [#766][i766] lands. [#504][i504] closed the
+*safety* half (stop the silent overwrite); the implementation was never filed until this review
+found the gap, so an earlier revision of this proposal named a closed issue as a live blocker.
 **"Directory removal" is not one either** — it is list-then-bulk-delete, and both halves are
 built, so `rm --recursive` works today.
 
@@ -205,6 +241,18 @@ assert the gateway is fail-closed, which is exactly what an operator wants to kn
 own deployment. **Off by default** so long runs do not spend operations on them; the `smoke`
 scenario declares them **on** as part of its shape, so the correctness sweep always includes
 them.
+
+**[#491][i491] is currently a live defect, so this makes `smoke` red on every existing build.**
+Its percent-encoded spelling of `partNumber` misses the raw-string denylist, falls through to the
+plain object PUT path, and overwrites the whole object instead of returning 501 — a data-loss bug,
+open against *Foundations*. A vector that asserts the correct behaviour therefore fails today, by
+design: that is the vector working.
+
+Two consequences, both stated rather than discovered later. **#491 is a hard dependency of any
+graduation criterion that requires a green `smoke`** — see *Graduation criteria*, where criterion
+1 is scoped accordingly. And until it closes, a red `smoke` on that vector is the expected state,
+not a regression, so the run must distinguish "known-open defect" from "new failure" rather than
+reading as broken.
 
 **The matrix must be keyed to the server version.** Expectations change as slices land, so a
 tool validating an older release would otherwise fail on rows naming issues fixed after that
@@ -228,9 +276,30 @@ Chosen to straddle boundaries on both sides of the wire — S3's, and Wyrd's own
 | 5 MiB | S3 minimum part size | S3 spec |
 | 8 MiB | stock SDK multipart threshold; bulk-delete body cap | `lib.rs:439` |
 | 64 × `C` | multi-chunk, many fragments | — |
-| segmentation threshold ± | **chunk-map segmentation boundary** | `--segment-threshold-bytes` |
-| 5 GiB | S3 single-PUT maximum → `EntityTooLarge` | [#671][i671] |
+| segmentation threshold ± | **chunk-map segmentation boundary** | `--segment-threshold-bytes`; **needs [#635][i635]** |
+| 5 GiB | S3's largest accepted single PUT — **must succeed** | S3 spec |
+| 5 GiB + 1 | first size past it — **must fail `EntityTooLarge`** | [#671][i671]; **unimplemented today** |
 | > 5 GiB | multipart-only territory | gated on [#508][i508] |
+
+Two corrections to an earlier revision, both material to what the matrix can assert:
+
+**The 5 GiB boundary is two rows, not one.** It previously read "S3 single-PUT maximum →
+`EntityTooLarge`", which is self-contradictory: 5 GiB is the largest single PUT S3 *accepts*, so
+it must **succeed**; 5 GiB + 1 is the first that must fail. Conflating them left the matrix
+unable to assign a required outcome at the boundary it exists to test. Note also that
+`EntityTooLarge` appears **nowhere** in `crates/gateway-s3/` today — the row is
+`unsupported(#671)` until that lands, not a required behaviour.
+
+**The upper size classes need [#635][i635], which is not merely a tuning dependency.** The
+segmented chunk map is **shape-only** at present: `crates/core/src/metadata.rs:262-266` states the
+slice "lands the shape, its decode-time invariants and its `seg:`/`seggrp:` key helpers only — no
+resolver, no producer", and every existing consumer treats `ChunkMap::Segmented` as the typed
+error `SegmentedMapUnsupported`. Since a flat map must fit `MAX_VALUE_BYTES` (100,000) at the
+1 MiB default chunk size, `:250-252` records that an inline `Vec<ChunkRef>` "caps an object's
+chunk count far below the >10 GiB launch requirement". So the segmentation-threshold and 5 GiB
+classes assert behaviour that **does not exist yet**, and #635 is a hard prerequisite for that
+half of the size axis — distinct from [#739][i739], which only tunes a budget that must first
+work at all.
 
 **The tuning values are inputs, not assumptions.** A blackbox tool cannot import
 `DEFAULT_CHUNK_SIZE` or `MAX_ROOT_VALUE_BYTES` — that is the price of §9. Rather than hardcode
@@ -284,20 +353,56 @@ full-set read after quiesce, not a continuous sweep.
 ### 6. The oracle
 
 Per key, the model holds `{size, sha256, etag, content-type, last-modified, generation}`.
-Checked on every read:
+
+**What the oracle may assert depends on whether the tool controls the write order**, and
+conflating the two would make it report valid behaviour as failure. Two tiers:
+
+**Single-writer keys** (the disjoint and workflow pools, §5 — one worker owns each key, and its
+own writes are sequential). Here the tool knows the serialization order because it created it, so
+the full set applies:
 
 - bytes read back hash to the recorded digest — the whole object, and every `Range` slice
 - `Content-Length`, `ETag`, `Content-Type` match what was written (ADR-0047)
 - a deleted key `404`s, and stays `404`
 - an overwritten key never serves a prior generation
 - conditional requests answer per the recorded `ETag` / `Last-Modified`
-- at quiesce: the full `ListObjectsV2` sweep equals the model's live set exactly — no extra key,
-  no missing key, correct `CommonPrefixes` rollups under `delimiter=/`
 
-`Last-Modified` is real wall-clock and safe to verify: `now_millis()` reads `SystemTime::now()`
-(`crates/server/src/lib.rs:756`), documented as "the access layer's single wall-clock source —
-lease stamps and ADR-0047 publication timestamps all read THIS fn", and objects are stamped at
-`:197` and `:348`. That is also what makes `sync`'s size-and-mtime comparison implementable.
+**Concurrently-written keys** (the contention pool). The tool observes *completion* order at the
+client, which is **not** commit order at the server. Two overlapping PUTs have no
+client-observable serialization, so "last writer wins" and "never serves a prior generation" are
+unassertable — asserting them would report correct linearizations as fatal `oracle` failures, and
+`oracle` stops the run. The contention pool therefore asserts only what is sound without an
+ordering model:
+
+- every read returns bytes that hash to **some** value actually written to that key (never a
+  torn, invented or foreign value — the atomicity property that matters)
+- a read never returns a value written by a PUT that had not yet started when the read completed
+- once a read observes generation *g*, no **subsequent read by the same worker** observes an
+  earlier one — per-session monotonicity, which the tool *can* order because both operations are
+  its own
+
+Establishing a total order over concurrent writes needs a real linearizability checker, which is
+what `cargo xtask consistency-run` already does with Elle. Duplicating it here in hand-rolled
+form is how a validator invents its own false failures.
+
+**At quiesce**, with mutation stopped: the full `ListObjectsV2` sweep equals the model's live set
+exactly — no extra key, no missing key, correct `CommonPrefixes` rollups under `delimiter=/`.
+
+**`Last-Modified` is real wall-clock but not directly comparable across surfaces.**
+`now_millis()` reads `SystemTime::now()` (`crates/server/src/lib.rs:756`) and objects are stamped
+at `:197` and `:348`. But the value the wire returns differs by surface and is not ordered across
+a fleet:
+
+- A listing renders `<LastModified>` through `iso8601`, keeping milliseconds; `GET`/`HEAD` render
+  the header through `http_date`, which is IMF-fixdate and second-granular. The same object
+  therefore reports two different times, up to 999 ms apart ([#767][i767]).
+- Each gateway stamps from its own clock with no monotonicity guard at overwrite commit, so on
+  the blueprinted N-gateway fleet `Last-Modified` can go **backwards** across an overwrite
+  ([#768][i768]).
+
+So the oracle verifies the timestamp **per surface** — a listing time against the listing format,
+a header time against the header format — and never compares one to the other or assumes ordering.
+`sync`'s comparison (§7 workflows) inherits the same limit and is discussed there.
 (madsim virtualises the read under DST, so the stamp is deterministic in simulation and real
 everywhere else.)
 
@@ -395,35 +500,45 @@ provider outside the `deny.toml` allowlist, flagged NEEDS-HUMAN at
 `crates/gateway-s3/src/lib.rs:50-57`. Until that is decided the endpoint is plain HTTP behind an
 operator's own terminator.
 
-### 11. Faults belong to the launcher, not the tool
+### 11. Faults belong to the launcher — because of §9, not because the legs are stuck
 
-Investigated rather than assumed, and the answer changed the design.
+An earlier revision of this proposal argued that fault injection had to live in the launcher
+because the existing legs could not be driven independently of a workload. **That was wrong**,
+and the correction matters because it changes what the launcher is for.
 
-The existing fault legs **do not detach**. `xtask/src/nemesis.rs` is clean — 151 lines of pure
-routing with no topology — and there is a real seam, `ClusterFault`
-(`crates/metadata-fault-conformance/src/lib.rs:87`), with `apply`, `heal` and peer-side
-materialization evidence, built so "one battery judges two backends". The iptables agent image
-has already been reused three times (`fdb_faults.rs:47`, `consistency_run_runner.rs:42`, the
-Jepsen leg), so the technique travels.
+The legs **do** detach, and cleanly. `crates/metadata-fault-conformance/src/nemesis.rs:250`
+declares `pub trait NemesisLeg`, whose `apply()` (`:267`) injects a fault and runs no workload at
+all. `:305` provides
 
-But every leg is packaged as `cargo test -p <crate> --test <binary> -- --ignored --exact <fn>`,
-with the fault injection and the workload living **together inside that test function**. There
-is no "inject a fault, then run any workload" entry point. And `ClusterFault` lives in a
-`wyrd-*` crate, so the tool cannot link it without breaking §9.
+```rust
+pub fn drive_leg<L, W, T>(leg: &L, workload: W) -> Result<T, String>
+where L: NemesisLeg, W: FnOnce() -> T
+```
 
-So **fault injection stays in the launcher**. `cargo xtask s3-blackbox --nemesis <leg>` injects
-against the compose stack while `wyrd-validate` runs the workload as a separate process that
-never knows a fault happened — it reports what it saw. Correlation happens in the sink: both
-streams are timestamped and land in the same place, so the fault window overlays the workload's
-error rate there (§13). That is cleaner than teaching the tool about faults, and it keeps §9
-intact.
+— the workload is a caller-supplied closure, so fault and workload are decoupled by
+construction. Legs take container names as constructor arguments rather than compose project
+names, and the seam is already consumed outside the metadata crates:
+`crates/server/tests/consistency_run_fdb.rs:118` imports `PartitionLeg` / `ClockSkewLeg` /
+`ProcessPauseLeg` and drives an S3 workload under them.
 
-On **hetzner** there is no launcher, so faults are manual. Blueprint §B.2 already names the
-honest one: `hcloud server delete d<n>` destroys a real machine, which is what a rack loss
-looks like and what no single-host container cluster can imitate. That is a **Cloud** capability
-— Server Auction bare-metal is monthly with a minimum term, so a machine cannot be destroyed and
-replaced as a test action. Bare-metal is still faultable (`systemctl stop`, a firewall rule);
-the fault set is smaller, not empty. Since long soaks are run by hand, manual faults fit.
+So the real constraint is **§9, not reusability**. `wyrd-metadata-fault-conformance` is a
+`wyrd-*` crate. A tool that linked it to drive its own faults would forfeit the blackbox property
+that is this tool's entire premise — the lint would have to be scoped away, and once scoped away
+it stops meaning anything.
+
+The placement is therefore unchanged and the reasoning is replaced: **fault injection lives in
+the launcher, which links the seam the tool may not.** `cargo xtask s3-blackbox --nemesis <leg>`
+calls `drive_leg` with a workload closure that runs `wyrd-validate` as a subprocess — using the
+real seam rather than reimplementing it, and keeping the tool's dependency closure clean. The
+tool never knows a fault happened; it reports what it saw. Correlation happens in the sink, where
+both timestamped streams land (§13).
+
+On **hetzner** there is no launcher, so faults are manual. Blueprint §B.2 names the honest one:
+`hcloud server delete d<n>` destroys a real machine, which is what a rack loss looks like and what
+no single-host container cluster can imitate. That is a **Cloud** capability — Server Auction
+bare-metal is monthly with a minimum term, so a machine cannot be destroyed and replaced as a test
+action. Bare-metal remains faultable (`systemctl stop`, a firewall rule); the fault set is smaller,
+not empty. Since long runs are driven by hand, manual faults fit.
 
 ### 12. Resumability
 
@@ -529,10 +644,21 @@ bucket holding real data. Deleted storage does not come back.
 Run-id-scoped keys (§5) are the primary defence and the right design — but they are a *single*
 line, effective only while the code is correct. Three guards sit behind them:
 
-**Refuse a non-empty target.** At startup, list one page under the configured bucket and
-prefix. Anything present that does not carry this run's id means the tool exits without writing
-a byte, naming what it found. `--allow-non-empty` overrides, deliberately and by name. Bounded
-to one page so the check costs the same against a bucket with a thousand keys or a billion.
+**Refuse an occupied namespace.** Scoped to the **run prefix**, not to the bucket — which is what
+makes it both sound and cheap. `<run-id>/` is a namespace the tool is about to create, so one
+`ListObjectsV2` with `prefix=<run-id>/` and `max-keys=1` returning anything at all is conclusive:
+something is already there, and the run exits without writing a byte.
+
+An earlier revision listed one page of the whole configured prefix and read an absence of foreign
+keys as proof the target was clean. That is unsound and was removed: one page establishes nothing
+about later pages, and on `--resume` the run's own keys can fill page one while foreign content
+sits past the boundary. A guard that looks like a proof and is not is worse than no guard, because
+it gets trusted.
+
+Scoping to the run prefix proves the property that actually matters — *nothing of mine is already
+here, so nothing of anyone else's can be mistaken for mine* — in one request. The tool makes **no
+claim** about the rest of the bucket, and says so rather than implying safety it never
+established. `--allow-non-empty` overrides, for a deliberate `--resume` onto an existing run id.
 
 **`--dry-run`.** Enumerate every key the run would create and every key it would delete, print
 them, touch nothing, exit. An operator gets to look before committing, and it doubles as the
@@ -568,17 +694,63 @@ force multi-chunk objects") — and `wyrd put` already takes the flag (`cli.rs:5
 never wires one, so every deployed gateway chunks at the 1 MiB default. Tracked as [#738][i738].
 
 **The chunk-map budget constants are compile-time.** `MAX_ROOT_VALUE_BYTES` (50,000) and
-`MAX_ROOT_SEGMENTS` (512), `crates/core/src/metadata.rs`. **The blast radius is small, and was
-measured rather than assumed**: `MAX_ROOT_SEGMENTS` is enforced in exactly two code sites, both
-in that file (`:688` resolve ceiling, `:2450` accounting); `MAX_ROOT_VALUE_BYTES` appears in no
-production code outside its own definition. The custodian is insulated — its ceiling checks go
-through `metadata::flat_value_ceiling_crossed` against `MAX_VALUE_BYTES`, which is not changing.
-And `crates/core/tests/segmented_map_record.rs` is already patch-aware, reading the constants
-from source via `production_constant(...)` and measuring "whatever `MAX_ROOT_SEGMENTS` and
-`MAX_VALUE_BYTES`" are (`:364`). What moves: the `const` assertion at `:354` becomes fail-closed
-startup validation. It must fail closed — the reserve is a durability property, since "a root
-that cannot be re-written is an object whose placement can never be repaired". Tracked as
-[#739][i739].
+`MAX_ROOT_SEGMENTS` (512), `crates/core/src/metadata.rs`. Tracked as [#739][i739].
+
+An earlier revision of this section called the blast radius small and cited four supporting
+facts. **Two of the four were wrong**, and the corrected scope is materially larger:
+
+- `:688` is **not** an enforcement site. It is the `Display` arm for
+  `ChunkMapError::TooManySegments`, interpolating `{MAX_ROOT_SEGMENTS}` by inline format capture —
+  so with a runtime value it *fails to compile*. The fix is a `ceiling` field on a **public** error
+  variant, the shape `SegmentValueOverCeiling { ceiling }` already uses. The only true enforcement
+  site is `:2450`.
+- "Already patch-aware" is **backwards**. `crates/core/tests/segmented_map_record.rs` text-greps
+  the source for `pub const <name>: … = <integer literal>;` and **panics** when that declaration
+  stops being a literal — which is exactly what making it configurable does, taking the whole
+  Criterion-3 suite with it.
+- The load-bearing invariant — proposal 0016's `max_segref_bytes × MAX_ROOT_SEGMENTS ≤ V/2` —
+  exists **only as a measurement**: the test encodes worst-case tables and asserts on
+  `encode(...).len()`. No production function computes that bound, so nothing can be "moved" to
+  startup validation; a closed-form must be newly derived. Concretely, an operator setting
+  `MAX_ROOT_SEGMENTS = 4096` passes the `:354` assertion and still produces roots around 400 KB,
+  four times `MAX_VALUE_BYTES` — objects that can never be re-written, and therefore never
+  repaired.
+- Enforcement at `:2450` sits inside private `read_group_range`, reached through
+  `metadata::resolve_chunk_map` from six call sites across three crates. Threading configuration
+  there is a signature change with a wide blast radius; a process-global instead breaks tests that
+  exercise both sides of the ceiling in one binary.
+
+What **did** survive checking: the custodian is genuinely insulated (its checks go through
+`metadata::flat_value_ceiling_crossed` against `MAX_VALUE_BYTES`, which is not changing), multipart
+derives nothing from the knob (every reference in `multipart.rs` is a doc comment), and
+`MAX_ROOT_VALUE_BYTES` has no production consumer beyond its own assertion.
+
+**And one design question this raises, which is not the tool's to answer.** If the ceiling is
+per-gateway configuration, a root published under a raised value becomes permanently unresolvable
+the moment any gateway runs a lower one — decode is deliberately liberal, so the failure surfaces
+at resolve time on a durable object. Multipart already solved the same problem by **storing** its
+budget profile in the `mpuctl` record rather than deriving it per gateway, precisely so "a rolling
+configuration change cannot leave two gateways enforcing different bounds"
+(`crates/core/src/multipart.rs:1139-1144`). Whether a segmented root must likewise carry its own
+ceiling is an architecture decision, and #739 should not be built until it is settled.
+
+**`aws-sdk-s3` moves from a dev-dependency into a shipped artifact.** It is currently dev-only
+(`crates/server/Cargo.toml:120-129`, noted there as "not compiled into the production binary").
+Making it a *normal* dependency of a shipped workspace member brings roughly a hundred crates
+inside `deny.toml`'s frame — whose own header states it "guards the default feature graph — the
+artifact we ship". INTEGRATION.md §4 names "any new dependency or license" a human-only
+NEEDS-HUMAN item, so this needs the ADR-0003 three-test audit before the crate lands, not after.
+It is a larger item than §14's MinIO note and lands earlier.
+
+**The tool cannot speak HTTPS, and the endpoint it is meant to validate is TLS-terminated.**
+§10 and blueprint §B.1 make the S3 port the only public exposure, behind an operator's own
+terminator. Nothing in this proposal adds a TLS client, and adding one meets the same wall the
+gateway already sits behind: a rustls crypto provider outside the `deny.toml` allowlist
+(`crates/gateway-s3/src/lib.rs:50-57`), a declared NEEDS-HUMAN dependency decision. Until that is
+resolved the tool validates the plain-HTTP configuration — which is a real limitation of the Alpha
+evidence artifact, not a detail: a 7-day run proving correctness over plain HTTP with static
+credentials has not exercised the transport an operator is told to deploy. Resolve the provider
+decision, or state in the verdict that transport is out of scope for what the run licenses.
 
 **`MAX_VALUE_BYTES` (100,000) is explicitly not in scope.** It is FoundationDB's hard limit,
 inherited by every backend so the tightest governs, and decimal rather than `100 * 1024` for
@@ -612,10 +784,30 @@ and a tarball can carry two binaries.
 know, and a wrong bar is worse than none: it either fails good deployments or blesses bad ones.
 The tool reports; the operator compares.
 
-**Folding this into [#512][i512].** Rejected — different things. #512 is a client-compatibility
-matrix: does stock tooling work, one pass. This is protocol and endurance: does it stay correct
-for a month. Different clients, different durations, different pass bars. They can share a
-substrate.
+**Folding this into [#512][i512].** Partly rejected, and an earlier revision overstated the case.
+
+The claim was "different things — #512 is one pass with stock tooling, this is endurance." That
+holds for `endurance`, `churn`, `listing` and `large-object`, which have no counterpart in #512.
+It does **not** hold for `smoke`. #512's own scope reads: "exercise the Alpha operation set end to
+end with aws-cli and boto3 (put/head/get/list/copy/delete, multipart, range, bulk-delete),
+asserting **byte-identical round-trips and correct S3 XML/error responses**", it folds in
+[#491][i491]'s bypass vectors, and it says "**Define the pass bar as the Alpha S3 gate**". That is
+the same work as this proposal's matrix, `smoke`, and auth-negative vectors, with a different
+client. Two issues currently both claim to be the Alpha S3 gate.
+
+The honest boundary, proposed here for #512's owner to accept or reject:
+
+- **#512 owns client diversity.** Does *stock aws-cli and boto3* work — the tooling a user
+  actually runs. That is the question this proposal explicitly declined to answer when it chose
+  one Rust client, and nothing here replaces it.
+- **This proposal owns the time axis and the operator-facing tool.** Endurance, churn, listing at
+  scale, resumability, the shipped binary. None of that is in #512.
+- **The overlap is the correctness matrix itself**, and it should be single-sourced rather than
+  written twice. The declared operation/status/error-code table is the artifact both need; #512's
+  client matrix and this tool's `smoke` should assert the *same* table through different clients.
+
+Until that is settled with #512's owner, this proposal duplicates #512's correctness pass. Saying
+so is better than the earlier claim that they were simply different.
 
 **Extending `cargo xtask consistency-run`.** Rejected. That run exists so a checker *we did not
 write* judges a history under a fault. Bolting endurance onto it would dilute a credibility
@@ -629,16 +821,37 @@ hourly-billed cloud.
 ## Graduation criteria
 
 1. `cargo xtask s3-blackbox --scenario smoke` passes against loopback and against
-   `deploy/small-multi-node-fdb`, wired as an advisory Tier-2 job.
+   `deploy/small-multi-node-fdb`, wired as an advisory Tier-2 job — **with the [#491][i491]
+   vector recorded as a known-open defect rather than a failure**, since asserting the correct
+   behaviour is red until #491 closes. "Passes" means: no failure outside the declared
+   known-open set, and that set is named in the verdict. When #491 closes, the entry is removed
+   and the criterion tightens automatically.
 2. The matrix asserts every `unsupported` row's declared status and error code — including
    [#504][i504]'s `CopyObject` rejection, a standing regression guard against the
    silent-overwrite class — and the auth-negative vectors under `smoke`.
 3. **The §14 self-check passes**: `smoke` is clean against MinIO under the reference profile,
    and every corrupting-proxy fixture comes back as its matching failure class. Wired as a
    preflight that must pass before any live run, including the gating one.
-4. A 24-hour `endurance` run completes against the fleet with a clean verdict.
+4. A 24-hour `endurance` run completes against the fleet. **Its availability-failure budget is
+   set by that run, not before it** — the first clean run establishes the threshold (Open
+   question 1), so this criterion reads "completes, and the observed failure rate becomes the
+   declared budget", not "completes below a budget nobody has computed". Only the second such run
+   can be gated on a number.
 5. A **7-day `endurance` run completes against the Hetzner substrate**, verdict committed. This
-   is the Alpha evidence artifact, and **0.1 Alpha does not tag without it**.
+   is the Alpha evidence artifact.
+
+   **Where "0.1 Alpha does not tag without it" is enforced.** As prose it is unfalsifiable:
+   tagging runs `.github/workflows/release.yml` on a `v*` push, and nothing in `cargo xtask ci`,
+   `xtask dist` or any checklist reads a verdict artifact. This proposal does not add a machine
+   gate — a release-blocking check on a hand-run week-long job is the wrong shape. It names a
+   **release-runbook step** instead: the tag procedure requires the committed verdict, its
+   substrate recorded as `hetzner`, and its scenario as `endurance`. That is a human step, and
+   calling it one is more honest than implying automation that does not exist.
+
+   **What this run does and does not license** (§13's prose, applied here): endurance of the
+   build it ran, over plain HTTP, on the substrate named. It licenses no claim about TLS
+   transport (*Dependencies*), no failure-domain claim unless faults were injected, and no
+   performance claim at all.
 6. `wyrd-validate` ships in the operator tarball, and `xtask/tests/dist_templates.rs` pins the
    two-binary layout.
 7. Every failure found is filed; deterministic ones land seeded DST regressions (ADR-0009).
@@ -677,6 +890,21 @@ Two forward couplings, both deliberate:
 5. **Where does a gating verdict get committed?** `docs/design/reviews/` alongside the
    consistency run, or `docs/design/runbooks/drills/` where [#485][i485] puts its drill record.
    A convention for the gating run, not a property of the tool.
+6. **The [#512][i512] boundary needs its owner's agreement.** *Alternatives considered* proposes
+   single-sourcing the correctness matrix and splitting client-diversity from the time axis.
+   Until that is accepted, two issues both claim to be the Alpha S3 gate and the correctness pass
+   is written twice.
+7. **Must a segmented root carry its own ceiling?** Raised by *Dependencies*: a per-gateway
+   `MAX_ROOT_SEGMENTS` makes a root published under a high value unresolvable to a gateway running
+   a lower one, on a durable object. Multipart stores its budget in the record rather than deriving
+   it per gateway, for exactly this reason. An architecture decision, and [#739][i739] should not be
+   built before it is settled.
+8. **The rustls provider decision gates whether the tool can ever validate a real endpoint.**
+   Until it is made (*Dependencies*), every run — including the Alpha gating run — exercises plain
+   HTTP, which is not the transport operators are told to deploy.
+9. **Does the production OCI image carry the validation tool?** §2: dist extracts the tarball
+   binary from the image, so shipping a second binary in the tarball but not the image breaks the
+   bit-identical guarantee and needs separate assembly. A release-pipeline decision.
 
 [i364]: https://github.com/getwyrd/wyrd/issues/364
 [i485]: https://github.com/getwyrd/wyrd/issues/485
@@ -696,7 +924,12 @@ Two forward couplings, both deliberate:
 [i669]: https://github.com/getwyrd/wyrd/issues/669
 [i670]: https://github.com/getwyrd/wyrd/issues/670
 [i671]: https://github.com/getwyrd/wyrd/issues/671
+[i635]: https://github.com/getwyrd/wyrd/issues/635
 [i674]: https://github.com/getwyrd/wyrd/issues/674
+[i491]: https://github.com/getwyrd/wyrd/issues/491
+[i766]: https://github.com/getwyrd/wyrd/issues/766
+[i767]: https://github.com/getwyrd/wyrd/issues/767
+[i768]: https://github.com/getwyrd/wyrd/issues/768
 [i736]: https://github.com/getwyrd/wyrd/issues/736
 [i737]: https://github.com/getwyrd/wyrd/issues/737
 [i738]: https://github.com/getwyrd/wyrd/issues/738
