@@ -260,8 +260,19 @@ build. The gateway advertises no version today — no `Server:` header, nothing 
 this needs the version header of [#736][i736] (*Dependencies*). Until it lands, `--server-version` is an
 operator-supplied parameter, with the honest weakness that a parameter can be silently wrong.
 
-The matrix is a reviewed constant with citations. When [#508][i508] lands, the change is
-flipping six rows; the tool needs no other edit. That property is the point.
+**Profiles are versioned and retained — rows are never flipped in place.** An earlier revision
+said "when #508 lands, the change is flipping six rows", which contradicts the version-keying
+requirement two paragraphs up: flipping discards the expectations for every release where those
+operations *were* unsupported. A newer tool pointed at an older release would then classify its
+correct `NotImplemented` responses as failures, even when handed the right `--server-version`.
+
+So the matrix is a set of **immutable per-release profiles** keyed by the version range each
+applies to. Landing #508 adds a profile whose multipart rows are `required`; it does not edit the
+profile that preceded it. Selecting a server version selects a profile, which is what makes
+version-keying mean anything rather than being a flag the tool accepts and ignores.
+
+Each profile is a reviewed constant with citations, and the retained ones are how a validator
+shipped in an operator tarball stays useful against the release that operator actually runs.
 
 ### 4. Size classes
 
@@ -290,16 +301,37 @@ unable to assign a required outcome at the boundary it exists to test. Note also
 `EntityTooLarge` appears **nowhere** in `crates/gateway-s3/` today — the row is
 `unsupported(#671)` until that lands, not a required behaviour.
 
-**The upper size classes need [#635][i635], which is not merely a tuning dependency.** The
-segmented chunk map is **shape-only** at present: `crates/core/src/metadata.rs:262-266` states the
-slice "lands the shape, its decode-time invariants and its `seg:`/`seggrp:` key helpers only — no
-resolver, no producer", and every existing consumer treats `ChunkMap::Segmented` as the typed
-error `SegmentedMapUnsupported`. Since a flat map must fit `MAX_VALUE_BYTES` (100,000) at the
-1 MiB default chunk size, `:250-252` records that an inline `Vec<ChunkRef>` "caps an object's
-chunk count far below the >10 GiB launch requirement". So the segmentation-threshold and 5 GiB
-classes assert behaviour that **does not exist yet**, and #635 is a hard prerequisite for that
-half of the size axis — distinct from [#739][i739], which only tunes a budget that must first
-work at all.
+**The segmentation class is multipart-only, and unreachable through `PutObject` by
+construction.** Two revisions got this wrong — first omitting the dependency entirely, then
+naming [#635][i635] as the blocker. #635 is necessary but not sufficient, and the deeper
+constraint is a *decision*, not a missing implementation. Proposal 0016 settles it:
+
+> A published map of `≤ MAX_MAP_CHUNKS` chunks stays a flat inline map (unchanged, today's
+> shape); a larger map is produced **only** by a multipart session, and is segmented.
+
+A single `PutObject` publishes a **flat** map and reaches large sizes by *raising its chunk size*
+— `chunk_size_effective = max(DEFAULT_CHUNK_SIZE, ⌈Content-Length / MAX_MAP_CHUNKS⌉)` — because it
+carries a declared `Content-Length` and has "no session record to fence, no epoch to key segments
+by, and so no anchor for the staged-publication protocol".
+
+Three consequences for this table:
+
+- The **segmentation threshold class must go through `CompleteMultipartUpload`**, so it is gated
+  on [#508][i508], not merely on #635. Driving it with a large `PutObject` would exercise a
+  large *flat* map — a different code path wearing the same size label, which is worse than not
+  testing it, because the run would report coverage it never had.
+- **`--chunk-size` does not describe large objects.** The gateway overrides it above the flat-map
+  ceiling, so the `C ± 1` classes are meaningful for small objects only. The tool cannot assume
+  the configured value was the one used, and the verdict should not imply it was.
+- The gateway's own `EntityTooLarge` guard fires when a PUT cannot fit even at `chunk_size_max`,
+  which 0016 records as "a guard, not a routine path" since anything inside S3's 5 GiB range
+  always fits. So the 5 GiB + 1 row tests **S3's** limit, not Wyrd's guard; the two share an error
+  code and are different assertions.
+
+#635 remains a prerequisite for the resolver those objects need on read
+(`crates/core/src/metadata.rs:262-266`: the slice "lands the shape … no resolver, no producer",
+and every existing consumer treats `ChunkMap::Segmented` as `SegmentedMapUnsupported`) — but it
+is the second gate, behind #508.
 
 **The tuning values are inputs, not assumptions.** A blackbox tool cannot import
 `DEFAULT_CHUNK_SIZE` or `MAX_ROOT_VALUE_BYTES` — that is the price of §9. Rather than hardcode
@@ -322,9 +354,20 @@ because the per-chunk record's encoded width is an internal detail. It is an exp
 with a derived default. The obligation is only to *cross* the boundary — segmentation is not
 observable over the S3 wire, so the tool exercises it, it does not assert it.
 
-Payloads are **derived, never stored**: `bytes = f(seed, key, size)`. A checkpoint keeps the
-seed, size and digest, not the object. Without this a months-long run would need disk
-proportional to everything it ever wrote.
+Payloads are **derived, never stored**: `bytes = f(seed, key, size, generation)`. A checkpoint
+keeps the seed, size, generation and digest — not the object. Without this a months-long run would
+need disk proportional to everything it ever wrote.
+
+**The generation is load-bearing, not decoration.** An earlier revision derived from
+`(seed, key, size)` alone, which regenerates *identical bytes* whenever a key is overwritten at
+the same size — the common case in the contention and churn pools. Identical bytes give an
+identical digest and an identical `ETag`, so a read that returned the **prior generation** would be
+indistinguishable from a correct one, and §6 declares exactly that read fatal. The oracle would
+have been structurally unable to detect the failure it names. Including the generation makes every
+overwrite a distinguishable value, which is what makes the assertion checkable at all.
+
+This matters beyond the oracle: rapid overwrites can also share a second-resolution wire timestamp
+([#767][i767]), so content is the only reliable discriminator between generations.
 
 ### 5. Worker pools
 
@@ -442,8 +485,39 @@ instantly when a byte comes back wrong.
 | `integrity` | bytes, digest, or size differ | **fatal** — stop, preserve state and the object |
 | `oracle` | model and server disagree (deleted key readable, stale generation, listing mismatch) | **fatal** |
 | `unexpected-support` | an `unsupported` operation succeeded | **fatal** |
-| `protocol` | wrong status, error code, or XML shape | **fatal** in `smoke`; budgeted in long scenarios |
-| `availability` | timeout, connection reset, 5xx | **budgeted** — counted, rate-limited, fails only above a declared threshold |
+| `protocol` | wrong status, error code, or XML shape | **fatal**, in every scenario |
+| `availability` | transport failure, connection reset, 5xx | **budgeted** — counted, rate-limited, fails only above a declared threshold |
+
+**`protocol` is fatal everywhere.** An earlier revision budgeted it in long scenarios, which is
+incoherent: a wrong status or malformed XML is a *correctness* violation, not transient
+unavailability. Under a budget, a rare malformed response during a week-long run could stay below
+threshold and the run could still report `PASS` — while the verdict claims to cover correctness
+and while `smoke` treats the identical response as fatal. Only transport-shaped failures are
+budgeted. Rarity is not a defence for a wrong answer.
+
+**Every operation is bounded, and unbounded waits are not an availability class at all.** A peer
+that accepts a request or body stream and then stops producing data cannot be *classified* by the
+budget, because no error is ever returned — the worker simply stays pending, and with it quiesce,
+checkpointing, shutdown and the verdict. So the tool imposes explicit deadlines on connect, on the
+operation, and on the response-body stream, and cancels outstanding worker tasks rather than
+waiting for them. This is a standing rule in the target repo, not a preference of this proposal —
+`AGENTS.md` requires that "every await on external work is bounded (timeout, fail-closed);
+spawned helper tasks are aborted on drop; shutdown never joins a potentially infinite stream."
+Classifying returned timeouts is what the taxonomy does; *producing* them is a precondition for
+the taxonomy applying at all.
+
+**A timed-out mutation leaves the model wrong, and must be resolved rather than budgeted.** If a
+PUT, overwrite or delete times out *after* the server committed it, counting the timeout as
+budgeted availability and continuing leaves the oracle holding the pre-request state. The next
+read — or the next quiesce sweep — then reports a fatal `integrity` or `oracle` failure even
+though the server performed exactly one valid operation. That is a false failure manufactured by
+the tool's own bookkeeping.
+
+So an indeterminate mutation triggers an **outcome-resolution step**: probe the key, compare
+against both the pre- and post-request expectations, and record whichever the server actually
+holds. Where the probe cannot settle it — the key is unreadable, or a concurrent writer makes the
+observation ambiguous — the run goes **INCONCLUSIVE** rather than continuing against a state the
+client no longer knows. Continuing on a guess is how a validator produces confident nonsense.
 
 ### 8. Scenarios
 
@@ -569,7 +643,36 @@ A months-long run cannot die with an SSH session.
 - oracle state checkpoints to disk at every quiesce point
 - `--resume` restores from checkpoint and continues to the original deadline
 - ships as a systemd unit for long runs, mirroring the three role units in `deploy/dist/systemd/`
-- checkpoints are small by construction (§4: seeds, not payloads)
+
+**Resuming from a checkpoint alone is not safe, and an earlier revision advertised it as if it
+were.** Operations that completed after the last checkpoint are real on the server and absent from
+the restored model. Continuing directly from that state reports failures against a **correct**
+server: an upload since the checkpoint appears as an extra key at the next quiesce sweep, a delete
+appears as a key that should be present and is not, and an overwrite leaves the model holding a
+generation the server no longer has — a fatal `integrity` mismatch on the next read.
+
+Two mechanisms, and the run needs both:
+
+- **A mutation journal**, appended *before* each mutation is issued and marked on completion, so a
+  restart knows which operations were in flight and which keys are therefore indeterminate. This
+  is the same intent-then-act ordering the mutation-resolution rule in §7 relies on.
+- **Reconciliation into a well-defined model at resume**, not blind continuation: enumerate the run
+  prefix, resolve every key the journal marks indeterminate through the §7 outcome-resolution step,
+  and only then start issuing new work. Keys that resolve are adopted with their observed state;
+  keys that cannot be resolved are excluded from the oracle and reported, never guessed at.
+
+That ordering also keeps §15's ownership invariant intact: the journal can only make the model a
+*better* lower bound on what the run wrote — it never causes the tool to claim a key it did not
+create.
+
+**Checkpoints are bounded by format, not by hoping the workload stays small.** §4's derived
+payloads keep object *bodies* off disk, but the model still holds metadata for every live key —
+and the `listing` scenario deliberately grows to millions of them. A whole-file rewrite at every
+quiesce would reach hundreds of megabytes, rewritten repeatedly, distorting the very workload
+being measured. So the on-disk form is an **incremental ledger**: append mutations, compact on a
+declared schedule, and bound the resident model by the scenario's own working-set budget. A
+scenario whose keyspace is unbounded by design (§8, `listing`) declares how its ledger is bounded
+as part of its shape, rather than inheriting a promise the format cannot keep.
 
 ### 13. Two outputs, one source of truth
 
