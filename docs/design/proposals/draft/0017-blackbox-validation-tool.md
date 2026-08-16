@@ -377,13 +377,27 @@ ordering model:
 - every read returns bytes that hash to **some** value actually written to that key (never a
   torn, invented or foreign value — the atomicity property that matters)
 - a read never returns a value written by a PUT that had not yet started when the read completed
-- once a read observes generation *g*, no **subsequent read by the same worker** observes an
-  earlier one — per-session monotonicity, which the tool *can* order because both operations are
-  its own
+  — causality, which needs no serialization order to check
 
-Establishing a total order over concurrent writes needs a real linearizability checker, which is
-what `cargo xtask consistency-run` already does with Elle. Duplicating it here in hand-rolled
-form is how a validator invents its own false failures.
+**And nothing about ordering, including per-session monotonicity.** An earlier revision kept a
+monotonic-reads assertion here on the reasoning that both reads belong to the same worker, so the
+tool can order them. It can order the *reads*; it cannot order the *writes* they observe. Worker
+W reads generation 5, then reads again; meanwhile worker Y's PUT of generation 3 — issued before
+W's first read — commits between them. W's second read returns 3. That is a valid serialization
+in which Y simply committed last, and the assertion would call it a fatal failure. Client-assigned
+generation numbers do not order concurrent commits, so no rule built on them is sound while writes
+are in flight.
+
+Wyrd does contract monotonic reads (ADR-0015), and it is worth checking. But the tool can only
+check it where it can establish order, which is **at quiesce**: writes stopped, in-flight requests
+drained, and then the value is determinate. So the contention pool's ordering checks move there —
+the final value must be one of the written values, and repeated reads must agree on it. That is
+the same shape the consistency run uses when it takes "ONE composed full-set read after heal +
+quiesce" rather than sampling continuously.
+
+Establishing a total order over genuinely concurrent writes needs a real linearizability checker,
+which is what `cargo xtask consistency-run` already does with Elle. Duplicating it here in
+hand-rolled form is how a validator invents its own false failures.
 
 **At quiesce**, with mutation stopped: the full `ListObjectsV2` sweep equals the model's live set
 exactly — no extra key, no missing key, correct `CommonPrefixes` rollups under `delimiter=/`.
@@ -664,9 +678,21 @@ established. `--allow-non-empty` overrides, for a deliberate `--resume` onto an 
 them, touch nothing, exit. An operator gets to look before committing, and it doubles as the
 cheapest possible smoke test of a new deployment's credentials and endpoint.
 
-**Delete-time key verification.** Before issuing any delete, re-check that the key carries this
-run's id. Belt and braces against the write path and the delete path disagreeing — the one bug
-class where run-id scoping would fail exactly when it matters.
+**Delete-time ownership verification — membership, not name shape.** Before issuing any delete,
+require that the key is **present in this run's model as something this run wrote**. Checking only
+that the key carries the run id is not an ownership proof, and an earlier revision made exactly
+that mistake: if `--allow-non-empty` admitted pre-existing objects under `<run-id>/`, those objects
+also carry the run id, so a prefix-shape check passes and `rm --recursive` or cleanup deletes data
+the tool never wrote. The name proves where a key lives; only the model proves who put it there.
+
+That also narrows `--allow-non-empty` to what it should always have meant. It permits the run to
+**start** over an occupied namespace; it never adopts what it found. Pre-existing keys are absent
+from the model, so they are never deleted, never reported as oracle failures, and never counted as
+coverage. On `--resume` the model is restored from the checkpoint, so membership is known exactly
+and the previous run's own keys are legitimately owned.
+
+Belt and braces against the write path and the delete path disagreeing — the one bug class where
+run-id scoping fails exactly when it matters.
 
 Together with retain-on-failure (§8), the invariant is: *the tool never removes a byte it did
 not write, and never writes into occupied space it was not explicitly pointed at.*
