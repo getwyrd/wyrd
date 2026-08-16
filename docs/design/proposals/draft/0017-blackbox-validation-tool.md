@@ -395,6 +395,14 @@ the final value must be one of the written values, and repeated reads must agree
 the same shape the consistency run uses when it takes "ONE composed full-set read after heal +
 quiesce" rather than sampling continuously.
 
+**Which means this tool does not cover monotonic reads *under concurrency*, and should not claim
+to.** Quiesced checks confirm the value settles; they cannot exercise ADR-0015's guarantee while
+commits are in flight, which is the only interesting case. That coverage belongs to
+`cargo xtask consistency-run`, where a checker we did not write judges a recorded history — and
+losing it here is the price of not inventing false failures. The contention pool's contribution is
+narrower than an earlier revision implied: atomicity and causality under concurrency, plus a
+determinate settle at quiesce.
+
 Establishing a total order over genuinely concurrent writes needs a real linearizability checker,
 which is what `cargo xtask consistency-run` already does with Elle. Duplicating it here in
 hand-rolled form is how a validator invents its own false failures.
@@ -635,9 +643,24 @@ known-bad and degraded histories through the same jar that judged the real one a
 `true`, `false` and `:unknown` respectively — "a checker build that blessed the known-bad fixture
 would fail the run before its verdict was trusted."
 
-**It runs as a preflight, not a suite.** The fixture set executes before every live run,
-including the Alpha gating run. A build whose detection has stopped working fails *before* its
-verdict is trusted, not after.
+**One fixture needs the Wyrd profile, not the reference profile.** A third review round caught
+that `unexpected-support` cannot be tested against a plain MinIO backend: MinIO genuinely
+*implements* the operations Wyrd marks unsupported, and §14's reference profile expects exactly
+those successes — so a real success proves nothing about detecting an unexpected one. That fixture
+therefore runs MinIO under the **Wyrd** profile, where `CopyObject` succeeding is a declared
+failure. The proxy is not needed for it; the profile mismatch is the fixture.
+
+**It gates the build, not each run.** An earlier revision said the fixture set "executes before
+every live run, including the Alpha gating run". That is incompatible with keeping the fixtures
+dev-only: a hand-run Hetzner execution has no launcher, and an operator's installed binary has
+neither MinIO nor the proxy. Requiring a preflight nobody can perform would make the requirement
+decorative.
+
+So the self-check is a **release gate on the tool itself**, run in CI: no `wyrd-validate` build
+ships without its fixture set passing. Each live run then records the tool build it used, and
+inherits the guarantee from that build rather than re-proving it in the field. A build whose
+detection has stopped working never reaches a substrate — which is the property that was wanted,
+placed where it can actually hold.
 
 Both MinIO and the proxy are **test fixtures**, not dependencies: containers and a dev-only
 binary, never linked into `wyrd-validate`. §9's lint is scoped accordingly.
@@ -687,9 +710,27 @@ the tool never wrote. The name proves where a key lives; only the model proves w
 
 That also narrows `--allow-non-empty` to what it should always have meant. It permits the run to
 **start** over an occupied namespace; it never adopts what it found. Pre-existing keys are absent
-from the model, so they are never deleted, never reported as oracle failures, and never counted as
-coverage. On `--resume` the model is restored from the checkpoint, so membership is known exactly
-and the previous run's own keys are legitimately owned.
+from the model, so they are never reported as oracle failures and never counted as coverage.
+
+**But "absent from the model" is not enough on its own**, and a third review round caught why:
+nothing stopped a *generated* key from colliding with a pre-existing one. The tool would overwrite
+it, that key would then legitimately enter the model, and cleanup would delete it — destroying
+data the run did not create, through the guard rather than around it. So under
+`--allow-non-empty`, **cleanup is disabled for the whole run** (`--cleanup never` is forced, not
+merely defaulted). A run that starts over occupied space leaves everything it wrote behind, and
+says so in the verdict. Deleting nothing is a recoverable inconvenience; deleting someone else's
+object is not.
+
+**Ownership may under-approximate. It must never over-approximate.** A checkpoint is written at
+quiesce, so a crash leaves writes that succeeded after the last one absent from the restored
+model. Those orphans are indistinguishable from foreign keys, and the tool therefore treats them
+as foreign: it does not delete them, and it reports them as an orphan set for a human to clear.
+That direction leaks storage, which is visible and fixable. The opposite direction — inferring
+ownership to reclaim them — would delete data on a guess. The invariant is stated deliberately
+because the two failure modes are not symmetric.
+
+On `--resume` the model is restored from the checkpoint, so membership up to that point is known
+exactly and the previous run's own keys are legitimately owned.
 
 Belt and braces against the write path and the delete path disagreeing — the one bug class where
 run-id scoping fails exactly when it matters.
@@ -952,7 +993,6 @@ Two forward couplings, both deliberate:
 [i671]: https://github.com/getwyrd/wyrd/issues/671
 [i635]: https://github.com/getwyrd/wyrd/issues/635
 [i674]: https://github.com/getwyrd/wyrd/issues/674
-[i491]: https://github.com/getwyrd/wyrd/issues/491
 [i766]: https://github.com/getwyrd/wyrd/issues/766
 [i767]: https://github.com/getwyrd/wyrd/issues/767
 [i768]: https://github.com/getwyrd/wyrd/issues/768
