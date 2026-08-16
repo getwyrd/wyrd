@@ -74,7 +74,7 @@ jobs:
           key: mutants
 
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.85.13
         with:
           tool: cargo-mutants
 
@@ -135,7 +135,7 @@ jobs:
           key: mutants
 
       - name: Install cargo-mutants
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.85.13
         with:
           tool: cargo-mutants
 
