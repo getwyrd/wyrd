@@ -802,3 +802,24 @@ fn completing_cursor_past_key_space_is_rejected() {
         })
     );
 }
+
+/// **The `psum:` attribution witness.** [`decode_part_summary`] exists to surface a malformed
+/// summary as this record class's own [`RecordError::MalformedRecordValue`] rather than let a
+/// bare [`metadata::decode`] error escape untyped (`multipart.rs`, the decoder's own doc) — and
+/// until this test, it was the one decoder of the four whose rejection arm no test entered. Its
+/// three siblings each carry a malformed-value witness (`part:` twice, plus `mpu:` and `slot:`),
+/// so the attribution every class is named for was asserted for every class but this one.
+///
+/// Found mechanically: the per-patch diff-coverage gate scored #716 at 99.0% and named the two
+/// uncovered lines as the body of this decoder's `map_err` closure.
+///
+/// Omitting `digest` is the same isolating negation the sibling witnesses use — exactly one
+/// required field is absent, so the value violates only the rule under test, and serde's own
+/// message names the field it missed.
+#[test]
+fn part_summary_omitted_digest_is_rejected() {
+    let bytes = "{\"chunks\":3,\"len\":150,\"committed_at_millis\":900}"
+        .as_bytes()
+        .to_vec();
+    assert_malformed(decode_both(&bytes, decode_part_summary), "psum:", "digest");
+}
