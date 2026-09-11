@@ -1237,7 +1237,7 @@ fn the_shipped_artifact_wall_carries_no_off_by_default_backend_exception() {
     let deny = read("deny.toml");
     let all_features = read("deny-all-features.toml");
 
-    // The six tikv-client advisories (#543). None may appear in the default wall.
+    // The seven tikv-client advisories (#543). None may appear in the default wall.
     for advisory in [
         "RUSTSEC-2026-0104",
         "RUSTSEC-2026-0099",
@@ -1247,6 +1247,10 @@ fn the_shipped_artifact_wall_carries_no_off_by_default_backend_exception() {
         // Only raised because both configs set `unsound = "all"`; cargo-deny's default
         // unsound scope (`workspace`) never looks at transitive crates like rand 0.7.3.
         "RUSTSEC-2026-0097",
+        // h2 0.3.27 via tonic 0.10. The default graph carries the FIXED h2 0.4.x (#773), so
+        // this ID must stay out of deny.toml: parked there, it would silently re-admit a
+        // vulnerable 0.4.x if a default dependency ever pinned one again.
+        "RUSTSEC-2026-0258",
     ] {
         assert!(
             !deny.contains(advisory),
