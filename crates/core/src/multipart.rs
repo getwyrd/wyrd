@@ -5,12 +5,14 @@
 //! This is slices 1–2 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). It is
 //! deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
 //! `async fn`. After this module a reader can name every key the protocol will ever write
-//! (`0016` §1, `:333-527`), parse it back, **and decode the one record value admission turns
-//! on** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
-//! derivations that profile establishes, `0016:348`, `:1469-1470`). The remaining record
-//! values (`mpu:`'s session shape, `part:`'s chunk list) are the next children's; the outcome
-//! enums, the answer table and `multipart_etag` are the child after that's (`0016` decision 3,
-//! `:894-1037`, `0016:3064-3070`).
+//! (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
+//! names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
+//! derivations that profile establishes, `0016:348`, `:1469-1470`), the in-flight lifecycle
+//! records ([`SessionRecord`], [`SlotRecord`], [`PartRecord`], [`PartSummary`]), and the
+//! retirement obligation ([`RetirePayload`], whose identity lives partly in its **key**). The
+//! owned staging entry (`sidx:`'s [`crate::metadata::PendingEntry`] with its ownership fields)
+//! is the next child's; the outcome enums, the answer table and `multipart_etag` are the child
+//! after that's (`0016` decision 3, `:894-1037`, `0016:3064-3070`).
 //!
 //! There is **no** `encode_record`/`decode_record` envelope, and this header's earlier forward
 //! reference to one is withdrawn: `0016` §1 gives every value a **key-determined** shape
@@ -18,6 +20,13 @@
 //! to dispatch on. Each record type instead validates inside its own `Deserialize` over the
 //! store-wide codec [`crate::metadata::encode`] / [`crate::metadata::decode`] — the shape
 //! [`AdmissionRecord`] lands here and every later child repeats.
+//!
+//! **One record breaks that shape, deliberately: the retirement obligation.** Most of its rules
+//! are relations against its own **key**, so it takes the key as a decoder parameter
+//! ([`decode_retire_obligation`]) and carries **no** `Deserialize` at all — a decode that cannot
+//! see the key cannot validate against it, and a payload obtained that way would be exactly the
+//! value ADR-0045 decision 1 forbids. That is also the second reason a value-only dispatching
+//! envelope could not have served this key space.
 //!
 //! # The keyed classes (`0016` §1, `:333-527`)
 //!
@@ -29,8 +38,8 @@
 //! | `part:<id>:<n>` | a **committed part** |
 //! | `psum:<id>:<n>` | that part's **summary** |
 //! | `sidx:<id>:<n>:<chunk>` | one **owned staging entry**, under a prefix disjoint from `pending:` (`0016:475-491`) |
-//! | `retire:bytes:<token>` | a **retirement obligation**: orphan-mark bytes, then delete the naming records |
-//! | `retire:records:<token>` | records to delete whose bytes something else protects |
+//! | `retire:bytes:<token>` | a **retirement obligation** ([`RetirePayload`]): orphan-mark bytes, then delete the naming records |
+//! | `retire:records:<token>` | records to delete whose bytes something else protects (the same payload, records mode) |
 //!
 //! Every prefix here is disjoint from every other and from the pre-existing `inode:` /
 //! `dirent:` / `pending:` / `bucket:` / `orphan:` (`metadata.rs:30-70`), `seg:` / `seggrp:`
@@ -60,26 +69,29 @@
 //! Structural validity is checked **at decode**, never by convention at a call site
 //! (`0016:390-414`).
 //!
-//! # Nothing here is written yet — where the living-architecture update belongs
+//! # Nothing here is written yet — and the living-architecture doc says exactly that
 //!
-//! This module is the key **grammar** plus the admission ledger's record **shape**: it has no
-//! writer, no store call and no production consumer (the first writers are the store round
-//! trips, #656–#659). The living
-//! architecture doc describes the system **as it is** (`docs/design/README.md:28`), and its
-//! metadata model (`docs/design/architecture/05-building-block-view.md:183-195`) therefore
-//! gains these namespaces with the slice that first *persists* one — documenting records no
-//! code emits would make the living doc describe a system that does not exist. Until then the
-//! normative description of this key space is proposal 0016 §1 (`0016:333-356`), already
-//! merged on `main`.
+//! This module is the key **grammar** plus the record **shapes**: it has no writer, no store
+//! call and no production consumer (the first writers are the store round trips, #656–#659).
+//! An earlier revision of this header deferred the living-architecture update to "the slice
+//! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
+//! the convention ended up saying. The living architecture doc describes the system **as it
+//! is** (`docs/design/README.md:28`), and a persisted record *definition* is part of that
+//! system the moment it is merged — `AGENTS.md:154-158` makes updating it in the same PR a
+//! merge requirement, not a follow-up. Its metadata model
+//! (`docs/design/architecture/05-building-block-view.md:202`) therefore records these record
+//! **types** as landed ahead of their writers, and defers the *protocol* — the fenced
+//! transitions, staged publication and the retirement drain — to the proposal, whose §1
+//! (`0016:333-356`) stays the normative description of this key space.
 
 use std::fmt;
 
 use serde::de::Error as DeError;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use wyrd_traits::{ChunkId, DServerId, SCAN_CAP};
 
 use crate::erasure;
-use crate::metadata::{self, ChunkRef, EcScheme, InodeId};
+use crate::metadata::{self, ChunkRef, EcScheme, InodeId, SegmentGroup};
 
 // ===========================================================================
 // 1. Errors — every structural violation is a typed error, never a value
@@ -290,6 +302,139 @@ pub enum RecordError {
         /// How many chunks the absurd list carries.
         chunks: usize,
     },
+    /// A part-number set run whose bounds are reversed, `lo > hi` (`0016:382-388`). A reversed
+    /// run names no part at all, and its endpoints are a second spelling of the empty set.
+    PartNumberRunReversed {
+        /// The run's lower bound.
+        lo: u32,
+        /// The run's upper bound.
+        hi: u32,
+    },
+    /// A part-number set whose runs are not **strictly ascending and non-adjacent**
+    /// (`0016:382-388`): the encoding is coalesced, so an out-of-order, overlapping or abutting
+    /// run is a **second spelling** of one set — `[[1,2],[3,4]]` for `[[1,4]]` — and two
+    /// spellings of one obligation defeat the `require_absent` installation guard exactly as two
+    /// spellings of one key would (`0016:369-373`; the module's canonical-key rule in the
+    /// header).
+    PartNumberRunsNotCoalesced {
+        /// The offending run's lower bound.
+        lo: u32,
+        /// The upper bound of the run before it.
+        previous_hi: u32,
+    },
+    /// A retirement obligation, or one component of it, that owes **nothing** (`0016:355-356`):
+    /// an empty payload, an explicitly empty part set ([`PartNumberSet::from_runs`]), a
+    /// present-but-empty chunk list — the payload's own or a flat generation's, both judged by the
+    /// module's `checked_chunks` — or a generation naming neither of its two reclamation sources
+    /// ([`RetiredMap`]). A drain that met one would
+    /// mark nothing, delete the obligation, and record the work as done: residue nothing drains,
+    /// and no record left naming it.
+    ///
+    /// Each spelling is refused where it is read and reports **which** component owes nothing, so
+    /// an operator is not left to find the empty list inside an otherwise plausible value.
+    RetireObligationOwesNothing {
+        /// Which part of the payload owes nothing (`payload` for the whole value).
+        component: &'static str,
+    },
+    /// A `parts: "all"` wildcard outside the one shape that installs it — the `retire:bytes:`
+    /// session teardown `{session, all}` the reaper's `Open` arm commits (`0016:2187`). The
+    /// wildcard is an instruction to enumerate the session's own `part:<id>:` range **at drain
+    /// time**, and only the teardown fence that installs it makes that range immutable
+    /// (`0016:664`, `:2187`): without the teardown component the same obligation names whatever a
+    /// still-live session happens to hold when the drain arrives, which is a set no writer chose.
+    /// The mode half of the rule is [`RetireModeMismatch`](Self::RetireModeMismatch) — under
+    /// `retire:records:` the wildcard would delete **every** part record of a session, including
+    /// the staged parts whose records are the only protection their bytes have and the only
+    /// source of their placements (`0016:919-921`, X104).
+    RetireAllPartsWithoutSession,
+    /// A retirement payload component stored under the **other** mode's key prefix
+    /// (`0016:434-441`). The mode lives in the key precisely so this is a decode error and never
+    /// a misread boolean: a record-mode component under `retire:bytes:` would orphan-mark bytes a
+    /// live object still names, and a byte-mode component under `retire:records:` would delete
+    /// the only records naming durable bytes with no orphan evidence ever written.
+    RetireModeMismatch {
+        /// The mode the key names.
+        key_mode: RetireMode,
+        /// The component that may not live under it.
+        component: &'static str,
+    },
+    /// A retirement payload component whose **token scope** disagrees with the key's token
+    /// (`0016:358-366`): a generation component under a session (`s:`) token, or a
+    /// session-scoped component under a generation (`g:`) token. Either would let a drain
+    /// reclaim one identity's data while clearing another identity's obligation
+    /// (`0016:369-373`, outcome (a)).
+    RetireTokenScopeMismatch {
+        /// The token kind the key carries (`s:` or `g:`).
+        token: &'static str,
+        /// The component found under it.
+        component: &'static str,
+    },
+    /// A session-scoped component whose part scope disagrees with the token's **optional
+    /// `:<part-number>:<attempt-id>` suffix** (`0016:358-366`). The suffix exists only for the
+    /// per-part obligations (a re-uploaded part's superseded chunks, a losing writer's
+    /// compensation, `0016:659`, `:672`); the whole-session obligations a fence, a publication or
+    /// a rollback installs carry no suffix (`0016:662-665`, `:2187`, `:2193`). A whole-session
+    /// obligation filed under one part's token is cleared by that part's drain and is never
+    /// enumerated by the session's own emptiness gate (`0016:374-380`); a per-part obligation
+    /// filed session-wide names an attempt nothing can attribute.
+    RetireTokenSuffixMismatch {
+        /// The component found.
+        component: &'static str,
+        /// Whether the key's token named a part attempt.
+        token_names_part: bool,
+    },
+    /// A generation payload under a `g:` token naming a **different** `(inode, version)`: the
+    /// obligation would evidence one generation's fragments while clearing another's — one
+    /// generation's bytes reclaimed and the other's obligation gone, with no record left naming
+    /// either (`0016:369-373`, outcome (a)).
+    RetireGenerationIdentityMismatch {
+        /// The inode the key's token names.
+        key_inode: InodeId,
+        /// The version the key's token names.
+        key_version: u64,
+        /// The inode the payload names.
+        payload_inode: InodeId,
+        /// The version the payload names.
+        payload_version: u64,
+    },
+    /// A `generation` payload naming **both** reclamation sources — an inline `chunks` list and a
+    /// `segments` group — when a generation has exactly one ([`RetiredMap`]).
+    ///
+    /// The obligation mirrors the committed map it retires, and that map is the two-arm
+    /// [`crate::metadata::ChunkMap`] (`metadata.rs:1014`): a flat root's chunks are inline and a
+    /// segmented root's live in the `seg:` range its group names, with no inline list beside them.
+    /// `0016`'s two spellings of the row (`:355` `chunks, segments?`; `:2417` `chunks?, segments`)
+    /// are those two cases, not a union. A payload carrying both would leave the drain
+    /// (#656–#659) to invent a meaning for a value no writer installs — orphan-mark the inline
+    /// list *and* walk a segment range, for a generation only one of them ever described.
+    RetireGenerationBothSources {
+        /// The inode the generation names.
+        inode: InodeId,
+        /// The version it names.
+        version: u64,
+    },
+    /// A `retire:records:` payload naming a segment group of a **different epoch** than its
+    /// token's (`0016:2350-2380`).
+    ///
+    /// A segment group's epoch is the `Completing` fence epoch that wrote those segments
+    /// (`0016:354`), and the obligation retiring them is installed **by the fence that ends that
+    /// very attempt**, whose `require(mpu == Completing@E)` precondition is what the token's
+    /// epoch records (`0016:663-665`, `:2357-2362`). So the token's epoch is `E` — the epoch
+    /// whose segment keys the payload names — **exactly**. Admitting a window instead would give
+    /// one obligation two legal keys, and `require_absent(retire:<mode>:<token>)` cannot refuse a
+    /// second installation of an obligation spelled under a key it never looked at
+    /// (`0016:369-373`): the same obligation is then installed and drained twice.
+    ///
+    /// Draining a misfiled one deletes a **different** attempt's `seg:` records — and a later
+    /// attempt's may already have been adopted by a winning root flip, so the deletion strips a
+    /// *published* object of its segment map while orphan-marking nothing: the F18 class the
+    /// epoch-scoped key space exists to make impossible (`0016:2364-2380`).
+    RetireSegmentEpochMismatch {
+        /// The session epoch the key's token names.
+        key_epoch: u64,
+        /// The epoch of the segment group the payload names.
+        segment_epoch: u64,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -409,6 +554,73 @@ impl fmt::Display for RecordError {
             Self::PartLengthOverflow { chunks } => {
                 write!(f, "summing {chunks} chunks' logical lengths overflows u64")
             }
+            Self::PartNumberRunReversed { lo, hi } => {
+                write!(f, "part-number run [{lo}, {hi}] is reversed")
+            }
+            Self::PartNumberRunsNotCoalesced { lo, previous_hi } => write!(
+                f,
+                "part-number run starting at {lo} overlaps or abuts the run ending at \
+                 {previous_hi}: the encoding is coalesced, strictly ascending, non-adjacent runs"
+            ),
+            Self::RetireObligationOwesNothing { component } => {
+                write!(f, "the retirement obligation's `{component}` owes nothing")
+            }
+            Self::RetireAllPartsWithoutSession => write!(
+                f,
+                "the `{ALL_PARTS}` part-number wildcard is stored without the `session` \
+                 teardown component: only the teardown that installs it freezes the part range \
+                 it names"
+            ),
+            Self::RetireModeMismatch {
+                key_mode,
+                component,
+            } => write!(
+                f,
+                "a `{component}` retirement component is stored under a `{}` key",
+                String::from_utf8_lossy(key_mode.prefix())
+            ),
+            Self::RetireTokenScopeMismatch { token, component } => write!(
+                f,
+                "a `{component}` retirement component is stored under a `{token}` token: the \
+                 component's scope disagrees with its key"
+            ),
+            Self::RetireTokenSuffixMismatch {
+                component,
+                token_names_part,
+            } => write!(
+                f,
+                "a `{component}` retirement component is stored under a token that {} a part \
+                 attempt",
+                if *token_names_part {
+                    "names"
+                } else {
+                    "does not name"
+                }
+            ),
+            Self::RetireGenerationIdentityMismatch {
+                key_inode,
+                key_version,
+                payload_inode,
+                payload_version,
+            } => write!(
+                f,
+                "a generation payload for inode {payload_inode} version {payload_version} is \
+                 stored under the token for inode {key_inode} version {key_version}"
+            ),
+            Self::RetireGenerationBothSources { inode, version } => write!(
+                f,
+                "the retired generation for inode {inode} version {version} names both an inline \
+                 chunk list and a segment group: a published map is one or the other"
+            ),
+            Self::RetireSegmentEpochMismatch {
+                key_epoch,
+                segment_epoch,
+            } => write!(
+                f,
+                "a records obligation naming the epoch-{segment_epoch} segment group is stored \
+                 under the session token for epoch {key_epoch}: the fence that ends an attempt \
+                 installs its obligation, so the token names that attempt's own epoch"
+            ),
         }
     }
 }
@@ -2191,4 +2403,856 @@ pub fn decode_part_summary(value: &[u8]) -> Result<PartSummary, RecordError> {
             detail: err.to_string(),
         })?;
     require_canonical(summary, value, "psum:")
+}
+
+// ===========================================================================
+// 9. The retirement obligation — the `retire:<mode>:<token>` VALUE (`0016:355-388`)
+// ===========================================================================
+
+/// A **range-encoded** part-number set (`0016:382-388`): `[[1, 400]]` for a contiguous run, so
+/// the common "every staged part was published" case is a few bytes and the worst case — 10,000
+/// alternating part numbers — still fits inside one value.
+///
+/// The encoding is **canonical**, and that is the whole reason this is a type rather than a
+/// `Vec<(u32, u32)>`: the runs are ordered, non-overlapping and **non-adjacent**, so `[[1,4]]`
+/// is the *only* spelling of `{1,2,3,4}` and `[[1,2],[3,4]]` is not a second one
+/// ([`RecordError::PartNumberRunsNotCoalesced`]). A retirement obligation is installed under
+/// `require_absent(retire:<mode>:<token>)` and drained under `require(retire:… == prior)`
+/// (`0016:369-373`, `:667`), so two spellings of one set are two records one drain would answer
+/// twice and one `require` could never match — the value-side form of the two-spellings-of-one-key
+/// hazard the module's key grammar refuses (**C-1**, `docs/principles.md` §5).
+///
+/// Every endpoint is a [`PartNumber`]: `[1, MAX_PART_NUMBER]`, the **format** bound the
+/// `part:`/`psum:`/`sidx:` key grammar can spell, never the live `MAX_PARTS_PER_SESSION` knob
+/// (`0016:390-402`). A number past it would name a `part:` record no parser could read back.
+/// Those two rules together are also the set's **cardinality** bound, so no separate one is
+/// spelled: runs must ascend and never abut, so the most a canonical set can hold is
+/// `⌈MAX_PART_NUMBER / 2⌉` of them — an alternating set over the whole key space, the worst case
+/// `0016:382-388` sizes the encoding for.
+///
+/// It is also **non-empty by construction**. A part set naming no part is an obligation that
+/// owes nothing — residue a drain would clear having marked nothing — so the emptiness rule lives
+/// in the type rather than in each writer's discipline: neither constructor can mint one, which
+/// is what keeps a writer (#656–#659) from computing an empty set for the root flip's unnamed
+/// staged parts (`0016:662`, `:919-921`) and storing an obligation this decoder then refuses,
+/// under a key the session's terminal-delete gate can never see emptied (`0016:673`).
+///
+/// There is deliberately **no** `Deserialize`: the only decode path is [`RetirePayload`]'s wire
+/// shape, which routes through [`Self::from_runs`] so every rejection arrives as its own typed
+/// [`RecordError`] rather than as a serde message — the reason [`crate::metadata::SegmentNonce`]
+/// carries none either (`metadata.rs:757-760`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct PartNumberSet(Vec<(u32, u32)>);
+
+impl PartNumberSet {
+    /// The validating constructor every decode routes through — the one home of the
+    /// canonical-spelling and non-emptiness rules (ADR-0045, parse-don't-validate: a
+    /// non-canonical or empty set is an error at the boundary, never a value inside the program).
+    pub fn from_runs(runs: Vec<(u32, u32)>) -> Result<Self, RecordError> {
+        if runs.is_empty() {
+            return Err(RecordError::RetireObligationOwesNothing { component: "parts" });
+        }
+        let mut previous_hi: Option<u32> = None;
+        for &(lo, hi) in &runs {
+            PartNumber::new(lo)?;
+            PartNumber::new(hi)?;
+            if lo > hi {
+                return Err(RecordError::PartNumberRunReversed { lo, hi });
+            }
+            if let Some(previous_hi) = previous_hi {
+                // `previous_hi + 1` cannot overflow: `PartNumber::new` bounded it by
+                // `MAX_PART_NUMBER`, three orders of magnitude below `u32::MAX`.
+                if lo <= previous_hi + 1 {
+                    return Err(RecordError::PartNumberRunsNotCoalesced { lo, previous_hi });
+                }
+            }
+            previous_hi = Some(hi);
+        }
+        Ok(Self(runs))
+    }
+
+    /// Mint the set from any iterator of part numbers, coalescing contiguous runs — the
+    /// writer-side counterpart of [`Self::from_runs`]: it sorts, deduplicates and coalesces, so it
+    /// can only produce the canonical encoding its own decode accepts. It exists so that no writer
+    /// (#656–#659) has to spell the rule a second time; a hand-built run vector is exactly how a
+    /// second spelling of one obligation gets stored.
+    ///
+    /// `None` for an iterator naming **no** part, because the empty set is not a value this type
+    /// has: the writer rows that compute one compute a *possibly*-empty set — the parts a Complete
+    /// left unnamed (`0016:662`, `:919-921`) — and the empty case is not an obligation to install
+    /// under a smaller payload but an obligation not to install at all, since a stored empty set
+    /// is residue no drain can clear (`0016:673`). Answering `None` is what puts that decision in
+    /// front of the writer instead of inside a record its own decoder would refuse.
+    pub fn from_numbers(numbers: impl IntoIterator<Item = PartNumber>) -> Option<Self> {
+        let sorted: std::collections::BTreeSet<u32> =
+            numbers.into_iter().map(PartNumber::get).collect();
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for number in sorted {
+            match runs.last_mut() {
+                // `last.1 + 1` cannot overflow: every input is a [`PartNumber`], so every run
+                // endpoint is bounded by `MAX_PART_NUMBER` — the same argument `from_runs` makes.
+                Some(last) if last.1 + 1 == number => last.1 = number,
+                _ => runs.push((number, number)),
+            }
+        }
+        (!runs.is_empty()).then_some(Self(runs))
+    }
+
+    /// The set's runs, `[lo, hi]` inclusive, ascending, non-adjacent and never empty.
+    ///
+    /// There is deliberately no `len`, `is_empty` or member iterator beside it: the runs are the
+    /// stored shape, emptiness is not a state this type has, and the drain that walks them
+    /// (#656–#659) is what decides how to page a run of up to [`MAX_PART_NUMBER`] members. A
+    /// convenience iterator minted here would be an API this child has no consumer for and no
+    /// test that could pin its paging behaviour.
+    pub fn runs(&self) -> &[(u32, u32)] {
+        &self.0
+    }
+}
+
+/// The literal a [`PartScope::All`] is spelled as.
+const ALL_PARTS: &str = "all";
+
+/// Which of a session's parts an obligation covers (`0016:355-356`, `:2187` vs `:2193`).
+///
+/// The two arms are the two things a writer can know at install time, and they are **not** two
+/// spellings of one thing: the fence that tears down an `Open` session names no list, because a
+/// list frozen by the caller is read *before* its fence lands and a part commit that won the
+/// read-then-fence window would be missing from it — the fence makes the session's own bounded
+/// `part:<id>:` range immutable, so [`Self::All`] is the instruction to enumerate that range at
+/// drain time (`0016:2187`, `:673`). A publication or a `Completing` rollback, by contrast,
+/// names the exact part numbers it published or left staged, because *which* parts they are is
+/// the whole content of the obligation (`0016:662`, `:919-921`, `:2193`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartScope {
+    /// Every part the token's session holds, enumerated from its own bounded ranges at drain
+    /// time. Spelled `"all"`, and legal **only** in the `retire:bytes:` session teardown
+    /// `{session, all}` that freezes that range (`0016:2187`) — see `ALL_PARTS_COMPONENT` and
+    /// [`RecordError::RetireAllPartsWithoutSession`] for the two halves of that rule.
+    All,
+    /// Exactly these part numbers, frozen under the fence that installed the obligation.
+    /// Spelled as the range encoding itself, `[[1,4],[7,9]]` (`0016:382-388`).
+    Set(PartNumberSet),
+}
+
+impl Serialize for PartScope {
+    /// Serialized as the value `0016:382` writes — the range encoding **itself**, not wrapped in
+    /// a tag object, so `parts` reads as `[[1, 400]]` there and here alike; the wildcard is the
+    /// one string no range encoding can be confused with.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::All => serializer.serialize_str(ALL_PARTS),
+            Self::Set(set) => set.serialize(serializer),
+        }
+    }
+}
+
+/// The wire shape of [`PartScope`]: the wildcard string, or the raw range encoding for
+/// [`PartNumberSet::from_runs`] to judge — so a non-canonical set is attributed to its own
+/// [`RecordError`] variant rather than arriving as a serde message.
+enum PartScopeWire {
+    All,
+    Set(Vec<(u32, u32)>),
+}
+
+impl<'de> Deserialize<'de> for PartScopeWire {
+    /// Hand-written rather than `#[serde(untagged)]`, for the rejection: an untagged enum
+    /// reports only "data did not match any variant of untagged enum PartScopeWire", naming an
+    /// internal type and no rule, where the visitor below names the two spellings a `parts`
+    /// component may take. A third spelling is a decode error either way — this one an operator
+    /// can act on.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ScopeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ScopeVisitor {
+            type Value = PartScopeWire;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "the wildcard {ALL_PARTS:?} or a range-encoded part-number set"
+                )
+            }
+
+            fn visit_str<E: DeError>(self, value: &str) -> Result<PartScopeWire, E> {
+                if value == ALL_PARTS {
+                    Ok(PartScopeWire::All)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+                }
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<PartScopeWire, A::Error> {
+                Vec::<(u32, u32)>::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))
+                    .map(PartScopeWire::Set)
+            }
+        }
+
+        deserializer.deserialize_any(ScopeVisitor)
+    }
+}
+
+impl TryFrom<PartScopeWire> for PartScope {
+    type Error = RecordError;
+
+    fn try_from(wire: PartScopeWire) -> Result<Self, RecordError> {
+        Ok(match wire {
+            PartScopeWire::All => Self::All,
+            PartScopeWire::Set(runs) => Self::Set(PartNumberSet::from_runs(runs)?),
+        })
+    }
+}
+
+/// One **present** retirement chunk list, judged: never spelled `[]`, and every chunk's stored
+/// `EcScheme` one [`crate::erasure`] can encode/decode. The single home of both rules, shared by
+/// the payload's own `chunks` component and a flat generation's inline list, so neither can be
+/// given the weaker check (an *absent* list is its caller's question — the component is simply
+/// not there):
+///
+/// * a **present but empty** list is [`RecordError::RetireObligationOwesNothing`] — a component
+///   that owes nothing is residue a drain would clear having marked nothing. It is refused
+///   *here*, where the list is read, rather than left to the canonical-bytes gate to reject as a
+///   re-encode mismatch (the field is skipped when empty, so the two bytes differ): the operator
+///   signal then names the empty list rather than "non-canonical bytes", and the two rules stay
+///   separately falsifiable — each has its own negation leg in the named test;
+/// * every chunk passes [`checked_chunk_scheme`] — an obligation's chunk list is exactly the
+///   untrusted stored geometry a drain fans its orphan marks out over, the #285 class made
+///   durable (ADR-0045's invariant table, `0045:71-72`). A chunk's `placement` **length** is
+///   deliberately not checked: the standing contextual check, liberal on read (ADR-0045
+///   `:45-49`, `:72`; `AGENTS.md:146-149`; `0016:416-432`).
+fn checked_chunks(
+    wire: Vec<ChunkRefWire>,
+    component: &'static str,
+) -> Result<Vec<ChunkRef>, RecordError> {
+    if wire.is_empty() {
+        return Err(RecordError::RetireObligationOwesNothing { component });
+    }
+    let chunks: Vec<ChunkRef> = wire.into_iter().map(ChunkRef::from).collect();
+    for chunk in &chunks {
+        checked_chunk_scheme(chunk)?;
+    }
+    Ok(chunks)
+}
+
+/// The wire shape of [`RetireGeneration`], closed and reading its chunks through the module's
+/// own [`ChunkRefWire`] for the reason that type records. Both reclamation sources are optional
+/// here — **which combinations are legal is [`RetireGeneration`]'s rule, not serde's** (an
+/// untagged enum would report only "data did not match any variant"), so each rejection arrives
+/// as its own [`RecordError`] naming the generation it was found on.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetireGenerationWire {
+    inode: InodeId,
+    version: u64,
+    #[serde(default)]
+    chunks: Option<Vec<ChunkRefWire>>,
+    #[serde(default)]
+    segments: Option<SegmentGroup>,
+}
+
+/// Which of the two reclamation sources a retired generation's bytes are named by — the
+/// **committed map this obligation mirrors**, and therefore a two-arm choice rather than a pair:
+/// [`crate::metadata::ChunkMap`] is `Flat(Vec<ChunkRef>) | Segmented(SegmentedMap)`
+/// (`metadata.rs:1002-1021`), and a [`crate::metadata::SegmentedMap`] carries **no** inline
+/// chunks — its chunks live in the `seg:` records its group names. A generation was published
+/// under one of those two shapes, so exactly one of them names its bytes.
+///
+/// Making that a type rather than a rule over two optional fields is ADR-0045's
+/// parse-don't-validate over this child's category: a generation owing both, or neither, is
+/// **unrepresentable** once decoded rather than merely refused somewhere (`0045:42-49`).
+///
+/// Its arms are open, as [`crate::metadata::ChunkMap`]'s are, so the **non-emptiness** of a
+/// `Flat` list is not a property of this type but of the decode that reads one (`checked_chunks`
+/// — an obligation owing nothing is residue no drain can clear). That is sound here for the same
+/// reason no record type in this module has a writer-side constructor: a [`RetireGeneration`] can
+/// only come into existence by decoding, so a hand-built `RetiredMap` has nowhere to go. The
+/// first writers (#656–#659) inherit that obligation with the constructor they add.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetiredMap {
+    /// A **flat** generation's own chunk list, copied into the obligation because the root that
+    /// named it is being overwritten or unlinked in the same batch — after which nothing else
+    /// names those fragments (`0016:355`, `:668`).
+    Flat(Vec<ChunkRef>),
+    /// A **segmented** generation's group, naming its `seg:<group-nonce>:<epoch>:` range. The
+    /// segments are named by their **keys**, never by frozen placements: the drain resolves that
+    /// bounded range and orphan-marks each record's *current* `ChunkRef.placement`, so a fragment
+    /// a reconstruction or rebalance repoint moved before the supersede won its inode CAS is
+    /// marked at the position it actually occupies (`0016:2417-2425`).
+    Segmented(SegmentGroup),
+}
+
+/// A **superseded or deleted object generation** whose bytes a `retire:bytes:` obligation owes
+/// (`0016:355`, `:668`, `:2416-2425`): the `(inode, version)` pair exactly one publication
+/// produced, and the one [`RetiredMap`] that named its bytes.
+///
+/// # Exactly one source, and why `0016` looks like it says otherwise
+///
+/// `0016` spells the row two ways — `{inode, version, chunks, segments?}` at `:355` and
+/// `{inode, version, chunks?, segments}` at `:2417`. Those are the **two cases**, not a union:
+/// a flat generation retires by its copied `chunks` (`:355`, the supersede of a flat root) and a
+/// segmented one by its `segments` group, re-read at drain time (`:2417`, the supersede of a
+/// segmented root). The obligation mirrors the committed map it retires, and that map is the
+/// two-arm [`crate::metadata::ChunkMap`] (`metadata.rs:1014`) — there is no published shape with
+/// both — so **both present is a decode error**
+/// ([`RecordError::RetireGenerationBothSources`]) and neither present is an obligation owing
+/// nothing ([`RecordError::RetireObligationOwesNothing`]). Settled for this record format by the
+/// human on 2026-09-11 after the two spellings above had been read as a union; the erratum
+/// against `0016`'s `:355` row rides the PR description, and this module does not edit the
+/// proposal.
+///
+/// A shape no writer can install is not a shape the record should be able to hold: accepting it
+/// would leave the first drain (#656–#659) to invent a meaning for a value the protocol never
+/// produces — orphan-mark the inline list *and* walk a segment range, on a generation only one
+/// of them ever described.
+///
+/// Whichever source it carries is **omitted when absent**, never spelled `[]` or `null`, so the
+/// accepted set stays exactly the encoder's image (`AGENTS.md:170-172`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireGeneration {
+    inode: InodeId,
+    version: u64,
+    map: RetiredMap,
+}
+
+impl RetireGeneration {
+    /// The inode the retired generation belonged to.
+    pub const fn inode(&self) -> InodeId {
+        self.inode
+    }
+
+    /// The retired generation's version.
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// The one source naming its bytes — the arm the drain dispatches on.
+    pub const fn map(&self) -> &RetiredMap {
+        &self.map
+    }
+}
+
+impl Serialize for RetireGeneration {
+    /// Written through a closed wire struct, the shape [`crate::metadata::SegmentedMap`]
+    /// serializes through (`metadata.rs:983-992`): the arm decides **which** of the two fields
+    /// exists, and the absent one is omitted rather than spelled `null`, so decode→encode is the
+    /// identity for both cases.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            inode: InodeId,
+            version: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            chunks: Option<&'a [ChunkRef]>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            segments: Option<&'a SegmentGroup>,
+        }
+        let (chunks, segments) = match &self.map {
+            RetiredMap::Flat(chunks) => (Some(chunks.as_slice()), None),
+            RetiredMap::Segmented(group) => (None, Some(group)),
+        };
+        Wire {
+            inode: self.inode,
+            version: self.version,
+            chunks,
+            segments,
+        }
+        .serialize(serializer)
+    }
+}
+
+/// The generation's own rules, the ones knowable from the value alone: it names **exactly one**
+/// reclamation source, and the source it names is not empty. Its remaining rules are relations —
+/// its chunks' geometry, judged with the payload's own by `checked_chunks`, and its
+/// `(inode, version)` against the `g:` token that names it (`RetirePayload::checked_against_key`).
+impl TryFrom<RetireGenerationWire> for RetireGeneration {
+    type Error = RecordError;
+
+    fn try_from(wire: RetireGenerationWire) -> Result<Self, RecordError> {
+        let map = match (wire.chunks, wire.segments) {
+            (Some(_), Some(_)) => {
+                return Err(RecordError::RetireGenerationBothSources {
+                    inode: wire.inode,
+                    version: wire.version,
+                })
+            }
+            (Some(chunks), None) => RetiredMap::Flat(checked_chunks(chunks, "generation.chunks")?),
+            (None, Some(group)) => RetiredMap::Segmented(group),
+            (None, None) => {
+                return Err(RecordError::RetireObligationOwesNothing {
+                    component: "generation",
+                })
+            }
+        };
+        Ok(Self {
+            inode: wire.inode,
+            version: wire.version,
+            map,
+        })
+    }
+}
+
+/// Which token kind a payload component's writer row files it under (`0016:358-366`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenScope {
+    /// The whole session at one epoch — the **suffix-free** `s:<upload-id>:<epoch>` token.
+    SessionWide,
+    /// One part attempt — `s:<upload-id>:<epoch>:<part-number>:<attempt-id>`.
+    PerPart,
+    /// One object generation — `g:<inode-id>:<version>`.
+    Generation,
+}
+
+/// One component of a [`RetirePayload`], with the mode and the token scope **its own writer row
+/// fixes**. The six constants below are that writer table, transcribed once: `0016`'s value
+/// column (`:355-356`) and the batches that install each obligation (`:659-673`, `:2187`,
+/// `:2193`, `:2417`). Every cross-check a decoder can make against a key is a lookup in it, so
+/// no rule is spelled twice and no component can be given a weaker check than its siblings.
+#[derive(Debug, Clone, Copy)]
+struct Component {
+    /// The field name, for the rejection that reports which component was found.
+    name: &'static str,
+    /// The mode this component may live under, or `None` for a component both modes install.
+    mode: Option<RetireMode>,
+    /// The token kind that names it.
+    scope: TokenScope,
+}
+
+/// `{session, …}` — the session's **own staged residue**: its owned `sidx:` fragments, orphan-marked
+/// and then deleted by this obligation (`0016:355`, "bytes to orphan-mark, then the naming records
+/// to delete"; `:2587` states the marking explicitly).
+///
+/// **Bytes only.** Every writer row that names it installs it under `retire:bytes:` — the abort /
+/// reap fence (`0016:664`, `:1001`), the `Completing`→`Aborting` and restore fences (`:665`,
+/// `:823`), the reaper's two arms (`:2187`, `:2193`). Under `retire:records:` it would mean
+/// *delete those staging records without marking their bytes*, which strands durable fragments
+/// with no record naming them and no orphan evidence — outcome (a) (`0016:369-373`). The
+/// `retire:records:` row's value column reuses the `{session, parts}` shorthand (`0016:356`), but
+/// its own prose and every batch row give that namespace exactly two contents: the **published**
+/// parts' records and one rolled-back attempt's segments (`:356`, `:662`, `:663`, `:665`, `:823`,
+/// `:2194`). The session's *own* records are the terminal delete's, gated on this obligation
+/// already having drained (`:673`) — never an obligation's.
+const SESSION_COMPONENT: Component = Component {
+    name: "session",
+    mode: Some(RetireMode::Bytes),
+    scope: TokenScope::SessionWide,
+};
+
+/// `{parts: <set>}` — an **explicit** part-number set, under either mode: their **bytes** for the
+/// staged parts a Complete did not name (`0016:662`, `:919-921`) and their **records** for the
+/// published ones (`0016:662`, `:356`).
+const PARTS_COMPONENT: Component = Component {
+    name: "parts",
+    mode: None,
+    scope: TokenScope::SessionWide,
+};
+
+/// `{parts: "all"}` — the wildcard, a **different writer row** from an explicit set and therefore
+/// its own entry in this table: exactly one batch installs it, the reaper's `Open` teardown
+/// `retire:bytes:{session, all}` (`0016:2187`), and it is legal only in that shape. Under
+/// `retire:records:` it would tell a drain to delete **every** part record of a live session —
+/// including the staged parts whose records are the only thing protecting their bytes and the only
+/// source of their placements, the precise deletion `0016:919-921` (iteration-14 finding 3, X104)
+/// forbids. The companion rule that it may not appear without `session` is
+/// [`RecordError::RetireAllPartsWithoutSession`]: `all` is an instruction to enumerate a range the
+/// installing fence has just frozen, and only the session teardown freezes it.
+const ALL_PARTS_COMPONENT: Component = Component {
+    name: "parts:all",
+    mode: Some(RetireMode::Bytes),
+    scope: TokenScope::SessionWide,
+};
+
+/// `{chunks: […]}` — the **per-part** obligation: a re-uploaded part's superseded chunks, a
+/// losing writer's compensation, a post-staging local refusal (`0016:659`, `:672`, `:1620`).
+/// Bytes only — its chunks have no naming record left, so they must be orphan-marked.
+const CHUNKS_COMPONENT: Component = Component {
+    name: "chunks",
+    mode: Some(RetireMode::Bytes),
+    scope: TokenScope::PerPart,
+};
+
+/// `{generation: {…}}` — a superseded or deleted object generation (`0016:355`, `:668`,
+/// `:2417`). Bytes only, and the one component a `g:` token names.
+const GENERATION_COMPONENT: Component = Component {
+    name: "generation",
+    mode: Some(RetireMode::Bytes),
+    scope: TokenScope::Generation,
+};
+
+/// `{seg: {nonce, epoch}}` — one rolled-back `Completing` attempt's dangling segment records
+/// (`0016:663`, `:665`, `:823`). **Records only**: those segments' fragments are still protected
+/// by the `part:` records, so orphan-marking them would mark live bytes (`0016:2347-2350`).
+const SEG_COMPONENT: Component = Component {
+    name: "seg",
+    mode: Some(RetireMode::Records),
+    scope: TokenScope::SessionWide,
+};
+
+/// The wire shape of [`RetirePayload`] — **closed** (`deny_unknown_fields`) and reading every
+/// nested chunk through this module's own [`ChunkRefWire`], for the reasons that type records: a
+/// retirement obligation is installed and drained under exact-bytes preconditions
+/// (`0016:369-373`, `:667`), so a field silently dropped or defaulted on the way in is a record
+/// nothing can precondition on.
+///
+/// Each component is optional **on the wire** and load-bearing in combination: `0016`'s writer
+/// rows install `{session, parts}` (`:665`, `:2193`) and `{parts}` **and/or** `{seg}` (`:356`)
+/// as single values under single keys, so the shape is a set of components rather than a closed
+/// list of alternatives.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetirePayloadWire {
+    #[serde(default)]
+    session: bool,
+    #[serde(default)]
+    parts: Option<PartScopeWire>,
+    #[serde(default)]
+    chunks: Option<Vec<ChunkRefWire>>,
+    #[serde(default)]
+    generation: Option<RetireGenerationWire>,
+    #[serde(default)]
+    seg: Option<SegmentGroup>,
+}
+
+/// What one retirement obligation owes — the `retire:bytes:<token>` / `retire:records:<token>`
+/// value (`0016:355-356`).
+///
+/// # Why it is a set of components, not a choice between them
+///
+/// `0016`'s writer rows install **combined** obligations, and a payload type whose arms made
+/// them inexpressible would silently force a writer to install two records where the protocol
+/// installs one — two keys where `require_absent` and the session's own emptiness gate expect
+/// one (`0016:369-380`). The rows, each a single value under a single key:
+///
+/// | Key | Payload | Row |
+/// |---|---|---|
+/// | `retire:bytes:s:<id>:<E>` | `{session}` | the abort/reap fence's own spelling (`0016:664`) — the session's staged residue, no part |
+/// | `retire:bytes:s:<id>:<E>` | `{session, all}` | the reaper's `Open` teardown, that residue **and** every part (`0016:2187`) — the **only** row the `all` wildcard has |
+/// | `retire:bytes:s:<id>:<E>` | `{session, parts: <set>}` | the `Completing`→`Aborting` fence, incl. the restore fence (`0016:665`, `:823`, `:2193`) |
+/// | `retire:bytes:s:<id>:<E>` | `{parts: <set>}` | the root flip's **unnamed** staged parts (`0016:662`, `:919-921`) |
+/// | `retire:bytes:s:<id>:<E>:<n>:<a>` | `{chunks: […]}` | a losing writer / re-upload compensation (`0016:659`, `:672`, `:1620`) |
+/// | `retire:bytes:g:<inode>:<version>` | `{generation: {…, chunks}}` | supersede or unlink of a **flat** generation, by the chunk list its root carried (`0016:355`, `:668`) |
+/// | `retire:bytes:g:<inode>:<version>` | `{generation: {…, segments}}` | supersede or unlink of a **segmented** one, by the `seg:` range its group names (`0016:2417`) — **exactly one of the two**, never both ([`RetiredMap`]) |
+/// | `retire:records:s:<id>:<E>` | `{parts: <set>}` | the root flip's **published** parts (`0016:662`, `:919-921`) |
+/// | `retire:records:s:<id>:<E>` | `{seg: {…}}` | a `Completing` rollback's dangling segments (`0016:663`, `:665`) |
+/// | `retire:records:s:<id>:<E>` | `{parts: <set>, seg: {…}}` | both, in one payload (`0016:356`, "and/or") |
+///
+/// The one place the record *is* a choice is one level in, and for the opposite reason: a
+/// generation's [`RetiredMap`] mirrors the two-arm committed map it retires, so its two sources
+/// are exclusive where the payload's components are combinable.
+///
+/// # Its identity lives partly in its key
+///
+/// The mode is the key's prefix (`0016:434-441`) and the obligation's identity is its token
+/// (`0016:358-380`), so this value is decoded **against** the key that names it —
+/// [`decode_retire_obligation`], the only entry point, takes both halves. Every component
+/// carries the mode and token scope of its own writer row (the `Component` table above), and a
+/// payload that disagrees with its key is a typed error rather than a value: one accepted under the
+/// wrong token — or the wrong *scope* of token — reclaims one attempt's data while clearing
+/// another's obligation, and the loss is invisible because no record names the bytes any more
+/// (`0016:369-373`, outcome (a); ADR-0045 decision 1).
+///
+/// # No `Deserialize`, and no writer-side constructor
+///
+/// Every other record class in this module derives `Deserialize`, so the store-wide
+/// [`crate::metadata::decode`] can read it from a value alone. **This one deliberately does
+/// not.** Most of its rules are relations against its key, so a value-only decode would hand a
+/// caller a `RetirePayload` that has never met the token naming it — precisely the value
+/// ADR-0045 decision 1 says must not exist, and precisely the value the drain (#656–#659) must
+/// never act on. Absence of the impl is what makes that unreachable: a `metadata::decode`
+/// turbofished with this type does not compile, so the single decode surface is
+/// [`decode_retire_obligation`] and the key-relation checks cannot be skipped by reaching for
+/// the store-wide seam the sibling records use. [`Serialize`] stays: encoding an
+/// already-validated payload is what the canonical-bytes gate and every future writer need.
+///
+/// There is no writer-side constructor either, as for every record type in this module: the
+/// first writers are the store round trips (#656–#659), and a value that could be built without
+/// passing decode's rules is a value those writers could make durable without them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetirePayload {
+    /// Omitted when absent rather than spelled `false` (`AGENTS.md:170-172`), so the accepted
+    /// set stays exactly the encoder's image.
+    #[serde(skip_serializing_if = "is_absent")]
+    session: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parts: Option<PartScope>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    chunks: Vec<ChunkRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<RetireGeneration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seg: Option<SegmentGroup>,
+}
+
+/// Whether a presence flag is absent — the `skip_serializing_if` that keeps an absent `session`
+/// component **omitted** instead of spelled `false`.
+const fn is_absent(present: &bool) -> bool {
+    !*present
+}
+
+impl RetirePayload {
+    /// Whether the obligation owes the session's **own staged residue** — its owned `sidx:`
+    /// fragments, orphan-marked and then deleted (`0016:355`, `:2587`) — distinct from the parts
+    /// it may also name. Never the `mpu:`/`slot:` records themselves: those are the terminal
+    /// delete's, and it is gated on this obligation having already drained (`0016:673`).
+    pub const fn session(&self) -> bool {
+        self.session
+    }
+
+    /// Which of the session's parts it owes, if any.
+    pub const fn parts(&self) -> Option<&PartScope> {
+        self.parts.as_ref()
+    }
+
+    /// The chunk list of a per-part obligation — each chunk's stored geometry already judged by
+    /// `checked_chunk_scheme`.
+    pub fn chunks(&self) -> &[ChunkRef] {
+        &self.chunks
+    }
+
+    /// The superseded or deleted generation it owes, if any.
+    pub const fn generation(&self) -> Option<&RetireGeneration> {
+        self.generation.as_ref()
+    }
+
+    /// The rolled-back attempt's segment group it owes, if any.
+    pub const fn segments(&self) -> Option<&SegmentGroup> {
+        self.seg.as_ref()
+    }
+
+    /// The components this payload actually carries, each with the mode and token scope its
+    /// writer row fixes. An absent component is silent: it is checked against nothing.
+    ///
+    /// The two `parts` spellings are **two rows** of that table, not one: an explicit set is
+    /// installed under either mode, while the `all` wildcard has exactly one writer row
+    /// (`0016:2187`) — so they are looked up as different components and a wildcard can never
+    /// inherit an explicit set's permissions.
+    fn present_components(&self) -> impl Iterator<Item = Component> + '_ {
+        [
+            (self.session, SESSION_COMPONENT),
+            (
+                matches!(self.parts, Some(PartScope::Set(_))),
+                PARTS_COMPONENT,
+            ),
+            (
+                matches!(self.parts, Some(PartScope::All)),
+                ALL_PARTS_COMPONENT,
+            ),
+            (!self.chunks.is_empty(), CHUNKS_COMPONENT),
+            (self.generation.is_some(), GENERATION_COMPONENT),
+            (self.seg.is_some(), SEG_COMPONENT),
+        ]
+        .into_iter()
+        .filter_map(|(present, component)| present.then_some(component))
+    }
+
+    /// The one rule that holds wherever the value is decoded, key or no key: the obligation owes
+    /// **something**. A payload carrying no component at all is residue nothing drains — a drain
+    /// would mark nothing, delete the obligation, and record the work as done.
+    ///
+    /// Its per-component forms are their own types' rules, already applied by the time a payload
+    /// exists, and each names the component it found rather than the whole value: an empty part
+    /// set is unrepresentable ([`PartNumberSet`]), a present-but-empty chunk list is refused
+    /// where it is read ([`checked_chunks`], which also judges every chunk's geometry there), and
+    /// a generation naming neither of its two reclamation sources is refused by
+    /// [`RetireGeneration`]'s own decode.
+    fn checked_shape(&self) -> Result<(), RecordError> {
+        if self.present_components().next().is_none() {
+            return Err(RecordError::RetireObligationOwesNothing {
+                component: "payload",
+            });
+        }
+        Ok(())
+    }
+
+    /// The rules **only a key-taking decode can make** — the payload against the key that names
+    /// it:
+    ///
+    /// * **mode** — each component's mode is its writer row's (`0016:434-441`): `chunks`,
+    ///   `generation` and `session` orphan-mark, so they are `retire:bytes:` only; `seg` must
+    ///   never orphan anything, so it is `retire:records:` only (`0016:2347-2350`). Two
+    ///   components whose modes differ therefore cannot share a payload at all, which is what
+    ///   keeps every cross-component combination `0016` does not install unrepresentable rather
+    ///   than separately refused;
+    /// * **token scope** — a `generation` lives only under a `g:` token and every other
+    ///   component only under an `s:` one, and the `s:` token's optional
+    ///   `:<part-number>:<attempt-id>` suffix is present for exactly the per-part component
+    ///   (`0016:358-366`);
+    /// * **generation identity** — a `generation` names the same `(inode, version)` its `g:`
+    ///   token does;
+    /// * **segment epoch** — a `seg` group's epoch is its token's epoch, exactly;
+    /// * **the wildcard's one row** — `parts: "all"` is legal only in the session teardown
+    ///   `{session, all}` the reaper's `Open` arm installs (`0016:2187`). The mode half is the
+    ///   `ALL_PARTS_COMPONENT` row above; the `session` half is here, because it is a relation
+    ///   between two components rather than between one component and the key. `all` is the
+    ///   instruction to enumerate the session's own `part:<id>:` range **at drain time**, and
+    ///   only a teardown fence makes that range immutable (`0016:664`, `:2187`); without the
+    ///   teardown it would name whatever a still-live session happens to hold when the drain
+    ///   arrives.
+    ///
+    /// ## What the segment check does **not** prove
+    ///
+    /// It binds the **epoch component only**. A segment group's nonce is deliberately
+    /// independent of the upload id, because segment records outlive the `mpu:` tombstone that
+    /// would otherwise be their only reuse guard (`0016:499-509`), so a *foreign* session's
+    /// group carrying the right epoch is **not** detectable at decode — the group's identity is
+    /// the installing writer's to establish and the drain's to act on (#656–#659). What this
+    /// check does establish is the property `require_absent` needs: **one canonical key per
+    /// obligation**. The fence that ends an attempt is the batch that installs the obligation
+    /// naming that attempt's segments (`0016:663-665`, `:2357-2362`), and it preconditions on
+    /// `require(mpu == Completing@E)`, so `E` is both the token's epoch and the epoch whose
+    /// `seg:` keys the payload names. Admitting `E ± 1` as well would give one obligation
+    /// several legal keys, and an installer's `require_absent` on one of them cannot see the
+    /// others: the same obligation is installed and drained twice (`0016:369-373`).
+    fn checked_against_key(
+        &self,
+        mode: RetireMode,
+        token: &RetireToken,
+    ) -> Result<(), RecordError> {
+        for component in self.present_components() {
+            component.checked_mode(mode)?;
+            component.checked_scope(token)?;
+        }
+        if matches!(self.parts, Some(PartScope::All)) && !self.session {
+            return Err(RecordError::RetireAllPartsWithoutSession);
+        }
+        // Both relations below are reached only for a token kind the scope check has already
+        // proved, so neither arm can silently skip its rule: a `generation` under anything but a
+        // `g:` token, or a `seg` under anything but an `s:` one, has returned above.
+        if let (Some(generation), RetireToken::Generation { inode, version }) =
+            (&self.generation, token)
+        {
+            if generation.inode != *inode || generation.version != *version {
+                return Err(RecordError::RetireGenerationIdentityMismatch {
+                    key_inode: *inode,
+                    key_version: *version,
+                    payload_inode: generation.inode,
+                    payload_version: generation.version,
+                });
+            }
+        }
+        if let (Some(group), RetireToken::Session { epoch, .. }) = (&self.seg, token) {
+            if group.epoch() != *epoch {
+                return Err(RecordError::RetireSegmentEpochMismatch {
+                    key_epoch: *epoch,
+                    segment_epoch: group.epoch(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Component {
+    /// The mode half of this component's writer row (`0016:434-441`).
+    fn checked_mode(self, mode: RetireMode) -> Result<(), RecordError> {
+        match self.mode {
+            Some(required) if required != mode => Err(RecordError::RetireModeMismatch {
+                key_mode: mode,
+                component: self.name,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The token half of this component's writer row (`0016:358-366`) — the kind of token, and
+    /// for a session token whether it names a part attempt.
+    fn checked_scope(self, token: &RetireToken) -> Result<(), RecordError> {
+        let scope_mismatch = |named| {
+            Err(RecordError::RetireTokenScopeMismatch {
+                token: named,
+                component: self.name,
+            })
+        };
+        let suffix_mismatch = |token_names_part| {
+            Err(RecordError::RetireTokenSuffixMismatch {
+                component: self.name,
+                token_names_part,
+            })
+        };
+        match (self.scope, token) {
+            (TokenScope::Generation, RetireToken::Session { .. }) => scope_mismatch("s:"),
+            (TokenScope::SessionWide | TokenScope::PerPart, RetireToken::Generation { .. }) => {
+                scope_mismatch("g:")
+            }
+            (TokenScope::SessionWide, RetireToken::Session { part: Some(_), .. }) => {
+                suffix_mismatch(true)
+            }
+            (TokenScope::PerPart, RetireToken::Session { part: None, .. }) => {
+                suffix_mismatch(false)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl TryFrom<RetirePayloadWire> for RetirePayload {
+    type Error = RecordError;
+
+    fn try_from(wire: RetirePayloadWire) -> Result<Self, RecordError> {
+        let payload = Self {
+            session: wire.session,
+            parts: wire.parts.map(PartScope::try_from).transpose()?,
+            chunks: wire
+                .chunks
+                .map(|chunks| checked_chunks(chunks, "chunks"))
+                .transpose()?
+                .unwrap_or_default(),
+            generation: wire
+                .generation
+                .map(RetireGeneration::try_from)
+                .transpose()?,
+            seg: wire.seg,
+        };
+        payload.checked_shape()?;
+        Ok(payload)
+    }
+}
+
+/// Decode a retirement obligation from **both halves of the record** — its key ([`retire_key`])
+/// and its value — returning everything the pair means: the **mode** and the **token** the key
+/// names, beside the payload the value carries.
+///
+/// The mode is part of the answer, not merely a check made and dropped, because it is what the
+/// drain *dispatches* on and the two modes are opposite instructions over the same payload shape
+/// (`0016:434-441`): `retire:bytes:{parts}` orphan-marks those parts' fragments and then deletes
+/// their records, while `retire:records:{parts}` deletes records whose bytes a published object
+/// still protects and must **never** orphan-mark anything. A caller holding only
+/// `(token, payload)` would have to re-parse the key to tell them apart — a second spelling of a
+/// decision this decode has already made, and the one place a drain could get it backwards.
+///
+/// The key is a parameter because most of this record class's rules are relations between the
+/// two halves, and a decode that cannot see the key can check none of them: the **mode**
+/// (`0016:434-441`), the token **scope** and its per-part **suffix** (`0016:358-366`), the
+/// generation **identity**, the segment group's **epoch** (`0016:2357-2362`) and the one writer
+/// row the `all` wildcard has (`0016:2187`). An obligation's identity lives partly in its token —
+/// that is the whole point of `require_absent` on the key (`0016:369-373`) — so a value-only
+/// decoder would vouch for a payload it has no way to attribute, which is how a drain comes to
+/// reclaim one attempt's data while clearing another's. That is also why [`RetirePayload`] has no
+/// `Deserialize`: this is not merely the *recommended* decode surface, it is the only one that
+/// exists.
+///
+/// The value's own rules (an obligation or one component owing nothing, an unsupported nested
+/// chunk geometry, a non-canonical part-number set) are each type's own and hold wherever the
+/// value is decoded; they are applied **first**, so a torn value is attributed to the rule it
+/// broke rather than to the key it happens to sit under — the order
+/// [`decode_session_record`]/[`decode_part_record`] apply. It closes with the canonical-bytes
+/// gate every decoder in this module closes with (`require_canonical`): every retirement
+/// obligation is installed and drained under exact-bytes preconditions (`0016:369-373`, `:667`),
+/// so a re-encode that is not the identity is a record nothing can precondition on.
+pub fn decode_retire_obligation(
+    key: &[u8],
+    value: &[u8],
+) -> Result<(RetireMode, RetireToken, RetirePayload), RecordError> {
+    let (mode, token) = parse_retire_key(key)?;
+    let wire: RetirePayloadWire =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "retire:",
+            detail: err.to_string(),
+        })?;
+    let payload = RetirePayload::try_from(wire)?;
+    payload.checked_against_key(mode, &token)?;
+    Ok((mode, token, require_canonical(payload, value, "retire:")?))
 }
