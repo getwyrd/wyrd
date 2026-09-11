@@ -150,4 +150,12 @@ ignore = [
     # as "not checkable, no entry needed". It was always checkable; the wall was simply not
     # looking at the part of the graph it lives in.
     { id = "RUSTSEC-2026-0097", reason = "rand 0.7.3 via fail 0.4 <- tikv-client 0.4.0; unsound only under a custom log logger calling thread_rng during a reseed. Absent from the shipped graph, which resolves the patched rand 0.8.6. No fix reachable: tikv-client 0.4.0 is abandoned upstream (#543)." },
+
+    # LOW. h2 accepts and queues empty HTTP/2 DATA frames without limit (unbounded memory,
+    # or a panic on length overflow). h2 0.3.27 <- hyper 0.14 / tonic 0.10 <- tikv-client
+    # 0.4.0. The default graph is unaffected: it resolves h2 0.4.19, which carries the fix
+    # (#773 bumped it; the advisory is patched only in the 0.4 line, `>= 0.4.16`). The 0.3
+    # line is end-of-life — 0.3.27 is its last release and no 0.3.x fix will ship — so this
+    # is the same tonic-0.10 chain and the same no-release-to-chase story as the five above.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 via tonic 0.10 <- tikv-client 0.4.0; the 0.3 line has no patched release. Absent from the shipped graph, which resolves the patched h2 0.4.19 (#773). No fix reachable: tikv-client 0.4.0 is abandoned upstream (#543)." },
 ]
