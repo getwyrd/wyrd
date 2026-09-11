@@ -49,7 +49,7 @@ unsound = "all"
 
 # THE tikv-client EXPOSURE BOUNDARY (#543).
 #
-# The six tikv entries below all reach us through exactly one crate — `tikv-client` 0.4.0 —
+# The seven tikv entries below all reach us through exactly one crate — `tikv-client` 0.4.0 —
 # which is pulled in only by the OFF-by-default `tikv` feature (`crates/server/Cargo.toml`).
 # They are therefore reachable **only** under `--features tikv`: by the `tikv-conformance`
 # and Tier-1 TiKV fault legs, and by an operator who deliberately builds the TiKV backend.
@@ -110,7 +110,7 @@ ignore = [
     # warning appears there.
     { id = "RUSTSEC-2026-0253", reason = "lru < 0.18.2 unsound pop(); dev-only via aws-sdk-s3, which pins ^0.16.3 (awslabs/aws-sdk-rust#1451). Mirrors the entry in deny.toml." },
 
-    # --- The tikv-client tree (#543). All six: `--features tikv` only. ---
+    # --- The tikv-client tree (#543). All seven: `--features tikv` only. ---
 
     # HIGH (7.5). Reachable panic parsing a certificate revocation list, BEFORE the CRL's
     # signature is verified. rustls-webpki 0.101.7 <- rustls 0.21.12 <- tokio-rustls 0.24 /
@@ -156,6 +156,6 @@ ignore = [
     # 0.4.0. The default graph is unaffected: it resolves h2 0.4.19, which carries the fix
     # (#773 bumped it; the advisory is patched only in the 0.4 line, `>= 0.4.16`). The 0.3
     # line is end-of-life — 0.3.27 is its last release and no 0.3.x fix will ship — so this
-    # is the same tonic-0.10 chain and the same no-release-to-chase story as the five above.
+    # is the same tonic-0.10 chain and the same no-release-to-chase story as the six above.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 via tonic 0.10 <- tikv-client 0.4.0; the 0.3 line has no patched release. Absent from the shipped graph, which resolves the patched h2 0.4.19 (#773). No fix reachable: tikv-client 0.4.0 is abandoned upstream (#543)." },
 ]
