@@ -112,15 +112,25 @@ jobs:
 
       # The recognized checker itself — a checker we did not write, pinned by sha256 so a
       # compromised or moved release asset cannot silently swap in a different verdict engine.
+      #
+      # The 0.1.9 release publishes ONE asset, `elle-cli-bin-0.1.9.zip`, which carries the
+      # standalone jar under `target/`; the bare jar was never a release asset, so fetching it
+      # directly 404s (#579 — this job failed on every scheduled run from day one for exactly
+      # that). Fetch the zip, extract only the jar, and verify THE JAR: it is the artifact the
+      # runner executes and the thing the pin is about, so a benign re-upload of the zip
+      # around the same jar does not break the seat.
       - name: Download elle-cli (the recognized checker)
         run: |
           set -euo pipefail
+          tmp="$(mktemp -d)"
+          curl --fail --location --silent --show-error \
+            --output "$tmp/elle-cli-bin-0.1.9.zip" \
+            "https://github.com/ligurio/elle-cli/releases/download/0.1.9/elle-cli-bin-0.1.9.zip"
+          unzip -q -j "$tmp/elle-cli-bin-0.1.9.zip" target/elle-cli-0.1.9-standalone.jar -d "$tmp"
           sudo mkdir -p "$(dirname "$WYRD_ELLE_CLI_JAR")"
-          sudo curl --fail --location --silent --show-error \
-            --output "$WYRD_ELLE_CLI_JAR" \
-            "https://github.com/ligurio/elle-cli/releases/download/0.1.9/elle-cli-0.1.9-standalone.jar"
+          sudo install -m 0644 "$tmp/elle-cli-0.1.9-standalone.jar" "$WYRD_ELLE_CLI_JAR"
           echo "c9ba9b9fd32640e73d632cb5f15069c162ba6528a67f27a878767187c59f539a  $WYRD_ELLE_CLI_JAR" \
-            | sudo sha256sum -c -
+            | sha256sum -c -
 
       # The whole job, per the CI rule: one opt-in invocation of the #408 runner. It stands up
       # deploy/fdb-multi-replica, drives the #406 workload under the #407 partition leg,
