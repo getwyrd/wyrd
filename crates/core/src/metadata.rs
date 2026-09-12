@@ -1552,11 +1552,133 @@ pub struct DirentRecord {
 }
 
 /// A pending-chunk ledger entry: a lease on a provisionally-written chunk id.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The same value shape serves two key spaces (proposal 0016, `:442-457`): an **ordinary**
+/// streaming-write lease under `pending:<chunk-id>`, carrying neither ownership field, and an
+/// **owned** multipart staging entry under `sidx:<upload-id>:<part-number>:<chunk-id>`, carrying
+/// both — the owning upload id and the chunk's planned placement. Both or neither is the only
+/// valid shape, refused at decode otherwise ([`crate::multipart::RecordError::TornOwnedEntry`],
+/// the cross-field rule [`InodeRecord`]'s wire applies to its own record); **which** of the two a
+/// value may be is decided against its key, by one decode entry point per namespace —
+/// [`decode_pending_entry`] here, [`crate::multipart::decode_owned_entry`] for `sidx:`. The
+/// validated owned view, and the checked way to mint one, is [`crate::multipart::OwnedEntry`].
+///
+/// The write side mirrors the decode, as [`InodeRecord::checked_for_publication`] does for its
+/// record: the fields are public, so a caller *can* hand [`put_pending`] or [`renew_pending`] a
+/// torn or owned value, and storing it would leave under `pending:` bytes every reader of that
+/// namespace refuses. Both writers therefore apply the same rule as [`decode_pending_entry`]
+/// ([`Self::checked_ordinary_lease`]) and refuse such a value before touching the store.
+///
+/// # Serialization identity, and the CAS shape it protects
+///
+/// `skip_serializing_if` on both fields is load-bearing, as it is for [`InodeRecord`]'s optional
+/// trio — but this record rides the **other** of the two CAS shapes in this module, and 0016's
+/// account of it (`0016:475-485`, "compare the *re-encoded* prior entry") does not match the
+/// code. [`renew_pending`] preconditions on the **raw bytes it read** and puts the entry **its
+/// caller handed it**, freshly encoded (`require(key, current)` + `put(key, encode(entry))`), and
+/// the lease guards pin those same raw bytes. So an encoder that spelled an absent field
+/// `"owner":null` would not wedge those CASes on a permanent `Conflict`, as it would an `inode:`
+/// CAS on `require(key, encode(prior))`: the CAS would *win*, and the renewal would durably rewrite
+/// every legacy entry's shape with no error anywhere. Omitting `None` is what keeps a both-absent
+/// entry's encoding byte-identical to what every earlier build wrote, so a renewal changes only the
+/// lease it came to extend.
+///
+/// The wire stays **open**, as [`InodeRecordWire`] is and as this record's derive always was: the
+/// `pending:` namespace has a stored corpus and live readers across a mixed-version fleet, so
+/// making an unknown field fatal here is a format change of its own. The owned shape, which has no
+/// corpus yet, is decoded closed by the `sidx:` entry point.
+///
+/// Not `Copy`: `owner` is a [`crate::multipart::UploadId`], a `String` newtype.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PendingEntryWire")]
 pub struct PendingEntry {
     /// When the lease expires (logical milliseconds); a custodian sweep may
     /// reclaim the chunk after this.
     pub lease_expiry_millis: u64,
+    /// The owning upload session — `Some(..)` only on an owned `sidx:` entry (`0016:442-457`).
+    /// A validated token, so a malformed owner is a decode error rather than an id no
+    /// per-session `sidx:<upload-id>:` range could be derived from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<crate::multipart::UploadId>,
+    /// The chunk's planned EC placement, written at intent time so a record-only reaper can
+    /// compute its `orphan:<dserver>:<chunk>:<index>` keys (`0016:459-473`) — `Some(..)` only on
+    /// an owned `sidx:` entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged: Option<crate::multipart::StagedPlacement>,
+}
+
+/// The wire shape of [`PendingEntry`] — identical field-for-field, so every record ever written
+/// still decodes (both new fields default to absent); it exists to give the decode a place to
+/// refuse a torn value before the value exists, as [`InodeRecordWire`] does for its record.
+#[derive(Deserialize)]
+struct PendingEntryWire {
+    lease_expiry_millis: u64,
+    #[serde(default)]
+    owner: Option<crate::multipart::UploadId>,
+    #[serde(default)]
+    staged: Option<crate::multipart::StagedPlacement>,
+}
+
+impl TryFrom<PendingEntryWire> for PendingEntry {
+    type Error = crate::multipart::RecordError;
+
+    fn try_from(wire: PendingEntryWire) -> std::result::Result<Self, Self::Error> {
+        crate::multipart::checked_ownership_pairing(wire.owner.is_some(), wire.staged.is_some())?;
+        Ok(Self {
+            lease_expiry_millis: wire.lease_expiry_millis,
+            owner: wire.owner,
+            staged: wire.staged,
+        })
+    }
+}
+
+impl PendingEntry {
+    /// The `pending:` namespace's shape rule, in one place: an entry under `pending:` is an
+    /// **ordinary** lease, carrying neither ownership field. Both directions apply it —
+    /// [`decode_pending_entry`] to what it reads, [`put_pending`] and [`renew_pending`] to what
+    /// they are asked to store — so no value one side refuses can pass the other.
+    ///
+    /// The pairing rule runs first, so a torn value is refused as torn
+    /// ([`crate::multipart::RecordError::TornOwnedEntry`]) wherever it is met, and only a value
+    /// carrying **both** fields reaches the namespace check — which, after the pairing, is the
+    /// presence of an `owner`.
+    fn checked_ordinary_lease(&self) -> std::result::Result<(), crate::multipart::RecordError> {
+        crate::multipart::checked_ownership_pairing(self.owner.is_some(), self.staged.is_some())?;
+        if self.owner.is_some() {
+            return Err(
+                crate::multipart::RecordError::PendingEntryNamespaceMismatch {
+                    namespace: "pending:",
+                    shape: crate::multipart::OWNED_SHAPE,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Decode a `pending:<chunk-id>` value — the `pending:` namespace's **one** decode entry point,
+/// through which every reader of that namespace goes ([`renew_pending`], [`live_lease_guards`],
+/// `write::sweep_expired_leases`, the custodian GC's expired-lease scan).
+///
+/// It accepts only an **ordinary** lease. A torn value is refused by the record's own decode, and
+/// an owned staging entry — both ownership fields present, a `sidx:` value filed under the wrong
+/// key — is refused here, as
+/// [`PendingEntryNamespaceMismatch`](crate::multipart::RecordError::PendingEntryNamespaceMismatch):
+/// read as an ordinary lease it would be renewed with its ownership erased ([`renew_pending`]
+/// puts its caller's entry) or reclaimed by an expiry sweep that believes it holds an abandoned
+/// write. The store-wide [`decode`] of a `PendingEntry` still reads either valid shape; it cannot
+/// see which namespace a value came from, which is why this entry point exists.
+pub fn decode_pending_entry(
+    value: &[u8],
+) -> std::result::Result<PendingEntry, crate::multipart::RecordError> {
+    let wire: PendingEntryWire =
+        decode(value).map_err(|err| crate::multipart::RecordError::MalformedRecordValue {
+            namespace: "pending:",
+            detail: err.to_string(),
+        })?;
+    let entry = PendingEntry::try_from(wire)?;
+    entry.checked_ordinary_lease()?;
+    Ok(entry)
 }
 
 /// Encode a record to its stored bytes. Serialization of these plain structs is
@@ -1937,11 +2059,16 @@ pub async fn commit_chunk_map_superseding_leased(
 }
 
 /// Write a pending-chunk ledger entry (the Intent phase of the write protocol).
+///
+/// Errors (before touching the store) on an entry that is not an ordinary lease — a torn value
+/// or an owned `sidx:` entry — which every `pending:` reader would refuse
+/// ([`PendingEntry::checked_ordinary_lease`]).
 pub async fn put_pending(
     store: &impl MetadataStore,
     chunk: ChunkId,
     entry: &PendingEntry,
 ) -> Result<CommitOutcome> {
+    entry.checked_ordinary_lease()?;
     store
         .commit(WriteBatch::new().put(pending_key(chunk), encode(entry)))
         .await
@@ -1987,6 +2114,12 @@ pub async fn sweep_pending(
 /// deletes an entry **between** the read-back and the commit turns the precondition false and
 /// the whole batch is `Conflict` — a read-verify-then-blind-put in two commits could not
 /// close that interleave. An empty slice is a no-op.
+///
+/// Both values it handles must be ordinary leases ([`PendingEntry::checked_ordinary_lease`]):
+/// an `entry` that is not one is refused before the store is touched, as [`put_pending`]
+/// refuses it, and a stored value that is not one — an owned `sidx:` entry misfiled under
+/// `pending:`, a torn or malformed value — is an error rather than a lease to renew, since the
+/// put would replace it with the caller's entry and erase its ownership fields.
 pub async fn renew_pending(
     store: &impl MetadataStore,
     chunks: &[ChunkId],
@@ -1996,6 +2129,7 @@ pub async fn renew_pending(
     if chunks.is_empty() {
         return Ok(CommitOutcome::Committed);
     }
+    entry.checked_ordinary_lease()?;
     let mut batch = WriteBatch::new();
     for &chunk in chunks {
         let key = pending_key(chunk);
@@ -2004,7 +2138,7 @@ pub async fn renew_pending(
             None => return Ok(CommitOutcome::Conflict),
             Some(bytes) => bytes,
         };
-        let existing: PendingEntry = decode(&current)?;
+        let existing = decode_pending_entry(&current)?;
         if existing.lease_expiry_millis <= now_millis {
             // Lapsed but not yet reaped — renewing it would revive revoked authority.
             return Ok(CommitOutcome::Conflict);
@@ -2040,7 +2174,7 @@ async fn live_lease_guards(
         let Some(current) = store.get(&key).await? else {
             return Ok(None);
         };
-        let entry: PendingEntry = decode(&current)?;
+        let entry = decode_pending_entry(&current)?;
         if entry.lease_expiry_millis <= now_millis {
             return Ok(None);
         }
@@ -3419,6 +3553,8 @@ mod segmented_shape_invariants {
                     chunk,
                     &PendingEntry {
                         lease_expiry_millis,
+                        owner: None,
+                        staged: None,
                     },
                 )),
                 None => pollster::block_on(sweep_pending(&store, &[chunk])),

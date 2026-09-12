@@ -223,6 +223,8 @@ async fn sweep_reclaims_at_expiry_boundary_and_deletes() {
         0xAAAA,
         &PendingEntry {
             lease_expiry_millis: 100,
+            owner: None,
+            staged: None,
         },
     )
     .await
@@ -232,6 +234,8 @@ async fn sweep_reclaims_at_expiry_boundary_and_deletes() {
         0xBBBB,
         &PendingEntry {
             lease_expiry_millis: 200,
+            owner: None,
+            staged: None,
         },
     )
     .await
@@ -567,6 +571,8 @@ async fn commit_chunk_map_superseding_leased_stamps_a_fresh_modified() {
         new_chunk,
         &PendingEntry {
             lease_expiry_millis: 1_000,
+            owner: None,
+            staged: None,
         },
     )
     .await

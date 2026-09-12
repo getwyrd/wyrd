@@ -8,11 +8,12 @@
 //! (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
 //! names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
 //! derivations that profile establishes, `0016:348`, `:1469-1470`), the in-flight lifecycle
-//! records ([`SessionRecord`], [`SlotRecord`], [`PartRecord`], [`PartSummary`]), and the
-//! retirement obligation ([`RetirePayload`], whose identity lives partly in its **key**). The
-//! owned staging entry (`sidx:`'s [`crate::metadata::PendingEntry`] with its ownership fields)
-//! is the next child's; the outcome enums, the answer table and `multipart_etag` are the child
-//! after that's (`0016` decision 3, `:894-1037`, `0016:3064-3070`).
+//! records ([`SessionRecord`], [`SlotRecord`], [`PartRecord`], [`PartSummary`]), and the two
+//! whose identity lives partly in their **key**: the retirement obligation ([`RetirePayload`])
+//! and the owned staging entry ([`OwnedEntry`] — `sidx:`'s [`crate::metadata::PendingEntry`]
+//! with its two ownership fields, its planned placement a [`StagedPlacement`]). The outcome
+//! enums, the answer table and `multipart_etag` are the next child's (`0016` decision 3,
+//! `:894-1037`, `0016:3064-3070`).
 //!
 //! There is **no** `encode_record`/`decode_record` envelope, and this header's earlier forward
 //! reference to one is withdrawn: `0016` §1 gives every value a **key-determined** shape
@@ -21,12 +22,21 @@
 //! store-wide codec [`crate::metadata::encode`] / [`crate::metadata::decode`] — the shape
 //! [`AdmissionRecord`] lands here and every later child repeats.
 //!
-//! **One record breaks that shape, deliberately: the retirement obligation.** Most of its rules
+//! **Two records break that shape, deliberately.** Most of the retirement obligation's rules
 //! are relations against its own **key**, so it takes the key as a decoder parameter
 //! ([`decode_retire_obligation`]) and carries **no** `Deserialize` at all — a decode that cannot
 //! see the key cannot validate against it, and a payload obtained that way would be exactly the
 //! value ADR-0045 decision 1 forbids. That is also the second reason a value-only dispatching
 //! envelope could not have served this key space.
+//!
+//! The owned staging entry takes its key too ([`decode_owned_entry`]): its `owner` must be the
+//! upload id the key names, and its shape must be the one its namespace holds. Its value *is*
+//! the shared `pending:` record, which keeps a shape-level `Deserialize` — live `pending:`
+//! readers and a stored corpus depend on it — so the namespace rule is carried by **one decode
+//! entry point per namespace** instead: [`decode_owned_entry`] refuses an ordinary lease under
+//! `sidx:`, and [`crate::metadata::decode_pending_entry`], which every `pending:` reader goes
+//! through, refuses an owned entry under `pending:` — the rule the `pending:` writers also apply
+//! to what they store.
 //!
 //! # The keyed classes (`0016` §1, `:333-527`)
 //!
@@ -37,7 +47,7 @@
 //! | `slot:<id>:<k>` | one **in-flight part slot**; the key space *is* the per-session cap |
 //! | `part:<id>:<n>` | a **committed part** |
 //! | `psum:<id>:<n>` | that part's **summary** |
-//! | `sidx:<id>:<n>:<chunk>` | one **owned staging entry**, under a prefix disjoint from `pending:` (`0016:475-491`) |
+//! | `sidx:<id>:<n>:<chunk>` | one **owned staging entry** ([`OwnedEntry`], stored as a [`crate::metadata::PendingEntry`] carrying `owner`/`staged`), under a prefix disjoint from `pending:` (`0016:475-491`) |
 //! | `retire:bytes:<token>` | a **retirement obligation** ([`RetirePayload`]): orphan-mark bytes, then delete the naming records |
 //! | `retire:records:<token>` | records to delete whose bytes something else protects (the same payload, records mode) |
 //!
@@ -83,6 +93,18 @@
 //! **types** as landed ahead of their writers, and defers the *protocol* — the fenced
 //! transitions, staged publication and the retirement drain — to the proposal, whose §1
 //! (`0016:333-356`) stays the normative description of this key space.
+//!
+//! One type here does reach a live path: the owned entry's value is the shared
+//! [`crate::metadata::PendingEntry`], which every streaming write already puts under
+//! `pending:`. Its two ownership fields are additive and omitted when absent, so every
+//! `pending:` record written today decodes and re-encodes byte-identically. What changes on that
+//! path is the namespace rule, applied in both directions: the `pending:` readers refuse an owned
+//! or torn value rather than read it as an ordinary lease, and the two `pending:` writers refuse
+//! to store one. An expiry sweep that meets such a value skips it, reclaiming nothing on it, and
+//! goes on with the rest — `write::sweep_expired_leases` then reports each skipped key in its
+//! error, and GC's expired-lease input names each on its audit seam. Neither runs by default in a
+//! deployment: the first has no production caller, and GC reads `pending:` only when an operator
+//! arms that input (`--gc-expired-pending`), so until then such a value simply stays in place.
 
 use std::fmt;
 
@@ -435,6 +457,51 @@ pub enum RecordError {
         /// The epoch of the segment group the payload names.
         segment_epoch: u64,
     },
+    /// A [`crate::metadata::PendingEntry`] carrying **exactly one** of `owner` / `staged`
+    /// (`0016:442-457`). Both (an owned `sidx:` entry) or neither (an ordinary `pending:` lease)
+    /// are the only shapes any writer produces; a torn value leaves every reader — under either
+    /// namespace — to guess which one it is, so it is refused under both.
+    TornOwnedEntry {
+        /// The ownership field the value carries.
+        present: &'static str,
+        /// The one it lacks.
+        absent: &'static str,
+    },
+    /// A lease-bearing staging value whose **shape disagrees with the namespace naming it**
+    /// (`0016:353`, `:442-457`): an owned entry (`owner` and `staged` present) read under
+    /// `pending:` or handed to a `pending:` writer, or an ordinary lease (neither) read under
+    /// `sidx:`. The two key spaces share one value shape by design, so which of the two a value
+    /// is must be decided against its key: an owned entry accepted as an ordinary lease has its
+    /// ownership erased by the next renewal's put or its fragments reclaimed by an expiry sweep,
+    /// and an ordinary lease accepted under a session's `sidx:` range is residue attributed to a
+    /// session that never staged it.
+    PendingEntryNamespaceMismatch {
+        /// The namespace the value was read under or offered to (`pending:` or `sidx:`).
+        namespace: &'static str,
+        /// The shape it carries (`owned` or `ordinary`).
+        shape: &'static str,
+    },
+    /// An owned entry whose stored `owner` is not the upload id its own `sidx:` key names
+    /// (`0016:353`). Honouring it would renew — or reclaim — one session's staged data under
+    /// another session's identity, through the per-session `sidx:<upload-id>:` range that is the
+    /// only way any pass enumerates owned entries (`0016:475-491`).
+    OwnedEntryOwnerMismatch {
+        /// The upload id the key names.
+        key_owner: UploadId,
+        /// The upload id the value claims.
+        entry_owner: UploadId,
+    },
+    /// A [`StagedPlacement`] whose stored `EcScheme::ReedSolomon` is not one
+    /// [`crate::erasure::supported`] can encode/decode — the rule
+    /// [`RecordError::ChunkSchemeUnsupported`] applies to a committed chunk, applied to the
+    /// **planned** geometry an owned entry carries (ADR-0045's invariant table, the #285 class).
+    /// Reported without a chunk id because the value carries none: the id is in the key.
+    StagedSchemeUnsupported {
+        /// The rejected data-fragment count.
+        k: u8,
+        /// The parity-fragment count that accompanied it.
+        m: u8,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -620,6 +687,27 @@ impl fmt::Display for RecordError {
                 "a records obligation naming the epoch-{segment_epoch} segment group is stored \
                  under the session token for epoch {key_epoch}: the fence that ends an attempt \
                  installs its obligation, so the token names that attempt's own epoch"
+            ),
+            Self::TornOwnedEntry { present, absent } => write!(
+                f,
+                "pending entry carries `{present}` but not `{absent}`: both ownership fields or \
+                 neither is the only valid shape"
+            ),
+            Self::PendingEntryNamespaceMismatch { namespace, shape } => write!(
+                f,
+                "a `{namespace}` value is never an {shape} pending entry, and this one is"
+            ),
+            Self::OwnedEntryOwnerMismatch {
+                key_owner,
+                entry_owner,
+            } => write!(
+                f,
+                "owned entry names owner {entry_owner} but its sidx: key names upload id \
+                 {key_owner}"
+            ),
+            Self::StagedSchemeUnsupported { k, m } => write!(
+                f,
+                "invalid staged EC scheme rs({k},{m}); unsupported by the erasure coder"
             ),
         }
     }
@@ -3255,4 +3343,293 @@ pub fn decode_retire_obligation(
     let payload = RetirePayload::try_from(wire)?;
     payload.checked_against_key(mode, &token)?;
     Ok((mode, token, require_canonical(payload, value, "retire:")?))
+}
+
+// ===========================================================================
+// 10. The owned staging entry — the `sidx:<upload-id>:<part-number>:<chunk-id>` VALUE
+//     (`0016:353`, `:442-491`)
+// ===========================================================================
+
+/// The shape [`RecordError::PendingEntryNamespaceMismatch`] names for a value carrying both
+/// ownership fields — an owned `sidx:` entry.
+pub(crate) const OWNED_SHAPE: &str = "owned";
+/// The shape it names for a value carrying neither — an ordinary `pending:` lease.
+pub(crate) const ORDINARY_SHAPE: &str = "ordinary";
+
+/// The **ownership pairing rule**, in one place (`0016:442-457`): a
+/// [`crate::metadata::PendingEntry`]'s `owner` and `staged` are present together — an owned
+/// `sidx:` entry — or absent together — an ordinary `pending:` lease. Exactly one is a torn value
+/// no writer of this protocol produces.
+///
+/// One definition, applied by every seam that can meet the value: the shared record's own
+/// `Deserialize` (so the `pending:` decode refuses a torn value as well), the `pending:`
+/// namespace rule (`PendingEntry::checked_ordinary_lease`, so neither `pending:` writer stores
+/// one), [`decode_owned_entry`]'s wire path (which needs the rejection typed rather than
+/// stringified by serde's `Error::custom`), and [`OwnedEntry::from_pending`], the validator a
+/// writer outside this crate can apply to a record it assembled by hand. So no two of them can
+/// disagree about what "torn" means — the reason `Budget::inflight_owned_refs` is shared between
+/// its rule and its charge.
+///
+/// It judges the value's shape alone. Which of the two valid shapes a value may have is a relation
+/// against its **key**, checked by each namespace's own decode entry point — [`decode_owned_entry`]
+/// for `sidx:`, [`crate::metadata::decode_pending_entry`] for `pending:` — and, for `pending:`,
+/// by its writers too.
+pub(crate) fn checked_ownership_pairing(
+    owner_present: bool,
+    staged_present: bool,
+) -> Result<(), RecordError> {
+    if owner_present == staged_present {
+        return Ok(());
+    }
+    Err(RecordError::TornOwnedEntry {
+        present: if owner_present { "owner" } else { "staged" },
+        absent: if owner_present { "staged" } else { "owner" },
+    })
+}
+
+/// The wire shape of [`StagedPlacement`], closed and reading its scheme through the module's own
+/// [`EcSchemeWire`] for the reason [`ChunkRefWire`] records: an unknown field at either level is a
+/// decode error, never a field dropped on the way in and missing from the re-encode a lease
+/// renewal puts.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedPlacementWire {
+    scheme: EcSchemeWire,
+    placement: Vec<DServerId>,
+}
+
+/// A chunk's **planned** EC placement, carried only by an owned `sidx:` entry (`0016:442-473`):
+/// the same `(scheme, per-fragment D-server vector)` a committed [`crate::metadata::ChunkRef`]
+/// carries, written at intent time — before any fragment reaches a D server — so a record-only
+/// reaper can compute the entry's `orphan:<dserver>:<chunk>:<index>` keys and a drain can count
+/// its fragments as held on a specific server without a live write plan in hand
+/// (`0016:459-473`).
+///
+/// **Geometry is judged at decode; length is not.** The scheme must be one
+/// [`crate::erasure::supported`] can encode/decode (ADR-0045's invariant table, `0045:71`; the
+/// #285 class): untrusted stored geometry such as `rs(0, 1)` is
+/// [`RecordError::StagedSchemeUnsupported`], never a value the reaper's fragment arithmetic then
+/// indexes with. The placement's **length** is deliberately not checked against the scheme's
+/// fragment count: that is the standing *contextual* check, liberal on read (ADR-0045 `:45-49` and
+/// its `ChunkRef` row `:72`; `AGENTS.md:146-149`; `0016:416-432`, which names this very record),
+/// so a length-mismatched placement decodes. What a maintenance pass does with one is that pass's
+/// to decide, and no pass in this tree reads a `sidx:` key yet.
+///
+/// The fields are private behind [`Self::new`], the one checked constructor, so no
+/// `StagedPlacement` exists — decoded or minted — whose geometry the coder refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StagedPlacementWire")]
+pub struct StagedPlacement {
+    scheme: EcScheme,
+    placement: Vec<DServerId>,
+}
+
+impl StagedPlacement {
+    /// The checked constructor — for the writer that stages an owned entry (`write::intent`
+    /// recording its `WritePlan` placement, `0016:459-473`; #656–#659), which sits outside this
+    /// module's decode path. It refuses exactly the geometry decode refuses.
+    pub fn new(scheme: EcScheme, placement: Vec<DServerId>) -> Result<Self, RecordError> {
+        checked_staged_scheme(scheme)?;
+        Ok(Self { scheme, placement })
+    }
+
+    /// How the chunk is fragmented — already `erasure::supported` (see this type's doc).
+    pub const fn scheme(&self) -> EcScheme {
+        self.scheme
+    }
+
+    /// The D server planned to hold each fragment, by fragment index. Its **length** is not a
+    /// decode-time invariant (see this type's doc).
+    pub fn placement(&self) -> &[DServerId] {
+        &self.placement
+    }
+}
+
+/// Refuse a staged scheme [`crate::erasure`] cannot encode/decode — the peer of
+/// [`checked_chunk_scheme`] for *planned* geometry, on the same predicate
+/// ([`crate::erasure::supported`]), attributed to its own variant because the value it judges
+/// carries no chunk id. `EcScheme::None` has no `(k, m)` pair to check and is always valid.
+fn checked_staged_scheme(scheme: EcScheme) -> Result<(), RecordError> {
+    if let EcScheme::ReedSolomon { k, m } = scheme {
+        if !erasure::supported(k as usize, m as usize) {
+            return Err(RecordError::StagedSchemeUnsupported { k, m });
+        }
+    }
+    Ok(())
+}
+
+impl TryFrom<StagedPlacementWire> for StagedPlacement {
+    type Error = RecordError;
+
+    fn try_from(wire: StagedPlacementWire) -> Result<Self, RecordError> {
+        Self::new(wire.scheme.into(), wire.placement)
+    }
+}
+
+/// The wire shape of a `sidx:` value — [`crate::metadata::PendingEntry`]'s own three fields, read
+/// here so [`decode_owned_entry`] can attribute each rule to its own [`RecordError`] variant
+/// rather than to the message a `try_from` conversion funnels through
+/// [`crate::metadata::decode`] (the reason [`decode_admission_record`] reaches its own wire struct
+/// too). Only the *shape* is mirrored: the pairing rule is `checked_ownership_pairing` and the
+/// geometry rule is [`StagedPlacement`]'s conversion, both shared with the record's own
+/// `Deserialize`.
+///
+/// **Closed**, as every wire shape in this module is, where the shared record's own wire stays
+/// open: an owned entry has no stored corpus to stay compatible with (its first writer is
+/// #656–#659), so a field this build does not know is a decode error here rather than a field a
+/// renewal's re-encode would silently drop.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedEntryWire {
+    lease_expiry_millis: u64,
+    #[serde(default)]
+    owner: Option<UploadId>,
+    #[serde(default)]
+    staged: Option<StagedPlacementWire>,
+}
+
+/// The value under a `sidx:<upload-id>:<part-number>:<chunk-id>` key (`0016:353`, `:442-457`),
+/// with its two ownership fields present **by type** rather than by convention.
+///
+/// 0016 makes that value *be* a [`crate::metadata::PendingEntry`] rather than a parallel type, so
+/// one renewal loop and one set of lease guards serve an owned entry and an ordinary lease alike.
+/// On the shared record the two fields are therefore `Option`s; this is the view in which they are
+/// not. [`decode_owned_entry`] returns it, and a writer mints the stored value from it:
+/// [`Self::new`] takes both components, so the record [`Self::to_pending`] hands back can never be
+/// torn.
+///
+/// # Minting one outside this crate
+///
+/// The first `sidx:` writer (#656–#659) lives in another crate, and the shared record's fields are
+/// public — every in-tree `pending:` writer builds it as a literal. A writer left to hand-assemble
+/// an owned literal could encode a torn value: bytes both decoders refuse, an entry its own reaper
+/// could never read back. So the checked path for the **value** is public — [`StagedPlacement::new`]
+/// (geometry), [`Self::new`] (both fields, by type), [`Self::to_pending`] (the stored form) — and
+/// [`Self::from_pending`] validates a record that did not come from it. The **key** stays the
+/// writer's: the one relation no value-side check can see, the owner against the key's upload id,
+/// is [`decode_owned_entry`]'s, so a writer files the entry under the [`sidx_key`] it builds from
+/// [`Self::owner`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedEntry {
+    owner: UploadId,
+    lease_expiry_millis: u64,
+    staged: StagedPlacement,
+}
+
+impl OwnedEntry {
+    /// The owned entry a staging write puts under `sidx:` for one chunk. Total: both components
+    /// are already validated types, and the entry's one relation — its owner against the key
+    /// naming it — is [`decode_owned_entry`]'s, the only party holding that key.
+    pub const fn new(owner: UploadId, lease_expiry_millis: u64, staged: StagedPlacement) -> Self {
+        Self {
+            owner,
+            lease_expiry_millis,
+            staged,
+        }
+    }
+
+    /// The owning session.
+    pub const fn owner(&self) -> &UploadId {
+        &self.owner
+    }
+
+    /// When the lease expires (logical milliseconds).
+    pub const fn lease_expiry_millis(&self) -> u64 {
+        self.lease_expiry_millis
+    }
+
+    /// The chunk's planned EC placement.
+    pub const fn staged(&self) -> &StagedPlacement {
+        &self.staged
+    }
+
+    /// The shared-record form this entry is **stored** as — the value a `sidx:` put writes, with
+    /// both ownership fields present.
+    pub fn to_pending(&self) -> metadata::PendingEntry {
+        metadata::PendingEntry {
+            lease_expiry_millis: self.lease_expiry_millis,
+            owner: Some(self.owner.clone()),
+            staged: Some(self.staged.clone()),
+        }
+    }
+
+    /// Validate a shared record that did **not** come from [`Self::to_pending`] — one a caller
+    /// assembled by hand — as an owned entry: the pairing rule first (a torn record is
+    /// [`RecordError::TornOwnedEntry`]), then the shape an owned entry must have (an ordinary
+    /// lease is [`RecordError::PendingEntryNamespaceMismatch`], never a silently accepted value).
+    ///
+    /// It holds no key, so it cannot check the one relation [`decode_owned_entry`] can — the
+    /// owner against the key's upload id.
+    pub fn from_pending(entry: &metadata::PendingEntry) -> Result<Self, RecordError> {
+        checked_ownership_pairing(entry.owner.is_some(), entry.staged.is_some())?;
+        match (&entry.owner, &entry.staged) {
+            (Some(owner), Some(staged)) => Ok(Self::new(
+                owner.clone(),
+                entry.lease_expiry_millis,
+                staged.clone(),
+            )),
+            _ => Err(RecordError::PendingEntryNamespaceMismatch {
+                namespace: "sidx:",
+                shape: ORDINARY_SHAPE,
+            }),
+        }
+    }
+}
+
+/// Decode an owned staging entry from **both halves of the record** — its key ([`sidx_key`]) and
+/// its value — the `sidx:` namespace's one decode entry point. Returns the part attempt and chunk
+/// the key names beside the entry the value carries.
+///
+/// The key is taken because two of this record's rules are relations against it, which a decode
+/// that cannot see the key cannot check (ADR-0045 decision 1):
+///
+/// 1. **namespace** — a `sidx:` value is an owned entry. An ordinary lease found here (neither
+///    ownership field) is [`RecordError::PendingEntryNamespaceMismatch`]: the mirror of the
+///    `pending:` entry point refusing an owned one ([`crate::metadata::decode_pending_entry`]);
+/// 2. **owner** — the value's `owner` is the upload id the key names
+///    ([`RecordError::OwnedEntryOwnerMismatch`]).
+///
+/// It hands back the key's `(part_number, chunk)` for the reason [`decode_retire_obligation`]
+/// hands back its token: the pass that reads this record needs them — the part number attributes
+/// residue to the part attempt that staged it, the chunk id is half of the
+/// `orphan:<dserver>:<chunk>:<index>` keys the `staged` placement completes (`0016:353`) — and
+/// re-parsing the key would be a second decision site that could disagree with this one. The
+/// upload id is not among them: it is [`OwnedEntry::owner`], which this decode has just proved
+/// equal to the key's.
+///
+/// The value's own rules run first — the pairing (`checked_ownership_pairing`) and the staged
+/// geometry ([`StagedPlacement`]) — so a torn value is attributed to the rule it broke rather than
+/// to the key it happens to sit under, the order [`decode_session_record`] and
+/// [`decode_retire_obligation`] apply. It closes with the canonical-bytes gate every decoder in
+/// this module closes with (`require_canonical`): a lease renewal preconditions on the **raw bytes
+/// it read** and puts a freshly encoded entry (`crate::metadata::renew_pending`'s shape), so a
+/// foreign spelling of an equal value would be bytes such a renewal silently rewrites — more than
+/// the lease it came to extend — rather than a value it could renew in place.
+pub fn decode_owned_entry(
+    key: &[u8],
+    value: &[u8],
+) -> Result<(PartNumber, ChunkId, OwnedEntry), RecordError> {
+    let (key_owner, part_number, chunk) = parse_sidx_key(key)?;
+    let wire: OwnedEntryWire =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "sidx:",
+            detail: err.to_string(),
+        })?;
+    checked_ownership_pairing(wire.owner.is_some(), wire.staged.is_some())?;
+    let (Some(owner), Some(staged)) = (wire.owner, wire.staged) else {
+        return Err(RecordError::PendingEntryNamespaceMismatch {
+            namespace: "sidx:",
+            shape: ORDINARY_SHAPE,
+        });
+    };
+    let staged = StagedPlacement::try_from(staged)?;
+    if owner != key_owner {
+        return Err(RecordError::OwnedEntryOwnerMismatch {
+            key_owner,
+            entry_owner: owner,
+        });
+    }
+    let entry = OwnedEntry::new(owner, wire.lease_expiry_millis, staged);
+    require_canonical(entry.to_pending(), value, "sidx:")?;
+    Ok((part_number, chunk, entry))
 }

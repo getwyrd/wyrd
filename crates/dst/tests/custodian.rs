@@ -922,6 +922,8 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
         LEASED,
         &PendingEntry {
             lease_expiry_millis: lease_expiry,
+            owner: None,
+            staged: None,
         },
     )
     .await

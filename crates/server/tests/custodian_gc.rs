@@ -642,6 +642,8 @@ async fn armed_deployed_role_reclaims_expired_pending_lease_garbage() {
         pending_key(LEASED_CHUNK),
         metadata::encode(&PendingEntry {
             lease_expiry_millis: LEASE_EXPIRY,
+            owner: None,
+            staged: None,
         }),
     ))
     .await
@@ -723,6 +725,8 @@ async fn deployed_role_defers_expired_pending_garbage_by_default() {
         pending_key(LEASED_CHUNK),
         metadata::encode(&PendingEntry {
             lease_expiry_millis: LOGICAL_ZERO_LEASE_EXPIRY,
+            owner: None,
+            staged: None,
         }),
     ))
     .await
@@ -917,6 +921,8 @@ async fn deployed_role_defers_gc_when_the_operator_fleet_is_startup_partial() {
         pending_key(LEASED_CHUNK),
         metadata::encode(&PendingEntry {
             lease_expiry_millis: LEASE_EXPIRY,
+            owner: None,
+            staged: None,
         }),
     ))
     .await

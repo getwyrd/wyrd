@@ -383,6 +383,8 @@ async fn an_in_flight_pending_chunk_is_left_to_gc() {
 
     let entry = PendingEntry {
         lease_expiry_millis: NOW + 60_000,
+        owner: None,
+        staged: None,
     };
     meta.commit(WriteBatch::new().put(metadata::pending_key(11), metadata::encode(&entry)))
         .await
