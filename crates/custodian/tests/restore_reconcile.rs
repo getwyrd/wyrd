@@ -383,6 +383,8 @@ async fn an_in_flight_pending_chunk_is_left_to_gc() {
 
     let entry = PendingEntry {
         lease_expiry_millis: NOW + 60_000,
+        owner: None,
+        staged: None,
     };
     meta.commit(WriteBatch::new().put(metadata::pending_key(11), metadata::encode(&entry)))
         .await
@@ -404,6 +406,50 @@ async fn an_in_flight_pending_chunk_is_left_to_gc() {
         "a chunk holding a live pending lease belongs to GC's lease path, not to this pass: \
          {report:?}"
     );
+}
+
+/// PR #793 review — a `pending:` entry the pass cannot read as an ordinary lease (here a torn
+/// one: an owner spelled `null`, no placement) is neither trusted on the strength of its key
+/// nor ignored: its chunk is HELD exactly as a live lease's would be, and the entry is named in
+/// the report as a human's, so the fragments it holds cannot sit forever with a clean bill.
+/// Negation: route the scan back to the key alone — the entry vanishes from the report and
+/// `is_clean` goes true again.
+#[tokio::test]
+async fn an_unreadable_pending_entry_holds_its_chunk_and_needs_a_human() {
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+    let held = frag(11, 0);
+    d0.put(held).await;
+
+    meta.commit(WriteBatch::new().put(
+        metadata::pending_key(11),
+        br#"{"lease_expiry_millis":9999999999,"owner":null}"#.to_vec(),
+    ))
+    .await
+    .unwrap();
+
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 1_000,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    let report = reconcile_after_restore(&ctx, NOW).await.unwrap();
+
+    assert_eq!(
+        report.pending_unreadable,
+        vec!["pending:11".to_owned()],
+        "the unreadable entry must be named, not counted away: {report:?}"
+    );
+    assert_eq!(
+        report.stranded_marked, 0,
+        "a chunk whose ledger entry cannot be read is held, never marked: {report:?}"
+    );
+    assert_eq!(report.pending_skipped, 1, "{report:?}");
+    assert!(report.needs_human(), "{report:?}");
+    assert!(!report.is_clean(), "{report:?}");
 }
 
 // ---- the loss this pass reports ----

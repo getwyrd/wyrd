@@ -116,6 +116,8 @@ fn pending_ledger_written_and_cleared() {
             chunk,
             &PendingEntry {
                 lease_expiry_millis: 5_000,
+                owner: None,
+                staged: None,
             },
         )
         .await

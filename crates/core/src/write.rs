@@ -206,6 +206,8 @@ pub async fn intent(
             chunk.id,
             &PendingEntry {
                 lease_expiry_millis,
+                owner: None,
+                staged: None,
             },
         )
         .await?;
@@ -432,6 +434,8 @@ async fn intent_and_write_chunk(
         id,
         &PendingEntry {
             lease_expiry_millis,
+            owner: None,
+            staged: None,
         },
     )
     .await?;
@@ -493,6 +497,8 @@ async fn lease_write_chunk(
             now_millis,
             &PendingEntry {
                 lease_expiry_millis: now_millis + lease_ttl_millis,
+                owner: None,
+                staged: None,
             },
         )
         .await?;
@@ -626,6 +632,17 @@ where
 /// as of `now_millis` in one atomic commit, and returns the reclaimed chunk ids.
 /// Orphaned *fragments* are collectable garbage; reclaiming them needs a
 /// chunk-store delete (a later milestone).
+///
+/// A value it cannot read as an **ordinary** pending lease — an owned multipart staging entry
+/// filed under `pending:`, a torn or malformed value — is **skipped**: neither reclaimed nor
+/// deleted, while the sweep goes on for every other entry and still commits their reclaim. The
+/// skip is then reported, never passed off as success: the call returns
+/// [`WriteError::UnreadablePendingEntries`], naming each skipped key and carrying the chunk ids
+/// the sweep did reclaim. That is ADR-0045 decision 3 for a maintenance sweep — classify, skip
+/// and surface the record, never act on it — through the one channel this module has, its
+/// result (it has no `tracing` seam), so what reaches a human is whatever the caller does with
+/// that error. Aborting on the first such value instead would leave one misfiled record stalling
+/// the reclaim of every expired lease beside it, in any scan order.
 pub async fn sweep_expired_leases(
     meta: &impl MetadataStore,
     now_millis: u64,
@@ -633,8 +650,15 @@ pub async fn sweep_expired_leases(
     let pending = meta.scan(b"pending:").await?;
     let mut batch = WriteBatch::new();
     let mut reclaimed = Vec::new();
+    let mut skipped = Vec::new();
     for (key, value) in pending {
-        let entry: PendingEntry = metadata::decode(&value)?;
+        let entry = match metadata::decode_pending_entry(&value) {
+            Ok(entry) => entry,
+            Err(fault) => {
+                skipped.push((key, fault));
+                continue;
+            }
+        };
         if entry.lease_expiry_millis <= now_millis {
             if let Some(id) = parse_pending_key(&key) {
                 reclaimed.push(id);
@@ -644,6 +668,9 @@ pub async fn sweep_expired_leases(
     }
     if !reclaimed.is_empty() {
         meta.commit(batch).await?;
+    }
+    if !skipped.is_empty() {
+        return Err(WriteError::UnreadablePendingEntries { reclaimed, skipped }.into());
     }
     Ok(reclaimed)
 }
@@ -670,6 +697,17 @@ pub enum WriteError {
         /// The in-flight chunk ids whose leases the renewal could not extend.
         chunks: Vec<ChunkId>,
     },
+    /// The lease sweep ([`sweep_expired_leases`]) met `pending:` values it could not read as an
+    /// ordinary lease and **skipped** each one: nothing was reclaimed on it and it was left in
+    /// place for a human to repair or refile. Every readable expired lease was still reclaimed
+    /// and committed — this reports what the sweep could not act on; it undoes nothing it did.
+    UnreadablePendingEntries {
+        /// The chunk ids whose expired leases the sweep reclaimed and committed.
+        reclaimed: Vec<ChunkId>,
+        /// Each skipped entry's key, as the store spells it, with the reason its value was
+        /// refused.
+        skipped: Vec<(Vec<u8>, crate::multipart::RecordError)>,
+    },
 }
 
 impl std::fmt::Display for WriteError {
@@ -682,6 +720,22 @@ impl std::fmt::Display for WriteError {
                      be renewed ({} in-flight chunk(s)); refusing to resurrect a swept lease and \
                      publish missing fragments",
                     chunks.len()
+                )
+            }
+            WriteError::UnreadablePendingEntries { reclaimed, skipped } => {
+                write!(
+                    f,
+                    "lease sweep skipped {} pending-ledger value(s) it could not read as an \
+                     ordinary lease, leaving each in place",
+                    skipped.len()
+                )?;
+                if let Some((key, fault)) = skipped.first() {
+                    write!(f, " (first: {}: {fault})", key.escape_ascii())?;
+                }
+                write!(
+                    f,
+                    "; {} expired lease(s) beside them were reclaimed",
+                    reclaimed.len()
                 )
             }
         }

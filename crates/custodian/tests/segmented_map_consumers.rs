@@ -497,6 +497,8 @@ async fn seed_expired_lease(meta: &MemMeta, d0: &MemDServer, chunk: ChunkId) {
         chunk,
         &metadata::PendingEntry {
             lease_expiry_millis: 10,
+            owner: None,
+            staged: None,
         },
     )
     .await

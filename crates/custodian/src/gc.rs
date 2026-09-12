@@ -44,13 +44,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 pub(crate) use wyrd_core::metadata::orphan_key;
 use wyrd_core::metadata::{
     self, parse_orphan_key, ChunkMapError, EcScheme, InodeRecord, InodeState, MalformedPlacement,
-    PendingEntry, ORPHAN_PREFIX,
+    ORPHAN_PREFIX,
 };
 use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::reconciliation::Reconciled;
 
-fn parse_pending_chunk(key: &[u8]) -> Option<ChunkId> {
+pub(crate) fn parse_pending_chunk(key: &[u8]) -> Option<ChunkId> {
     std::str::from_utf8(key)
         .ok()?
         .strip_prefix("pending:")?
@@ -480,13 +480,34 @@ pub(crate) fn object_name(key: &[u8]) -> String {
 }
 
 /// The chunk ids whose pending-ledger lease has expired as of `now_millis`.
+///
+/// A `pending:` value that does not read as an **ordinary** lease — an owned multipart staging
+/// entry filed under the wrong key, a torn or malformed value — is **classified and skipped**:
+/// its chunk never enters the expired set, so none of its fragments is reclaimed as expired-lease
+/// garbage and its entry is never deleted, and the scan goes on for every other entry. That is
+/// ADR-0045 decision 3 for a GC sweep — classify, skip and emit NEEDS-HUMAN, and fail safe rather
+/// than reclaim on doubt — with the containment the `malformed-placement` skip gives a corrupt
+/// committed placement: each skipped entry is named to an operator on the durability seam
+/// ([`emit_unreadable_pending`], as [`emit_malformed`] names that chunk), so the skip is never
+/// silent. It is not an error: a `?` here would fail the whole pass, and every other reclaim in
+/// it, over one record — the stall decision 3 rules out. Nor is a repair record written for it:
+/// the unreadable entry stays where it is, and every pass that reads this input names it again
+/// until a human repairs or refiles it. Only a pass under [`ExpiredPendingPolicy::Reclaim`]
+/// reads it: under `Defer`, a deployment's default, nothing here runs and the entry is simply
+/// left in place, unnamed.
 async fn expired_pending_chunks(
     meta: &dyn MetadataStore,
     now_millis: u64,
 ) -> Result<HashSet<ChunkId>> {
     let mut set = HashSet::new();
     for (key, value) in meta.scan(b"pending:").await? {
-        let entry: PendingEntry = metadata::decode(&value)?;
+        let entry = match metadata::decode_pending_entry(&value) {
+            Ok(entry) => entry,
+            Err(fault) => {
+                emit_unreadable_pending(&object_name(&key), &fault.to_string());
+                continue;
+            }
+        };
         if entry.lease_expiry_millis <= now_millis {
             if let Some(chunk) = parse_pending_chunk(&key) {
                 set.insert(chunk);
@@ -568,6 +589,22 @@ fn emit_unresolvable(object: &str, fault: &str) {
         inode = %object,
         fault = %fault,
         "gc could not read a committed object's chunk map; its reference set is incomplete, so gc reclaims NOTHING and certifies NOTHING until this record is repaired — operator signal",
+    );
+}
+
+/// Emit a `pending:` entry GC could **not read as an ordinary lease** on the durability-plane
+/// seam (ADR-0011 / ADR-0012): the expired-lease input skipped it, so no fragment is reclaimed on
+/// its lease and its entry is left in place until a human repairs or refiles it. Named by key —
+/// escaped as [`object_name`] escapes an `inode:` key — for the reason [`emit_unresolvable`]
+/// names its record.
+fn emit_unreadable_pending(entry: &str, fault: &str) {
+    tracing::warn!(monotonic_counter.gc_unreadable_pending_entries = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "unreadable-pending-entry",
+        entry = %entry,
+        fault = %fault,
+        "gc could not read a pending-ledger entry as an ordinary lease; it reclaims nothing on that lease and leaves the entry in place — operator signal",
     );
 }
 

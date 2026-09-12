@@ -20,23 +20,30 @@
 //!    emitted on the `DurabilityTelemetry` seam as metric + audit events and read
 //!    back in-process via `gather_prometheus`. This leg lives in its own test binary
 //!    (`gc_telemetry.rs`) — it must not share this process's `tracing` callsite cache
-//!    with the criteria above (issue #214).
+//!    with the criteria above (issue #214). The #772 leg at the end of this file reads
+//!    back its audit lines here all the same: it is the only test in this binary that
+//!    fires that callsite (`emit_unreadable_pending`), so no sibling can latch it, and
+//!    it installs the #214 global-default guard before its first pass runs.
 
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::prelude::*;
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
+use wyrd_core::multipart::{OwnedEntry, StagedPlacement, UploadId};
 use wyrd_custodian::{
     mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
     Reconciled,
 };
+use wyrd_testkit::Sim;
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
     WriteBatch,
@@ -201,6 +208,8 @@ async fn reclaims_expired_lease_byte_and_orphan_through_reconcile_step() {
         pending_chunk,
         &PendingEntry {
             lease_expiry_millis: 100,
+            owner: None,
+            staged: None,
         },
     )
     .await
@@ -879,4 +888,276 @@ async fn a_segmented_root_gc_cannot_resolve_blocks_certification_and_reclaims_no
         "the containment is fleet-wide while the set is incomplete: nothing at all is \
          reclaimed, not even an orphan of no committed map"
     );
+}
+
+// ---- #772 S5: a `pending:` value GC cannot read as an ordinary lease is skipped, not reclaimed ----
+
+/// Collects what a `tracing` subscriber writes, so the leg below reads back the audit lines the
+/// pass actually emitted rather than assuming them — the in-tree pattern of
+/// `segmented_map_consumers.rs`'s `Capture`.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
+    type Writer = Self;
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// [`MemMeta`], answering `scan` in the order the test names; every other call goes straight
+/// through. `MetadataStore::scan` leaves order unspecified, so a sweep over it must be right under
+/// **every** order — and a `HashMap`'s order is one no test can name: over it, a sweep that
+/// stopped at its first unreadable entry passed a fixed fixture whenever that entry came last.
+struct ScanInOrder {
+    meta: MemMeta,
+    /// The keys `scan` yields first, in this order; a key not listed follows, in key order.
+    order: Vec<Vec<u8>>,
+}
+
+#[async_trait]
+impl MetadataStore for ScanInOrder {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.meta.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        let rank = |key: &Vec<u8>| self.order.iter().position(|k| k == key);
+        let mut hits = self.meta.scan(prefix).await?;
+        hits.sort_by(|(a, _), (b, _)| {
+            let (ra, rb) = (rank(a).unwrap_or(usize::MAX), rank(b).unwrap_or(usize::MAX));
+            ra.cmp(&rb).then_with(|| a.cmp(b))
+        });
+        Ok(hits)
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        self.meta.commit(batch).await
+    }
+}
+
+/// What one seeded `pending:` entry is, and so what GC must do with it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Drawn {
+    /// An ordinary lease at or before `now`: its byte is reclaimed and its entry retired.
+    Expired,
+    /// An ordinary lease still live: kept.
+    Live,
+    /// An owned multipart staging entry filed under `pending:`, minted through `wyrd-core`'s
+    /// public checked path from this crate, its lease expired: skipped.
+    Misfiled,
+    /// A torn value — an `owner` without `staged`, the literal an outside crate can assemble —
+    /// its lease expired: skipped.
+    Torn,
+    /// Bytes that are not a pending entry at all: skipped.
+    Garbage,
+}
+
+/// Draw a population from `sim` as `(chunk, kind, stored value)` under distinct chunk ids: one
+/// expired ordinary lease and one unreadable value, so every seed has a reclaim for a stalled scan
+/// to miss, then up to six more entries of any kind. Every unreadable value carries a lease GC
+/// would act on if it misread it as an ordinary one.
+fn draw(sim: &mut Sim, now: u64) -> Vec<(ChunkId, Drawn, Bytes)> {
+    const KINDS: [Drawn; 5] = [
+        Drawn::Expired,
+        Drawn::Live,
+        Drawn::Misfiled,
+        Drawn::Torn,
+        Drawn::Garbage,
+    ];
+    let mut kinds = vec![Drawn::Expired, KINDS[2 + (sim.gen::<u32>() % 3) as usize]];
+    for _ in 0..sim.gen::<u32>() % 7 {
+        kinds.push(KINDS[(sim.gen::<u32>() % 5) as usize]);
+    }
+    let owner = || UploadId::new("a1".repeat(16)).unwrap();
+    let ordinary = |lease_expiry_millis| PendingEntry {
+        lease_expiry_millis,
+        owner: None,
+        staged: None,
+    };
+    let mut chunks = std::collections::BTreeSet::new();
+    let mut population = Vec::new();
+    for kind in kinds {
+        let chunk = loop {
+            let chunk = ChunkId::from(1 + sim.gen::<u32>() % 10_000);
+            if chunks.insert(chunk) {
+                break chunk;
+            }
+        };
+        // At or before `now`, so `now` itself — the boundary — is drawn too.
+        let expired = now - sim.gen::<u64>() % 500;
+        let value = match kind {
+            Drawn::Expired => metadata::encode(&ordinary(expired)),
+            Drawn::Live => metadata::encode(&ordinary(now + 1 + sim.gen::<u64>() % 500)),
+            Drawn::Misfiled => {
+                let staged = StagedPlacement::new(EcScheme::None, vec![0]).unwrap();
+                metadata::encode(&OwnedEntry::new(owner(), expired, staged).to_pending())
+            }
+            Drawn::Torn => metadata::encode(&PendingEntry {
+                lease_expiry_millis: expired,
+                owner: Some(owner()),
+                staged: None,
+            }),
+            Drawn::Garbage => Bytes::from_static(b"not a pending entry"),
+        };
+        population.push((chunk, kind, value));
+    }
+    population
+}
+
+/// One GC pass over `population`, its `pending:` keys scanned in `order`; asserts what the pass
+/// did with every entry and what it named on the audit seam.
+async fn gc_pass_over(
+    seed: u64,
+    now: u64,
+    population: &[(ChunkId, Drawn, Bytes)],
+    order: Vec<Vec<u8>>,
+) {
+    let meta = ScanInOrder {
+        meta: MemMeta::default(),
+        order,
+    };
+    let d0 = MemDServer::default();
+    for (chunk, _, value) in population {
+        d0.put(frag(*chunk, 0)).await;
+        let put = WriteBatch::new().put(metadata::pending_key(*chunk), value.clone());
+        assert_eq!(meta.commit(put).await.unwrap(), CommitOutcome::Committed);
+    }
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &d0)];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    let audit = Capture::default();
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
+        .with_subscriber(tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(audit.clone()),
+            ),
+        ))
+        .await
+        .unwrap_or_else(|err| {
+            panic!("seed {seed}: one unreadable pending entry must not fail the pass: {err}")
+        });
+    assert_eq!(outcome, Reconciled::Changed, "seed {seed}");
+
+    for (chunk, kind, value) in population {
+        let byte = d0.get_fragment(frag(*chunk, 0)).await.unwrap();
+        let entry = meta.get(&metadata::pending_key(*chunk)).await.unwrap();
+        if *kind == Drawn::Expired {
+            assert!(
+                byte.is_none() && entry.is_none(),
+                "seed {seed}: the expired lease on chunk {chunk} was left in place — the pass \
+                 stopped short of it"
+            );
+        } else {
+            assert!(
+                byte.is_some(),
+                "seed {seed}: GC reclaimed chunk {chunk}'s byte on a {kind:?} value"
+            );
+            assert_eq!(
+                entry.as_ref(),
+                Some(value),
+                "seed {seed}: the {kind:?} entry on chunk {chunk} must be left exactly as it was"
+            );
+        }
+    }
+
+    // Named for an operator: one audit line per skipped entry, on the GC audit seam, carrying the
+    // key to repair — and one tick of the counter each.
+    let logged = String::from_utf8(audit.0.lock().unwrap().clone()).unwrap();
+    let named: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains(r#""action":"unreadable-pending-entry""#))
+        .collect();
+    let skipped: Vec<ChunkId> = population
+        .iter()
+        .filter(|(_, kind, _)| matches!(kind, Drawn::Misfiled | Drawn::Torn | Drawn::Garbage))
+        .map(|(chunk, ..)| *chunk)
+        .collect();
+    assert_eq!(
+        named.len(),
+        skipped.len(),
+        "seed {seed}: one audit line per skipped entry. got: {logged}"
+    );
+    for chunk in &skipped {
+        let entry = format!(r#""entry":"pending:{chunk}""#);
+        assert!(
+            named.iter().any(|line| line.contains(&entry)
+                && line.contains(r#""target":"wyrd.custodian.gc.audit""#)),
+            "seed {seed}: the audit seam must name pending:{chunk}. got: {logged}"
+        );
+    }
+    assert_eq!(
+        logged.matches("gc_unreadable_pending_entries").count(),
+        skipped.len(),
+        "seed {seed}. got: {logged}"
+    );
+}
+
+/// GC's expired-lease input classifies and skips a `pending:` value it cannot read as an ordinary
+/// lease — an owned staging entry filed under the wrong key, a torn value, garbage — and goes on
+/// with the rest (ADR-0045 decision 3, fail safe): the skipped value's byte is kept and its entry
+/// left in place, while every expired ordinary lease beside it is still reclaimed. A `?`-abort on
+/// the unreadable value would fail the whole step and strand that garbage; a scan that stopped at
+/// it would strand whatever came after it. And the skip is not silent: each one is named on the
+/// GC audit seam.
+///
+/// Seeded Tier 0 (ADR-0009): `wyrd_testkit::Sim` draws each seed's population and scan order, and
+/// a failure names the seed that reproduces it. A pass reads the ledger in one sequential scan, so
+/// what a seed varies is what that scan meets and in which order. Every seed is swept twice, in
+/// its drawn order and in the reverse. With at least one expired ordinary lease and one unreadable
+/// value in each, a pass that stopped at its first unreadable entry must miss an expired lease in
+/// one of the two: to be reached in both orders, every expired lease would have to sit before the
+/// first unreadable entry and also after the last. So what this proves does not depend on the
+/// order a store happens to scan in.
+#[tokio::test]
+async fn expired_lease_input_skips_what_it_cannot_read_under_every_scan_order() {
+    // A permissive global default, installed before any callsite a pass fires is first hit, so
+    // none can latch `Interest::never` under the parallel harness and leave a capture empty
+    // (#214; the guard `segmented_map_consumers.rs` documents).
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    for seed in 0..32 {
+        let mut sim = Sim::new(seed);
+        let now = 1_000 + sim.gen::<u64>() % 1_000;
+        let population = draw(&mut sim, now);
+        let mut order: Vec<Vec<u8>> = population
+            .iter()
+            .map(|(chunk, ..)| metadata::pending_key(*chunk))
+            .collect();
+        // Fisher–Yates over the seeded RNG, as `erasure.rs`'s seeded property draws its subsets.
+        for i in (1..order.len()).rev() {
+            order.swap(i, (sim.gen::<u32>() as usize) % (i + 1));
+        }
+        let reversed = order.iter().rev().cloned().collect();
+        gc_pass_over(seed, now, &population, order).await;
+        gc_pass_over(seed, now, &population, reversed).await;
+    }
 }
