@@ -861,3 +861,45 @@ fn s9_an_owned_entry_is_minted_outside_the_crate_through_the_checked_path() {
     assert_eq!(decoded, minted);
     assert!(decode_pending_witness(&bytes).is_err());
 }
+
+/// PR #793 review — an ownership field spelled `null` is **refused**, not read as absent.
+/// `Option<T>`'s own decode would map `"owner":null` to `None`, and the encoder never emits
+/// that spelling back, so such a lease would decode, pass every rule, and be rewritten
+/// field-for-field by the next `renew_pending` — a CAS that WINS while changing the stored
+/// shape. Both surfaces refuse it (the wire is shared), so the accepted set stays exactly the
+/// encoder's image. Negation: drop `deserialize_with` from either wire field — this test alone
+/// fails.
+#[test]
+fn an_explicit_null_ownership_field_is_refused() {
+    for (label, value) in [
+        (
+            "owner",
+            format!("{{\"lease_expiry_millis\":{LEASE},\"owner\":null}}"),
+        ),
+        (
+            "staged",
+            format!("{{\"lease_expiry_millis\":{LEASE},\"staged\":null}}"),
+        ),
+        (
+            "both",
+            format!("{{\"lease_expiry_millis\":{LEASE},\"owner\":null,\"staged\":null}}"),
+        ),
+    ] {
+        let err = decode_pending_witness(value.as_bytes())
+            .expect_err("an explicit null ownership field must not decode");
+        assert!(
+            matches!(
+                err,
+                RecordError::MalformedRecordValue {
+                    namespace: "pending:",
+                    ..
+                }
+            ),
+            "{label}: {err:?}"
+        );
+        assert!(
+            metadata::decode::<PendingEntry>(value.as_bytes()).is_err(),
+            "{label}: the store-wide decode read null as absent"
+        );
+    }
+}

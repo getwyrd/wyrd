@@ -89,7 +89,8 @@ use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::{
-    object_name, orphan_key, orphan_leases, referenced_fragments, GcContext, ReferenceSet,
+    object_name, orphan_key, orphan_leases, parse_pending_chunk, referenced_fragments, GcContext,
+    ReferenceSet,
 };
 
 /// How many orphan marks to commit at once.
@@ -114,6 +115,17 @@ pub struct RestoreReport {
     /// Unreferenced fragments left alone because their chunk still holds a `pending:`
     /// lease — an in-flight write, whose lease TTL is already its grace. GC owns them.
     pub pending_skipped: usize,
+    /// `pending:` entries this pass could **not read as an ordinary lease** — torn, malformed,
+    /// or an owned staging entry filed under the wrong key — named by key as
+    /// [`RestoreReport::unresolvable`] names a record. Their chunks are **held** exactly as a
+    /// live lease's are (a fragment of theirs counts under [`RestoreReport::pending_skipped`]),
+    /// because an entry the pass cannot read may be protecting an in-flight write; and they are
+    /// a human's, because nothing else will ever clear them — GC's lease path refuses the same
+    /// value, so the entry and the fragments it holds would otherwise stay forever without a
+    /// signal anywhere (PR #793 review). Not folded into `unresolvable`: an unreadable lease does
+    /// not make the reading of the **committed** namespace partial, so it withholds no mark and
+    /// does not take "complete" off the summary line.
+    pub pending_unreadable: Vec<String>,
     /// Fragments the restored map still needs but whose bytes have MOVED — a repair or
     /// rebalance after the restore point wrote them to a new D server and repointed the
     /// placement, and the restore rewound the map but not the bytes. These are the **only
@@ -183,7 +195,10 @@ impl RestoreReport {
     /// report rather than in the command because a caller that never prints the summary still
     /// needs the same verdict, and would otherwise re-derive it slightly differently.
     pub fn needs_human(&self) -> bool {
-        !self.dangling.is_empty() || !self.misplaced.is_empty() || !self.unresolvable.is_empty()
+        !self.dangling.is_empty()
+            || !self.misplaced.is_empty()
+            || !self.unresolvable.is_empty()
+            || !self.pending_unreadable.is_empty()
     }
 }
 
@@ -291,7 +306,10 @@ pub async fn reconcile_after_restore(
     let mut unreadable = BTreeSet::new();
     attribute_unresolvable(&referenced.unresolvable, &mut unreadable);
     let already = orphan_leases(ctx.meta).await?;
-    let pending = pending_chunks(ctx.meta).await?;
+    let PendingLedger {
+        held: pending,
+        unreadable: pending_unreadable,
+    } = pending_chunks(ctx.meta).await?;
     // Read UP FRONT, before a fragment is marked: the mark gate below has to know about a hole
     // THIS read found before it decides anything (see the one-reading rule in this function's
     // docs). It is the same list this pass has always materialized, taken here rather than at
@@ -310,6 +328,7 @@ pub async fn reconcile_after_restore(
         // record only one of them could read is still a record this run cannot speak for —
         // deduplicated and in the store's own key order, whichever read met each of them.
         unresolvable: unreadable.iter().map(|key| object_name(key)).collect(),
+        pending_unreadable,
         ..Default::default()
     };
     // ONE READING, ONE CONCLUSION. `gc::ReferenceSet::protects` already withholds every fragment
@@ -725,19 +744,55 @@ fn reconstruction_threshold(chunk: &wyrd_core::metadata::ChunkRef) -> u16 {
     }
 }
 
-/// Chunk ids that still hold a `pending:` lease — an in-flight write, GC's business.
-async fn pending_chunks(meta: &dyn MetadataStore) -> Result<HashSet<ChunkId>> {
-    let mut out = HashSet::new();
-    for (key, _value) in meta.scan(b"pending:").await? {
-        if let Some(chunk) = std::str::from_utf8(&key)
-            .ok()
-            .and_then(|k| k.strip_prefix("pending:"))
-            .and_then(|c| c.parse().ok())
-        {
-            out.insert(chunk);
+/// What the `pending:` scan found: the chunks it holds, and the entries it could not read.
+struct PendingLedger {
+    /// Chunk ids under a `pending:` key — a live lease's, **and** an unreadable entry's (held on
+    /// the same terms; see [`RestoreReport::pending_unreadable`]).
+    held: HashSet<ChunkId>,
+    /// The entries [`wyrd_core::metadata::decode_pending_entry`] refused, by escaped key, in
+    /// the store's own key order.
+    unreadable: Vec<String>,
+}
+
+/// Chunk ids that still hold a `pending:` lease — an in-flight write, GC's business — read
+/// through the namespace's one decode entry point, as every other `pending:` reader is.
+///
+/// A value that entry point refuses is not a lease this pass may reason from, and it is not
+/// nothing either: the key still names a chunk, and the entry may be a misfiled owned staging
+/// record protecting a write in flight. So its chunk is held as a live lease's would be, and the
+/// entry is named on the audit seam and in the report — never read as a valid lease on the
+/// strength of its key alone.
+async fn pending_chunks(meta: &dyn MetadataStore) -> Result<PendingLedger> {
+    let mut ledger = PendingLedger {
+        held: HashSet::new(),
+        unreadable: Vec::new(),
+    };
+    for (key, value) in meta.scan(b"pending:").await? {
+        if let Err(fault) = wyrd_core::metadata::decode_pending_entry(&value) {
+            let entry = object_name(&key);
+            emit_unreadable_pending(&entry, &fault.to_string());
+            ledger.unreadable.push(entry);
+        }
+        if let Some(chunk) = parse_pending_chunk(&key) {
+            ledger.held.insert(chunk);
         }
     }
-    Ok(out)
+    Ok(ledger)
+}
+
+/// Emit a `pending:` entry this pass could **not read as an ordinary lease** on the
+/// durability-plane seam (ADR-0011 / ADR-0012): its chunk is held, nothing of it is marked, and
+/// the entry stays until a human repairs or refiles it — GC's expired-lease scan
+/// (`gc::emit_unreadable_pending`) says the same of the same value.
+fn emit_unreadable_pending(entry: &str, fault: &str) {
+    tracing::warn!(monotonic_counter.restore_unreadable_pending_entries = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "unreadable-pending-entry",
+        entry = %entry,
+        fault = %fault,
+        "post-restore: could not read a pending-ledger entry as an ordinary lease; its chunk is held unmarked and the entry is left in place — operator signal",
+    );
 }
 
 /// A fragment nothing references and nothing accounted for — the leak this pass closes.
@@ -846,6 +901,7 @@ fn emit_summary(report: &RestoreReport) {
         stranded_marked = report.stranded_marked,
         already_marked = report.already_marked,
         pending_skipped = report.pending_skipped,
+        pending_unreadable = report.pending_unreadable.len(),
         displaced_kept = report.displaced_kept,
         dangling = report.dangling.len(),
         misplaced = report.misplaced.len(),

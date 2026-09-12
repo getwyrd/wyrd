@@ -1610,13 +1610,39 @@ pub struct PendingEntry {
 /// The wire shape of [`PendingEntry`] — identical field-for-field, so every record ever written
 /// still decodes (both new fields default to absent); it exists to give the decode a place to
 /// refuse a torn value before the value exists, as [`InodeRecordWire`] does for its record.
+///
+/// Absence is the **only** spelling of an absent ownership field. `Option<T>`'s own
+/// `Deserialize` would also read an explicit `"owner":null` / `"staged":null` as `None`, and the
+/// encoder (`skip_serializing_if`) can never emit that spelling back — so a lease stored with a
+/// `null` would decode, pass every rule, and be rewritten field-for-field by the next
+/// [`renew_pending`], which preconditions on the raw bytes it read and puts a fresh encoding:
+/// the CAS wins and the stored shape changes with no error anywhere (PR #793 review). Requiring
+/// a value when the key is present makes the accepted set exactly the encoder's image, the same
+/// closure `de_content_type` gives the session record's one optional field.
 #[derive(Deserialize)]
 struct PendingEntryWire {
     lease_expiry_millis: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_present_ownership")]
     owner: Option<crate::multipart::UploadId>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_present_ownership")]
     staged: Option<crate::multipart::StagedPlacement>,
+}
+
+/// Read a **present** ownership field of [`PendingEntryWire`] as a value, never as `null`.
+///
+/// It never returns `None`: serde calls it only for a key that is present, and absence is the
+/// `#[serde(default)]` beside it. The `Option` in the signature is the field's type, not a
+/// second absence channel — `de_content_type`'s shape, for the same reason.
+fn de_present_ownership<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some).map_err(|err| {
+        DeError::custom(format!(
+            "{err} (an absent ownership field is spelled by omitting it, never as null)"
+        ))
+    })
 }
 
 impl TryFrom<PendingEntryWire> for PendingEntry {

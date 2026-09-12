@@ -1261,7 +1261,8 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
          whose bytes were already reclaimed), {} MISPLACED (bytes present but not where the \
          restored map looks — unreadable until the placement is fixed), {} under-replicated (the \
          repair loop rebuilds these); {} committed object(s) UNREADABLE (their chunk maps could \
-         not be read, so every count here is drawn over the rest of the store).",
+         not be read, so every count here is drawn over the rest of the store); {} pending-ledger \
+         entr(y/ies) UNREADABLE (held unmarked, see below).",
         // NOT "complete" over a store the pass could only partly read: "complete" is a claim
         // about a reading that FINISHED, and an operator scanning this line for one word must
         // not find it while a record is still unreadable.
@@ -1278,7 +1279,23 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         report.misplaced.len(),
         report.under_replicated.len(),
         report.unresolvable.len(),
+        report.pending_unreadable.len(),
     )];
+    if !report.pending_unreadable.is_empty() {
+        lines.push(format!(
+            // Named for the same reason `unresolvable` is named below: the operator's next move
+            // is a repair of a specific record, and a count does not say which.
+            "wyrd custodian: NEEDS-HUMAN — {} pending-ledger entr(y/ies) could not be READ as an \
+             ordinary lease: {}. Each may be a torn or misfiled multipart staging record \
+             protecting an in-flight write, so this pass HELD their chunks (counted with the \
+             pending leases above) and marked nothing of theirs — and GC's lease path refuses the \
+             same values, so nothing will ever clear them on its own. Repair or remove the \
+             entr(y/ies) named here and re-run this pass. The audit log carries each one too \
+             (`action=unreadable-pending-entry`).",
+            report.pending_unreadable.len(),
+            named_records(&report.pending_unreadable),
+        ));
+    }
     if !report.dangling.is_empty() {
         lines.push(format!(
             "wyrd custodian: NEEDS-HUMAN — {} chunk(s) are LOST. Restoring past a delete \
@@ -2884,6 +2901,12 @@ mod tests {
         // job, under-replication is the reconstruction loop's. Failing a restore script on either
         // would train an operator to ignore the status. It is also what stops the rule above
         // being satisfiable by failing every run.
+        // A pending-ledger entry the pass could not read as a lease (PR #793 review): held, not
+        // marked, and a human's — GC refuses the same value, so nothing else clears it.
+        let pending = RestoreReport {
+            pending_unreadable: vec!["pending:11".to_owned()],
+            ..Default::default()
+        };
         let routine = RestoreReport {
             stranded_marked: 4,
             under_replicated: vec![3],
@@ -2893,6 +2916,7 @@ mod tests {
             (&dangling, true),
             (&misplaced, true),
             (&unreadable, true),
+            (&pending, true),
             (&routine, false),
         ] {
             let verdict = restore_verdict(report);
@@ -2935,7 +2959,7 @@ mod tests {
             // merely counted. A count tells them a repair is needed and not which record to
             // repair, and the operator this command is written for is mid-restore at a terminal
             // — the log collector is one of the things a restore brings back up.
-            for object in &report.unresolvable {
+            for object in report.unresolvable.iter().chain(&report.pending_unreadable) {
                 assert!(
                     printed.contains(object.as_str()),
                     "the blocking record {object} is not named in what the operator reads: \

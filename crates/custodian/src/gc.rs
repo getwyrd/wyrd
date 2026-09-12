@@ -50,7 +50,7 @@ use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Res
 
 use crate::reconciliation::Reconciled;
 
-fn parse_pending_chunk(key: &[u8]) -> Option<ChunkId> {
+pub(crate) fn parse_pending_chunk(key: &[u8]) -> Option<ChunkId> {
     std::str::from_utf8(key)
         .ok()?
         .strip_prefix("pending:")?
