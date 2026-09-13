@@ -291,7 +291,9 @@ fn session_aborting_round_trips() {
 
 #[test]
 fn session_completed_round_trips() {
-    let etag = hex64("ab");
+    // A composed multipart ETag, `-N` suffix included (#693): the recorded ETag is the one a
+    // retry is answered with, so the record stores it whole.
+    let etag = format!("{}-3", hex64("ab"));
     let fingerprint = hex64("cd");
     let bytes = session(
         EPOCH,
@@ -306,7 +308,7 @@ fn session_completed_round_trips() {
     };
     assert_eq!(completion.inode, 9);
     assert_eq!(completion.version, VERSION);
-    assert_eq!(completion.etag.to_hex(), etag);
+    assert_eq!(completion.etag.to_string(), etag);
     assert_eq!(completion.completed_at_millis, 6000);
     assert_eq!(completion.complete_fingerprint.to_hex(), fingerprint);
 }
@@ -334,12 +336,12 @@ fn publish_target_round_trips_standalone() {
 /// [`Completion`] decodes on its own, independent of any [`SessionState`] wrapping it.
 #[test]
 fn completion_round_trips_standalone() {
-    let etag = hex64("11");
+    let etag = format!("{}-2", hex64("11"));
     let fingerprint = hex64("22");
     let bytes = completion_json(3, &etag, 42, &fingerprint).into_bytes();
     let completion: Completion = metadata::decode(&bytes).expect("a bare Completion decodes");
     assert_eq!(completion.inode, 3);
-    assert_eq!(completion.etag.to_hex(), etag);
+    assert_eq!(completion.etag.to_string(), etag);
     assert_eq!(metadata::encode(&completion).as_ref(), bytes.as_slice());
 }
 

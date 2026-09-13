@@ -20,6 +20,12 @@ futures-util.workspace = true
 reed-solomon-simd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `multipart_etag` / `complete_fingerprint` (issue #693, proposal 0016 decision 3,
+# `0016:894-1037`, `:3064-3070`; ADR-0047:73-89, `:112`). NOT a new dependency decision:
+# `sha2 = "0.11"` is already a workspace dependency (`Cargo.toml:147`), used by
+# `gateway-s3`/`server`, its licence inside the `deny.toml` allowlist — ADR-0003's audit is
+# not re-opened by naming it here too.
+sha2.workspace = true
 
 [dev-dependencies]
 # The fragment-fault audit tests assert on what the read path ACTUALLY emitted (#530) — a
