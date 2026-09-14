@@ -629,42 +629,43 @@ async fn an_unreadable_object_does_not_starve_the_objects_the_pass_could_read() 
 // ---- criterion (3), continued: the name outlives a store fault that ends the pass ----
 
 /// Attribution a later fault can swallow is not attribution. The pass reads more of the store
-/// after the reference build — the `orphan:` and `pending:` ledgers, then the fleet — and any of
-/// those reads can fail for reasons that have nothing to do with the damaged record: a backend
-/// blip, a partitioned store. That error propagates, and rightly (a pass that cannot read the
-/// store has no answer for any object). But by then this pass already KNOWS which record it
-/// could not read, and if that name were held back for a report the fault stops it from
+/// after the reference build — the `pending:` ledger, the committed namespace again, then the
+/// fleet — and any of those reads can fail for reasons that have nothing to do with the damaged
+/// record: a backend blip, a partitioned store. That error propagates, and rightly (a pass that
+/// cannot read the store has no answer for any object). But by then this pass already KNOWS which
+/// record it could not read, and if that name were held back for a report the fault stops it from
 /// returning, the operator would be left with an error naming nothing and the record still
 /// blocking every future pass — the stall with no way out that C-1 forbids.
 ///
-/// So the name must already be on the durability seam. Asserted per intervening read, and on the
-/// injected fault's own text, so a leg cannot pass on some *other* error.
+/// So the name must already be on the durability seam. Asserted on the `pending:` read that
+/// follows the reference build, and on the injected fault's own text, so the leg cannot pass on
+/// some *other* error. (The `orphan:` ledger is no longer a read this pass makes over a hole: it
+/// is walked only for the fragments the pass may mark, and while a record is unreadable it may
+/// mark none — #661.)
 #[tokio::test]
 async fn a_record_already_known_unreadable_is_named_before_a_later_read_can_fail() {
     enable_audit_callsites();
-    for ledger in [b"orphan:".as_slice(), b"pending:".as_slice()] {
-        let meta = MemMeta::default();
-        let d0 = MemDServer::default();
-        seed_damaged(&meta, &d0).await;
-        let meta = meta.fail_scans_of(ledger);
+    let meta = MemMeta::default();
+    let d0 = MemDServer::default();
+    seed_damaged(&meta, &d0).await;
+    let meta = meta.fail_scans_of(b"pending:");
 
-        let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
-        let audit = Capture::default();
-        let failed = reconcile(&meta, &fleet)
-            .with_subscriber(capturing_dispatch(audit.clone()))
-            .await
-            .expect_err("fixture: the poisoned ledger read must end the pass with an error");
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = vec![(0, &d0)];
+    let audit = Capture::default();
+    let failed = reconcile(&meta, &fleet)
+        .with_subscriber(capturing_dispatch(audit.clone()))
+        .await
+        .expect_err("fixture: the poisoned ledger read must end the pass with an error");
 
-        assert!(
-            failed.to_string().contains(STORE_FAULT),
-            "fixture: the pass must have failed on the INJECTED store fault: {failed}"
-        );
-        assert_attributes_blocker(
-            &audit.contents(),
-            "wyrd.custodian.restore.audit",
-            DAMAGED_OBJECT,
-        );
-    }
+    assert!(
+        failed.to_string().contains(STORE_FAULT),
+        "fixture: the pass must have failed on the INJECTED store fault: {failed}"
+    );
+    assert_attributes_blocker(
+        &audit.contents(),
+        "wyrd.custodian.restore.audit",
+        DAMAGED_OBJECT,
+    );
 }
 
 // ---- criterion (2c): the marks and the report rest on ONE reading ----

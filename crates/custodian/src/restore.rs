@@ -89,7 +89,7 @@ use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::{
-    object_name, orphan_key, orphan_leases, parse_pending_chunk, referenced_fragments, GcContext,
+    marked_among, object_name, orphan_key, parse_pending_chunk, referenced_fragments, GcContext,
     ReferenceSet,
 };
 
@@ -109,8 +109,9 @@ pub struct RestoreReport {
     /// them on its normal grace window. **This pass deletes nothing**; these become
     /// collectable, not collected.
     pub stranded_marked: usize,
-    /// Unreferenced fragments that already carried an `orphan:` record. Left untouched —
-    /// re-stamping would reset the grace clock and delay their reclamation.
+    /// Unreferenced fragments that already carried an `orphan:` record — their own key, whatever
+    /// its value holds. Left untouched — re-stamping would reset the grace clock and delay their
+    /// reclamation, or overwrite a value GC cannot read that a human still has to repair.
     pub already_marked: usize,
     /// Unreferenced fragments left alone because their chunk still holds a `pending:`
     /// lease — an in-flight write, whose lease TTL is already its grace. GC owns them.
@@ -305,7 +306,6 @@ pub async fn reconcile_after_restore(
     // not attribution.
     let mut unreadable = BTreeSet::new();
     attribute_unresolvable(&referenced.unresolvable, &mut unreadable);
-    let already = orphan_leases(ctx.meta).await?;
     let PendingLedger {
         held: pending,
         unreadable: pending_unreadable,
@@ -367,7 +367,9 @@ pub async fn reconcile_after_restore(
         canonical.entry(frag).or_default().push(dserver);
     }
 
-    // Pass 2 — decide, with the full picture.
+    // Pass 2 — decide, with the full picture: first which fragments may be marked at all, then
+    // (below) which of those already are.
+    let mut candidates: Vec<(DServerId, FragmentId)> = Vec::new();
     for (dserver, frag) in on_disk {
         // SAFETY GATE, identical to GC's: never mark a fragment the restored map points at —
         // nor any fragment of a malformed-placement chunk, whose true placement cannot be
@@ -410,7 +412,19 @@ pub async fn reconcile_after_restore(
             // is exactly right, and is the leak this pass exists to close.
         }
 
-        if already.contains_key(&(dserver, frag)) {
+        candidates.push((dserver, frag));
+    }
+
+    // Which candidates ALREADY carry their own `orphan:` record — judged over the WHOLE ledger,
+    // walked in bounded pages (`gc::marked_among`), never one `scan` (which fails whole past
+    // `SCAN_CAP`) and never part of it: the put below re-stamps anything this judgement missed,
+    // restarting that mark's grace clock. Any value counts, readable or not — a mark whose value
+    // does not read as an instant is still a mark, and re-stamping it would erase the only
+    // evidence a human has to repair. Read only once the candidates are known, so a pass with
+    // nothing it may mark reads none of the ledger.
+    let already = marked_among(ctx.meta, &candidates).await?;
+    for (dserver, frag) in candidates {
+        if already.contains(&(dserver, frag)) {
             report.already_marked += 1;
             continue;
         }
