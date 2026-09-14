@@ -1783,9 +1783,13 @@ const RESTORE_STRAY: ChunkId = 0x6513;
 const LATE_INODE: InodeId = 2;
 /// How far past the pass's start the concurrent writer's landing point is drawn from, in
 /// simulated milliseconds. One `network_hop` is 1 ms and the pass's two `inode:` readings are
-/// three hops apart, so this span spans "before the second reading", the tie with it, and "after
-/// the whole pass" — and the coverage property below **proves** the middle one is reached rather
-/// than assuming it.
+/// two hops apart, with the `pending:` scan between them (the `orphan:` ledger is read after both,
+/// and only for the fragments the pass may mark — #661), so this span spans "before the second
+/// reading", the tie with it, and "after the whole pass" — and the coverage property below
+/// **proves** the middle one is reached rather than assuming it. A writer drawn to land at 0 ms
+/// starts at once rather than sleeping: the simulator's `sleep` never finishes inside the tick it
+/// was called in, so a zero sleep would start the writer a hop late — onto the tie with the
+/// second reading, never ahead of it.
 const RESTORE_NEMESIS_SPAN: u32 = 6;
 
 /// A recording tap over the DST tier's simulated-TiKV store: every trait call is forwarded
@@ -1969,7 +1973,10 @@ async fn restore_under_a_concurrent_writer(nemesis: Nemesis, delay_millis: u64) 
         let meta = Arc::clone(&meta);
         let held_key = held_key.clone();
         async move {
-            madsim::time::sleep(Duration::from_millis(delay_millis)).await;
+            // Zero means now: see `RESTORE_NEMESIS_SPAN`.
+            if delay_millis > 0 {
+                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
+            }
             let outcome = match nemesis {
                 Nemesis::LateCommit => {
                     metadata::create(&*meta, ROOT, "late", LATE_INODE, &late_record).await
@@ -2165,6 +2172,389 @@ async fn prop_restore_two_readings_cover_the_divergence_window() {
     }
 }
 
+// ---- property 12: GC's paged walk of the `orphan:` ledger under a concurrent unlink (#661) ----
+//
+// GC reads the orphan ledger in cursor-keyed `scan_page` pages, never with one `scan` (proposal
+// 0016, `0016:1392-1408`), so a pass's view of the ledger is assembled over several reads with
+// real await boundaries between them — and a writer can land in between. The per-pass legs in
+// `crates/custodian/tests/gc_ledger_walk.rs` pin the walk's decisions over doubles that never
+// yield; here the ledger is paged over the simulated-TiKV model with a page cap the seed picks,
+// and a genuinely concurrent task unlinks an object at an instant the seed picks, writing fresh
+// marks (inside grace) behind the walk's current page and ahead of it.
+//
+// The ledger stays below the production window (`gc::ORPHAN_WINDOW`): that is a constant, and a
+// test could lower it only through a context field or a global, both ruled out. So every pass
+// reads the whole ledger in several pages, and what the simulator sweeps is where between those
+// pages the writer lands — the no-skip clause (`scan_page` clause 4) doing its work under a real
+// interleaving rather than a scripted one.
+//
+// The property is the retention rule itself: no fragment that is referenced, or whose own mark is
+// inside its grace window, is ever deleted — and every fragment actionable when the run starts is
+// reclaimed by its end. The unlinked object's chunks also carry a stale, EXPIRED `pending:` lease
+// (a writer that died between its commit and its release), so a walk that let the lease outrank a
+// mark it had not read would delete those fragments inside their grace window.
+
+/// The object referenced for the whole run: chunk 7, one fragment on server 1. Its fragment also
+/// carries a stale mark long past grace, so the reference is the only thing keeping it.
+const WALK_LIVE: ChunkId = 7;
+/// The unlinked object's two chunks: chunk 1 on server 0 and chunk 9 on server 3. Their marks —
+/// written by the unlink — are the first (`orphan:0:1:0`) and last (`orphan:3:9:0`) keys of the
+/// ledger, so wherever the walk is mid-way when they land, one is behind it and one ahead.
+const WALK_VICTIM: [(ChunkId, DServerId); 2] = [(1, 0), (9, 3)];
+/// Where the actionable ledger's chunk ids start: `5000..`, four digits each, so they sort after
+/// `orphan:0:1:0` and `orphan:2:4…:0` and before `orphan:1:7:0` and `orphan:3:9:0`.
+const WALK_ACTIONABLE_BASE: ChunkId = 5000;
+/// Two unreferenced fragments on server 2 whose marks are inside grace for the whole run.
+const WALK_WITHIN_GRACE: [ChunkId; 2] = [4000, 4001];
+const WALK_VICTIM_INODE: InodeId = 3;
+const WALK_LIVE_INODE: InodeId = 4;
+const WALK_GRACE: u64 = 1_000;
+/// Every pass runs at this instant; the unlink stamps it too, so its marks are inside grace for
+/// the whole run while everything stamped at zero is long past it.
+const WALK_NOW: u64 = 10_000;
+/// Passes per run: the first reclaims the actionable ledger, the rest walk what the unlink wrote.
+const WALK_PASSES: usize = 3;
+/// How far past the run's start the unlink's landing point is drawn from, in simulated
+/// milliseconds. One `network_hop` is 1 ms; a pass is its two scans, the cursor read, one hop per
+/// page and a cleanup commit, and the unlink itself spans four hops (two reads and a commit) — so
+/// this spans "before the first page", every gap between pages of the first walk, the gaps between
+/// passes, and "after the whole run". The coverage property below proves the mid-walk landing is
+/// reached rather than assuming it.
+const WALK_NEMESIS_SPAN: u32 = 32;
+
+/// One observation at the store seam, in the order the simulation produced them. Keys are kept as
+/// text: every key in this run is ASCII, so text order is the store's byte order, and a failure
+/// message stays readable.
+#[derive(Clone, Debug)]
+enum WalkEvent {
+    /// The run began a GC pass.
+    Pass,
+    /// A `scan_page` of the `orphan:` ledger answered, ending on `last`; `more` is whether it
+    /// handed back a cursor (the walk was not done).
+    Page { last: Option<String>, more: bool },
+    /// A commit wrote these `orphan:` marks — the unlink, the only writer of marks in the run.
+    Marked(Vec<String>),
+}
+
+/// A recording tap over the simulated-TiKV store: every call is forwarded unchanged, network hops
+/// included, and the orphan-ledger pages and mark-writing commits are logged in the order they
+/// complete. Instance state only (ADR-0035).
+struct WalkMeta {
+    inner: SimTikvMetadataStore,
+    events: Mutex<Vec<WalkEvent>>,
+}
+
+impl WalkMeta {
+    fn log(&self, event: WalkEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+#[async_trait]
+impl MetadataStore for WalkMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        let (items, next) = self.inner.scan_page(prefix, after, limit).await?;
+        if prefix == metadata::ORPHAN_PREFIX {
+            self.log(WalkEvent::Page {
+                last: items
+                    .last()
+                    .map(|(key, _)| String::from_utf8_lossy(key).into_owned()),
+                more: next.is_some(),
+            });
+        }
+        Ok((items, next))
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let marks: Vec<String> = batch
+            .puts
+            .iter()
+            .filter(|(key, _)| key.starts_with(metadata::ORPHAN_PREFIX))
+            .map(|(key, _)| String::from_utf8_lossy(key).into_owned())
+            .collect();
+        let outcome = self.inner.commit(batch).await?;
+        if outcome == CommitOutcome::Committed && !marks.is_empty() {
+            self.log(WalkEvent::Marked(marks));
+        }
+        Ok(outcome)
+    }
+}
+
+/// Where the unlink's marks landed relative to the walk — observed at the store seam.
+struct WalkLanding {
+    /// Between two pages of one pass's walk: after a page that handed back a cursor, before the
+    /// next page of the same pass.
+    mid_walk: bool,
+    /// Mid-walk, with marks both behind the walk's cursor and ahead of it.
+    behind_and_ahead: bool,
+}
+
+fn walk_landing(events: &[WalkEvent]) -> WalkLanding {
+    let mut cursor: Option<&String> = None;
+    for event in events {
+        match event {
+            WalkEvent::Pass => cursor = None,
+            WalkEvent::Page { last, more } => cursor = last.as_ref().filter(|_| *more),
+            WalkEvent::Marked(keys) => {
+                let Some(at) = cursor else {
+                    return WalkLanding {
+                        mid_walk: false,
+                        behind_and_ahead: false,
+                    };
+                };
+                return WalkLanding {
+                    mid_walk: true,
+                    behind_and_ahead: keys.iter().any(|key| key < at)
+                        && keys.iter().any(|key| key > at),
+                };
+            }
+        }
+    }
+    WalkLanding {
+        mid_walk: false,
+        behind_and_ahead: false,
+    }
+}
+
+/// A committed flat record placing each `(chunk, dserver)` as an un-erasure-coded chunk.
+fn flat_committed_on(chunks: &[(ChunkId, DServerId)]) -> InodeRecord {
+    InodeRecord {
+        size: 5 * chunks.len() as u64,
+        chunk_map: chunks
+            .iter()
+            .map(|&(id, dserver)| ChunkRef {
+                id,
+                scheme: EcScheme::None,
+                len: 5,
+                placement: vec![dserver],
+            })
+            .collect::<Vec<_>>()
+            .into(),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    }
+}
+
+/// One run: `WALK_PASSES` GC passes, each with a fresh `GcContext`, over a ledger of `actionable`
+/// reclaimable marks (plus the live object's stale mark and two within-grace ones) paged `page_cap`
+/// at a time, while the unlink lands `delay_millis` into the run. Asserts the retention property
+/// and returns where the unlink landed.
+async fn gc_walk_under_a_concurrent_unlink(
+    page_cap: usize,
+    actionable: usize,
+    delay_millis: u64,
+) -> WalkLanding {
+    let d = servers();
+    let meta = Arc::new(WalkMeta {
+        inner: SimTikvMetadataStore::new().with_scan_cap(page_cap),
+        events: Mutex::new(Vec::new()),
+    });
+
+    // The live object, referenced for the whole run — and a stale mark on its fragment, long past
+    // grace, so only the reference keeps it.
+    let live = frag_of(WALK_LIVE);
+    d[1].put_fragment(live, Bytes::from_static(b"live"), None)
+        .await
+        .unwrap();
+    let live_record = flat_committed_on(&[(WALK_LIVE, 1)]);
+    let created = metadata::create(&*meta, ROOT, "walk-live", WALK_LIVE_INODE, &live_record);
+    assert_eq!(created.await.unwrap(), CommitOutcome::Committed);
+    mark_orphaned(&*meta, 1, live, 0).await.unwrap();
+
+    // The object the concurrent task unlinks: referenced until it lands. Its chunks keep a stale,
+    // expired lease, so after the unlink a mark is all that stands between them and a reclaim.
+    for &(chunk, dserver) in &WALK_VICTIM {
+        d[dserver as usize]
+            .put_fragment(frag_of(chunk), Bytes::from_static(b"victim"), None)
+            .await
+            .unwrap();
+        let lease = PendingEntry {
+            lease_expiry_millis: 1,
+            owner: None,
+            staged: None,
+        };
+        metadata::put_pending(&*meta, chunk, &lease).await.unwrap();
+    }
+    let victim_record = flat_committed_on(&WALK_VICTIM);
+    let created = metadata::create(
+        &*meta,
+        ROOT,
+        "walk-victim",
+        WALK_VICTIM_INODE,
+        &victim_record,
+    );
+    assert_eq!(created.await.unwrap(), CommitOutcome::Committed);
+
+    // Unreferenced fragments whose marks are inside grace for the whole run.
+    for &chunk in &WALK_WITHIN_GRACE {
+        d[2].put_fragment(frag_of(chunk), Bytes::from_static(b"held"), None)
+            .await
+            .unwrap();
+        mark_orphaned(&*meta, 2, frag_of(chunk), WALK_NOW)
+            .await
+            .unwrap();
+    }
+
+    // The actionable ledger: unreferenced fragments whose marks are long past grace.
+    let reclaimable: Vec<(DServerId, FragmentId)> = (0..actionable)
+        .map(|i| {
+            let chunk = WALK_ACTIONABLE_BASE + i as ChunkId;
+            ((i % 4) as DServerId, frag_of(chunk))
+        })
+        .collect();
+    for &(dserver, frag) in &reclaimable {
+        d[dserver as usize]
+            .put_fragment(frag, Bytes::from_static(b"garbage"), None)
+            .await
+            .unwrap();
+        mark_orphaned(&*meta, dserver, frag, 0).await.unwrap();
+    }
+
+    // The run starts here: what the fixture wrote above is not the concurrent writer.
+    meta.events.lock().unwrap().clear();
+
+    // The genuinely concurrent unlink, landing where the seed (or the coverage walk) puts it.
+    let writer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        async move {
+            // Zero means now: the simulator's `sleep` never finishes inside the tick it was called
+            // in (see `RESTORE_NEMESIS_SPAN`).
+            if delay_millis > 0 {
+                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
+            }
+            let unlinked = metadata::unlink(&*meta, ROOT, "walk-victim", WALK_NOW)
+                .await
+                .unwrap()
+                .expect("the victim's name is bound until this unlink");
+            assert_eq!(
+                unlinked.outcome,
+                CommitOutcome::Committed,
+                "the concurrent unlink must land, or this run tests nothing"
+            );
+        }
+    });
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-gc-walk").await;
+    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    for pass in 1..=WALK_PASSES {
+        meta.log(WalkEvent::Pass);
+        // A FRESH context every pass, as the deployed loop builds one
+        // (`crates/server/src/custodian.rs:600-608`).
+        let ctx = GcContext {
+            meta: &*meta,
+            fleet: &fleet,
+            grace_window_millis: WALK_GRACE,
+            expired_pending: ExpiredPendingPolicy::Reclaim,
+        };
+        let outcome =
+            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, WALK_NOW).await;
+        assert!(
+            outcome.is_ok(),
+            "GC pass {pass} failed (page cap {page_cap}, unlink at {delay_millis} ms): {:?}",
+            outcome.err()
+        );
+    }
+    writer
+        .await
+        .expect("the concurrent unlink ran to completion");
+    let events = meta.events.lock().unwrap().clone();
+
+    // (1) NEVER DELETE A REFERENCED FRAGMENT, OR ONE WHOSE OWN MARK IS INSIDE GRACE.
+    assert!(
+        d[1].get_fragment(live).await.unwrap().is_some(),
+        "the referenced object's fragment was deleted (page cap {page_cap}, unlink at \
+         {delay_millis} ms): {events:?}"
+    );
+    for &(chunk, dserver) in &WALK_VICTIM {
+        assert!(
+            d[dserver as usize]
+                .get_fragment(frag_of(chunk))
+                .await
+                .unwrap()
+                .is_some(),
+            "chunk {chunk} on server {dserver} was deleted — referenced until the unlink, and \
+             marked inside grace after it (page cap {page_cap}, unlink at {delay_millis} ms): \
+             {events:?}"
+        );
+        assert_eq!(
+            meta.get(&metadata::orphan_key(dserver, frag_of(chunk)))
+                .await
+                .unwrap(),
+            Some(Bytes::from(WALK_NOW.to_string())),
+            "the unlink's mark for chunk {chunk} was consumed inside its grace window"
+        );
+    }
+    for &chunk in &WALK_WITHIN_GRACE {
+        assert!(
+            d[2].get_fragment(frag_of(chunk)).await.unwrap().is_some(),
+            "a fragment whose mark is inside grace was deleted (page cap {page_cap}, unlink at \
+             {delay_millis} ms)"
+        );
+    }
+
+    // (2) EVERY FRAGMENT ACTIONABLE AT THE START IS RECLAIMED BY THE END, its mark consumed.
+    for &(dserver, frag) in &reclaimable {
+        assert!(
+            d[dserver as usize]
+                .get_fragment(frag)
+                .await
+                .unwrap()
+                .is_none()
+                && !is_marked(&*meta, dserver, frag).await,
+            "{frag:?} on server {dserver} was actionable from the start and survived the run \
+             (page cap {page_cap}, unlink at {delay_millis} ms): {events:?}"
+        );
+    }
+
+    walk_landing(&events)
+}
+
+/// The campaign leg: the seed picks the page cap, how long the ledger is, and where the unlink
+/// lands, so 50 seeds sweep the schedule space around the walk's pages.
+async fn prop_gc_orphan_walk_under_a_concurrent_unlink(rng: &mut ChaCha8Rng) {
+    let page_cap = 3 + (rng.next_u32() % 4) as usize;
+    let actionable =
+        page_cap * (3 + (rng.next_u32() % 3) as usize) + (rng.next_u32() as usize % page_cap);
+    let delay = u64::from(rng.next_u32() % (WALK_NEMESIS_SPAN + 1));
+    gc_walk_under_a_concurrent_unlink(page_cap, actionable, delay).await;
+}
+
+/// **The mid-walk landing is genuinely REACHED.** Walks the unlink's landing point across the
+/// whole span in one run, asserting the full property at every point, then asserts that at least
+/// one landing fell between two pages of a pass's walk with marks both behind the walk's cursor and
+/// ahead of it — the interleaving this property is about. Without it, a span that drifted past the
+/// walk would leave the campaign green with nothing behind it.
+async fn prop_gc_orphan_walk_reaches_the_mid_walk_landing() {
+    let mut mid_walk = Vec::new();
+    for delay in 0..=u64::from(WALK_NEMESIS_SPAN) {
+        let landing = gc_walk_under_a_concurrent_unlink(3, 12, delay).await;
+        if landing.mid_walk && landing.behind_and_ahead {
+            mid_walk.push(delay);
+        }
+    }
+    assert!(
+        !mid_walk.is_empty(),
+        "no landing point in 0..={WALK_NEMESIS_SPAN} ms fell between two pages of a walk with \
+         marks both behind and ahead of it — the interleaving this property exists for was never \
+         exercised"
+    );
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -2247,6 +2637,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn gc_orphan_walk_under_a_concurrent_unlink() {
+        prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn gc_orphan_walk_reaches_the_mid_walk_landing() {
+        prop_gc_orphan_walk_reaches_the_mid_walk_landing().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -2279,6 +2681,7 @@ dst_campaign_test! {
             prop_reader_flips_atomically_across_commit(&mut rng).await;
             prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies(&mut rng).await;
             prop_restore_two_readings_never_license_a_mark(&mut rng).await;
+            prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rng).await;
         }
     }
 }
