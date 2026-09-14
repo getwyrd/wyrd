@@ -202,9 +202,12 @@ pub async fn mark_orphaned(
 /// report the store converged — [`Reconciled::Changed`] if any fragment bytes were
 /// reclaimed, and [`Reconciled::Satisfied`] otherwise. Scrub answers the identical
 /// condition the identical way ([`crate::scrub::reconcile`]): one incomplete set, one
-/// rule, read twice. `Satisfied` is "this pass reclaimed nothing", as it always was — over
-/// the one window of the `orphan:` ledger the pass read ([`OrphanWindow`]), never a claim
-/// about the rest of the ledger.
+/// rule, read twice. A pass whose window of the `orphan:` ledger ([`OrphanWindow`]) stopped
+/// short of the ledger's end and reclaimed nothing answers [`Reconciled::Partial`], never
+/// `Satisfied`: `Satisfied` certifies that reality matched, and a caller driving the loop to
+/// satisfaction would stop on it with eligible marks still unvisited in the windows ahead (PR
+/// #802 review). `Satisfied` is therefore "this pass read the ledger to its end and reclaimed
+/// nothing".
 pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Reconciled> {
     // The reference set is the safety gate: every fragment a *committed* chunk map's
     // placement record points at. A fragment in this set is NEVER reclaimed
@@ -352,6 +355,10 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
         Reconciled::Blocked
     } else if changed {
         Reconciled::Changed
+    } else if window.is_partial() {
+        // Nothing reclaimed in THIS window, and more of the ledger lies beyond it: not a
+        // certification. The next pass resumes where this one stopped.
+        Reconciled::Partial
     } else {
         Reconciled::Satisfied
     })
@@ -677,10 +684,24 @@ impl OrphanWindow {
             .get(ORPHAN_CURSOR_KEY)
             .await?
             .map(|value| value.to_vec());
-        // Only a key inside the ledger is a place to resume; anything else is the head.
-        let after = stored
-            .clone()
-            .filter(|cursor| cursor.starts_with(ORPHAN_PREFIX));
+        // Only a key the ledger could hold is a place to resume: under the prefix AND no longer
+        // than the longest key a writer can spell. The empty value is the head, as
+        // `record_resume_point` writes it. Anything else — a torn, damaged or oversized value a
+        // restore or a fault left here — is named and the walk restarts from the head. Handed
+        // to `scan_page` as-is, an oversized cursor would be refused by the backend as a key
+        // too large BEFORE `record_resume_point` could move it, and every later pass would
+        // reread the same value and fail the same way — reclamation stopped for good on one
+        // record (PR #802 review). `record_resume_point` rewrites it below, since the head this
+        // pass resumes from differs from what is stored.
+        let after = match stored.as_deref() {
+            None => None,
+            Some([]) => None,
+            Some(cursor) if is_resumable_cursor(cursor) => Some(cursor.to_vec()),
+            Some(cursor) => {
+                emit_unusable_cursor(&object_name(cursor), cursor.len());
+                None
+            }
+        };
 
         let mut marks = HashMap::new();
         let mut position = after.clone();
@@ -731,6 +752,12 @@ impl OrphanWindow {
         Ok(())
     }
 
+    /// Whether this window stopped short of the ledger's end — so the pass has not seen the
+    /// whole ledger and may not answer [`Reconciled::Satisfied`] over it.
+    fn is_partial(&self) -> bool {
+        self.through.is_some()
+    }
+
     /// The fragment's own mark, if this window read it.
     fn mark_of(&self, dserver: DServerId, frag: FragmentId) -> Option<ReadMark> {
         self.marks.get(&(dserver, frag)).copied()
@@ -749,6 +776,19 @@ impl OrphanWindow {
                 .as_deref()
                 .is_none_or(|through| key.as_slice() <= through)
     }
+}
+
+/// The longest key [`orphan_key`] can spell: the prefix, then a `u64` D-server id, a `u128`
+/// chunk id and a `u16` index in decimal, colon-separated — the bound a persisted cursor is
+/// held to before it is handed to a backend as a key.
+const ORPHAN_KEY_MAX_LEN: usize = ORPHAN_PREFIX.len() + 20 + 1 + 39 + 1 + 5;
+
+/// Whether a persisted cursor is a place the walk may resume from: a key under the ledger's
+/// prefix that a backend will accept as a key. It need not parse — a malformed key already IN
+/// the ledger can legitimately end a window and become the cursor, and restarting from the
+/// head on it would pin the walk to that window for good — only be bounded.
+fn is_resumable_cursor(cursor: &[u8]) -> bool {
+    cursor.starts_with(ORPHAN_PREFIX) && cursor.len() <= ORPHAN_KEY_MAX_LEN
 }
 
 /// Read one `orphan:` ledger entry into `marks` — or, for a key no writer spells, classify it,
@@ -979,6 +1019,21 @@ fn emit_unreadable_mark(mark: &str) {
         action = "unreadable-orphan-mark",
         mark = %mark,
         "gc could not read an orphan-ledger mark's value as an instant; it still counts as a mark, so its fragment is kept and the mark left in place — operator signal",
+    );
+}
+
+/// Emit a persisted walk cursor the pass could **not resume from** — not a bounded key under the
+/// ledger's prefix — on the durability-plane seam (ADR-0011 / ADR-0012): the walk restarts from
+/// the head and the record is rewritten, so no pass fails on it, but a value got there that no
+/// pass wrote, and an operator should know.
+fn emit_unusable_cursor(cursor: &str, len: usize) {
+    tracing::warn!(monotonic_counter.gc_unusable_orphan_cursors = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "unusable-orphan-cursor",
+        cursor = %cursor,
+        len,
+        "gc could not resume the orphan-ledger walk from the persisted cursor (not a bounded ledger key); restarting from the head and rewriting it — operator signal",
     );
 }
 

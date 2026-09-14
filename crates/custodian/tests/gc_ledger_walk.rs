@@ -41,6 +41,11 @@
 //!   deleted, and is named on the audit seam.
 //! * **E** — only a fragment's own key, as `orphan_key` spells it, licenses a reclaim.
 //! * **F** — restore survives the same ledger and never re-stamps a mark it did not read.
+//! * **G** — a pass that stops short of the ledger's end and reclaims nothing answers `Partial`,
+//!   never `Satisfied`; only a pass that read the ledger to its end may (PR #802 review).
+//! * **H** — a persisted cursor the walk cannot resume from (longer than any key a writer
+//!   spells) restarts the walk from the head and is rewritten, instead of failing every pass;
+//!   the longest key a writer can spell is still honoured (PR #802 review).
 //! * **The walk's guards** — a store whose `scan_page` repeats its cursor, or answers more than
 //!   it was asked for, is refused with an error by both passes rather than walked.
 //!
@@ -472,6 +477,8 @@ struct Walk {
     custodian: Custodian,
     policy: ExpiredPendingPolicy,
     passes: usize,
+    /// What the last pass answered.
+    outcome: Option<Reconciled>,
 }
 
 impl Walk {
@@ -482,6 +489,7 @@ impl Walk {
             custodian,
             policy,
             passes: 0,
+            outcome: None,
         }
     }
 
@@ -514,13 +522,14 @@ impl Walk {
             now,
         )
         .await;
-        if let Err(err) = &outcome {
-            panic!(
+        match outcome {
+            Err(err) => panic!(
                 "{leg}: GC pass {} failed: {err}. On main this is the single `scan` of the \
                  `orphan:` ledger past the cap (`gc.rs:177`, the scan at `:526`) — a ledger this \
                  size fails every pass, and the pass that should shrink it can never start",
                 self.passes
-            );
+            ),
+            Ok(outcome) => self.outcome = Some(outcome),
         }
         let tap = meta.take_tap();
         assert_bounded(leg, self.passes, &tap);
@@ -774,6 +783,159 @@ async fn c_the_tail_does_not_starve_and_the_walk_wraps() {
         0,
         "leg C: every consumed mark is removed"
     );
+}
+
+// ---- leg G: a partial walk is not a certification ----
+
+/// A ledger longer than one window whose first window holds nothing reclaimable (marks inside
+/// their grace) while the window behind it holds expired marks. The first pass reclaims nothing
+/// and must NOT answer `Satisfied` — a caller driving reconciliation to satisfaction would stop
+/// with the tail's garbage unvisited. Only once the ledger has been read to its end does a pass
+/// that reclaims nothing answer `Satisfied`. Negation: return `Satisfied` for an unchanged
+/// partial window — the first assertion fails.
+#[tokio::test]
+async fn g_a_partial_walk_that_reclaims_nothing_is_not_satisfied() {
+    let meta = LedgerMeta::default();
+    let servers: Vec<MemDServer> = (0..3).map(|_| MemDServer::default()).collect();
+    let head = B + 10;
+    let tail = 5;
+    let head_frags: Vec<FragmentId> = (0..head)
+        .map(|i| frag(2_000_000 + i as ChunkId, 0))
+        .collect();
+    let tail_frags: Vec<FragmentId> = (0..tail)
+        .map(|i| frag(3_000_000 + i as ChunkId, 0))
+        .collect();
+    for &f in &head_frags {
+        servers[1].put(f);
+        meta.seed_mark(1, f, NOW); // inside grace at NOW: kept
+    }
+    for &f in &tail_frags {
+        servers[2].put(f);
+        meta.seed_mark(2, f, 0); // long expired: reclaimable
+    }
+
+    let coord = MemCoordination::new();
+    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Defer).await;
+    let fleet = fleet_of(&servers);
+
+    let tap = walk.pass("leg G", &meta, &fleet, NOW).await;
+    assert!(
+        !tap.reached_end(),
+        "fixture: the first window must stop short of the tail"
+    );
+    assert_eq!(
+        servers[2].fragment_count(),
+        tail,
+        "fixture: the tail is beyond the window"
+    );
+    assert_eq!(
+        walk.outcome,
+        Some(Reconciled::Partial),
+        "leg G: a pass that read one window of a longer ledger and reclaimed nothing certified \
+         the store as converged with {tail} expired marks unvisited behind its window"
+    );
+
+    // Drive to the end: every pass before the ledger is empty is Changed or Partial, never
+    // Satisfied, and the tail is reclaimed on the way.
+    let later = NOW + GRACE;
+    let bound = (head + tail).div_ceil(B) * 2 + 2;
+    while meta.orphan_len() > 0 {
+        assert!(
+            walk.passes < bound,
+            "leg G: ledger not drained after {} passes",
+            walk.passes
+        );
+        walk.pass("leg G", &meta, &fleet, later).await;
+        assert_ne!(
+            walk.outcome,
+            Some(Reconciled::Satisfied),
+            "leg G: Satisfied answered while {} marks remained",
+            meta.orphan_len()
+        );
+    }
+    assert_eq!(
+        servers[2].fragment_count(),
+        0,
+        "leg G: the tail was never reclaimed"
+    );
+    let tap = walk.pass("leg G", &meta, &fleet, later).await;
+    assert!(
+        tap.reached_end(),
+        "leg G: an empty ledger is read to its end"
+    );
+    assert_eq!(
+        walk.outcome,
+        Some(Reconciled::Satisfied),
+        "leg G: a pass that read the whole (empty) ledger and reclaimed nothing is Satisfied"
+    );
+}
+
+// ---- leg H: a cursor the walk cannot resume from restarts it, not the failure ----
+
+/// The cursor record is a metadata VALUE and may hold anything a restore or a fault left there,
+/// while `scan_page` takes it as a KEY the backend bounds. A value under the prefix but longer
+/// than any key a writer spells is not handed to the backend: the pass names it, restarts from
+/// the head, and rewrites the record — so the next pass does not meet it again. The longest key a
+/// writer CAN spell is still honoured as a cursor. Negation: drop the length bound — the
+/// "rewritten" assertion fails (and against a real backend the pass would).
+#[tokio::test]
+async fn h_an_unusable_cursor_restarts_the_walk_from_the_head_and_is_rewritten() {
+    const CURSOR: &[u8] = b"gc:orphan-cursor";
+    let meta = LedgerMeta::default();
+    let servers: Vec<MemDServer> = (0..2).map(|_| MemDServer::default()).collect();
+    let expired = frag(4_000_001, 0);
+    servers[1].put(expired);
+    meta.seed_mark(1, expired, 0);
+    let coord = MemCoordination::new();
+    let mut walk = Walk::new(&coord, ExpiredPendingPolicy::Defer).await;
+    let fleet = fleet_of(&servers);
+
+    // The longest key any writer can spell: a legitimate resume point, honoured as one.
+    let longest = orphan_key(
+        u64::MAX,
+        FragmentId {
+            chunk: u128::MAX,
+            index: u16::MAX,
+        },
+    );
+    meta.seed(CURSOR.to_vec(), longest.clone());
+    let tap = walk.pass("leg H", &meta, &fleet, NOW).await;
+    assert_eq!(
+        tap.resumed_from(),
+        Some(longest.as_slice()),
+        "leg H: the longest spellable key must still be a usable cursor"
+    );
+    // (Byte order puts `orphan:18446744073709551615:…` BEFORE `orphan:1:…`, so this pass read
+    // the real mark too and reclaimed it; each case below re-seeds it.)
+
+    // One byte past the longest spellable key: unusable. Oversized the same way, only more so.
+    for (label, bad) in [
+        ("one byte over", [longest.as_slice(), b"0"].concat()),
+        (
+            "oversized",
+            [ORPHAN_PREFIX, vec![b'x'; 100_000].as_slice()].concat(),
+        ),
+    ] {
+        meta.seed(CURSOR.to_vec(), bad.clone());
+        servers[1].put(expired);
+        meta.seed_mark(1, expired, 0);
+        let tap = walk.pass("leg H", &meta, &fleet, NOW).await;
+        assert_eq!(
+            tap.resumed_from(),
+            None,
+            "leg H ({label}): an unusable cursor must restart the walk from the head"
+        );
+        assert_eq!(
+            servers[1].fragment_count(),
+            0,
+            "leg H ({label}): the expired mark at the head was not reclaimed"
+        );
+        assert_ne!(
+            meta.value(CURSOR).as_deref(),
+            Some(bad.as_slice()),
+            "leg H ({label}): the unusable cursor was left in place for the next pass to fail on"
+        );
+    }
 }
 
 // ---- leg D: what a pass may conclude from a partial read ----

@@ -42,20 +42,37 @@ pub enum Reconciled {
     /// healthy object instead, and [`reconcile_step`] would stop before the loops that
     /// follow it ever ran.
     Blocked,
+    /// The loop read a **bounded window** of its input and stopped short of the end: nothing
+    /// it read diverged, and the rest is unvisited. GC answers this when its walk of the
+    /// `orphan:` ledger (`crate::gc::OrphanWindow`) did not reach the ledger's end this pass
+    /// (PR #802 review).
+    ///
+    /// Distinct from [`Reconciled::Satisfied`] because that outcome is a **certification** —
+    /// "reality already matched the desired state" — and a caller that drives reconciliation
+    /// until it is satisfied would stop on it. Over a partial walk that stop leaves eligible
+    /// garbage unvisited in the windows the pass never read, so the pass must answer something
+    /// a caller keeps driving on. Distinct from [`Reconciled::Blocked`] because nothing is
+    /// wrong: the next pass resumes where this one stopped, and the whole ledger is read once
+    /// per lap. Distinct from [`Reconciled::Changed`] because the loop converged nothing.
+    Partial,
 }
 
 impl Reconciled {
     /// The outcome of a step whose loops reported `self` and `other` — the **least
     /// certified** of the two, so a step never claims more than its weakest loop did.
     ///
-    /// `Blocked` outranks `Changed`, and `Changed` outranks `Satisfied`. A blocked loop
-    /// beside a converging one is still a step that cannot certify the store: the enqueues
-    /// and reclamations the other loop made are durable in the store either way, while the
-    /// refusal is the only thing that tells the caller its picture has a hole in it.
+    /// `Blocked` outranks `Changed`, `Changed` outranks `Partial`, and `Partial` outranks
+    /// `Satisfied`. A blocked loop beside a converging one is still a step that cannot
+    /// certify the store: the enqueues and reclamations the other loop made are durable in
+    /// the store either way, while the refusal is the only thing that tells the caller its
+    /// picture has a hole in it. `Changed` and `Partial` both mean "drive again"; `Changed`
+    /// wins the pair because it carries the evidence that something converged, and `Partial`
+    /// exists only to deny a `Satisfied` that a partial walk could not honestly give.
     fn least_certified(self, other: Reconciled) -> Reconciled {
         match (self, other) {
             (Reconciled::Blocked, _) | (_, Reconciled::Blocked) => Reconciled::Blocked,
             (Reconciled::Changed, _) | (_, Reconciled::Changed) => Reconciled::Changed,
+            (Reconciled::Partial, _) | (_, Reconciled::Partial) => Reconciled::Partial,
             (Reconciled::Satisfied, Reconciled::Satisfied) => Reconciled::Satisfied,
         }
     }
@@ -97,7 +114,8 @@ impl std::error::Error for ReconcileError {}
 /// runs the **rebalance loop** — drain/decommission evacuation ([`rebalance::reconcile`],
 /// `0005:297-303`) — and all `None` exercises the fence alone (no maintenance inputs
 /// wired). When several are supplied the step runs each independent loop and reports the
-/// **least certified** of their outcomes ([`Reconciled::least_certified`]):
+/// **least certified** of their outcomes ([`Reconciled::least_certified`], which ranks
+/// [`Reconciled::Partial`] between `Changed` and `Satisfied`):
 /// [`Reconciled::Blocked`] if any loop refused to certify, else [`Reconciled::Changed`] if
 /// any converged.
 #[allow(clippy::too_many_arguments)]
