@@ -18,6 +18,12 @@
 //! `0016:3064-3070`), and the request identity a `Completed` tombstone answers a retry on
 //! ([`complete_fingerprint`], `0016:898-908`).
 //!
+//! It also carries the protocol's **numbers** (issue #655, slice 2 of 7 of #636; section 14):
+//! every knob `0016`'s table settles a range for, valued as a named constant with its
+//! derivation, and [`knob_clamps_hold`], which checks a whole [`KnobSet`] against that table —
+//! the profile half of it through [`Budget`]'s own rules and derivations, so the ledger and the
+//! configuration can never disagree about what a number means.
+//!
 //! There is **no** `encode_record`/`decode_record` envelope, and this header's earlier forward
 //! reference to one is withdrawn: `0016` §1 gives every value a **key-determined** shape
 //! (`:333-356`) and a stored value carries no type tag, so a per-record arm would have nothing
@@ -122,7 +128,10 @@ use sha2::{Digest as _, Sha256};
 use wyrd_traits::{ChunkId, DServerId, SCAN_CAP};
 
 use crate::erasure;
-use crate::metadata::{self, ChunkRef, EcScheme, InodeId, SegmentGroup};
+use crate::metadata::{
+    self, ChunkRef, EcScheme, InodeId, SegmentGroup, MAX_ROOT_SEGMENTS, MAX_ROOT_VALUE_BYTES,
+    MAX_VALUE_BYTES,
+};
 
 // ===========================================================================
 // 1. Errors — every structural violation is a typed error, never a value
@@ -1580,9 +1589,16 @@ impl Budget {
     ///
     /// **One definition, used by both**, so the rule (G5) and the charge can never disagree
     /// about what "in-flight owned refs" means — the reason `checked_chunk_bytes` exists for
-    /// the other cross-checked quantity in this repo (`metadata.rs:1208-1218`).
-    fn inflight_owned_refs(&self) -> u128 {
-        u128::from(self.max_inflight_parts) * u128::from(self.max_part_chunks)
+    /// the other cross-checked quantity in this repo (`metadata.rs:1208-1218`). Section 14's
+    /// fleet-wide [`MAX_OWNED_FLEET`] is this product times the session limit, for the same
+    /// reason.
+    ///
+    /// This and the derivations below are `const fn` so that section 14's shipped
+    /// [`U_REF`] and [`MAX_SESSIONS`] are evaluated **by** them rather than by a second spelling
+    /// of the formula. That is also why the widening is `as`: `u128::from` is a trait call,
+    /// which a `const fn` cannot make.
+    const fn inflight_owned_refs(&self) -> u128 {
+        self.max_inflight_parts as u128 * self.max_part_chunks as u128
     }
 
     /// `U_ref` in **exact** integers, verbatim `0016:1469`:
@@ -1610,11 +1626,12 @@ impl Budget {
     /// the width itself cannot overflow. ADR-0045 names checked arithmetic for the same reason
     /// on `InodeRecord` version increments and `PendingEntry` lease timestamps
     /// (`docs/design/adr/0045-metadata-validation-boundaries.md:73-74`).
-    fn u_ref_exact(&self) -> u128 {
-        let raw = (u128::from(self.max_parts_per_session) + u128::from(self.max_inflight_parts))
-            * u128::from(self.max_part_chunks);
-        let ceiling = u128::from(self.max_staged_chunks) + 2 * self.inflight_owned_refs();
-        raw.min(ceiling)
+    const fn u_ref_exact(&self) -> u128 {
+        let raw = (self.max_parts_per_session as u128 + self.max_inflight_parts as u128)
+            * self.max_part_chunks as u128;
+        let ceiling = self.max_staged_chunks as u128 + 2 * self.inflight_owned_refs();
+        // `raw.min(ceiling)`, which a `const fn` cannot call (`Ord` is not a const trait).
+        raw - raw.saturating_sub(ceiling)
     }
 
     /// `U_ref` — this profile's worst-case per-session staged-reference footprint
@@ -1625,8 +1642,10 @@ impl Budget {
     /// has a `U_ref` inside the width its budget is stated in. The narrowing therefore states
     /// a type invariant the way [`crate::metadata::encode`] states serialization's
     /// (`metadata.rs:1562-1566`) — not a fallible step with a hidden failure mode.
-    pub fn u_ref(&self) -> u64 {
-        u64::try_from(self.u_ref_exact()).expect("G7 bounds every Budget's U_ref by its w_ref")
+    pub const fn u_ref(&self) -> u64 {
+        let exact = self.u_ref_exact();
+        assert!(exact as u64 as u128 == exact, "G7 bounds U_ref by w_ref");
+        exact as u64
     }
 
     /// `MAX_SESSIONS = min( ⌊W_ref / U_ref⌋ , SCAN_CAP/2 )` — **derived, never chosen**
@@ -1640,8 +1659,16 @@ impl Budget {
     /// The clamp is what makes the two bounds compose.
     ///
     /// Total: G1 ∧ G2 put `U_ref ≥ 1`, so the division always has a divisor.
-    pub fn max_sessions(&self) -> u64 {
-        (self.w_ref / self.u_ref()).min(SCAN_HALF)
+    ///
+    /// **The one spelling.** [`AdmissionRecord`]'s G8 checks a stored `max_sessions` against
+    /// it, section 14's [`MAX_SESSIONS`] is it evaluated at the shipped profile, and
+    /// [`knob_clamps_hold`] checks a configured value against it: three consumers of one
+    /// derivation, because two derivations of one budget are how a session gets admitted
+    /// against a number the reconcile host cannot hold (`docs/principles.md` §5 C-1).
+    pub const fn max_sessions(&self) -> u64 {
+        let quotient = self.w_ref / self.u_ref();
+        // `quotient.min(SCAN_HALF)`, which a `const fn` cannot call.
+        quotient - quotient.saturating_sub(SCAN_HALF)
     }
 
     /// The profile's whole rule set, in one place and applied wherever a [`Budget`] can come
@@ -1652,12 +1679,12 @@ impl Budget {
     /// tuple's own stored components to each other or to a constant of the **format** that
     /// cannot move under a stored record — [`MAX_PART_NUMBER`] and `SCAN_CAP/2`. The knob
     /// *ranges* `0016` settles for an operator's choice (the `max_chunkref_bytes`
-    /// value-ceiling that puts `MAX_PART_CHUNKS` in 165–381, the `B_ops` clamp, the
+    /// value-ceiling on `MAX_PART_CHUNKS`, the `B_ops` clamp, the
     /// `MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS` ceiling on `MAX_STAGED_CHUNKS`) are deliberately
-    /// **absent**: those constants have no definition on this base, they are #508's and
-    /// #625's to value, and `0016:1466`/`:1468` enforce them where work is admitted
-    /// (`UploadPart`, part commit). A decode that consulted one would make a durable ledger
-    /// unreadable the day a deployment moved it — what `0016:390-402` and
+    /// **absent**: [`knob_clamps_hold`] checks them over a whole configuration (section 14,
+    /// which applies these rules too), and `0016:1466`/`:1468` enforce them where work is
+    /// admitted (`UploadPart`, part commit). A decode that consulted one would make a durable
+    /// ledger unreadable the day a deployment moved it — what `0016:390-402` and
     /// [`crate::metadata::MAX_ROOT_SEGMENTS`] both forbid, and this ledger is the record every
     /// teardown path must read to decrement `count`.
     ///
@@ -4314,4 +4341,573 @@ pub fn answer(
         Verb::ListParts => Answer::ListParts(list_parts_answer(state)),
         Verb::ListMultipartUploads => Answer::ListUploads(list_uploads_answer(state)),
     }
+}
+
+// ===========================================================================
+// 14. The protocol's numbers — every knob `0016` settles a range for, valued, derived and
+//     checked as one set (issue #655; the knob table `0016:1462-1479`)
+// ===========================================================================
+//
+// `0016` settles each correctness knob's valid RANGE and BOUNDING INVARIANT and leaves the
+// VALUE to the slice that implements it (`0016:1458-1460`, `:3070-3078`). This section is that
+// slice: one named constant per knob, its derivation in its own doc comment, and
+// `knob_clamps_hold`, which checks a whole set against the table rather than one number at a
+// time. The protocol slices (#656–#660), the reaper (#625) and the gateway (#508) CONSUME these
+// and re-derive none of them: two derivations of one budget are how a session gets admitted
+// against a number the batch that must later undo it cannot hold — never fenced, never
+// deleted, holding its admission slot forever (`docs/principles.md` §5 C-1).
+//
+// Nothing here is enforced yet — no admission path exists to enforce it on — and none of it is
+// a decode rule. A capacity is a contextual check made where work is admitted, never against a
+// stored record (ADR-0045 decision 1; `0016:390-402`), so moving a number can never make a
+// durable record unreadable. That is why `Budget`'s record rules leave these ranges out, and why
+// `knob_clamps_hold` is a separate, configuration-side check that applies those rules as well.
+
+/// The durability scheme the shipped chunk caps are sized for: Reed-Solomon(6,3), the
+/// deployment default (`DEFAULT_DURABILITY`, `crates/server/src/lib.rs:49`), restated because
+/// `core` may not depend on `server` (ADR-0010). A deployment on another scheme
+/// (`--durability rs(k,m)`, `crates/server/src/cli.rs:514-532`) sizes its caps through
+/// [`max_chunkref_bytes_for`], and [`knob_clamps_hold`] refuses the shipped caps under any
+/// scheme whose chunk refs they no longer fit.
+pub const SIZING_SCHEME: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 };
+
+/// `max_chunkref_bytes` — `b_ref` in `0016`'s arithmetic (`0016:1050-1053`) — at
+/// [`SIZING_SCHEME`]: the most bytes one [`ChunkRef`] can encode to, every field at its widest
+/// rendering — the chunk id at `u128::MAX` (39 digits), `len` at `u64::MAX` (20) and one
+/// `u64::MAX` placement id (20) per fragment. **Measured, not taken from prose:**
+/// [`max_chunkref_bytes_for`] encodes exactly that ref through [`metadata::encode`],
+/// `crates/core/tests/multipart_knobs.rs` encodes it again on its own, and both must equal this
+/// constant.
+///
+/// It is 13 bytes over `0016`'s "~302 B", and the 13 bytes are `len`: both of `0016`'s figures
+/// (131 B with one-digit D-server ids, 302 B with twenty-digit ones) render `len` in seven
+/// digits, a 1 MiB chunk. Nothing bounds `len` there — `chunk_size` is a deployment knob
+/// (`0016:1474`) and a stored ref's `len` is any `u64` — so the bound every cap below divides
+/// by takes the widest `len`, as `segmented_map_record.rs` widens every `u64` for
+/// [`crate::metadata::MAX_ROOT_SEGMENTS`]. A narrower `len` would size caps that fit `V/2` at
+/// 1 MiB chunks and overrun it at larger ones. The cost is caps of 158 where `0016` quotes 165:
+/// the same rule (`0016:1464-1466`), at the measured `b_ref`.
+pub const MAX_CHUNKREF_BYTES: usize = 315;
+
+/// [`MAX_CHUNKREF_BYTES`] for any `scheme`: one [`ChunkRef`] with every field at its widest
+/// rendering, measured through the store codec. A wider scheme has a longer `placement` (one
+/// D-server id per fragment, [`ChunkRef::fragment_count`]), so it gets a larger number and,
+/// through [`value_chunk_capacity`], smaller caps.
+pub fn max_chunkref_bytes_for(scheme: EcScheme) -> usize {
+    metadata::encode(&widest_chunk_ref(scheme)).len()
+}
+
+/// The [`ChunkRef`] [`max_chunkref_bytes_for`] measures: every number at its widest rendering.
+fn widest_chunk_ref(scheme: EcScheme) -> ChunkRef {
+    let mut widest = ChunkRef {
+        id: ChunkId::MAX,
+        scheme,
+        len: u64::MAX,
+        placement: Vec::new(),
+    };
+    widest.placement = vec![DServerId::MAX; usize::from(widest.fragment_count())];
+    widest
+}
+
+/// How many chunk refs one JSON value may name when each can encode to `max_chunkref_bytes`:
+/// `⌊(V/2) / max_chunkref_bytes⌋` (`0016:1053`, `:1063`). `V/2` is [`MAX_ROOT_VALUE_BYTES`] —
+/// imported, never re-spelled — the half of [`MAX_VALUE_BYTES`] whose other half is the reserve
+/// a record's own fields and any later field addition are spent from (`metadata.rs:329-352`).
+///
+/// **One rule for three records.** A flat inode map, a `seg:` record and a `part:` record are
+/// each one JSON value (`0016:1042-1044`), so [`MAX_MAP_CHUNKS`], [`MAX_SEG_CHUNKS`] and
+/// [`MAX_PART_CHUNKS`] are all this function at [`MAX_CHUNKREF_BYTES`], and
+/// [`knob_clamps_hold`] checks each against it at the set's own scheme. Zero for a zero-byte
+/// ref, which no encoding produces — the answer that fails closed.
+pub const fn value_chunk_capacity(max_chunkref_bytes: usize) -> u32 {
+    match MAX_ROOT_VALUE_BYTES.checked_div(max_chunkref_bytes) {
+        Some(chunks) => chunks as u32,
+        None => 0,
+    }
+}
+
+/// [`value_chunk_capacity`] at [`MAX_CHUNKREF_BYTES`]: ⌊50,000 / 315⌋ = 158, the one number the
+/// three single-value chunk caps share.
+pub const VALUE_CHUNK_CAPACITY: u32 = value_chunk_capacity(MAX_CHUNKREF_BYTES);
+
+// The `V/2` rule tied at compile time, the way `metadata.rs:354` ties its own halves: a
+// capacity retuned by hand, or computed against the whole value, fails the build here.
+const _: () = assert!(VALUE_CHUNK_CAPACITY as usize * MAX_CHUNKREF_BYTES <= MAX_ROOT_VALUE_BYTES);
+
+/// The most chunks a **flat** inode chunk map may name (`0016:1464`). A multipart publication
+/// past it segments (decision 7); a single `PutObject` picks a larger chunk instead
+/// (`0016:1057-1060`). Never an over-budget value.
+pub const MAX_MAP_CHUNKS: u32 = VALUE_CHUNK_CAPACITY;
+
+/// The most chunks one `seg:` record may name (`0016:1465`) — the same one-value rule — and the
+/// factor [`MAX_STAGED_CHUNKS`] multiplies by.
+pub const MAX_SEG_CHUNKS: u32 = VALUE_CHUNK_CAPACITY;
+
+/// The most chunks one `part:` record may name (`0016:1466`) — the same one-value rule, since a
+/// part's chunk list is one value too. [`knob_clamps_hold`] checks the second clamp that meets
+/// here as well: a part commit is an **unsplittable** batch deleting up to this many owned
+/// `sidx:` entries besides its fixed operations (`0016:659`), and it must fit [`MAX_BATCH_OPS`].
+/// Past that, a *valid* part's commit and its compensation — the same shape (`0016:672`) —
+/// would both time out on every attempt, leaving the slot and the staged residue with no path
+/// that ever clears them (`0016:1466`).
+pub const MAX_PART_CHUNKS: u32 = VALUE_CHUNK_CAPACITY;
+
+/// The largest part `UploadPart` accepts at `chunk_size` bytes per chunk:
+/// `max_part_bytes = MAX_PART_CHUNKS × chunk_size` (`0016:1063-1064`; 158 MiB at the default
+/// 1 MiB chunk). A part above it is refused [`Refusal::EntityTooLarge`] before any over-budget
+/// `part:` commit, never discovered at the backend (`0016:1500`). `chunk_size` is #508's knob
+/// (`0016:1474`), hence an argument; a product past `u64` saturates, refusing nothing a `u64`
+/// length could name.
+pub const fn max_part_bytes(chunk_size: u64) -> u64 {
+    (MAX_PART_CHUNKS as u64).saturating_mul(chunk_size)
+}
+
+/// The most parts one session may hold — S3's per-upload limit, the front door these verbs
+/// serve (#508; `0016:2845`). A **capacity**, checked where a part number is admitted; the key
+/// space under it is [`MAX_PART_NUMBER`] (#691), and [`knob_clamps_hold`] refuses a value past
+/// that, since a part number the `part:`/`psum:`/`sidx:` grammar cannot spell would be a record
+/// nothing reads back.
+pub const MAX_PARTS_PER_SESSION: u32 = 10_000;
+
+/// The most parts one session may have **in flight** — the size of its `slot:<id>:` key space,
+/// indices `[0, MAX_INFLIGHT_PARTS)`, each claimed by `require_absent`. The key space **is** the
+/// bound (`0016:349`): no concurrency can mint a `MAX_INFLIGHT_PARTS + 1`-th key, so no writer
+/// has to CAS a counter correctly for it to hold.
+///
+/// Four clamps bound it (`0016:1471`), all in [`knob_clamps_hold`]: at most
+/// [`MAX_PARTS_PER_SESSION`], the premise [`MAX_OWNED_FLEET`]'s `W_ref/2` rests on;
+/// `MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS ≤ SCAN_CAP/2`, so one session's owned `sidx:` range
+/// stays one scan; and the reaper's idle fence — one pin per index, in one batch that cannot be
+/// split (`0016:664`) — inside both [`MAX_BATCH_BYTES`] and [`MAX_BATCH_OPS`]. Past either, an
+/// abandoned session could be neither fenced nor deleted and would hold its admission count
+/// forever (`0016:1471`). 16 is `0016`'s own worked value (`0016:2847`).
+///
+/// **Rollout:** because the value defines the key space, raising it is always safe; lowering it
+/// leaves live sessions holding indices above the new cap until those parts finish — a transient
+/// over-cap bounded by the *old* value, never an unbounded one (`0016:1471`).
+pub const MAX_INFLIGHT_PARTS: u32 = 16;
+
+/// The chunk refs one session may hold in committed `part:` records: the publishable segmented
+/// ceiling `MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS` (512 × 158 = 80,896), the upper end of its range
+/// `[MAX_PART_CHUNKS, MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS]` and the value `0016:1468` settles.
+/// **Derived, not chosen**: were a session able to stage more than it could publish, [`U_REF`]
+/// would charge the raw part-number space — ≈19× what Complete lets it publish at maximal parts
+/// (`0016:1431-1438`) — and [`MAX_SESSIONS`] would collapse towards one. Enforced by an
+/// [`Refusal::EntityTooLarge`] at part commit against the `psum:` summaries; the overshoot
+/// racing commits can add is bounded by the in-flight cap and charged in [`U_REF`]
+/// (`0016:1441-1451`).
+pub const MAX_STAGED_CHUNKS: u32 = MAX_ROOT_SEGMENTS as u32 * MAX_SEG_CHUNKS;
+
+// The `u32` product is the whole product: no bits of `MAX_ROOT_SEGMENTS` fell off in the cast.
+const _: () = assert!(MAX_STAGED_CHUNKS as u64 == MAX_ROOT_SEGMENTS as u64 * MAX_SEG_CHUNKS as u64);
+
+/// `E_tx` — FoundationDB's per-transaction ceiling, the tightest backend in play and so every
+/// backend's de-facto envelope (`crates/traits/src/lib.rs:1328-1331`): 10 MB …
+const E_TX_BYTES: u64 = 10_000_000;
+
+/// … and five seconds.
+const E_TX_MILLIS: u64 = 5_000;
+
+/// `B_bytes` — the bytes the per-item part of one drain, segment, fence or teardown batch may
+/// carry: `E_tx / 2` (`0016:1475`, `:621-626`), the top of its range. The other half is the
+/// batch's margin, the way `V/2` keeps half a value in reserve for a record's own fields
+/// (`metadata.rs:329-352`): each batch's O(1) fixed puts are spent from it — the idle fence's
+/// three, each at most one value, which the assertion below checks fit.
+///
+/// Its range has a floor too: one [`MAX_SEGMENT_PUT_BYTES`]. A segment-write batch carries
+/// `⌊B_bytes / segment put⌋` puts (`0016:661`), so a budget below one put derives a batch of
+/// zero and the publication never advances.
+///
+/// **#625 consumes this and must not re-derive it.** `0016:3073` gives `B` to #625; it is valued
+/// here because [`MAX_INFLIGHT_PARTS`]' byte clamp cannot be checked without it.
+pub const MAX_BATCH_BYTES: u64 = E_TX_BYTES / 2;
+
+// The idle fence's three fixed puts (`0016:664`), each at most one value, fit the half of the
+// envelope `B_bytes` leaves.
+const _: () = assert!(3 * MAX_VALUE_BYTES as u64 <= E_TX_BYTES - MAX_BATCH_BYTES);
+
+/// The most bytes one `seg:` put carries — the item a segment-write batch counts
+/// (`0016:661`): the widest key the segment grammar spells (`seg:` + a 32-hex nonce + a
+/// twenty-digit epoch + a six-digit index, with two separators: 64 B, measured on
+/// [`crate::metadata::seg_key`] by `crates/core/tests/multipart_knobs.rs`) plus a value at the
+/// ceiling [`MAX_VALUE_BYTES`], the charge `0016:661` makes per put. It is the largest item any
+/// splittable batch carries — an `orphan:` mark or a record delete is a key and a few bytes — so
+/// a [`MAX_BATCH_BYTES`] that holds one holds one of each.
+pub const MAX_SEGMENT_PUT_BYTES: u64 = 64 + MAX_VALUE_BYTES as u64;
+
+/// The time one sequential in-transaction operation takes on the slowest supported backend —
+/// **assumed, not measured**. Both networked backends run a batch's preconditions and mutations
+/// one after another inside the transaction (TiKV awaits each `get_for_update`/`put`/`delete`,
+/// FDB each precondition read — `0016:630-633`), so a batch lasts its operation count times
+/// this. 5 ms is the figure `0016`'s own warning implies: ~1,000 small marks "can exceed" the
+/// five seconds (`0016:633-635`).
+const SLOWEST_OP_MILLIS: u64 = 5;
+
+/// The most sequential operations one transaction finishes inside its five seconds at
+/// `SLOWEST_OP_MILLIS` each: 1,000, the top of `B_ops`' range. A batch past it cannot finish at
+/// the assumed latency however often it is retried, so [`knob_clamps_hold`] refuses it.
+const DEADLINE_OPS: u64 = E_TX_MILLIS / SLOWEST_OP_MILLIS;
+
+/// `B_ops` — the operations one batch may carry (`0016:1475`, `:640-648`): half of
+/// `DEADLINE_OPS`, i.e. 500 — the margin `0016:640-642` asks for below the deadline, kept in
+/// the value rather than the range because the latency behind `DEADLINE_OPS` is assumed. Bytes
+/// alone do not prove termination: ~1,000 small marks fit 5 MB and can still outrun 5 s (the
+/// `MARK_BATCH` precedent, `crates/custodian/src/restore.rs:103`), and a batch that always
+/// times out is stuck, not slow.
+///
+/// **Uncalibrated.** `0016:1475` asks for it "calibrated … on the slowest supported backend";
+/// this slice has no backend to measure. **#625 consumes this constant, must replace
+/// `SLOWEST_OP_MILLIS` with a measured figure before relying on it, and must not re-derive
+/// `B_ops` anywhere else.**
+pub const MAX_BATCH_OPS: u32 = (DEADLINE_OPS / 2) as u32;
+
+/// The operations a part commit spends besides its owned `sidx:` deletes (`0016:659`, `:675`):
+/// four preconditions — `require(mpu == Open@E)`, the part record's, its own slot's, and the
+/// re-upload obligation's `require_absent` — and four mutations: the `part:` put, the `psum:`
+/// put, the slot delete and the re-upload `retire:bytes:` put. The live-session compensation
+/// (`0016:672`) is the same shape with fewer, so the commit is the batch the clamp must fit.
+const PART_COMMIT_FIXED_OPS: u64 = 8;
+
+/// The operations the reaper's idle fence spends besides its one pin per slot index
+/// (`0016:664`, `:675`): the session precondition, two obligation `require_absent`s, and three
+/// puts — the session, `retire:bytes:{session}`, `retire:records:{seg}`. The terminal delete
+/// (`0016:673`) spends five besides its slot deletes — the session and ledger preconditions, the
+/// session and `seggrp:` deletes, the ledger put — so the fence is the one the clamp must fit.
+const FENCE_FIXED_OPS: u64 = 6;
+
+/// The bytes one slot index costs the idle fence: its key at the widest index (44 B) plus the
+/// widest value its `require(slot == prior)` carries — every [`SlotRecord`] field at its widest
+/// rendering (155 B). `crates/core/tests/multipart_knobs.rs` measures both on the codec and
+/// holds [`knob_clamps_hold`]'s fence clamp to exactly this number from either side.
+const SLOT_PIN_BYTES: u64 = 199;
+
+/// `W_ref` — the reconcile pass's staged-reference **memory** budget, in chunk refs
+/// (`0016:1473`): the whole in-memory staged reference set — ×9 fragment pairs — not one scan.
+/// Its range is `[U_REF, deployment RAM]`, and it is the budget [`MAX_SESSIONS`] divides.
+///
+/// **#625's to size (`0016:3073`), valued here because [`MAX_SESSIONS`] cannot be derived
+/// without it. #625 consumes this constant and must not re-derive it.** 4,000,000 is `0016`'s own
+/// worked figure (`0016:2847`: ≈36 M `(server, fragment)` pairs, a few GB on the reconcile host).
+/// A compile-time value for now: if #625 turns it into a deployment input sized from host RAM,
+/// that input is checked by [`knob_clamps_hold`] and every derived constant below is re-derived
+/// from it through the same functions — never re-spelled.
+pub const W_REF: u64 = 4_000_000;
+
+/// The shipped profile — the five numbers `mpuctl` stores (`0016:348`) — as a [`Budget`], so the
+/// constants below are evaluated by the **same** derivations the ledger's decoder applies
+/// ([`Budget::u_ref`], [`Budget::max_sessions`]). Private, and built without
+/// `TryFrom<BudgetWire>`, so it is held to `Budget`'s invariant twice over: its derivations run at
+/// compile time (a profile they are undefined for fails the build), and [`knob_clamps_hold`]
+/// applies every one of `Budget`'s rules to [`KnobSet::DEPLOYED`], whose profile is these same
+/// five constants (`crates/core/tests/multipart_knobs.rs`, leg 1).
+const SHIPPED_PROFILE: Budget = Budget {
+    w_ref: W_REF,
+    max_part_chunks: MAX_PART_CHUNKS,
+    max_parts_per_session: MAX_PARTS_PER_SESSION,
+    max_inflight_parts: MAX_INFLIGHT_PARTS,
+    max_staged_chunks: MAX_STAGED_CHUNKS,
+};
+
+/// `U_ref` at the shipped profile — each session's worst-case staged-reference footprint
+/// (`0016:1469`), by [`Budget::u_ref`]: `min((MAX_PARTS_PER_SESSION + MAX_INFLIGHT_PARTS) ×
+/// MAX_PART_CHUNKS, MAX_STAGED_CHUNKS + 2 × MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS)` =
+/// `min(1,582,528, 85,952)`. The second term binds: the staged ceiling, plus what
+/// `MAX_INFLIGHT_PARTS` racing commits can add past it, plus their owned entries — every part
+/// charged its full `MAX_PART_CHUNKS`, for every interleaving (`0016:1441-1451`).
+pub const U_REF: u64 = SHIPPED_PROFILE.u_ref();
+
+/// `MAX_SESSIONS = min(⌊W_ref / U_ref⌋, SCAN_CAP/2)` (`0016:1470`) = 46 — **derived, never
+/// chosen**, by [`Budget::max_sessions`], the function the ledger's stored `max_sessions` is
+/// checked against at decode (G8). Every session is charged its worst case, so `Σ footprint ≤
+/// MAX_SESSIONS × U_ref ≤ W_ref` for every part-size distribution; a hard-coded value would
+/// decouple what is admitted from what the reconcile pass can hold.
+pub const MAX_SESSIONS: u64 = SHIPPED_PROFILE.max_sessions();
+
+/// `MAX_OWNED_FLEET` — the fleet's in-flight owned `sidx:` entries (`0016:1472`): `MAX_SESSIONS ×
+/// MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`. Derived, and at most `W_REF / 2` by construction —
+/// either term of `U_ref` is at least twice one session's owned entries (the second charges them
+/// twice; the first does because `MAX_INFLIGHT_PARTS ≤ MAX_PARTS_PER_SESSION` is a clamp) — which
+/// the assertion below re-checks for the shipped numbers. Owned entries are read only through
+/// per-session `sidx:<id>:` ranges, so this bounds memory, never a single scan.
+pub const MAX_OWNED_FLEET: u64 = owned_fleet(&SHIPPED_PROFILE) as u64;
+
+const _: () = assert!(owned_fleet(&SHIPPED_PROFILE) <= W_REF as u128 / 2);
+
+/// The fleet's owned population under `profile`: its session limit times one session's owned
+/// entries — the product G5 bounds — defined once for [`MAX_OWNED_FLEET`] and
+/// [`knob_clamps_hold`]. `profile` must already pass `Budget`'s rules.
+const fn owned_fleet(profile: &Budget) -> u128 {
+    profile.max_sessions() as u128 * profile.inflight_owned_refs()
+}
+
+/// `R_publish` — root-flip attempts one Complete makes before it releases its fence
+/// (`0016:1476`, range `[1, small]`). A flip loses only to a concurrent writer moving the target
+/// dirent or inode, and each retry re-resolves it (`0016:662`). Bounded so Complete terminates
+/// with no reaper running — at the bound the fence goes back to `Open` and the client may retry —
+/// and small because every attempt is a publication batch plus a round of reads.
+pub const R_PUBLISH: u32 = 3;
+
+/// `MAX_COMPLETE_ATTEMPTS` — Complete fences one session may spend (`0016:1477`, range
+/// `[1, small]`). Each fence mints a `Completing@E` epoch whose rolled-back segments become one
+/// `retire:records:{seg}` obligation, so this caps what one session can install at that many
+/// epochs' worth of `seg:` records; `W_session` bounds residency, not a client's retry rate. At
+/// the bound the fence is refused ([`Refusal::CompleteAttemptsExhausted`]) and Abort is the
+/// session's only exit.
+pub const MAX_COMPLETE_ATTEMPTS: u32 = 3;
+
+/// Upload ids a create mints before it refuses — its budget for a `require_absent(mpu:<id>)`
+/// **collision**, a 2^-128 event per mint (`0016:493-497`). Two: one re-mint makes a second
+/// collision a 2^-256 event, and more buys nothing.
+///
+/// **Not the contention budget, and never sized like it** — see
+/// [`MAX_ADMISSION_CAS_ATTEMPTS`].
+pub const MAX_UPLOAD_ID_ATTEMPTS: u32 = 2;
+
+/// Admission-CAS attempts a create makes before refusing with
+/// [`Backpressure::AdmissionContention`] — its budget for losing the `mpuctl` CAS to other
+/// creators (`0016:1999-2034`). Contention there is normal: every create CASes the one ledger,
+/// so `N` simultaneous creators serialize and the last needs `N` attempts.
+///
+/// **Derived: [`MAX_SESSIONS`].** Among creates, a lost CAS means another create was admitted,
+/// so after `MAX_SESSIONS` losses the ledger is full and the refusal is the capacity bound: a
+/// create storm on an empty ledger is never refused while the ledger has room. The defect this
+/// pair replaces was one budget shared with [`MAX_UPLOAD_ID_ATTEMPTS`] — sized for a 2^-128
+/// collision, it answered a false `503 SlowDown` on an empty store at ordinary client
+/// concurrency. (A CAS lost to a teardown's decrement is churn, and a refusal under churn is
+/// backpressure.) The cast is exact: [`MAX_SESSIONS`] is at most `SCAN_CAP/2` by its own clamp.
+pub const MAX_ADMISSION_CAS_ATTEMPTS: u32 = MAX_SESSIONS as u32;
+
+/// The least a creator waits after a lost admission CAS, in milliseconds, and the step the
+/// backoff window doubles from.
+pub const ADMISSION_BACKOFF_BASE_MILLIS: u64 = 2;
+
+/// The most a creator waits after one lost admission CAS, in milliseconds; a create that spends
+/// its whole contention budget has waited at most `MAX_ADMISSION_CAS_ATTEMPTS ×` this (2.3 s).
+pub const ADMISSION_BACKOFF_CAP_MILLIS: u64 = 50;
+
+const _: () = assert!(
+    ADMISSION_BACKOFF_BASE_MILLIS >= 1
+        && ADMISSION_BACKOFF_CAP_MILLIS > ADMISSION_BACKOFF_BASE_MILLIS
+);
+
+/// How long to wait after losing the admission CAS for the `attempt`-th time (counting from 0):
+/// a delay in `[BASE, window]`, where `window = min(CAP, BASE × 2^(attempt+1))`, placed in that
+/// range by `jitter` — the caller's random `u64`, scaled into the window rather than reduced
+/// modulo it.
+///
+/// So the delay is never below [`ADMISSION_BACKOFF_BASE_MILLIS`] or above
+/// [`ADMISSION_BACKOFF_CAP_MILLIS`]; the window doubles per attempt until the cap; and for any
+/// one `jitter` the delay never shrinks as `attempt` grows. The jitter is what separates creators
+/// that lost the same CAS at the same instant — a fixed delay would re-collide them on every
+/// retry. Pure: no clock read and no sleep, so `core` stays runtime-free (ADR-0009) and the
+/// caller owns the wait.
+pub fn admission_backoff_millis(attempt: u32, jitter: u64) -> u64 {
+    let window = ADMISSION_BACKOFF_BASE_MILLIS
+        .saturating_mul(2u64.saturating_pow(attempt.saturating_add(1)))
+        .min(ADMISSION_BACKOFF_CAP_MILLIS);
+    let span = u128::from(window - ADMISSION_BACKOFF_BASE_MILLIS) + 1;
+    let offset = (u128::from(jitter) * span) >> 64;
+    ADMISSION_BACKOFF_BASE_MILLIS + offset as u64
+}
+
+/// A whole set of knob values: the aggregate [`knob_clamps_hold`] checks, and the shape a
+/// deployment's configuration takes once #508/#625 wire one (`0016:1462-1479`).
+///
+/// Five of its numbers are the profile `mpuctl` stores — a [`Budget`]'s — and are checked by
+/// that type's own rules. Unlike [`Budget`] this is **unvalidated** data with public fields:
+/// [`knob_clamps_hold`] is its validator, and a set that breaks a clamp must be constructible so
+/// the clamp can be shown to refuse it. It also carries the values a consumer admits against
+/// ([`MAX_SESSIONS`], [`MAX_OWNED_FLEET`], the contention budget), so that a configured or stored
+/// copy of a derived value is held to its derivation — the relation `mpuctl`'s G8 applies to its
+/// own `max_sessions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnobSet {
+    /// The durability scheme the chunk caps are sized for ([`SIZING_SCHEME`]).
+    pub scheme: EcScheme,
+    /// [`MAX_MAP_CHUNKS`].
+    pub max_map_chunks: u32,
+    /// [`MAX_SEG_CHUNKS`].
+    pub max_seg_chunks: u32,
+    /// [`MAX_PART_CHUNKS`] — a profile number.
+    pub max_part_chunks: u32,
+    /// [`MAX_PARTS_PER_SESSION`] — a profile number.
+    pub max_parts_per_session: u32,
+    /// [`MAX_INFLIGHT_PARTS`] — a profile number.
+    pub max_inflight_parts: u32,
+    /// [`MAX_STAGED_CHUNKS`] — a profile number.
+    pub max_staged_chunks: u32,
+    /// `W_ref` ([`W_REF`]) — a profile number.
+    pub w_ref: u64,
+    /// [`MAX_SESSIONS`] — derived, and checked against its derivation.
+    pub max_sessions: u64,
+    /// [`MAX_OWNED_FLEET`] — derived, and checked against its derivation.
+    pub max_owned_fleet: u64,
+    /// `B_bytes` ([`MAX_BATCH_BYTES`]).
+    pub batch_bytes: u64,
+    /// `B_ops` ([`MAX_BATCH_OPS`]).
+    pub batch_ops: u32,
+    /// `R_publish` ([`R_PUBLISH`]).
+    pub r_publish: u32,
+    /// [`MAX_COMPLETE_ATTEMPTS`].
+    pub max_complete_attempts: u32,
+    /// [`MAX_UPLOAD_ID_ATTEMPTS`].
+    pub max_upload_id_attempts: u32,
+    /// [`MAX_ADMISSION_CAS_ATTEMPTS`].
+    pub max_admission_cas_attempts: u32,
+}
+
+impl KnobSet {
+    /// The shipped set: every field the constant of its name.
+    pub const DEPLOYED: Self = Self {
+        scheme: SIZING_SCHEME,
+        max_map_chunks: MAX_MAP_CHUNKS,
+        max_seg_chunks: MAX_SEG_CHUNKS,
+        max_part_chunks: MAX_PART_CHUNKS,
+        max_parts_per_session: MAX_PARTS_PER_SESSION,
+        max_inflight_parts: MAX_INFLIGHT_PARTS,
+        max_staged_chunks: MAX_STAGED_CHUNKS,
+        w_ref: W_REF,
+        max_sessions: MAX_SESSIONS,
+        max_owned_fleet: MAX_OWNED_FLEET,
+        batch_bytes: MAX_BATCH_BYTES,
+        batch_ops: MAX_BATCH_OPS,
+        r_publish: R_PUBLISH,
+        max_complete_attempts: MAX_COMPLETE_ATTEMPTS,
+        max_upload_id_attempts: MAX_UPLOAD_ID_ATTEMPTS,
+        max_admission_cas_attempts: MAX_ADMISSION_CAS_ATTEMPTS,
+    };
+
+    /// This set's profile as the [`Budget`] `mpuctl` would store — a candidate that never leaves
+    /// [`knob_clamps_hold`], judged by the same `checked_rules` a decoded ledger is.
+    const fn profile(&self) -> Budget {
+        Budget {
+            w_ref: self.w_ref,
+            max_part_chunks: self.max_part_chunks,
+            max_parts_per_session: self.max_parts_per_session,
+            max_inflight_parts: self.max_inflight_parts,
+            max_staged_chunks: self.max_staged_chunks,
+        }
+    }
+}
+
+/// The clamp a [`KnobSet`] broke — [`knob_clamps_hold`]'s answer, one variant per clamp, so a
+/// value change that breaks one names which (and a [`RecordError`] for a profile rule, naming the
+/// numbers on both sides).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KnobClamp {
+    /// The set is sized for a scheme the erasure coder cannot run — the test a stored chunk's
+    /// scheme gets at decode (section 8, ADR-0045) — so its caps would describe chunks no writer
+    /// can produce.
+    SchemeUnsupported,
+    /// The named one-value chunk cap (`MAX_MAP_CHUNKS`, `MAX_SEG_CHUNKS` or `MAX_PART_CHUNKS`)
+    /// is zero, or `max_chunkref_bytes × chunks > V/2` at the set's scheme (`0016:1464-1466`).
+    ValueCeiling(&'static str),
+    /// The profile breaks one of [`Budget`]'s own rules (G1–G7), applied by the same code the
+    /// `mpuctl` decoder runs: a profile no ledger could hold.
+    Profile(RecordError),
+    /// `MAX_STAGED_CHUNKS > MAX_ROOT_SEGMENTS × MAX_SEG_CHUNKS` (`0016:1468`): a session could
+    /// stage more than it could ever publish.
+    StagedAbovePublishable,
+    /// `B_bytes > E_tx/2` (`0016:1475`).
+    BatchBytesAboveHalfEnvelope,
+    /// `B_bytes < MAX_SEGMENT_PUT_BYTES`: a segment-write batch of `⌊B_bytes / segment put⌋ = 0`
+    /// puts, and a Complete that never publishes (`0016:661`).
+    BatchBytesBelowSegmentPut,
+    /// `B_ops` sequential operations outlast the transaction's five seconds at the assumed
+    /// per-operation latency (`0016:1475`): a batch that always times out.
+    BatchOpsAboveDeadline,
+    /// A part commit — `MAX_PART_CHUNKS` owned-entry deletes plus its fixed operations — exceeds
+    /// `B_ops` (`0016:1466`): an unsplittable batch that would time out on every attempt.
+    PartCommitOverOps,
+    /// The idle fence's pins over the whole slot range exceed `B_bytes` (`0016:1471`).
+    SlotRangeOverBytes,
+    /// The idle fence — one pin per slot index plus its fixed operations — exceeds `B_ops`
+    /// (`0016:1471`).
+    SlotRangeOverOps,
+    /// `MAX_SESSIONS × U_ref > W_ref` (`0016:1470`, `:1473`): the admitted sessions' worst-case
+    /// footprint exceeds the reconcile budget.
+    SessionsOverFootprint,
+    /// `MAX_SESSIONS > SCAN_CAP/2` (`0016:1470`): the reaper's one `scan("mpu:")` could fail.
+    SessionsOverScanHalf,
+    /// `MAX_SESSIONS` is not `min(⌊W_ref / U_ref⌋, SCAN_CAP/2)` (`0016:1470`) — chosen, not
+    /// derived.
+    SessionsNotDerived,
+    /// `MAX_OWNED_FLEET > W_ref / 2` (`0016:1472`).
+    OwnedFleetOverHalfRef,
+    /// `MAX_OWNED_FLEET` is not `MAX_SESSIONS × MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS`
+    /// (`0016:1472`).
+    OwnedFleetNotDerived,
+    /// The named retry or fence budget (`R_PUBLISH`, `MAX_COMPLETE_ATTEMPTS`,
+    /// `MAX_UPLOAD_ID_ATTEMPTS` or `MAX_ADMISSION_CAS_ATTEMPTS`) is zero: a Complete, a fence or
+    /// a create that could never make its first attempt (`0016:1476-1477`).
+    RetryBoundZero(&'static str),
+    /// `MAX_ADMISSION_CAS_ATTEMPTS < MAX_SESSIONS`: a create storm could spend its contention
+    /// budget while the ledger still has room — a refusal that is a lost race, not a bound.
+    AdmissionCasBelowSessions,
+}
+
+/// `Ok` when the clamp `holds`, else `broken` — one line per inequality in [`knob_clamps_hold`].
+fn ensure(holds: bool, broken: KnobClamp) -> Result<(), KnobClamp> {
+    holds.then_some(()).ok_or(broken)
+}
+
+/// Whether `set` satisfies every clamp of `0016`'s knob table (`0016:1462-1479`), and if not the
+/// first it breaks, in this order: the scheme, the one-value ceilings, the profile rules, the
+/// publishable ceiling, the batch envelope, the session limit, the owned fleet, the retry
+/// budgets. A bound is checked before the derivation it belongs to, so a value set too high is
+/// named by the bound it crosses and one set too low by the derivation it misses.
+///
+/// The table's other rows are not a set's to carry: `MAX_ROOT_SEGMENTS` is metadata's and its
+/// ceiling is measured there (`crates/core/tests/segmented_map_record.rs`), `chunk_size` needs
+/// an object size (#508), and the time windows are #625's and the write path's.
+///
+/// Configuration-side, never a decode rule (see this section's header): #508/#625 run it over a
+/// deployment's values where they are loaded, and a set it refuses is not one to admit against.
+pub fn knob_clamps_hold(set: &KnobSet) -> Result<(), KnobClamp> {
+    use KnobClamp::*;
+    // The scheme test a stored chunk gets at decode, on the ref the caps are sized against.
+    checked_chunk_scheme(&widest_chunk_ref(set.scheme)).map_err(|_| SchemeUnsupported)?;
+    let capacity = value_chunk_capacity(max_chunkref_bytes_for(set.scheme));
+    for (knob, chunks) in [
+        ("MAX_MAP_CHUNKS", set.max_map_chunks),
+        ("MAX_SEG_CHUNKS", set.max_seg_chunks),
+        ("MAX_PART_CHUNKS", set.max_part_chunks),
+    ] {
+        ensure(chunks > 0 && chunks <= capacity, ValueCeiling(knob))?;
+    }
+    let profile = set.profile();
+    profile.checked_rules().map_err(Profile)?;
+    let publishable = MAX_ROOT_SEGMENTS as u64 * u64::from(set.max_seg_chunks);
+    ensure(
+        u64::from(set.max_staged_chunks) <= publishable,
+        StagedAbovePublishable,
+    )?;
+    let (bytes, ops) = (set.batch_bytes, u64::from(set.batch_ops));
+    ensure(bytes <= E_TX_BYTES / 2, BatchBytesAboveHalfEnvelope)?;
+    ensure(bytes >= MAX_SEGMENT_PUT_BYTES, BatchBytesBelowSegmentPut)?;
+    ensure(ops <= DEADLINE_OPS, BatchOpsAboveDeadline)?;
+    let part_commit = u64::from(set.max_part_chunks) + PART_COMMIT_FIXED_OPS;
+    ensure(part_commit <= ops, PartCommitOverOps)?;
+    let inflight = u64::from(set.max_inflight_parts);
+    ensure(inflight * SLOT_PIN_BYTES <= bytes, SlotRangeOverBytes)?;
+    ensure(inflight + FENCE_FIXED_OPS <= ops, SlotRangeOverOps)?;
+    // The profile passed G1–G7, so its derivations are total from here on.
+    let sessions = set.max_sessions;
+    let footprint = u128::from(sessions) * u128::from(profile.u_ref());
+    ensure(footprint <= u128::from(set.w_ref), SessionsOverFootprint)?;
+    ensure(sessions <= SCAN_HALF, SessionsOverScanHalf)?;
+    ensure(sessions == profile.max_sessions(), SessionsNotDerived)?;
+    let fleet = u128::from(set.max_owned_fleet);
+    ensure(fleet <= u128::from(set.w_ref) / 2, OwnedFleetOverHalfRef)?;
+    ensure(fleet == owned_fleet(&profile), OwnedFleetNotDerived)?;
+    for (knob, bound) in [
+        ("R_PUBLISH", set.r_publish),
+        ("MAX_COMPLETE_ATTEMPTS", set.max_complete_attempts),
+        ("MAX_UPLOAD_ID_ATTEMPTS", set.max_upload_id_attempts),
+        ("MAX_ADMISSION_CAS_ATTEMPTS", set.max_admission_cas_attempts),
+    ] {
+        ensure(bound > 0, RetryBoundZero(knob))?;
+    }
+    let contention = u64::from(set.max_admission_cas_attempts);
+    ensure(contention >= sessions, AdmissionCasBelowSessions)
 }
