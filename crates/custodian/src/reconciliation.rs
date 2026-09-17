@@ -24,8 +24,9 @@ pub enum Reconciled {
     Changed,
     /// The loop ran over everything it could read and **refuses to certify the rest**: at
     /// least one committed object's chunk map could not be read
-    /// (`crate::gc::ReferenceSet::unresolvable`), so the reference set the loop reasoned
-    /// over is incomplete.
+    /// (`crate::gc::ReferenceSet::unresolvable`) — or, for GC, one staged multipart record
+    /// (`crate::gc::StagedSet::unresolvable`) — so the set the loop reasoned over is
+    /// incomplete.
     ///
     /// A third outcome rather than a flavour of the other two, because it is a different
     /// **claim**. `Satisfied` says every referenced fragment was checked and matched — over

@@ -68,6 +68,10 @@ use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
+use wyrd_core::multipart::{
+    decode_part_record, decode_session_record, mpu_key, part_key, part_range, sidx_key, sidx_range,
+    OwnedEntry, PartNumber, StagedPlacement, UploadId,
+};
 use wyrd_core::placement::Topology;
 use wyrd_core::read::{read_object, read_object_from};
 use wyrd_core::repair;
@@ -2555,6 +2559,488 @@ async fn prop_gc_orphan_walk_reaches_the_mid_walk_landing() {
     );
 }
 
+// ---- property 13: GC's staged reads across a part commit, a publication flip and its
+//      retirement drain (issue #803) ----
+//
+// GC protects a multipart upload's staged bytes as a class of their own, read through each
+// session's bounded ranges in a fixed order — its owned staging entries (`sidx:`), then its
+// committed parts (`part:`), then the `inode:` scan — because three moves hand one chunk's
+// protection from one of those classes to the next, each in a single batch: a part commit
+// (`sidx:` → `part:`), the publication's root flip (`part:` → a committed inode, the part record
+// kept), and the retirement drain that later deletes the part record (`0016:782-800`, X67
+// `0016:2596`). A reading that took a destination before its source could see the chunk in
+// neither class.
+//
+// The per-pass legs in `crates/custodian/tests/staged_protection.rs` pin that order with a double
+// that lands each move at a scripted instant. Here a genuinely concurrent task makes all three
+// moves over the simulated-TiKV model, each at an instant the seed picks, while GC passes run back
+// to back; the chunk's fragment carries an `orphan:` mark past grace for the whole run, so its
+// protection is all that keeps it. The property: it is never reclaimed. The coverage leg proves the
+// sweep reaches, for each move, a landing between the two reads it hands protection across and a
+// landing outside them.
+
+/// The upload whose part the concurrent task commits and publishes: 32 lowercase-hex characters.
+const HANDOFF_UPLOAD: &str = "80380380380380380380380380380380";
+/// The chunk that moves: one un-erasure-coded fragment on server 1, marked past grace all run.
+const HANDOFF_CHUNK: ChunkId = 0x8030;
+/// An unprotected fragment on server 2, marked past grace: the first pass reclaims it — the
+/// positive observable that GC is reclaiming at all in this run.
+const HANDOFF_STRAY: ChunkId = 0x8031;
+/// The inode the publication flip writes.
+const HANDOFF_INODE: InodeId = 6;
+const HANDOFF_OBJECT: &str = "handoff";
+const HANDOFF_GRACE: u64 = 50;
+const HANDOFF_NOW: u64 = 10_000;
+/// How long the tap takes to carry a read's answer back, in simulated milliseconds, after the
+/// model's own 1 ms request hop. Three, so that the gap between two consecutive reads' answers
+/// (4 ms) holds two commits landing 2 ms apart strictly inside it — a flip and the drain right
+/// behind it, the one schedule a reading that took committed inodes before part records sees in
+/// neither class — rather than only on ties the scheduler breaks.
+const HANDOFF_REPLY_MILLIS: u64 = 3;
+/// How far apart the concurrent task's moves are drawn, in simulated milliseconds: the part commit
+/// lands up to this far into the run, the flip up to this far after the fence, and the drain up to
+/// this far after the flip. A read here takes 4 ms and a GC pass is six reads (plus a cleanup
+/// commit when it reclaims), so this spans about one pass per gap — the coverage leg below proves
+/// the landings between the reads are reached rather than assuming it.
+const HANDOFF_SPAN: u32 = 24;
+/// The most GC passes one run makes before it gives up on the concurrent task finishing.
+const HANDOFF_MAX_PASSES: usize = 64;
+
+/// The three moves, each one batch handing a chunk's protection from one class to the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handoff {
+    /// Deletes the owned staging entry and writes the part record naming the chunk.
+    PartCommit,
+    /// Writes the committed inode naming the chunk and moves the session to `Completed`, keeping
+    /// the part record.
+    Flip,
+    /// Deletes the part record (the retirement drain; its `retire:records:` key is left out — no
+    /// pass in this slice reads `retire:`).
+    Drain,
+}
+
+impl Handoff {
+    const ALL: [Handoff; 3] = [Handoff::PartCommit, Handoff::Flip, Handoff::Drain];
+
+    /// This move's position in [`Handoff::ALL`].
+    fn index(self) -> usize {
+        match self {
+            Handoff::PartCommit => 0,
+            Handoff::Flip => 1,
+            Handoff::Drain => 2,
+        }
+    }
+
+    /// The two reads this move hands protection across: its source, then its destination.
+    fn reads(self, upload: &UploadId) -> (Vec<u8>, Vec<u8>) {
+        match self {
+            Handoff::PartCommit => (sidx_range(upload), part_range(upload)),
+            Handoff::Flip | Handoff::Drain => (part_range(upload), b"inode:".to_vec()),
+        }
+    }
+}
+
+/// One observation at the store seam, in the order the simulation produced them. Keys are kept as
+/// text — every key in this run is ASCII — so a failure message stays readable.
+#[derive(Clone, Debug)]
+enum HandoffEvent {
+    /// A GC pass began.
+    Pass,
+    /// A read's answer was taken, of this key or prefix.
+    Read(String),
+    /// A move's batch applied.
+    Landed(Handoff),
+}
+
+/// A recording tap over the simulated-TiKV store. Every call is forwarded, network hops included,
+/// and each read's answer is logged the instant it is taken — then carried back over a reply hop of
+/// its own ([`HANDOFF_REPLY_MILLIS`]), so two consecutive reads are separated by instants a
+/// concurrent commit can land on strictly between them, rather than only by a tie the scheduler
+/// breaks. Instance state only (ADR-0035).
+struct HandoffMeta {
+    inner: SimTikvMetadataStore,
+    events: Mutex<Vec<HandoffEvent>>,
+}
+
+impl HandoffMeta {
+    fn log(&self, event: HandoffEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+
+    /// Log that a read of `subject` was answered, then carry the answer back.
+    async fn answered(&self, subject: &[u8]) {
+        self.log(HandoffEvent::Read(
+            String::from_utf8_lossy(subject).into_owned(),
+        ));
+        madsim::time::sleep(Duration::from_millis(HANDOFF_REPLY_MILLIS)).await;
+    }
+}
+
+#[async_trait]
+impl MetadataStore for HandoffMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let value = self.inner.get(key).await?;
+        self.answered(key).await;
+        Ok(value)
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        let answer = self.inner.scan(prefix).await?;
+        self.answered(prefix).await;
+        Ok(answer)
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        let page = self.inner.scan_page(prefix, after, limit).await?;
+        self.answered(prefix).await;
+        Ok(page)
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        self.inner.commit(batch).await
+    }
+}
+
+/// A session record targeting [`HANDOFF_OBJECT`] in `state` (its JSON), as the base decoder spells
+/// it and checked against it.
+fn handoff_session(state: &str) -> Bytes {
+    let bytes = format!(
+        "{{\"parent\":{ROOT},\"object\":\"{HANDOFF_OBJECT}\",\"created_at_millis\":100,\
+         \"clock_source\":\"wall\",\"epoch\":1,\"attempts\":1,\"state\":{state}}}"
+    )
+    .into_bytes();
+    decode_session_record(&bytes).expect("the seeded session record decodes");
+    Bytes::from(bytes)
+}
+
+fn handoff_chunk_ref() -> ChunkRef {
+    ChunkRef {
+        id: HANDOFF_CHUNK,
+        scheme: EcScheme::None,
+        len: 5,
+        placement: vec![1],
+    }
+}
+
+/// Where each move landed relative to the two reads it hands protection across — observed at the
+/// store seam.
+struct HandoffLandings {
+    /// Whether each move landed at all.
+    landed: [bool; 3],
+    /// For each move, the GC pass it landed inside of — after that pass's source read and before
+    /// its destination read — by the log position of the pass's start; `None` when it landed in no
+    /// such window.
+    between: [Option<usize>; 3],
+}
+
+impl HandoffLandings {
+    fn between(&self, handoff: Handoff) -> bool {
+        self.between[handoff.index()].is_some()
+    }
+
+    fn outside(&self, handoff: Handoff) -> bool {
+        self.landed[handoff.index()] && self.between[handoff.index()].is_none()
+    }
+
+    /// Whether the flip AND the drain both landed between the SAME pass's part read and its
+    /// `inode:` scan — the schedule in which a reading that took committed inodes first sees the
+    /// chunk in neither class.
+    fn published_within_one_window(&self) -> bool {
+        let flip = self.between[Handoff::Flip.index()];
+        flip.is_some() && flip == self.between[Handoff::Drain.index()]
+    }
+}
+
+fn handoff_landings(events: &[HandoffEvent], upload: &UploadId) -> HandoffLandings {
+    let mut landings = HandoffLandings {
+        landed: [false; 3],
+        between: [None; 3],
+    };
+    for handoff in Handoff::ALL {
+        let Some(at) = events
+            .iter()
+            .position(|event| matches!(event, HandoffEvent::Landed(h) if *h == handoff))
+        else {
+            continue;
+        };
+        landings.landed[handoff.index()] = true;
+        let (source, destination) = handoff.reads(upload);
+        let Some(start) = events[..at]
+            .iter()
+            .rposition(|event| matches!(event, HandoffEvent::Pass))
+        else {
+            continue;
+        };
+        let end = events[at..]
+            .iter()
+            .position(|event| matches!(event, HandoffEvent::Pass))
+            .map_or(events.len(), |offset| at + offset);
+        let read_in = |subject: &[u8], window: &[HandoffEvent]| {
+            window
+                .iter()
+                .any(|event| matches!(event, HandoffEvent::Read(s) if s.as_bytes() == subject))
+        };
+        if read_in(&source, &events[start..at]) && read_in(&destination, &events[at..end]) {
+            landings.between[handoff.index()] = Some(start);
+        }
+    }
+    landings
+}
+
+/// One run: GC passes back to back while the concurrent task commits the part `gaps[0]` ms into
+/// the run, fences the session to `Completing` and flips `gaps[1]` ms after the commit, and drains
+/// `gaps[2]` ms after the flip, as a batch of its own. Asserts after every pass that the chunk's
+/// fragment is still on disk, and returns where each move landed.
+async fn staged_handoffs_under_gc(gaps: [u64; 3]) -> HandoffLandings {
+    let d = servers();
+    let meta = Arc::new(HandoffMeta {
+        inner: SimTikvMetadataStore::new(),
+        events: Mutex::new(Vec::new()),
+    });
+    let upload = UploadId::new(HANDOFF_UPLOAD).expect("32 lowercase-hex characters");
+    let part = PartNumber::new(1).expect("a part number in range");
+    let fragment = frag_of(HANDOFF_CHUNK);
+    let stray = frag_of(HANDOFF_STRAY);
+
+    // An `Open` session with one owned staging entry planning the chunk on server 1.
+    let open = handoff_session("{\"kind\":\"Open\"}");
+    let owned_key = sidx_key(&upload, part, HANDOFF_CHUNK);
+    let staged = StagedPlacement::new(EcScheme::None, vec![1]).expect("a supported scheme");
+    let owned = OwnedEntry::new(upload.clone(), HANDOFF_NOW * 1_000, staged);
+    let seeded = meta
+        .commit(
+            WriteBatch::new()
+                .put(mpu_key(&upload), open.clone())
+                .put(owned_key.clone(), metadata::encode(&owned.to_pending())),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seeded, CommitOutcome::Committed);
+    d[1].put_fragment(fragment, Bytes::from_static(b"staged"), None)
+        .await
+        .unwrap();
+    d[2].put_fragment(stray, Bytes::from_static(b"stray"), None)
+        .await
+        .unwrap();
+    mark_orphaned(&*meta, 1, fragment, 0).await.unwrap();
+    mark_orphaned(&*meta, 2, stray, 0).await.unwrap();
+
+    // The part record the commit writes, and the records the publication writes.
+    let chunk = String::from_utf8(metadata::encode(&handoff_chunk_ref()).to_vec()).unwrap();
+    let part_record = Bytes::from(
+        format!(
+            "{{\"chunks\":[{chunk}],\"len\":5,\"digest\":\"{}\",\"committed_at_millis\":1,\
+             \"session_epoch\":1}}",
+            "ef".repeat(32)
+        )
+        .into_bytes(),
+    );
+    decode_part_record(&part_record).expect("the part record decodes");
+    let completing = handoff_session(&format!(
+        "{{\"kind\":\"Completing\",\"fenced_at_millis\":1,\"segments_written\":0,\
+         \"publish_target\":{{\"parent\":{ROOT},\"name\":\"{HANDOFF_OBJECT}\",\"epoch\":1}}}}"
+    ));
+    let completed = handoff_session(&format!(
+        "{{\"kind\":\"Completed\",\"completion\":{{\"inode\":{HANDOFF_INODE},\"version\":1,\
+         \"etag\":\"{}-1\",\"completed_at_millis\":2,\"complete_fingerprint\":\"{}\"}}}}",
+        "ab".repeat(32),
+        "cd".repeat(32)
+    ));
+    let published = InodeRecord {
+        size: 5,
+        chunk_map: vec![handoff_chunk_ref()].into(),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    };
+
+    // The run starts here: what the fixture wrote above is not the concurrent task.
+    meta.events.lock().unwrap().clear();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let writer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let done = Arc::clone(&done);
+        let upload = upload.clone();
+        async move {
+            // Zero means now: see `RESTORE_NEMESIS_SPAN`.
+            let pause = |millis: u64| async move {
+                if millis > 0 {
+                    madsim::time::sleep(Duration::from_millis(millis)).await;
+                }
+            };
+            let land = |batch: WriteBatch, handoff: Handoff| {
+                let meta = Arc::clone(&meta);
+                async move {
+                    let outcome = meta.commit(batch).await.unwrap();
+                    assert_eq!(
+                        outcome,
+                        CommitOutcome::Committed,
+                        "the {handoff:?} must land, or this run tests nothing"
+                    );
+                    meta.log(HandoffEvent::Landed(handoff));
+                }
+            };
+
+            pause(gaps[0]).await;
+            let commit = WriteBatch::new()
+                .require(mpu_key(&upload), open.clone())
+                .delete(owned_key)
+                .put(part_key(&upload, part), part_record);
+            land(commit, Handoff::PartCommit).await;
+
+            // The Complete fence: the session goes to `Completing` before the flip.
+            let fence = WriteBatch::new()
+                .require(mpu_key(&upload), open)
+                .put(mpu_key(&upload), completing.clone());
+            assert_eq!(meta.commit(fence).await.unwrap(), CommitOutcome::Committed);
+
+            pause(gaps[1]).await;
+            let flip = WriteBatch::new()
+                .require(mpu_key(&upload), completing)
+                .require_absent(metadata::inode_key(HANDOFF_INODE))
+                .require_absent(metadata::dirent_key(ROOT, HANDOFF_OBJECT))
+                .put(
+                    metadata::inode_key(HANDOFF_INODE),
+                    metadata::encode(&published),
+                )
+                .put(
+                    metadata::dirent_key(ROOT, HANDOFF_OBJECT),
+                    metadata::encode(&metadata::DirentRecord {
+                        inode: HANDOFF_INODE,
+                    }),
+                )
+                .put(mpu_key(&upload), completed);
+            land(flip, Handoff::Flip).await;
+
+            pause(gaps[2]).await;
+            land(
+                WriteBatch::new().delete(part_key(&upload, part)),
+                Handoff::Drain,
+            )
+            .await;
+            done.store(true, Ordering::Relaxed);
+        }
+    });
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-staged-handoffs").await;
+    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    let mut passes = 0;
+    loop {
+        // One more pass once every move has landed, so a pass reads the store the moves left.
+        let finished = done.load(Ordering::Relaxed);
+        meta.log(HandoffEvent::Pass);
+        let ctx = GcContext {
+            meta: &*meta,
+            fleet: &fleet,
+            grace_window_millis: HANDOFF_GRACE,
+            expired_pending: ExpiredPendingPolicy::Defer,
+        };
+        let outcome =
+            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, HANDOFF_NOW).await;
+        passes += 1;
+        assert!(
+            outcome.is_ok(),
+            "GC pass {passes} failed (gaps {gaps:?}): {:?}",
+            outcome.err()
+        );
+        assert!(
+            d[1].get_fragment(fragment).await.unwrap().is_some(),
+            "GC pass {passes} reclaimed the moving chunk's fragment, which an owned staging entry, \
+             a part record or a committed inode named at every instant of the run — the pass's \
+             readings saw it in no class (gaps {gaps:?}): {:?}",
+            meta.events.lock().unwrap()
+        );
+        if finished {
+            break;
+        }
+        assert!(
+            passes < HANDOFF_MAX_PASSES,
+            "the concurrent task never finished its moves (gaps {gaps:?})"
+        );
+    }
+    writer.await.expect("the concurrent task ran to completion");
+    // The run's observations end here: the reads below are the property's, not a pass's.
+    let events = meta.events.lock().unwrap().clone();
+
+    // Every move landed, the chunk ends where the publication put it, and it was never reclaimed —
+    // while the unprotected stray beside it was.
+    assert!(
+        is_marked(&*meta, 1, fragment).await,
+        "the moving chunk's mark was consumed without a reclaim (gaps {gaps:?})"
+    );
+    assert!(
+        d[2].get_fragment(stray).await.unwrap().is_none(),
+        "the unprotected stray survived every pass: GC reclaimed nothing in this run, so keeping \
+         the chunk proves nothing (gaps {gaps:?})"
+    );
+    assert!(
+        meta.get(&metadata::inode_key(HANDOFF_INODE))
+            .await
+            .unwrap()
+            .is_some()
+            && meta.get(&part_key(&upload, part)).await.unwrap().is_none(),
+        "the publication did not leave the chunk named by the committed inode alone (gaps {gaps:?})"
+    );
+
+    handoff_landings(&events, &upload)
+}
+
+/// The campaign leg: the seed picks when each of the three moves lands, so 50 seeds sweep the
+/// schedule space around GC's staged and committed reads.
+async fn prop_gc_staged_handoffs_never_reclaim_the_chunk(rng: &mut ChaCha8Rng) {
+    let gaps = [(); 3].map(|()| u64::from(rng.next_u32() % (HANDOFF_SPAN + 1)));
+    staged_handoffs_under_gc(gaps).await;
+}
+
+/// **The windows this property exists for are genuinely REACHED.** Walks one spacing across the
+/// whole span — for all three moves, and again with the drain right behind the flip — asserting the
+/// property at every point. Then it asserts that each move landed between the two reads it hands
+/// protection across in at least one run and outside them in at least one other, and that in at
+/// least one run the flip and the drain both landed between the same pass's two reads: the schedule
+/// a reading that took committed inodes before part records sees the chunk in neither class.
+/// Without it, a span that drifted away from GC's reads would leave the campaign green with nothing
+/// behind it.
+async fn prop_gc_staged_handoffs_reach_between_and_outside_the_reads() {
+    let mut between = [false; 3];
+    let mut outside = [false; 3];
+    let mut published_within_one_window = false;
+    for spacing in 0..=u64::from(HANDOFF_SPAN) {
+        for drain_gap in [spacing, 0] {
+            let landed = staged_handoffs_under_gc([spacing, spacing, drain_gap]).await;
+            for handoff in Handoff::ALL {
+                between[handoff.index()] |= landed.between(handoff);
+                outside[handoff.index()] |= landed.outside(handoff);
+            }
+            published_within_one_window |= landed.published_within_one_window();
+        }
+    }
+    for handoff in Handoff::ALL {
+        assert!(
+            between[handoff.index()],
+            "no spacing in 0..={HANDOFF_SPAN} ms landed the {handoff:?} between the two reads it \
+             hands protection across — the schedule this property exists for was never exercised"
+        );
+        assert!(
+            outside[handoff.index()],
+            "no spacing in 0..={HANDOFF_SPAN} ms landed the {handoff:?} outside the two reads it \
+             hands protection across — the sweep is stuck in one regime"
+        );
+    }
+    assert!(
+        published_within_one_window,
+        "no spacing in 0..={HANDOFF_SPAN} ms landed the flip AND the drain between one pass's part \
+         read and its inode scan — the one publication schedule a destination-first reading loses \
+         the chunk on was never exercised"
+    );
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -2649,6 +3135,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn gc_staged_handoffs_never_reclaim_the_chunk() {
+        prop_gc_staged_handoffs_never_reclaim_the_chunk(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn gc_staged_handoffs_reach_between_and_outside_the_reads() {
+        prop_gc_staged_handoffs_reach_between_and_outside_the_reads().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -2682,6 +3180,7 @@ dst_campaign_test! {
             prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies(&mut rng).await;
             prop_restore_two_readings_never_license_a_mark(&mut rng).await;
             prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rng).await;
+            prop_gc_staged_handoffs_never_reclaim_the_chunk(&mut rng).await;
         }
     }
 }
