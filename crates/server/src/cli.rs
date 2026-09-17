@@ -1260,9 +1260,10 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
          chunk(s) DANGLING (unreadable AND unreconstructible — the restore resurrected maps \
          whose bytes were already reclaimed), {} MISPLACED (bytes present but not where the \
          restored map looks — unreadable until the placement is fixed), {} under-replicated (the \
-         repair loop rebuilds these); {} committed object(s) UNREADABLE (their chunk maps could \
-         not be read, so every count here is drawn over the rest of the store); {} pending-ledger \
-         entr(y/ies) UNREADABLE (held unmarked, see below).",
+         repair loop rebuilds these); {} record(s) UNREADABLE (committed objects' chunk maps or \
+         staged multipart records the pass could not read — so every count here is drawn over \
+         the rest of the store); {} pending-ledger entr(y/ies) UNREADABLE (held unmarked, see \
+         below).",
         // NOT "complete" over a store the pass could only partly read: "complete" is a claim
         // about a reading that FINISHED, and an operator scanning this line for one word must
         // not find it while a record is still unreadable.
@@ -1325,16 +1326,34 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             //
             // The fleet-wide claim POINTS AT the marked count printed a line up rather than
             // restating it, so the two can never contradict each other. It is 0 by construction
-            // — the pass withholds every mark while either read of the committed namespace
-            // found a hole (`restore.rs`'s one-reading rule) — and this is where an operator
-            // checks that for themselves rather than taking it on trust.
-            "wyrd custodian: NEEDS-HUMAN — {} committed object(s) could not be READ: {}. Their \
-             chunk maps are missing segments or will not decode, so this run says nothing about \
-             the chunks they own and marked nothing anywhere in the fleet ({} stranded \
-             fragment(s) marked, above) — while any object is unreadable no fragment can be shown \
-             to be a stray. Repair or remove the record(s) named here and re-run this pass; until \
-             then the counts above cover the REST of the store only and this run is NOT a clean \
-             bill. The audit log carries each one too (`action=unresolvable-chunk-map`).",
+            // — the pass withholds every mark while either read of the committed namespace, or
+            // its read of the staged multipart records, found a hole (`restore.rs`'s
+            // one-reading rule) — and this is where an operator checks that for themselves
+            // rather than taking it on trust.
+            //
+            // Named as RECORDS, not committed objects: the report carries staged multipart
+            // records beside committed objects (`RestoreReport::unresolvable`), and an operator
+            // told a `part:` or `sidx:` key is a committed object goes looking for a file that
+            // was never published.
+            //
+            // The staged half says exactly WHICH half of a record the pass judged, per class,
+            // because that is what the operator repairs. The pass never decodes an upload
+            // session's or a staging entry's VALUE to build this class (`custodian::gc`'s
+            // `staged_fragments` reads a session by key alone, and an undecodable `sidx:` value
+            // under a key that still names its chunk HOLDS that chunk rather than landing here) —
+            // so promising that a value was checked would send a repair at a record the pass
+            // never read.
+            "wyrd custodian: NEEDS-HUMAN — {} record(s) could not be READ: {}. Each is a \
+             committed object whose chunk map is missing segments or will not decode, or a staged \
+             multipart record: an upload session (`mpu:`) or an in-flight staging entry (`sidx:`) \
+             whose KEY will not parse, or a committed part (`part:`) whose key will not parse or \
+             whose value will not decode — so this run says nothing about the chunks they own and \
+             marked nothing anywhere in the fleet ({} stranded fragment(s) marked, above): while \
+             any such record is unreadable no fragment can be shown to be a stray. Repair or \
+             remove the record(s) named here and re-run this pass; until then the counts above \
+             cover the REST of the store only and this run is NOT a clean bill. The audit log \
+             carries each one too (`action=unresolvable-chunk-map` for a committed object, \
+             `action=unresolvable-staged-record` for a staged multipart record).",
             report.unresolvable.len(),
             named_records(&report.unresolvable),
             report.stranded_marked,
@@ -1354,15 +1373,17 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
 /// A bound, not a filter: the paragraph is one stderr line an operator reads mid-restore, and a
 /// store whose whole `inode:` namespace is damaged would otherwise print its every key into it.
 /// Every name is still carried in full by [`RestoreReport::unresolvable`] and by the audit trail
-/// (`action=unresolvable-chunk-map`), and the remainder is stated as a count rather than dropped
-/// — so the line is never a silent truncation, and repairing the ones it names and re-running is
-/// the operator's loop out of the tail.
+/// (`action=unresolvable-chunk-map`, and `action=unresolvable-staged-record` for a staged
+/// multipart record), and the remainder is stated as a count rather than dropped — so the line is
+/// never a silent truncation, and repairing the ones it names and re-running is the operator's
+/// loop out of the tail.
 const NAMED_UNREADABLE_RECORDS: usize = 20;
 
 /// Name the blocking records for the operator, in the order the pass reported them (the store's
 /// own key order), capped at [`NAMED_UNREADABLE_RECORDS`] with the remainder counted.
 ///
-/// The names are `inode:` keys as the store spells them, escaped by the pass itself
+/// The names are record keys as the store spells them — `inode:` keys, and `mpu:` / `part:` /
+/// `sidx:` keys for staged multipart records — escaped by the pass itself
 /// (`custodian::gc::object_name`) so two damaged records never arrive under one name — a repair
 /// guided by an ambiguous name fixes one record and leaves the other blocking the store.
 fn named_records(names: &[String]) -> String {
@@ -3002,11 +3023,68 @@ mod tests {
             "records past the bound must be COUNTED, never silently dropped: {printed}"
         );
         assert!(
-            printed.contains(&format!(
-                "{} committed object(s) could not be READ",
-                names.len()
-            )),
+            printed.contains(&format!("{} record(s) could not be READ", names.len())),
             "...and the total is the report's own, not the number that fitted: {printed}"
         );
+    }
+
+    /// Issue #803: the post-restore pass reports a staged multipart record it could not read in
+    /// the same field as a committed object (`RestoreReport::unresolvable`, keys as the pass names
+    /// them — `custodian::gc::object_name`), so what the operator reads names both kinds as what
+    /// they are. Calling a `part:` or `sidx:` key a "committed object" sends a repair after a file
+    /// that was never published, and the audit action to look for is the staged one.
+    ///
+    /// The mixed report and a report holding one staged part record alone each need a human, say
+    /// INCOMPLETE, count and name every record as a record, and point at both audit actions —
+    /// never at "committed object(s)".
+    #[test]
+    fn restore_verdict_names_unreadable_staged_records_as_staged() {
+        let upload = "0123456789abcdef0123456789abcdef";
+        let part = format!("part:{upload}:000001");
+        let mixed = RestoreReport {
+            unresolvable: vec![
+                "inode:7".to_owned(),
+                format!("mpu:{upload}"),
+                part.clone(),
+                format!("sidx:{upload}:000001:9"),
+            ],
+            ..Default::default()
+        };
+        let part_only = RestoreReport {
+            unresolvable: vec![part],
+            ..Default::default()
+        };
+        for report in [&mixed, &part_only] {
+            let verdict = restore_verdict(report);
+            let printed = verdict.lines.join("\n");
+            let count = report.unresolvable.len();
+            assert!(verdict.needs_human, "{printed}");
+            for needle in [
+                "INCOMPLETE".to_owned(),
+                format!("{count} record(s) UNREADABLE"),
+                format!("{count} record(s) could not be READ"),
+                "staged multipart record".to_owned(),
+                "action=unresolvable-chunk-map".to_owned(),
+                "action=unresolvable-staged-record".to_owned(),
+            ]
+            .iter()
+            .chain(&report.unresolvable)
+            {
+                assert!(
+                    printed.contains(needle.as_str()),
+                    "the verdict does not say {needle:?}: {printed}"
+                );
+            }
+            for stale in [
+                "committed object(s) UNREADABLE",
+                "committed object(s) could not be READ",
+            ] {
+                assert!(
+                    !printed.contains(stale),
+                    "the verdict still calls every unreadable record a committed object \
+                     ({stale:?}): {printed}"
+                );
+            }
+        }
     }
 }

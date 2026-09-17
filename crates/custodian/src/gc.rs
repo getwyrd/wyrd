@@ -39,6 +39,18 @@
 //! contained: it is attributed, and the walk — and every other object's protection —
 //! continues.
 //!
+//! **Staged bytes are never reclaimed either**, and they are protected as a class of their own
+//! ([`StagedSet`], proposal 0016 decision 2, `0016:765-893`): the fragments a multipart upload's
+//! committed parts (`part:`) and in-flight owned staging entries (`sidx:`) name, for every
+//! session listed under `mpu:`, before any committed chunk map names them. A pass reads that
+//! class ([`staged_fragments`]) through each session's own bounded ranges — never one read of a
+//! whole namespace — and BEFORE the committed reference set: owned entries, then committed parts,
+//! then committed inodes, the order that leaves a chunk in at least one class whenever a part
+//! commit or a publication lands mid-read (`0016:782-800`). A staged record the pass cannot read
+//! makes that class incomplete, which reclaims nothing and certifies nothing exactly as an
+//! unreadable committed map does; a store fault under one of its reads fails the pass. Scrub and
+//! the drain-status surface do not read the class at all.
+//!
 //! Dependency boundary (ADR-0010, `0005:421-422`): this loop stays over the
 //! `traits` / `core` seams plus `tracing` — **no** concrete backend.
 
@@ -51,8 +63,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 // `crate::gc::orphan_key` unchanged.
 pub(crate) use wyrd_core::metadata::orphan_key;
 use wyrd_core::metadata::{
-    self, parse_orphan_key, ChunkMapError, EcScheme, InodeRecord, InodeState, MalformedPlacement,
-    ORPHAN_PREFIX,
+    self, parse_orphan_key, ChunkMapError, ChunkRef, EcScheme, InodeRecord, InodeState,
+    MalformedPlacement, ORPHAN_PREFIX,
+};
+use wyrd_core::multipart::{
+    decode_owned_entry, decode_part_record, parse_mpu_key, parse_part_key, parse_sidx_key,
+    part_range, sidx_range, MAX_PART_CHUNKS, MPU_PREFIX, U_REF,
 };
 use wyrd_traits::{
     BoxError, ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, ScanPage,
@@ -113,6 +129,26 @@ pub(crate) const CLEANUP_BATCH: usize = 1_000;
 /// mutable globals are ruled out (ADR-0035). Being in the store also carries the walk across a
 /// leader change. Outside `orphan:`, so the walk never reads its own bookmark.
 pub(crate) const ORPHAN_CURSOR_KEY: &[u8] = b"gc:orphan-cursor";
+
+/// **P** — the most records one page of a staged read holds ([`staged_fragments`]).
+///
+/// Every staged read is paged rather than one `scan`: `scan` is complete-or-fail-loud, so a range
+/// larger than the store's configured cap would fail whole on every pass, and GC and the
+/// post-restore pass with it. A page is bounded instead.
+///
+/// Derivation: 512. One `part:` value names at most [`MAX_PART_CHUNKS`] (158) chunk references,
+/// so one page of committed parts holds at most 512 × 158 = 80,896 — within [`U_REF`] (85,952),
+/// one admitted session's worst-case staged footprint (`0016:1469`), the unit the per-pass
+/// reference budget `W_ref` already charges every session. Reading one page therefore never holds
+/// more references than that budget allows a single session, and its raw bytes come to at most
+/// 512 × [`metadata::MAX_VALUE_BYTES`] = 51.2 MB. A session at `MAX_PARTS_PER_SESSION` (10,000
+/// parts) is read in 20 pages; its owned range, at most `MAX_INFLIGHT_PARTS × MAX_PART_CHUNKS` =
+/// 2,528 entries, in 5.
+const STAGED_PAGE: usize = 512;
+
+// The derivation above, held at compile time: a retuned page or part cap that breaks it fails the
+// build here.
+const _: () = assert!(STAGED_PAGE as u64 * MAX_PART_CHUNKS as u64 <= U_REF);
 
 pub(crate) fn parse_pending_chunk(key: &[u8]) -> Option<ChunkId> {
     std::str::from_utf8(key)
@@ -202,13 +238,35 @@ pub async fn mark_orphaned(
 /// report the store converged — [`Reconciled::Changed`] if any fragment bytes were
 /// reclaimed, and [`Reconciled::Satisfied`] otherwise. Scrub answers the identical
 /// condition the identical way ([`crate::scrub::reconcile`]): one incomplete set, one
-/// rule, read twice. A pass whose window of the `orphan:` ledger ([`OrphanWindow`]) stopped
+/// rule, read twice. A staged multipart record this pass could not read
+/// ([`StagedSet::unresolvable`]) is answered the same way, by GC alone: scrub does not read
+/// staged records. A pass whose window of the `orphan:` ledger ([`OrphanWindow`]) stopped
 /// short of the ledger's end and reclaimed nothing answers [`Reconciled::Partial`], never
 /// `Satisfied`: `Satisfied` certifies that reality matched, and a caller driving the loop to
 /// satisfaction would stop on it with eligible marks still unvisited in the windows ahead (PR
 /// #802 review). `Satisfied` is therefore "this pass read the ledger to its end and reclaimed
 /// nothing".
 pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Reconciled> {
+    // The staged protection class, read FIRST: every fragment a multipart upload's committed
+    // parts and in-flight owned staging entries name. Never reclaimed either — and read before the
+    // committed reference set below because a publication moves a chunk's protection from its
+    // `part:` record to a committed inode, so reading the inodes first could miss a flip and then
+    // miss the part record its drain deleted, seeing the chunk in neither (`0016:793-800`, X67).
+    // Its own reads run owned entries before committed parts, for a part commit's move
+    // (`0016:782-790`). A store fault under any of them fails the pass here, before anything is
+    // reclaimed.
+    let staged = staged_fragments(ctx.meta).await?;
+    // Attributed the moment the reading returns, before the next store read, on the placement the
+    // committed set's attribution below explains: a fault a `?` later must not take the names of
+    // records a human has to repair with it.
+    for (record, fault) in &staged.unresolvable {
+        emit_unresolvable_staged(&object_name(record), fault);
+    }
+    for (&chunk, records) in &staged.held {
+        for (record, fault) in records {
+            emit_untrusted_staged(&object_name(record), chunk, fault);
+        }
+    }
     // The reference set is the safety gate: every fragment a *committed* chunk map's
     // placement record points at. A fragment in this set is NEVER reclaimed
     // (`0005:294-295`, Q3 `0005:394-397`) — its violation is silent corruption.
@@ -268,8 +326,12 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
             // placement cannot be trusted, so every fragment bearing its id is off-limits;
             // so is every fragment at all while the set is incomplete. The set itself says
             // WHICH rule held, so the audit trail never files an unrelated orphan under
-            // `referenced` when what actually saved it was a blanket containment.
-            if let Some(reason) = referenced.protection(dserver, frag) {
+            // `referenced` when what actually saved it was a blanket containment. The staged
+            // class gates the same way, by its own rules and under its own reasons.
+            if let Some(reason) = referenced
+                .protection(dserver, frag)
+                .or_else(|| staged.protection(dserver, frag))
+            {
                 emit_skip(dserver, frag, reason);
                 continue;
             }
@@ -345,23 +407,27 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
     }
     cleanup.finish().await?;
 
-    Ok(if !referenced.unresolvable.is_empty() {
-        // Refuse to certify — whatever this pass reclaimed above is durable either way (a
-        // reclaim never depended on the object it could not read, `ReferenceSet::protects`
-        // withheld everything). What answering `Changed` / `Satisfied` would destroy is the
-        // only signal that this pass could not see every committed object's chunks: an
-        // operator reading `Satisfied` is being told the store converged, and would act on
-        // it — decommission the server, close the ticket (`docs/principles.md` §5 C-1).
-        Reconciled::Blocked
-    } else if changed {
-        Reconciled::Changed
-    } else if window.is_partial() {
-        // Nothing reclaimed in THIS window, and more of the ledger lies beyond it: not a
-        // certification. The next pass resumes where this one stopped.
-        Reconciled::Partial
-    } else {
-        Reconciled::Satisfied
-    })
+    Ok(
+        if !referenced.unresolvable.is_empty() || !staged.unresolvable.is_empty() {
+            // Refuse to certify — whatever this pass reclaimed above is durable either way (a
+            // reclaim never depended on the object it could not read, `ReferenceSet::protects`
+            // withheld everything). What answering `Changed` / `Satisfied` would destroy is the
+            // only signal that this pass could not see every committed object's chunks: an
+            // operator reading `Satisfied` is being told the store converged, and would act on
+            // it — decommission the server, close the ticket (`docs/principles.md` §5 C-1). An
+            // unreadable staged record is the same hole in the other class: `StagedSet::protects`
+            // withheld everything, and the answer says so.
+            Reconciled::Blocked
+        } else if changed {
+            Reconciled::Changed
+        } else if window.is_partial() {
+            // Nothing reclaimed in THIS window, and more of the ledger lies beyond it: not a
+            // certification. The next pass resumes where this one stopped.
+            Reconciled::Partial
+        } else {
+            Reconciled::Satisfied
+        },
+    )
 }
 
 /// The **committed reference set** GC and scrub gate on: every fragment a *valid*
@@ -570,6 +636,271 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
         schemes,
         unresolvable,
     })
+}
+
+/// The **staged protection class** (proposal 0016 decision 2, `0016:765-893`): every fragment a
+/// multipart upload's own records name — the chunks of its committed parts (`part:`) and the
+/// planned placement of its in-flight owned staging entries (`sidx:`) — for **every** session
+/// listed under `mpu:`, whatever its state. 0016 counts fewer (`0016:770-775`); covering more only
+/// keeps more, and a session's state is not needed to find its records, only its upload id.
+///
+/// A class of its own, **disjoint** from the committed [`ReferenceSet`] rather than merged into
+/// it, so each consumer decides for itself what staged bytes mean to it (`0016:767-782`, `:881`),
+/// and built by a reader of its own ([`staged_fragments`]) rather than inside
+/// [`referenced_fragments`]. Only the two passes that delete or mark read it: GC's reclaim
+/// ([`reconcile`]) and the post-restore mark gate ([`crate::restore`]). Scrub and the drain-status
+/// query share the committed build and read no upload record at all, so an upload record's
+/// damage, a store fault reading one, or the cost of reading them cannot reach their answers.
+///
+/// Its rules mirror the committed set's, one level each:
+///
+/// - a record whose placement **cannot be trusted** — a staged placement whose length is not its
+///   scheme's fragment count, or an owned value that will not decode under a key that still names
+///   its chunk — holds that chunk **whole** ([`Self::held`]), as a malformed committed placement
+///   does (0016 X65, `0016:2594`; ADR-0045 decision 3). A staged placement is held to the exact
+///   length: the identity fallback a committed map's empty placement gets exists for records
+///   written before placements were, and every staged record is born with a full one
+///   (`0016:828`);
+/// - a record that **cannot be read at all** — a session key naming no upload, a part key the
+///   parser rejects or a part value that will not decode, an owned key naming no chunk — hides
+///   which chunks it protects, so the class is **incomplete** ([`Self::unresolvable`]) and
+///   protects every fragment in the fleet, exactly as an unreadable committed map does.
+///
+/// deferred: #663, #664 — scrub and reconstruction (#663), and drain status and rebalance (#664),
+/// acting on staged bytes.
+#[derive(Default)]
+pub(crate) struct StagedSet {
+    /// `(dserver, fragment)` a staged record places: each chunk of a committed part at its recorded
+    /// placement, each owned entry's chunk at its planned one.
+    pub placed: HashSet<(DServerId, FragmentId)>,
+    /// Chunks held **whole**, each with the staged record(s) naming it that could not be trusted —
+    /// by key as the store spells it, and why — for attribution. Every fragment bearing one of
+    /// these ids is protected.
+    pub held: BTreeMap<ChunkId, Vec<(Vec<u8>, String)>>,
+    /// Staged records that could not be read at all, keyed by their raw key bytes and valued by the
+    /// fault — [`ReferenceSet::unresolvable`]'s shape, for its reasons (a rendered name is not
+    /// injective, and a key that will not parse is still a record a human has to go and find).
+    /// While this is non-empty the class is **incomplete**.
+    pub unresolvable: BTreeMap<Vec<u8>, String>,
+}
+
+impl StagedSet {
+    /// **Why** `frag` on `dserver` is protected by the staged class — the audit reason, one per
+    /// rule, never a committed-set reason — or `None` when this class does not protect it.
+    pub fn protection(&self, dserver: DServerId, frag: FragmentId) -> Option<&'static str> {
+        if self.placed.contains(&(dserver, frag)) {
+            Some("staged")
+        } else if self.held.contains_key(&frag.chunk) {
+            Some("untrusted-staged-record")
+        } else if !self.unresolvable.is_empty() {
+            Some("incomplete-staged-set")
+        } else {
+            None
+        }
+    }
+
+    /// Whether the staged class protects `frag` on `dserver`: a staged placement names it, a staged
+    /// record that cannot be trusted names its chunk, or **anything at all** while a staged record
+    /// could not be read — [`ReferenceSet::protects`]' containment, for the other class.
+    pub fn protects(&self, dserver: DServerId, frag: FragmentId) -> bool {
+        self.protection(dserver, frag).is_some()
+    }
+
+    /// Classify one `sidx:` entry through the namespace's one decode entry point
+    /// ([`decode_owned_entry`]), which checks key and value together.
+    fn read_owned_entry(&mut self, key: &[u8], value: &[u8]) {
+        match decode_owned_entry(key, value) {
+            Ok((_part, chunk, entry)) => {
+                let staged = entry.staged();
+                // The planned placement in the shape both placement rules are stated over. An
+                // owned entry records no logical length, and neither rule reads one.
+                let planned = ChunkRef {
+                    id: chunk,
+                    scheme: staged.scheme(),
+                    len: 0,
+                    placement: staged.placement().to_vec(),
+                };
+                self.place(key, &planned);
+            }
+            // The decode failed; whether the damage is confined to one chunk is the key's to say.
+            Err(fault) => match parse_sidx_key(key) {
+                Ok((_upload, _part, chunk)) => self.hold(chunk, key, fault.to_string()),
+                Err(_) => {
+                    self.unresolvable.insert(key.to_vec(), fault.to_string());
+                }
+            },
+        }
+    }
+
+    /// Classify one `part:` record. Its key and its value are validated separately
+    /// ([`parse_part_key`], [`decode_part_record`]), and a record either refuses is one this pass
+    /// cannot read: a value naming chunks under a key no writer spells is not a part anyone can
+    /// publish or retire.
+    fn read_part(&mut self, key: &[u8], value: &[u8]) {
+        match parse_part_key(key).and_then(|_| decode_part_record(value)) {
+            Ok(part) => {
+                for chunk in part.chunks() {
+                    self.place(key, chunk);
+                }
+            }
+            Err(fault) => {
+                self.unresolvable.insert(key.to_vec(), fault.to_string());
+            }
+        }
+    }
+
+    /// Place `chunk`, which the staged record under `key` names — or hold it whole when its
+    /// placement is not exactly one D server per fragment.
+    fn place(&mut self, key: &[u8], chunk: &ChunkRef) {
+        let expected = chunk.fragment_count();
+        if chunk.placement.len() == usize::from(expected) {
+            for (index, dserver) in chunk.fragments() {
+                self.placed.insert((
+                    dserver,
+                    FragmentId {
+                        chunk: chunk.id,
+                        index,
+                    },
+                ));
+            }
+        } else {
+            let fault = format!(
+                "staged placement names {} D server(s) for a scheme of {expected} fragment(s)",
+                chunk.placement.len()
+            );
+            self.hold(chunk.id, key, fault);
+        }
+    }
+
+    fn hold(&mut self, chunk: ChunkId, key: &[u8], fault: String) {
+        self.held
+            .entry(chunk)
+            .or_default()
+            .push((key.to_vec(), fault));
+    }
+}
+
+/// Read the [`StagedSet`]: list the sessions under `mpu:`, then read each one's owned staging
+/// entries (`sidx:<id>:`) and **then** its committed parts (`part:<id>:`).
+///
+/// **The order is the protection** (`0016:782-800`). A part commit deletes a chunk's owned entry
+/// and writes the part record naming it in one batch, so reading parts before owned entries could
+/// see the chunk in neither; reading the source first sees it in one or both. Publication moves the
+/// same protection on to a committed inode, so the caller reads this class before the committed
+/// reference set ([`referenced_fragments`]) for the same reason. Reads within a range may be paged
+/// without weakening either: a whole source range is read before its destination is begun, so a
+/// move that lands mid-walk is still seen on one side of it.
+///
+/// **Bounded reads, never a namespace scan** (`0016:890`). Every range is walked in pages of at
+/// most [`STAGED_PAGE`], through the same checked page read the orphan-ledger walk uses: the
+/// listing, then two ranges per session. No read covers another session's records, so none grows
+/// with the fleet's upload population beyond the session count admission bounds. A `part:` or
+/// `sidx:` record whose session is no longer listed is therefore not read: no per-session range
+/// can reach it. Each read's await is bounded as every other custodian read is, by the
+/// `MetadataStore` implementation's own network bound (#508/#636); a read that fails fails the
+/// pass closed.
+///
+/// **What it cannot read or trust, it contains** (ADR-0045 decision 3): see [`StagedSet`]. A
+/// session record's **value** is never decoded: protection does not depend on the state, and a
+/// damaged value still names its ranges through its key. A **store fault** is not contained: the
+/// reading is then missing an unknown part of some session's records, so it propagates as a
+/// [`StagedReadFault`] naming the range that failed, and the pass fails before it deletes or marks
+/// anything.
+pub(crate) async fn staged_fragments(meta: &dyn MetadataStore) -> Result<StagedSet> {
+    // deferred: #806 — the `mpuctl` budget-profile preflight (`0016:348`, X99 `0016:2628`): read
+    // the admission record and fail closed with an alarm, before this build, when its stored
+    // profile differs from the custodian's own, so a rolling profile change cannot grow this
+    // reading past the `W_ref` the custodian was sized for. Until then the reading's total size is
+    // bounded only by the profile the gateways admitted sessions under, which this pass does not
+    // check; each page of it stays bounded by `STAGED_PAGE`.
+    let mut set = StagedSet::default();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (sessions, next) = staged_page(meta, MPU_PREFIX, after.as_deref()).await?;
+        for (key, _session) in &sessions {
+            let upload = match parse_mpu_key(key) {
+                Ok(upload) => upload,
+                Err(fault) => {
+                    set.unresolvable.insert(key.clone(), fault.to_string());
+                    continue;
+                }
+            };
+            walk_staged_range(meta, &sidx_range(&upload), |key, value| {
+                set.read_owned_entry(key, value)
+            })
+            .await?;
+            walk_staged_range(meta, &part_range(&upload), |key, value| {
+                set.read_part(key, value)
+            })
+            .await?;
+        }
+        match (next, sessions.into_iter().last()) {
+            (Some(_), Some((last, _))) => after = Some(last),
+            _ => return Ok(set),
+        }
+    }
+}
+
+/// Walk every record under `range`, page by page, handing each to `read`.
+async fn walk_staged_range(
+    meta: &dyn MetadataStore,
+    range: &[u8],
+    mut read: impl FnMut(&[u8], &[u8]),
+) -> Result<()> {
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (page, next) = staged_page(meta, range, after.as_deref()).await?;
+        for (key, value) in &page {
+            read(key, value);
+        }
+        match (next, page.into_iter().last()) {
+            (Some(_), Some((last, _))) => after = Some(last),
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// One checked page of a staged read, its failure named by the range it was reading.
+async fn staged_page(
+    meta: &dyn MetadataStore,
+    range: &[u8],
+    after: Option<&[u8]>,
+) -> Result<ScanPage> {
+    checked_page(meta, range, "staged-record", after, STAGED_PAGE)
+        .await
+        .map_err(|source| {
+            BoxError::from(StagedReadFault {
+                range: object_name(range),
+                source,
+            })
+        })
+}
+
+/// A read of the staged protection class that failed, naming the key range it was reading.
+///
+/// The store's own error stays reachable through [`source`](std::error::Error::source), so a
+/// chain-walking classifier (`wyrd_traits::classify`) still finds its class.
+#[derive(Debug)]
+struct StagedReadFault {
+    /// The key range being read, escaped as [`object_name`] escapes a key.
+    range: String,
+    source: BoxError,
+}
+
+impl std::fmt::Display for StagedReadFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "staged protection: reading the key range {} failed: {}",
+            self.range, self.source
+        )
+    }
+}
+
+impl std::error::Error for StagedReadFault {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.source)
+    }
 }
 
 /// How a blocker is named to an operator: the `inode:` key as the store spells it, with
@@ -819,7 +1150,18 @@ fn classify_ledger_entry(
 }
 
 /// One page of the `orphan:` ledger strictly after `after`, at most `limit` entries — refused
-/// if it is longer than that, or does not move the walk forward.
+/// if it is longer than that, or does not move the walk forward ([`checked_page`]).
+async fn ledger_page(
+    meta: &dyn MetadataStore,
+    after: Option<&[u8]>,
+    limit: usize,
+) -> Result<ScanPage> {
+    checked_page(meta, ORPHAN_PREFIX, "orphan-ledger", after, limit).await
+}
+
+/// One page of the keys under `prefix` strictly after `after`, at most `limit` entries — refused
+/// if it is longer than that, or does not move the walk forward. `walk` names the walk in the
+/// refusal.
 ///
 /// `scan_page`'s contract already promises both (a page holds at most `limit` entries, starts
 /// strictly after its cursor, and is empty only at the end), but a walk that trusted it blindly
@@ -827,16 +1169,19 @@ fn classify_ledger_entry(
 /// bounded — and loop forever on one that broke the cursor. So a walker checks the two things its
 /// bound and its termination rest on: the page is no longer than it asked for, and it either
 /// ends the walk or carries it past `after`. Anything else is an error, never a page accepted
-/// silently.
-async fn ledger_page(
+/// silently. Shared by every paged walk in this module — the `orphan:` ledger's and the staged
+/// protection class's — so they cannot disagree about what a usable page is.
+async fn checked_page(
     meta: &dyn MetadataStore,
+    prefix: &[u8],
+    walk: &str,
     after: Option<&[u8]>,
     limit: usize,
 ) -> Result<ScanPage> {
-    let (page, next) = meta.scan_page(ORPHAN_PREFIX, after, limit).await?;
+    let (page, next) = meta.scan_page(prefix, after, limit).await?;
     if page.len() > limit {
         return Err(BoxError::from(format!(
-            "orphan-ledger scan_page after {:?} returned {} entries for a limit of {limit} — \
+            "{walk} scan_page after {:?} returned {} entries for a limit of {limit} — \
              refused rather than read past the walk's budget",
             after.map(object_name),
             page.len(),
@@ -849,7 +1194,7 @@ async fn ledger_page(
     };
     if !advances {
         return Err(BoxError::from(format!(
-            "orphan-ledger scan_page after {:?} returned a page that does not advance the walk \
+            "{walk} scan_page after {:?} returned a page that does not advance the walk \
              ({} entries, next {:?}) — refused rather than walked forever",
             after.map(object_name),
             page.len(),
@@ -988,6 +1333,38 @@ fn emit_unresolvable(object: &str, fault: &str) {
         inode = %object,
         fault = %fault,
         "gc could not read a committed object's chunk map; its reference set is incomplete, so gc reclaims NOTHING and certifies NOTHING until this record is repaired — operator signal",
+    );
+}
+
+/// Emit a staged multipart record GC could **not read** on the durability-plane seam (ADR-0011 /
+/// ADR-0012): the staged class is incomplete because of it, so this pass reclaims nothing
+/// fleet-wide and certifies nothing until that record is repaired — [`emit_unresolvable`]'s
+/// signal, for the other class. Named by key, escaped as [`object_name`] escapes an `inode:` key.
+/// Emitted from the GC loop, never from the reader both GC and the post-restore pass share.
+fn emit_unresolvable_staged(record: &str, fault: &str) {
+    tracing::warn!(monotonic_counter.gc_unresolvable_staged_records = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "unresolvable-staged-record",
+        record = %record,
+        fault = %fault,
+        "gc could not read a staged multipart record; its staged set is incomplete, so gc reclaims NOTHING and certifies NOTHING until this record is repaired — operator signal",
+    );
+}
+
+/// Emit a staged multipart record GC could read but **not trust** on the durability-plane seam
+/// (ADR-0011 / ADR-0012): its placement is of the wrong length, or its value will not decode under
+/// a key that still names `chunk`. Every fragment of that chunk is held, never reclaimed, until
+/// the record is repaired — [`emit_malformed`]'s containment, attributed to the record.
+fn emit_untrusted_staged(record: &str, chunk: ChunkId, fault: &str) {
+    tracing::warn!(monotonic_counter.gc_untrusted_staged_records = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "untrusted-staged-record",
+        record = %record,
+        chunk = %wyrd_traits::chunk_hex(chunk),
+        fault = %fault,
+        "gc found a staged multipart record it cannot trust about where its chunk's fragments are; every fragment of that chunk is held, NEVER reclaimed — operator signal",
     );
 }
 

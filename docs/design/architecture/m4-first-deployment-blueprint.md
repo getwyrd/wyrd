@@ -606,16 +606,22 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #                  strictly through the placement. This is NOT data loss. Do not reach for
 #                  an older backup: restage those fragments onto the D servers the map names
 #                  (the audit log gives each chunk id), then re-run the pass.
-#      UNREADABLE — a committed object whose chunk map the pass could not READ at all (its
-#                  segments are missing, or the record will not decode). The pass NAMES the
-#                  records to repair — in the paragraph it prints (the first 20 of them, with
-#                  any remainder counted) and every one of them in the audit log — and keeps
-#                  going, so the counts above still hold for every OTHER object; they are not
-#                  a bill for the whole store, and the summary says INCOMPLETE, not
+#      UNREADABLE — a record the pass could not READ at all: a committed object whose chunk
+#                  map is missing segments or will not decode; an upload session (mpu:) or an
+#                  in-flight staging entry (sidx:) whose KEY will not parse — the pass never
+#                  decodes their values, so a damaged one is not what you are looking at; or a
+#                  committed part (part:) whose key will not parse or whose value will not
+#                  decode. The pass NAMES the records to repair
+#                  — in the paragraph it prints (the first 20 of them, with any remainder
+#                  counted) and every one of them in the audit log
+#                  (action=unresolvable-chunk-map for a committed object,
+#                  action=unresolvable-staged-record for a staged multipart record) — and
+#                  keeps going, so the counts above still hold for every OTHER record; they
+#                  are not a bill for the whole store, and the summary says INCOMPLETE, not
 #                  "complete", while one remains. It also reports how many fragments it
-#                  marked, which is 0 while any object is unreadable: such a map hides which
-#                  chunks it owns, so no fragment can be shown to be a stray. Repair or remove
-#                  those records, then re-run.
+#                  marked, which is 0 while any record is unreadable: such a record hides
+#                  which chunks it owns, so no fragment can be shown to be a stray. Repair or
+#                  remove those records, then re-run.
 
 # 8. Resume writers, then run a scrub pass (see below).
 ```

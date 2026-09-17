@@ -68,6 +68,14 @@
 //! reclaim it). A chunk with a *malformed* placement is treated as fully referenced — fail
 //! safe — exactly as GC treats it.
 //!
+//! **Nor is a staged fragment ever marked** — one a multipart upload's committed part or in-flight
+//! owned staging entry names ([`crate::gc::StagedSet`], proposal 0016 decision 2). The pass reads
+//! that class through the reader GC uses, before either reading of the committed namespace, and
+//! gates on it by the same rules: a staged record it cannot read withholds every mark and is named
+//! in the report, one it cannot trust holds its chunk, and a store fault under one of its reads
+//! fails the pass. The protection covers the upload records already durable when the pass read
+//! them; a write or an upload that starts while the pass runs is not yet covered (#805).
+//!
 //! # Idempotent, and running it twice is not a way to lose data
 //!
 //! A fragment that **already** carries an `orphan:` record is left alone rather than
@@ -89,8 +97,8 @@ use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
 use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::{
-    marked_among, object_name, orphan_key, parse_pending_chunk, referenced_fragments, GcContext,
-    ReferenceSet,
+    marked_among, object_name, orphan_key, parse_pending_chunk, referenced_fragments,
+    staged_fragments, GcContext, ReferenceSet, StagedSet,
 };
 
 /// How many orphan marks to commit at once.
@@ -152,14 +160,19 @@ pub struct RestoreReport {
     /// Committed chunks missing fragments but still holding **at least `k` at their placement**:
     /// readable, and the reconstruction loop will rebuild them. Reported for visibility.
     pub under_replicated: Vec<ChunkId>,
-    /// Committed objects whose chunk map this pass could **not read** — a segmented generation
-    /// whose `seg:` records are incomplete, or a record that will not decode — named by
-    /// `inode:` key as the store spells it ([`crate::gc::ReferenceSet::unresolvable`], escaped
-    /// rather than rendered lossily so two damaged records never arrive under one name).
-    /// Ordered by that key.
+    /// Records this pass could **not read**, named by key as the store spells it, escaped rather
+    /// than rendered lossily so two damaged records never arrive under one name, and ordered by
+    /// that key. Two kinds:
     ///
-    /// The pass keeps going past them and marks **nothing** on their account: while any object
-    /// is unresolvable the reference set is incomplete, so every fragment in the fleet is held
+    /// - **committed objects** whose chunk map could not be read — a segmented generation whose
+    ///   `seg:` records are incomplete, or a record that will not decode — by `inode:` key
+    ///   ([`crate::gc::ReferenceSet::unresolvable`]); and
+    /// - **staged multipart records** that could not be read — a session key naming no upload, a
+    ///   part key or value that will not parse or decode, an owned staging key naming no chunk —
+    ///   by `mpu:`, `part:` or `sidx:` key ([`crate::gc::StagedSet::unresolvable`]).
+    ///
+    /// The pass keeps going past them and marks **nothing** on their account: while any record
+    /// is unresolvable the reading is incomplete, so every fragment in the fleet is held
     /// off-limits and [`RestoreReport::stranded_marked`] stays 0.
     ///
     /// They are reported because every *other* verdict here — dangling, misplaced,
@@ -188,9 +201,10 @@ impl RestoreReport {
     /// Does this run need a **human** — the question `wyrd custodian --reconcile-after-restore`
     /// turns into its exit status (`crates/server/src/cli.rs`'s `restore_verdict`)?
     ///
-    /// The three findings no loop resolves on its own: chunks that can no longer be read at all,
-    /// chunks whose bytes are somewhere the restored map does not look, and committed objects
-    /// this pass could not read. Marks and under-replication are deliberately **not** here — the
+    /// The findings no loop resolves on its own: chunks that can no longer be read at all, chunks
+    /// whose bytes are somewhere the restored map does not look, records — committed objects or
+    /// staged multipart records — this pass could not read, and pending-ledger entries it could
+    /// not read as a lease. Marks and under-replication are deliberately **not** here — the
     /// first is this pass doing its job and the second is the reconstruction loop's, so failing
     /// a restore script on either would train an operator to ignore the status. It lives on the
     /// report rather than in the command because a caller that never prints the summary still
@@ -215,6 +229,23 @@ impl RestoreReport {
 ///    that can no longer be read *or rebuilt* are reported as [`RestoreReport::dangling`].
 ///
 /// Deletes nothing. Marks only. Run it with **writers stopped**, after a restore.
+///
+/// # Staged bytes are never marked
+///
+/// A fragment a multipart upload's committed part (`part:`) or in-flight owned staging entry
+/// (`sidx:`) names is referenced by no committed chunk map yet, and marking it would hand GC a
+/// live upload's bytes. So the pass first reads the staged protection class
+/// ([`staged_fragments`], the reader GC uses), for every session listed under `mpu:` whatever its
+/// state, and never marks a fragment it protects. It is read before either reading of the
+/// committed namespace, so a publication that moves a chunk from its part record to a committed
+/// inode while the pass runs leaves it protected by one reading or the other. A staged record the
+/// pass cannot read is named in [`RestoreReport::unresolvable`] and withholds every mark, as an
+/// unreadable committed object does; one it can read but not trust holds its chunk and is named on
+/// the audit seam; a store fault under a staged read fails the pass with an `Err` naming the read.
+///
+/// What this covers is the upload records **already durable when the pass read them**. A write or
+/// an upload that starts after that read is not protected by it — the runbook's writers-stopped
+/// rule is what covers that window today (#805).
 ///
 /// # An object it cannot read is CONTAINED, and the run is not certified
 ///
@@ -296,8 +327,18 @@ pub async fn reconcile_after_restore(
     // parse — so a store holding a single unreadable or segmented object produced no report AT
     // ALL: not the stranded count, not the dangling or misplaced chunks of the objects it could
     // read, at exactly the moment an operator needs them most.
-    let referenced = referenced_fragments(ctx.meta).await?;
-    // ATTRIBUTED THE INSTANT IT IS KNOWN, per object, before the next store read — the placement
+    //
+    // FIRST, the staged protection class — the fragments multipart uploads' own records name — by
+    // the reader GC uses (`gc::staged_fragments`), and BEFORE either reading of the committed
+    // namespace below: a publication moves a chunk's protection from its `part:` record to a
+    // committed inode, so this order sees it in at least one of them (`0016:793-800`). A store
+    // fault under it fails the pass here, before anything is marked.
+    //
+    // deferred: #805 — this read protects the upload records already durable when it ran. A write
+    // or an upload that starts after it is not in it; until #805 that window is the runbook's
+    // writers-stopped rule, not this pass's.
+    let staged = staged_fragments(ctx.meta).await?;
+    // ATTRIBUTED THE INSTANT IT IS KNOWN, per record, before the next store read — the placement
     // `gc::reconcile` uses for the same set (`gc.rs`, its `unresolvable` loop sits between the
     // reference build and the fleet walk). Batching these names behind the reads below would
     // mean a genuine, unrelated store fault in any of them — one `?` away — ends the pass with
@@ -305,6 +346,8 @@ pub async fn reconcile_after_restore(
     // then, never reaches them at all. Attribution that a later transient fault can swallow is
     // not attribution.
     let mut unreadable = BTreeSet::new();
+    attribute_staged(&staged, &mut unreadable);
+    let referenced = referenced_fragments(ctx.meta).await?;
     attribute_unresolvable(&referenced.unresolvable, &mut unreadable);
     let PendingLedger {
         held: pending,
@@ -326,7 +369,9 @@ pub async fn reconcile_after_restore(
         // Either read's hole makes this report partial: the mark half is drawn from
         // `referenced`, the verdicts below from `committed`. So the names are the UNION — a
         // record only one of them could read is still a record this run cannot speak for —
-        // deduplicated and in the store's own key order, whichever read met each of them.
+        // deduplicated and in the store's own key order, whichever read met each of them. A
+        // staged record the staged read could not read is in it too: the mark half gates on
+        // that class as well, so its hole is this run's hole.
         unresolvable: unreadable.iter().map(|key| object_name(key)).collect(),
         pending_unreadable,
         ..Default::default()
@@ -382,7 +427,16 @@ pub async fn reconcile_after_restore(
         // says so. Otherwise an object committed in the instant between the two reads — absent
         // from `referenced` and present in `committed` — would have its live fragments marked
         // collectable, and GC would take the only copy after the grace window.
-        if incomplete || referenced.protects(dserver, frag) || appeared.protects(dserver, frag) {
+        //
+        // And never a fragment the staged class protects: a multipart upload's committed part or
+        // owned staging entry names it, or names its chunk untrustworthily, or a staged record
+        // could not be read. (Staged counters are #664's; such a fragment is skipped uncounted,
+        // as a referenced one is.)
+        if incomplete
+            || referenced.protects(dserver, frag)
+            || appeared.protects(dserver, frag)
+            || staged.protects(dserver, frag)
+        {
             continue;
         }
 
@@ -749,6 +803,29 @@ fn attribute_unresolvable(faults: &BTreeMap<Vec<u8>, String>, named: &mut BTreeS
     }
 }
 
+/// Name what the staged read could not read or could not trust on the durability seam, the moment
+/// that read returns — [`attribute_unresolvable`]'s placement and reasons, for the staged class.
+///
+/// An unreadable staged record joins `named`, so it is reported in
+/// [`RestoreReport::unresolvable`] beside the committed objects and withholds every mark. A record
+/// it read but cannot trust holds its chunk (the mark gate skips every fragment bearing its id) and
+/// is named on the audit seam only.
+fn attribute_staged(staged: &StagedSet, named: &mut BTreeSet<Vec<u8>>) {
+    for (record, fault) in &staged.unresolvable {
+        if named.insert(record.clone()) {
+            emit_unresolvable_staged(&object_name(record), fault);
+        }
+    }
+    // deferred: #664 — whether a held (untrusted) staged record also needs a human, and so sets
+    // `RestoreReport::needs_human`, is that slice's, with restore's staged counters. Until then it
+    // is named here and holds its chunk, and the report's verdict is unchanged by it.
+    for (&chunk, records) in &staged.held {
+        for (record, fault) in records {
+            emit_untrusted_staged(&object_name(record), chunk, fault);
+        }
+    }
+}
+
 /// How many fragments must survive for this chunk to be rebuildable: `k` under
 /// Reed-Solomon, and 1 under `EcScheme::None` (the lone fragment *is* the data).
 fn reconstruction_threshold(chunk: &wyrd_core::metadata::ChunkRef) -> u16 {
@@ -903,11 +980,44 @@ fn emit_unresolvable(object: &str, fault: &str) {
     );
 }
 
+/// A staged multipart record this pass could **not read** — a session key naming no upload, a part
+/// key or value that will not parse or decode, an owned staging key naming no chunk — named on the
+/// durability-plane seam (ADR-0011 / ADR-0012) as GC names the same record on its own
+/// (`gc::emit_unresolvable_staged`). Which chunks it protects is unknown, so nothing was marked
+/// anywhere in the fleet on its account, and the report names it in
+/// [`RestoreReport::unresolvable`].
+fn emit_unresolvable_staged(record: &str, fault: &str) {
+    tracing::warn!(monotonic_counter.restore_unresolvable_staged_records = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "unresolvable-staged-record",
+        record = %record,
+        fault = %fault,
+        "post-restore: a staged multipart record could not be read; nothing was marked anywhere in the fleet on its account — this run is NOT a clean bill for the store until this record is repaired",
+    );
+}
+
+/// A staged multipart record this pass read but could **not trust** about where `chunk`'s
+/// fragments are — a placement of the wrong length, or a value that will not decode under a key
+/// that still names the chunk — named on the durability-plane seam as GC names it
+/// (`gc::emit_untrusted_staged`). Every fragment of the chunk was held unmarked.
+fn emit_untrusted_staged(record: &str, chunk: ChunkId, fault: &str) {
+    tracing::warn!(monotonic_counter.restore_untrusted_staged_records = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "untrusted-staged-record",
+        record = %record,
+        chunk = %wyrd_traits::chunk_hex(chunk),
+        fault = %fault,
+        "post-restore: a staged multipart record names this chunk but cannot be trusted about where its fragments are; every fragment of the chunk was held unmarked — operator signal",
+    );
+}
+
 /// The pass's own verdict, so a restore's true cost lands in one line an operator can read.
 ///
 /// It says **complete** only when the reading finished. Over a store with an unreadable
-/// committed record in it the same line would otherwise be the certification the rest of this
-/// pass refuses to give, in the one place an operator greps for it.
+/// committed or staged record in it the same line would otherwise be the certification the rest
+/// of this pass refuses to give, in the one place an operator greps for it.
 fn emit_summary(report: &RestoreReport) {
     tracing::info!(
         target: "wyrd.custodian.restore.audit",
@@ -920,7 +1030,7 @@ fn emit_summary(report: &RestoreReport) {
         dangling = report.dangling.len(),
         misplaced = report.misplaced.len(),
         under_replicated = report.under_replicated.len(),
-        // The qualifier on every count above: they are drawn over the objects this pass could
+        // The qualifier on every count above: they are drawn over the records this pass could
         // read, and this is how many it could not.
         unresolvable = report.unresolvable.len(),
         // The pass's own two-word verdict, so the predicate the report offers its callers is the
@@ -931,7 +1041,7 @@ fn emit_summary(report: &RestoreReport) {
         if report.unresolvable.is_empty() {
             "complete"
         } else {
-            "INCOMPLETE — every count above covers only the objects this pass could read"
+            "INCOMPLETE — every count above covers only the records this pass could read"
         },
     );
 }
