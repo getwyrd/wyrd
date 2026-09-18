@@ -46,7 +46,9 @@ pub enum Reconciled {
     /// The loop read a **bounded window** of its input and stopped short of the end: nothing
     /// it read diverged, and the rest is unvisited. GC answers this when its walk of the
     /// `orphan:` ledger (`crate::gc::OrphanWindow`) did not reach the ledger's end this pass
-    /// (PR #802 review).
+    /// (PR #802 review), and when a reclaim intent it recorded lost to a mark that changed after
+    /// the pass read it and nothing was reclaimed: the mark's new value is one the pass never
+    /// read (#804).
     ///
     /// Distinct from [`Reconciled::Satisfied`] because that outcome is a **certification** —
     /// "reality already matched the desired state" — and a caller that drives reconciliation

@@ -27,6 +27,22 @@
 //! for a later pass, never reclaimed on other evidence meanwhile. Its own writes commit in
 //! batches of at most [`CLEANUP_BATCH`].
 //!
+//! **A marked fragment's reclamation is recorded before its bytes are destroyed** (proposal
+//! 0016, `0016:1312-1338`). A mark is read in any of its three shapes through the one codec
+//! beside its key ([`metadata::decode_orphan_mark`]); a value that is none of them is kept,
+//! with its fragment, and named. A mark past its grace window is first moved to its terminal
+//! `reclaiming` shape — an exact-value compare-and-swap from the bytes the pass read, up to
+//! [`CLEANUP_BATCH`] of them per commit — and only a mark whose swap committed has its fragment
+//! deleted, and then its key. So any commit still preconditioned on the mark's earlier bytes (a
+//! mover adopting a pre-marked position) fails from the instant reclamation begins, instead of
+//! landing between the fragment's deletion and the key's and publishing a placement over bytes
+//! that are gone. A mark that changed after the pass read it loses its swap and keeps its
+//! fragment; a mark already `reclaiming` — a pass that died between its swap and its deletes —
+//! is finished with no second grace test; and a mark whose event names a retirement still
+//! draining (`retire:bytes:<event>`, one keyed read) is not reclaimed until that drain is done
+//! (`0016:1226-1247`). The bytes behind an expired `pending:` lease carry no mark, and are
+//! reclaimed as before.
+//!
 //! The loop's load-bearing invariant, whose violation is **silent corruption**:
 //! **never reclaim a referenced fragment** — a fragment a committed chunk map's
 //! placement record points at is **never** passed to `delete_fragment`
@@ -63,16 +79,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 // `crate::gc::orphan_key` unchanged.
 pub(crate) use wyrd_core::metadata::orphan_key;
 use wyrd_core::metadata::{
-    self, parse_orphan_key, ChunkMapError, ChunkRef, EcScheme, InodeRecord, InodeState,
-    MalformedPlacement, ORPHAN_PREFIX,
+    self, decode_orphan_mark, encode_orphan_mark, parse_orphan_key, ChunkMapError, ChunkRef,
+    EcScheme, InodeRecord, InodeState, MalformedPlacement, OrphanMark, ORPHAN_PREFIX,
 };
 use wyrd_core::multipart::{
     decode_owned_entry, decode_part_record, parse_mpu_key, parse_part_key, parse_sidx_key,
-    part_range, sidx_range, MAX_PART_CHUNKS, MPU_PREFIX, U_REF,
+    part_range, retire_key, sidx_range, RetireMode, MAX_PART_CHUNKS, MPU_PREFIX, U_REF,
 };
 use wyrd_traits::{
-    BoxError, ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, ScanPage,
-    WriteBatch, SCAN_CAP,
+    BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result,
+    ScanPage, WriteBatch, SCAN_CAP,
 };
 
 use crate::reconciliation::Reconciled;
@@ -102,10 +118,16 @@ pub(crate) const ORPHAN_WINDOW: usize = SCAN_CAP / 16;
 /// were already deleted, leaving their marks behind. `W` is restore's `MARK_BATCH` precedent
 /// (`restore.rs`), the existing bounded commit against the same envelope.
 ///
+/// The same bound caps each commit that records reclaim intents ([`Intent`]): at most `W` marks
+/// moved to `reclaiming` per commit — one precondition and one put each — so the commit count a
+/// pass spends on them is `⌈n / W⌉`, not one per mark.
+///
 /// **Bytes: bounded.** Every key a cleanup commit deletes is an
 /// `orphan:<dserver>:<chunk>:<index>` key (at most 73 bytes) or a `pending:<chunk>` key (at most
 /// 47), so `W` of them come to under 73 KB — far inside the 10 MB per transaction of the
-/// inherited envelope (`MetadataStore`, "Operational envelope").
+/// inherited envelope (`MetadataStore`, "Operational envelope"). An intent commit carries each
+/// mark's key twice and its value twice (the bytes read, then `reclaiming`); a decodable mark is
+/// at most 328 bytes ([`metadata::MAX_ORPHAN_EVENT_LEN`]), so `W` intents come to under 800 KB.
 ///
 /// **Operations: NOT calibrated.** The envelope's other half is 5 s per transaction, and a
 /// backend applies a batch's mutations one after another inside it — TiKV takes a lock round
@@ -213,7 +235,8 @@ pub enum ExpiredPendingPolicy {
 /// Record that `frag` on `dserver` became **orphaned** at `orphaned_at_millis` — the
 /// grace-record an orphaning operation (delete / completed reconstruction, later
 /// slices) writes so GC can honour the reader-safe window before reclaiming the
-/// bytes. Idempotent at the metadata layer (a plain put).
+/// bytes. Idempotent at the metadata layer (a plain put). The value is the legacy
+/// [`OrphanMark`] shape — the bare decimal instant — spelled by the shared codec.
 pub async fn mark_orphaned(
     meta: &impl MetadataStore,
     dserver: DServerId,
@@ -222,7 +245,7 @@ pub async fn mark_orphaned(
 ) -> Result<()> {
     meta.commit(WriteBatch::new().put(
         orphan_key(dserver, frag),
-        orphaned_at_millis.to_string().into_bytes(),
+        encode_orphan_mark(&OrphanMark::legacy(orphaned_at_millis)),
     ))
     .await?;
     Ok(())
@@ -244,8 +267,13 @@ pub async fn mark_orphaned(
 /// short of the ledger's end and reclaimed nothing answers [`Reconciled::Partial`], never
 /// `Satisfied`: `Satisfied` certifies that reality matched, and a caller driving the loop to
 /// satisfaction would stop on it with eligible marks still unvisited in the windows ahead (PR
-/// #802 review). `Satisfied` is therefore "this pass read the ledger to its end and reclaimed
-/// nothing".
+/// #802 review). A pass that lost a reclaim intent — a mark it judged changed before its
+/// `reclaiming` swap committed — and reclaimed nothing answers `Partial` for the same reason:
+/// the mark's new value is one this pass never read. `Satisfied` is therefore "this pass read
+/// the ledger to its end, lost no intent, and reclaimed nothing".
+///
+/// A store fault ends the pass with its error, after the key deletes it had queued for
+/// fragments already deleted are committed, best effort ([`Cleanup::finish_after_fault`]).
 pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Reconciled> {
     // The staged protection class, read FIRST: every fragment a multipart upload's committed
     // parts and in-flight owned staging entries name. Never reclaimed either — and read before the
@@ -310,88 +338,26 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
     // the ledger, and the walk reads them again on its next lap.
     window.record_resume_point(ctx.meta).await?;
 
-    let mut changed = false;
     let mut cleanup = Cleanup::new(ctx.meta);
-    // For the expired-lease input, per chunk: did this pass reclaim any of its bytes, and does
-    // any unprotected fragment of it survive the pass? Its `pending:` entry is the one record
-    // naming every such survivor, so it is retired only when the first holds and the second
-    // does not (below).
-    let mut reclaimed_expired: BTreeSet<ChunkId> = BTreeSet::new();
-    let mut still_held: HashSet<ChunkId> = HashSet::new();
-
-    for &(dserver, store) in ctx.fleet {
-        for frag in store.list_fragments().await? {
-            // SAFETY GATE — never reclaim a referenced fragment. A fragment of a
-            // malformed-placement chunk is protected the same way (fail safe): its true
-            // placement cannot be trusted, so every fragment bearing its id is off-limits;
-            // so is every fragment at all while the set is incomplete. The set itself says
-            // WHICH rule held, so the audit trail never files an unrelated orphan under
-            // `referenced` when what actually saved it was a blanket containment. The staged
-            // class gates the same way, by its own rules and under its own reasons.
-            if let Some(reason) = referenced
-                .protection(dserver, frag)
-                .or_else(|| staged.protection(dserver, frag))
-            {
-                emit_skip(dserver, frag, reason);
-                continue;
-            }
-
-            let mark = window.mark_of(dserver, frag);
-            let reason = if let Some(ReadMark::Stamped(since)) = mark {
-                // Orphan input: reclaim ONLY after the reader-safe grace window.
-                if now_millis >= since.saturating_add(ctx.grace_window_millis) {
-                    Some("orphan")
-                } else {
-                    emit_skip(dserver, frag, "within-grace");
-                    None
-                }
-            } else if mark.is_none()
-                && expired_pending.contains(&frag.chunk)
-                && window.covers_mark_of(dserver, frag)
-            {
-                // Expired pending-lease input: the lease TTL is its grace — for a fragment this
-                // window shows has NO mark, and for no other. A mark outranks the lease: it may
-                // still be inside its own grace window, which a reader holding the prior version
-                // is relying on. So the arm needs the window to have covered the key position
-                // the fragment's mark would occupy and found nothing there. A mark this pass did
-                // not read — outside its window — is unknown, not absent; one it read and could
-                // not decode is a mark all the same (`ReadMark::Unreadable`). Both fall to the
-                // conservative arm below and wait for a pass that can see them.
-                //
-                // "Covered and absent" is sound although the page that covered the position may
-                // have been read a moment ago: every in-tree writer of a mark that dereferences
-                // (unlink, supersede, repoint, evacuation) writes it in the SAME commit that
-                // dereferences the fragment, and the reference set this pass gates on was read
-                // before this window was — a fragment dereferenced after that read is still
-                // protected this pass. The one writer that marks without dereferencing, the
-                // post-restore pass, never marks a fragment whose chunk holds a `pending:` entry.
-                Some("expired-lease")
-            } else {
-                // No evidence the grace window elapsed — conservatively keep it
-                // (reader-safe: a fragment is never reclaimed without a deadline).
-                None
-            };
-
-            if let Some(reason) = reason {
-                store.delete_fragment(frag).await?;
-                emit_reclaim(dserver, frag, reason);
-                if reason == "orphan" {
-                    // Consume the mark this pass read and judged — the one key it holds a
-                    // licence to delete. An expired-lease reclaim deletes no ledger key at all:
-                    // its window found none at this position, and a key it did not read is not
-                    // one to destroy.
-                    cleanup.delete(orphan_key(dserver, frag)).await?;
-                }
-                if expired_pending.contains(&frag.chunk) {
-                    reclaimed_expired.insert(frag.chunk);
-                }
-                changed = true;
-            } else if expired_pending.contains(&frag.chunk) {
-                // An unprotected fragment of an expired-lease chunk survives this pass — a mark
-                // in its grace window, one outside this window, or none that can be seen yet.
-                still_held.insert(frag.chunk);
-            }
-        }
+    let mut sweep = Sweep {
+        ctx,
+        now_millis,
+        referenced: &referenced,
+        staged: &staged,
+        window: &window,
+        expired_pending: &expired_pending,
+        intents: Vec::new(),
+        changed: false,
+        lost_intent: false,
+        reclaimed_expired: BTreeSet::new(),
+        still_held: HashSet::new(),
+    };
+    if let Err(fault) = sweep.run(&mut cleanup).await {
+        // The sweep may already have deleted fragments whose key deletes are still queued: commit
+        // those before the fault goes up, so it costs the pass its remaining work and never
+        // strands a consumed mark over bytes that are gone.
+        cleanup.finish_after_fault(&fault).await;
+        return Err(fault);
     }
 
     // Retire the swept pending-ledger entries (the byte reclaim the stand-in deferred,
@@ -400,8 +366,8 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
     // entry then would leave those with neither the entry nor a mark: evidence-free bytes GC
     // keeps forever. So an entry goes only once this pass has reclaimed bytes of its chunk and no
     // unprotected fragment of it is left for the entry to account for.
-    for chunk in reclaimed_expired {
-        if !still_held.contains(&chunk) {
+    for &chunk in &sweep.reclaimed_expired {
+        if !sweep.still_held.contains(&chunk) {
             cleanup.delete(metadata::pending_key(chunk)).await?;
         }
     }
@@ -418,16 +384,274 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
             // unreadable staged record is the same hole in the other class: `StagedSet::protects`
             // withheld everything, and the answer says so.
             Reconciled::Blocked
-        } else if changed {
+        } else if sweep.changed {
             Reconciled::Changed
-        } else if window.is_partial() {
-            // Nothing reclaimed in THIS window, and more of the ledger lies beyond it: not a
-            // certification. The next pass resumes where this one stopped.
+        } else if window.is_partial() || sweep.lost_intent {
+            // Nothing reclaimed, and something this pass did not read: more of the ledger beyond
+            // its window, or a mark that changed after its window read it. Not a certification;
+            // the next pass reads both.
             Reconciled::Partial
         } else {
             Reconciled::Satisfied
         },
     )
+}
+
+/// One pass's walk of the fleet against its window: each unprotected fragment judged on its own
+/// evidence, and the reclaims it licenses recorded before any is carried out.
+struct Sweep<'p, 'a> {
+    ctx: &'p GcContext<'a>,
+    now_millis: u64,
+    referenced: &'p ReferenceSet,
+    staged: &'p StagedSet,
+    window: &'p OrphanWindow,
+    expired_pending: &'p HashSet<ChunkId>,
+    /// Marks judged past their grace window whose `reclaiming` swap has not been committed yet —
+    /// never more than [`CLEANUP_BATCH`]. Nothing is deleted for them until it has.
+    intents: Vec<Intent<'a>>,
+    /// Whether this pass deleted any fragment bytes.
+    changed: bool,
+    /// Whether an intent lost its precondition to a mark that changed after the window read it.
+    lost_intent: bool,
+    /// For the expired-lease input, per chunk: did this pass reclaim any of its bytes, and does
+    /// any unprotected fragment of it survive the pass? Its `pending:` entry is the one record
+    /// naming every such survivor, so it is retired only when the first holds and the second does
+    /// not ([`reconcile`]).
+    reclaimed_expired: BTreeSet<ChunkId>,
+    still_held: HashSet<ChunkId>,
+}
+
+/// A reclaim a pass has judged and not yet recorded: the fragment, the store holding it, and its
+/// mark exactly as the pass's window read it.
+struct Intent<'a> {
+    dserver: DServerId,
+    store: &'a dyn ChunkStore,
+    frag: FragmentId,
+    mark: OrphanMark,
+}
+
+impl Intent<'_> {
+    /// Add this intent's `reclaiming` swap to `batch`: the mark must still hold the bytes the pass
+    /// read, and becomes `reclaiming` with its stamp and event unchanged. Re-encoding the decoded
+    /// mark reproduces those bytes exactly — the codec decodes only what it would itself encode —
+    /// so the precondition is the value read, not a paraphrase of it.
+    fn record(&self, batch: WriteBatch) -> WriteBatch {
+        let key = orphan_key(self.dserver, self.frag);
+        batch
+            .require(key.clone(), encode_orphan_mark(&self.mark))
+            .put(
+                key,
+                encode_orphan_mark(&self.mark.clone().into_reclaiming()),
+            )
+    }
+}
+
+impl<'a> Sweep<'_, 'a> {
+    /// Walk every D server's fragments, then record whatever intents are still pending.
+    async fn run(&mut self, cleanup: &mut Cleanup<'_>) -> Result<()> {
+        for &(dserver, store) in self.ctx.fleet {
+            for frag in store.list_fragments().await? {
+                self.judge(dserver, store, frag, cleanup).await?;
+            }
+        }
+        self.record_intents(cleanup).await
+    }
+
+    async fn judge(
+        &mut self,
+        dserver: DServerId,
+        store: &'a dyn ChunkStore,
+        frag: FragmentId,
+        cleanup: &mut Cleanup<'_>,
+    ) -> Result<()> {
+        // SAFETY GATE — never reclaim a referenced fragment. A fragment of a malformed-placement
+        // chunk is protected the same way (fail safe): its true placement cannot be trusted, so
+        // every fragment bearing its id is off-limits; so is every fragment at all while the set
+        // is incomplete. The set itself says WHICH rule held, so the audit trail never files an
+        // unrelated orphan under `referenced` when what actually saved it was a blanket
+        // containment. The staged class gates the same way, by its own rules and under its own
+        // reasons. It outranks every mark — a `reclaiming` one included: that decision was taken
+        // against an earlier reading, and this pass's reading says the bytes are named.
+        if let Some(reason) = self
+            .referenced
+            .protection(dserver, frag)
+            .or_else(|| self.staged.protection(dserver, frag))
+        {
+            emit_skip(dserver, frag, reason);
+            return Ok(());
+        }
+
+        let window = self.window;
+        match window.mark_of(dserver, frag) {
+            Some(ReadMark::Reclaiming) => {
+                // Reclamation already decided and recorded by an earlier pass that did not finish
+                // it: resume, with no second grace test — the window elapsed once, and the swap
+                // did not move the stamp it was measured from (`0016:1321-1333`). Deleting the
+                // fragment again is idempotent if the earlier attempt landed.
+                self.destroy(dserver, store, frag, "resumed", cleanup)
+                    .await?;
+            }
+            Some(ReadMark::Stamped(mark)) => {
+                // Orphan input: reclaim ONLY after the reader-safe grace window.
+                if self.now_millis
+                    < mark
+                        .orphaned_at_millis()
+                        .saturating_add(self.ctx.grace_window_millis)
+                {
+                    emit_skip(dserver, frag, "within-grace");
+                    self.held(frag.chunk);
+                } else if self.retirement_draining(mark).await? {
+                    emit_skip(dserver, frag, "draining-retirement");
+                    self.held(frag.chunk);
+                } else {
+                    self.intents.push(Intent {
+                        dserver,
+                        store,
+                        frag,
+                        mark: mark.clone(),
+                    });
+                    if self.intents.len() >= CLEANUP_BATCH {
+                        self.record_intents(cleanup).await?;
+                    }
+                }
+            }
+            // A mark whose value is none of the three shapes: evidence that something stranded
+            // the fragment, with no instant a grace window could run from. Kept, on no other
+            // evidence, until a human repairs it (named when the window read it).
+            Some(ReadMark::Unreadable) => self.held(frag.chunk),
+            None if self.expired_pending.contains(&frag.chunk)
+                && window.covers_mark_of(dserver, frag) =>
+            {
+                // Expired pending-lease input: the lease TTL is its grace — for a fragment this
+                // window shows has NO mark, and for no other. A mark outranks the lease: it may
+                // still be inside its own grace window, which a reader holding the prior version
+                // is relying on. So the arm needs the window to have covered the key position the
+                // fragment's mark would occupy and found nothing there. A mark this pass did not
+                // read — outside its window — is unknown, not absent; one it read and could not
+                // decode is a mark all the same (`ReadMark::Unreadable`). Both fall to the
+                // conservative arm below and wait for a pass that can see them.
+                //
+                // "Covered and absent" is sound although the page that covered the position may
+                // have been read a moment ago: every in-tree writer of a mark that dereferences
+                // (unlink, supersede, repoint, evacuation) writes it in the SAME commit that
+                // dereferences the fragment, and the reference set this pass gates on was read
+                // before this window was — a fragment dereferenced after that read is still
+                // protected this pass. The one writer that marks without dereferencing, the
+                // post-restore pass, never marks a fragment whose chunk holds a `pending:` entry.
+                //
+                // No mark, so nothing to record first: the bytes go as they always have (#557,
+                // #490 own this arm's order), and no ledger key is deleted — the window found none
+                // at this position, and a key it did not read is not one to destroy.
+                store.delete_fragment(frag).await?;
+                emit_reclaim(dserver, frag, "expired-lease");
+                self.reclaimed(frag.chunk);
+            }
+            // No evidence the grace window elapsed — conservatively keep it (reader-safe: a
+            // fragment is never reclaimed without a deadline).
+            None => self.held(frag.chunk),
+        }
+        Ok(())
+    }
+
+    /// Whether `mark` names a retirement that is still draining: its event spells a retirement
+    /// token and that token's `retire:bytes:` obligation is present (`0016:1226-1247`, X97
+    /// `0016:2626`).
+    ///
+    /// One keyed read per candidate, never a range read of `retire:` — that namespace is
+    /// deliberately not bounded by cardinality, and expanding it would make a pass's memory
+    /// unbounded. A drain installs its obligation before it writes a mark naming it, and a token
+    /// is never reused, so an obligation found absent here has drained for good; a mark that
+    /// changes to name another event after this read loses its `reclaiming` swap instead. The
+    /// read's await is bounded as every other custodian read is, by the `MetadataStore`
+    /// implementation's own network bound (#508/#636), and a fault fails the pass before it
+    /// records anything for this mark. The obligation's value is not decoded: its presence is the
+    /// whole answer, so one that will not decode protects all the same.
+    async fn retirement_draining(&self, mark: &OrphanMark) -> Result<bool> {
+        let Some(token) = mark.retire_token() else {
+            return Ok(false);
+        };
+        let obligation = retire_key(RetireMode::Bytes, &token);
+        Ok(self.ctx.meta.get(&obligation).await?.is_some())
+    }
+
+    /// Record the pending intents — each mark's exact-value swap to `reclaiming`, all of them in
+    /// one commit — and only then delete the fragments whose swap committed, and queue their keys.
+    ///
+    /// A `Conflict` says at least one mark changed after the window read it. A lost precondition
+    /// costs only its own intent: each intent is then recorded alone, and one that loses keeps
+    /// its fragment and its mark's new value, both untouched by this pass. An `Err` is propagated
+    /// before anything of this batch is deleted: whether its swaps landed is unknown, and a mark
+    /// left `reclaiming` over a present fragment is simply resumed by the next pass.
+    async fn record_intents(&mut self, cleanup: &mut Cleanup<'_>) -> Result<()> {
+        if self.intents.is_empty() {
+            return Ok(());
+        }
+        let intents = std::mem::take(&mut self.intents);
+        let batch = intents
+            .iter()
+            .fold(WriteBatch::new(), |batch, intent| intent.record(batch));
+        if self.ctx.meta.commit(batch).await? == CommitOutcome::Committed {
+            for intent in &intents {
+                self.destroy(intent.dserver, intent.store, intent.frag, "orphan", cleanup)
+                    .await?;
+            }
+            return Ok(());
+        }
+        for intent in &intents {
+            let alone = intent.record(WriteBatch::new());
+            match self.ctx.meta.commit(alone).await? {
+                CommitOutcome::Committed => {
+                    self.destroy(intent.dserver, intent.store, intent.frag, "orphan", cleanup)
+                        .await?;
+                }
+                CommitOutcome::Conflict => {
+                    emit_skip(intent.dserver, intent.frag, "mark-changed");
+                    self.lost_intent = true;
+                    self.held(intent.frag.chunk);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Carry out a recorded reclaim: delete the fragment's bytes, then queue its mark's key for
+    /// deletion — the one key this pass holds a licence to delete. Never called before the mark
+    /// is `reclaiming` in the store.
+    ///
+    /// deferred: #800 — a pass that dies after the fragment is deleted and before the queued key
+    /// delete commits leaves a `reclaiming` mark over bytes that are gone. It is safe (nothing
+    /// preconditioned on the mark's earlier bytes can commit, and no writer overwrites it), but
+    /// this walk is driven by `list_fragments()` and never visits a position with no fragment, so
+    /// the key is left for #800's fragment-less sweep.
+    async fn destroy(
+        &mut self,
+        dserver: DServerId,
+        store: &dyn ChunkStore,
+        frag: FragmentId,
+        reason: &str,
+        cleanup: &mut Cleanup<'_>,
+    ) -> Result<()> {
+        store.delete_fragment(frag).await?;
+        emit_reclaim(dserver, frag, reason);
+        self.reclaimed(frag.chunk);
+        cleanup.delete(orphan_key(dserver, frag)).await
+    }
+
+    fn reclaimed(&mut self, chunk: ChunkId) {
+        self.changed = true;
+        if self.expired_pending.contains(&chunk) {
+            self.reclaimed_expired.insert(chunk);
+        }
+    }
+
+    /// An unprotected fragment of `chunk` survives this pass — a mark in its grace window, one
+    /// outside this window or not readable, a draining retirement, a lost intent, or no evidence
+    /// that can be seen yet.
+    fn held(&mut self, chunk: ChunkId) {
+        if self.expired_pending.contains(&chunk) {
+            self.still_held.insert(chunk);
+        }
+    }
 }
 
 /// The **committed reference set** GC and scrub gate on: every fragment a *valid*
@@ -967,11 +1191,16 @@ async fn expired_pending_chunks(
 }
 
 /// What one pass's [`OrphanWindow`] read of a fragment's own mark.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ReadMark {
-    /// The mark, stamped with the instant its fragment was orphaned.
-    Stamped(u64),
-    /// The mark, holding a value that does not read as an instant. Still a mark: it is evidence
+    /// A legacy or structured mark: the instant its fragment was orphaned and, for a structured
+    /// one, the unreference event that wrote it — decoded from exactly the bytes read, which is
+    /// what the reclaim intent's precondition re-encodes.
+    Stamped(OrphanMark),
+    /// A mark GC has already moved to `reclaiming`: the reclamation is decided, and what is left
+    /// is to finish it.
+    Reclaiming,
+    /// The mark, holding a value that is none of the three shapes. Still a mark: it is evidence
     /// that something stranded this fragment, and the instant it would have given is unknown,
     /// so it can neither start nor end a grace window — its fragment is kept, on no other
     /// evidence, until a human repairs the value ([`emit_unreadable_mark`]).
@@ -1090,8 +1319,8 @@ impl OrphanWindow {
     }
 
     /// The fragment's own mark, if this window read it.
-    fn mark_of(&self, dserver: DServerId, frag: FragmentId) -> Option<ReadMark> {
-        self.marks.get(&(dserver, frag)).copied()
+    fn mark_of(&self, dserver: DServerId, frag: FragmentId) -> Option<&ReadMark> {
+        self.marks.get(&(dserver, frag))
     }
 
     /// Whether this window read the key range the fragment's own mark would occupy — so that
@@ -1125,9 +1354,11 @@ fn is_resumable_cursor(cursor: &[u8]) -> bool {
 /// Read one `orphan:` ledger entry into `marks` — or, for a key no writer spells, classify it,
 /// name it and skip it (ADR-0045 decision 3: a record that does not decode is never acted on).
 ///
-/// A value that does not read as an instant is decoded exactly as the ledger always has been
-/// (the bare decimal [`mark_orphaned`] writes); it still counts as its fragment's mark
-/// ([`ReadMark::Unreadable`]) and is named on the audit seam.
+/// The value is decoded through the one codec every mark writer and reader shares
+/// ([`decode_orphan_mark`]): legacy and structured marks carry their stamp, a `reclaiming` mark
+/// its recorded decision. A value that is none of the three shapes still counts as its
+/// fragment's mark ([`ReadMark::Unreadable`]) and is named on the audit seam, and nothing this
+/// pass writes touches it.
 fn classify_ledger_entry(
     marks: &mut HashMap<(DServerId, FragmentId), ReadMark>,
     key: &[u8],
@@ -1139,10 +1370,11 @@ fn classify_ledger_entry(
         emit_malformed_orphan_key(&object_name(key));
         return;
     };
-    let mark = match std::str::from_utf8(value).ok().and_then(|s| s.parse().ok()) {
-        Some(at) => ReadMark::Stamped(at),
-        None => {
-            emit_unreadable_mark(&object_name(key));
+    let mark = match decode_orphan_mark(value) {
+        Ok(mark) if mark.is_reclaiming() => ReadMark::Reclaiming,
+        Ok(mark) => ReadMark::Stamped(mark),
+        Err(fault) => {
+            emit_unreadable_mark(&object_name(key), &fault.to_string());
             ReadMark::Unreadable
         }
     };
@@ -1272,6 +1504,21 @@ impl<'a> Cleanup<'a> {
         self.commit_queued().await
     }
 
+    /// Commit whatever is still queued after `fault` ended the pass — best effort.
+    ///
+    /// Every key queued by then is the mark of a fragment the pass has already deleted, so
+    /// dropping the batch with the fault would leave each of those marks `reclaiming` over bytes
+    /// that are gone, a position no `list_fragments()`-driven walk visits again. A failure here is
+    /// named on the audit seam and dropped: `fault` is what the pass reports. Only deletes never
+    /// attempted are still queued — a batch whose own commit failed was taken when it was tried,
+    /// and is not retried, because its result may be unknown and a blind delete applied after a
+    /// first attempt that did land could take a mark a writer wrote in between.
+    async fn finish_after_fault(self, fault: &BoxError) {
+        if let Err(also) = self.finish().await {
+            emit_cleanup_lost(&fault.to_string(), &also.to_string());
+        }
+    }
+
     async fn commit_queued(&mut self) -> Result<()> {
         if !self.batch.deletes.is_empty() {
             self.meta.commit(std::mem::take(&mut self.batch)).await?;
@@ -1282,7 +1529,8 @@ impl<'a> Cleanup<'a> {
 
 /// Emit a reclamation on the durability-plane seam (ADR-0011 / ADR-0012): a metric
 /// the `DurabilityTelemetry` `tracing`→OTel bridge counts, plus an append-only audit
-/// event (`0005:336-340`).
+/// event (`0005:336-340`). `reason` is `orphan` (a mark this pass moved to `reclaiming`),
+/// `resumed` (a mark an earlier pass left `reclaiming`) or `expired-lease`.
 fn emit_reclaim(dserver: DServerId, frag: FragmentId, reason: &str) {
     tracing::info!(monotonic_counter.gc_fragments_reclaimed = 1_u64, reason);
     tracing::info!(
@@ -1384,18 +1632,36 @@ fn emit_unreadable_pending(entry: &str, fault: &str) {
     );
 }
 
-/// Emit an `orphan:` mark whose value GC could **not read as an instant** on the durability-plane
+/// Emit an `orphan:` mark whose value is **none of the three mark shapes** on the durability-plane
 /// seam (ADR-0011 / ADR-0012): the mark still counts as its fragment's mark, so the fragment is
-/// kept on no other evidence — neither its grace window nor an expired lease can reclaim it —
-/// and the mark is left in place, until a human repairs the value. Named by key, escaped as
-/// [`object_name`] escapes an `inode:` key, as [`emit_unreadable_pending`] names its entry.
-fn emit_unreadable_mark(mark: &str) {
+/// kept on no other evidence — neither a grace window nor an expired lease can reclaim it — and
+/// the mark is left in place, byte for byte, until a human repairs the value. Named by key,
+/// escaped as [`object_name`] escapes an `inode:` key, as [`emit_unreadable_pending`] names its
+/// entry, with the codec's reason.
+fn emit_unreadable_mark(mark: &str, fault: &str) {
     tracing::warn!(monotonic_counter.gc_unreadable_orphan_marks = 1_u64);
     tracing::warn!(
         target: "wyrd.custodian.gc.audit",
         action = "unreadable-orphan-mark",
         mark = %mark,
-        "gc could not read an orphan-ledger mark's value as an instant; it still counts as a mark, so its fragment is kept and the mark left in place — operator signal",
+        fault = %fault,
+        "gc could not read an orphan-ledger mark's value as any mark shape; it still counts as a mark, so its fragment is kept and the mark left in place — operator signal",
+    );
+}
+
+/// Emit a pass whose best-effort commit of its queued key deletes failed after a store fault had
+/// already ended it ([`Cleanup::finish_after_fault`]) on the durability-plane seam (ADR-0011 /
+/// ADR-0012): the marks of fragments it deleted may remain, `reclaiming`, over bytes that are
+/// gone. Safe — nothing preconditioned on their earlier bytes can commit — but left for the
+/// fragment-less sweep, so an operator should know.
+fn emit_cleanup_lost(fault: &str, cleanup: &str) {
+    tracing::warn!(monotonic_counter.gc_cleanup_lost_after_fault = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "cleanup-lost-after-fault",
+        fault = %fault,
+        cleanup = %cleanup,
+        "gc could not commit the key deletes of fragments it had already reclaimed when a store fault ended its pass; those marks stay `reclaiming` over deleted bytes — operator signal",
     );
 }
 
@@ -1428,8 +1694,9 @@ fn emit_malformed_orphan_key(key: &str) {
     );
 }
 
-/// Emit a skip (a still-referenced or within-grace fragment) on the same seam — the
-/// observable record that GC *considered* and *declined* a fragment.
+/// Emit a skip on the same seam — the observable record that GC *considered* and *declined* a
+/// fragment: still protected, within its grace window, named by a retirement still draining, or
+/// its mark changed before the pass could record its reclaim (`mark-changed`).
 fn emit_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
     tracing::info!(monotonic_counter.gc_fragments_skipped = 1_u64, reason);
     tracing::info!(
@@ -1439,6 +1706,6 @@ fn emit_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
         dserver,
         chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
-        "gc declined a fragment (still referenced, or within its grace window)",
+        "gc declined a fragment (still protected, within its grace window, under a draining retirement, or its mark changed)",
     );
 }
