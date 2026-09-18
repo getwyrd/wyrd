@@ -3041,6 +3041,427 @@ async fn prop_gc_staged_handoffs_reach_between_and_outside_the_reads() {
     );
 }
 
+// ---- property 14: a mover's adoption races GC's reclaim of the position it pre-marked (#804) ----
+//
+// A repoint pre-marks its destination position, writes the fragment there, and later adopts it in
+// one CAS preconditioned on the pre-mark's exact bytes (`0016:1285-1292`). A pre-mark is a
+// grace-limited promise, so a mover paused past the grace window meets GC reclaiming the position.
+// GC records that reclamation — the mark swapped to `reclaiming` — BEFORE it deletes the fragment
+// (`0016:1312-1320`), so the adoption either lands first (GC's intent loses, and the placement names
+// bytes that are still there) or loses (GC deleted the bytes, and nothing is published). What it
+// must never do is commit after the delete: a ledger still holding the pre-mark's bytes over a
+// deleted fragment is the window a delete-first GC leaves open, and a placement over deleted bytes
+// is 0016's outcome (c).
+//
+// The per-pass leg in `crates/custodian/tests/gc_reclaim_intent.rs` (B(iii)) lands the adoption
+// inside GC's delete at a scripted instant. Here the mover is a genuinely concurrent task over the
+// simulated-TiKV model, landing where the seed puts it, and every D-server call a pass makes — each
+// listing and each delete — spans a simulated hop, so the adoption can land before GC reads the
+// mark, between that read and GC's intent, inside the delete, and after the whole pass. The
+// coverage leg proves both outcomes, the lost intent and the landing inside the delete are reached.
+
+/// The object's chunk: its source fragment on server 0, referenced for the whole run, and the
+/// mover's copy of it on server 1 — the pre-marked destination.
+const ADOPT_CHUNK: ChunkId = 0x8040;
+/// An unreferenced fragment on server 2, marked long past grace: GC reclaims it in every run — the
+/// positive observable that GC is reclaiming at all.
+const ADOPT_STRAY: ChunkId = 0x8041;
+const ADOPT_INODE: InodeId = 8;
+const ADOPT_OBJECT: &str = "adopt";
+const ADOPT_GRACE: u64 = 50;
+const ADOPT_NOW: u64 = 10_000;
+/// How far into the run the adoption is drawn, in simulated milliseconds. A pass here takes about
+/// 14: four reads before the fleet walk (session listing, inodes, cursor, ledger), four listings of
+/// a hop each, the intent commit (two hops), two deletes of a hop each and the cleanup commit (two
+/// hops). The adoption itself is a two-hop commit. So this spans "before the pass reads the mark"
+/// through "after the whole pass", and the coverage leg proves the landings between are reached.
+const ADOPT_SPAN: u32 = 20;
+/// The most GC passes one run makes before it gives up on the mover finishing.
+const ADOPT_MAX_PASSES: usize = 16;
+
+/// The pre-mark's value: the legacy decimal, or 0016's structured shape naming the move's nonce.
+#[derive(Clone, Copy, Debug)]
+enum PreMark {
+    Legacy,
+    Structured,
+}
+
+impl PreMark {
+    fn bytes(self) -> Bytes {
+        match self {
+            PreMark::Legacy => Bytes::from_static(b"0"),
+            PreMark::Structured => {
+                Bytes::from_static(br#"{"orphaned_at_millis":0,"event":"move-8040"}"#)
+            }
+        }
+    }
+}
+
+/// One observation at the store seams, in the order the simulation produced them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AdoptEvent {
+    /// A GC pass began.
+    Pass,
+    /// A ledger page handed the pre-mark to the pass.
+    PreMarkRead,
+    /// A D server began deleting a fragment; the delete spans a hop.
+    DeleteBegan(DServerId, FragmentId),
+    /// ...and the bytes are gone.
+    Deleted(DServerId, FragmentId),
+    /// A commit other than the adoption deleted the pre-mark's key: GC consumed it.
+    PreMarkConsumed,
+    /// The adoption was answered.
+    Adoption(CommitOutcome),
+}
+
+type AdoptLog = Arc<Mutex<Vec<AdoptEvent>>>;
+
+fn adopt_premark_key() -> Vec<u8> {
+    metadata::orphan_key(1, frag_of(ADOPT_CHUNK))
+}
+
+/// A recording tap over the simulated-TiKV store: every call is forwarded, network hops included.
+/// Instance state only (ADR-0035).
+struct AdoptMeta {
+    inner: SimTikvMetadataStore,
+    log: AdoptLog,
+}
+
+#[async_trait]
+impl MetadataStore for AdoptMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        let (items, next) = self.inner.scan_page(prefix, after, limit).await?;
+        if prefix == metadata::ORPHAN_PREFIX && items.iter().any(|(k, _)| *k == adopt_premark_key())
+        {
+            self.log.lock().unwrap().push(AdoptEvent::PreMarkRead);
+        }
+        Ok((items, next))
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let consumes = batch.deletes.contains(&adopt_premark_key())
+            && !batch.puts.iter().any(|(key, _)| key.starts_with(b"inode:"));
+        let outcome = self.inner.commit(batch).await?;
+        if consumes && outcome == CommitOutcome::Committed {
+            self.log.lock().unwrap().push(AdoptEvent::PreMarkConsumed);
+        }
+        Ok(outcome)
+    }
+}
+
+/// A D server whose listing and delete each span a simulated hop, logging when a delete begins and
+/// when its bytes are gone.
+struct HopDServer<'a> {
+    id: DServerId,
+    inner: &'a MemDServer,
+    log: AdoptLog,
+}
+
+#[async_trait]
+impl ChunkStore for HopDServer<'_> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.inner.put_fragment(id, fragment, deadline_millis).await
+    }
+
+    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+        self.inner.get_fragment(id).await
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        madsim::time::sleep(Duration::from_millis(1)).await;
+        self.inner.list_fragments().await
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.log
+            .lock()
+            .unwrap()
+            .push(AdoptEvent::DeleteBegan(self.id, id));
+        madsim::time::sleep(Duration::from_millis(1)).await;
+        self.inner.delete_fragment(id).await?;
+        self.log
+            .lock()
+            .unwrap()
+            .push(AdoptEvent::Deleted(self.id, id));
+        Ok(())
+    }
+
+    async fn health(&self) -> Result<Health> {
+        Ok(Health::Healthy)
+    }
+}
+
+/// What one run's adoption met, observed at the store seams.
+struct AdoptRun {
+    /// The adoption committed: the mover won.
+    adopted: bool,
+    /// GC deleted the pre-marked destination's bytes.
+    reclaimed: bool,
+    /// The adoption committed after a pass had read the pre-mark and before that pass ended: GC's
+    /// intent on the bytes it read lost to it.
+    lost_to_the_adoption: bool,
+    /// The adoption was answered after GC began deleting the destination's bytes and before GC
+    /// consumed the mark — where a delete-first GC leaves the pre-mark's bytes standing over a
+    /// deleted fragment.
+    inside_the_delete: bool,
+}
+
+fn adopt_run(events: &[AdoptEvent]) -> AdoptRun {
+    let position = |wanted: &AdoptEvent| events.iter().position(|event| event == wanted);
+    let destination = frag_of(ADOPT_CHUNK);
+    let answered = events
+        .iter()
+        .position(|event| matches!(event, AdoptEvent::Adoption(_)));
+    let adopted = events.contains(&AdoptEvent::Adoption(CommitOutcome::Committed));
+    let lost_to_the_adoption = adopted
+        && answered.is_some_and(|at| {
+            events[..at]
+                .iter()
+                .rev()
+                .take_while(|event| **event != AdoptEvent::Pass)
+                .any(|event| *event == AdoptEvent::PreMarkRead)
+        });
+    let inside_the_delete = match (
+        position(&AdoptEvent::DeleteBegan(1, destination)),
+        answered,
+        position(&AdoptEvent::PreMarkConsumed),
+    ) {
+        (Some(began), Some(at), Some(consumed)) => began < at && at < consumed,
+        _ => false,
+    };
+    AdoptRun {
+        adopted,
+        reclaimed: events.contains(&AdoptEvent::Deleted(1, destination)),
+        lost_to_the_adoption,
+        inside_the_delete,
+    }
+}
+
+/// One run: GC passes back to back while the mover's adoption lands `delay_millis` into the run.
+/// Asserts that no committed placement ever names a deleted fragment, and returns what the
+/// adoption met.
+async fn adoption_races_gc(premark: PreMark, delay_millis: u64) -> AdoptRun {
+    let d = servers();
+    let log: AdoptLog = Arc::new(Mutex::new(Vec::new()));
+    let meta = Arc::new(AdoptMeta {
+        inner: SimTikvMetadataStore::new(),
+        log: Arc::clone(&log),
+    });
+    let chunk = frag_of(ADOPT_CHUNK);
+    let stray = frag_of(ADOPT_STRAY);
+
+    // The object, its source fragment on server 0.
+    d[0].put_fragment(chunk, Bytes::from_static(b"source"), None)
+        .await
+        .unwrap();
+    let prior = flat_committed_on(&[(ADOPT_CHUNK, 0)]);
+    let created = metadata::create(&*meta, ROOT, ADOPT_OBJECT, ADOPT_INODE, &prior);
+    assert_eq!(created.await.unwrap(), CommitOutcome::Committed);
+    // The mover's destination: pre-marked, then written — and then the mover paused past the
+    // grace window, so the pre-mark is stale when GC meets it.
+    let premark_key = adopt_premark_key();
+    let premarked = meta
+        .commit(WriteBatch::new().put(premark_key.clone(), premark.bytes()))
+        .await
+        .unwrap();
+    assert_eq!(premarked, CommitOutcome::Committed);
+    d[1].put_fragment(chunk, Bytes::from_static(b"destination"), None)
+        .await
+        .unwrap();
+    // The positive observable.
+    d[2].put_fragment(stray, Bytes::from_static(b"stray"), None)
+        .await
+        .unwrap();
+    mark_orphaned(&*meta, 2, stray, 0).await.unwrap();
+
+    // The run starts here: what the fixture wrote above is not the mover.
+    log.lock().unwrap().clear();
+
+    // The adoption: the placement moves to server 1 only if the pre-mark still holds exactly the
+    // bytes the mover wrote, and the source position is orphaned in the same commit.
+    let next = InodeRecord {
+        version: 2,
+        ..flat_committed_on(&[(ADOPT_CHUNK, 1)])
+    };
+    let inode_key = metadata::inode_key(ADOPT_INODE);
+    let adoption = WriteBatch::new()
+        .require(inode_key.clone(), metadata::encode(&prior))
+        .put(inode_key.clone(), metadata::encode(&next))
+        .require(premark_key.clone(), premark.bytes())
+        .delete(premark_key)
+        .put(
+            metadata::orphan_key(0, chunk),
+            Bytes::from(ADOPT_NOW.to_string()),
+        );
+    let done = Arc::new(AtomicBool::new(false));
+    let mover = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let log = Arc::clone(&log);
+        let done = Arc::clone(&done);
+        async move {
+            // Zero means now: see `RESTORE_NEMESIS_SPAN`.
+            if delay_millis > 0 {
+                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
+            }
+            let outcome = meta.commit(adoption).await.unwrap();
+            log.lock().unwrap().push(AdoptEvent::Adoption(outcome));
+            done.store(true, Ordering::Relaxed);
+        }
+    });
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-gc-reclaim-intent").await;
+    let hops: Vec<HopDServer<'_>> = d
+        .iter()
+        .enumerate()
+        .map(|(id, inner)| HopDServer {
+            id: id as DServerId,
+            inner,
+            log: Arc::clone(&log),
+        })
+        .collect();
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = hops
+        .iter()
+        .map(|hop| (hop.id, hop as &dyn ChunkStore))
+        .collect();
+    let mut passes = 0;
+    loop {
+        // One more pass once the adoption has been answered, so a pass reads what it left.
+        let finished = done.load(Ordering::Relaxed);
+        log.lock().unwrap().push(AdoptEvent::Pass);
+        let ctx = GcContext {
+            meta: &*meta,
+            fleet: &fleet,
+            grace_window_millis: ADOPT_GRACE,
+            expired_pending: ExpiredPendingPolicy::Defer,
+        };
+        let outcome =
+            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, ADOPT_NOW).await;
+        passes += 1;
+        assert!(
+            outcome.is_ok(),
+            "GC pass {passes} failed ({premark:?} pre-mark, adoption at {delay_millis} ms): {:?}",
+            outcome.err()
+        );
+        if finished {
+            break;
+        }
+        assert!(
+            passes < ADOPT_MAX_PASSES,
+            "the adoption was never answered ({premark:?} pre-mark, at {delay_millis} ms)"
+        );
+    }
+    mover.await.expect("the mover ran to completion");
+    let events = log.lock().unwrap().clone();
+    let run = adopt_run(&events);
+
+    // NEVER A PLACEMENT OVER DELETED BYTES (outcome (c)): wherever the committed record places the
+    // chunk, that D server still holds it.
+    let record: InodeRecord =
+        metadata::decode(&meta.get(&inode_key).await.unwrap().unwrap()).unwrap();
+    let placed = record.chunk_map.as_flat().unwrap()[0].placement[0];
+    assert!(
+        d[placed as usize]
+            .get_fragment(chunk)
+            .await
+            .unwrap()
+            .is_some(),
+        "the committed placement names server {placed}, whose copy of the chunk was deleted — the \
+         adoption landed over bytes GC had already destroyed ({premark:?} pre-mark, adoption at \
+         {delay_millis} ms): {events:?}"
+    );
+    // The adoption is the only writer of the placement, so the record says who won.
+    assert_eq!(
+        run.adopted,
+        placed == 1,
+        "the adoption's answer and the committed placement disagree: {events:?}"
+    );
+    assert!(
+        !(run.adopted && run.reclaimed),
+        "the adoption committed AND GC deleted its destination ({premark:?} pre-mark, adoption at \
+         {delay_millis} ms): {events:?}"
+    );
+    // The source copy is referenced until the adoption, and marked inside grace by it: never lost.
+    assert!(
+        d[0].get_fragment(chunk).await.unwrap().is_some(),
+        "the chunk's source copy was deleted: {events:?}"
+    );
+    assert!(
+        d[2].get_fragment(stray).await.unwrap().is_none(),
+        "the unprotected stray survived every pass: GC reclaimed nothing in this run, so the \
+         property proves nothing ({premark:?} pre-mark, adoption at {delay_millis} ms)"
+    );
+    run
+}
+
+/// The campaign leg: the seed picks the pre-mark's shape and where the adoption lands, so 50 seeds
+/// sweep the schedule space around GC's read, its intent and its delete.
+async fn prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(rng: &mut ChaCha8Rng) {
+    let premark = if rng.next_u32().is_multiple_of(2) {
+        PreMark::Legacy
+    } else {
+        PreMark::Structured
+    };
+    let delay = u64::from(rng.next_u32() % (ADOPT_SPAN + 1));
+    adoption_races_gc(premark, delay).await;
+}
+
+/// **Both outcomes, and the windows between them, are genuinely REACHED.** Walks the adoption's
+/// landing across the whole span for both pre-mark shapes, asserting the property at every point,
+/// then asserts that the mover won in some run and GC in another; that in some run the adoption
+/// won after a pass had read the pre-mark (GC's intent lost to it); and that in some run the
+/// adoption was answered inside GC's delete — the one landing a delete-first GC turns into a
+/// placement over deleted bytes. Without it, a span that drifted away from the pass would leave
+/// the campaign green with nothing behind it.
+async fn prop_gc_reclaim_intent_reaches_both_outcomes() {
+    let (mut adopted, mut reclaimed, mut lost, mut inside) = (false, false, false, false);
+    for premark in [PreMark::Legacy, PreMark::Structured] {
+        for delay in 0..=u64::from(ADOPT_SPAN) {
+            let run = adoption_races_gc(premark, delay).await;
+            adopted |= run.adopted;
+            reclaimed |= run.reclaimed;
+            lost |= run.lost_to_the_adoption;
+            inside |= run.inside_the_delete;
+        }
+    }
+    assert!(
+        adopted,
+        "no landing in 0..={ADOPT_SPAN} ms let the mover's adoption win"
+    );
+    assert!(
+        reclaimed,
+        "no landing in 0..={ADOPT_SPAN} ms let GC reclaim the pre-marked destination"
+    );
+    assert!(
+        lost,
+        "no landing in 0..={ADOPT_SPAN} ms committed the adoption after a pass read the pre-mark — \
+         GC's intent never met a mark that changed under it"
+    );
+    assert!(
+        inside,
+        "no landing in 0..={ADOPT_SPAN} ms answered the adoption inside GC's delete — the \
+         interleaving this property exists for was never exercised"
+    );
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -3147,6 +3568,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn gc_reclaim_intent_never_publishes_over_deleted_bytes() {
+        prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn gc_reclaim_intent_reaches_both_outcomes() {
+        prop_gc_reclaim_intent_reaches_both_outcomes().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -3181,6 +3614,7 @@ dst_campaign_test! {
             prop_restore_two_readings_never_license_a_mark(&mut rng).await;
             prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rng).await;
             prop_gc_staged_handoffs_never_reclaim_the_chunk(&mut rng).await;
+            prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rng).await;
         }
     }
 }

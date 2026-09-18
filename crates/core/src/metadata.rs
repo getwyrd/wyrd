@@ -57,8 +57,9 @@ pub fn bucket_key(name: &str) -> Vec<u8> {
 /// operation (a delete, or a completed reconstruction / rebalance) writes when it
 /// strands a fragment, so the custodian **GC** loop reclaims the bytes only once the
 /// grace window has elapsed (proposal 0005, "The four custodian loops" / GC,
-/// `0005:288-295`; the reader-safe window `0005:291-294`). The value is the
-/// logical-millis instant the fragment became orphaned.
+/// `0005:288-295`; the reader-safe window `0005:291-294`). The value is an
+/// [`OrphanMark`]: the logical-millis instant the fragment became orphaned, in one of
+/// the three shapes [`decode_orphan_mark`] reads.
 pub const ORPHAN_PREFIX: &[u8] = b"orphan:";
 
 /// Key for an orphan-ledger grace record: `orphan:<dserver>:<chunk>:<index>`.
@@ -82,6 +83,227 @@ pub fn parse_orphan_key(key: &[u8]) -> Option<(DServerId, FragmentId)> {
     let chunk = parts.next()?.parse().ok()?;
     let index = parts.next()?.parse().ok()?;
     Some((dserver, FragmentId { chunk, index }))
+}
+
+/// The longest unreference-event identity an [`OrphanMark`] may carry, in bytes.
+///
+/// Every identity proposal 0016 enumerates is short ASCII (`0016:1174-1187`): a `retire:`
+/// token (the longest, a per-part session token, is 94 bytes), an `<upload-id>:<epoch>`, an
+/// `{inode, version}` pair, or a per-move nonce. The bound is what caps a decodable mark's
+/// size, and so what a commit carrying marks costs: GC's reclaim intent carries each mark
+/// twice — the exact-value precondition and the `reclaiming` value — for a whole batch of
+/// marks in one commit, and an event free to grow to the value ceiling would put that commit
+/// past the backend's transaction envelope on every pass. At this bound a mark encodes to at
+/// most 328 bytes (pinned by this module's codec tests).
+pub const MAX_ORPHAN_EVENT_LEN: usize = 256;
+
+/// The value of an `orphan:` mark, decoded: when its fragment became orphaned, which
+/// unreference event wrote the mark, and whether GC has recorded its decision to reclaim the
+/// fragment.
+///
+/// **Three shapes, one codec** ([`encode_orphan_mark`], [`decode_orphan_mark`]; proposal 0016,
+/// `0016:1190-1216` and `:1321-1338`), defined here beside [`orphan_key`] for the reason the key
+/// is: every writer and every reader of a mark goes through one definition, so no two of them
+/// can spell a shape differently.
+///
+/// | Shape | Stored bytes | Carries |
+/// |---|---|---|
+/// | legacy | `1700000000000` | `orphaned_at_millis` alone: the bare decimal every writer before 0016 writes |
+/// | structured | `{"orphaned_at_millis":N,"event":"E"}` | the identity of the unreference event that wrote it, too |
+/// | reclaiming | `{"orphaned_at_millis":N,"event":"E","reclaiming":true}` | GC's recorded decision to reclaim; `event` is absent when the mark GC replaced was legacy |
+///
+/// **Decoding accepts exactly what encoding writes** (ADR-0045). The shapes are told apart by
+/// the bytes' own form — ASCII digits or a JSON object — and a decoded value is re-encoded and
+/// refused unless it comes back byte for byte. So a legacy value round-trips unchanged, a reader
+/// that only reads the ledger never rewrites a mark or restarts a grace clock
+/// (`0016:1208-1211`), and an exact-value compare-and-swap may be built from a decoded mark and
+/// match the stored bytes. Every other value — a non-canonical decimal (`007`, `+7`), fields
+/// reordered, unknown or `null`, `"reclaiming":false`, an event outside [`Self::structured`]'s
+/// grammar — is a [`RecordError`](crate::multipart::RecordError), never a value: a maintenance
+/// pass keeps such a mark and its fragment and names it, and never acts on it (ADR-0045 decision
+/// 3).
+///
+/// **No writer overwrites a `reclaiming` mark.** GC writes one by an exact-value
+/// compare-and-swap from the bytes it read, commits it before it deletes the fragment, and
+/// deletes the key after — blind (`0016:1312-1320`). From the instant it lands, any commit
+/// preconditioned on the mark's earlier bytes (an adoption of a pre-marked position) fails.
+/// The writer side of that, which 0016 leaves implicit: a writer that finds a `reclaiming` mark
+/// must not replace it, neither with a fresh stamp nor with its own identity. GC's blind key
+/// delete would take the new value with it, leaving whatever that writer meant it to evidence
+/// with no evidence at all; and a position whose fragment GC is deleting is no place for a new
+/// write either. A writer that needs the position marked waits until the key is gone and writes
+/// under `require_absent`. Every mark writer that reads before it writes — the three-arm drain
+/// (#659), the repoint pre-mark (#663) — inherits this rule. The writers that mark a position in
+/// the same commit that dereferences it (a delete, a supersede) do not read first: GC swaps a
+/// mark to `reclaiming` only on a position nothing referenced when it looked, and once every move
+/// that re-places a chunk adopts under its mark's precondition (#663), nothing can reference that
+/// position again before its key is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanMark {
+    orphaned_at_millis: u64,
+    event: Option<String>,
+    reclaiming: bool,
+}
+
+impl OrphanMark {
+    /// A legacy mark: the instant alone, stored as the bare decimal every writer before proposal
+    /// 0016 writes.
+    pub fn legacy(orphaned_at_millis: u64) -> Self {
+        Self {
+            orphaned_at_millis,
+            event: None,
+            reclaiming: false,
+        }
+    }
+
+    /// A structured mark, naming the unreference event that wrote it.
+    ///
+    /// The identity grammar is the one [`decode_orphan_mark`] holds a stored value to: 1 to
+    /// [`MAX_ORPHAN_EVENT_LEN`] bytes of visible ASCII other than `"` and `\` — every identity
+    /// 0016 enumerates, and nothing JSON would escape, so a mark's encoded size is its event's
+    /// size plus a constant. Anything else is refused here, so no writer can encode a mark the
+    /// decoder would refuse.
+    pub fn structured(
+        orphaned_at_millis: u64,
+        event: impl Into<String>,
+    ) -> std::result::Result<Self, crate::multipart::RecordError> {
+        Ok(Self {
+            orphaned_at_millis,
+            event: Some(checked_orphan_event(event.into())?),
+            reclaiming: false,
+        })
+    }
+
+    /// This mark in its terminal `reclaiming` state: the same stamp and the same event (none,
+    /// for a legacy mark), so the compare-and-swap that writes it disturbs nothing the grace
+    /// test was measured from (`0016:1331-1332`).
+    pub fn into_reclaiming(self) -> Self {
+        Self {
+            reclaiming: true,
+            ..self
+        }
+    }
+
+    /// The instant the fragment became orphaned — where its grace window starts.
+    pub fn orphaned_at_millis(&self) -> u64 {
+        self.orphaned_at_millis
+    }
+
+    /// The identity of the unreference event that wrote the mark; `None` for a legacy mark, and
+    /// for a `reclaiming` mark that replaced one.
+    pub fn event(&self) -> Option<&str> {
+        self.event.as_deref()
+    }
+
+    /// Whether GC has recorded its decision to reclaim the fragment: the reclamation is already
+    /// decided, and what remains is to finish it (`0016:1321-1333`).
+    pub fn is_reclaiming(&self) -> bool {
+        self.reclaiming
+    }
+
+    /// The retirement token this mark's event spells, if it spells one: the obligation whose
+    /// `retire:bytes:` key ([`crate::multipart::retire_key`]) is still present while that
+    /// retirement drains, and whose absence says it has drained (`0016:1242-1247`).
+    ///
+    /// Read through the `retire:` key grammar's own parser ([`crate::multipart::parse_retire_key`]),
+    /// so an event is a token only in the one spelling a retirement is installed under. An event
+    /// that is not a token — a repoint pre-mark's per-move nonce, an owned-staging walk's
+    /// `<upload-id>:<epoch>` — names no obligation, and answers `None`.
+    pub fn retire_token(&self) -> Option<crate::multipart::RetireToken> {
+        let event = self.event.as_deref()?;
+        let mut key = crate::multipart::RETIRE_BYTES_PREFIX.to_vec();
+        key.extend_from_slice(event.as_bytes());
+        match crate::multipart::parse_retire_key(&key) {
+            Ok((crate::multipart::RetireMode::Bytes, token)) => Some(token),
+            _ => None,
+        }
+    }
+}
+
+/// The JSON form of the structured and `reclaiming` shapes. Field order is the stored order;
+/// `event` and `reclaiming` are omitted when absent or false, never written as defaults, so a
+/// structured mark and a `reclaiming` one differ by exactly the `"reclaiming":true` suffix.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrphanMarkWire {
+    orphaned_at_millis: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    event: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reclaiming: bool,
+}
+
+/// An event identity [`OrphanMark::structured`] and [`decode_orphan_mark`] both accept: 1 to
+/// [`MAX_ORPHAN_EVENT_LEN`] bytes of visible ASCII other than `"` and `\`.
+fn checked_orphan_event(
+    event: String,
+) -> std::result::Result<String, crate::multipart::RecordError> {
+    let visible = |b: &u8| matches!(b, 0x21..=0x7e) && *b != b'"' && *b != b'\\';
+    if (1..=MAX_ORPHAN_EVENT_LEN).contains(&event.len()) && event.bytes().all(|b| visible(&b)) {
+        Ok(event)
+    } else {
+        Err(crate::multipart::RecordError::MalformedRecordValue {
+            namespace: "orphan:",
+            detail: format!(
+                "event {event:?} is not 1 to {MAX_ORPHAN_EVENT_LEN} bytes of visible ASCII \
+                 other than `\"` and `\\`"
+            ),
+        })
+    }
+}
+
+/// Encode an [`OrphanMark`] in its shape: the bare decimal for a legacy mark — byte for byte
+/// what every writer before proposal 0016 writes — and the JSON object otherwise.
+pub fn encode_orphan_mark(mark: &OrphanMark) -> Bytes {
+    if mark.event.is_none() && !mark.reclaiming {
+        return Bytes::from(mark.orphaned_at_millis.to_string());
+    }
+    encode(&OrphanMarkWire {
+        orphaned_at_millis: mark.orphaned_at_millis,
+        event: mark.event.clone(),
+        reclaiming: mark.reclaiming,
+    })
+}
+
+/// Decode an `orphan:` value into its [`OrphanMark`], accepting exactly the bytes
+/// [`encode_orphan_mark`] writes and refusing everything else (see [`OrphanMark`]).
+///
+/// A value that is not a mark of any shape is
+/// [`RecordError::MalformedRecordValue`](crate::multipart::RecordError::MalformedRecordValue);
+/// one that reads as a mark in some other spelling than this codec's — a leading zero,
+/// whitespace inside the object, reordered fields, a default written out — is
+/// [`RecordError::NoncanonicalRecordValue`](crate::multipart::RecordError::NoncanonicalRecordValue),
+/// because a compare-and-swap built from the decoded mark could never match those bytes.
+pub fn decode_orphan_mark(
+    value: &[u8],
+) -> std::result::Result<OrphanMark, crate::multipart::RecordError> {
+    let malformed = |detail: String| crate::multipart::RecordError::MalformedRecordValue {
+        namespace: "orphan:",
+        detail,
+    };
+    let mark = if !value.is_empty() && value.iter().all(u8::is_ascii_digit) {
+        // The legacy shape. Digits alone reach `from_str`, so no sign can; a leading zero reads
+        // as a number here and is refused as non-canonical below.
+        let at = std::str::from_utf8(value)
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+            .ok_or_else(|| malformed("a bare decimal past u64".to_string()))?;
+        OrphanMark::legacy(at)
+    } else {
+        let wire: OrphanMarkWire =
+            serde_json::from_slice(value).map_err(|err| malformed(err.to_string()))?;
+        OrphanMark {
+            orphaned_at_millis: wire.orphaned_at_millis,
+            event: wire.event.map(checked_orphan_event).transpose()?,
+            reclaiming: wire.reclaiming,
+        }
+    };
+    if encode_orphan_mark(&mark).as_ref() != value {
+        return Err(crate::multipart::RecordError::NoncanonicalRecordValue {
+            namespace: "orphan:",
+        });
+    }
+    Ok(mark)
 }
 
 /// Whether an inode's content is fully committed or still being written.
@@ -3743,6 +3965,196 @@ mod segmented_shape_invariants {
             41,
             "every stored record contributes its key-derived id and none ends the walk — a \
              record this build cannot read must raise the floor, never silently lower it",
+        );
+    }
+}
+
+/// The `orphan:` value codec ([`OrphanMark`]): each of the three shapes round-trips byte for
+/// byte, the legacy shape is exactly what every existing writer spells, and every value outside
+/// the encoder's image is refused rather than read. Co-located because the custodian's
+/// discriminator (`crates/custodian/tests/gc_reclaim_intent.rs`) names no symbol this codec adds.
+#[cfg(test)]
+mod orphan_mark_codec {
+    use super::*;
+    use crate::multipart::{RecordError, RetireToken, UploadId};
+
+    fn round_trips(mark: &OrphanMark, stored: &[u8]) {
+        assert_eq!(
+            encode_orphan_mark(mark).as_ref(),
+            stored,
+            "{mark:?} encodes"
+        );
+        assert_eq!(
+            decode_orphan_mark(stored).as_ref(),
+            Ok(mark),
+            "{:?} decodes",
+            String::from_utf8_lossy(stored)
+        );
+    }
+
+    #[test]
+    fn the_legacy_shape_is_every_existing_writers_bare_decimal() {
+        for at in [0, 1, 60_000, 1_700_000_000_000, u64::MAX] {
+            // `unlink`, the superseding commits, `mark_orphaned`, restore and the repair loops
+            // all write `orphaned_at_millis.to_string()`.
+            round_trips(&OrphanMark::legacy(at), at.to_string().as_bytes());
+        }
+        let mark = decode_orphan_mark(b"42").unwrap();
+        assert_eq!(
+            (
+                mark.orphaned_at_millis(),
+                mark.event(),
+                mark.is_reclaiming()
+            ),
+            (42, None, false)
+        );
+    }
+
+    #[test]
+    fn the_structured_and_reclaiming_shapes_round_trip_byte_for_byte() {
+        let structured = OrphanMark::structured(7, "g:1:2").unwrap();
+        round_trips(&structured, br#"{"orphaned_at_millis":7,"event":"g:1:2"}"#);
+        round_trips(
+            &structured.clone().into_reclaiming(),
+            br#"{"orphaned_at_millis":7,"event":"g:1:2","reclaiming":true}"#,
+        );
+        // A legacy mark GC replaces keeps its stamp and has no event to carry.
+        round_trips(
+            &OrphanMark::legacy(7).into_reclaiming(),
+            br#"{"orphaned_at_millis":7,"reclaiming":true}"#,
+        );
+        let reclaiming = structured.into_reclaiming();
+        assert_eq!(
+            (
+                reclaiming.orphaned_at_millis(),
+                reclaiming.event(),
+                reclaiming.is_reclaiming()
+            ),
+            (7, Some("g:1:2"), true),
+            "the reclaiming state disturbs neither the stamp nor the event"
+        );
+    }
+
+    #[test]
+    fn a_value_outside_the_encoders_image_is_refused() {
+        let over_long = format!(
+            r#"{{"orphaned_at_millis":7,"event":"{}"}}"#,
+            "e".repeat(MAX_ORPHAN_EVENT_LEN + 1)
+        );
+        // The event `g:1:2` with its first letter written as a JSON unicode escape (a backslash,
+        // `u`, then `0067`): JSON reads the same string, the codec does not write it.
+        let escaped = format!(
+            r#"{{"orphaned_at_millis":7,"event":"{}u0067:1:2"}}"#,
+            char::from(92)
+        );
+        for value in [
+            // Not a mark of any shape.
+            b"".as_slice(),
+            b"not an instant",
+            b"-1",
+            b"+7",
+            b"1.5",
+            b" 7",
+            b"18446744073709551616",
+            br#"{"orphaned_at_millis":"7","event":"g:1:2"}"#,
+            br#"{"orphaned_at_millis":7,"event":"g:1:2","extra":1}"#,
+            br#"{"event":"g:1:2"}"#,
+            br#"[7,"g:1:2"]"#,
+            br#"{"orphaned_at_millis":7,"event":""}"#,
+            br#"{"orphaned_at_millis":7,"event":"g 1"}"#,
+            br#"{"orphaned_at_millis":7,"event":"g\"1"}"#,
+            over_long.as_bytes(),
+            // A mark, but not in this codec's spelling.
+            b"007",
+            br#"{"orphaned_at_millis":7}"#,
+            br#"{"orphaned_at_millis":7,"event":null}"#,
+            br#"{"orphaned_at_millis":7,"event":"g:1:2","reclaiming":false}"#,
+            br#"{"event":"g:1:2","orphaned_at_millis":7}"#,
+            br#"{"orphaned_at_millis": 7,"event":"g:1:2"}"#,
+            escaped.as_bytes(),
+            br#"{"orphaned_at_millis":7,"reclaiming":true,"event":"g:1:2"}"#,
+        ] {
+            assert!(
+                matches!(
+                    decode_orphan_mark(value),
+                    Err(RecordError::MalformedRecordValue {
+                        namespace: "orphan:",
+                        ..
+                    } | RecordError::NoncanonicalRecordValue {
+                        namespace: "orphan:"
+                    })
+                ),
+                "{:?} decoded as a mark: {:?}",
+                String::from_utf8_lossy(value),
+                decode_orphan_mark(value)
+            );
+        }
+        assert_eq!(
+            decode_orphan_mark(b"007"),
+            Err(RecordError::NoncanonicalRecordValue {
+                namespace: "orphan:"
+            }),
+            "a leading zero reads as 7 and is refused as a second spelling of it"
+        );
+    }
+
+    #[test]
+    fn a_writer_cannot_encode_what_the_decoder_refuses() {
+        for event in [
+            String::new(),
+            "g 1".to_string(),
+            "g\"1".to_string(),
+            "g\\1".to_string(),
+            "é".to_string(),
+            "e".repeat(MAX_ORPHAN_EVENT_LEN + 1),
+        ] {
+            assert!(
+                OrphanMark::structured(7, event.clone()).is_err(),
+                "event {event:?} must be refused at construction"
+            );
+        }
+        // The largest mark any writer can produce: the bound `MAX_ORPHAN_EVENT_LEN` states.
+        let largest = OrphanMark::structured(u64::MAX, "e".repeat(MAX_ORPHAN_EVENT_LEN))
+            .unwrap()
+            .into_reclaiming();
+        let bytes = encode_orphan_mark(&largest);
+        assert_eq!(bytes.len(), 328);
+        assert_eq!(decode_orphan_mark(&bytes), Ok(largest));
+    }
+
+    #[test]
+    fn an_event_names_a_retirement_only_in_the_retire_key_grammars_spelling() {
+        let token = |event: &str| OrphanMark::structured(0, event).unwrap().retire_token();
+        assert_eq!(
+            token("g:9:2"),
+            Some(RetireToken::Generation {
+                inode: 9,
+                version: 2
+            })
+        );
+        let upload = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            token(&format!("s:{upload}:3")),
+            Some(RetireToken::Session {
+                upload_id: UploadId::new(upload).unwrap(),
+                epoch: 3,
+                part: None,
+            })
+        );
+        // A per-move nonce, an owned-staging walk's identity, a second spelling of a token.
+        for event in ["move-8045", &format!("{upload}:3"), "g:09:2", "g:9:2:1"] {
+            assert_eq!(token(event), None, "{event:?} names no retirement");
+        }
+        assert_eq!(OrphanMark::legacy(0).retire_token(), None);
+        assert_eq!(
+            OrphanMark::structured(0, "g:9:2")
+                .unwrap()
+                .into_reclaiming()
+                .retire_token(),
+            Some(RetireToken::Generation {
+                inode: 9,
+                version: 2
+            })
         );
     }
 }
