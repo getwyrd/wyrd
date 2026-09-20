@@ -60,8 +60,10 @@
 //! or whose value is none of the three shapes is left in place. Each delete is an exact-value
 //! compare-and-swap from the bytes the window read, in commits of at most [`CONDITIONAL_BATCH`]
 //! marks, so a mark rewritten after the pass read it survives; and each is audited and counted
-//! only once its commit has landed — or, for a commit whose result the backend could not report
-//! but is out of flight, once a fresh read shows the key gone.
+//! only once its commit has landed. A commit whose result the backend could not report is judged
+//! as the one atomic commit it was, from a fresh read of every key in it: a mark still holding
+//! what the pass read proves it did not land, and a key found gone is recorded as gone but
+//! claimed by nobody — this pass's delete or another writer's, the read cannot tell.
 //!
 //! The loop's load-bearing invariant, whose violation is **silent corruption**:
 //! **never reclaim a referenced fragment** — a fragment a committed chunk map's
@@ -930,7 +932,10 @@ impl<'p, 'a> Sweep<'p, 'a> {
     /// [`CommitUnknownResult`] the backend says is no longer in flight
     /// ([`Self::settle_unknown_sweep`]): a delete that landed under it has taken the key with it,
     /// so a pass that gave up there would leave that delete unaudited and uncounted with nothing
-    /// a later pass could read to reconstruct it (PR #821 review).
+    /// a later pass could read to reconstruct it (PR #821 review). The settle judges the batch as
+    /// the one commit it was and claims no sweep from it: a key found gone is recorded on the
+    /// audit seam as gone and attributed to nobody, since another writer's delete reads exactly
+    /// as this pass's would (PR #823 review).
     async fn commit_sweep(&mut self, batch: &[Sweepable<'p>]) -> Result<()> {
         let whole = batch
             .iter()
@@ -978,14 +983,29 @@ impl<'p, 'a> Sweep<'p, 'a> {
         Ok(())
     }
 
-    /// A sweep commit answered `Err`. If it is a [`CommitUnknownResult`] the backend says is out of
-    /// flight, settle it by a fresh read of each key: a key now absent was taken by this pass's
-    /// conditional delete — the one delete on those exact bytes it issued — and is claimed as
-    /// swept, marked on the audit seam as settled by a re-read; a key still holding a mark was not,
-    /// and is left for the next pass, as a lost precondition is. If the batch **may still commit**
-    /// no re-read can settle it: each mark is named as unsettled and the fault ends the pass, as
-    /// every other `Err` does — a later pass reads whichever way it went. Any other error is
-    /// returned untouched.
+    /// A sweep commit answered `Err`. If it is a [`CommitUnknownResult`] the backend says is out
+    /// of flight, judge the batch **as the one atomic commit it was**, from a fresh read of every
+    /// key in it. The commit deleted all of its marks or none, so a key still holding the bytes
+    /// the pass read proves the batch did **not** land — its precondition on that key would have
+    /// taken the key with it — and every key of the batch found absent was then deleted by
+    /// another writer (`mark-gone`, as the re-read after a lost precondition judges it), not by
+    /// this pass. With no such survivor nothing proves the batch landed either: a key found
+    /// absent may have been taken by this pass's delete or by another writer's, and one found
+    /// rewritten may have been rewritten over this pass's delete or instead of it. An absent key
+    /// is then named `sweep-unattributed` on the audit seam — gone, after a commit whose result
+    /// the store could not report — and claimed by nobody: not audited as this pass's sweep, not
+    /// counted, and the pass answers `Partial` for it, never `Changed` or `Satisfied`. A key still
+    /// holding a mark is left for the next pass in every case, as a lost precondition's is.
+    ///
+    /// The reads are sequential and a writer may land between them; the judgement does not
+    /// depend on their order. The batch was out of flight before the first read, so a survivor
+    /// holding the read bytes disproves the landing at whatever instant it is read, and an
+    /// absent key is never attributed, whenever it is read. What the judgement rests on is the
+    /// commit's atomicity, which the `MetadataStore` contract guarantees (PR #823 review).
+    ///
+    /// If the batch **may still commit** no re-read can judge it: each mark is named as unsettled
+    /// and the fault ends the pass, as every other `Err` does — a later pass reads whichever way
+    /// it went. Any other error is returned untouched.
     async fn settle_unknown_sweep(&mut self, marks: &[Sweepable<'p>], err: BoxError) -> Result<()> {
         let Some(unknown) = err.downcast_ref::<CommitUnknownResult>() else {
             return Err(err);
@@ -997,15 +1017,28 @@ impl<'p, 'a> Sweep<'p, 'a> {
             self.lost_sweep = true;
             return Err(err);
         }
+        // Every key first, then the judgement: it is one commit that is being judged, and a
+        // survivor anywhere in it speaks for every key of it.
+        let mut reads = Vec::with_capacity(marks.len());
         for mark in marks {
-            match self.ctx.meta.get(&mark.key).await? {
+            reads.push(self.ctx.meta.get(&mark.key).await?);
+        }
+        let landing_disproved = marks.iter().zip(&reads).any(|(mark, now)| {
+            now.as_ref()
+                .is_some_and(|now| *now == encode_orphan_mark(mark.mark))
+        });
+        for (mark, now) in marks.iter().zip(&reads) {
+            match now {
+                // The batch did not land, so this pass did not delete it: another writer did.
+                None if landing_disproved => emit_mark_skip(mark.dserver, mark.frag, "mark-gone"),
+                // Gone, and nothing says by whose hand.
                 None => {
-                    emit_mark_swept_settled(mark.dserver, mark.frag);
-                    self.marks_swept = true;
+                    self.lost_sweep = true;
+                    emit_mark_gone_unattributed(mark.dserver, mark.frag, &unknown.detail);
                 }
                 Some(now) => {
                     self.lost_sweep = true;
-                    let reason = if now == encode_orphan_mark(mark.mark) {
+                    let reason = if *now == encode_orphan_mark(mark.mark) {
                         "mark-unchanged"
                     } else {
                         "mark-changed"
@@ -1961,20 +1994,22 @@ fn emit_mark_swept(dserver: DServerId, frag: FragmentId) {
     );
 }
 
-/// [`emit_mark_swept`] for a delete whose commit answered an out-of-flight
-/// [`CommitUnknownResult`] and whose key a fresh read then found absent: the same action and the
-/// same counter, plus `settled` naming the evidence, so the trail says this claim rests on a
-/// re-read rather than on the commit's own answer.
-fn emit_mark_swept_settled(dserver: DServerId, frag: FragmentId) {
-    tracing::info!(monotonic_counter.gc_orphan_marks_swept = 1_u64);
-    tracing::info!(
+/// Emit a sweep delete whose commit answered an out-of-flight [`CommitUnknownResult`] and whose
+/// key a fresh read then found absent, with nothing in the batch proving the commit did not land
+/// ([`Sweep::settle_unknown_sweep`]): the mark is gone, and whether this pass's delete or another
+/// writer's took it cannot be told, so the pass claims neither — not [`emit_mark_swept`]'s action
+/// and not its counter. A counter of its own, so an operator can see how much of the trail is
+/// deletion attributed to nobody, and `detail` carrying the backend's account of the commit.
+fn emit_mark_gone_unattributed(dserver: DServerId, frag: FragmentId, detail: &str) {
+    tracing::warn!(monotonic_counter.gc_orphan_mark_sweeps_unattributed = 1_u64);
+    tracing::warn!(
         target: "wyrd.custodian.gc.audit",
-        action = "sweep-mark",
-        settled = "unknown-commit-reread",
+        action = "sweep-unattributed",
         dserver,
         chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
-        "gc deleted an orphan mark with no fragment beneath it: the commit's result was unknown and a fresh read found the key gone",
+        detail = %detail,
+        "an orphan mark is gone after a sweep delete whose commit result the store could not report: taken by this pass's delete or by another writer's, and claimed by neither; the pass answers Partial",
     );
 }
 
