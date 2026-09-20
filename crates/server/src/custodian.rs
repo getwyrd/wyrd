@@ -113,6 +113,15 @@ use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
 /// lease-liveness work (#557).
 const GC_GRACE_WINDOW_MILLIS: u64 = crate::cli::LEASE_TTL_MILLIS;
 
+// GC's fragment-less sweep deletes a mark once it is older than the late-write deadline `D`
+// (`wyrd_custodian::gc::LATE_WRITE_DEADLINE_MILLIS`), and proposal 0016 requires that deadline to
+// sit STRICTLY inside the orphan grace, `G_orphan > W_repoint + W_write + δ_clock`
+// (`0016:1386-1388`): a fragment written as late as its writer may write it then lands while its
+// mark's grace is still running, so no reclaim removes evidence a late write needs. Held here,
+// against the grace this deployed pass honours itself, so retuning either value past the other
+// fails the build.
+const _: () = assert!(wyrd_custodian::gc::LATE_WRITE_DEADLINE_MILLIS < GC_GRACE_WINDOW_MILLIS);
+
 /// A configured D-server the role was told to maintain over: its stable [`DServerId`],
 /// its opaque failure-domain label, and the connected [`ChunkStore`] client. The role
 /// probes each one's reachability every pass ([`live_reconstruction_view`]) and hands the
