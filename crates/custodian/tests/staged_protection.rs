@@ -8,8 +8,8 @@
 //! pass reads either, so GC reclaims such a fragment as soon as it carries an `orphan:` mark past
 //! grace, and the post-restore pass marks it stranded for the next GC pass to delete.
 //!
-//! Every leg drives the production entry points — `reconcile_step` (GC and scrub),
-//! `reconcile_after_restore` and `reconciliation_status` — over in-memory doubles. No client
+//! Every leg drives the production entry points — `reconcile_step` (GC and scrub) and
+//! `reconcile_after_restore` — over in-memory doubles. No client
 //! creates a session before the S3 verbs (#508), so every staged record is seeded, as raw JSON
 //! the base decoders accept (the shapes of
 //! `crates/core/tests/multipart_session_records.rs:81-141`), and each value is round-tripped
@@ -31,7 +31,8 @@
 //! - **E** a staged record a pass cannot read, one it cannot trust, and a store fault under a
 //!   staged read each fail closed — while a session VALUE, which no pass decodes, changes neither
 //!   pass's answer.
-//! - **F** scrub and the drain-status query read no upload record (a guard).
+//! - **F** scrub reads no upload record (a guard). The drain-status query did too until #808
+//!   (#664's slice) gave it the staged class; its own legs are in `staged_drain_status.rs`.
 //!
 //! Nothing here names a symbol the fix adds: every type, function and string it uses is on
 //! `main` already.
@@ -62,9 +63,9 @@ use wyrd_core::multipart::{
 };
 use wyrd_core::repair::repair_key;
 use wyrd_custodian::{
-    mark_orphaned, reconcile_after_restore, reconcile_step, reconciliation_status, set_lifecycle,
-    Custodian, DServerLifecycle, ExpiredPendingPolicy, FencedZone, GcContext, ReconcileError,
-    Reconciled, ReconciliationStatus, RestoreReport, ScrubContext,
+    mark_orphaned, reconcile_after_restore, reconcile_step, set_lifecycle, Custodian,
+    DServerLifecycle, ExpiredPendingPolicy, FencedZone, GcContext, ReconcileError, Reconciled,
+    RestoreReport, ScrubContext,
 };
 use wyrd_traits::{
     page_cursor, page_limit, page_start, BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId,
@@ -2119,16 +2120,14 @@ async fn f_store(uploads: Option<UploadRecords>) -> (Meta, [Disk; 4]) {
     (meta, d)
 }
 
-/// What scrub and the drain-status query answered over one store, and the `repair:` keys scrub
-/// left.
+/// What scrub answered over one store, and the `repair:` keys it left.
 #[derive(Debug, PartialEq)]
 struct Answers {
     scrub: Reconciled,
-    drain: ReconciliationStatus,
     repairs: Vec<Vec<u8>>,
 }
 
-async fn scrub_and_drain_status(meta: &Meta, d: &[Disk; 4], label: &str) -> Answers {
+async fn scrub_answers(meta: &Meta, d: &[Disk; 4], label: &str) -> Answers {
     let (zone, custodian) = elect().await;
     let fleet = fleet(d);
     let scrub = ScrubContext {
@@ -2138,40 +2137,37 @@ async fn scrub_and_drain_status(meta: &Meta, d: &[Disk; 4], label: &str) -> Answ
     let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, NOW)
         .await
         .unwrap_or_else(|fault| panic!("scrub returned Err over {label}: {fault}"));
-    let drain = reconciliation_status(meta, DRAINING)
-        .await
-        .unwrap_or_else(|fault| panic!("drain status returned Err over {label}: {fault}"));
     Answers {
         scrub: scrubbed,
-        drain,
         repairs: meta.keys_under(b"repair:"),
     }
 }
 
-/// **(F)** Scrub (`reconcile_step` with a `ScrubContext`) and `reconciliation_status` answer over a
-/// store holding upload records exactly as over the same store without them — the same
-/// `Reconciled`, the same `repair:` key for the missing chunk, the same drain status — with the
-/// upload records healthy, with each (E)(i) damaged record in place, and with each (E)(iii) store
-/// fault armed; and neither issues a read under `mpu:`, `sidx:` or `part:`. A consumer that does
-/// not yet act on staged bytes inherits neither their reads, nor their damage, nor their faults
-/// (`desired_state.rs:178-180`).
+/// **(F)** Scrub (`reconcile_step` with a `ScrubContext`) answers over a store holding upload
+/// records exactly as over the same store without them — the same `Reconciled`, the same
+/// `repair:` key for the missing chunk — with the upload records healthy, with each (E)(i)
+/// damaged record in place, and with each (E)(iii) store fault armed; and it issues no read under
+/// `mpu:`, `sidx:` or `part:`. A consumer that does not yet act on staged bytes inherits neither
+/// their reads, nor their damage, nor their faults.
 ///
 /// A guard: green on base.
-// deferred: #663, #664 — those slices add upload records to scrub and to drain status, and own
-// changing this leg.
+///
+/// The **drain-status** half of this leg is gone, discharged by #808 (#664's slice): that query
+/// now reads the staged class and counts a staged fragment as held (`0016:826-827`), so it no
+/// longer answers identically with and without upload records — by design. Its behaviour over
+/// them is `crates/custodian/tests/staged_drain_status.rs`; what stays here is scrub's half.
+// deferred: #663 — that slice adds upload records to scrub, and owns changing this leg.
 #[tokio::test]
-async fn scrub_and_drain_status_do_not_read_upload_records() {
+async fn scrub_does_not_read_upload_records() {
     capture_audit();
     let (without, without_disks) = f_store(None).await;
-    let expected =
-        scrub_and_drain_status(&without, &without_disks, "the store without uploads").await;
+    let expected = scrub_answers(&without, &without_disks, "the store without uploads").await;
     assert_eq!(
         expected.repairs,
         vec![repair_key(F_LOST)],
         "scrub must enqueue a repair for the missing chunk, or the comparison below compares \
          nothing"
     );
-    assert_eq!(expected.drain, ReconciliationStatus::Pending);
 
     for uploads in [
         UploadRecords::Healthy,
@@ -2186,11 +2182,8 @@ async fn scrub_and_drain_status_do_not_read_upload_records() {
         let (with, with_disks) = f_store(Some(uploads)).await;
         with.clear_reads();
         let label = format!("upload records {uploads:?}");
-        let answers = scrub_and_drain_status(&with, &with_disks, &label).await;
-        assert_eq!(
-            answers, expected,
-            "scrub or drain status answered differently with {label}"
-        );
+        let answers = scrub_answers(&with, &with_disks, &label).await;
+        assert_eq!(answers, expected, "scrub answered differently with {label}");
         let reads = with.reads();
         assert!(!reads.is_empty(), "the read log recorded nothing");
         let staged: Vec<&Read> = reads
@@ -2203,7 +2196,7 @@ async fn scrub_and_drain_status_do_not_read_upload_records() {
             .collect();
         assert!(
             staged.is_empty(),
-            "scrub or drain status read upload records with {label}: {staged:?}"
+            "scrub read upload records with {label}: {staged:?}"
         );
     }
 }

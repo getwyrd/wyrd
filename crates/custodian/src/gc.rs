@@ -356,8 +356,9 @@ pub async fn mark_orphaned(
 /// reclaimed or any fragment-less mark swept, and [`Reconciled::Satisfied`] otherwise. Scrub
 /// answers the identical condition the identical way ([`crate::scrub::reconcile`]): one
 /// incomplete set, one rule, read twice. A staged multipart record this pass could not read
-/// ([`StagedSet::unresolvable`]) is answered the same way, by GC alone: scrub does not read
-/// staged records. A pass whose window of the `orphan:` ledger ([`OrphanWindow`]) stopped
+/// ([`StagedSet::unresolvable`]) is answered the same way, by GC and by the drain-status query
+/// ([`crate::desired_state::reconciliation_status`]) — but not by scrub, which reads no staged
+/// record. A pass whose window of the `orphan:` ledger ([`OrphanWindow`]) stopped
 /// short of the ledger's end and reclaimed nothing answers [`Reconciled::Partial`], never
 /// `Satisfied`: `Satisfied` certifies that reality matched, and a caller driving the loop to
 /// satisfaction would stop on it with eligible marks still unvisited in the windows ahead (PR
@@ -1154,10 +1155,13 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
 /// A class of its own, **disjoint** from the committed [`ReferenceSet`] rather than merged into
 /// it, so each consumer decides for itself what staged bytes mean to it (`0016:767-782`, `:881`),
 /// and built by a reader of its own ([`staged_fragments`]) rather than inside
-/// [`referenced_fragments`]. Only the two passes that delete or mark read it: GC's reclaim
-/// ([`reconcile`]) and the post-restore mark gate ([`crate::restore`]). Scrub and the drain-status
-/// query share the committed build and read no upload record at all, so an upload record's
-/// damage, a store fault reading one, or the cost of reading them cannot reach their answers.
+/// [`referenced_fragments`]. Three passes read it: the two that delete or mark — GC's reclaim
+/// ([`reconcile`]) and the post-restore mark gate ([`crate::restore`]) — and the operator's
+/// drain-status query ([`crate::desired_state::reconciliation_status`]), which counts a staged
+/// fragment as held so a drain is never certified over a live upload's bytes (`0016:826-827`).
+/// Scrub still shares the committed build and reads no upload record at all, so an upload
+/// record's damage, a store fault reading one, or the cost of reading them cannot reach its
+/// answer.
 ///
 /// Its rules mirror the committed set's, one level each:
 ///
@@ -1173,8 +1177,9 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
 ///   which chunks it protects, so the class is **incomplete** ([`Self::unresolvable`]) and
 ///   protects every fragment in the fleet, exactly as an unreadable committed map does.
 ///
-/// deferred: #663, #664 — scrub and reconstruction (#663), and drain status and rebalance (#664),
-/// acting on staged bytes.
+/// deferred: #663 — scrub and reconstruction acting on staged bytes. (#664's half — drain status
+/// and rebalance — is discharged: the drain-status query above reads this class, and rebalance is
+/// disjoint from it by construction, `crate::rebalance::plan_evacuations`.)
 #[derive(Default)]
 pub(crate) struct StagedSet {
     /// `(dserver, fragment)` a staged record places: each chunk of a committed part at its recorded
