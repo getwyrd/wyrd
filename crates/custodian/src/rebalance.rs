@@ -231,6 +231,25 @@ struct EvacScan {
 /// Scan the committed chunk maps for fragments sitting on a draining server, building
 /// one [`EvacPlan`] per affected chunk.
 ///
+/// **Staged multipart bytes are out of this scan by construction, and deliberately so**
+/// (proposal 0016 decision 2, the rebalance row `0016:881`). The walk is a `scan(b"inode:")`
+/// of the committed namespace: an upload's `mpu:` / `part:` / `sidx:` records are in other
+/// namespaces, so no plan is ever built for a staged chunk and no `part:` record is ever
+/// rewritten here. That is the design, not an omission — a staged fragment empties itself
+/// within the session's own window (published, aborted, or reaped), and repointing a part
+/// record from outside the session fence buys no durability while racing the upload that
+/// owns it. Reconstruction is where a staged chunk's placement is rewritten, under the
+/// session precondition (`0016:875`).
+///
+/// So for a draining server holding **only** staged fragments this pass plans nothing and
+/// answers [`Reconciled::Satisfied`] — the honest answer to *its own* question, "is there
+/// committed content left to evacuate". It is **not** the operator's drain verdict: that is
+/// [`crate::desired_state::reconciliation_status`], which counts the staged class too and
+/// answers `Pending` for exactly that server. The two are consistent only because the staged
+/// class is disjoint from the committed reference set rather than merged into it
+/// (`0016:767-782`, `:881`); merging them would have made this pass plan a move it must not
+/// perform.
+///
 /// Every committed record is read through the ONE resolver every other consumer shares
 /// ([`metadata::resolve_chunk_map`], proposal 0016 decision 7(e)) — the same reading GC
 /// (`crate::gc::referenced_fragments`) and restore (`crate::restore`) already do — so a
