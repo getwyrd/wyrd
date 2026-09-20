@@ -48,7 +48,8 @@ pub enum Reconciled {
     /// `orphan:` ledger (`crate::gc::OrphanWindow`) did not reach the ledger's end this pass
     /// (PR #802 review), and when a reclaim intent it recorded lost to a mark that changed after
     /// the pass read it and nothing was reclaimed: the mark's new value is one the pass never
-    /// read (#804).
+    /// read (#804). Likewise when its sweep of a mark with no fragment beneath it lost to a mark a
+    /// fresh read then found still at the key, and nothing was reclaimed or swept (#800).
     ///
     /// Distinct from [`Reconciled::Satisfied`] because that outcome is a **certification** —
     /// "reality already matched the desired state" — and a caller that drives reconciliation

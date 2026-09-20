@@ -946,13 +946,15 @@ const KEPT: FragmentId = FragmentId { chunk: 7, index: 0 };
 
 /// Fill the ledger with `before` marks on D server 1 and `after` marks on D server 3 — marks with
 /// no fragment on disk, which no pass reclaims and none consumes, so the ledger stays several
-/// windows long for as many passes as a leg runs.
+/// windows long for as many passes as a leg runs. Stamped [`NOW`]: every pass these legs run is
+/// well inside the fillers' late-write deadline (41 s, `gc::LATE_WRITE_DEADLINE_MILLIS`), so GC's
+/// sweep of fragment-less marks (#800) keeps them too.
 fn seed_filler(meta: &LedgerMeta, before: usize, after: usize) {
     for i in 0..before {
-        meta.seed_mark(1, frag(5_000_000 + i as ChunkId, 0), 0);
+        meta.seed_mark(1, frag(5_000_000 + i as ChunkId, 0), NOW);
     }
     for i in 0..after {
-        meta.seed_mark(3, frag(6_000_000 + i as ChunkId, 0), 0);
+        meta.seed_mark(3, frag(6_000_000 + i as ChunkId, 0), NOW);
     }
 }
 
@@ -1133,10 +1135,16 @@ async fn d2_an_expired_leases_entry_outlives_every_fragment_it_accounts_for() {
     let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
     let block = B * 4 / 5;
     // Filler on the odd D servers 1, 3, 5, 7, 9, a block each; the chunk's fragments on the even
-    // ones between them, so each fragment's position lands a block further into the ledger.
+    // ones between them, so each fragment's position lands a block further into the ledger. No
+    // fragment under any filler, and stamped `NOW` so it stays inside its late-write deadline and
+    // no pass sweeps it either (`seed_filler`).
     for (n, dserver) in [1, 3, 5, 7, 9].into_iter().enumerate() {
         for i in 0..block {
-            meta.seed_mark(dserver, frag(7_000_000 + (n * block + i) as ChunkId, 0), 0);
+            meta.seed_mark(
+                dserver,
+                frag(7_000_000 + (n * block + i) as ChunkId, 0),
+                NOW,
+            );
         }
     }
     let chunk: ChunkId = 9;

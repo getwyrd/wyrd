@@ -3462,6 +3462,305 @@ async fn prop_gc_reclaim_intent_reaches_both_outcomes() {
     );
 }
 
+// ---- property 15: GC's sweep of fragment-less marks under a concurrent re-stamp (#800) ----
+//
+// A mark whose position holds no fragment is deleted by GC's sweep once the pass's own listing
+// shows the position empty past the mark's late-write deadline (proposal 0016, `0016:1359-1408`).
+// The delete is a compare-and-swap from the bytes the pass read, because a writer may re-stamp the
+// mark between that read and the delete — a fresh pre-mark over the same position — and a blind
+// delete would take the refreshed mark with it, leaving whatever it was written to evidence with
+// no evidence at all (#661 round 1's finding). The per-pass legs in
+// `crates/custodian/tests/gc_mark_sweep.rs` land that writer at scripted instants (D(i), D(iii));
+// here the ledger is paged over the simulated-TiKV model with a page cap the seed picks, and a
+// genuinely concurrent task re-stamps one sweep target at an instant the seed picks — before the
+// pass reads it, between that read and the delete, inside the delete's own commit, or after it.
+//
+// The property: the refreshed mark always survives, holding exactly the refreshed value, and every
+// other sweep target is gone by the end of the run (the sweep is running). The coverage leg proves
+// that some landing point falls between a pass's read of the target and its delete of it, and
+// that some does not.
+
+/// Where the sweep targets' chunk ids start: target `i` is chunk `SWEEP_BASE + i`, fragment 0, on
+/// D server `i % 4` — a fragment-less mark stamped at zero, so every pass here is past its
+/// late-write deadline.
+const SWEEP_BASE: ChunkId = 0x8050;
+/// The grace every pass runs with: the deployed 60 s, which the late-write deadline (41 s) sits
+/// strictly inside.
+const SWEEP_GRACE: u64 = 60_000;
+/// Every pass runs at this instant: past the late-write deadline of every mark stamped at zero, and
+/// inside that of the re-stamp, which is stamped here — so the refreshed mark is never old enough
+/// to sweep in this run, and a delete of it can only be the pass mistaking it for the mark it read.
+const SWEEP_NOW: u64 = 100_000;
+/// Passes per run: the first sweeps the ledger, the rest walk what the re-stamp left.
+const SWEEP_PASSES: usize = 3;
+/// How far into the run the re-stamp is drawn, in simulated milliseconds. A pass here is its
+/// staged listing, its `inode:` scan and cursor read (a hop each), one hop per ledger page, and the
+/// sweep's commit (two hops; a lost one adds a retry and a read), so three passes take about 30 ms
+/// at the smallest page cap; the re-stamp itself is a two-hop commit. This spans "before the first
+/// pass reads the target" through "after the last pass", and the coverage leg proves the landings
+/// between are reached.
+const SWEEP_SPAN: u32 = 36;
+
+/// The re-stamp's value: a fresh legacy decimal, or 0016's structured shape naming a new move.
+#[derive(Clone, Copy, Debug)]
+enum Restamp {
+    Legacy,
+    Structured,
+}
+
+impl Restamp {
+    fn bytes(self) -> Bytes {
+        match self {
+            Restamp::Legacy => Bytes::from(SWEEP_NOW.to_string()),
+            Restamp::Structured => Bytes::from(format!(
+                r#"{{"orphaned_at_millis":{SWEEP_NOW},"event":"move-8050"}}"#
+            )),
+        }
+    }
+}
+
+/// One observation at the store seam, in the order the simulation produced them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SweepEvent {
+    /// A GC pass began.
+    Pass,
+    /// A ledger page handed the target's mark to the pass.
+    TargetRead,
+    /// A commit deleting the target's key under a precondition on it — the sweep's delete — was
+    /// answered.
+    DeleteTried(CommitOutcome),
+    /// The concurrent writer's re-stamp committed.
+    Restamped,
+}
+
+/// A recording tap over the simulated-TiKV store: every call is forwarded unchanged, network hops
+/// included, and the target's reads, deletes and re-stamp are logged in the order they complete.
+/// Instance state only (ADR-0035).
+struct SweepMeta {
+    inner: SimTikvMetadataStore,
+    target: Vec<u8>,
+    events: Mutex<Vec<SweepEvent>>,
+}
+
+impl SweepMeta {
+    fn log(&self, event: SweepEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+#[async_trait]
+impl MetadataStore for SweepMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        let (items, next) = self.inner.scan_page(prefix, after, limit).await?;
+        if prefix == metadata::ORPHAN_PREFIX && items.iter().any(|(key, _)| *key == self.target) {
+            self.log(SweepEvent::TargetRead);
+        }
+        Ok((items, next))
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let deletes_target = batch.deletes.contains(&self.target)
+            && batch.preconditions.iter().any(|pre| pre.key == self.target);
+        let restamps = batch.puts.iter().any(|(key, _)| *key == self.target);
+        let outcome = self.inner.commit(batch).await?;
+        if deletes_target {
+            self.log(SweepEvent::DeleteTried(outcome));
+        }
+        if restamps && outcome == CommitOutcome::Committed {
+            self.log(SweepEvent::Restamped);
+        }
+        Ok(outcome)
+    }
+}
+
+/// Whether the re-stamp landed between a pass's read of the target and that same pass's delete of
+/// it: a read after the pass began and before the re-stamp, and a delete tried after the re-stamp
+/// and before the next pass began.
+fn restamp_between_read_and_delete(events: &[SweepEvent]) -> bool {
+    let Some(landed) = events.iter().position(|e| *e == SweepEvent::Restamped) else {
+        return false;
+    };
+    let began = events[..landed]
+        .iter()
+        .rposition(|e| *e == SweepEvent::Pass)
+        .map_or(0, |at| at + 1);
+    let ends = events[landed..]
+        .iter()
+        .position(|e| *e == SweepEvent::Pass)
+        .map_or(events.len(), |at| landed + at);
+    events[began..landed].contains(&SweepEvent::TargetRead)
+        && events[landed..ends]
+            .iter()
+            .any(|e| matches!(e, SweepEvent::DeleteTried(_)))
+}
+
+/// One run: `SWEEP_PASSES` GC passes, each with a fresh `GcContext`, over `targets` fragment-less
+/// marks paged `page_cap` at a time, while a concurrent writer re-stamps target `restamped`
+/// `delay_millis` into the run. Asserts the property and returns whether the re-stamp landed
+/// between a pass's read of the target and its delete.
+async fn sweep_under_a_concurrent_restamp(
+    page_cap: usize,
+    targets: usize,
+    restamped: usize,
+    restamp: Restamp,
+    delay_millis: u64,
+) -> bool {
+    let d = servers();
+    let marks: Vec<(DServerId, FragmentId)> = (0..targets)
+        .map(|i| ((i % 4) as DServerId, frag_of(SWEEP_BASE + i as ChunkId)))
+        .collect();
+    let (target_server, target) = marks[restamped];
+    let target_key = metadata::orphan_key(target_server, target);
+    let meta = Arc::new(SweepMeta {
+        inner: SimTikvMetadataStore::new().with_scan_cap(page_cap),
+        target: target_key.clone(),
+        events: Mutex::new(Vec::new()),
+    });
+    for &(dserver, frag) in &marks {
+        mark_orphaned(&*meta, dserver, frag, 0).await.unwrap();
+    }
+    // The run starts here: the fixture's own writes are not the concurrent writer.
+    meta.events.lock().unwrap().clear();
+
+    let refreshed = restamp.bytes();
+    let writer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let key = target_key.clone();
+        let value = refreshed.clone();
+        async move {
+            // Zero means now: see `RESTORE_NEMESIS_SPAN`.
+            if delay_millis > 0 {
+                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
+            }
+            // A blind put, retried: one that meets a pass's in-flight commit on the key loses the
+            // lock race as `Err` — never `Conflict`, which a blind batch cannot have — and a real
+            // writer tries again.
+            loop {
+                match meta
+                    .commit(WriteBatch::new().put(key.clone(), value.clone()))
+                    .await
+                {
+                    Ok(outcome) => {
+                        assert_eq!(
+                            outcome,
+                            CommitOutcome::Committed,
+                            "a blind batch is never Conflict"
+                        );
+                        break;
+                    }
+                    Err(_) => madsim::time::sleep(Duration::from_millis(1)).await,
+                }
+            }
+        }
+    });
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-gc-mark-sweep").await;
+    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    for pass in 1..=SWEEP_PASSES {
+        meta.log(SweepEvent::Pass);
+        // A FRESH context every pass, as the deployed loop builds one
+        // (`crates/server/src/custodian.rs:600-608`).
+        let ctx = GcContext {
+            meta: &*meta,
+            fleet: &fleet,
+            grace_window_millis: SWEEP_GRACE,
+            expired_pending: ExpiredPendingPolicy::Defer,
+        };
+        let outcome =
+            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, SWEEP_NOW).await;
+        assert!(
+            outcome.is_ok(),
+            "GC pass {pass} failed (page cap {page_cap}, {targets} targets, re-stamp of \
+             #{restamped} at {delay_millis} ms): {:?}",
+            outcome.err()
+        );
+    }
+    writer
+        .await
+        .expect("the concurrent re-stamp ran to completion");
+    let events = meta.events.lock().unwrap().clone();
+
+    // (1) THE REFRESHED MARK ALWAYS SURVIVES, holding exactly what its writer wrote.
+    assert_eq!(
+        meta.get(&target_key).await.unwrap(),
+        Some(refreshed),
+        "the re-stamped mark was deleted or changed ({restamp:?} re-stamp of #{restamped} at \
+         {delay_millis} ms, page cap {page_cap}, {targets} targets): {events:?}"
+    );
+    // (2) EVERY OTHER TARGET IS SWEPT: the sweep ran, so the property above was earned.
+    for (i, &(dserver, frag)) in marks.iter().enumerate() {
+        if i != restamped {
+            assert!(
+                !is_marked(&*meta, dserver, frag).await,
+                "target #{i} ({frag:?} on server {dserver}) is fragment-less and past its \
+                 late-write deadline, and survived the run (page cap {page_cap}, re-stamp at \
+                 {delay_millis} ms): {events:?}"
+            );
+        }
+    }
+    restamp_between_read_and_delete(&events)
+}
+
+/// The campaign leg: the seed picks the page cap, how many targets the ledger holds, which of them
+/// the writer re-stamps, the re-stamp's shape and where it lands, so 50 seeds sweep the schedule
+/// space around the pass's pages and its delete.
+async fn prop_gc_fragment_less_sweep_never_deletes_a_restamped_mark(rng: &mut ChaCha8Rng) {
+    let page_cap = 2 + (rng.next_u32() % 4) as usize;
+    let targets =
+        page_cap * (2 + (rng.next_u32() % 2) as usize) + (rng.next_u32() as usize % page_cap);
+    let restamped = rng.next_u32() as usize % targets;
+    let restamp = if rng.next_u32().is_multiple_of(2) {
+        Restamp::Legacy
+    } else {
+        Restamp::Structured
+    };
+    let delay = u64::from(rng.next_u32() % (SWEEP_SPAN + 1));
+    sweep_under_a_concurrent_restamp(page_cap, targets, restamped, restamp, delay).await;
+}
+
+/// **The window between the read and the delete is genuinely REACHED, and so is the outside of
+/// it.** Walks the re-stamp's landing point across the whole span for both shapes, asserting the
+/// full property at every point, then asserts that some landing fell between a pass's read of the
+/// target and its delete of it — the interleaving a blind delete loses the refreshed mark to — and
+/// some did not. Without it, a span that drifted away from the pass would leave the campaign green
+/// with nothing behind it.
+async fn prop_gc_fragment_less_sweep_reaches_between_the_read_and_the_delete() {
+    let (mut between, mut outside) = (Vec::new(), Vec::new());
+    for restamp in [Restamp::Legacy, Restamp::Structured] {
+        for delay in 0..=u64::from(SWEEP_SPAN) {
+            if sweep_under_a_concurrent_restamp(2, 8, 1, restamp, delay).await {
+                between.push((restamp, delay));
+            } else {
+                outside.push((restamp, delay));
+            }
+        }
+    }
+    assert!(
+        !between.is_empty(),
+        "no landing point in 0..={SWEEP_SPAN} ms fell between a pass's read of the target and its \
+         delete of it — the interleaving this property exists for was never exercised"
+    );
+    assert!(
+        !outside.is_empty(),
+        "every landing point in 0..={SWEEP_SPAN} ms fell between a pass's read and its delete — \
+         the span no longer covers the landings before the read and after the delete"
+    );
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -3580,6 +3879,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn gc_fragment_less_sweep_never_deletes_a_restamped_mark() {
+        prop_gc_fragment_less_sweep_never_deletes_a_restamped_mark(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn gc_fragment_less_sweep_reaches_between_the_read_and_the_delete() {
+        prop_gc_fragment_less_sweep_reaches_between_the_read_and_the_delete().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -3615,6 +3926,7 @@ dst_campaign_test! {
             prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rng).await;
             prop_gc_staged_handoffs_never_reclaim_the_chunk(&mut rng).await;
             prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rng).await;
+            prop_gc_fragment_less_sweep_never_deletes_a_restamped_mark(&mut rng).await;
         }
     }
 }

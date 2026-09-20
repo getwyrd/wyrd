@@ -43,6 +43,21 @@
 //! (`0016:1226-1247`). The bytes behind an expired `pending:` lease carry no mark, and are
 //! reclaimed as before.
 //!
+//! **A mark with no fragment beneath it is swept once no fragment can still land under it**
+//! (proposal 0016, `0016:1359-1408`, X87, X91, X96). The walk above reaches a mark only through a
+//! fragment some D server lists, so a mark whose position holds none — the old position of a
+//! repaired missing fragment, a `reclaiming` mark whose fragment is already gone, and later a
+//! teardown's planned placement or a repoint's pre-mark — would stay in the ledger for good. A
+//! pass therefore also deletes each mark of its window whose position no listing of **this** pass
+//! reported, once the mark is at least the late-write deadline [`LATE_WRITE_DEADLINE_MILLIS`] old
+//! ([`Sweep::sweep_fragment_less_marks`]): the listing was then taken after the last instant a
+//! fragment could land under that mark, so the position's emptiness is an observation, never an
+//! inference from the mark's age. A mark on a D server this pass did not list, at a position the
+//! reference set or the staged class protects, or whose value is none of the three shapes is left
+//! in place. Each delete is an exact-value compare-and-swap from the bytes the window read, in
+//! commits of at most [`CLEANUP_BATCH`], so a mark rewritten after the pass read it survives; and
+//! each is audited and counted only once its commit has landed.
+//!
 //! The loop's load-bearing invariant, whose violation is **silent corruption**:
 //! **never reclaim a referenced fragment** — a fragment a committed chunk map's
 //! placement record points at is **never** passed to `delete_fragment`
@@ -136,7 +151,86 @@ pub(crate) const ORPHAN_WINDOW: usize = SCAN_CAP / 16;
 /// bounds every such batch by an operation-count knob `B_ops` calibrated against the slowest
 /// supported backend (`0016:640-643`); `W` is not that calibration. What it does guarantee is
 /// that a cleanup commit's size is a constant, independent of the ledger and of the pass.
+///
+/// The same bound caps each commit of the fragment-less sweep ([`Sweepable`]): at most `W` marks
+/// deleted per commit, each conditioned on the value the pass read — one precondition and one
+/// delete, so a commit carries each key twice and each value once: at most 73 + 328 + 73 bytes a
+/// mark, under 480 KB for `W` of them.
 pub(crate) const CLEANUP_BATCH: usize = 1_000;
+
+/// **`W_write`** — the fragment-write deadline (proposal 0016 decision 5, `0016:1551-1576`): a
+/// fragment write lands within `W_write` of the instant its writer authorized it, or not at all.
+/// Both ends hold the bound: the writer's own await gives up at the deadline, and the D server
+/// refuses a write whose deadline has passed (the `deadline_millis` of
+/// [`ChunkStore::put_fragment`], refused as [`wyrd_traits::WriteDeadlineExpired`], #638) — a
+/// caller-side timeout alone bounds how long the writer waits, never when an accepted write takes
+/// effect (`0016:1557-1564`).
+///
+/// Derivation: 30 s, the D server's own ceiling on one request (`DEFAULT_REQUEST_TIMEOUT`,
+/// `crates/server/src/dserver.rs`), at which it cuts the request with a deadline status. A write
+/// still running past that is one the server has stopped serving, so a longer `W_write` would
+/// promise a window no write can use; a shorter one would refuse writes the server still serves.
+///
+/// A bound on writers, not on GC: it holds only for a write that carries it. See
+/// [`LATE_WRITE_DEADLINE_MILLIS`] for the writers that must.
+pub const W_WRITE_MILLIS: u64 = 30_000;
+
+/// **`W_repoint`** — the pre-mark deadline (proposal 0016 decision 4.2, `0016:1339-1349`, X88): a
+/// mover that marks a position before it writes a fragment there must authorize that write within
+/// `W_repoint` of its pre-mark's stamp; once the pre-mark is older it MUST NOT authorize the write
+/// at all, and restarts from a fresh pre-mark instead. A caller-side deadline gating a caller-side
+/// action — whether this mover issues the write — which is the job such a deadline can do
+/// soundly (`0016:1350-1356`).
+///
+/// Derivation: 10 s, two metadata transaction envelopes of 5 s (`E_TX_MILLIS`,
+/// `crates/core/src/multipart.rs`, the envelope every `MetadataStore` commit is sized against):
+/// the pre-mark's own commit, which may use its whole envelope before the mover learns it landed,
+/// and one more read or commit before the mover authorizes the write. A mover slower than that has
+/// stalled, and a fresh pre-mark is the restart 0016 already asks of it.
+///
+/// A bound on writers, not on GC, exactly as [`W_WRITE_MILLIS`] is.
+pub const W_REPOINT_MILLIS: u64 = 10_000;
+
+/// **`δ_clock`** — the most two clocks that judge one mark's deadline may disagree by: the
+/// writer's, which stamps the mark and authorizes a write under it; the D server's, which refuses
+/// a late write; and the custodian's, which ages the mark (`0016:1566-1569`). All three read the
+/// one deployment wall clock, on different hosts (the clock-lifecycle table, `0016:2508-2509`).
+///
+/// Derivation: 1 s, a stated budget rather than a measurement. ADR-0024 (Proposed) makes one
+/// clock-skew budget the bound every time-dependent check shares, with hosts held to it by
+/// authenticated time sync, and sets no value yet; this is the budget the sweep assumes, and a
+/// fleet whose hosts drift further apart than this has already broken the lease and grace checks
+/// that share it. It is a thousand ticks of the millisecond clock every stamp is read in, so the
+/// strict margin 0016 needs — at least one tick (`0016:1570-1575`) — holds with room to spare.
+pub const DELTA_CLOCK_MILLIS: u64 = 1_000;
+
+/// **`D`** — the late-write deadline (proposal 0016, `0016:1369-1391`, X91): the longest after a
+/// mark's `orphaned_at` that a fragment may still land at its position, `W_repoint + W_write +
+/// δ_clock`. A repoint's pre-mark is legitimately fragment-less for up to [`W_REPOINT_MILLIS`],
+/// the write it then authorizes lands within [`W_WRITE_MILLIS`], and the clocks that stamped the
+/// mark, refused a late write and now age the mark may disagree by [`DELTA_CLOCK_MILLIS`]. So a
+/// listing taken at or after `orphaned_at + D` that shows the position empty shows it empty for
+/// good, and that listing is what licenses the fragment-less sweep to delete the mark
+/// ([`Sweep::sweep_fragment_less_marks`]) — never the mark's age alone (X96, `0016:2625`).
+///
+/// 41 s, strictly inside the orphan grace the deployed pass honours, as 0016 requires
+/// (`G_orphan > W_repoint + W_write + δ_clock`, `0016:1386-1388`): a fragment written as late as
+/// its writer may write it lands while its mark's grace is still running, so the reclaim never
+/// removes evidence a late write needs. The build holds that against the deployed grace itself,
+/// beside it (`GC_GRACE_WINDOW_MILLIS`, `crates/server/src/custodian.rs`). The uniform bound is
+/// the safe default; 0016 allows tightening it per event kind (`0016:1388-1390`), which this does
+/// not do.
+///
+/// **The writers' obligation.** `D` bounds only a writer that enforces its parts, and no change to
+/// GC can make it sound alone (`0016:1339-1349`, `:1551-1576`). Every writer that marks a position
+/// before its fragment lands there — the staged re-place (#814, split from #663), flat pre-marking
+/// (#723) and multipart teardown — MUST refuse to authorize the write once its mark is older than
+/// [`W_REPOINT_MILLIS`], and MUST write with a deadline [`W_WRITE_MILLIS`] after that
+/// authorization, which the D server enforces. No writer on `main` marks ahead of its fragment, so
+/// the sweep is sound against today's tree: unlink marks the placed positions of a committed map,
+/// and a map commits only after every fragment it names is acknowledged; reconstruction and
+/// rebalance write first, and mark only the positions they vacate, in the repoint commit.
+pub const LATE_WRITE_DEADLINE_MILLIS: u64 = W_REPOINT_MILLIS + W_WRITE_MILLIS + DELTA_CLOCK_MILLIS;
 
 /// Where the `orphan:` ledger walk resumes: the one persisted record of [`OrphanWindow`].
 ///
@@ -259,9 +353,9 @@ pub async fn mark_orphaned(
 /// committed object's chunk map could not be read ([`ReferenceSet::unresolvable`]), so
 /// [`ReferenceSet::protects`] withheld every fragment in the fleet and this pass may not
 /// report the store converged — [`Reconciled::Changed`] if any fragment bytes were
-/// reclaimed, and [`Reconciled::Satisfied`] otherwise. Scrub answers the identical
-/// condition the identical way ([`crate::scrub::reconcile`]): one incomplete set, one
-/// rule, read twice. A staged multipart record this pass could not read
+/// reclaimed or any fragment-less mark swept, and [`Reconciled::Satisfied`] otherwise. Scrub
+/// answers the identical condition the identical way ([`crate::scrub::reconcile`]): one
+/// incomplete set, one rule, read twice. A staged multipart record this pass could not read
 /// ([`StagedSet::unresolvable`]) is answered the same way, by GC alone: scrub does not read
 /// staged records. A pass whose window of the `orphan:` ledger ([`OrphanWindow`]) stopped
 /// short of the ledger's end and reclaimed nothing answers [`Reconciled::Partial`], never
@@ -269,8 +363,10 @@ pub async fn mark_orphaned(
 /// satisfaction would stop on it with eligible marks still unvisited in the windows ahead (PR
 /// #802 review). A pass that lost a reclaim intent — a mark it judged changed before its
 /// `reclaiming` swap committed — and reclaimed nothing answers `Partial` for the same reason:
-/// the mark's new value is one this pass never read. `Satisfied` is therefore "this pass read
-/// the ledger to its end, lost no intent, and reclaimed nothing".
+/// the mark's new value is one this pass never read. So does a pass whose sweep of a
+/// fragment-less mark lost its precondition to a mark a fresh read then found still present.
+/// `Satisfied` is therefore "this pass read the ledger to its end, lost no intent and no sweep
+/// to a mark still there, and reclaimed and swept nothing".
 ///
 /// A store fault ends the pass with its error, after the key deletes it had queued for
 /// fragments already deleted are committed, best effort ([`Cleanup::finish_after_fault`]).
@@ -351,6 +447,9 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
         lost_intent: false,
         reclaimed_expired: BTreeSet::new(),
         still_held: HashSet::new(),
+        listed: HashSet::new(),
+        marks_swept: false,
+        lost_sweep: false,
     };
     if let Err(fault) = sweep.run(&mut cleanup).await {
         // The sweep may already have deleted fragments whose key deletes are still queued: commit
@@ -384,12 +483,12 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
             // unreadable staged record is the same hole in the other class: `StagedSet::protects`
             // withheld everything, and the answer says so.
             Reconciled::Blocked
-        } else if sweep.changed {
+        } else if sweep.changed || sweep.marks_swept {
             Reconciled::Changed
-        } else if window.is_partial() || sweep.lost_intent {
-            // Nothing reclaimed, and something this pass did not read: more of the ledger beyond
-            // its window, or a mark that changed after its window read it. Not a certification;
-            // the next pass reads both.
+        } else if window.is_partial() || sweep.lost_intent || sweep.lost_sweep {
+            // Nothing reclaimed or swept, and something this pass did not read: more of the ledger
+            // beyond its window, or a mark that changed after its window read it. Not a
+            // certification; the next pass reads both.
             Reconciled::Partial
         } else {
             Reconciled::Satisfied
@@ -398,7 +497,8 @@ pub(crate) async fn reconcile(ctx: &GcContext<'_>, now_millis: u64) -> Result<Re
 }
 
 /// One pass's walk of the fleet against its window: each unprotected fragment judged on its own
-/// evidence, and the reclaims it licenses recorded before any is carried out.
+/// evidence, and the reclaims it licenses recorded before any is carried out — and then the sweep
+/// of the window's marks that no listing of the pass reported.
 struct Sweep<'p, 'a> {
     ctx: &'p GcContext<'a>,
     now_millis: u64,
@@ -419,6 +519,16 @@ struct Sweep<'p, 'a> {
     /// not ([`reconcile`]).
     reclaimed_expired: BTreeSet<ChunkId>,
     still_held: HashSet<ChunkId>,
+    /// The positions of this window's marks that a listing of THIS pass reported — each keyed by
+    /// the fragment its own mark names, never by a raw ledger key. A position here holds a
+    /// fragment, which the walk judged; the fragment-less sweep never touches it. Bounded by the
+    /// window, not by the fleet's fragment count: only a listed fragment that has a mark in the
+    /// window is recorded.
+    listed: HashSet<(DServerId, FragmentId)>,
+    /// Whether this pass deleted any fragment-less mark (a sweep whose commit landed).
+    marks_swept: bool,
+    /// Whether a sweep lost its precondition to a mark a fresh read then found still present.
+    lost_sweep: bool,
 }
 
 /// A reclaim a pass has judged and not yet recorded: the fragment, the store holding it, and its
@@ -446,15 +556,44 @@ impl Intent<'_> {
     }
 }
 
-impl<'a> Sweep<'_, 'a> {
-    /// Walk every D server's fragments, then record whatever intents are still pending.
+/// A fragment-less mark the sweep judged deletable: its key, the position it names, and its value
+/// exactly as the pass's window read it, borrowed from the window.
+struct Sweepable<'w> {
+    key: Vec<u8>,
+    dserver: DServerId,
+    frag: FragmentId,
+    mark: &'w OrphanMark,
+}
+
+impl Sweepable<'_> {
+    /// Add this mark's delete to `batch`, conditioned on the mark still holding the bytes the pass
+    /// read — the decoded mark re-encoded, which reproduces those bytes exactly, as a reclaim
+    /// intent's precondition does ([`Intent::record`]). A mark rewritten since, deleted since, or
+    /// deleted and written again with another value fails it.
+    fn delete(&self, batch: WriteBatch) -> WriteBatch {
+        batch
+            .require(self.key.clone(), encode_orphan_mark(self.mark))
+            .delete(self.key.clone())
+    }
+}
+
+impl<'p, 'a> Sweep<'p, 'a> {
+    /// Walk every D server's fragments, record whatever intents are still pending, and then sweep
+    /// the window's marks that no listing of this pass reported.
     async fn run(&mut self, cleanup: &mut Cleanup<'_>) -> Result<()> {
         for &(dserver, store) in self.ctx.fleet {
             for frag in store.list_fragments().await? {
+                // Recorded before the fragment is judged, whatever the judgement: a listed position
+                // is the walk's, protected or not. Per listing, so a fleet naming one server twice
+                // still has the position listed if either of its listings reports it.
+                if self.window.mark_of(dserver, frag).is_some() {
+                    self.listed.insert((dserver, frag));
+                }
                 self.judge(dserver, store, frag, cleanup).await?;
             }
         }
-        self.record_intents(cleanup).await
+        self.record_intents(cleanup).await?;
+        self.sweep_fragment_less_marks().await
     }
 
     async fn judge(
@@ -483,7 +622,7 @@ impl<'a> Sweep<'_, 'a> {
 
         let window = self.window;
         match window.mark_of(dserver, frag) {
-            Some(ReadMark::Reclaiming) => {
+            Some(ReadMark::Reclaiming(_)) => {
                 // Reclamation already decided and recorded by an earlier pass that did not finish
                 // it: resume, with no second grace test — the window elapsed once, and the swap
                 // did not move the stamp it was measured from (`0016:1321-1333`). Deleting the
@@ -618,11 +757,11 @@ impl<'a> Sweep<'_, 'a> {
     /// deletion — the one key this pass holds a licence to delete. Never called before the mark
     /// is `reclaiming` in the store.
     ///
-    /// deferred: #800 — a pass that dies after the fragment is deleted and before the queued key
-    /// delete commits leaves a `reclaiming` mark over bytes that are gone. It is safe (nothing
-    /// preconditioned on the mark's earlier bytes can commit, and no writer overwrites it), but
-    /// this walk is driven by `list_fragments()` and never visits a position with no fragment, so
-    /// the key is left for #800's fragment-less sweep.
+    /// A pass that dies after the fragment is deleted and before the queued key delete commits
+    /// leaves a `reclaiming` mark over bytes that are gone. It is safe — nothing preconditioned on
+    /// the mark's earlier bytes can commit, and no writer overwrites it — and this walk, driven by
+    /// `list_fragments()`, never visits the position again; the fragment-less sweep deletes the
+    /// key instead ([`Self::sweep_fragment_less_marks`]).
     async fn destroy(
         &mut self,
         dserver: DServerId,
@@ -635,6 +774,150 @@ impl<'a> Sweep<'_, 'a> {
         emit_reclaim(dserver, frag, reason);
         self.reclaimed(frag.chunk);
         cleanup.delete(orphan_key(dserver, frag)).await
+    }
+
+    /// **Sweep the window's fragment-less marks** (proposal 0016, `0016:1359-1408`, X87, X91,
+    /// X96): delete each mark this pass's window read whose position no listing of this pass
+    /// reported, once the mark is at least [`LATE_WRITE_DEADLINE_MILLIS`] old — so every `orphan:`
+    /// mark has a deleter whether or not a fragment ever lands under it (`0016:1406-1408`).
+    ///
+    /// **An observation licenses the delete, never the mark's age** (X96, `0016:2625`). The pass's
+    /// clock was read before the pass began — the deployed loop reads it as the pass's argument
+    /// (`crates/server/src/custodian.rs`) — and every listing is taken during the pass, so no
+    /// listing predates `now_millis`. A mark at least `D` old at `now_millis` was therefore listed
+    /// empty at or after `orphaned_at + D`, past the last instant a fragment may land under it,
+    /// and its position stays empty. Only this pass's own listing counts: nothing of a listing
+    /// outlives its pass (the deployed loop builds a fresh [`GcContext`] every pass, and nothing
+    /// here is written to the store), so a listing an earlier pass took — before a fragment
+    /// landed — never licenses a delete. One clock: the mark is aged on `now_millis`, the reading
+    /// the grace test uses, so the mark's whole lifecycle is judged on it (ADR-0009).
+    ///
+    /// A mark is left in place when:
+    ///
+    /// - its position is listed: a fragment is there, and the walk judged it;
+    /// - its D server is not in this pass's fleet: nothing listed that server, so no absence was
+    ///   observed;
+    /// - the reference set or the staged class protects its position — the reclaim's own safety
+    ///   gate, read the same way, so an incomplete set sweeps nothing as it reclaims nothing;
+    /// - its value is none of the three shapes: there is no stamp to age, so it stays
+    ///   byte-identical, as it was named when the window read it (ADR-0045 decision 3);
+    /// - it is younger than `D`.
+    ///
+    /// Only a key a writer spells is a mark here. The window files a mark under the position it
+    /// names only when [`orphan_key`] spells that position as the very key read, and records a
+    /// listing only by that position, so a differently spelled key is never swept or rewritten,
+    /// and never lends the mark of its position its stamp or its listing — it was named when the
+    /// window read it ([`classify_ledger_entry`]).
+    ///
+    /// The marks are judged in position order, and the deletes go in that order, at most
+    /// [`CLEANUP_BATCH`] to a commit ([`Self::commit_sweep`]) — so the commits a pass makes are
+    /// the same on every run.
+    async fn sweep_fragment_less_marks(&mut self) -> Result<()> {
+        let window: &'p OrphanWindow = self.window;
+        let fleet: HashSet<DServerId> =
+            self.ctx.fleet.iter().map(|&(dserver, _)| dserver).collect();
+        let mut judged = Vec::new();
+        for (dserver, frag, read) in window.marks_in_position_order() {
+            let mark = match read {
+                ReadMark::Stamped(mark) | ReadMark::Reclaiming(mark) => mark,
+                ReadMark::Unreadable => continue,
+            };
+            if self.listed.contains(&(dserver, frag)) {
+                continue;
+            }
+            let kept = if !fleet.contains(&dserver) {
+                Some("server-not-in-fleet")
+            } else if let Some(reason) = self
+                .referenced
+                .protection(dserver, frag)
+                .or_else(|| self.staged.protection(dserver, frag))
+            {
+                Some(reason)
+            } else if self.now_millis
+                < mark
+                    .orphaned_at_millis()
+                    .saturating_add(LATE_WRITE_DEADLINE_MILLIS)
+            {
+                Some("within-late-write-deadline")
+            } else {
+                None
+            };
+            match kept {
+                Some(reason) => emit_mark_skip(dserver, frag, reason),
+                // Its key is the one the window read: the window files a mark only under the
+                // position `orphan_key` spells as that key.
+                None => judged.push(Sweepable {
+                    key: orphan_key(dserver, frag),
+                    dserver,
+                    frag,
+                    mark,
+                }),
+            }
+        }
+        for batch in judged.chunks(CLEANUP_BATCH) {
+            self.commit_sweep(batch).await?;
+        }
+        Ok(())
+    }
+
+    /// Commit one batch of the sweep's deletes, and claim each — audit it, count it — only once
+    /// its commit has landed: evidence is claimed only once it is durable, as the post-restore
+    /// pass claims its marks (`crate::restore`).
+    ///
+    /// The batch goes in one commit while every mark in it still holds the bytes the pass read. A
+    /// `Conflict` says only that some precondition lost (`CommitOutcome`, clause 2) — not which,
+    /// and not that any of the marks still exists — so each delete is then committed alone, and
+    /// one that loses again is judged on a **fresh read** of its key, never on the `Conflict`: a
+    /// mark found holding other bytes was rewritten after the pass read it, and keeps its new
+    /// value for a pass that reads it; one found holding the same bytes lost to something else
+    /// (a concurrent commit on the key) and waits for the next pass; one found absent was deleted
+    /// by another writer, and this pass claims nothing about it — neither a sweep it did not make
+    /// nor a mark that is not there. The fresh read's await is bounded as every other custodian
+    /// read is, by the `MetadataStore` implementation's own network bound (#508/#636).
+    ///
+    /// An `Err` ends the pass with nothing of its own commit claimed — whether that commit landed
+    /// is unknown — while every commit before it was claimed the moment it landed. So a fault
+    /// partway through the sweep leaves the audit trail and the count saying exactly which
+    /// deletes were durable when it struck.
+    async fn commit_sweep(&mut self, batch: &[Sweepable<'p>]) -> Result<()> {
+        let whole = batch
+            .iter()
+            .fold(WriteBatch::new(), |acc, mark| mark.delete(acc));
+        if self.ctx.meta.commit(whole).await? == CommitOutcome::Committed {
+            for mark in batch {
+                self.claim_sweep(mark);
+            }
+            return Ok(());
+        }
+        for mark in batch {
+            match self.ctx.meta.commit(mark.delete(WriteBatch::new())).await? {
+                CommitOutcome::Committed => self.claim_sweep(mark),
+                CommitOutcome::Conflict => {
+                    let reason = match self.ctx.meta.get(&mark.key).await? {
+                        // Deleted by another writer: nothing about it for this pass to claim.
+                        None => "mark-gone",
+                        // A mark is at the key and this pass did not delete it: the next pass
+                        // reads it, so this one certifies nothing.
+                        Some(now) => {
+                            self.lost_sweep = true;
+                            if now == encode_orphan_mark(mark.mark) {
+                                "mark-unchanged"
+                            } else {
+                                "mark-changed"
+                            }
+                        }
+                    };
+                    emit_mark_skip(mark.dserver, mark.frag, reason);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Claim one sweep whose commit has landed: its audit event, its count, and the pass's answer.
+    fn claim_sweep(&mut self, mark: &Sweepable<'_>) {
+        emit_mark_swept(mark.dserver, mark.frag);
+        self.marks_swept = true;
     }
 
     fn reclaimed(&mut self, chunk: ChunkId) {
@@ -1198,8 +1481,9 @@ enum ReadMark {
     /// what the reclaim intent's precondition re-encodes.
     Stamped(OrphanMark),
     /// A mark GC has already moved to `reclaiming`: the reclamation is decided, and what is left
-    /// is to finish it.
-    Reclaiming,
+    /// is to finish it. Its stamp and bytes are kept for the fragment-less sweep, which ages it
+    /// and deletes it on the exact value read once its fragment is gone.
+    Reclaiming(OrphanMark),
     /// The mark, holding a value that is none of the three shapes. Still a mark: it is evidence
     /// that something stranded this fragment, and the instant it would have given is unknown,
     /// so it can neither start nor end a grace window — its fragment is kept, on no other
@@ -1323,6 +1607,19 @@ impl OrphanWindow {
         self.marks.get(&(dserver, frag))
     }
 
+    /// Every mark this window read — the position it names and what the window read of its
+    /// value — ordered by position (D server, chunk, index), so whatever a pass does over them it
+    /// does in the same order on every run.
+    fn marks_in_position_order(&self) -> Vec<(DServerId, FragmentId, &ReadMark)> {
+        let mut marks: Vec<_> = self
+            .marks
+            .iter()
+            .map(|(&(dserver, frag), read)| (dserver, frag, read))
+            .collect();
+        marks.sort_unstable_by_key(|&(dserver, frag, _)| (dserver, frag.chunk, frag.index));
+        marks
+    }
+
     /// Whether this window read the key range the fragment's own mark would occupy — so that
     /// [`Self::mark_of`] answering `None` means the fragment has **no** mark, rather than that
     /// this pass did not look.
@@ -1371,7 +1668,7 @@ fn classify_ledger_entry(
         return;
     };
     let mark = match decode_orphan_mark(value) {
-        Ok(mark) if mark.is_reclaiming() => ReadMark::Reclaiming,
+        Ok(mark) if mark.is_reclaiming() => ReadMark::Reclaiming(mark),
         Ok(mark) => ReadMark::Stamped(mark),
         Err(fault) => {
             emit_unreadable_mark(&object_name(key), &fault.to_string());
@@ -1508,7 +1805,8 @@ impl<'a> Cleanup<'a> {
     ///
     /// Every key queued by then is the mark of a fragment the pass has already deleted, so
     /// dropping the batch with the fault would leave each of those marks `reclaiming` over bytes
-    /// that are gone, a position no `list_fragments()`-driven walk visits again. A failure here is
+    /// that are gone, a position no `list_fragments()`-driven walk visits again — only the
+    /// fragment-less sweep, a late-write deadline later. A failure here is
     /// named on the audit seam and dropped: `fault` is what the pass reports. Only deletes never
     /// attempted are still queued — a batch whose own commit failed was taken when it was tried,
     /// and is not retried, because its result may be unknown and a blind delete applied after a
@@ -1541,6 +1839,22 @@ fn emit_reclaim(dserver: DServerId, frag: FragmentId, reason: &str) {
         chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
         "gc reclaimed collectable fragment bytes after the grace window",
+    );
+}
+
+/// Emit a fragment-less mark the sweep deleted on the durability-plane seam (ADR-0011 /
+/// ADR-0012): a metric the `DurabilityTelemetry` bridge counts, plus an append-only audit event —
+/// [`emit_reclaim`]'s pair, for a mark rather than for fragment bytes. Emitted only once the
+/// commit that deleted the mark has landed ([`Sweep::commit_sweep`]).
+fn emit_mark_swept(dserver: DServerId, frag: FragmentId) {
+    tracing::info!(monotonic_counter.gc_orphan_marks_swept = 1_u64);
+    tracing::info!(
+        target: "wyrd.custodian.gc.audit",
+        action = "sweep-mark",
+        dserver,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
+        index = frag.index,
+        "gc deleted an orphan mark with no fragment beneath it: this pass's own listing, taken past the mark's late-write deadline, showed its position empty",
     );
 }
 
@@ -1652,8 +1966,9 @@ fn emit_unreadable_mark(mark: &str, fault: &str) {
 /// Emit a pass whose best-effort commit of its queued key deletes failed after a store fault had
 /// already ended it ([`Cleanup::finish_after_fault`]) on the durability-plane seam (ADR-0011 /
 /// ADR-0012): the marks of fragments it deleted may remain, `reclaiming`, over bytes that are
-/// gone. Safe — nothing preconditioned on their earlier bytes can commit — but left for the
-/// fragment-less sweep, so an operator should know.
+/// gone. Safe — nothing preconditioned on their earlier bytes can commit — and a later pass's
+/// fragment-less sweep deletes them ([`Sweep::sweep_fragment_less_marks`]), but an operator
+/// should know.
 fn emit_cleanup_lost(fault: &str, cleanup: &str) {
     tracing::warn!(monotonic_counter.gc_cleanup_lost_after_fault = 1_u64);
     tracing::warn!(
@@ -1707,5 +2022,24 @@ fn emit_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
         chunk = %wyrd_traits::chunk_hex(frag.chunk),
         index = frag.index,
         "gc declined a fragment (still protected, within its grace window, under a draining retirement, or its mark changed)",
+    );
+}
+
+/// Emit a fragment-less mark the sweep considered and did **not** delete on the same seam —
+/// [`emit_skip`]'s record, for a mark rather than a fragment: its D server is not in this pass's
+/// fleet (`server-not-in-fleet`), a protection class covers its position (the class's own reason,
+/// as for a fragment), it is inside its late-write deadline (`within-late-write-deadline`), or its
+/// delete lost and a fresh read found it rewritten (`mark-changed`), as it was
+/// (`mark-unchanged`), or deleted by another writer (`mark-gone`).
+fn emit_mark_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
+    tracing::info!(monotonic_counter.gc_orphan_marks_skipped = 1_u64, reason);
+    tracing::info!(
+        target: "wyrd.custodian.gc.audit",
+        action = "skip-mark",
+        reason,
+        dserver,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
+        index = frag.index,
+        "gc did not delete an orphan mark with no fragment beneath it (its server was not listed, its position is protected, it is inside its late-write deadline, or its delete lost)",
     );
 }
