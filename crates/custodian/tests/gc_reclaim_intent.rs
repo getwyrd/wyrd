@@ -74,6 +74,11 @@ use wyrd_traits::{
 /// **W**, the production batch (`gc::CLEANUP_BATCH`): the most marks one commit of a pass moves
 /// to `reclaiming`, and the most key deletes one cleanup commit carries.
 const W: usize = 1_000;
+/// **CW**, the production conditional batch (`gc::CONDITIONAL_BATCH`, half of
+/// `multipart::MAX_BATCH_OPS`): the most intents one recording commit carries — each a
+/// precondition plus a put, two sequential operations on the networked backends, so the bound is
+/// the transaction's operation budget, not its byte budget (PR #821 review). Pinned by literal.
+const CW: usize = 250;
 
 /// The double's cap on one `scan` answer and one `scan_page` page, as `gc_ledger_walk.rs` lowers
 /// it. Every ledger here fits one page.
@@ -1069,11 +1074,11 @@ async fn b5_a_store_fault_after_deletes_still_commits_their_key_deletes() {
 
 /// [`W`] + 1 marks past grace, spread over four D servers, all reclaimed in one pass. The commits
 /// that carry a precondition or a put on an `orphan:` key — the reclaim intents — number exactly
-/// two, neither moving more than [`W`] marks, together every mark once. Negation: record each
-/// intent alone (v1's surviving mutant: 1,001 commits), all in one commit, or per D server; or
-/// record none (`main`).
+/// ⌈([`W`] + 1) / [`CW`]⌉, none moving more than [`CW`] marks, together every mark once. Negation:
+/// record each intent alone (v1's surviving mutant: 1,001 commits), all in one commit, or per D
+/// server; or record none (`main`).
 #[tokio::test]
-async fn c_intents_are_recorded_in_batches_of_at_most_w() {
+async fn c_intents_are_recorded_in_batches_of_at_most_cw() {
     install_global_default();
     let log = Log::default();
     let meta = Meta::new(&log);
@@ -1099,15 +1104,16 @@ async fn c_intents_are_recorded_in_batches_of_at_most_w() {
         .collect();
     assert_eq!(
         recording.len(),
-        2,
-        "leg C: {population} reclaim intents must be recorded in exactly ⌈{population} / {W}⌉ = 2 \
-         commits; {} commits carried a precondition or a put on an `orphan:` key",
+        population.div_ceil(CW),
+        "leg C: {population} reclaim intents must be recorded in exactly ⌈{population} / {CW}⌉ = \
+         {} commits; {} commits carried a precondition or a put on an `orphan:` key",
+        population.div_ceil(CW),
         recording.len()
     );
     for commit in &recording {
         assert!(
-            commit.marks_moved() <= W,
-            "leg C: one commit recorded {} intents, over the batch of {W}",
+            commit.marks_moved() <= CW,
+            "leg C: one commit recorded {} intents, over the conditional batch of {CW}",
             commit.marks_moved()
         );
     }
