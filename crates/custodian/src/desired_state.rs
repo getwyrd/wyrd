@@ -137,6 +137,12 @@ pub enum ReconciliationStatus {
     /// server holds no byte that can still become referenced: no committed chunk map
     /// places a fragment there, and no multipart upload has staged one there; its
     /// leftover bytes are GC-eligible orphans.
+    ///
+    /// This certifies the records the query **read**. That no upload stages a *new* byte
+    /// onto the server after this answer is the intent writer's fence, not this query's:
+    /// every batch installing a `sidx:` entry carries `require_absent(desired:dserver:<S>)`
+    /// per selected server (`0016:837-857`), so an intent and a drain request are a
+    /// single-winner race on the desired-state key — see [`reconciliation_status`].
     Satisfied,
 }
 
@@ -206,6 +212,23 @@ pub async fn draining_servers(
 /// (`0016:890`), the same bounded reading GC already does every pass — which is what being
 /// right about a live upload's bytes costs.
 ///
+/// **What `Satisfied` does and does not close.** It certifies the store's records as this
+/// query read them, after the drain record was observed. A staged intent that reaches the
+/// store *after* that reading is a different window (`0016:837-857`): a writer selects
+/// `dserver`, the operator records the drain, this query reads no staging record naming
+/// `dserver` and answers `Satisfied`, and only then does the intent land. Ordering the two
+/// reads here cannot close it, because the intent does not exist yet when either read runs.
+/// Proposal 0016 closes it on the **writer's** side with a keyed precondition: every batch
+/// that installs a `sidx:` entry carries `require_absent(desired:dserver:<S>)` for each
+/// server in the placement it installs ([`desired_key`]), so an intent either commits
+/// before the drain record — and is then in the staged class this query reads — or fails
+/// its precondition and re-plans against `Topology::excluding(draining)`. There is no
+/// third outcome, so no fragment lands on a server after it was reported `Satisfied`. No
+/// production writer of `sidx:` entries exists yet (`crates/core/src/multipart.rs`, "Nothing
+/// here is written yet"); the fence lands with the first one — `deferred: #657` — and the
+/// seeded interleaving that exercises it, `deferred: #665`. Until then a `Satisfied` answer
+/// is exact for every byte the store holds, and silent about none.
+///
 /// Every non-satisfied answer says **why**, because "not yet" and "not ever, until you repair
 /// X" are different operator instructions: still-held ([`ReconciliationStatus::Pending`]),
 /// blocked by a placement that cannot be trusted ([`ReconciliationStatus::PendingMalformed`],
@@ -219,6 +242,10 @@ pub async fn reconciliation_status(
     meta: &dyn MetadataStore,
     dserver: DServerId,
 ) -> Result<ReconciliationStatus> {
+    // The drain record this query reads is the key the `sidx:` intent writer must
+    // `require_absent` per selected server (`0016:837-857`), so an intent that lands after the
+    // readings below cannot name `dserver`. That precondition is the writer's, with the writer
+    // — deferred: #657 (fence), #665 (seeded interleaving).
     if meta.get(&desired_key(dserver)).await?.is_none() {
         return Ok(ReconciliationStatus::NotRequested);
     }
