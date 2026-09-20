@@ -37,15 +37,27 @@
 //!   listing from an earlier pass never licenses a sweep (X96). (v) A fleet naming one server twice
 //!   never makes a listed position look unlisted. (vi) An incomplete reference set sweeps nothing
 //!   (the pass answers `Blocked`), and a referenced position is never swept. (vii) Each of the
-//!   three value shapes is swept on its own stamp; a value that is none of them is never swept,
-//!   stays byte-identical and is named.
+//!   marks written after their fragment — legacy, and `reclaiming` with and without its event —
+//!   is swept on its own stamp; a value that is none of the three shapes is never swept, stays
+//!   byte-identical and is named. (viii) A structured mark that is not `reclaiming` — one that
+//!   may have been written ahead of its fragment — is never swept, however old, and is named
+//!   `event-may-await-write`: a write whose effect the store could not verify may still land under
+//!   it (PR #821 review).
 //! * **D** — a sweep never deletes a mark newer than the one it judged, and its accounting matches
 //!   what landed. (i) A mark re-stamped between the pass's read and its delete survives, and is
 //!   neither audited nor counted. (ii) A commit that fails partway through the sweep leaves claimed
 //!   exactly the deletes that landed — across a batch boundary and inside the per-mark retry. (iii)
 //!   After a lost precondition the pass concludes only what a fresh read of the mark shows: a mark
 //!   rewritten and then deleted under it is claimed neither swept nor protecting, and one that
-//!   still reads as it did is left for the next pass.
+//!   still reads as it did is left for the next pass. (iv) A commit whose result is unknown but
+//!   out of flight is judged as one atomic commit from a fresh read of every key: a key gone is
+//!   recorded as gone but claimed by nobody, and the pass answers `Partial`; keys still there are
+//!   left. (v) One that may still commit is named unsettled, claims nothing, and ends the pass on
+//!   the fault (PR #821 review). (vi) Another writer landing after the unknown result and before
+//!   the re-read never earns this pass a claim: a sibling still holding what the pass read proves
+//!   the batch did not land, so a key it finds gone was another writer's delete; and a sibling
+//!   rewritten proves nothing, so a key gone stays unattributed (PR #823 review). No commit
+//!   carries more than `CW` deletes.
 //! * **E** — a differently spelled key never costs a mark: it lends the mark neither its stamp nor
 //!   its listing, and is itself never deleted or rewritten, only named.
 //!
@@ -73,8 +85,8 @@ use wyrd_custodian::{
 };
 use wyrd_traits::{
     chunk_hex, page_cursor, page_limit, page_start, BoxError, ChunkId, ChunkStore, CommitOutcome,
-    DServerId, FragmentId, Health, MetadataStore, PageStart, Result, ScanCapExceeded, ScanPage,
-    WriteBatch,
+    CommitUnknownResult, DServerId, FragmentId, Health, MetadataStore, PageStart, Result,
+    ScanCapExceeded, ScanPage, WriteBatch,
 };
 
 /// **D** — the late-write deadline, `W_repoint + W_write + δ_clock`
@@ -89,9 +101,14 @@ const D: u64 = 41_000;
 /// does not.
 const GRACE: u64 = 60_000;
 
-/// **W**, the production batch (`gc::CLEANUP_BATCH`): the most marks one commit of the sweep
-/// deletes.
+/// **W**, the production blind batch (`gc::CLEANUP_BATCH`): the byte bound every GC commit keeps.
 const W: usize = 1_000;
+/// **CW**, the production conditional batch (`gc::CONDITIONAL_BATCH`, half of
+/// `multipart::MAX_BATCH_OPS`): the most marks one commit of the sweep deletes — each delete a
+/// precondition plus a mutation, two sequential operations on the networked backends, so the
+/// bound is the transaction's operation budget, not its byte budget (PR #821 review). Pinned by
+/// literal, as `W` is.
+const CW: usize = 250;
 
 /// The double's cap on one `scan` answer and on one `scan_page` page, lowered as
 /// `gc_ledger_walk.rs` lowers it: a pass reads even these small ledgers in several pages.
@@ -148,6 +165,17 @@ enum Racer {
     Hold(usize),
 }
 
+/// A commit that deletes `key` answers `CommitUnknownResult` — after applying the batch or not,
+/// and out of flight or possibly still to be applied. Taken once.
+struct UnknownCommit {
+    key: Vec<u8>,
+    applied: bool,
+    may_still_commit: bool,
+    /// What another writer lands **after** the unknown result is returned and **before** the pass
+    /// reads anything back: per key, a rewrite (`Some`) or a delete (`None`).
+    then: Vec<(Vec<u8>, Option<Bytes>)>,
+}
+
 /// Interleavings and faults the metadata double injects on request.
 #[derive(Default)]
 struct Faults {
@@ -155,6 +183,8 @@ struct Faults {
     racers: BTreeMap<Vec<u8>, Racer>,
     /// Fail — `Err`, nothing applied — every commit that would otherwise land and deletes this key.
     fail_deleting: Option<Vec<u8>>,
+    /// Answer an unknown result for the first commit that would otherwise land and deletes its key.
+    unknown_deleting: Option<UnknownCommit>,
 }
 
 /// An in-memory metadata store over an ORDERED map, with a lowered cap (see the module docs).
@@ -303,6 +333,38 @@ impl MetadataStore for Meta {
             return Err(BoxError::from(
                 "simulated metadata fault committing a batch of deletes",
             ));
+        }
+        // An unknown result: the batch is applied, or not, and the store says it cannot tell.
+        let unknown = {
+            let mut faults = self.faults();
+            match &faults.unknown_deleting {
+                Some(u) if batch.deletes.contains(&u.key) => faults.unknown_deleting.take(),
+                _ => None,
+            }
+        };
+        if let Some(u) = unknown {
+            if u.applied {
+                let mut kv = self.kv.lock().unwrap();
+                for (key, value) in &batch.puts {
+                    kv.insert(key.clone(), value.clone());
+                }
+                for key in &batch.deletes {
+                    kv.remove(key);
+                }
+            }
+            for (key, value) in u.then {
+                match value {
+                    Some(value) => self.seed(key, value),
+                    None => self.remove(&key),
+                }
+            }
+            self.log(Event::Commit(commit));
+            return Err(Box::new(CommitUnknownResult {
+                backend: "simulated",
+                code: None,
+                detail: "simulated unknown commit result".to_owned(),
+                may_still_commit: u.may_still_commit,
+            }));
         }
         {
             let mut kv = self.kv.lock().unwrap();
@@ -1010,11 +1072,12 @@ async fn b6_a_referenced_position_is_never_swept() {
     assert_control_swept("leg B(vi), referenced", &meta, &pass, 1, control);
 }
 
-/// **B(vii).** Each of the three shapes a mark's value takes is swept on its own stamp: aged
-/// exactly `D` — a legacy decimal, a structured mark, a `reclaiming` mark with and without its
-/// event — it is swept; stamped a millisecond later it is kept, byte-identical. A value that is
-/// none of the three shapes, however old any stamp read out of it would be, is never swept, is left
-/// byte-identical, and is named on the audit seam carrying its key (ADR-0045 decision 3).
+/// **B(vii).** Each shape a mark written after its fragment takes is swept on its own stamp: aged
+/// exactly `D` — a legacy decimal, a `reclaiming` mark with and without its event — it is swept;
+/// stamped a millisecond later it is kept, byte-identical. A value that is none of the three
+/// shapes, however old any stamp read out of it would be, is never swept, is left byte-identical,
+/// and is named on the audit seam carrying its key (ADR-0045 decision 3). The structured,
+/// non-`reclaiming` shape is leg B(viii)'s.
 #[tokio::test]
 async fn b7_each_shape_is_swept_on_its_stamp_and_a_fourth_is_never_swept() {
     install_global_default();
@@ -1025,7 +1088,6 @@ async fn b7_each_shape_is_swept_on_its_stamp_and_a_fourth_is_never_swept() {
     let shapes = |at: u64| {
         [
             legacy(at),
-            structured(at, "move-8007"),
             reclaiming(at, Some("move-8007")),
             reclaiming(at, None),
         ]
@@ -1061,8 +1123,8 @@ async fn b7_each_shape_is_swept_on_its_stamp_and_a_fourth_is_never_swept() {
     for (f, value) in &old {
         assert!(
             meta.value(&orphan_key(1, *f)).is_none() && pass.swept(1, *f),
-            "leg B(vii): {:?}, aged exactly D, is one of 0016's three shapes and must be swept \
-             on its stamp. got: {}",
+            "leg B(vii): {:?}, aged exactly D, is a shape written after its fragment and must be \
+             swept on its stamp. got: {}",
             String::from_utf8_lossy(value),
             pass.log
         );
@@ -1109,6 +1171,68 @@ async fn b7_each_shape_is_swept_on_its_stamp_and_a_fourth_is_never_swept() {
         pass.counted(),
         old.len(),
         "leg B(vii): exactly the swept marks are counted"
+    );
+}
+
+/// **B(viii).** A structured mark that is not `reclaiming` may have been written ahead of its
+/// fragment — a repoint's pre-mark, a teardown's planned placement — and `D` bounds when a write is
+/// accepted, not when it takes effect: a publication straddling the deadline is `WriteEffect::
+/// Unknown` with the bytes possibly landed. So such a mark is never swept on `D`, however old:
+/// with a move nonce or a retirement token for its event, aged `D` and aged far past it, it is
+/// kept byte-identical and named `event-may-await-write`, while the legacy control beside it is
+/// swept. Negation: drop the event-class arm — the first assertion fails.
+#[tokio::test]
+async fn b8_a_structured_mark_that_may_await_its_write_is_never_swept_on_the_deadline() {
+    install_global_default();
+    let meta = Meta::default();
+    let disks = disks(3);
+    let fleet = fleet_of(&disks);
+    let now = T0 + 10 * D;
+    let awaiting: Vec<(FragmentId, Bytes)> = [
+        structured(now - D, "move-8007"),
+        structured(T0, "move-8007"),
+        structured(now - D, "g:1:1"),
+        structured(T0, "s:0123456789abcdef0123456789abcdef:7"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, value)| (frag(0xF0 + i as ChunkId, 0), value))
+    .collect();
+    for (f, value) in &awaiting {
+        meta.seed(orphan_key(1, *f), value.clone());
+    }
+    let control = seed_control(&meta, 1, 0xF8, now);
+    let gc = Gc::elect().await;
+
+    let pass = gc.pass(&meta, &fleet, now).await;
+    pass.answer("leg B(viii)");
+    for (f, value) in &awaiting {
+        assert_eq!(
+            meta.value(&orphan_key(1, *f)).as_ref(),
+            Some(value),
+            "leg B(viii): {:?} is a structured mark that is not reclaiming; its writer may still \
+             have a write in flight whose effect no deadline bounds, so it must never be swept on \
+             the deadline — it was swept or rewritten",
+            String::from_utf8_lossy(value)
+        );
+        assert!(
+            !pass.swept(1, *f),
+            "leg B(viii): audited as swept: {}",
+            pass.log
+        );
+        assert_eq!(
+            pass.mark_skips(1, *f),
+            ["event-may-await-write"],
+            "leg B(viii): {:?} must be kept for that reason and named. got: {}",
+            String::from_utf8_lossy(value),
+            pass.log
+        );
+    }
+    assert_control_swept("leg B(viii)", &meta, &pass, 1, control);
+    assert_eq!(
+        pass.counted(),
+        1,
+        "leg B(viii): only the control is counted"
     );
 }
 
@@ -1282,8 +1406,9 @@ async fn d2_a_fault_across_a_batch_boundary_claims_exactly_what_landed() {
     for event in &events {
         if let Event::Commit(commit) = event {
             assert!(
-                commit.deletes.len() <= W,
-                "leg D(ii): a commit carried {} deletes, over the batch of {W}",
+                commit.deletes.len() <= CW,
+                "leg D(ii): a commit carried {} deletes, over the conditional batch of {CW} \
+                 (two operations a mark: the transaction's operation budget, not its byte budget)",
                 commit.deletes.len()
             );
         }
@@ -1463,6 +1588,302 @@ async fn d3_a_delete_that_loses_to_an_unchanged_mark_leaves_it_for_the_next_pass
         "leg D(iii): with the key released, the next pass sweeps the mark. got: {}",
         next.log
     );
+}
+
+/// **D(iv).** The sweep's commit answers an unknown result the backend says is out of flight. The
+/// pass judges it from a fresh read of every key instead of giving up, and claims nothing it
+/// cannot prove: (a) when the batch did land, every key is gone, and each is recorded once as
+/// `sweep-unattributed` — gone after a commit whose result the store could not report, by this
+/// pass's hand or another's — never as `sweep-mark`, never counted, with no per-mark retry commit,
+/// and the pass answers `Partial`; (b) when it did not land, every mark is still there and
+/// untouched, nothing is claimed, and the next pass sweeps them. Negation: claim a gone key as
+/// swept — (a) audits and counts deletes the pass cannot know it made; drop the settle — (a) ends
+/// the pass with the fault and leaves the deletions unrecorded.
+#[tokio::test]
+async fn d4_an_out_of_flight_unknown_commit_is_judged_by_a_fresh_read() {
+    install_global_default();
+    for applied in [true, false] {
+        let meta = Meta::default();
+        let disks = disks(3);
+        let fleet = fleet_of(&disks);
+        let now = T0 + D;
+        let marks: Vec<FragmentId> = (0..3).map(|i| frag(0x20_0000 + i, 0)).collect();
+        for &f in &marks {
+            meta.seed(orphan_key(1, f), legacy(T0));
+        }
+        meta.faults().unknown_deleting = Some(UnknownCommit {
+            key: orphan_key(1, marks[0]),
+            applied,
+            may_still_commit: false,
+            then: Vec::new(),
+        });
+        let gc = Gc::elect().await;
+
+        let pass = gc.pass(&meta, &fleet, now).await;
+        let label = if applied { "D(iv)(a)" } else { "D(iv)(b)" };
+        assert!(
+            pass.outcome.is_ok(),
+            "leg {label}: an out-of-flight unknown result is judged by a re-read, not a fault: {:?}",
+            pass.outcome.as_ref().err().map(|e| e.to_string())
+        );
+        let commits = meta
+            .take_events()
+            .into_iter()
+            .filter(|e| matches!(e, Event::Commit(c) if !c.deletes.is_empty()))
+            .count();
+        assert_eq!(
+            commits, 1,
+            "leg {label}: the unknown batch is judged by a read, never retried per mark"
+        );
+        assert_eq!(
+            pass.counted(),
+            0,
+            "leg {label}: nothing the pass cannot prove it deleted is counted"
+        );
+        if applied {
+            for &f in &marks {
+                assert!(
+                    meta.value(&orphan_key(1, f)).is_none(),
+                    "leg {label}: fixture"
+                );
+                assert!(
+                    !pass.swept(1, f),
+                    "leg {label}: a delete under an unknown result is never claimed as this \
+                     pass's sweep. got: {}",
+                    pass.log
+                );
+                assert_eq!(
+                    pass.audit_of("sweep-unattributed", 1, f).len(),
+                    1,
+                    "leg {label}: a key found gone after an unknown result is recorded exactly \
+                     once as unattributed. got: {}",
+                    pass.log
+                );
+                assert!(
+                    pass.mark_skips(1, f).is_empty(),
+                    "leg {label}: nothing in the batch disproved the landing, so no key is \
+                     attributed to another writer. got: {}",
+                    pass.log
+                );
+            }
+            assert_eq!(
+                pass.answer(label),
+                Reconciled::Partial,
+                "leg {label}: marks gone by nobody's proven hand are not a certification"
+            );
+            let next = gc.pass(&meta, &fleet, now).await;
+            assert_eq!(
+                next.answer(label),
+                Reconciled::Satisfied,
+                "leg {label}: the next pass finds the ledger empty and certifies it"
+            );
+        } else {
+            for &f in &marks {
+                assert_eq!(
+                    meta.value(&orphan_key(1, f)),
+                    Some(legacy(T0)),
+                    "leg {label}: a delete that did not land leaves the mark untouched"
+                );
+                assert!(
+                    !pass.swept(1, f),
+                    "leg {label}: claimed a delete that did not land"
+                );
+                assert_eq!(
+                    pass.mark_skips(1, f),
+                    ["mark-unchanged"],
+                    "leg {label}: {}",
+                    pass.log
+                );
+            }
+            assert_ne!(
+                pass.answer(label),
+                Reconciled::Satisfied,
+                "leg {label}: marks it meant to sweep are still there"
+            );
+            let next = gc.pass(&meta, &fleet, now).await;
+            next.answer(label);
+            for &f in &marks {
+                assert!(
+                    meta.value(&orphan_key(1, f)).is_none() && next.swept(1, f),
+                    "leg {label}: the next pass must sweep {f:?}"
+                );
+            }
+        }
+    }
+}
+
+/// **D(v).** The sweep's commit answers an unknown result that **may still commit**: no read can
+/// settle it. The pass names each mark `sweep-unsettled`, claims nothing, and ends on the fault;
+/// whether the batch landed is left for the next pass to read. Negation: settle it anyway — a
+/// batch that lands after the re-read is claimed as not swept and its marks vanish unaudited.
+#[tokio::test]
+async fn d5_an_unknown_commit_that_may_still_land_is_named_and_ends_the_pass() {
+    install_global_default();
+    let meta = Meta::default();
+    let disks = disks(3);
+    let fleet = fleet_of(&disks);
+    let now = T0 + D;
+    let marks: Vec<FragmentId> = (0..2).map(|i| frag(0x30_0000 + i, 0)).collect();
+    for &f in &marks {
+        meta.seed(orphan_key(1, f), legacy(T0));
+    }
+    meta.faults().unknown_deleting = Some(UnknownCommit {
+        key: orphan_key(1, marks[0]),
+        applied: false,
+        may_still_commit: true,
+        then: Vec::new(),
+    });
+    let gc = Gc::elect().await;
+
+    let pass = gc.pass(&meta, &fleet, now).await;
+    assert!(
+        matches!(pass.outcome, Err(ReconcileError::Store(_))),
+        "leg D(v): an unknown result that may still commit ends the pass with its fault: {:?}",
+        pass.outcome.as_ref().map(|_| ())
+    );
+    for &f in &marks {
+        assert!(
+            !pass.swept(1, f),
+            "leg D(v): claimed a sweep it cannot know landed"
+        );
+        assert_eq!(
+            pass.audit_of("sweep-unsettled", 1, f).len(),
+            1,
+            "leg D(v): each mark of the unsettled batch must be named once. got: {}",
+            pass.log
+        );
+    }
+    assert_eq!(pass.counted(), 0, "leg D(v): nothing is counted");
+}
+
+/// **D(vi).** Another writer lands between the unknown result and the pass's re-read (a second
+/// custodian across a leadership handoff, PR #823 review). The batch is judged as the one atomic
+/// commit it was. (a) It did **not** land, and the other writer deleted one of its marks: the
+/// siblings still hold what the pass read, which proves the batch landed nowhere, so the gone mark
+/// is another writer's delete — `mark-gone`, neither `sweep-mark` nor `sweep-unattributed` — and
+/// the next pass sweeps the siblings. (b) It **did** land, and the other writer re-created one of
+/// its marks: a rewritten sibling proves nothing about the landing, so each gone mark stays
+/// `sweep-unattributed`, the re-created mark is `mark-changed` and survives, and nothing is counted.
+/// Negation: judge each key alone — (a) claims the other writer's delete as this pass's sweep.
+#[tokio::test]
+async fn d6_a_writer_landing_before_the_re_read_never_earns_the_pass_a_claim() {
+    install_global_default();
+    let disks = disks(3);
+    let fleet = fleet_of(&disks);
+    let now = T0 + D;
+    let marks: Vec<FragmentId> = (0..3).map(|i| frag(0x40_0000 + i, 0)).collect();
+
+    // (a) Not landed; the other writer deletes marks[1] before the re-read.
+    {
+        let meta = Meta::default();
+        for &f in &marks {
+            meta.seed(orphan_key(1, f), legacy(T0));
+        }
+        meta.faults().unknown_deleting = Some(UnknownCommit {
+            key: orphan_key(1, marks[0]),
+            applied: false,
+            may_still_commit: false,
+            then: vec![(orphan_key(1, marks[1]), None)],
+        });
+        let gc = Gc::elect().await;
+        let pass = gc.pass(&meta, &fleet, now).await;
+        let label = "D(vi)(a)";
+        assert_eq!(
+            pass.mark_skips(1, marks[1]),
+            ["mark-gone"],
+            "leg {label}: a sibling still holding what the pass read proves the batch did not \
+             land, so the gone mark is another writer's delete. got: {}",
+            pass.log
+        );
+        assert!(
+            !pass.swept(1, marks[1]),
+            "leg {label}: another writer's delete claimed as this pass's sweep: {}",
+            pass.log
+        );
+        assert_eq!(
+            pass.audits("sweep-unattributed"),
+            0,
+            "leg {label}: with the landing disproved nothing is left unattributed. got: {}",
+            pass.log
+        );
+        for f in [marks[0], marks[2]] {
+            assert_eq!(
+                pass.mark_skips(1, f),
+                ["mark-unchanged"],
+                "leg {label}: {}",
+                pass.log
+            );
+        }
+        assert_eq!(
+            pass.counted(),
+            0,
+            "leg {label}: nothing landed, nothing counted"
+        );
+        assert_eq!(pass.answer(label), Reconciled::Partial);
+        let next = gc.pass(&meta, &fleet, now).await;
+        next.answer(label);
+        for f in [marks[0], marks[2]] {
+            assert!(
+                meta.value(&orphan_key(1, f)).is_none() && next.swept(1, f),
+                "leg {label}: the next pass must sweep {f:?}"
+            );
+        }
+    }
+
+    // (b) Landed; the other writer re-creates marks[1] before the re-read.
+    {
+        let meta = Meta::default();
+        for &f in &marks {
+            meta.seed(orphan_key(1, f), legacy(T0));
+        }
+        let refreshed = legacy(T0 + 1);
+        meta.faults().unknown_deleting = Some(UnknownCommit {
+            key: orphan_key(1, marks[0]),
+            applied: true,
+            may_still_commit: false,
+            then: vec![(orphan_key(1, marks[1]), Some(refreshed.clone()))],
+        });
+        let gc = Gc::elect().await;
+        let pass = gc.pass(&meta, &fleet, now).await;
+        let label = "D(vi)(b)";
+        assert_eq!(
+            pass.mark_skips(1, marks[1]),
+            ["mark-changed"],
+            "leg {label}: {}",
+            pass.log
+        );
+        for f in [marks[0], marks[2]] {
+            assert!(
+                !pass.swept(1, f),
+                "leg {label}: a rewritten sibling proves nothing, so a gone key is never claimed: {}",
+                pass.log
+            );
+            assert_eq!(
+                pass.audit_of("sweep-unattributed", 1, f).len(),
+                1,
+                "leg {label}: each gone key is recorded once as unattributed. got: {}",
+                pass.log
+            );
+        }
+        assert_eq!(
+            pass.counted(),
+            0,
+            "leg {label}: nothing proven, nothing counted"
+        );
+        assert_eq!(pass.answer(label), Reconciled::Partial);
+        let next = gc.pass(&meta, &fleet, now).await;
+        next.answer(label);
+        assert_eq!(
+            meta.value(&orphan_key(1, marks[1])),
+            Some(refreshed),
+            "leg {label}: the re-created mark is inside its late-write deadline and survives"
+        );
+        assert!(
+            !next.swept(1, marks[1]),
+            "leg {label}: the re-created mark was swept: {}",
+            next.log
+        );
+    }
 }
 
 // ---- leg E: a differently spelled key never costs a mark ----

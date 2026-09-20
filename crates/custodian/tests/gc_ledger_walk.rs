@@ -49,8 +49,9 @@
 //! * **The walk's guards** — a store whose `scan_page` repeats its cursor, or answers more than
 //!   it was asked for, is refused with an error by both passes rather than walked.
 //!
-//! **The two constants are pinned by literal.** [`B`] and [`W`] are the production window and
-//! cleanup batch (`gc::ORPHAN_WINDOW`, `gc::CLEANUP_BATCH`), written here as numbers rather than
+//! **The three constants are pinned by literal.** [`B`], [`W`] and [`CW`] are the production window,
+//! blind cleanup batch and conditional batch (`gc::ORPHAN_WINDOW`, `gc::CLEANUP_BATCH`,
+//! `gc::CONDITIONAL_BATCH`), written here as numbers rather than
 //! named — this file compiles against `main`, where neither exists — so a change to either
 //! production value fails this file instead of silently moving the bound it pins.
 //!
@@ -88,6 +89,11 @@ const B: usize = 65_536;
 /// **W**, the production cleanup batch (`gc::CLEANUP_BATCH`): the most writes one commit of a
 /// pass's own ledger cleanup carries.
 const W: usize = 1_000;
+/// **CW**, the production conditional batch (`gc::CONDITIONAL_BATCH`, half of
+/// `multipart::MAX_BATCH_OPS`): the most marks one **conditional** commit — a reclaim intent's
+/// swap, the sweep's delete, each a precondition plus a mutation — carries. The bound is the
+/// transaction's operation budget, not its byte budget (PR #821 review). Pinned by literal too.
+const CW: usize = 250;
 
 /// The double's lowered cap — on one `scan`'s answer and on one `scan_page` page, the single knob
 /// the production backends apply to both. Far below every ledger seeded here, so a `scan` of the
@@ -132,6 +138,9 @@ struct Page {
 struct Commit {
     puts: Vec<Vec<u8>>,
     deletes: Vec<Vec<u8>>,
+    /// Whether the batch carried preconditions — a reclaim intent's swap or the sweep's delete,
+    /// two operations a key — rather than the blind cleanup's one.
+    conditional: bool,
 }
 
 /// The key range one pass's ledger pages ran across.
@@ -352,9 +361,11 @@ impl MetadataStore for LedgerMeta {
                 kv.remove(key);
             }
         }
+        let conditional = !batch.preconditions.is_empty();
         self.tap.lock().unwrap().commits.push(Commit {
             puts: batch.puts.into_iter().map(|(key, _)| key).collect(),
             deletes: batch.deletes,
+            conditional,
         });
         Ok(CommitOutcome::Committed)
     }
@@ -559,24 +570,34 @@ fn assert_bounded(leg: &str, pass: usize, tap: &Tap) {
     );
     for (i, commit) in tap.commits.iter().enumerate() {
         let writes = commit.puts.len() + commit.deletes.len();
+        let (bound, kind) = if commit.conditional {
+            (CW, "conditional")
+        } else {
+            (W, "cleanup")
+        };
         assert!(
-            writes <= W,
-            "{leg}, pass {pass}: commit {i} carried {writes} writes, over the cleanup batch of {W}"
+            writes <= bound,
+            "{leg}, pass {pass}: commit {i} carried {writes} writes, over the {kind} batch of {bound}"
         );
     }
-    let deletes: usize = tap.commits.iter().map(|commit| commit.deletes.len()).sum();
-    let carrying = tap
-        .commits
-        .iter()
-        .filter(|commit| !commit.deletes.is_empty())
-        .count();
-    assert_eq!(
-        carrying,
-        deletes.div_ceil(W),
-        "{leg}, pass {pass}: {deletes} key deletes rode {carrying} commits; batches of {W} make \
-         that exactly {}",
-        deletes.div_ceil(W)
-    );
+    // The blind cleanup's key deletes ride commits of exactly `W`; the sweep's conditional deletes
+    // ride commits of exactly `CW`. Each is counted against its own bound.
+    for (conditional, bound, kind) in [(false, W, "cleanup"), (true, CW, "conditional")] {
+        let commits: Vec<&Commit> = tap
+            .commits
+            .iter()
+            .filter(|commit| commit.conditional == conditional && !commit.deletes.is_empty())
+            .collect();
+        let deletes: usize = commits.iter().map(|commit| commit.deletes.len()).sum();
+        assert_eq!(
+            commits.len(),
+            deletes.div_ceil(bound),
+            "{leg}, pass {pass}: {deletes} {kind} key deletes rode {} commits; batches of {bound} \
+             make that exactly {}",
+            commits.len(),
+            deletes.div_ceil(bound)
+        );
+    }
 }
 
 /// Where `key` sat relative to one pass's window: read by it, ahead of it, behind it — or the pass

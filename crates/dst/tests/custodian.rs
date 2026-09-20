@@ -52,7 +52,7 @@
 #![forbid(unsafe_code)]
 #![cfg(madsim)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -86,8 +86,8 @@ use wyrd_custodian::{
 use wyrd_dst::dst_campaign_test;
 use wyrd_testkit::{SeededStorageFaults, StorageFault};
 use wyrd_traits::{
-    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
-    PlacementChunkStore, Result, WriteBatch,
+    chunk_hex, BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health,
+    MetadataStore, PlacementChunkStore, Result, WriteBatch,
 };
 
 // The DST tier's **second** `MetadataStore` implementation — the deterministic
@@ -97,7 +97,7 @@ use wyrd_traits::{
 // namespace, which an in-memory store that never yields cannot produce.
 #[path = "support/mod.rs"]
 mod support;
-use support::SimTikvMetadataStore;
+use support::{sim_commit_unknown_result, SimTikvMetadataStore, SIM_COMMIT_UNKNOWN_RESULT};
 
 // ---- in-memory trait stores (backend-agnostic; the loops are proven over the seams) ----
 
@@ -3761,6 +3761,547 @@ async fn prop_gc_fragment_less_sweep_reaches_between_the_read_and_the_delete() {
     );
 }
 
+// ---- property 16: the sweep's judgement of an ambiguous commit, under a concurrent writer ----
+// ---- (#800, PR #823 review) ----
+//
+// A sweep commit the store answers with an out-of-flight `CommitUnknownResult` landed whole or not
+// at all, and the pass judges it from a fresh read of every key in it — sequential reads, each a
+// network round-trip, between any two of which another writer (a second custodian across a
+// leadership handoff) may delete or re-create a mark of that batch. The judgement must rest on the
+// commit's atomicity and never on one read alone: a mark still holding what the pass read proves
+// the batch landed nowhere, so a sibling found gone was the other writer's delete and is claimed
+// by nobody (`mark-gone`); with no such survivor a gone key is recorded as gone and attributed to
+// nobody (`sweep-unattributed`); and in no case is a `sweep-mark` claimed from an ambiguous commit.
+// The per-pass legs D(iv) and D(vi) in `crates/custodian/tests/gc_mark_sweep.rs` land the other
+// writer at a scripted instant; here the ledger is paged over the simulated-TiKV model, the
+// ambiguity strikes the sweep's commit through a tap that applies the batch whole or not at all,
+// and a genuinely concurrent task lands its delete or re-stamp at an instant the seed picks —
+// before the pass's first read-back, between two of them, or after the last.
+//
+// The property: the struck pass claims no sweep and answers `Partial`; every key it read back is
+// judged by the batch, not alone; and the sweep still converges — by the end of the run every
+// target is gone except a re-stamped one, which holds exactly its re-stamp. The coverage leg proves
+// that under each fate the other writer's landing is reached both before the pass's first
+// read-back of the raced key and after its last read-back.
+
+/// Where this property's targets' chunk ids start: target `i` is chunk `AMBIG_BASE + i`, fragment
+/// 0, on D server `i % 4` — a fragment-less mark stamped at zero, past its late-write deadline at
+/// [`SWEEP_NOW`].
+const AMBIG_BASE: ChunkId = 0x8090;
+/// How far after the ambiguous answer the other writer's landing is drawn, in simulated
+/// milliseconds. The read-backs follow the answer at one hop each, one per target, so this spans
+/// "before the first read-back" through "after the last" for the target counts drawn below.
+const AMBIG_SPAN: u32 = 24;
+
+/// What became of the struck commit: applied whole, or not at all. The store cannot say which;
+/// the tap knows, so the leg can check the judgement against the truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    Landed,
+    NotLanded,
+}
+
+/// What the other writer does to its target once the ambiguous answer is out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OtherWriter {
+    /// A blind delete: the mark is gone by another hand.
+    Delete,
+    /// A blind re-stamp at [`SWEEP_NOW`]: a fresh mark inside its late-write deadline.
+    Restamp,
+}
+
+/// One observation at the store seam, in the order the simulation produced them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AmbigEvent {
+    /// A GC pass began.
+    Pass,
+    /// The sweep's delete of the targets was answered with an out-of-flight unknown result.
+    Ambiguous,
+    /// The pass read target `i` back after the ambiguous answer, and found this.
+    ReadBack(usize, Option<Bytes>),
+    /// The other writer's commit on its target landed.
+    OtherLanded,
+}
+
+/// A tap over the simulated-TiKV store: every call is forwarded, network hops included, except the
+/// one conditional delete of the targets, which is answered ambiguously — applied whole or not at
+/// all, as the `MetadataStore` contract has it, then `CommitUnknownResult` out of flight. Target
+/// read-backs after that answer and the other writer's landing are logged in completion order.
+/// Instance state only (ADR-0035).
+struct AmbiguousSweepMeta {
+    inner: SimTikvMetadataStore,
+    /// The targets' keys, by target index.
+    targets: Vec<Vec<u8>>,
+    /// The other writer's key.
+    other: Vec<u8>,
+    fate: Fate,
+    /// The nemesis fires once: set when the sweep's delete is taken.
+    struck: AtomicBool,
+    /// Set once the ambiguous answer is out — what the other writer waits for.
+    answered: AtomicBool,
+    events: Mutex<Vec<AmbigEvent>>,
+}
+
+impl AmbiguousSweepMeta {
+    fn log(&self, event: AmbigEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+
+    fn answered(&self) -> bool {
+        self.answered.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl MetadataStore for AmbiguousSweepMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let value = self.inner.get(key).await?;
+        if self.answered() {
+            if let Some(i) = self.targets.iter().position(|t| t == key) {
+                self.log(AmbigEvent::ReadBack(i, value.clone()));
+            }
+        }
+        Ok(value)
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let sweeps_a_target = self.targets.iter().any(|t| {
+            batch.deletes.contains(t) && batch.preconditions.iter().any(|pre| pre.key == *t)
+        });
+        if sweeps_a_target && !self.struck.swap(true, Ordering::SeqCst) {
+            // The resolver accepts the batch — nothing has moved a target yet, the other writer
+            // waits for this very answer — and the reply is lost. Landed: applied whole, by the
+            // store itself. Not landed: nothing is applied, and the two round-trips still pass.
+            match self.fate {
+                Fate::Landed => {
+                    let outcome = self.inner.commit(batch).await?;
+                    assert_eq!(
+                        outcome,
+                        CommitOutcome::Committed,
+                        "fixture: the struck sweep commit's preconditions hold"
+                    );
+                }
+                Fate::NotLanded => madsim::time::sleep(Duration::from_millis(2)).await,
+            }
+            self.log(AmbigEvent::Ambiguous);
+            self.answered.store(true, Ordering::SeqCst);
+            return Err(BoxError::from(sim_commit_unknown_result(
+                SIM_COMMIT_UNKNOWN_RESULT,
+            )));
+        }
+        let other = batch.preconditions.is_empty()
+            && (batch.deletes.contains(&self.other)
+                || batch.puts.iter().any(|(key, _)| *key == self.other));
+        let outcome = self.inner.commit(batch).await?;
+        if other && outcome == CommitOutcome::Committed {
+            self.log(AmbigEvent::OtherLanded);
+        }
+        Ok(outcome)
+    }
+}
+
+/// A `tracing` layer that keeps every field of every event as text, so a leg reads back the audit
+/// lines a pass emitted — action, reason, counter and the mark they name — with no formatter in
+/// between. Instance state only (ADR-0035).
+#[derive(Clone, Default)]
+struct AuditCapture {
+    lines: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+}
+
+struct TextVisitor<'a>(&'a mut BTreeMap<String, String>);
+
+impl tracing::field::Visit for TextVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AuditCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut line = BTreeMap::new();
+        event.record(&mut TextVisitor(&mut line));
+        self.lines.lock().unwrap().push(line);
+    }
+}
+
+impl AuditCapture {
+    /// Every audit line of `action` naming `frag` on `dserver`.
+    fn of(
+        &self,
+        action: &str,
+        dserver: DServerId,
+        frag: FragmentId,
+    ) -> Vec<BTreeMap<String, String>> {
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| {
+                line.get("action").map(String::as_str) == Some(action)
+                    && line.get("dserver") == Some(&dserver.to_string())
+                    && line.get("index") == Some(&frag.index.to_string())
+                    && line.get("chunk") == Some(&chunk_hex(frag.chunk))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The reasons of every `skip-mark` line naming `frag` on `dserver`.
+    fn skips(&self, dserver: DServerId, frag: FragmentId) -> Vec<String> {
+        self.of("skip-mark", dserver, frag)
+            .iter()
+            .filter_map(|line| line.get("reason").cloned())
+            .collect()
+    }
+
+    /// How many lines carried the field `name` — for a counter, how often it ticked.
+    fn ticks(&self, name: &str) -> usize {
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains_key(name))
+            .count()
+    }
+}
+
+/// Where the other writer's landing fell relative to the struck pass's read-backs.
+struct AmbigRun {
+    /// It landed before the pass read its target back — the read saw the other writer's work.
+    before_first_read_back: bool,
+    /// It landed after the pass's last read-back — the judgement saw the batch as it was.
+    after_last_read_back: bool,
+}
+
+/// One run: `SWEEP_PASSES` GC passes over `targets` fragment-less marks paged `page_cap` at a
+/// time, the first pass's sweep commit answered ambiguously with `fate`, while a concurrent writer
+/// does `other` to target `raced` `delay_millis` after that answer. Asserts the property and
+/// returns where the landing fell.
+async fn sweep_judged_after_an_ambiguous_commit(
+    page_cap: usize,
+    targets: usize,
+    raced: usize,
+    other: OtherWriter,
+    fate: Fate,
+    delay_millis: u64,
+) -> AmbigRun {
+    assert!(
+        targets >= 2,
+        "a sibling is what the judgement reads the batch by"
+    );
+    let d = servers();
+    let marks: Vec<(DServerId, FragmentId)> = (0..targets)
+        .map(|i| ((i % 4) as DServerId, frag_of(AMBIG_BASE + i as ChunkId)))
+        .collect();
+    let keys: Vec<Vec<u8>> = marks
+        .iter()
+        .map(|&(dserver, frag)| metadata::orphan_key(dserver, frag))
+        .collect();
+    let meta = Arc::new(AmbiguousSweepMeta {
+        inner: SimTikvMetadataStore::new().with_scan_cap(page_cap),
+        targets: keys.clone(),
+        other: keys[raced].clone(),
+        fate,
+        struck: AtomicBool::new(false),
+        answered: AtomicBool::new(false),
+        events: Mutex::new(Vec::new()),
+    });
+    for &(dserver, frag) in &marks {
+        mark_orphaned(&*meta, dserver, frag, 0).await.unwrap();
+    }
+    let original = meta
+        .get(&keys[0])
+        .await
+        .unwrap()
+        .expect("fixture: the marks are written");
+    // The run starts here: the fixture's own writes are not the other writer.
+    meta.events.lock().unwrap().clear();
+
+    let restamp = Bytes::from(SWEEP_NOW.to_string());
+    let writer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let key = keys[raced].clone();
+        let restamp = restamp.clone();
+        async move {
+            while !meta.answered() {
+                madsim::time::sleep(Duration::from_millis(1)).await;
+            }
+            if delay_millis > 0 {
+                madsim::time::sleep(Duration::from_millis(delay_millis)).await;
+            }
+            // Blind, retried: one that meets a pass's in-flight commit on the key loses the lock
+            // race as `Err` — never `Conflict`, which a blind batch cannot have — and tries again.
+            loop {
+                let batch = match other {
+                    OtherWriter::Delete => WriteBatch::new().delete(key.clone()),
+                    OtherWriter::Restamp => WriteBatch::new().put(key.clone(), restamp.clone()),
+                };
+                match meta.commit(batch).await {
+                    Ok(outcome) => {
+                        assert_eq!(
+                            outcome,
+                            CommitOutcome::Committed,
+                            "a blind batch is never Conflict"
+                        );
+                        break;
+                    }
+                    Err(_) => madsim::time::sleep(Duration::from_millis(1)).await,
+                }
+            }
+        }
+    });
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-gc-ambiguous-sweep").await;
+    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    let mut passes: Vec<(Reconciled, AuditCapture)> = Vec::with_capacity(SWEEP_PASSES);
+    for pass in 1..=SWEEP_PASSES {
+        meta.log(AmbigEvent::Pass);
+        let capture = AuditCapture::default();
+        // A FRESH context every pass, as the deployed loop builds one.
+        let ctx = GcContext {
+            meta: &*meta,
+            fleet: &fleet,
+            grace_window_millis: SWEEP_GRACE,
+            expired_pending: ExpiredPendingPolicy::Defer,
+        };
+        let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, SWEEP_NOW)
+            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+            .await;
+        let answer = outcome.unwrap_or_else(|err| {
+            panic!(
+                "GC pass {pass} failed ({fate:?}, {other:?} of #{raced} at {delay_millis} ms, \
+                 page cap {page_cap}, {targets} targets): {err}"
+            )
+        });
+        passes.push((answer, capture));
+    }
+    writer.await.expect("the other writer ran to completion");
+    let events = meta.events.lock().unwrap().clone();
+    let context = format!(
+        "{fate:?}, {other:?} of #{raced} at {delay_millis} ms, page cap {page_cap}, {targets} \
+         targets: {events:?}"
+    );
+
+    // The ambiguity was exercised, once, and the pass it struck read every key of the batch back.
+    let struck = events
+        .iter()
+        .position(|e| *e == AmbigEvent::Ambiguous)
+        .unwrap_or_else(|| panic!("the sweep's commit was never struck — {context}"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| **e == AmbigEvent::Ambiguous)
+            .count(),
+        1,
+        "struck once — {context}"
+    );
+    let struck_end = events[struck..]
+        .iter()
+        .position(|e| *e == AmbigEvent::Pass)
+        .map_or(events.len(), |at| struck + at);
+    let read_backs: Vec<(usize, Option<Bytes>)> = events[struck..struck_end]
+        .iter()
+        .filter_map(|e| match e {
+            AmbigEvent::ReadBack(i, value) => Some((*i, value.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        read_backs.len(),
+        targets,
+        "the struck pass reads every key of the ambiguous batch back, once — {context}"
+    );
+
+    // (1) NOTHING IS CLAIMED FROM AN AMBIGUOUS COMMIT: no sweep audited, none counted, and the
+    // pass is no certification.
+    let (answer, audit) = &passes[0];
+    assert_eq!(
+        *answer,
+        Reconciled::Partial,
+        "the struck pass answers Partial — {context}"
+    );
+    for &(dserver, frag) in &marks {
+        assert!(
+            audit.of("sweep-mark", dserver, frag).is_empty(),
+            "the struck pass claimed a sweep it cannot know it made — {context}"
+        );
+    }
+    assert_eq!(
+        audit.ticks("monotonic_counter.gc_orphan_marks_swept"),
+        0,
+        "the struck pass counted a sweep it cannot know it made — {context}"
+    );
+
+    // (2) EACH KEY IS JUDGED BY THE BATCH, NOT ALONE. A survivor holding what the pass read is
+    // exactly the not-landed fate: the tap knows, the pass infers.
+    let survivor = read_backs
+        .iter()
+        .any(|(_, value)| value.as_ref() == Some(&original));
+    assert_eq!(
+        survivor,
+        fate == Fate::NotLanded,
+        "fixture: a sibling holding the read bytes is the not-landed fate and nothing else — \
+         {context}"
+    );
+    for (i, value) in &read_backs {
+        let (dserver, frag) = marks[*i];
+        let skips = audit.skips(dserver, frag);
+        let unattributed = audit.of("sweep-unattributed", dserver, frag).len();
+        match value {
+            Some(now) if *now == original => {
+                assert_eq!(skips, ["mark-unchanged"], "target #{i} — {context}");
+                assert_eq!(unattributed, 0, "target #{i} — {context}");
+            }
+            Some(_) => {
+                assert_eq!(skips, ["mark-changed"], "target #{i} — {context}");
+                assert_eq!(unattributed, 0, "target #{i} — {context}");
+            }
+            None if survivor => {
+                assert_eq!(
+                    skips,
+                    ["mark-gone"],
+                    "target #{i}: a sibling holding what the pass read proves the batch did not \
+                     land, so this key was the other writer's delete — {context}"
+                );
+                assert_eq!(unattributed, 0, "target #{i} — {context}");
+            }
+            None => {
+                assert!(skips.is_empty(), "target #{i} — {context}");
+                assert_eq!(
+                    unattributed, 1,
+                    "target #{i}: gone with nothing to say by whose hand is recorded once as \
+                     unattributed — {context}"
+                );
+            }
+        }
+    }
+
+    // (3) THE SWEEP STILL CONVERGES, and no mark is ever claimed twice.
+    for (i, &(dserver, frag)) in marks.iter().enumerate() {
+        if i == raced && other == OtherWriter::Restamp {
+            assert_eq!(
+                meta.get(&keys[i]).await.unwrap(),
+                Some(restamp.clone()),
+                "the re-stamped mark was deleted or changed — {context}"
+            );
+        } else {
+            assert!(
+                !is_marked(&*meta, dserver, frag).await,
+                "target #{i} is fragment-less and past its late-write deadline, and survived the \
+                 run — {context}"
+            );
+        }
+        let claims: usize = passes
+            .iter()
+            .map(|(_, audit)| audit.of("sweep-mark", dserver, frag).len())
+            .sum();
+        assert!(
+            claims <= 1,
+            "target #{i} claimed swept {claims} times — {context}"
+        );
+    }
+
+    let landed = events.iter().position(|e| *e == AmbigEvent::OtherLanded);
+    let first_read_back = events[struck..struck_end]
+        .iter()
+        .position(|e| matches!(e, AmbigEvent::ReadBack(i, _) if *i == raced))
+        .map(|at| struck + at);
+    let last_read_back = events[struck..struck_end]
+        .iter()
+        .rposition(|e| matches!(e, AmbigEvent::ReadBack(..)))
+        .map(|at| struck + at);
+    AmbigRun {
+        before_first_read_back: matches!((landed, first_read_back), (Some(l), Some(r)) if l < r),
+        after_last_read_back: matches!((landed, last_read_back), (Some(l), Some(r)) if l > r),
+    }
+}
+
+/// The campaign leg: the seed picks the page cap, how many targets the ledger holds, which of them
+/// the other writer touches and how, the struck commit's fate and where the landing falls, so 50
+/// seeds sweep the schedule space around the pass's read-backs.
+async fn prop_gc_sweep_judges_an_ambiguous_commit_as_one_batch(rng: &mut ChaCha8Rng) {
+    let page_cap = 2 + (rng.next_u32() % 4) as usize;
+    let targets =
+        page_cap * (2 + (rng.next_u32() % 2) as usize) + (rng.next_u32() as usize % page_cap);
+    let raced = rng.next_u32() as usize % targets;
+    let other = if rng.next_u32().is_multiple_of(2) {
+        OtherWriter::Delete
+    } else {
+        OtherWriter::Restamp
+    };
+    let fate = if rng.next_u32().is_multiple_of(2) {
+        Fate::Landed
+    } else {
+        Fate::NotLanded
+    };
+    let delay = u64::from(rng.next_u32() % (AMBIG_SPAN + 1));
+    sweep_judged_after_an_ambiguous_commit(page_cap, targets, raced, other, fate, delay).await;
+}
+
+/// **The landing before the read-back is genuinely REACHED, and so is the one after it, under
+/// each fate.** Walks the other writer's landing across the span for both of its shapes and both
+/// fates, asserting the full property at every point, then asserts that some landing fell before
+/// the pass read the raced key back — the interleaving a per-key judgement misattributes — and
+/// some after its last read-back. Without it, a span that drifted away from the read-backs would
+/// leave the campaign green with nothing behind it.
+async fn prop_gc_sweep_ambiguity_reaches_before_and_after_the_read_back() {
+    for fate in [Fate::Landed, Fate::NotLanded] {
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for other in [OtherWriter::Delete, OtherWriter::Restamp] {
+            for delay in 0..=u64::from(AMBIG_SPAN) {
+                let run = sweep_judged_after_an_ambiguous_commit(2, 8, 6, other, fate, delay).await;
+                if run.before_first_read_back {
+                    before.push((other, delay));
+                }
+                if run.after_last_read_back {
+                    after.push((other, delay));
+                }
+            }
+        }
+        assert!(
+            !before.is_empty(),
+            "{fate:?}: no landing in 0..={AMBIG_SPAN} ms fell before the struck pass read the \
+             raced key back — the interleaving this property exists for was never exercised"
+        );
+        assert!(
+            !after.is_empty(),
+            "{fate:?}: every landing in 0..={AMBIG_SPAN} ms fell before the struck pass's last \
+             read-back — the span no longer covers the landings after the judgement"
+        );
+    }
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -3891,6 +4432,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn gc_sweep_judges_an_ambiguous_commit_as_one_batch() {
+        prop_gc_sweep_judges_an_ambiguous_commit_as_one_batch(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn gc_sweep_ambiguity_reaches_before_and_after_the_read_back() {
+        prop_gc_sweep_ambiguity_reaches_before_and_after_the_read_back().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -3927,6 +4480,7 @@ dst_campaign_test! {
             prop_gc_staged_handoffs_never_reclaim_the_chunk(&mut rng).await;
             prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rng).await;
             prop_gc_fragment_less_sweep_never_deletes_a_restamped_mark(&mut rng).await;
+            prop_gc_sweep_judges_an_ambiguous_commit_as_one_batch(&mut rng).await;
         }
     }
 }

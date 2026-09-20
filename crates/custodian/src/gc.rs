@@ -46,17 +46,24 @@
 //! **A mark with no fragment beneath it is swept once no fragment can still land under it**
 //! (proposal 0016, `0016:1359-1408`, X87, X91, X96). The walk above reaches a mark only through a
 //! fragment some D server lists, so a mark whose position holds none — the old position of a
-//! repaired missing fragment, a `reclaiming` mark whose fragment is already gone, and later a
-//! teardown's planned placement or a repoint's pre-mark — would stay in the ledger for good. A
-//! pass therefore also deletes each mark of its window whose position no listing of **this** pass
-//! reported, once the mark is at least the late-write deadline [`LATE_WRITE_DEADLINE_MILLIS`] old
-//! ([`Sweep::sweep_fragment_less_marks`]): the listing was then taken after the last instant a
-//! fragment could land under that mark, so the position's emptiness is an observation, never an
-//! inference from the mark's age. A mark on a D server this pass did not list, at a position the
-//! reference set or the staged class protects, or whose value is none of the three shapes is left
-//! in place. Each delete is an exact-value compare-and-swap from the bytes the window read, in
-//! commits of at most [`CLEANUP_BATCH`], so a mark rewritten after the pass read it survives; and
-//! each is audited and counted only once its commit has landed.
+//! repaired missing fragment, a `reclaiming` mark whose fragment is already gone — would stay in
+//! the ledger for good. A pass therefore also deletes each mark of its window whose position no
+//! listing of **this** pass reported, once the mark is at least the late-write deadline
+//! [`LATE_WRITE_DEADLINE_MILLIS`] old ([`Sweep::sweep_fragment_less_marks`]): the listing was then
+//! taken after the last instant a fragment could land under that mark, so the position's
+//! emptiness is an observation, never an inference from the mark's age. That holds for the marks
+//! written **after** their fragment — a legacy mark, and GC's own `reclaiming` mark; a structured
+//! mark carrying an unreference event may have been written ahead of its fragment (a repoint's
+//! pre-mark, a teardown's planned placement), and a write whose effect the store could not verify
+//! may still land under it, so it is left to the slice that introduces its writer. A mark on a
+//! D server this pass did not list, at a position the reference set or the staged class protects,
+//! or whose value is none of the three shapes is left in place. Each delete is an exact-value
+//! compare-and-swap from the bytes the window read, in commits of at most [`CONDITIONAL_BATCH`]
+//! marks, so a mark rewritten after the pass read it survives; and each is audited and counted
+//! only once its commit has landed. A commit whose result the backend could not report is judged
+//! as the one atomic commit it was, from a fresh read of every key in it: a mark still holding
+//! what the pass read proves it did not land, and a key found gone is recorded as gone but
+//! claimed by nobody — this pass's delete or another writer's, the read cannot tell.
 //!
 //! The loop's load-bearing invariant, whose violation is **silent corruption**:
 //! **never reclaim a referenced fragment** — a fragment a committed chunk map's
@@ -99,11 +106,12 @@ use wyrd_core::metadata::{
 };
 use wyrd_core::multipart::{
     decode_owned_entry, decode_part_record, parse_mpu_key, parse_part_key, parse_sidx_key,
-    part_range, retire_key, sidx_range, RetireMode, MAX_PART_CHUNKS, MPU_PREFIX, U_REF,
+    part_range, retire_key, sidx_range, RetireMode, MAX_BATCH_OPS, MAX_PART_CHUNKS, MPU_PREFIX,
+    U_REF,
 };
 use wyrd_traits::{
-    BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result,
-    ScanPage, WriteBatch, SCAN_CAP,
+    BoxError, ChunkId, ChunkStore, CommitOutcome, CommitUnknownResult, DServerId, FragmentId,
+    MetadataStore, Result, ScanPage, WriteBatch, SCAN_CAP,
 };
 
 use crate::reconciliation::Reconciled;
@@ -157,6 +165,23 @@ pub(crate) const ORPHAN_WINDOW: usize = SCAN_CAP / 16;
 /// delete, so a commit carries each key twice and each value once: at most 73 + 328 + 73 bytes a
 /// mark, under 480 KB for `W` of them.
 pub(crate) const CLEANUP_BATCH: usize = 1_000;
+
+/// The most marks one **conditional** commit of a pass carries — a reclaim intent's swap
+/// ([`Intent::record`]) or a fragment-less sweep's delete ([`Sweepable::delete`]), each a
+/// precondition plus a mutation, two sequential operations on the networked backends.
+///
+/// [`CLEANUP_BATCH`] bounds bytes; it does not bound the transaction's **time**. Both networked
+/// backends run a batch's preconditions and mutations one after another inside the transaction,
+/// so `CLEANUP_BATCH` conditional deletes are 2,000 sequential operations — past the five-second
+/// envelope at the latency proposal 0016 assumes, and a batch that always times out is not slow,
+/// it is stuck: every later pass would retry the same leading batch and the ledger would never
+/// shrink (PR #821 review). So a conditional commit carries at most half of
+/// [`MAX_BATCH_OPS`] marks — `B_ops`, the operation budget 0016 derives for the slowest
+/// supported backend (`0016:640-648`), spent two operations a mark. The blind cleanup batch and
+/// the restore pass's `MARK_BATCH` are one operation a key and keep the byte bound until
+/// `B_ops` is calibrated against a measured backend (the obligation on `MAX_BATCH_OPS`).
+pub(crate) const CONDITIONAL_BATCH: usize = (MAX_BATCH_OPS / 2) as usize;
+const _: () = assert!(CONDITIONAL_BATCH >= 1 && CONDITIONAL_BATCH <= CLEANUP_BATCH);
 
 /// **`W_write`** — the fragment-write deadline (proposal 0016 decision 5, `0016:1551-1576`): a
 /// fragment write lands within `W_write` of the instant its writer authorized it, or not at all.
@@ -230,6 +255,17 @@ pub const DELTA_CLOCK_MILLIS: u64 = 1_000;
 /// the sweep is sound against today's tree: unlink marks the placed positions of a committed map,
 /// and a map commits only after every fragment it names is acknowledged; reconstruction and
 /// rebalance write first, and mark only the positions they vacate, in the repoint commit.
+///
+/// **`D` bounds acceptance, not effect, and the sweep relies on it only for marks written after
+/// their fragment.** A D server judges the deadline before it publishes, but the publishing step
+/// itself can straddle it, and the store then answers [`wyrd_traits::WriteEffect::Unknown`] with
+/// the bytes possibly on disk (`ChunkStore::put_fragment`'s contract; `FsChunkStore` re-reads its
+/// clock after `rename`). So a writer that marks a position **ahead of** its fragment cannot take
+/// a listing at `orphaned_at + D` as proof its position stays empty. Until the slice that
+/// introduces such a writer settles its marks — on `Unknown`, re-read the position; if the bytes
+/// landed and the adoption cannot proceed, re-mark them so they stay evidenced; and only then add
+/// its event to the sweep's set — the sweep leaves every structured, non-`reclaiming` mark in
+/// place (`event-may-await-write`, [`Sweep::sweep_fragment_less_marks`]; PR #821 review).
 pub const LATE_WRITE_DEADLINE_MILLIS: u64 = W_REPOINT_MILLIS + W_WRITE_MILLIS + DELTA_CLOCK_MILLIS;
 
 /// Where the `orphan:` ledger walk resumes: the one persisted record of [`OrphanWindow`].
@@ -508,7 +544,7 @@ struct Sweep<'p, 'a> {
     window: &'p OrphanWindow,
     expired_pending: &'p HashSet<ChunkId>,
     /// Marks judged past their grace window whose `reclaiming` swap has not been committed yet —
-    /// never more than [`CLEANUP_BATCH`]. Nothing is deleted for them until it has.
+    /// never more than [`CONDITIONAL_BATCH`]. Nothing is deleted for them until it has.
     intents: Vec<Intent<'a>>,
     /// Whether this pass deleted any fragment bytes.
     changed: bool,
@@ -650,7 +686,7 @@ impl<'p, 'a> Sweep<'p, 'a> {
                         frag,
                         mark: mark.clone(),
                     });
-                    if self.intents.len() >= CLEANUP_BATCH {
+                    if self.intents.len() >= CONDITIONAL_BATCH {
                         self.record_intents(cleanup).await?;
                     }
                 }
@@ -802,7 +838,17 @@ impl<'p, 'a> Sweep<'p, 'a> {
     ///   gate, read the same way, so an incomplete set sweeps nothing as it reclaims nothing;
     /// - its value is none of the three shapes: there is no stamp to age, so it stays
     ///   byte-identical, as it was named when the window read it (ADR-0045 decision 3);
-    /// - it is younger than `D`.
+    /// - it is younger than `D`;
+    /// - it is a structured mark that is not `reclaiming` — one carrying an unreference event
+    ///   (`event-may-await-write`). Such a mark may have been written **ahead of** its fragment
+    ///   (a repoint's pre-mark, a teardown's planned placement), and `D` bounds when a write is
+    ///   *accepted*, not when it takes effect: a publication that straddles the deadline is
+    ///   reported as [`wyrd_traits::WriteEffect::Unknown`] with the bytes possibly landed, so a
+    ///   listing at `orphaned_at + D` does not prove the position stays empty (PR #821 review).
+    ///   No writer on `main` writes such a mark yet; the slice that introduces one settles how
+    ///   its mark is retired — see [`LATE_WRITE_DEADLINE_MILLIS`] — and adds its event to the
+    ///   swept set then. A legacy mark is written after its fragment (unlink, a vacated source),
+    ///   and a `reclaiming` mark is GC's own decision over a position nothing may write under.
     ///
     /// Only a key a writer spells is a mark here. The window files a mark under the position it
     /// names only when [`orphan_key`] spells that position as the very key read, and records a
@@ -811,7 +857,7 @@ impl<'p, 'a> Sweep<'p, 'a> {
     /// window read it ([`classify_ledger_entry`]).
     ///
     /// The marks are judged in position order, and the deletes go in that order, at most
-    /// [`CLEANUP_BATCH`] to a commit ([`Self::commit_sweep`]) — so the commits a pass makes are
+    /// [`CONDITIONAL_BATCH`] to a commit ([`Self::commit_sweep`]) — so the commits a pass makes are
     /// the same on every run.
     async fn sweep_fragment_less_marks(&mut self) -> Result<()> {
         let window: &'p OrphanWindow = self.window;
@@ -840,6 +886,10 @@ impl<'p, 'a> Sweep<'p, 'a> {
                     .saturating_add(LATE_WRITE_DEADLINE_MILLIS)
             {
                 Some("within-late-write-deadline")
+            } else if !mark.is_reclaiming() && mark.event().is_some() {
+                // Possibly written ahead of its fragment, and a straddling write's effect is
+                // not bounded by `D` — left to the writer's own slice (see the doc above).
+                Some("event-may-await-write")
             } else {
                 None
             };
@@ -855,7 +905,7 @@ impl<'p, 'a> Sweep<'p, 'a> {
                 }),
             }
         }
-        for batch in judged.chunks(CLEANUP_BATCH) {
+        for batch in judged.chunks(CONDITIONAL_BATCH) {
             self.commit_sweep(batch).await?;
         }
         Ok(())
@@ -879,19 +929,38 @@ impl<'p, 'a> Sweep<'p, 'a> {
     /// An `Err` ends the pass with nothing of its own commit claimed — whether that commit landed
     /// is unknown — while every commit before it was claimed the moment it landed. So a fault
     /// partway through the sweep leaves the audit trail and the count saying exactly which
-    /// deletes were durable when it struck.
+    /// deletes were durable when it struck. The one `Err` that is **settled first** is a
+    /// [`CommitUnknownResult`] the backend says is no longer in flight
+    /// ([`Self::settle_unknown_sweep`]): a delete that landed under it has taken the key with it,
+    /// so a pass that gave up there would leave that delete unaudited and uncounted with nothing
+    /// a later pass could read to reconstruct it (PR #821 review). The settle judges the batch as
+    /// the one commit it was and claims no sweep from it: a key found gone is recorded on the
+    /// audit seam as gone and attributed to nobody, since another writer's delete reads exactly
+    /// as this pass's would (PR #823 review).
     async fn commit_sweep(&mut self, batch: &[Sweepable<'p>]) -> Result<()> {
         let whole = batch
             .iter()
             .fold(WriteBatch::new(), |acc, mark| mark.delete(acc));
-        if self.ctx.meta.commit(whole).await? == CommitOutcome::Committed {
-            for mark in batch {
-                self.claim_sweep(mark);
+        match self.ctx.meta.commit(whole).await {
+            Ok(CommitOutcome::Committed) => {
+                for mark in batch {
+                    self.claim_sweep(mark);
+                }
+                return Ok(());
             }
-            return Ok(());
+            Ok(CommitOutcome::Conflict) => {}
+            Err(err) => return self.settle_unknown_sweep(batch, err).await,
         }
         for mark in batch {
-            match self.ctx.meta.commit(mark.delete(WriteBatch::new())).await? {
+            let alone = match self.ctx.meta.commit(mark.delete(WriteBatch::new())).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    return self
+                        .settle_unknown_sweep(std::slice::from_ref(mark), err)
+                        .await
+                }
+            };
+            match alone {
                 CommitOutcome::Committed => self.claim_sweep(mark),
                 CommitOutcome::Conflict => {
                     let reason = match self.ctx.meta.get(&mark.key).await? {
@@ -907,6 +976,73 @@ impl<'p, 'a> Sweep<'p, 'a> {
                                 "mark-changed"
                             }
                         }
+                    };
+                    emit_mark_skip(mark.dserver, mark.frag, reason);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A sweep commit answered `Err`. If it is a [`CommitUnknownResult`] the backend says is out
+    /// of flight, judge the batch **as the one atomic commit it was**, from a fresh read of every
+    /// key in it. The commit deleted all of its marks or none, so a key still holding the bytes
+    /// the pass read proves the batch did **not** land — its precondition on that key would have
+    /// taken the key with it — and every key of the batch found absent was then deleted by
+    /// another writer (`mark-gone`, as the re-read after a lost precondition judges it), not by
+    /// this pass. With no such survivor nothing proves the batch landed either: a key found
+    /// absent may have been taken by this pass's delete or by another writer's, and one found
+    /// rewritten may have been rewritten over this pass's delete or instead of it. An absent key
+    /// is then named `sweep-unattributed` on the audit seam — gone, after a commit whose result
+    /// the store could not report — and claimed by nobody: not audited as this pass's sweep, not
+    /// counted, and the pass answers `Partial` for it, never `Changed` or `Satisfied`. A key still
+    /// holding a mark is left for the next pass in every case, as a lost precondition's is.
+    ///
+    /// The reads are sequential and a writer may land between them; the judgement does not
+    /// depend on their order. The batch was out of flight before the first read, so a survivor
+    /// holding the read bytes disproves the landing at whatever instant it is read, and an
+    /// absent key is never attributed, whenever it is read. What the judgement rests on is the
+    /// commit's atomicity, which the `MetadataStore` contract guarantees (PR #823 review).
+    ///
+    /// If the batch **may still commit** no re-read can judge it: each mark is named as unsettled
+    /// and the fault ends the pass, as every other `Err` does — a later pass reads whichever way
+    /// it went. Any other error is returned untouched.
+    async fn settle_unknown_sweep(&mut self, marks: &[Sweepable<'p>], err: BoxError) -> Result<()> {
+        let Some(unknown) = err.downcast_ref::<CommitUnknownResult>() else {
+            return Err(err);
+        };
+        if unknown.may_still_commit {
+            for mark in marks {
+                emit_mark_unsettled(mark.dserver, mark.frag, &unknown.detail);
+            }
+            self.lost_sweep = true;
+            return Err(err);
+        }
+        // Every key first, then the judgement: it is one commit that is being judged, and a
+        // survivor anywhere in it speaks for every key of it.
+        let mut reads = Vec::with_capacity(marks.len());
+        for mark in marks {
+            reads.push(self.ctx.meta.get(&mark.key).await?);
+        }
+        let landing_disproved = marks.iter().zip(&reads).any(|(mark, now)| {
+            now.as_ref()
+                .is_some_and(|now| *now == encode_orphan_mark(mark.mark))
+        });
+        for (mark, now) in marks.iter().zip(&reads) {
+            match now {
+                // The batch did not land, so this pass did not delete it: another writer did.
+                None if landing_disproved => emit_mark_skip(mark.dserver, mark.frag, "mark-gone"),
+                // Gone, and nothing says by whose hand.
+                None => {
+                    self.lost_sweep = true;
+                    emit_mark_gone_unattributed(mark.dserver, mark.frag, &unknown.detail);
+                }
+                Some(now) => {
+                    self.lost_sweep = true;
+                    let reason = if *now == encode_orphan_mark(mark.mark) {
+                        "mark-unchanged"
+                    } else {
+                        "mark-changed"
                     };
                     emit_mark_skip(mark.dserver, mark.frag, reason);
                 }
@@ -1863,6 +1999,41 @@ fn emit_mark_swept(dserver: DServerId, frag: FragmentId) {
     );
 }
 
+/// Emit a sweep delete whose commit answered an out-of-flight [`CommitUnknownResult`] and whose
+/// key a fresh read then found absent, with nothing in the batch proving the commit did not land
+/// ([`Sweep::settle_unknown_sweep`]): the mark is gone, and whether this pass's delete or another
+/// writer's took it cannot be told, so the pass claims neither — not [`emit_mark_swept`]'s action
+/// and not its counter. A counter of its own, so an operator can see how much of the trail is
+/// deletion attributed to nobody, and `detail` carrying the backend's account of the commit.
+fn emit_mark_gone_unattributed(dserver: DServerId, frag: FragmentId, detail: &str) {
+    tracing::warn!(monotonic_counter.gc_orphan_mark_sweeps_unattributed = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "sweep-unattributed",
+        dserver,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
+        index = frag.index,
+        detail = %detail,
+        "an orphan mark is gone after a sweep delete whose commit result the store could not report: taken by this pass's delete or by another writer's, and claimed by neither; the pass answers Partial",
+    );
+}
+
+/// Emit a sweep delete whose commit answered a [`CommitUnknownResult`] that **may still commit**
+/// — nothing this pass can read settles it — on the durability-plane seam: the pass ends on the
+/// fault, and the next pass reads whichever way it went.
+fn emit_mark_unsettled(dserver: DServerId, frag: FragmentId, detail: &str) {
+    tracing::warn!(monotonic_counter.gc_orphan_mark_sweeps_unsettled = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.gc.audit",
+        action = "sweep-unsettled",
+        dserver,
+        chunk = %wyrd_traits::chunk_hex(frag.chunk),
+        index = frag.index,
+        detail = %detail,
+        "gc could not tell whether its delete of an orphan mark landed (the commit may still be applied); the pass ends and the next one reads the outcome",
+    );
+}
+
 /// Emit a **malformed committed placement** signal on the durability-plane seam
 /// (ADR-0011 / ADR-0012, ADR-0040 decision 4): a committed chunk whose `placement` vector
 /// is non-empty but of the wrong length — truncation / corruption. GC fails safe (the
@@ -2033,7 +2204,8 @@ fn emit_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
 /// Emit a fragment-less mark the sweep considered and did **not** delete on the same seam —
 /// [`emit_skip`]'s record, for a mark rather than a fragment: its D server is not in this pass's
 /// fleet (`server-not-in-fleet`), a protection class covers its position (the class's own reason,
-/// as for a fragment), it is inside its late-write deadline (`within-late-write-deadline`), or its
+/// as for a fragment), it is inside its late-write deadline (`within-late-write-deadline`), it is a
+/// structured mark whose writer may still have a write in flight (`event-may-await-write`), or its
 /// delete lost and a fresh read found it rewritten (`mark-changed`), as it was
 /// (`mark-unchanged`), or deleted by another writer (`mark-gone`).
 fn emit_mark_skip(dserver: DServerId, frag: FragmentId, reason: &str) {
