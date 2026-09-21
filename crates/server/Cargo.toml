@@ -104,10 +104,15 @@ tonic-health.workspace = true
 # architecture §8.9): a server-wide concurrency bound + load-shedding applied to
 # the tonic service stack via `Server::layer`.
 tower.workspace = true
+# The Clock seam (ADR-0009/ADR-0024): the deployed custodian role implements
+# `wyrd_testkit::Clock` over its own run-loop clock (`custodian.rs` `LoopClock`) to fill
+# `ReconstructionContext::clock` — a normal dependency because that composition is production
+# code, not a test double (the same reason `wyrd-chunkstore-fs` takes it,
+# `crates/chunkstore-fs/Cargo.toml:14-19`).
+wyrd-testkit.workspace = true
 
 [dev-dependencies]
 wyrd-chunk-format.workspace = true
-wyrd-testkit.workspace = true
 # The #407 composable-nemesis lifecycle seam (`nemesis::{NemesisLeg, drive_leg, PartitionLeg,
 # ClockSkewLeg, ProcessPauseLeg}` + the typed `MaterializationEvidence`), consumed as-is by the
 # #408 live checked-consistency scenario (`tests/consistency_run_fdb.rs`, `fdb`-feature-gated).

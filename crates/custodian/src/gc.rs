@@ -86,8 +86,9 @@
 //! then committed inodes, the order that leaves a chunk in at least one class whenever a part
 //! commit or a publication lands mid-read (`0016:782-800`). A staged record the pass cannot read
 //! makes that class incomplete, which reclaims nothing and certifies nothing exactly as an
-//! unreadable committed map does; a store fault under one of its reads fails the pass. Scrub and
-//! the drain-status surface do not read the class at all.
+//! unreadable committed map does; a store fault under one of its reads fails the pass. The
+//! drain-status surface and reconstruction read the same class; scrub reads only its committed
+//! `part:` half, through a reader of its own ([`staged_committed_parts`]).
 //!
 //! Dependency boundary (ADR-0010, `0005:421-422`): this loop stays over the
 //! `traits` / `core` seams plus `tracing` — **no** concrete backend.
@@ -392,10 +393,13 @@ pub async fn mark_orphaned(
 /// reclaimed or any fragment-less mark swept, and [`Reconciled::Satisfied`] otherwise. Scrub
 /// answers the identical condition the identical way ([`crate::scrub::reconcile`]): one
 /// incomplete set, one rule, read twice. A staged multipart record this pass could not read
-/// ([`StagedSet::unresolvable`]) is answered the same way, by GC and by the drain-status query
-/// ([`crate::desired_state::reconciliation_status`]) — but not by scrub, which reads no staged
-/// record. A pass whose window of the `orphan:` ledger ([`OrphanWindow`]) stopped
-/// short of the ledger's end and reclaimed nothing answers [`Reconciled::Partial`], never
+/// ([`StagedSet::unresolvable`]) is answered the same way, by GC, by reconstruction and by the
+/// drain-status query ([`crate::desired_state::reconciliation_status`]) — scrub answers the
+/// identical condition too, but over its own narrower, PART-ONLY staged read
+/// ([`StagedPartSet::unresolvable`], `crate::scrub`): it never reads an owned `sidx:` entry
+/// (0016 decision 2, `0016:776-781`). A pass whose window of the `orphan:` ledger
+/// ([`OrphanWindow`]) stopped short of the ledger's end and reclaimed nothing answers
+/// [`Reconciled::Partial`], never
 /// `Satisfied`: `Satisfied` certifies that reality matched, and a caller driving the loop to
 /// satisfaction would stop on it with eligible marks still unvisited in the windows ahead (PR
 /// #802 review). A pass that lost a reclaim intent — a mark it judged changed before its
@@ -1291,13 +1295,15 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
 /// A class of its own, **disjoint** from the committed [`ReferenceSet`] rather than merged into
 /// it, so each consumer decides for itself what staged bytes mean to it (`0016:767-782`, `:881`),
 /// and built by a reader of its own ([`staged_fragments`]) rather than inside
-/// [`referenced_fragments`]. Three passes read it: the two that delete or mark — GC's reclaim
-/// ([`reconcile`]) and the post-restore mark gate ([`crate::restore`]) — and the operator's
+/// [`referenced_fragments`]. Four passes read it: the two that delete or mark — GC's reclaim
+/// ([`reconcile`]) and the post-restore mark gate ([`crate::restore`]) — the operator's
 /// drain-status query ([`crate::desired_state::reconciliation_status`]), which counts a staged
-/// fragment as held so a drain is never certified over a live upload's bytes (`0016:826-827`).
-/// Scrub still shares the committed build and reads no upload record at all, so an upload
-/// record's damage, a store fault reading one, or the cost of reading them cannot reach its
-/// answer.
+/// fragment as held so a drain is never certified over a live upload's bytes (`0016:826-827`),
+/// and reconstruction (`crate::reconstruction`), which never drains an obligation for a chunk
+/// this class still names. Scrub reads a narrower slice of the same protocol instead — every
+/// session's committed `part:` records, never its `sidx:` entries, through a reader of its own
+/// ([`crate::scrub`]) — so an upload's owned-entry damage, a store fault reading one, or the
+/// cost of reading them cannot reach scrub's answer.
 ///
 /// Its rules mirror the committed set's, one level each:
 ///
@@ -1313,9 +1319,13 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
 ///   which chunks it protects, so the class is **incomplete** ([`Self::unresolvable`]) and
 ///   protects every fragment in the fleet, exactly as an unreadable committed map does.
 ///
-/// deferred: #663 — scrub and reconstruction acting on staged bytes. (#664's half — drain status
-/// and rebalance — is discharged: the drain-status query above reads this class, and rebalance is
-/// disjoint from it by construction, `crate::rebalance::plan_evacuations`.)
+/// deferred: #814 — rebuilding or re-placing a staged chunk. #663's other half is discharged:
+/// scrub now checks a session's committed `part:` fragments (`crate::scrub`) and reconstruction
+/// now keeps rather than drains an obligation this class still names
+/// (`crate::reconstruction`); neither one repoints or re-places over a staged record, which
+/// stays #814's. (#664's half — drain status and rebalance — was already discharged: the
+/// drain-status query above reads this class, and rebalance is disjoint from it by
+/// construction, `crate::rebalance::plan_evacuations`.)
 #[derive(Default)]
 pub(crate) struct StagedSet {
     /// `(dserver, fragment)` a staged record places: each chunk of a committed part at its recorded
@@ -1398,25 +1408,29 @@ impl StagedSet {
     }
 
     /// Place `chunk`, which the staged record under `key` names — or hold it whole when its
-    /// placement is not exactly one D server per fragment.
+    /// placement is not exactly one D server per fragment ([`staged_placement`], the one rule
+    /// both staged readers resolve a staged placement through).
     fn place(&mut self, key: &[u8], chunk: &ChunkRef) {
-        let expected = chunk.fragment_count();
-        if chunk.placement.len() == usize::from(expected) {
-            for (index, dserver) in chunk.fragments() {
-                self.placed.insert((
-                    dserver,
-                    FragmentId {
-                        chunk: chunk.id,
-                        index,
-                    },
-                ));
+        match staged_placement(chunk) {
+            Ok(frags) => {
+                for (index, dserver) in frags {
+                    self.placed.insert((
+                        dserver,
+                        FragmentId {
+                            chunk: chunk.id,
+                            index,
+                        },
+                    ));
+                }
             }
-        } else {
-            let fault = format!(
-                "staged placement names {} D server(s) for a scheme of {expected} fragment(s)",
-                chunk.placement.len()
-            );
-            self.hold(chunk.id, key, fault);
+            Err(m) => self.hold(
+                chunk.id,
+                key,
+                format!(
+                    "staged placement names {} D server(s) for a scheme of {} fragment(s)",
+                    m.actual, m.expected
+                ),
+            ),
         }
     }
 
@@ -1425,6 +1439,36 @@ impl StagedSet {
             .entry(chunk)
             .or_default()
             .push((key.to_vec(), fault));
+    }
+}
+
+/// Resolve the placement a **staged** record (`sidx:` or `part:`) gives a chunk — the one rule
+/// every staged reader in this module shares ([`StagedSet::place`] for the protection class,
+/// [`read_staged_part`] for the scrub-checked one), so neither can drift from the other about
+/// which staged placements are trustworthy.
+///
+/// **Exact length, no identity fallback.** A staged placement is valid *iff* it names exactly one
+/// D server per fragment of its own scheme; any other length — the EMPTY vector included — is
+/// [`MalformedPlacement`]. This is deliberately STRICTER than the committed rule
+/// ([`wyrd_core::metadata::ChunkRef::checked_fragments`], ADR-0040 decisions 3–4), which admits
+/// an empty vector as the pre-M3 identity fallback: that exemption exists for committed records
+/// written before placements were, and **every** staged record is born with a full placement
+/// (`0016:828`). So an empty staged placement can only be damage, and identity-filling it would
+/// hand a reader D-server locations no record ever named — protecting fragments at fabricated
+/// positions on GC's side, and on scrub's fetching and then enqueueing *phantom* repair
+/// obligations against them (`0016` X65, `0016:2594`; ADR-0045 decision 3). Damage is contained
+/// instead: the caller holds or reports the chunk, and fabricates nothing.
+fn staged_placement(
+    chunk: &ChunkRef,
+) -> std::result::Result<impl Iterator<Item = (u16, DServerId)> + '_, MalformedPlacement> {
+    let expected = chunk.fragment_count();
+    if chunk.placement.len() == usize::from(expected) {
+        Ok(chunk.fragments())
+    } else {
+        Err(MalformedPlacement {
+            expected,
+            actual: chunk.placement.len(),
+        })
     }
 }
 
@@ -1485,6 +1529,135 @@ pub(crate) async fn staged_fragments(meta: &dyn MetadataStore) -> Result<StagedS
         match (next, sessions.into_iter().last()) {
             (Some(_), Some((last, _))) => after = Some(last),
             _ => return Ok(set),
+        }
+    }
+}
+
+/// The **scrub-checked staged class** (0016 decision 2, `0016:824-825`; split from #663): every
+/// fragment a session's COMMITTED `part:` record places, with the [`EcScheme`] that record's
+/// own [`ChunkRef`] carries — never an in-flight `sidx:` entry. Checking a fragment needs the
+/// COMMITTED scheme a part record carries; an owned entry's is only planned, not yet committed
+/// (`0016:776-781`), so scrub — which only ever verifies committed state — leaves an in-flight
+/// chunk alone by construction (leg B, `crates/custodian/tests/staged_scrub.rs`).
+///
+/// A reader of its own, not [`StagedSet`]: `StagedSet` folds `sidx:` and `part:` placements
+/// into one set because GC's and restore's question is "is this fragment protected", never
+/// "which record placed it, and under what scheme" — the question this one answers instead.
+/// Widening `StagedSet`'s own shape for one consumer would cost every other one a field it
+/// never reads; a second, PART-ONLY walk keeps the boundary explicit.
+pub(crate) struct StagedPartSet {
+    /// `(dserver, fragment)` a committed part record places, each with the scheme its own
+    /// `ChunkRef` carries — mirrors [`ReferenceSet::schemes`], so a consumer verifies a
+    /// fragment's FULL identity (index + EC tuple) against the part record, not the chunk id
+    /// alone (`wyrd_core::repair::fragment_intact`, the scrub/verify contract `0005:262-267`).
+    pub placed: HashMap<(DServerId, FragmentId), EcScheme>,
+    /// Chunks whose committed part placement is malformed — not exactly one D server per
+    /// fragment, the EMPTY vector included ([`staged_placement`], the same rule
+    /// [`StagedSet::place`] holds a chunk by) — held out of `placed` rather than
+    /// identity-filled, as [`ReferenceSet::malformed`] treats a malformed COMMITTED placement
+    /// (ADR-0040 decision 4): the chunk's true placement cannot be trusted, so none of it is
+    /// fabricated and no fragment is fetched, checked or enqueued at a position no record
+    /// named. A committed chunk map's empty placement IS valid (the pre-M3 identity fallback);
+    /// a staged record's never is (`0016:828`). Each chunk keeps the `part:` key(s) naming it
+    /// with the damage, as [`StagedSet::held`] does, so an operator is sent to the damaged
+    /// RECORD — there may be no committed object to look for at all.
+    pub malformed: BTreeMap<ChunkId, Vec<(Vec<u8>, MalformedPlacement)>>,
+    /// Committed part records that could not be read at all — a session key `parse_mpu_key`
+    /// rejects, or a part key/value [`parse_part_key`]/[`decode_part_record`] rejects — keyed
+    /// by the raw key bytes and valued by the fault, [`ReferenceSet::unresolvable`]'s shape for
+    /// the same reasons. While non-empty this class is INCOMPLETE: scrub cannot say one word
+    /// about the chunks the unreadable record would have named, so it refuses to certify the
+    /// store rather than certify only the part it could read.
+    pub unresolvable: BTreeMap<Vec<u8>, String>,
+}
+
+/// Read the [`StagedPartSet`]: list the sessions under `mpu:` (reusing the same paged listing
+/// [`staged_fragments`] makes), then read each one's committed parts (`part:<id>:`) — never its
+/// owned staging range. Bounded exactly as [`staged_fragments`] is: every range is walked in
+/// pages of at most [`STAGED_PAGE`] ([`walk_staged_range`]), never one `scan` of a whole
+/// namespace (`0016:890`).
+///
+/// **The caller reads this class BEFORE the committed reference set** ([`referenced_fragments`]),
+/// for the reason [`staged_fragments`]'s own caller does (`0016:782-800`): a publication writes
+/// the committed inode and only LATER deletes the `part:` record it replaces, so a reading that
+/// took the destination first could see a chunk in neither class — and for scrub that means never
+/// fetching its fragments while certifying the store (`crate::scrub::reconcile`).
+///
+/// **What it cannot read or trust, it contains** (ADR-0045 decision 3), [`StagedSet`]'s own
+/// rule for the same two record shapes: an unparsable session or part key, or an undecodable
+/// part value, names that record in [`StagedPartSet::unresolvable`] and the walk goes on over
+/// every OTHER record — one damaged part record does not stop scrub from checking the rest of
+/// the store. A **store** fault is not contained: it propagates as the same [`StagedReadFault`]
+/// [`staged_fragments`] raises, naming the range that failed, before scrub enqueues or
+/// certifies anything.
+pub(crate) async fn staged_committed_parts(meta: &dyn MetadataStore) -> Result<StagedPartSet> {
+    let mut set = StagedPartSet {
+        placed: HashMap::new(),
+        malformed: BTreeMap::new(),
+        unresolvable: BTreeMap::new(),
+    };
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (sessions, next) = staged_page(meta, MPU_PREFIX, after.as_deref()).await?;
+        for (key, _session) in &sessions {
+            let upload = match parse_mpu_key(key) {
+                Ok(upload) => upload,
+                Err(fault) => {
+                    set.unresolvable.insert(key.clone(), fault.to_string());
+                    continue;
+                }
+            };
+            walk_staged_range(meta, &part_range(&upload), |key, value| {
+                read_staged_part(&mut set, key, value)
+            })
+            .await?;
+        }
+        match (next, sessions.into_iter().last()) {
+            (Some(_), Some((last, _))) => after = Some(last),
+            _ => return Ok(set),
+        }
+    }
+}
+
+/// Classify one `part:` record for [`staged_committed_parts`] — [`StagedSet::read_part`]'s
+/// twin, scheme-tagged for scrub's verify against the chunk's committed EC tuple instead of
+/// expanded into a reclaim-protection set.
+fn read_staged_part(set: &mut StagedPartSet, key: &[u8], value: &[u8]) {
+    match parse_part_key(key).and_then(|_| decode_part_record(value)) {
+        Ok(part) => {
+            for chunk in part.chunks() {
+                // Classify the committed placement BEFORE expanding it (ADR-0040 decision 4),
+                // exactly as `referenced_fragments` does for a committed chunk map — but
+                // through the STAGED rule ([`staged_placement`], the one
+                // [`StagedSet::place`] applies), not the committed one: a part record's
+                // placement is never identity-filled, the empty vector included, because
+                // every staged record is born with a full one (`0016:828`). Filling one
+                // would have scrub fetch — and enqueue phantom repairs against — D servers
+                // no record ever named.
+                match staged_placement(chunk) {
+                    Ok(frags) => {
+                        for (index, dserver) in frags {
+                            set.placed.insert(
+                                (
+                                    dserver,
+                                    FragmentId {
+                                        chunk: chunk.id,
+                                        index,
+                                    },
+                                ),
+                                chunk.scheme,
+                            );
+                        }
+                    }
+                    Err(m) => {
+                        let records = set.malformed.entry(chunk.id).or_default();
+                        records.push((key.to_vec(), m));
+                    }
+                }
+            }
+        }
+        Err(fault) => {
+            set.unresolvable.insert(key.to_vec(), fault.to_string());
         }
     }
 }

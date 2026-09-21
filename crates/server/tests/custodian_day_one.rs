@@ -616,6 +616,7 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
         "the killed server 1 is dropped from the live fleet; 0,2,3 remain"
     );
 
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &live_fleet,
@@ -623,6 +624,8 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
         // The killed server(s) dropped this pass: their placed fragments are transiently
         // unavailable, so `assess` must not raise a false data-loss alarm on them.
         unreachable: &unreachable,
+        clock: &pass_clock,
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -648,6 +651,7 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
     );
 
     // PASS 2 — repaired: the obligation is drained, so the count RETURNS TO ZERO.
+    pass_clock.set(600);
     let outcome = service
         .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .await
@@ -736,6 +740,7 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
         vec![0, 2, 3],
         "the killed server 1 is dropped; 0,2,3 remain live"
     );
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &live_fleet,
@@ -743,6 +748,8 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
         // The killed server(s) dropped this pass: their placed fragments are transiently
         // unavailable, so `assess` must not raise a false data-loss alarm on them.
         unreachable: &unreachable,
+        clock: &pass_clock,
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -772,6 +779,7 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
     // PASS 2 — chunk A is repaired; chunk B is still lost (queued). The backlog gauge RETURNS TO
     // ZERO despite the permanent data loss — the day-one signal on a populated store. Pre-fix it
     // stays pinned at 1.
+    pass_clock.set(600);
     service
         .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .await
@@ -860,6 +868,8 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
     service
         .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
@@ -908,6 +918,8 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         fleet: &live_fleet2,
         topology: &live_topo2,
         unreachable: &unreachable2,
+        clock: &wyrd_testkit::ManualClock::new(600),
+        staged_write_window_millis: 0,
     };
     service
         .reconcile_pass(&zone, &custodian, None, None, Some(&ctx2), None, 600)
@@ -983,11 +995,14 @@ async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
         vec![0, 2],
         "the killed server 1 is dropped; only A,C remain — no free domain to re-place into"
     );
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
+        clock: &pass_clock,
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -1020,6 +1035,7 @@ async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
     );
 
     // PASS 2 — the condition persists; the backlog gauge must STAY at zero (never floor at 1).
+    pass_clock.set(600);
     service
         .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .await
@@ -1696,6 +1712,8 @@ async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -1793,6 +1811,8 @@ async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();

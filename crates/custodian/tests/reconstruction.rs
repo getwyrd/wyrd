@@ -368,6 +368,8 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -500,6 +502,8 @@ async fn reconstruction_preserves_object_metadata_across_a_repair() {
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -573,6 +577,8 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
         fleet: &full_fleet,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -693,6 +699,8 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -830,6 +838,8 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -931,6 +941,8 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
         fleet: &healthy_fleet,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -1078,6 +1090,8 @@ async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() 
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -1262,6 +1276,8 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
         fleet: &recon_fleet,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -1364,6 +1380,8 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
         fleet: &recon_fleet,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -1430,6 +1448,8 @@ async fn emits_the_three_repair_metrics_on_the_durability_seam() {
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();
@@ -1644,6 +1664,8 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
     reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .with_subscriber(tracing_subscriber::registry().with(telemetry.metrics_layer()))
@@ -1670,6 +1692,8 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(600),
+        staged_write_window_millis: 0,
     };
     reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, 600)
         .with_subscriber(tracing_subscriber::registry().with(telemetry2.metrics_layer()))
@@ -1775,6 +1799,8 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
     reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
         .with_subscriber(tracing_subscriber::registry().with(telemetry.metrics_layer()))
@@ -1803,6 +1829,8 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(600),
+        staged_write_window_millis: 0,
     };
     reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, 600)
         .with_subscriber(tracing_subscriber::registry().with(telemetry2.metrics_layer()))
@@ -1906,6 +1934,8 @@ async fn an_aborted_repair_is_not_counted_as_a_successful_repair() {
         fleet: &recon_fleet,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
 
     let coord = MemCoordination::new();

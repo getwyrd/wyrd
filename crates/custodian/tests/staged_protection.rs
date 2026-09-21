@@ -1,6 +1,8 @@
 //! Issue #803 (662.1) — the **staged protection class** for the two custodian passes that delete
 //! or mark: GC's reclaim and the post-restore mark gate (proposal 0016 decision 2,
-//! `docs/design/proposals/draft/0016-multipart-commit-protocol.md:765-893`).
+//! `docs/design/proposals/draft/0016-multipart-commit-protocol.md:765-893`). Legs G-I (issue
+//! #813, 663.1) extend it to the THIRD pass over the same class: reconstruction's repair queue,
+//! which neither deletes nor marks but must not DRAIN an obligation the class still names.
 //!
 //! A multipart upload's bytes are durable long before they are published: a committed part's
 //! fragments are named by its `part:` record, and a still-streaming part's by the owned `sidx:`
@@ -31,11 +33,27 @@
 //! - **E** a staged record a pass cannot read, one it cannot trust, and a store fault under a
 //!   staged read each fail closed — while a session VALUE, which no pass decodes, changes neither
 //!   pass's answer.
-//! - **F** scrub reads no upload record (a guard). The drain-status query did too until #808
-//!   (#664's slice) gave it the staged class; its own legs are in `staged_drain_status.rs`.
+//! - **F** scrub checks a session's committed `part:` fragments the same way it already checks a
+//!   committed chunk map's, but never reads an owned `sidx:` entry (a guard, still). The
+//!   drain-status query's own half of the ORIGINAL leg F is gone, discharged by #808 (#664's
+//!   slice) before scrub read anything here; its legs are in `staged_drain_status.rs`.
+//! - **G** reconstruction keeps rather than drains an obligation for a chunk a committed part or
+//!   an owned entry still names — or holds, with a placement it cannot use (G-held) — and drains
+//!   one no class names at all. With nothing queued it reads no record at all (a guard).
+//! - **H** the reads run source before destination for reconstruction too: a publication landing
+//!   between its two reads must not drain the chunk either.
+//! - **I** an unreadable staged record holds back every drain reconstruction would otherwise make,
+//!   the same rule leg E gives GC and restore.
+//! - **J** once a published chunk's lost fragment has been moved by reconstruction, scrub and
+//!   reconstruction settle: scrub checks the chunk where the committed map now places it, not at
+//!   the empty position the upload's leftover part record still names, and the committed chunk's
+//!   obligation is discharged as on base (J-discharge).
 //!
-//! Nothing here names a symbol the fix adds: every type, function and string it uses is on
-//! `main` already.
+//! Legs A-F name no symbol the fix adds; every type, function and string they use is on `main`
+//! already. Legs G-J do: they build a `ReconstructionContext`, whose two new fields (`clock`,
+//! `staged_write_window_millis`) do not exist on the red leg's base — which is why they live
+//! here, in a MODIFIED file C4-verify reverts along with the production change, rather than in
+//! the new `staged_scrub.rs` (brief §Verification posture).
 
 #![forbid(unsafe_code)]
 
@@ -61,11 +79,13 @@ use wyrd_core::multipart::{
     parse_part_key, parse_sidx_key, part_key, part_range, sidx_key, sidx_range, OwnedEntry,
     PartNumber, StagedPlacement, UploadId, MPU_PREFIX, PART_PREFIX, SIDX_PREFIX,
 };
-use wyrd_core::repair::repair_key;
+use wyrd_core::placement::Topology;
+use wyrd_core::repair::{enqueue_repair, repair_key};
+use wyrd_core::write::encode_ec_fragment;
 use wyrd_custodian::{
     mark_orphaned, reconcile_after_restore, reconcile_step, set_lifecycle, Custodian,
     DServerLifecycle, ExpiredPendingPolicy, FencedZone, GcContext, ReconcileError, Reconciled,
-    RestoreReport, ScrubContext,
+    ReconstructionContext, RestoreReport, ScrubContext,
 };
 use wyrd_traits::{
     page_cursor, page_limit, page_start, BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId,
@@ -176,6 +196,12 @@ impl Meta {
     /// Whether `key` is present, looked up around the read log.
     fn holds(&self, key: &[u8]) -> bool {
         self.kv.lock().unwrap().contains_key(key)
+    }
+
+    /// `key`'s current value, looked up around the read log — for a byte-identical check
+    /// (leg G/H: reconstruction must not touch a record it only kept an obligation over).
+    fn value(&self, key: &[u8]) -> Option<Bytes> {
+        self.kv.lock().unwrap().get(key).cloned()
     }
 
     /// Every key under `prefix`, looked up around the read log.
@@ -477,6 +503,41 @@ async fn restore_pass(meta: &Meta, d: &[Disk; 4]) -> Result<RestoreReport> {
         expired_pending: ExpiredPendingPolicy::Defer,
     };
     reconcile_after_restore(&ctx, NOW).await
+}
+
+/// Servers `0`..`3`, each its own failure domain (`A`..`D`), so a repair has somewhere to put a
+/// rebuilt fragment (leg J). Legs G-I never get as far as choosing one.
+fn four_domains() -> Topology {
+    let mut topology = Topology::default();
+    topology
+        .register(0, "A")
+        .register(1, "B")
+        .register(2, "C")
+        .register(3, "D");
+    topology
+}
+
+/// One reconstruction pass through the fenced control point, at `now`. `clock` and
+/// `staged_write_window_millis` are the seam #814 reads (Scope item 3); this pass reads neither,
+/// but the clock still reads `now` itself, so the seam and the pass's own `now_millis` are one
+/// source (ADR-0009) — never a wall clock beside a fixed logical instant.
+async fn reconstruction_pass(
+    meta: &Meta,
+    d: &[Disk; 4],
+    now: u64,
+) -> std::result::Result<Reconciled, ReconcileError> {
+    let (zone, custodian) = elect().await;
+    let fleet = fleet(d);
+    let topology = four_domains();
+    let ctx = ReconstructionContext {
+        meta,
+        fleet: &fleet,
+        topology: &topology,
+        unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(now),
+        staged_write_window_millis: 0,
+    };
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now).await
 }
 
 // ---- the records --------------------------------------------------------------------------------
@@ -833,6 +894,7 @@ fn named_on_audit_seam(target: &str, record: &[u8]) -> bool {
 
 const GC_AUDIT: &str = "wyrd.custodian.gc.audit";
 const RESTORE_AUDIT: &str = "wyrd.custodian.restore.audit";
+const RECONSTRUCTION_AUDIT: &str = "wyrd.custodian.reconstruction.audit";
 
 // ---- (A) GC protects both staged classes, in every session state --------------------------------
 
@@ -2128,44 +2190,59 @@ struct Answers {
 }
 
 async fn scrub_answers(meta: &Meta, d: &[Disk; 4], label: &str) -> Answers {
+    scrub_result(meta, d)
+        .await
+        .unwrap_or_else(|fault| panic!("scrub returned Err over {label}: {fault}"))
+}
+
+/// [`scrub_answers`]'s fallible twin: scrub now genuinely reads a session's committed `part:`
+/// records (0016 decision 2, split from #663), so a store fault under that read propagates as
+/// `Err` — this leg needs both outcomes over one sweep.
+async fn scrub_result(meta: &Meta, d: &[Disk; 4]) -> std::result::Result<Answers, ReconcileError> {
     let (zone, custodian) = elect().await;
     let fleet = fleet(d);
     let scrub = ScrubContext {
         meta,
         fleet: &fleet,
     };
-    let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, NOW)
-        .await
-        .unwrap_or_else(|fault| panic!("scrub returned Err over {label}: {fault}"));
-    Answers {
+    let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, NOW).await?;
+    Ok(Answers {
         scrub: scrubbed,
         repairs: meta.keys_under(b"repair:"),
-    }
+    })
 }
 
-/// **(F)** Scrub (`reconcile_step` with a `ScrubContext`) answers over a store holding upload
-/// records exactly as over the same store without them — the same `Reconciled`, the same
-/// `repair:` key for the missing chunk — with the upload records healthy, with each (E)(i)
-/// damaged record in place, and with each (E)(iii) store fault armed; and it issues no read under
-/// `mpu:`, `sidx:` or `part:`. A consumer that does not yet act on staged bytes inherits neither
-/// their reads, nor their damage, nor their faults.
+/// **(F)** Scrub (`reconcile_step` with a `ScrubContext`) now reads a session's committed
+/// `part:` records too (0016 decision 2, `0016:824-825`, split from #663) — checking the
+/// fragments they place exactly as it already checks a committed chunk map's — but **never**
+/// an owned `sidx:` entry: that guard is unconditional, over every one of leg F's fixtures,
+/// healthy or damaged. What differs is the ANSWER, split into three groups matching what the
+/// upload records do to scrub's own reading, never to the base committed objects beside them:
 ///
-/// A guard: green on base.
+/// - **no effect** (`Healthy`, `OwnedKeyNamingNoChunk`, `OwnedRangeFails`): scrub answers
+///   exactly as over the same store without any upload records — the committed part's
+///   fragment is intact, or the damage sits only in the `sidx:` half scrub never reads;
+/// - **`Blocked`** (`UndecodablePart`, `UnparsablePartKey`, `SessionKeyNamingNoUpload`): a
+///   committed part record, or the session key naming its range, could not be read — scrub
+///   still enqueues the base repair (leg A's rule: one damaged record contains, it does not
+///   abort), but refuses to certify the store, `emit_unscrubbable_staged`'s rule
+///   (`scrub.rs:266-283`);
+/// - **`Err`** (`SessionListingFails`, `PartRangeFails`): a store fault under a read scrub now
+///   makes propagates, exactly as a fault under its committed `inode:` scan already does.
 ///
 /// The **drain-status** half of this leg is gone, discharged by #808 (#664's slice): that query
 /// now reads the staged class and counts a staged fragment as held (`0016:826-827`), so it no
 /// longer answers identically with and without upload records — by design. Its behaviour over
 /// them is `crates/custodian/tests/staged_drain_status.rs`; what stays here is scrub's half.
-// deferred: #663 — that slice adds upload records to scrub, and owns changing this leg.
 #[tokio::test]
-async fn scrub_does_not_read_upload_records() {
+async fn scrub_checks_committed_parts_and_never_reads_owned_entries() {
     capture_audit();
     let (without, without_disks) = f_store(None).await;
     let expected = scrub_answers(&without, &without_disks, "the store without uploads").await;
     assert_eq!(
         expected.repairs,
         vec![repair_key(F_LOST)],
-        "scrub must enqueue a repair for the missing chunk, or the comparison below compares \
+        "scrub must enqueue a repair for the missing chunk, or the comparisons below compare \
          nothing"
     );
 
@@ -2182,21 +2259,664 @@ async fn scrub_does_not_read_upload_records() {
         let (with, with_disks) = f_store(Some(uploads)).await;
         with.clear_reads();
         let label = format!("upload records {uploads:?}");
-        let answers = scrub_answers(&with, &with_disks, &label).await;
-        assert_eq!(answers, expected, "scrub answered differently with {label}");
+        let result = scrub_result(&with, &with_disks).await;
+
+        match uploads {
+            UploadRecords::Healthy
+            | UploadRecords::OwnedKeyNamingNoChunk
+            | UploadRecords::OwnedRangeFails => {
+                let answers = result
+                    .unwrap_or_else(|fault| panic!("scrub returned Err over {label}: {fault}"));
+                assert_eq!(
+                    answers, expected,
+                    "scrub answered differently with {label}, which does not touch its \
+                     committed-part reading"
+                );
+            }
+            UploadRecords::UndecodablePart
+            | UploadRecords::UnparsablePartKey
+            | UploadRecords::SessionKeyNamingNoUpload => {
+                let answers = result
+                    .unwrap_or_else(|fault| panic!("scrub returned Err over {label}: {fault}"));
+                assert_eq!(
+                    answers.repairs, expected.repairs,
+                    "scrub's enqueue over the base committed objects must be unaffected by an \
+                     unreadable staged record with {label}"
+                );
+                assert_eq!(
+                    answers.scrub,
+                    Reconciled::Blocked,
+                    "scrub must refuse to certify the store while a committed part record is \
+                     unreadable, with {label}: {answers:?}"
+                );
+            }
+            UploadRecords::SessionListingFails | UploadRecords::PartRangeFails => {
+                let fault = result.expect_err(&format!(
+                    "a store fault under a read scrub now makes must fail the pass, with {label}"
+                ));
+                assert!(
+                    matches!(fault, ReconcileError::Store(_)),
+                    "a staged-read store fault must surface as `ReconcileError::Store`, with \
+                     {label}: {fault}"
+                );
+            }
+        }
+
         let reads = with.reads();
-        assert!(!reads.is_empty(), "the read log recorded nothing");
-        let staged: Vec<&Read> = reads
+        assert!(
+            !reads.is_empty(),
+            "the read log recorded nothing, with {label}"
+        );
+        let owned: Vec<&Read> = reads
             .iter()
-            .filter(|read| {
-                [MPU_PREFIX, SIDX_PREFIX, PART_PREFIX]
-                    .iter()
-                    .any(|prefix| read.subject().starts_with(prefix))
-            })
+            .filter(|read| read.subject().starts_with(SIDX_PREFIX))
             .collect();
         assert!(
-            staged.is_empty(),
-            "scrub read upload records with {label}: {staged:?}"
+            owned.is_empty(),
+            "scrub read an owned `sidx:` entry with {label}: {owned:?}"
         );
     }
+}
+
+// ---- (G) reconstruction keeps a staged chunk's obligation ---------------------------------------
+
+/// **(G) harness:** seed whatever `seed` puts in place for `chunk` (a staged record naming it,
+/// or nothing at all), enqueue `chunk`'s own obligation by hand — standing in for scrub, which
+/// is #813's own other half, not this leg's — and run one reconstruction pass. `seed` returns
+/// the key/value pairs that must survive the pass byte-identical.
+async fn reconstruction_over_one_obligation(
+    pair: &str,
+    chunk: ChunkId,
+    seed: impl FnOnce(&Meta, &UploadId, ChunkId) -> Vec<(Vec<u8>, Bytes)>,
+) -> (
+    Meta,
+    [Disk; 4],
+    Vec<(Vec<u8>, Bytes)>,
+    std::result::Result<Reconciled, ReconcileError>,
+) {
+    let meta = Meta::new();
+    let d = disks();
+    let id = upload(pair);
+    let unchanged = seed(&meta, &id, chunk);
+    enqueue_repair(&meta, chunk, "test")
+        .await
+        .expect("seeding the obligation");
+    let outcome = reconstruction_pass(&meta, &d, NOW).await;
+    (meta, d, unchanged, outcome)
+}
+
+/// **(G)** A committed part's fragment is lost and its chunk is enqueued (`enqueue_repair`,
+/// standing in for scrub). One reconstruction pass: the obligation is still queued, the pass
+/// answers `Blocked` — as it does for a `seg:` repair it refuses (`reconstruction.rs:249-256`,
+/// `:341-358`) — no D server received a write, and the `part:` record is byte-identical (brief's
+/// leg D, split from #663).
+#[tokio::test]
+async fn reconstruction_keeps_an_obligation_a_committed_part_still_names() {
+    capture_audit();
+    let chunk: ChunkId = 0x1711;
+    let (meta, d, unchanged, outcome) =
+        reconstruction_over_one_obligation("aa", chunk, |meta, id, chunk| {
+            meta.seed(mpu_key(id), session(State::Open));
+            let value = part(&[chunk_ref(chunk, EcScheme::None, &[0])]);
+            let key = part_key(id, part_no(1));
+            meta.seed(key.clone(), value.clone());
+            // The fragment is LOST: nothing placed on server 0 — a genuine obligation, not the
+            // already-healthy duplicate finding `assess` would otherwise drain.
+            vec![(key, value)]
+        })
+        .await;
+    let outcome = outcome.expect("the reconstruction pass runs");
+
+    assert_eq!(
+        outcome,
+        Reconciled::Blocked,
+        "reconstruction must refuse to certify while a staged record — never a committed map — \
+         is the only thing naming a queued chunk: {outcome:?}"
+    );
+    assert!(
+        meta.holds(&repair_key(chunk)),
+        "reconstruction drained the obligation for a chunk a committed part record still names"
+    );
+    for (key, value) in &unchanged {
+        assert_eq!(
+            meta.value(key),
+            Some(value.clone()),
+            "reconstruction must not touch a record it only kept an obligation over"
+        );
+    }
+    for (_, store) in fleet(&d) {
+        assert!(
+            store.list_fragments().await.unwrap().is_empty(),
+            "reconstruction must not write any fragment for a staged chunk — rebuilding one is \
+             #814's, not this slice's"
+        );
+    }
+    assert!(
+        named_on_audit_seam(
+            RECONSTRUCTION_AUDIT,
+            &wyrd_traits::chunk_hex(chunk).into_bytes()
+        ),
+        "reconstruction kept the obligation without naming the chunk on its audit seam"
+    );
+}
+
+/// **(G)** The `sidx:` twin: an in-flight owned staging entry, never a committed part, names the
+/// chunk whose fragment is lost. Same rule, same result.
+#[tokio::test]
+async fn reconstruction_keeps_an_obligation_an_owned_entry_still_names() {
+    capture_audit();
+    let chunk: ChunkId = 0x1712;
+    let (meta, d, unchanged, outcome) =
+        reconstruction_over_one_obligation("ab", chunk, |meta, id, chunk| {
+            meta.seed(mpu_key(id), session(State::Open));
+            let key = sidx_key(id, part_no(2), chunk);
+            let value = owned(id, &key, EcScheme::None, &[0]);
+            meta.seed(key.clone(), value.clone());
+            // The fragment is LOST: nothing placed on server 0.
+            vec![(key, value)]
+        })
+        .await;
+    let outcome = outcome.expect("the reconstruction pass runs");
+
+    assert_eq!(
+        outcome,
+        Reconciled::Blocked,
+        "reconstruction must refuse to certify while a staged record — never a committed map — \
+         is the only thing naming a queued chunk: {outcome:?}"
+    );
+    assert!(
+        meta.holds(&repair_key(chunk)),
+        "reconstruction drained the obligation for a chunk an owned staging entry still names"
+    );
+    for (key, value) in &unchanged {
+        assert_eq!(
+            meta.value(key),
+            Some(value.clone()),
+            "reconstruction must not touch a record it only kept an obligation over"
+        );
+    }
+    for (_, store) in fleet(&d) {
+        assert!(
+            store.list_fragments().await.unwrap().is_empty(),
+            "reconstruction must not write any fragment for a staged chunk — rebuilding one is \
+             #814's, not this slice's"
+        );
+    }
+}
+
+/// **(G) control:** an obligation for a chunk that no committed map and no staged record names
+/// still drains, and the pass answers `Satisfied` — proving legs G's two positives above are
+/// about the record, not about reconstruction refusing to drain anything at all.
+#[tokio::test]
+async fn reconstruction_drains_an_obligation_no_class_names() {
+    capture_audit();
+    let chunk: ChunkId = 0x1713;
+    let (meta, _d, _unchanged, outcome) =
+        reconstruction_over_one_obligation("ac", chunk, |_meta, _id, _chunk| Vec::new()).await;
+    let outcome = outcome.expect("the reconstruction pass runs");
+
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "an obligation no committed map and no staged record names must still drain: {outcome:?}"
+    );
+    assert!(
+        !meta.holds(&repair_key(chunk)),
+        "reconstruction kept an obligation nothing names — the control proves nothing if it \
+         does not drain"
+    );
+}
+
+/// **(G-held) harness:** an `Open` session whose one staged record, `record` seeds, names RS(2,1)
+/// `chunk` on only `[0, 1]` — readable, but the wrong length, so the staged reading HOLDS the
+/// chunk (`StagedSet::held`) rather than placing it. It still names the chunk: one pass keeps the
+/// obligation, answers `Blocked`, writes nothing and leaves the record byte-identical.
+async fn reconstruction_keeps_a_held_chunks_obligation(
+    pair: &str,
+    chunk: ChunkId,
+    record: impl FnOnce(&Meta, &UploadId, ChunkId) -> (Vec<u8>, Bytes),
+) {
+    let (meta, d, unchanged, outcome) =
+        reconstruction_over_one_obligation(pair, chunk, |meta, id, chunk| {
+            meta.seed(mpu_key(id), session(State::Open));
+            vec![record(meta, id, chunk)]
+        })
+        .await;
+    let outcome = outcome.expect("the reconstruction pass runs");
+
+    assert_eq!(
+        outcome,
+        Reconciled::Blocked,
+        "a staged record that names the chunk without a usable placement still names it: \
+         {outcome:?}"
+    );
+    assert!(
+        meta.holds(&repair_key(chunk)),
+        "reconstruction discarded the obligation for a chunk a staged record holds"
+    );
+    for (key, value) in &unchanged {
+        assert_eq!(
+            meta.value(key),
+            Some(value.clone()),
+            "reconstruction must not touch a record it only kept an obligation over"
+        );
+    }
+    for (_, store) in fleet(&d) {
+        assert!(
+            store.list_fragments().await.unwrap().is_empty(),
+            "reconstruction must not write any fragment for a staged chunk"
+        );
+    }
+}
+
+/// **(G-held)** A committed part record holds the chunk.
+#[tokio::test]
+async fn reconstruction_keeps_an_obligation_a_held_part_record_names() {
+    capture_audit();
+    reconstruction_keeps_a_held_chunks_obligation("b3", 0x1714, |meta, id, chunk| {
+        let key = part_key(id, part_no(1));
+        let value = part(&[chunk_ref(chunk, RS_2_1, &[0, 1])]);
+        meta.seed(key.clone(), value.clone());
+        (key, value)
+    })
+    .await;
+}
+
+/// **(G-held)** The `sidx:` twin: an owned staging entry holds the chunk.
+#[tokio::test]
+async fn reconstruction_keeps_an_obligation_a_held_owned_entry_names() {
+    capture_audit();
+    reconstruction_keeps_a_held_chunks_obligation("b4", 0x1715, |meta, id, chunk| {
+        let key = sidx_key(id, part_no(2), chunk);
+        let value = owned(id, &key, RS_2_1, &[0, 1]);
+        meta.seed(key.clone(), value.clone());
+        (key, value)
+    })
+    .await;
+}
+
+/// **(Empty queue)** With nothing queued, a reconstruction pass reads no `mpu:`, `sidx:`, `part:`
+/// or `inode:` key and answers `Satisfied` — here over a store where every one of those reads
+/// would fault. Nothing is owed, so the staged read has no drain to protect (`reconstruction.rs`'s
+/// empty-queue branch). A guard, green on base: base reads no staged record at all.
+#[tokio::test]
+async fn an_empty_queue_reads_no_staged_record_and_answers_satisfied() {
+    capture_audit();
+    let meta = Meta::new();
+    let d = disks();
+    let id = upload("b5");
+    meta.seed(mpu_key(&id), session(State::Open));
+    meta.seed(
+        part_key(&id, part_no(1)),
+        part(&[chunk_ref(0x1751, EcScheme::None, &[0])]),
+    );
+    let prefixes: [&[u8]; 4] = [MPU_PREFIX, SIDX_PREFIX, PART_PREFIX, b"inode:"];
+    for prefix in prefixes {
+        meta.fail_reads_of(prefix);
+    }
+
+    let outcome = reconstruction_pass(&meta, &d, NOW)
+        .await
+        .expect("an empty queue reads nothing, so no read of it can fault");
+
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "nothing was owed: {outcome:?}"
+    );
+    let reads: Vec<Read> = meta
+        .reads()
+        .into_iter()
+        .filter(|read| prefixes.iter().any(|p| read.subject().starts_with(p)))
+        .collect();
+    assert!(
+        reads.is_empty(),
+        "a pass with an empty queue read staged or committed records: {reads:?}"
+    );
+}
+
+// ---- (H) source before destination, for reconstruction too --------------------------------------
+
+/// **(H)** A publication — ONE batch writing the committed inode and deleting the `part:`
+/// record it replaces (`0016:793-800`) — lands right after reconstruction's own, one and only,
+/// `inode:` scan returns. The obligation must not drain: this pass's staged reading, taken
+/// BEFORE that scan (`reconstruction.rs`'s own read order), still saw the chunk as a committed
+/// part's; a pass that read `inode:` first would see it in neither class.
+///
+/// Seeded with the chunk's fragment LOST — a genuine obligation, not an intact staged chunk:
+/// #814 drains an intact one as a duplicate finding, and this leg must stay green after it
+/// (brief's leg E, split from #663).
+#[tokio::test]
+async fn reconstruction_keeps_an_obligation_across_a_publication_between_its_reads() {
+    capture_audit();
+    let meta = Meta::new();
+    let d = disks();
+    let id = upload("ad");
+    let chunk: ChunkId = 0x1721;
+    let completing = session(State::Completing);
+    meta.seed(mpu_key(&id), completing.clone());
+    let placed = chunk_ref(chunk, EcScheme::None, &[2]);
+    meta.seed(
+        part_key(&id, part_no(1)),
+        part(std::slice::from_ref(&placed)),
+    );
+    // The fragment is LOST: nothing placed on server 2.
+    enqueue_repair(&meta, chunk, "test")
+        .await
+        .expect("seeding the obligation");
+
+    let published = InodeRecord {
+        size: placed.len,
+        chunk_map: vec![placed].into(),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    };
+    let publish = WriteBatch::new()
+        .require(mpu_key(&id), completing)
+        .require_absent(inode_key(PUBLISHED))
+        .require_absent(dirent_key(PARENT, OBJECT))
+        .put(inode_key(PUBLISHED), metadata::encode(&published))
+        .put(
+            dirent_key(PARENT, OBJECT),
+            metadata::encode(&DirentRecord { inode: PUBLISHED }),
+        )
+        .put(mpu_key(&id), session(State::Completed))
+        .delete(part_key(&id, part_no(1)));
+    let triggers: [&[u8]; 1] = [b"inode:"];
+    meta.hook(&triggers, 1, publish);
+
+    let outcome = reconstruction_pass(&meta, &d, NOW)
+        .await
+        .expect("the reconstruction pass runs");
+
+    assert_eq!(
+        outcome,
+        Reconciled::Blocked,
+        "a publication landing right after reconstruction's first `inode:` read got the chunk \
+         drained — a pass that read `inode:` before the staged classes sees it in neither: \
+         {outcome:?}"
+    );
+    assert!(
+        meta.holds(&repair_key(chunk)),
+        "reconstruction drained the obligation for a chunk a publication moved mid-pass"
+    );
+    assert_eq!(
+        meta.hook_outcomes(),
+        vec![Some(CommitOutcome::Committed)],
+        "the publication never landed during the pass, so the handoff was not exercised"
+    );
+    for (_, store) in fleet(&d) {
+        assert!(
+            store.list_fragments().await.unwrap().is_empty(),
+            "reconstruction must not write any fragment for a staged chunk — rebuilding one is \
+             #814's, not this slice's"
+        );
+    }
+}
+
+// ---- (I) an unreadable staged record holds back every drain -------------------------------------
+
+/// **(I)** One `part:` record that will not decode. An obligation for a chunk that NO class
+/// names at all is NOT drained while it is in place, and the pass answers `Blocked` — the
+/// existing rule for an unreadable committed object (`reconstruction.rs:322-339`), applied to
+/// the staged read (brief's leg F, split from #663): "I could not read a record" never counts
+/// as "no record names it".
+#[tokio::test]
+async fn an_unreadable_staged_record_holds_back_every_drain() {
+    capture_audit();
+    let meta = Meta::new();
+    let d = disks();
+    let id = upload("ae");
+    meta.seed(mpu_key(&id), session(State::Open));
+    let key = part_key(&id, part_no(2));
+    let value = b"{\"chunks\":\"not a chunk list\"}";
+    assert!(decode_part_record(value).is_err());
+    meta.seed(key.clone(), Bytes::from_static(value));
+
+    // An obligation for a chunk NO class names at all — what this leg proves stays held back
+    // while a DIFFERENT record's damage leaves the staged reading with a hole in it.
+    let orphaned: ChunkId = 0x1731;
+    enqueue_repair(&meta, orphaned, "test")
+        .await
+        .expect("seeding the obligation");
+
+    let outcome = reconstruction_pass(&meta, &d, NOW)
+        .await
+        .expect("an unreadable staged record is contained, never an Err");
+
+    assert_eq!(
+        outcome,
+        Reconciled::Blocked,
+        "reconstruction must refuse to certify while a staged record is unreadable: {outcome:?}"
+    );
+    assert!(
+        meta.holds(&repair_key(orphaned)),
+        "reconstruction drained an obligation no class names while a staged record was \
+         unreadable — 'I could not read a record' is not 'no record names it'"
+    );
+    let name = String::from_utf8(key).expect("a `part:` key is ASCII");
+    assert!(
+        named_on_audit_seam(RECONSTRUCTION_AUDIT, name.as_bytes()),
+        "reconstruction withheld every drain over the unreadable staged record {name} without \
+         naming it on its audit seam"
+    );
+}
+
+/// **(I)** The same unreadable `part:` record, but the `inode:` read that follows the staged one
+/// FAILS. The pass ends with `Err` — a store fault under the committed read is never contained
+/// (`reconstruction.rs:read_committed`) — and the unreadable staged record must STILL be named on
+/// the audit seam: the attribution is emitted the moment the staged reading returns, ahead of any
+/// further fallible read, exactly as `read_committed` names each unreadable object where it is met
+/// (`gc.rs:155-166`). A genuinely corrupt staged record has no repair path and no operator tooling
+/// yet (#694), so its name is the operator's whole situational awareness, and a transient
+/// `inode:`-store fault one statement later must not be what costs it.
+#[tokio::test]
+async fn an_unreadable_staged_record_is_named_even_when_the_committed_read_then_faults() {
+    capture_audit();
+    let meta = Meta::new();
+    let d = disks();
+    let id = upload("af");
+    meta.seed(mpu_key(&id), session(State::Open));
+    let key = part_key(&id, part_no(2));
+    let value = b"{\"chunks\":\"not a chunk list\"}";
+    assert!(decode_part_record(value).is_err());
+    meta.seed(key.clone(), Bytes::from_static(value));
+
+    // Something owed, so the pass reads at all (an empty queue reads nothing).
+    let orphaned: ChunkId = 0x1741;
+    enqueue_repair(&meta, orphaned, "test")
+        .await
+        .expect("seeding the obligation");
+    // The committed read is next after the staged one, and it fails.
+    meta.fail_reads_of(b"inode:");
+
+    let fault = reconstruction_pass(&meta, &d, NOW)
+        .await
+        .expect_err("a store fault under the committed read must fail the pass");
+    let ReconcileError::Store(store_fault) = &fault else {
+        panic!("a store fault must surface as `ReconcileError::Store`: {fault}");
+    };
+    assert!(
+        store_fault.to_string().contains(INJECTED_FAULT),
+        "the failure must wrap the store's own error: {store_fault}"
+    );
+    assert!(
+        meta.holds(&repair_key(orphaned)),
+        "a pass that failed drained nothing, so the obligation must still be queued"
+    );
+    let name = String::from_utf8(key).expect("a `part:` key is ASCII");
+    assert!(
+        named_on_audit_seam(RECONSTRUCTION_AUDIT, name.as_bytes()),
+        "the unreadable staged record {name} was found and then lost: the `inode:` fault ended the \
+         pass before its name reached the audit seam, so the operator has no record to go and \
+         repair"
+    );
+}
+
+// ---- (J) after publication, scrub and reconstruction settle on the committed placement ---------
+
+/// **(J)** Scrub and reconstruction stop undoing each other once a published chunk's fragment has
+/// moved. An upload has published RS(2,1) chunk `chunk`: its committed inode and its `part:`
+/// record, kept until the retirement drain, both place it on servers 3, 1 and 2. Fragment 0 is
+/// then lost from server 3, which stays up.
+///
+/// Round 1 is production end to end: scrub finds the loss and enqueues the chunk; reconstruction
+/// rebuilds fragment 0 and re-places it on server 0 (servers 1 and 2 hold domains B and C, and
+/// the selector takes free domain A before D), repointing the committed inode. Nothing updates
+/// the part record, which now names an empty position. Every later round must settle: scrub
+/// answers `Satisfied` with nothing queued, and reconstruction has nothing left to do. A scrub
+/// that also checked the part record's placement would enqueue the chunk every round and
+/// reconstruction would find it whole and drain it every round, so scrub would never again
+/// answer `Satisfied` while the part record lived.
+///
+/// **J-discharge:** the committed chunk's obligation is discharged as on base, whatever the
+/// leftover part record (byte-identical throughout) names: the repair deletes it in its repoint
+/// commit, and a later duplicate obligation for the whole chunk drains with the pass `Satisfied`
+/// and nothing written. A guard, green on base; it goes red on a reconstruction that keeps every
+/// obligation a staged record names, committed chunk or not.
+#[tokio::test]
+async fn scrub_and_reconstruction_settle_after_a_published_chunk_is_moved() {
+    capture_audit();
+    let meta = Meta::new();
+    let d = disks();
+    let id = upload("ae");
+    let chunk: ChunkId = 0x1741;
+    let placed = chunk_ref(chunk, RS_2_1, &[3, 1, 2]);
+    meta.seed(mpu_key(&id), session(State::Completed));
+    let leftover = part(std::slice::from_ref(&placed));
+    meta.seed(part_key(&id, part_no(1)), leftover.clone());
+    let published = InodeRecord {
+        size: placed.len,
+        chunk_map: vec![placed].into(),
+        state: InodeState::Committed,
+        version: 1,
+        ..Default::default()
+    };
+    meta.seed(inode_key(PUBLISHED), metadata::encode(&published));
+    // Real RS(2,1) fragments of the chunk's 5 bytes (`chunk_ref`'s `len`) on servers 1 and 2;
+    // fragment 0 is lost from server 3.
+    let shards = wyrd_core::erasure::encode(2, 1, b"moved").expect("RS(2,1) encodes");
+    for index in [1_u16, 2] {
+        let bytes = encode_ec_fragment(chunk, index, 2, 1, &shards[usize::from(index)]);
+        d[usize::from(index)]
+            .put_fragment(frag(chunk, index), bytes, None)
+            .await
+            .unwrap();
+    }
+
+    // Round 1: scrub finds the loss, and reconstruction moves the fragment.
+    assert_eq!(
+        scrub_answers(&meta, &d, "the published chunk's lost fragment").await,
+        Answers {
+            scrub: Reconciled::Changed,
+            repairs: vec![repair_key(chunk)],
+        },
+        "scrub must enqueue the published chunk's lost fragment, or nothing below is exercised"
+    );
+    let repaired = reconstruction_pass(&meta, &d, NOW)
+        .await
+        .expect("the reconstruction pass runs");
+    assert_eq!(
+        repaired,
+        Reconciled::Changed,
+        "reconstruction must rebuild the published chunk"
+    );
+    let moved: InodeRecord = metadata::decode(
+        &meta
+            .value(&inode_key(PUBLISHED))
+            .expect("the published inode"),
+    )
+    .expect("the repointed inode decodes");
+    assert_eq!(
+        moved.chunk_map.as_flat().expect("a flat chunk map")[0].placement,
+        vec![0, 1, 2],
+        "reconstruction must move fragment 0 to server 0, or the part record's position is not \
+         left empty and this leg tests nothing"
+    );
+    assert!(
+        on_disk(&d, 0, frag(chunk, 0)) && !on_disk(&d, 3, frag(chunk, 0)),
+        "the rebuilt fragment must be on server 0 and nothing on server 3"
+    );
+    assert_eq!(
+        meta.value(&part_key(&id, part_no(1))),
+        Some(leftover.clone()),
+        "the part record is a leftover nothing updates: it still names server 3"
+    );
+    // (J-discharge, i) the repair discharged the obligation in its own repoint commit, although
+    // a staged record still names the chunk: a committed chunk is settled against its committed
+    // map alone.
+    assert!(
+        wyrd_core::repair::queued_repairs(&meta)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the committed repair must discharge the chunk's obligation whatever a leftover part \
+         record names"
+    );
+
+    // Every later round settles.
+    for round in 2..=3 {
+        assert_eq!(
+            scrub_answers(&meta, &d, "the moved chunk").await,
+            Answers {
+                scrub: Reconciled::Satisfied,
+                repairs: Vec::new(),
+            },
+            "round {round}: scrub checked the published chunk at the empty position its leftover \
+             part record names, though the committed map places it on server 0, where it is \
+             intact"
+        );
+        let settled = reconstruction_pass(&meta, &d, NOW)
+            .await
+            .expect("the reconstruction pass runs");
+        assert_eq!(
+            settled,
+            Reconciled::Satisfied,
+            "round {round}: reconstruction had nothing queued, so it must answer `Satisfied`"
+        );
+        assert_eq!(
+            meta.value(&part_key(&id, part_no(1))),
+            Some(leftover.clone()),
+            "round {round}: the leftover part record must be left byte-identical"
+        );
+    }
+
+    // (J-discharge, ii) a duplicate obligation for the whole committed chunk — a health report's
+    // — drains as on base, with nothing written: the leftover part record neither keeps it nor
+    // blocks the pass.
+    enqueue_repair(&meta, chunk, "test")
+        .await
+        .expect("seeding the duplicate obligation");
+    let contents = |d: &[Disk; 4]| -> Vec<HashMap<FragmentId, Bytes>> {
+        d.iter()
+            .map(|disk| disk.frags.lock().unwrap().clone())
+            .collect()
+    };
+    let before = contents(&d);
+    let drained = reconstruction_pass(&meta, &d, NOW)
+        .await
+        .expect("the reconstruction pass runs");
+    assert_eq!(
+        drained,
+        Reconciled::Satisfied,
+        "a whole committed chunk's obligation is discharged by its committed map, whatever a \
+         leftover part record names: {drained:?}"
+    );
+    assert!(
+        wyrd_core::repair::queued_repairs(&meta)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the duplicate obligation for a whole committed chunk must drain"
+    );
+    assert!(
+        contents(&d) == before,
+        "draining a whole chunk's duplicate obligation must write no fragment"
+    );
+    assert_eq!(
+        meta.value(&part_key(&id, part_no(1))),
+        Some(leftover),
+        "the leftover part record must be left byte-identical"
+    );
 }
