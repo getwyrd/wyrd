@@ -22,6 +22,12 @@ wyrd-core.workspace = true
 # consumers that already name `DurabilityTelemetry`/`ExporterConfig`.
 tracing.workspace = true
 wyrd-telemetry.workspace = true
+# The Clock seam (ADR-0009/ADR-0024): `ReconstructionContext::clock` is a
+# `dyn wyrd_testkit::Clock`, the seam #814 reads a staged re-place's write-window
+# deadline through — a normal dependency because the field is on a struct this crate's
+# own production code (`reconstruction.rs`) declares, not a test-only composition (the
+# same reason `wyrd-chunkstore-fs` takes it, `crates/chunkstore-fs/Cargo.toml:14-19`).
+wyrd-testkit.workspace = true
 
 [dev-dependencies]
 # The telemetry read-back tests install the metrics bridge on a `tracing` subscriber
@@ -31,7 +37,6 @@ tracing-subscriber.workspace = true
 # In-memory coordination concrete to exercise leader election + fencing in-process
 # (a test/dev composition may name a concrete — ADR-0010).
 wyrd-coordination-mem.workspace = true
-wyrd-testkit.workspace = true
 tokio.workspace = true
 # In-memory trait stores for the GC loop's in-process test (the loop is proven over
 # the `MetadataStore`/`ChunkStore` seams, backend-agnostic).

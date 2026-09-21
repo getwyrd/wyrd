@@ -122,6 +122,52 @@ const GC_GRACE_WINDOW_MILLIS: u64 = crate::cli::LEASE_TTL_MILLIS;
 // fails the build.
 const _: () = assert!(wyrd_custodian::gc::LATE_WRITE_DEADLINE_MILLIS < GC_GRACE_WINDOW_MILLIS);
 
+/// The staged-write window `ReconstructionContext::staged_write_window_millis` feeds
+/// [`wyrd_custodian::reconstruction`] (issue #814 is its first reader; this slice only fills
+/// the seam, `reconstruction.rs`'s own field doc). Reuses GC's own `W_write`
+/// ([`wyrd_custodian::gc::W_WRITE_MILLIS`]) rather than a second definition — proposal 0016
+/// requires `G_orphan > W_repoint + W_write + δ_clock` (`0016:1348`), and #800's late-write
+/// deadline is already held against [`GC_GRACE_WINDOW_MILLIS`] above; a second `W_write`
+/// constant here could drift from the one the sweep actually honours.
+const STAGED_WRITE_WINDOW_MILLIS: u64 = wyrd_custodian::gc::W_WRITE_MILLIS;
+
+/// The run loop's **one** time source, in both shapes its readers take: the `now_millis` each
+/// pass is handed, and [`ReconstructionContext::clock`] (ADR-0009, ADR-0024 — every clock read
+/// that decides one lifecycle's correctness shares a single source). It **owns** the caller's
+/// clock closure, so the loop has no other way to read time and the seam cannot drift onto a
+/// second source: a caller that drives the loop from a logical clock (the day-one tests' fixed
+/// `|| 500`) gets that same logical clock behind the seam, and the deployed role's wall clock
+/// (`cli.rs` `wall_clock_millis`) is the wall clock on both.
+///
+/// Each read calls the closure once, exactly as the bare `clock()` calls it replaces did, so the
+/// seam moves between two reads inside one pass the way the closure does. A snapshot taken once
+/// per pass would not: a write-window deadline #814 checks through the seam could then never
+/// expire mid-pass, however long the write took.
+struct LoopClock<F>(std::sync::Mutex<F>);
+
+impl<F: FnMut() -> u64> LoopClock<F> {
+    fn new(clock: F) -> Self {
+        Self(std::sync::Mutex::new(clock))
+    }
+
+    /// The closure's next reading.
+    fn now_millis(&self) -> u64 {
+        // A poisoned lock only means an earlier read panicked; the closure holds no invariant
+        // a panic could leave half-updated, so keep reading it.
+        let mut clock = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (*clock)()
+    }
+}
+
+impl<F: FnMut() -> u64 + Send> wyrd_testkit::Clock for LoopClock<F> {
+    fn now_millis(&self) -> u64 {
+        LoopClock::now_millis(self)
+    }
+}
+
 /// A configured D-server the role was told to maintain over: its stable [`DServerId`],
 /// its opaque failure-domain label, and the connected [`ChunkStore`] client. The role
 /// probes each one's reachability every pass ([`live_reconstruction_view`]) and hands the
@@ -452,7 +498,8 @@ impl CustodianService {
     ///
     /// This is the production wiring the day-one runbook exercises: kill a D-server, watch
     /// the under-replicated gauge rise then return to zero, through a role that does not
-    /// exit on the kill. `now_millis` is advanced by the caller's wall `clock`.
+    /// exit on the kill. `now_millis` is advanced by the caller's wall `clock`, which is also
+    /// the clock the reconstruction pass's `ReconstructionContext::clock` reads (`LoopClock`).
     ///
     /// `operator_fleet_size` is the number of D-server endpoints the OPERATOR wired
     /// (`--endpoints`), which the caller must pass separately from `configured`: `connect_fleet`
@@ -480,14 +527,19 @@ impl CustodianService {
         operator_fleet_size: usize,
         expired_pending: ExpiredPendingPolicy,
         interval: Duration,
-        mut clock: Clock,
+        clock: Clock,
         shutdown: Fut,
     ) -> Result<(), ReconcileError>
     where
         Fut: Future<Output = ()>,
-        Clock: FnMut() -> u64,
+        Clock: FnMut() -> u64 + Send,
     {
         tokio::pin!(shutdown);
+        // The caller's clock, moved into the one `LoopClock` every pass reads: each pass's
+        // `now_millis` below and `ReconstructionContext::clock` are two views of this one source,
+        // never a wall clock beside a logical one. Nothing reads the context's field yet (#814 is
+        // its first reader).
+        let clock = LoopClock::new(clock);
         loop {
             let (fleet, topology, unreachable) = live_reconstruction_view(configured).await;
             // DERIVE this pass's repair obligations from the committed (gateway-written)
@@ -515,6 +567,8 @@ impl CustodianService {
                 // The servers dropped as unreachable this pass: `assess` treats their placed
                 // fragments as transiently unavailable, not confirmed lost (no false data-loss).
                 unreachable: &unreachable,
+                clock: &clock,
+                staged_write_window_millis: STAGED_WRITE_WINDOW_MILLIS,
             };
             // Scrub and reconstruction run as TWO passes, not one. `reconcile_step` short-
             // circuits on the first loop's error (scrub's `?`), so a combined pass would let a
@@ -525,7 +579,15 @@ impl CustodianService {
             // enqueues (same-interval drain preserved). Scrub therefore runs BEST-EFFORT: its
             // store fault is logged and reconstruction proceeds; a superseded term still stops.
             match self
-                .reconcile_pass(zone, custodian, None, Some(&scrub_ctx), None, None, clock())
+                .reconcile_pass(
+                    zone,
+                    custodian,
+                    None,
+                    Some(&scrub_ctx),
+                    None,
+                    None,
+                    clock.now_millis(),
+                )
                 .await
             {
                 Ok(_) => {}
@@ -539,7 +601,15 @@ impl CustodianService {
             // Reconstruction pass — drains the shared repair queue (what scrub just enqueued
             // plus any prior backlog), independent of a scrub blip.
             match self
-                .reconcile_pass(zone, custodian, None, None, Some(&ctx), None, clock())
+                .reconcile_pass(
+                    zone,
+                    custodian,
+                    None,
+                    None,
+                    Some(&ctx),
+                    None,
+                    clock.now_millis(),
+                )
                 .await
             {
                 Ok(_) => {}
@@ -616,7 +686,15 @@ impl CustodianService {
                     expired_pending,
                 };
                 match self
-                    .reconcile_pass(zone, custodian, Some(&gc_ctx), None, None, None, clock())
+                    .reconcile_pass(
+                        zone,
+                        custodian,
+                        Some(&gc_ctx),
+                        None,
+                        None,
+                        None,
+                        clock.now_millis(),
+                    )
                     .await
                 {
                     Ok(_) => {}
@@ -648,5 +726,36 @@ impl CustodianService {
                 _ = tokio::time::sleep(interval) => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The run loop's two kinds of clock read take turns on ONE sequence: a pass's `now_millis`
+    /// and a read through the `wyrd_testkit::Clock` seam `ReconstructionContext::clock` holds
+    /// each take the caller closure's next value. A second source behind the seam (a wall clock
+    /// beside a logical closure), or a reading cached once per pass, breaks the sequence at the
+    /// seam read.
+    #[test]
+    fn the_pass_clock_and_the_seam_read_one_source() {
+        let mut now = 500u64;
+        let clock = LoopClock::new(move || {
+            now += 1;
+            now
+        });
+        let seam: &(dyn wyrd_testkit::Clock + Sync) = &clock;
+        assert_eq!(clock.now_millis(), 501, "a pass's `now_millis`");
+        assert_eq!(
+            seam.now_millis(),
+            502,
+            "the seam reads the same closure, next"
+        );
+        assert_eq!(
+            clock.now_millis(),
+            503,
+            "and the next pass reads on from there"
+        );
     }
 }

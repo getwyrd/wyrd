@@ -649,6 +649,8 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reconstruction").await;
@@ -696,11 +698,14 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
         .unwrap();
 
     let (topo, healthy) = healthy_view(victim, &d);
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
+        clock: &pass_clock,
+        staged_write_window_millis: 0,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-crash").await;
@@ -751,6 +756,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
 
     // RESTART: the custodian comes back and completes to full redundancy — fully new.
     meta.disarm();
+    pass_clock.set(600);
     let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .await
         .unwrap();
@@ -821,6 +827,8 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
         fleet: &full,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(200),
+        staged_write_window_millis: 0,
     };
     let repaired = reconcile_step(&zone, &custodian, None, None, Some(&recon_ctx), None, 200)
         .await
@@ -1018,11 +1026,14 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
         .unwrap();
 
     let (topo, healthy) = healthy_view(victim, &d);
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
+        clock: &pass_clock,
+        staged_write_window_millis: 0,
     };
 
     // Two leadership terms: the first leader is deposed, the second is current. `zone`
@@ -1066,6 +1077,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
     );
 
     // Even RACING after the new leader, the deposed leader still lands nothing.
+    pass_clock.set(600);
     let raced = reconcile_step(&zone, &deposed, None, None, Some(&ctx), None, 600).await;
     assert!(raced.is_err(), "the deposed leader stays fenced");
     assert_eq!(
@@ -1091,11 +1103,14 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
         .unwrap();
 
     let (topo, healthy) = healthy_view(victim, &d);
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
+        clock: &pass_clock,
+        staged_write_window_millis: 0,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-telemetry").await;
@@ -1125,6 +1140,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
 
     // PASS 2 — repaired: the count RETURNS TO ZERO and the queue is drained.
     let settle = MetricCapture::default();
+    pass_clock.set(600);
     let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .with_subscriber(tracing_subscriber::registry().with(settle.clone()))
         .await
@@ -1196,11 +1212,14 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
             healthy.push((id, &d[id as usize] as &dyn ChunkStore));
         }
     }
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
+        clock: &pass_clock,
+        staged_write_window_millis: 0,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-midwrite").await;
@@ -1240,6 +1259,7 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
 
     // RESTART: the custodian comes back, the write completes, and the repair commits once.
     armed.store(false, Ordering::Relaxed);
+    pass_clock.set(600);
     let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
         .await
         .unwrap();
@@ -1310,6 +1330,8 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(500),
+        staged_write_window_millis: 0,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reader-race").await;
@@ -2559,8 +2581,8 @@ async fn prop_gc_orphan_walk_reaches_the_mid_walk_landing() {
     );
 }
 
-// ---- property 13: GC's staged reads across a part commit, a publication flip and its
-//      retirement drain (issue #803) ----
+// ---- property 13: the staged reads of GC **and reconstruction** across a part commit, a
+//      publication flip and its retirement drain (issues #803, #813) ----
 //
 // GC protects a multipart upload's staged bytes as a class of their own, read through each
 // session's bounded ranges in a fixed order — its owned staging entries (`sidx:`), then its
@@ -2571,20 +2593,47 @@ async fn prop_gc_orphan_walk_reaches_the_mid_walk_landing() {
 // `0016:2596`). A reading that took a destination before its source could see the chunk in
 // neither class.
 //
+// **Reconstruction reads the same two classes in the same order, and stakes the same thing on
+// it** (#813): an obligation is discarded — deleted with nothing resolved — only when NO record,
+// committed or staged, names or holds its chunk (a committed chunk's obligation is discharged
+// against its committed map, as before), so a pass that saw the chunk in neither class deletes
+// the one durable record saying it is short a fragment — and can then answer `Satisfied` over a
+// loss nothing repaired. So this property runs over BOTH loops ([`Driver`]), the same three
+// moves at the same seed-picked instants, each asserting what its own loop stands to lose.
+//
 // The per-pass legs in `crates/custodian/tests/staged_protection.rs` pin that order with a double
 // that lands each move at a scripted instant. Here a genuinely concurrent task makes all three
-// moves over the simulated-TiKV model, each at an instant the seed picks, while GC passes run back
-// to back; the chunk's fragment carries an `orphan:` mark past grace for the whole run, so its
-// protection is all that keeps it. The property: it is never reclaimed. The coverage leg proves the
-// sweep reaches, for each move, a landing between the two reads it hands protection across and a
-// landing outside them.
+// moves over the simulated-TiKV model, each at an instant the seed picks, while passes run back
+// to back. Under GC the chunk's fragment carries an `orphan:` mark past grace for the whole run,
+// so its protection is all that keeps it on disk; under reconstruction the fragment is LOST and
+// its repair obligation queued, so its protection is all that keeps the obligation. The coverage
+// leg proves the sweep reaches, for each move and each loop, a landing between the two reads it
+// hands protection across and a landing outside them.
+
+/// Which custodian loop a handoff run drives across the three moves — the two that read the
+/// staged classes and the committed namespace in one pass and decide something irreversible off
+/// the pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Driver {
+    /// GC's reclaim. The moving chunk's fragment is on disk under an `orphan:` mark past grace,
+    /// so a pass that finds it in neither class deletes the bytes.
+    Gc,
+    /// Reconstruction's drain (#813). The moving chunk's fragment is gone and its obligation is
+    /// queued, so a pass that finds it in neither class deletes the obligation — the only record
+    /// of the loss.
+    Reconstruction,
+}
 
 /// The upload whose part the concurrent task commits and publishes: 32 lowercase-hex characters.
 const HANDOFF_UPLOAD: &str = "80380380380380380380380380380380";
-/// The chunk that moves: one un-erasure-coded fragment on server 1, marked past grace all run.
+/// The chunk that moves: one un-erasure-coded fragment on server 1 — marked past grace all run
+/// under [`Driver::Gc`], absent with its repair obligation queued under
+/// [`Driver::Reconstruction`].
 const HANDOFF_CHUNK: ChunkId = 0x8030;
-/// An unprotected fragment on server 2, marked past grace: the first pass reclaims it — the
-/// positive observable that GC is reclaiming at all in this run.
+/// The control no class ever names: an unprotected fragment on server 2 marked past grace, which
+/// the first GC pass reclaims, and — under [`Driver::Reconstruction`] — a queued obligation for
+/// that same id, which the pass drains. Either way the positive observable that the loop under
+/// test is deleting at all in this run, so keeping the moving chunk proves something.
 const HANDOFF_STRAY: ChunkId = 0x8031;
 /// The inode the publication flip writes.
 const HANDOFF_INODE: InodeId = 6;
@@ -2603,7 +2652,7 @@ const HANDOFF_REPLY_MILLIS: u64 = 3;
 /// commit when it reclaims), so this spans about one pass per gap — the coverage leg below proves
 /// the landings between the reads are reached rather than assuming it.
 const HANDOFF_SPAN: u32 = 24;
-/// The most GC passes one run makes before it gives up on the concurrent task finishing.
+/// The most passes one run makes before it gives up on the concurrent task finishing.
 const HANDOFF_MAX_PASSES: usize = 64;
 
 /// The three moves, each one batch handing a chunk's protection from one class to the next.
@@ -2792,11 +2841,13 @@ fn handoff_landings(events: &[HandoffEvent], upload: &UploadId) -> HandoffLandin
     landings
 }
 
-/// One run: GC passes back to back while the concurrent task commits the part `gaps[0]` ms into
-/// the run, fences the session to `Completing` and flips `gaps[1]` ms after the commit, and drains
-/// `gaps[2]` ms after the flip, as a batch of its own. Asserts after every pass that the chunk's
-/// fragment is still on disk, and returns where each move landed.
-async fn staged_handoffs_under_gc(gaps: [u64; 3]) -> HandoffLandings {
+/// One run: `driver`'s passes back to back while the concurrent task commits the part `gaps[0]` ms
+/// into the run, fences the session to `Completing` and flips `gaps[1]` ms after the commit, and
+/// drains `gaps[2]` ms after the flip, as a batch of its own. Asserts after every pass that the
+/// moving chunk still holds what its class protects — its fragment on disk under
+/// [`Driver::Gc`], its repair obligation under [`Driver::Reconstruction`] — and returns where each
+/// move landed.
+async fn staged_handoffs_under(driver: Driver, gaps: [u64; 3]) -> HandoffLandings {
     let d = servers();
     let meta = Arc::new(HandoffMeta {
         inner: SimTikvMetadataStore::new(),
@@ -2821,14 +2872,33 @@ async fn staged_handoffs_under_gc(gaps: [u64; 3]) -> HandoffLandings {
         .await
         .unwrap();
     assert_eq!(seeded, CommitOutcome::Committed);
-    d[1].put_fragment(fragment, Bytes::from_static(b"staged"), None)
-        .await
-        .unwrap();
-    d[2].put_fragment(stray, Bytes::from_static(b"stray"), None)
-        .await
-        .unwrap();
-    mark_orphaned(&*meta, 1, fragment, 0).await.unwrap();
-    mark_orphaned(&*meta, 2, stray, 0).await.unwrap();
+    match driver {
+        // GC: the bytes are there, both positions marked past grace, so only the staged/committed
+        // protection keeps the moving chunk's fragment and nothing keeps the stray's.
+        Driver::Gc => {
+            d[1].put_fragment(fragment, Bytes::from_static(b"staged"), None)
+                .await
+                .unwrap();
+            d[2].put_fragment(stray, Bytes::from_static(b"stray"), None)
+                .await
+                .unwrap();
+            mark_orphaned(&*meta, 1, fragment, 0).await.unwrap();
+            mark_orphaned(&*meta, 2, stray, 0).await.unwrap();
+        }
+        // Reconstruction: the moving chunk's fragment is GONE — the loss an obligation exists to
+        // record — and the stray's obligation names a chunk no class ever names, so the pass
+        // drains it and proves it is draining at all. The fragment is left off disk rather than
+        // placed intact so this leg survives #814, which will rebuild an intact staged chunk and
+        // may drain its obligation as a duplicate finding.
+        Driver::Reconstruction => {
+            repair::enqueue_repair(&*meta, HANDOFF_CHUNK, "scrub")
+                .await
+                .unwrap();
+            repair::enqueue_repair(&*meta, HANDOFF_STRAY, "scrub")
+                .await
+                .unwrap();
+        }
+    }
 
     // The part record the commit writes, and the records the publication writes.
     let chunk = String::from_utf8(metadata::encode(&handoff_chunk_ref()).to_vec()).unwrap();
@@ -2931,32 +3001,66 @@ async fn staged_handoffs_under_gc(gaps: [u64; 3]) -> HandoffLandings {
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-staged-handoffs").await;
     let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    let topo = four_domains();
     let mut passes = 0;
     loop {
         // One more pass once every move has landed, so a pass reads the store the moves left.
         let finished = done.load(Ordering::Relaxed);
         meta.log(HandoffEvent::Pass);
-        let ctx = GcContext {
+        let gc = GcContext {
             meta: &*meta,
             fleet: &fleet,
             grace_window_millis: HANDOFF_GRACE,
             expired_pending: ExpiredPendingPolicy::Defer,
         };
-        let outcome =
-            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, HANDOFF_NOW).await;
+        let recon = ReconstructionContext {
+            meta: &*meta,
+            fleet: &fleet,
+            topology: &topo,
+            unreachable: &[],
+            clock: &wyrd_testkit::ManualClock::new(HANDOFF_NOW),
+            staged_write_window_millis: 0,
+        };
+        let outcome = match driver {
+            Driver::Gc => {
+                reconcile_step(&zone, &custodian, Some(&gc), None, None, None, HANDOFF_NOW).await
+            }
+            Driver::Reconstruction => {
+                reconcile_step(
+                    &zone,
+                    &custodian,
+                    None,
+                    None,
+                    Some(&recon),
+                    None,
+                    HANDOFF_NOW,
+                )
+                .await
+            }
+        };
         passes += 1;
         assert!(
             outcome.is_ok(),
-            "GC pass {passes} failed (gaps {gaps:?}): {:?}",
+            "{driver:?} pass {passes} failed (gaps {gaps:?}): {:?}",
             outcome.err()
         );
-        assert!(
-            d[1].get_fragment(fragment).await.unwrap().is_some(),
-            "GC pass {passes} reclaimed the moving chunk's fragment, which an owned staging entry, \
-             a part record or a committed inode named at every instant of the run — the pass's \
-             readings saw it in no class (gaps {gaps:?}): {:?}",
-            meta.events.lock().unwrap()
-        );
+        match driver {
+            Driver::Gc => assert!(
+                d[1].get_fragment(fragment).await.unwrap().is_some(),
+                "GC pass {passes} reclaimed the moving chunk's fragment, which an owned staging \
+                 entry, a part record or a committed inode named at every instant of the run — the \
+                 pass's readings saw it in no class (gaps {gaps:?}): {:?}",
+                meta.events.lock().unwrap()
+            ),
+            Driver::Reconstruction => assert!(
+                queued(&*meta, HANDOFF_CHUNK).await,
+                "reconstruction pass {passes} drained the moving chunk's obligation, which an owned \
+                 staging entry, a part record or a committed inode named at every instant of the \
+                 run — the pass's readings saw it in no class, so it discarded the only record that \
+                 the chunk is short a fragment (gaps {gaps:?}): {:?}",
+                meta.events.lock().unwrap()
+            ),
+        }
         if finished {
             break;
         }
@@ -2969,17 +3073,33 @@ async fn staged_handoffs_under_gc(gaps: [u64; 3]) -> HandoffLandings {
     // The run's observations end here: the reads below are the property's, not a pass's.
     let events = meta.events.lock().unwrap().clone();
 
-    // Every move landed, the chunk ends where the publication put it, and it was never reclaimed —
-    // while the unprotected stray beside it was.
-    assert!(
-        is_marked(&*meta, 1, fragment).await,
-        "the moving chunk's mark was consumed without a reclaim (gaps {gaps:?})"
-    );
-    assert!(
-        d[2].get_fragment(stray).await.unwrap().is_none(),
-        "the unprotected stray survived every pass: GC reclaimed nothing in this run, so keeping \
-         the chunk proves nothing (gaps {gaps:?})"
-    );
+    // Every move landed, the chunk ends where the publication put it, and what its class protects
+    // survived every pass — while the control beside it, which no class ever named, did not.
+    match driver {
+        Driver::Gc => {
+            assert!(
+                is_marked(&*meta, 1, fragment).await,
+                "the moving chunk's mark was consumed without a reclaim (gaps {gaps:?})"
+            );
+            assert!(
+                d[2].get_fragment(stray).await.unwrap().is_none(),
+                "the unprotected stray survived every pass: GC reclaimed nothing in this run, so \
+                 keeping the chunk proves nothing (gaps {gaps:?})"
+            );
+        }
+        Driver::Reconstruction => {
+            assert!(
+                queued(&*meta, HANDOFF_CHUNK).await,
+                "the moving chunk's obligation is gone by the end of the run (gaps {gaps:?})"
+            );
+            assert!(
+                !queued(&*meta, HANDOFF_STRAY).await,
+                "the control obligation — for a chunk no committed map and no staged record ever \
+                 named — survived every pass: reconstruction drained nothing in this run, so \
+                 keeping the moving chunk's obligation proves nothing (gaps {gaps:?})"
+            );
+        }
+    }
     assert!(
         meta.get(&metadata::inode_key(HANDOFF_INODE))
             .await
@@ -2992,28 +3112,42 @@ async fn staged_handoffs_under_gc(gaps: [u64; 3]) -> HandoffLandings {
     handoff_landings(&events, &upload)
 }
 
+/// Whether `chunk` still has a queued repair obligation, read through the production queue
+/// ([`repair::queued_repairs`]) rather than a key the test spells itself.
+async fn queued(meta: &dyn MetadataStore, chunk: ChunkId) -> bool {
+    repair::queued_repairs(meta).await.unwrap().contains(&chunk)
+}
+
 /// The campaign leg: the seed picks when each of the three moves lands, so 50 seeds sweep the
 /// schedule space around GC's staged and committed reads.
 async fn prop_gc_staged_handoffs_never_reclaim_the_chunk(rng: &mut ChaCha8Rng) {
     let gaps = [(); 3].map(|()| u64::from(rng.next_u32() % (HANDOFF_SPAN + 1)));
-    staged_handoffs_under_gc(gaps).await;
+    staged_handoffs_under(Driver::Gc, gaps).await;
 }
 
-/// **The windows this property exists for are genuinely REACHED.** Walks one spacing across the
-/// whole span — for all three moves, and again with the drain right behind the flip — asserting the
-/// property at every point. Then it asserts that each move landed between the two reads it hands
-/// protection across in at least one run and outside them in at least one other, and that in at
-/// least one run the flip and the drain both landed between the same pass's two reads: the schedule
-/// a reading that took committed inodes before part records sees the chunk in neither class.
-/// Without it, a span that drifted away from GC's reads would leave the campaign green with nothing
-/// behind it.
-async fn prop_gc_staged_handoffs_reach_between_and_outside_the_reads() {
+/// The same campaign leg over **reconstruction**'s reading of the same two classes (#813): the
+/// obligation for the moving chunk survives every schedule, and the obligation for a chunk no
+/// class names is drained.
+async fn prop_reconstruction_staged_handoffs_never_drain_the_obligation(rng: &mut ChaCha8Rng) {
+    let gaps = [(); 3].map(|()| u64::from(rng.next_u32() % (HANDOFF_SPAN + 1)));
+    staged_handoffs_under(Driver::Reconstruction, gaps).await;
+}
+
+/// **The windows this property exists for are genuinely REACHED**, for `driver`'s own reads. Walks
+/// one spacing across the whole span — for all three moves, and again with the drain right behind
+/// the flip — asserting the property at every point. Then it asserts that each move landed between
+/// the two reads it hands protection across in at least one run and outside them in at least one
+/// other, and that in at least one run the flip and the drain both landed between the same pass's
+/// two reads: the schedule a reading that took committed inodes before part records sees the chunk
+/// in neither class. Without it, a span that drifted away from a loop's reads would leave the
+/// campaign green with nothing behind it.
+async fn staged_handoffs_reach_between_and_outside_the_reads(driver: Driver) {
     let mut between = [false; 3];
     let mut outside = [false; 3];
     let mut published_within_one_window = false;
     for spacing in 0..=u64::from(HANDOFF_SPAN) {
         for drain_gap in [spacing, 0] {
-            let landed = staged_handoffs_under_gc([spacing, spacing, drain_gap]).await;
+            let landed = staged_handoffs_under(driver, [spacing, spacing, drain_gap]).await;
             for handoff in Handoff::ALL {
                 between[handoff.index()] |= landed.between(handoff);
                 outside[handoff.index()] |= landed.outside(handoff);
@@ -3024,21 +3158,30 @@ async fn prop_gc_staged_handoffs_reach_between_and_outside_the_reads() {
     for handoff in Handoff::ALL {
         assert!(
             between[handoff.index()],
-            "no spacing in 0..={HANDOFF_SPAN} ms landed the {handoff:?} between the two reads it \
-             hands protection across — the schedule this property exists for was never exercised"
+            "no spacing in 0..={HANDOFF_SPAN} ms landed the {handoff:?} between the two reads \
+             {driver:?} hands protection across — the schedule this property exists for was never \
+             exercised"
         );
         assert!(
             outside[handoff.index()],
-            "no spacing in 0..={HANDOFF_SPAN} ms landed the {handoff:?} outside the two reads it \
-             hands protection across — the sweep is stuck in one regime"
+            "no spacing in 0..={HANDOFF_SPAN} ms landed the {handoff:?} outside the two reads \
+             {driver:?} hands protection across — the sweep is stuck in one regime"
         );
     }
     assert!(
         published_within_one_window,
-        "no spacing in 0..={HANDOFF_SPAN} ms landed the flip AND the drain between one pass's part \
-         read and its inode scan — the one publication schedule a destination-first reading loses \
-         the chunk on was never exercised"
+        "no spacing in 0..={HANDOFF_SPAN} ms landed the flip AND the drain between one {driver:?} \
+         pass's part read and its inode scan — the one publication schedule a destination-first \
+         reading loses the chunk on was never exercised"
     );
+}
+
+async fn prop_gc_staged_handoffs_reach_between_and_outside_the_reads() {
+    staged_handoffs_reach_between_and_outside_the_reads(Driver::Gc).await;
+}
+
+async fn prop_reconstruction_staged_handoffs_reach_between_and_outside_the_reads() {
+    staged_handoffs_reach_between_and_outside_the_reads(Driver::Reconstruction).await;
 }
 
 // ---- property 14: a mover's adoption races GC's reclaim of the position it pre-marked (#804) ----
@@ -4409,6 +4552,18 @@ dst_campaign_test! {
 }
 
 dst_campaign_test! {
+    async fn reconstruction_staged_handoffs_never_drain_the_obligation() {
+        prop_reconstruction_staged_handoffs_never_drain_the_obligation(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reconstruction_staged_handoffs_reach_between_and_outside_the_reads() {
+        prop_reconstruction_staged_handoffs_reach_between_and_outside_the_reads().await;
+    }
+}
+
+dst_campaign_test! {
     async fn gc_reclaim_intent_never_publishes_over_deleted_bytes() {
         prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rand_seed()).await;
     }
@@ -4478,6 +4633,7 @@ dst_campaign_test! {
             prop_restore_two_readings_never_license_a_mark(&mut rng).await;
             prop_gc_orphan_walk_under_a_concurrent_unlink(&mut rng).await;
             prop_gc_staged_handoffs_never_reclaim_the_chunk(&mut rng).await;
+            prop_reconstruction_staged_handoffs_never_drain_the_obligation(&mut rng).await;
             prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rng).await;
             prop_gc_fragment_less_sweep_never_deletes_a_restamped_mark(&mut rng).await;
             prop_gc_sweep_judges_an_ambiguous_commit_as_one_batch(&mut rng).await;

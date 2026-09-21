@@ -578,6 +578,8 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         fleet: &recon_fleet,
         topology: &recon_topo,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(1_000),
+        staged_write_window_millis: 0,
     };
 
     let recon_result =

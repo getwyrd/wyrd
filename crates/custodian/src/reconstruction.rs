@@ -42,7 +42,21 @@
 //! Dependency boundary (ADR-0010, `0005:421-422`): the loop stays over the
 //! `traits` / `core` seams plus `tracing` — the erasure math, the placement selector,
 //! and the on-disk fragment format are all borrowed from `core`, so `custodian` gains
-//! no backend and no on-disk-format knowledge of its own.
+//! no backend and no on-disk-format knowledge of its own. It also names the
+//! [`wyrd_testkit::Clock`] seam (ADR-0024) on [`ReconstructionContext`] — a normal
+//! dependency, not a dev one, because the field is production-shaped even though this
+//! slice never reads it (#814 does).
+//!
+//! **A staged multipart upload's bytes are never drained out from under it either**
+//! (proposal 0016 decision 2, `0016:765-893`, split from #663): before concluding "no
+//! committed map references this chunk, drain the obligation", the pass also checks
+//! the staged classes GC and restore already read (`crate::gc::staged_fragments`) —
+//! read FIRST, source before destination (`0016:782-800`) — so a chunk a committed
+//! part or an in-flight owned staging entry still names is kept queued, never drained,
+//! even when a publication lands mid-pass. Once a committed map names the chunk, that map
+//! alone decides, exactly as for any committed chunk (scrub applies the same precedence,
+//! `crate::scrub`). This loop still never REBUILDS or re-places a staged chunk (that write
+//! path is #814's); it only refuses to discard the record saying one is short a fragment.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -92,6 +106,29 @@ pub struct ReconstructionContext<'a> {
     /// known-unreachable server, every missing fragment is treated as `confirmed gone` —
     /// exactly the prior semantics, unchanged.
     pub unreachable: &'a [DServerId],
+    /// The [`wyrd_testkit::Clock`] seam (ADR-0024) a staged re-place reads to decide whether
+    /// its own write is still within [`Self::staged_write_window_millis`] of its pre-mark —
+    /// a **seam ahead of its reader**: this slice only fills it, and reads it nowhere. #814
+    /// (split from the same #663, the next wave of this run) is the first consumer, and this
+    /// field is here so its own test compiles on this context's base and C4-verify can prove
+    /// #814's red.
+    ///
+    /// **One source with the pass's `now_millis`** (ADR-0009: one clock per correctness
+    /// lifecycle). A pre-mark stamped from the `now_millis` a pass is handed and a deadline
+    /// checked through this seam are one lifecycle, so whoever builds the context must back
+    /// both with the same clock — the deployed loop hands the pass readings of the very clock
+    /// it puts here (`crates/server/src/custodian.rs`, `LoopClock`), and a test that passes a
+    /// fixed instant puts a `wyrd_testkit::ManualClock` reading that instant here, never the
+    /// wall clock beside it.
+    pub clock: &'a (dyn wyrd_testkit::Clock + Sync),
+    /// How long after a staged re-place's pre-mark authorizes a write that write may still
+    /// land — proposal 0016's `W_write` (`0016:1551-1576`), fed from this crate's own
+    /// [`crate::gc::W_WRITE_MILLIS`] rather than a second definition. 0016 requires
+    /// `G_orphan > W_repoint + W_write + δ_clock` (`0016:1348`), and
+    /// #800's late-write deadline (`crate::gc::LATE_WRITE_DEADLINE_MILLIS`) must not be sized
+    /// below it. Unread this slice, for the same reason [`Self::clock`] is — #814 is the
+    /// first consumer.
+    pub staged_write_window_millis: u64,
 }
 
 /// The **repair priority** of a chunk, derived from how close it is to its durability
@@ -162,11 +199,57 @@ pub(crate) async fn reconcile(
     // and with nothing owed there is nothing to read and nothing to claim — the base's own
     // behaviour (its per-obligation loop scanned zero times over an empty queue), kept, and
     // the same shape `rebalance.rs:115-117` uses to answer without touching `inode:` at all.
-    let reading = if queue.is_empty() {
-        Reading::default()
+    // Extended the same way to the staged classes below: nothing is owed, so there is nothing
+    // for their read to protect from a drain either.
+    //
+    // **Source before destination, `sidx:` → `part:` → `inode:`** (normative, `0016:782-800`;
+    // GC's own order over the same two reads, `crate::gc::reconcile`). The staged classes are
+    // read FIRST, via the one reader GC and restore already share
+    // (`crate::gc::staged_fragments`) — never re-derived here — so a publish that lands mid-
+    // pass (writes the committed inode, and only LATER, in a separate retirement batch, deletes
+    // the `part:` record it replaces) is caught by this read even when it beats the committed
+    // scan below: the chunk is seen staged now, or committed by the later `inode:` read, or
+    // both — never neither. A pass that read `inode:` first could miss a chunk in both classes
+    // (see the leg this guards, `staged_protection.rs`'s (E)/(D) appendix for #663.1).
+    let (staged, reading) = if queue.is_empty() {
+        (crate::gc::StagedSet::default(), Reading::default())
     } else {
-        read_committed(ctx.meta, &queue).await?
+        let staged = crate::gc::staged_fragments(ctx.meta).await?;
+        // Attributed the moment the staged reading returns — **before** the committed read
+        // below, whose `?` would otherwise end the pass carrying these names down with it,
+        // exactly as GC attributes its own (`gc.rs:420-425`) and as `read_committed` names each
+        // unreadable object where it is met rather than batching it for a caller. A genuinely
+        // corrupt staged record has no repair path and no operator tooling yet (#694), so the
+        // record's name is the operator's whole situational awareness; an `inode:` store fault
+        // one statement later must not be what costs it.
+        for (record, fault) in &staged.unresolvable {
+            emit_unresolvable_staged(&crate::gc::object_name(record), fault);
+        }
+        let reading = read_committed(ctx.meta, &queue).await?;
+        (staged, reading)
     };
+    // The chunk ids the staged classes name at all — a committed part's own placement, or an
+    // owned entry's, whichever a staged record could still trust (`StagedSet::held` names a
+    // chunk too, just not where its fragments are) — is every question this pass asks the
+    // staged reading: NOT "which fragment", the reclaim/mark question GC and restore ask
+    // ([`crate::gc::StagedSet::protects`]), but "does ANY staged record still name this chunk
+    // at all". It is asked only of a chunk NO committed map names (`assess`): a committed chunk
+    // is discharged against its committed map alone, as it always was, whatever a leftover part
+    // record names; an obligation is DISCARDED — deleted with nothing resolved — only when no
+    // record, committed or staged, names or holds its chunk.
+    let staged_chunks: HashSet<ChunkId> = staged
+        .placed
+        .iter()
+        .map(|(_, frag)| frag.chunk)
+        .chain(staged.held.keys().copied())
+        .collect();
+    // While ANY staged record could not be read, the staged reading is INCOMPLETE — this pass
+    // cannot show a chunk is named by NO staged record, so "no committed map references it" is
+    // not "no record names it" and drains nothing at all, exactly as an incomplete committed
+    // reading withholds every drain below (`reading.incomplete`). Leg F's rule (#663.1),
+    // applied to the staged read the way `reading.incomplete` already applies it to the
+    // committed one.
+    let staged_incomplete = !staged.unresolvable.is_empty();
 
     // Assess each obligation (locate the chunk in that reading, gather + verify survivors)
     // so the drain can be ordered by repair priority before any rebuild commits.
@@ -206,8 +289,15 @@ pub(crate) async fn reconcile(
     // rebuild this pass — off the repairable-backlog gauge so a never-completable repair does
     // not floor the day-one "returns to zero" signal.
     let mut repair_blocked = 0usize;
+    // Whether this pass kept at least one obligation queued because a staged multipart record
+    // — never a committed map — names its chunk (`Assessment::Staged`). Like the `seg:`
+    // refusal, this pass may not drain it (nothing resolved it, and a staged record still
+    // names or holds the chunk, so deleting it would be a discard), so it withholds
+    // certification below exactly as `!reading.refused.is_empty()` already does for a
+    // segmented refusal.
+    let mut staged_kept = false;
     for &chunk in &queue {
-        match assess(ctx, &stores, &reading, chunk).await? {
+        match assess(ctx, &stores, &reading, &staged_chunks, chunk).await? {
             Assessment::Repairable(plan) => {
                 under_replicated += 1;
                 plans.push(plan);
@@ -254,6 +344,12 @@ pub(crate) async fn reconcile(
             // (it is the last record saying live data is under-replicated) and the pass
             // refuses to certify below.
             Assessment::Refused => {}
+            // A staged multipart record — never a committed map — names this chunk
+            // (`assess`'s own emit already named it on the audit seam). Kept queued, never
+            // drained, and OFF the repairable-backlog gauge like every other never-drained,
+            // never-repaired condition: it is not under-replicated by this pass's own
+            // reading (it has no committed reference to assess redundancy against at all).
+            Assessment::Staged => staged_kept = true,
         }
     }
 
@@ -330,7 +426,14 @@ pub(crate) async fn reconcile(
     // last record saying live data is under-replicated. One rule over the ONE batch both
     // paths flow into, so no site can drift from it; over a complete reading both behave
     // exactly as they always have.
-    if !reading.incomplete && !drain_only.is_empty() {
+    //
+    // **Extended to the staged reading the same way.** `drain_only` already excludes every
+    // chunk a staged record still names (`assess`'s own check, before `Drain`) — but while the
+    // staged reading itself is incomplete, this pass cannot show ANY of `drain_only`'s chunks
+    // is named by NO staged record either, so "no committed map references it" is once again
+    // not "no record names it" for every one of them, not just the ones a readable staged
+    // record happened to name.
+    if !reading.incomplete && !staged_incomplete && !drain_only.is_empty() {
         let mut batch = WriteBatch::new();
         for chunk in drain_only {
             batch = batch.delete(repair::repair_key(chunk));
@@ -338,9 +441,15 @@ pub(crate) async fn reconcile(
         ctx.meta.commit(batch).await?;
     }
 
-    // A hole in what this pass may claim: an object it could not read, a repair it may not
-    // perform, or one it refused because the record it would leave behind could not survive.
-    let hole = reading.incomplete || !reading.refused.is_empty() || ceiling_refused;
+    // A hole in what this pass may claim: an object it could not read, a staged record it
+    // could not read, a repair it may not perform, an obligation it kept queued on a staged
+    // record's word rather than a committed one, or one it refused because the record it
+    // would leave behind could not survive.
+    let hole = reading.incomplete
+        || staged_incomplete
+        || !reading.refused.is_empty()
+        || staged_kept
+        || ceiling_refused;
     Ok(if hole {
         // **This pass certifies only over the reading it performed.** It either could not
         // read every committed object, or held back a repair it may not perform — either way
@@ -592,24 +701,46 @@ enum Assessment {
     /// certify. Named and counted once per *object* by [`read_committed`], and kept off the
     /// repairable-backlog gauge like every other never-repaired condition.
     Refused,
+    /// No committed chunk map references this chunk, but a **staged multipart record** —
+    /// a committed part or an in-flight owned staging entry — still does (`staged_chunks`,
+    /// `reconcile`'s own read, before `inode:` is committed). Rebuilding or re-placing a
+    /// staged chunk is #814's (out of scope here, brief §Scope); this pass only refuses to
+    /// discard the one record still saying it is short a fragment. Like [`Self::Refused`]
+    /// the pass does not certify, and the obligation stays queued — the Invariant to
+    /// restore: "I could not read a record" never counts as "no record names it", and
+    /// neither does "no COMMITTED record names it" while a staged one still does.
+    Staged,
 }
 
 /// Locate `chunk` in **this pass's own reading** of the committed namespace — never a scan of
 /// its own — then gather and **verify** its surviving fragments, classifying it into an
-/// [`Assessment`].
+/// [`Assessment`]. `staged` is the set of chunks a staged multipart record still names
+/// (`reconcile`'s own read, taken before the committed one) — consulted only when the
+/// committed reading finds no site at all, so a chunk WITH a committed reference is assessed
+/// exactly as before regardless of any staged record's leftover.
 async fn assess(
     ctx: &ReconstructionContext<'_>,
     stores: &HashMap<DServerId, &dyn ChunkStore>,
     reading: &Reading,
+    staged: &HashSet<ChunkId>,
     chunk: ChunkId,
 ) -> Result<Assessment> {
     let site = match reading.sites.get(&chunk) {
         Some(Site::Flat(site)) => site,
         // Refused, not repaired and not discarded: the reference is in a `seg:` record.
         Some(Site::Refused) => return Ok(Assessment::Refused),
-        // The chunk is referenced by no committed chunk map — it was deleted out from under
-        // the obligation. Nothing to repair. Acted on only over a COMPLETE reading:
-        // `reconcile` gates the one batch both drain paths flow into.
+        // No COMMITTED chunk map references this chunk. A staged record may still name it —
+        // checked BEFORE concluding "deleted, drain it": the staged reading ran first
+        // (`reconcile`), specifically so a publish racing this pass cannot make both reads
+        // miss it (`0016:782-800`).
+        None if staged.contains(&chunk) => {
+            emit_staged(chunk);
+            return Ok(Assessment::Staged);
+        }
+        // Referenced by no committed chunk map and no staged record either — it was deleted
+        // out from under the obligation. Nothing to repair. Acted on only over a COMPLETE
+        // reading of BOTH classes: `reconcile` gates the one batch every drain path flows
+        // into.
         None => return Ok(Assessment::Drain),
     };
     // The reading proved this generation's own map is flat and carried this chunk's own
@@ -1096,6 +1227,25 @@ fn emit_unresolvable(object: &str, fault: &str) {
     );
 }
 
+/// Emit a staged multipart record this pass could **not read** on the durability-plane seam
+/// (ADR-0011 / ADR-0012): [`emit_unresolvable`]'s signal, for the staged reading — while any
+/// staged record is unreadable this pass cannot show a chunk is named by NO staged record, so
+/// it drains NOTHING and certifies NOTHING until that record is repaired. The same action
+/// string GC and restore already publish for the same condition (`gc.rs`'s
+/// `emit_unresolvable_staged`), so one grep over the durability seam finds every loop blocked
+/// on one damaged record. Named through [`crate::gc::object_name`], for the same reason
+/// [`emit_unresolvable`] is.
+fn emit_unresolvable_staged(record: &str, fault: &str) {
+    tracing::warn!(monotonic_counter.reconstruction_unresolvable_staged_records = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.reconstruction.audit",
+        action = "unresolvable-staged-record",
+        record = %record,
+        fault = %fault,
+        "reconstruction could not read a staged multipart record; this pass drains NOTHING and certifies NOTHING until that record is repaired — operator signal",
+    );
+}
+
 /// Emit a repair this pass may **not** perform on the same seam: the chunk's committed
 /// reference lives in a `seg:` record, whose write path is #682's. Once per **object**, not
 /// once per chunk — two obligations inside one segmented object are one refusal.
@@ -1111,6 +1261,24 @@ fn emit_refused(object: &str) {
         action = "refused-segmented",
         inode = %object,
         "reconstruction refused a repair for a chunk whose committed reference lives in a segmented record; nothing was written, the obligation stays queued, and the pass does not certify",
+    );
+}
+
+/// Emit an obligation this pass **kept queued** on a staged record's word alone, on the same
+/// seam: no committed chunk map references `chunk`, but a staged multipart record — a
+/// committed part or an in-flight owned staging entry — still does, so draining it would
+/// discard the only record saying it is short a fragment before publication ever gives it a
+/// committed reference to repair against. Nothing is written (rebuilding a staged chunk is
+/// #814's), and the pass answers `Blocked` for it, the same reason [`emit_refused`] does: an
+/// operator reading `Satisfied` would be told redundancy is restored for a chunk nothing
+/// restored.
+fn emit_staged(chunk: ChunkId) {
+    tracing::warn!(monotonic_counter.reconstruction_kept_staged = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.reconstruction.audit",
+        action = "kept-staged",
+        chunk = %wyrd_traits::chunk_hex(chunk),
+        "reconstruction kept an obligation queued: a staged multipart record still names this chunk, though no committed map does; nothing was drained, and the pass does not certify",
     );
 }
 

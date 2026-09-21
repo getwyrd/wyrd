@@ -420,6 +420,8 @@ async fn run(
         fleet: &fleet,
         topology: &topology,
         unreachable: &[],
+        clock: &wyrd_testkit::ManualClock::new(NOW),
+        staged_write_window_millis: 0,
     };
     let capture = Capture::default();
     let layer = tracing_subscriber::fmt::layer()

@@ -1467,7 +1467,7 @@ pub async fn run_reconstruction_over_backend<Fut, Clock>(
 ) -> Result<(), BoxError>
 where
     Fut: Future<Output = ()>,
-    Clock: FnMut() -> u64,
+    Clock: FnMut() -> u64 + Send,
 {
     match backend {
         MetadataBackend::Redb => {
