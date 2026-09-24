@@ -107,8 +107,8 @@ use wyrd_core::metadata::{
 };
 use wyrd_core::multipart::{
     decode_owned_entry, decode_part_record, parse_mpu_key, parse_part_key, parse_sidx_key,
-    part_range, retire_key, sidx_range, RetireMode, MAX_BATCH_OPS, MAX_PART_CHUNKS, MPU_PREFIX,
-    U_REF,
+    part_range, retire_key, sidx_range, PartRecord, RetireMode, MAX_BATCH_OPS, MAX_PART_CHUNKS,
+    MPU_PREFIX, U_REF,
 };
 use wyrd_traits::{
     BoxError, ChunkId, ChunkStore, CommitOutcome, CommitUnknownResult, DServerId, FragmentId,
@@ -249,24 +249,31 @@ pub const DELTA_CLOCK_MILLIS: u64 = 1_000;
 ///
 /// **The writers' obligation.** `D` bounds only a writer that enforces its parts, and no change to
 /// GC can make it sound alone (`0016:1339-1349`, `:1551-1576`). Every writer that marks a position
-/// before its fragment lands there — the staged re-place (#814, split from #663), flat pre-marking
-/// (#723) and multipart teardown — MUST refuse to authorize the write once its mark is older than
-/// [`W_REPOINT_MILLIS`], and MUST write with a deadline [`W_WRITE_MILLIS`] after that
-/// authorization, which the D server enforces. No writer on `main` marks ahead of its fragment, so
-/// the sweep is sound against today's tree: unlink marks the placed positions of a committed map,
-/// and a map commits only after every fragment it names is acknowledged; reconstruction and
-/// rebalance write first, and mark only the positions they vacate, in the repoint commit.
+/// before its fragment lands there — the staged re-place (`crate::reconstruction`), flat
+/// pre-marking (#723) and multipart teardown — MUST refuse to authorize the write once its mark is
+/// [`W_REPOINT_MILLIS`] old, and MUST write with a deadline no later than [`W_WRITE_MILLIS`] after
+/// that authorization, which the D server enforces. The staged re-place is the one such writer on
+/// `main`: it checks its pre-mark's age once, then authorizes all of a move's writes together and
+/// sends each with the deadline `pre-mark stamp + W_WRITE_MILLIS`, earlier than any later
+/// authorization would fix.
+/// Every other writer on `main` writes before it marks — unlink marks the placed positions of a
+/// committed map, and a map commits only after every fragment it names is acknowledged;
+/// reconstruction and rebalance write first, and mark only the positions they vacate, in the
+/// repoint commit — and the re-place's pre-mark is a structured mark naming its move, which the
+/// sweep leaves in place (below). So the sweep is sound against today's tree.
 ///
 /// **`D` bounds acceptance, not effect, and the sweep relies on it only for marks written after
 /// their fragment.** A D server judges the deadline before it publishes, but the publishing step
 /// itself can straddle it, and the store then answers [`wyrd_traits::WriteEffect::Unknown`] with
 /// the bytes possibly on disk (`ChunkStore::put_fragment`'s contract; `FsChunkStore` re-reads its
 /// clock after `rename`). So a writer that marks a position **ahead of** its fragment cannot take
-/// a listing at `orphaned_at + D` as proof its position stays empty. Until the slice that
-/// introduces such a writer settles its marks — on `Unknown`, re-read the position; if the bytes
-/// landed and the adoption cannot proceed, re-mark them so they stay evidenced; and only then add
-/// its event to the sweep's set — the sweep leaves every structured, non-`reclaiming` mark in
-/// place (`event-may-await-write`, [`Sweep::sweep_fragment_less_marks`]; PR #821 review).
+/// a listing at `orphaned_at + D` as proof its position stays empty. Until such a writer settles
+/// its marks — on `Unknown`, re-read the position; if the bytes landed and the adoption cannot
+/// proceed, re-mark them so they stay evidenced; and only then add its event to the sweep's set —
+/// the sweep leaves every structured, non-`reclaiming` mark in place (`event-may-await-write`,
+/// [`Sweep::sweep_fragment_less_marks`]; PR #821 review). The staged re-place does not settle its
+/// pre-marks that way yet (deferred: #825), so one whose move stopped before its fragment landed
+/// stays in the ledger: a mark kept too long, never a fragment left without one.
 pub const LATE_WRITE_DEADLINE_MILLIS: u64 = W_REPOINT_MILLIS + W_WRITE_MILLIS + DELTA_CLOCK_MILLIS;
 
 /// Where the `orphan:` ledger walk resumes: the one persisted record of [`OrphanWindow`].
@@ -849,10 +856,11 @@ impl<'p, 'a> Sweep<'p, 'a> {
     ///   *accepted*, not when it takes effect: a publication that straddles the deadline is
     ///   reported as [`wyrd_traits::WriteEffect::Unknown`] with the bytes possibly landed, so a
     ///   listing at `orphaned_at + D` does not prove the position stays empty (PR #821 review).
-    ///   No writer on `main` writes such a mark yet; the slice that introduces one settles how
-    ///   its mark is retired — see [`LATE_WRITE_DEADLINE_MILLIS`] — and adds its event to the
-    ///   swept set then. A legacy mark is written after its fragment (unlink, a vacated source),
-    ///   and a `reclaiming` mark is GC's own decision over a position nothing may write under.
+    ///   The staged re-place's pre-mark is such a mark (`crate::reconstruction`); its event joins
+    ///   the swept set only once that writer settles how its marks are retired — see
+    ///   [`LATE_WRITE_DEADLINE_MILLIS`]. A legacy mark is written after its fragment (unlink, a
+    ///   vacated source — the re-place's included), and a `reclaiming` mark is GC's own decision
+    ///   over a position nothing may write under.
     ///
     /// Only a key a writer spells is a mark here. The window files a mark under the position it
     /// names only when [`orphan_key`] spells that position as the very key read, and records a
@@ -1319,13 +1327,12 @@ pub(crate) async fn referenced_fragments(meta: &dyn MetadataStore) -> Result<Ref
 ///   which chunks it protects, so the class is **incomplete** ([`Self::unresolvable`]) and
 ///   protects every fragment in the fleet, exactly as an unreadable committed map does.
 ///
-/// deferred: #814 — rebuilding or re-placing a staged chunk. #663's other half is discharged:
-/// scrub now checks a session's committed `part:` fragments (`crate::scrub`) and reconstruction
-/// now keeps rather than drains an obligation this class still names
-/// (`crate::reconstruction`); neither one repoints or re-places over a staged record, which
-/// stays #814's. (#664's half — drain status and rebalance — was already discharged: the
-/// drain-status query above reads this class, and rebalance is disjoint from it by
-/// construction, `crate::rebalance::plan_evacuations`.)
+/// Scrub checks a session's committed `part:` fragments (`crate::scrub`), and reconstruction keeps
+/// rather than drains an obligation this class still names, and rebuilds a committed part's chunk
+/// while its upload is `Open` (`crate::reconstruction`) — the one pass that repoints a staged
+/// record, which it reads through [`staged_fragments_observing`] so the bytes it pins come from
+/// the very walk this class is built from. The drain-status query above reads this class too, and
+/// rebalance is disjoint from it by construction (`crate::rebalance::plan_evacuations`).
 #[derive(Default)]
 pub(crate) struct StagedSet {
     /// `(dserver, fragment)` a staged record places: each chunk of a committed part at its recorded
@@ -1393,16 +1400,19 @@ impl StagedSet {
     /// Classify one `part:` record. Its key and its value are validated separately
     /// ([`parse_part_key`], [`decode_part_record`]), and a record either refuses is one this pass
     /// cannot read: a value naming chunks under a key no writer spells is not a part anyone can
-    /// publish or retire.
-    fn read_part(&mut self, key: &[u8], value: &[u8]) {
+    /// publish or retire. The record is handed back when it decoded, so a reader that needs more
+    /// than the protection class ([`staged_fragments_observing`]) decodes it only once.
+    fn read_part(&mut self, key: &[u8], value: &[u8]) -> Option<PartRecord> {
         match parse_part_key(key).and_then(|_| decode_part_record(value)) {
             Ok(part) => {
                 for chunk in part.chunks() {
                     self.place(key, chunk);
                 }
+                Some(part)
             }
             Err(fault) => {
                 self.unresolvable.insert(key.to_vec(), fault.to_string());
+                None
             }
         }
     }
@@ -1499,6 +1509,35 @@ fn staged_placement(
 /// [`StagedReadFault`] naming the range that failed, and the pass fails before it deletes or marks
 /// anything.
 pub(crate) async fn staged_fragments(meta: &dyn MetadataStore) -> Result<StagedSet> {
+    staged_fragments_observing(meta, |_| {}).await
+}
+
+/// One committed part record exactly as [`staged_fragments_observing`] read it, beside the
+/// session record it was listed under — both the raw bytes the store returned and the part
+/// decoded. What a writer that repoints a part record needs from this reading and the protection
+/// class does not keep: the exact bytes to pin its compare-and-swap to (reconstruction's staged
+/// re-place, `crate::reconstruction`).
+pub(crate) struct StagedPartRead<'r> {
+    /// The session's `mpu:` key, and its value as the session listing returned it — never decoded
+    /// here ([`staged_fragments`]).
+    pub session_key: &'r [u8],
+    pub session: &'r [u8],
+    /// The part record's key and value as its range returned them.
+    pub key: &'r [u8],
+    pub value: &'r [u8],
+    /// That value, decoded ([`decode_part_record`]).
+    pub record: &'r PartRecord,
+}
+
+/// [`staged_fragments`], handing every committed part record that decoded to `observe` as it is
+/// read, in the walk's own order: sessions in key order, and each session's parts in key order,
+/// after its owned entries. The one staged walk, so a reader that needs a part record's own bytes
+/// takes them from the reading the protection class is built from, never from a second walk that
+/// could see a different store.
+pub(crate) async fn staged_fragments_observing(
+    meta: &dyn MetadataStore,
+    mut observe: impl FnMut(StagedPartRead<'_>),
+) -> Result<StagedSet> {
     // deferred: #806 — the `mpuctl` budget-profile preflight (`0016:348`, X99 `0016:2628`): read
     // the admission record and fail closed with an alarm, before this build, when its stored
     // profile differs from the custodian's own, so a rolling profile change cannot grow this
@@ -1509,11 +1548,12 @@ pub(crate) async fn staged_fragments(meta: &dyn MetadataStore) -> Result<StagedS
     let mut after: Option<Vec<u8>> = None;
     loop {
         let (sessions, next) = staged_page(meta, MPU_PREFIX, after.as_deref()).await?;
-        for (key, _session) in &sessions {
-            let upload = match parse_mpu_key(key) {
+        for (session_key, session) in &sessions {
+            let upload = match parse_mpu_key(session_key) {
                 Ok(upload) => upload,
                 Err(fault) => {
-                    set.unresolvable.insert(key.clone(), fault.to_string());
+                    set.unresolvable
+                        .insert(session_key.clone(), fault.to_string());
                     continue;
                 }
             };
@@ -1522,7 +1562,15 @@ pub(crate) async fn staged_fragments(meta: &dyn MetadataStore) -> Result<StagedS
             })
             .await?;
             walk_staged_range(meta, &part_range(&upload), |key, value| {
-                set.read_part(key, value)
+                if let Some(record) = set.read_part(key, value) {
+                    observe(StagedPartRead {
+                        session_key,
+                        session,
+                        key,
+                        value,
+                        record: &record,
+                    });
+                }
             })
             .await?;
         }

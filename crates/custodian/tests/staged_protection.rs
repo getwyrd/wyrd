@@ -39,7 +39,10 @@
 //!   slice) before scrub read anything here; its legs are in `staged_drain_status.rs`.
 //! - **G** reconstruction keeps rather than drains an obligation for a chunk a committed part or
 //!   an owned entry still names — or holds, with a placement it cannot use (G-held) — and drains
-//!   one no class names at all. With nothing queued it reads no record at all (a guard).
+//!   one no class names at all. With nothing queued it reads no record at all (a guard). A
+//!   committed part's chunk in an `Open` upload is assessed as a committed one is (#814): the
+//!   single-copy one here, whose only fragment is gone, is `Unrepairable`, and a repairable one is
+//!   rebuilt (`staged_repair.rs`).
 //! - **H** the reads run source before destination for reconstruction too: a publication landing
 //!   between its two reads must not drain the chunk either.
 //! - **I** an unreadable staged record holds back every drain reconstruction would otherwise make,
@@ -518,9 +521,10 @@ fn four_domains() -> Topology {
 }
 
 /// One reconstruction pass through the fenced control point, at `now`. `clock` and
-/// `staged_write_window_millis` are the seam #814 reads (Scope item 3); this pass reads neither,
-/// but the clock still reads `now` itself, so the seam and the pass's own `now_millis` are one
-/// source (ADR-0009) — never a wall clock beside a fixed logical instant.
+/// `staged_write_window_millis` are the seam the staged re-place reads (#814); no leg here
+/// reaches a re-place — each keeps its obligation or drains it — but the clock still reads `now`
+/// itself, so the seam and the pass's own `now_millis` are one source (ADR-0009) — never a wall
+/// clock beside a fixed logical instant.
 async fn reconstruction_pass(
     meta: &Meta,
     d: &[Disk; 4],
@@ -2346,10 +2350,17 @@ async fn reconstruction_over_one_obligation(
 }
 
 /// **(G)** A committed part's fragment is lost and its chunk is enqueued (`enqueue_repair`,
-/// standing in for scrub). One reconstruction pass: the obligation is still queued, the pass
-/// answers `Blocked` — as it does for a `seg:` repair it refuses (`reconstruction.rs:249-256`,
-/// `:341-358`) — no D server received a write, and the `part:` record is byte-identical (brief's
-/// leg D, split from #663).
+/// standing in for scrub), in an `Open` upload. One reconstruction pass: the obligation is still
+/// queued, no D server received a write, and the `part:` record is byte-identical (brief's leg D,
+/// split from #663).
+///
+/// The pass answers `Satisfied`: a committed part's chunk in an `Open` upload is assessed as a
+/// committed chunk is (#814), and this one's only fragment, single-copy (`EcScheme::None`), is
+/// gone, so nothing can rebuild it. It is `Unrepairable`, raised on the data-loss signal
+/// (`emit_data_loss`, the same audit seam naming the same chunk), and — as for a committed chunk —
+/// not a hole in the pass. A repairable chunk of an `Open` upload is rebuilt instead
+/// (`staged_repair.rs`), and one whose upload has left `Open` is kept and the pass answers
+/// `Blocked` (`staged_repair.rs`'s leg E).
 #[tokio::test]
 async fn reconstruction_keeps_an_obligation_a_committed_part_still_names() {
     capture_audit();
@@ -2369,9 +2380,10 @@ async fn reconstruction_keeps_an_obligation_a_committed_part_still_names() {
 
     assert_eq!(
         outcome,
-        Reconciled::Blocked,
-        "reconstruction must refuse to certify while a staged record — never a committed map — \
-         is the only thing naming a queued chunk: {outcome:?}"
+        Reconciled::Satisfied,
+        "an `Open` upload's single-copy chunk with its only fragment lost is `Unrepairable`, \
+         raised on the data-loss signal as a committed chunk's is, not a hole in the pass: \
+         {outcome:?}"
     );
     assert!(
         meta.holds(&repair_key(chunk)),
@@ -2387,8 +2399,8 @@ async fn reconstruction_keeps_an_obligation_a_committed_part_still_names() {
     for (_, store) in fleet(&d) {
         assert!(
             store.list_fragments().await.unwrap().is_empty(),
-            "reconstruction must not write any fragment for a staged chunk — rebuilding one is \
-             #814's, not this slice's"
+            "reconstruction must not write any fragment for a single-copy chunk whose only \
+             fragment is gone — nothing can rebuild it"
         );
     }
     assert!(
@@ -2438,8 +2450,8 @@ async fn reconstruction_keeps_an_obligation_an_owned_entry_still_names() {
     for (_, store) in fleet(&d) {
         assert!(
             store.list_fragments().await.unwrap().is_empty(),
-            "reconstruction must not write any fragment for a staged chunk — rebuilding one is \
-             #814's, not this slice's"
+            "reconstruction must not write any fragment for a chunk only an in-flight owned \
+             entry names"
         );
     }
 }
@@ -2649,8 +2661,8 @@ async fn reconstruction_keeps_an_obligation_across_a_publication_between_its_rea
     for (_, store) in fleet(&d) {
         assert!(
             store.list_fragments().await.unwrap().is_empty(),
-            "reconstruction must not write any fragment for a staged chunk — rebuilding one is \
-             #814's, not this slice's"
+            "reconstruction must not write any fragment for a chunk whose upload had left \
+             `Open` when the pass read it"
         );
     }
 }
