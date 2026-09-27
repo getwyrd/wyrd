@@ -203,7 +203,7 @@ tracing = "0.1"
 # tracing-subscriber's default feature set, so they are named here.
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
+opentelemetry = "0.33"
 opentelemetry_sdk = "0.32"
 opentelemetry-prometheus = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
