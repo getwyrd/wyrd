@@ -30,6 +30,17 @@ updates:
           - "crypto-common"
           - "block-buffer"
           - "hkdf"
+      # The OpenTelemetry crates release in lockstep and share one SDK trait set:
+      # bumping `opentelemetry_sdk` alone leaves two SDK versions in the graph, and
+      # `PrometheusExporter` / the OTLP `MetricExporter` stop satisfying
+      # `MetricReader` / `PushMetricExporter` (#829, #831, #832 — every one red by
+      # construction; the combined move is #833). Grouped, they arrive as one PR.
+      opentelemetry:
+        patterns:
+          - "opentelemetry"
+          - "opentelemetry_sdk"
+          - "opentelemetry-*"
+          - "tracing-opentelemetry"
 
   - package-ecosystem: github-actions
     directory: "/"
