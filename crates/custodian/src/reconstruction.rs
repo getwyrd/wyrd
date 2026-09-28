@@ -1388,8 +1388,10 @@ fn emit_refused(object: &str) {
 /// discard the only record saying it is short a fragment, and this pass may not repair it —
 /// `reason` says why: `in-flight` (only an owned staging entry names it; its part has no
 /// committed scheme yet), `session-not-open` (its upload has been fenced out of `Open`; the
-/// repair runs once the chunk is published, `0016:825`) or `untrusted-staged-record` (a staged
-/// record holds it with a placement that cannot be used). Nothing is written, and the pass
+/// repair runs once the chunk is published, `0016:825`), `untrusted-staged-record` (a staged
+/// record holds it with a placement that cannot be used) or `aliased-staged-record` (more than
+/// one committed part names it; only the first is repaired, so its full redundancy cannot
+/// certify the others — an inconsistent record a human must resolve). Nothing is written, and the pass
 /// answers `Blocked` for it, the same reason [`emit_refused`] does: an operator reading
 /// `Satisfied` would be told redundancy is restored for a chunk nothing restored.
 fn emit_staged(chunk: ChunkId, reason: &'static str) {

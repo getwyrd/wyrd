@@ -118,6 +118,13 @@ pub(super) struct StagedReading {
     /// For each owed chunk a committed part names, the first such part in the walk's key order —
     /// the first-reference rule the committed reading applies (`super::read_committed`).
     sites: HashMap<ChunkId, StagedSite>,
+    /// Owed chunks that more than one committed part site names. Chunk ids are minted fresh per
+    /// write and nothing copies one between parts, so only an inconsistent record gets here; but
+    /// only the first site is repaired, so the obligation must never drain on the first site's
+    /// word while another may still name a missing fragment. Such a chunk is repaired at its
+    /// first site and its obligation is KEPT, loudly (`aliased-staged-record`), until a human
+    /// resolves the records.
+    aliased: HashSet<ChunkId>,
 }
 
 /// One committed part this pass owes a repair inside, as the walk read it: the snapshot every
@@ -206,10 +213,15 @@ pub(super) async fn read(meta: &dyn MetadataStore, queue: &[ChunkId]) -> Result<
     let owed: HashSet<ChunkId> = queue.iter().copied().collect();
     let mut parts = Vec::new();
     let mut sites = HashMap::new();
+    let mut aliased = HashSet::new();
     let set = staged_fragments_observing(meta, |read| {
         let mut held = None;
         for (index, chunk) in read.record.chunks().iter().enumerate() {
-            if !owed.contains(&chunk.id) || sites.contains_key(&chunk.id) {
+            if !owed.contains(&chunk.id) {
+                continue;
+            }
+            if sites.contains_key(&chunk.id) {
+                aliased.insert(chunk.id);
                 continue;
             }
             let part = *held.get_or_insert_with(|| {
@@ -226,7 +238,12 @@ pub(super) async fn read(meta: &dyn MetadataStore, queue: &[ChunkId]) -> Result<
         }
     })
     .await?;
-    Ok(StagedReading { set, parts, sites })
+    Ok(StagedReading {
+        set,
+        parts,
+        sites,
+        aliased,
+    })
 }
 
 /// Assess an owed chunk that no committed chunk map names, against the committed part that names
@@ -285,6 +302,13 @@ pub(super) async fn assess(
     };
     let gathered = gather(ctx, stores, chunk, &chunk_ref.placement, chunk_ref.scheme).await?;
     if let Some(settled) = gathered.settle(k) {
+        // The first site at full redundancy says nothing about the other sites an aliased chunk
+        // has: draining here would discard the only record that one of them may still name a
+        // missing fragment (review of PR #826).
+        if matches!(settled, Assessment::Drain) && staged.aliased.contains(&chunk) {
+            emit_staged(chunk, "aliased-staged-record");
+            return Ok(Some(Assessment::Staged));
+        }
         return Ok(Some(settled));
     }
 
@@ -699,8 +723,12 @@ pub(super) async fn repair(
     let mut adopt = WriteBatch::new()
         .require(part.session_key.clone(), part.session.clone())
         .require(part.key.clone(), part.prior.clone())
-        .put(part.key.clone(), target.next.clone())
-        .delete(repair::repair_key(chunk));
+        .put(part.key.clone(), target.next.clone());
+    // An aliased chunk's obligation outlives this repair: only its first site is repointed
+    // ([`StagedReading::aliased`]), so the next pass keeps it queued and says why.
+    if !staged.aliased.contains(&chunk) {
+        adopt = adopt.delete(repair::repair_key(chunk));
+    }
     for dest in &target.destinations {
         let key = orphan_key(dest.dserver, fragment(chunk, dest.index));
         adopt = adopt

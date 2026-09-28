@@ -2317,7 +2317,9 @@ async fn a_chunk_below_k_only_behind_an_outage_is_not_data_loss() {
 /// **(First reference)** A chunk two committed parts name is repaired against ONE of them, the
 /// first in key order — the rule the committed reading applies to a chunk two objects name
 /// (`read_committed`) — and the move pins and repoints only that record: the other part record is
-/// left byte-identical.
+/// left byte-identical. Its obligation is KEPT: the second record still names the lost fragment,
+/// so once the first is healthy the next pass must not drain on its word. It keeps the chunk
+/// queued, says `aliased-staged-record`, and does not certify (review of PR #826).
 #[tokio::test]
 async fn a_chunk_two_parts_name_is_repaired_against_the_first() {
     capture_audit();
@@ -2343,6 +2345,26 @@ async fn a_chunk_two_parts_name_is_repaired_against_the_first() {
         fx.meta.value(&second),
         Some(fx.part.clone()),
         "the second part record must be left byte-identical"
+    );
+    assert!(
+        fx.queued(),
+        "the obligation must survive a repair that reached only the first of two sites"
+    );
+
+    let again = fx.run().await;
+
+    assert_eq!(
+        again,
+        Reconciled::Blocked,
+        "a healthy first site must not certify a chunk another part still names"
+    );
+    assert!(
+        fx.queued(),
+        "the obligation must never drain while a second site may name a missing fragment"
+    );
+    assert!(
+        audit_event_naming(&["aliased-staged-record", &wyrd_traits::chunk_hex(fx.chunk)]),
+        "keeping it must say why"
     );
 }
 
