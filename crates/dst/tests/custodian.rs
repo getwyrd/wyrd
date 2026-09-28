@@ -4445,6 +4445,551 @@ async fn prop_gc_sweep_ambiguity_reaches_before_and_after_the_read_back() {
     }
 }
 
+// ---- property 17: a staged re-place races the session fence (X29, #814) ----
+//
+// Reconstruction rebuilds a multipart upload's committed-part chunk while the upload is `Open`
+// (proposal 0016, `0016:825`): it pre-marks the destination position, writes the rebuilt fragment
+// there under a deadline, and adopts it into the `part:` record in one commit pinned to the
+// session's exact bytes. A Complete, an Abort or a reaper fences the session — a compare-and-swap
+// on its `mpu:` record that moves it out of `Open@E` — and the fence may land at any point of the
+// re-place: before the pre-mark, between the pre-mark and the write, between the write and the
+// adoption, or after the adoption. X29 (`0016:888`): in every interleaving no fragment ends
+// unreferenced and unevidenced, and the session never ends `Aborting` with a `part:` record naming
+// a fragment the re-place did not write.
+//
+// The per-point legs in `crates/custodian/tests/staged_repair.rs` land the fence at a scripted
+// instant. Here a genuinely concurrent task fences the session over the simulated-TiKV model at an
+// instant the seed picks, while reconstruction passes run back to back and every D-server call
+// spans a simulated hop. The D servers enforce the deadline each write carries (#638) on the
+// simulated wall clock the reconstruction context reads — one clock. The coverage leg proves every
+// one of the four landings is reached.
+
+/// The upload whose committed part the re-place repoints: 32 lowercase-hex characters.
+const REPLACE_UPLOAD: &str = "81481481481481481481481481481481";
+/// The part's one RS(2,1) chunk: fragments 0 and 1 on servers 0 and 1, fragment 2 lost from
+/// server 3. The free domain C (server 2) is where the re-place puts it.
+const REPLACE_CHUNK: ChunkId = 0x8140;
+const REPLACE_DATA: &[u8] = b"a staged chunk, re-placed while its upload is still Open";
+const REPLACE_OBJECT: &str = "replace";
+/// The session's epoch while `Open`; the fence moves it to `REPLACE_EPOCH + 1`.
+const REPLACE_EPOCH: u64 = 1;
+/// The part record's placement before any re-place.
+const REPLACE_PLACEMENT: [DServerId; 3] = [0, 1, 3];
+/// How far into the run the fence is drawn, in whole simulated milliseconds, each landing offset
+/// by half a millisecond so it never ties with a pass's step. A first pass here takes about 18
+/// ms: five reads (queue, session listing, owned range, part range, `inode:`), three fragment
+/// reads, the vacated position's mark, the destination's drain key and its mark, the pre-mark
+/// (two hops), the fragment write (three) and the adoption (two). So the span reaches from before
+/// the pass reads the session to after the adoption, and the coverage leg proves the four
+/// landings between.
+const REPLACE_SPAN: u32 = 24;
+/// The most passes one run makes before it gives up on the fence landing.
+const REPLACE_MAX_PASSES: usize = 64;
+/// A fragment write's round trip, in simulated milliseconds — longer than a metadata hop, so the
+/// fence has room to land while the write is in flight.
+const REPLACE_WRITE_MILLIS: u64 = 3;
+
+/// One observation at the store seams, in the order the simulation produced them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplaceEvent {
+    /// A reconstruction pass began.
+    Pass,
+    /// The re-place's pre-mark was answered.
+    PreMark(CommitOutcome),
+    /// The rebuilt fragment's write reached its D server...
+    Arrived,
+    /// ...and its bytes were published there.
+    Stored,
+    /// The re-place's adoption was answered.
+    Adopt(CommitOutcome),
+    /// The fence landed.
+    Fenced,
+}
+
+type ReplaceLog = Arc<Mutex<Vec<ReplaceEvent>>>;
+
+fn replace_fragment(index: u16) -> FragmentId {
+    FragmentId {
+        chunk: REPLACE_CHUNK,
+        index,
+    }
+}
+
+/// The destination's pre-mark key: fragment 2 on server 2.
+fn replace_premark_key() -> Vec<u8> {
+    metadata::orphan_key(2, replace_fragment(2))
+}
+
+/// The simulated wall clock — madsim virtualises it, so it stays seed-deterministic — read through
+/// the production `Clock` seam's wall-clock arm, as the deployed loop reads it.
+fn sim_now_millis() -> u64 {
+    wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock)
+}
+
+/// A session record for [`REPLACE_OBJECT`] in `state` (its JSON) at `epoch`, as the base decoder
+/// spells it and checked against it.
+fn replace_session(state: &str, epoch: u64) -> Bytes {
+    let bytes = format!(
+        "{{\"parent\":{ROOT},\"object\":\"{REPLACE_OBJECT}\",\"created_at_millis\":100,\
+         \"clock_source\":\"wall\",\"epoch\":{epoch},\"attempts\":1,\"state\":{state}}}"
+    )
+    .into_bytes();
+    decode_session_record(&bytes).expect("the seeded session record decodes");
+    Bytes::from(bytes)
+}
+
+/// A recording tap over the simulated-TiKV store: every call is forwarded, network hops included,
+/// and the re-place's two commits are logged as they are answered. Instance state only
+/// (ADR-0035).
+struct ReplaceMeta {
+    inner: SimTikvMetadataStore,
+    log: ReplaceLog,
+    part_key: Vec<u8>,
+}
+
+#[async_trait]
+impl MetadataStore for ReplaceMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let puts = |key: &[u8]| batch.puts.iter().any(|(k, _)| k.as_slice() == key);
+        let adoption = puts(&self.part_key);
+        let premark = puts(&replace_premark_key()) && !adoption;
+        let outcome = self.inner.commit(batch).await?;
+        if premark {
+            self.log
+                .lock()
+                .unwrap()
+                .push(ReplaceEvent::PreMark(outcome));
+        }
+        if adoption {
+            self.log.lock().unwrap().push(ReplaceEvent::Adopt(outcome));
+        }
+        Ok(outcome)
+    }
+}
+
+/// A D server that **enforces** the deadline a write carries, as the real one does since #638: it
+/// judges the deadline on the simulated wall clock before it publishes
+/// (`WriteDeadlineExpired::if_elapsed`, nothing stored), publishes, then reads the clock again and
+/// refuses to acknowledge a publication it cannot certify landed in time
+/// (`WriteDeadlineExpired::if_publication_unverified`). Every read spans a hop and every write
+/// [`REPLACE_WRITE_MILLIS`], so a concurrent commit can land while one is in flight.
+struct DeadlineDServer<'a> {
+    inner: &'a MemDServer,
+    log: ReplaceLog,
+}
+
+#[async_trait]
+impl ChunkStore for DeadlineDServer<'_> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        let tracked = id.chunk == REPLACE_CHUNK;
+        if tracked {
+            self.log.lock().unwrap().push(ReplaceEvent::Arrived);
+        }
+        madsim::time::sleep(Duration::from_millis(REPLACE_WRITE_MILLIS)).await;
+        if let Some(deadline) = deadline_millis {
+            if let Some(refusal) =
+                wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, sim_now_millis())
+            {
+                return Err(Box::new(refusal));
+            }
+        }
+        self.inner.put_fragment(id, fragment, None).await?;
+        if tracked {
+            self.log.lock().unwrap().push(ReplaceEvent::Stored);
+        }
+        if let Some(deadline) = deadline_millis {
+            if let Some(unverified) = wyrd_traits::WriteDeadlineExpired::if_publication_unverified(
+                id,
+                deadline,
+                sim_now_millis(),
+            ) {
+                return Err(Box::new(unverified));
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+        madsim::time::sleep(Duration::from_millis(1)).await;
+        self.inner.get_fragment(id).await
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        self.inner.list_fragments().await
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        self.inner.delete_fragment(id).await
+    }
+
+    async fn health(&self) -> Result<Health> {
+        Ok(Health::Healthy)
+    }
+}
+
+/// Where one run's fence landed relative to the re-place, observed at the store seams.
+struct ReplaceRun {
+    /// The adoption committed.
+    adopted: bool,
+    /// The fence landed before the pre-mark, which lost to it.
+    before_the_premark: bool,
+    /// The fence landed after the pre-mark committed and before the write's bytes were published.
+    between_premark_and_write: bool,
+    /// The fence landed after the write's bytes were published and before the adoption, which
+    /// lost to it.
+    between_write_and_adoption: bool,
+    /// The fence landed after the adoption committed.
+    after_the_adoption: bool,
+}
+
+fn replace_run(events: &[ReplaceEvent]) -> ReplaceRun {
+    let at = |wanted: ReplaceEvent| events.iter().position(|event| *event == wanted);
+    let fenced = at(ReplaceEvent::Fenced);
+    let premarked = at(ReplaceEvent::PreMark(CommitOutcome::Committed));
+    let premark_lost = at(ReplaceEvent::PreMark(CommitOutcome::Conflict));
+    let stored = at(ReplaceEvent::Stored);
+    let adopted = at(ReplaceEvent::Adopt(CommitOutcome::Committed));
+    let adoption_lost = at(ReplaceEvent::Adopt(CommitOutcome::Conflict));
+    let ordered =
+        |a: Option<usize>, b: Option<usize>| matches!((a, b), (Some(a), Some(b)) if a < b);
+    ReplaceRun {
+        adopted: adopted.is_some(),
+        before_the_premark: ordered(fenced, premark_lost),
+        between_premark_and_write: ordered(premarked, fenced) && ordered(fenced, stored),
+        between_write_and_adoption: ordered(stored, fenced) && ordered(fenced, adoption_lost),
+        after_the_adoption: ordered(adopted, fenced),
+    }
+}
+
+/// X29's property over the store as it stands: every fragment of the chunk on every D server is
+/// named by the part record or covered by an `orphan:` mark at its position, and every position
+/// the part record names that the re-place moved holds the fragment the re-place wrote there.
+async fn assert_replace_strands_nothing(
+    meta: &ReplaceMeta,
+    d: &[MemDServer; 4],
+    when: &str,
+    events: &ReplaceLog,
+) {
+    let part = meta
+        .get(&meta.part_key)
+        .await
+        .unwrap()
+        .expect("the part record is never deleted in this run");
+    let record = decode_part_record(&part).expect("the part record decodes");
+    let placement = record.chunks()[0].placement.clone();
+    for (id, server) in d.iter().enumerate() {
+        let id = id as DServerId;
+        for fragment in server.list_fragments().await.unwrap() {
+            let named = placement.get(usize::from(fragment.index)) == Some(&id);
+            let marked = meta
+                .get(&metadata::orphan_key(id, fragment))
+                .await
+                .unwrap()
+                .is_some();
+            assert!(
+                named || marked,
+                "{when}: fragment {} of the chunk on server {id} is named by no record and covered \
+                 by no mark — stranded: {:?}",
+                fragment.index,
+                events.lock().unwrap()
+            );
+        }
+    }
+    for (index, (&now, &was)) in placement.iter().zip(&REPLACE_PLACEMENT).enumerate() {
+        if now == was {
+            continue;
+        }
+        let fragment = replace_fragment(index as u16);
+        let bytes = d[now as usize].get_fragment(fragment).await.unwrap();
+        assert!(
+            bytes.is_some_and(|bytes| repair::fragment_intact(
+                &bytes,
+                fragment,
+                EcScheme::ReedSolomon {
+                    k: K as u8,
+                    m: M as u8
+                }
+            )),
+            "{when}: the part record names server {now} for fragment {index}, which the re-place \
+             never wrote there: {:?}",
+            events.lock().unwrap()
+        );
+    }
+}
+
+/// One run: reconstruction passes back to back while the fencer moves the session `Open@E` →
+/// `Aborting@E+1` at `delay_micros` into the run. Asserts X29 after every pass and at the end,
+/// and returns where the fence landed.
+async fn replace_races_the_fence(delay_micros: u64) -> ReplaceRun {
+    let d = servers();
+    let log: ReplaceLog = Arc::new(Mutex::new(Vec::new()));
+    let upload = UploadId::new(REPLACE_UPLOAD).expect("32 lowercase-hex characters");
+    let part_key = part_key(&upload, PartNumber::new(1).expect("a part number in range"));
+    let meta = Arc::new(ReplaceMeta {
+        inner: SimTikvMetadataStore::new(),
+        log: Arc::clone(&log),
+        part_key: part_key.clone(),
+    });
+
+    // The chunk's surviving fragments on servers 0 and 1; fragment 2 is gone from server 3.
+    let shards = wyrd_core::erasure::encode(K, M, REPLACE_DATA).expect("RS(2,1) encodes");
+    for index in [0_u16, 1] {
+        let bytes = write::encode_ec_fragment(
+            REPLACE_CHUNK,
+            index,
+            K as u8,
+            M as u8,
+            &shards[usize::from(index)],
+        );
+        d[usize::from(index)]
+            .put_fragment(replace_fragment(index), bytes, None)
+            .await
+            .unwrap();
+    }
+    let open = replace_session("{\"kind\":\"Open\"}", REPLACE_EPOCH);
+    let aborting = replace_session("{\"kind\":\"Aborting\"}", REPLACE_EPOCH + 1);
+    let chunk_ref = ChunkRef {
+        id: REPLACE_CHUNK,
+        scheme: EcScheme::ReedSolomon {
+            k: K as u8,
+            m: M as u8,
+        },
+        len: REPLACE_DATA.len() as u64,
+        placement: REPLACE_PLACEMENT.to_vec(),
+    };
+    let chunk = String::from_utf8(metadata::encode(&chunk_ref).to_vec()).unwrap();
+    let part = Bytes::from(
+        format!(
+            "{{\"chunks\":[{chunk}],\"len\":{},\"digest\":\"{}\",\"committed_at_millis\":1,\
+             \"session_epoch\":{REPLACE_EPOCH}}}",
+            REPLACE_DATA.len(),
+            "ef".repeat(32)
+        )
+        .into_bytes(),
+    );
+    decode_part_record(&part).expect("the part record decodes");
+    let seeded = meta
+        .commit(
+            WriteBatch::new()
+                .put(mpu_key(&upload), open.clone())
+                .put(part_key.clone(), part.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seeded, CommitOutcome::Committed);
+    repair::enqueue_repair(&*meta, REPLACE_CHUNK, "scrub")
+        .await
+        .unwrap();
+
+    // The run starts here: what the fixture wrote above is not the race.
+    log.lock().unwrap().clear();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let fencer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let log = Arc::clone(&log);
+        let done = Arc::clone(&done);
+        let session_key = mpu_key(&upload);
+        let aborting = aborting.clone();
+        async move {
+            madsim::time::sleep(Duration::from_micros(delay_micros)).await;
+            // The only writer of the session is this task, so a lost commit lost a lock race to an
+            // in-flight re-place commit that pins the same key: retry after a hop, as a fencer that
+            // re-reads would. Bounded, so a fence that could never land fails the run.
+            for _ in 0..REPLACE_MAX_PASSES {
+                let fence = WriteBatch::new()
+                    .require(session_key.clone(), open.clone())
+                    .put(session_key.clone(), aborting.clone());
+                if meta.commit(fence).await.unwrap() == CommitOutcome::Committed {
+                    log.lock().unwrap().push(ReplaceEvent::Fenced);
+                    done.store(true, Ordering::Relaxed);
+                    return;
+                }
+                madsim::time::sleep(Duration::from_millis(1)).await;
+            }
+            panic!("the fence never landed ({delay_micros} µs)");
+        }
+    });
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-staged-replace").await;
+    let hops: Vec<DeadlineDServer<'_>> = d
+        .iter()
+        .map(|inner| DeadlineDServer {
+            inner,
+            log: Arc::clone(&log),
+        })
+        .collect();
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = hops
+        .iter()
+        .enumerate()
+        .map(|(id, hop)| (id as DServerId, hop as &dyn ChunkStore))
+        .collect();
+    let topo = four_domains();
+    let mut passes = 0;
+    loop {
+        // One more pass once the fence has landed, so a pass reads the store it left.
+        let finished = done.load(Ordering::Relaxed);
+        log.lock().unwrap().push(ReplaceEvent::Pass);
+        let ctx = ReconstructionContext {
+            meta: &*meta,
+            fleet: &fleet,
+            topology: &topo,
+            unreachable: &[],
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
+        };
+        let outcome = reconcile_step(
+            &zone,
+            &custodian,
+            None,
+            None,
+            Some(&ctx),
+            None,
+            sim_now_millis(),
+        )
+        .await;
+        passes += 1;
+        assert!(
+            outcome.is_ok(),
+            "reconstruction pass {passes} failed (fence at {delay_micros} µs): {:?}",
+            outcome.err()
+        );
+        let when = format!("pass {passes}, fence at {delay_micros} µs");
+        assert_replace_strands_nothing(&meta, &d, &when, &log).await;
+        if finished {
+            break;
+        }
+        assert!(
+            passes < REPLACE_MAX_PASSES,
+            "the fence never landed ({delay_micros} µs)"
+        );
+    }
+    fencer.await.expect("the fencer ran to completion");
+    let events = log.lock().unwrap().clone();
+    let run = replace_run(&events);
+
+    // The session ends fenced, and the part record either still names what it named or names the
+    // fragment the re-place wrote — never anything in between.
+    assert_eq!(
+        meta.get(&mpu_key(&upload)).await.unwrap(),
+        Some(aborting),
+        "the fence must have landed: {events:?}"
+    );
+    let now = meta.get(&part_key).await.unwrap().expect("the part record");
+    let placement = decode_part_record(&now).unwrap().chunks()[0]
+        .placement
+        .clone();
+    let queued = repair::queued_repairs(&*meta)
+        .await
+        .unwrap()
+        .contains(&REPLACE_CHUNK);
+    let premark = meta.get(&replace_premark_key()).await.unwrap();
+    if run.adopted {
+        assert_eq!(placement, vec![0, 1, 2], "{events:?}");
+        assert!(
+            !queued,
+            "the adoption drains the obligation in its own commit: {events:?}"
+        );
+        assert!(
+            premark.is_none(),
+            "the adoption consumes its pre-mark: {events:?}"
+        );
+        assert!(
+            meta.get(&metadata::orphan_key(3, replace_fragment(2)))
+                .await
+                .unwrap()
+                .is_some(),
+            "the adoption marks the position it vacates: {events:?}"
+        );
+    } else {
+        assert_eq!(
+            now, part,
+            "an adoption that did not commit leaves the part record byte-identical: {events:?}"
+        );
+        assert!(
+            queued,
+            "an obligation is removed only by the commit that makes the repair durable: \
+             {events:?}"
+        );
+        if events.contains(&ReplaceEvent::PreMark(CommitOutcome::Committed)) {
+            assert!(
+                premark.is_some(),
+                "a lost re-place leaves its pre-mark standing: {events:?}"
+            );
+        }
+    }
+    run
+}
+
+/// The campaign leg: the seed picks where the fence lands, so 50 seeds sweep the schedule space
+/// around the re-place.
+async fn prop_staged_replace_under_the_fence_strands_nothing(rng: &mut ChaCha8Rng) {
+    let delay = u64::from(rng.next_u32() % (REPLACE_SPAN + 1));
+    replace_races_the_fence(delay * 1_000 + 500).await;
+}
+
+/// **Every landing is genuinely REACHED.** Walks the fence across the whole span, asserting X29 at
+/// every point, then asserts that the fence landed before the pre-mark in some run, between the
+/// pre-mark and the write in another, between the write and the adoption in another, and after
+/// the adoption in another — and that some run adopted and some did not. Without it, a span that
+/// drifted away from the re-place (or a pass that never re-placed at all) would leave the campaign
+/// green with nothing behind it.
+async fn prop_staged_replace_reaches_every_point_of_the_fence() {
+    let (mut before, mut premark_to_write, mut write_to_adoption, mut after) =
+        (false, false, false, false);
+    let (mut adopted, mut not_adopted) = (false, false);
+    for delay in 0..=u64::from(REPLACE_SPAN) {
+        let run = replace_races_the_fence(delay * 1_000 + 500).await;
+        before |= run.before_the_premark;
+        premark_to_write |= run.between_premark_and_write;
+        write_to_adoption |= run.between_write_and_adoption;
+        after |= run.after_the_adoption;
+        adopted |= run.adopted;
+        not_adopted |= !run.adopted;
+    }
+    assert!(
+        before,
+        "no landing in the span fenced the session before the re-place's pre-mark"
+    );
+    assert!(
+        premark_to_write,
+        "no landing in the span fenced the session between the pre-mark and the write"
+    );
+    assert!(
+        write_to_adoption,
+        "no landing in the span fenced the session between the write and the adoption — the X29 \
+         interleaving this property exists for was never exercised"
+    );
+    assert!(
+        after,
+        "no landing in the span fenced the session after the adoption"
+    );
+    assert!(adopted && not_adopted, "the sweep is stuck in one outcome");
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -4599,6 +5144,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn staged_replace_under_the_fence_strands_nothing() {
+        prop_staged_replace_under_the_fence_strands_nothing(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn staged_replace_reaches_every_point_of_the_fence() {
+        prop_staged_replace_reaches_every_point_of_the_fence().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -4637,6 +5194,7 @@ dst_campaign_test! {
             prop_gc_reclaim_intent_never_publishes_over_deleted_bytes(&mut rng).await;
             prop_gc_fragment_less_sweep_never_deletes_a_restamped_mark(&mut rng).await;
             prop_gc_sweep_judges_an_ambiguous_commit_as_one_batch(&mut rng).await;
+            prop_staged_replace_under_the_fence_strands_nothing(&mut rng).await;
         }
     }
 }

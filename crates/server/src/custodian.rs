@@ -123,12 +123,12 @@ const GC_GRACE_WINDOW_MILLIS: u64 = crate::cli::LEASE_TTL_MILLIS;
 const _: () = assert!(wyrd_custodian::gc::LATE_WRITE_DEADLINE_MILLIS < GC_GRACE_WINDOW_MILLIS);
 
 /// The staged-write window `ReconstructionContext::staged_write_window_millis` feeds
-/// [`wyrd_custodian::reconstruction`] (issue #814 is its first reader; this slice only fills
-/// the seam, `reconstruction.rs`'s own field doc). Reuses GC's own `W_write`
-/// ([`wyrd_custodian::gc::W_WRITE_MILLIS`]) rather than a second definition — proposal 0016
-/// requires `G_orphan > W_repoint + W_write + δ_clock` (`0016:1348`), and #800's late-write
-/// deadline is already held against [`GC_GRACE_WINDOW_MILLIS`] above; a second `W_write`
-/// constant here could drift from the one the sweep actually honours.
+/// [`wyrd_custodian::reconstruction`]'s staged re-place: each destination write it sends carries
+/// the deadline `pre-mark stamp + this window`, which the D server enforces (#814). Reuses GC's
+/// own `W_write` ([`wyrd_custodian::gc::W_WRITE_MILLIS`]) rather than a second definition —
+/// proposal 0016 requires `G_orphan > W_repoint + W_write + δ_clock` (`0016:1348`), and #800's
+/// late-write deadline is already held against [`GC_GRACE_WINDOW_MILLIS`] above; a second
+/// `W_write` constant here could drift from the one the sweep actually honours.
 const STAGED_WRITE_WINDOW_MILLIS: u64 = wyrd_custodian::gc::W_WRITE_MILLIS;
 
 /// The run loop's **one** time source, in both shapes its readers take: the `now_millis` each
@@ -141,8 +141,8 @@ const STAGED_WRITE_WINDOW_MILLIS: u64 = wyrd_custodian::gc::W_WRITE_MILLIS;
 ///
 /// Each read calls the closure once, exactly as the bare `clock()` calls it replaces did, so the
 /// seam moves between two reads inside one pass the way the closure does. A snapshot taken once
-/// per pass would not: a write-window deadline #814 checks through the seam could then never
-/// expire mid-pass, however long the write took.
+/// per pass would not: the staged re-place stamps its pre-mark and checks its `W_repoint` gate
+/// through the seam, and a snapshot would age neither while the pass ran, however long it took.
 struct LoopClock<F>(std::sync::Mutex<F>);
 
 impl<F: FnMut() -> u64> LoopClock<F> {
@@ -537,8 +537,9 @@ impl CustodianService {
         tokio::pin!(shutdown);
         // The caller's clock, moved into the one `LoopClock` every pass reads: each pass's
         // `now_millis` below and `ReconstructionContext::clock` are two views of this one source,
-        // never a wall clock beside a logical one. Nothing reads the context's field yet (#814 is
-        // its first reader).
+        // never a wall clock beside a logical one. The staged re-place reads the context's field
+        // (#814): its pre-mark stamps, its `W_repoint` gate and the mark it leaves on a vacated
+        // position.
         let clock = LoopClock::new(clock);
         loop {
             let (fleet, topology, unreachable) = live_reconstruction_view(configured).await;

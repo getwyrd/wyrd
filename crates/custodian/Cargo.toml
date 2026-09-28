@@ -28,6 +28,10 @@ wyrd-telemetry.workspace = true
 # own production code (`reconstruction.rs`) declares, not a test-only composition (the
 # same reason `wyrd-chunkstore-fs` takes it, `crates/chunkstore-fs/Cargo.toml:14-19`).
 wyrd-testkit.workspace = true
+# The staged re-place sends a move's destination writes together (`reconstruction::staged`),
+# through the same runtime-agnostic `join_all` the write path's fan-out uses
+# (`wyrd_core::write`): polled on the calling task, no task spawned, deterministic under madsim.
+futures-util.workspace = true
 
 [dev-dependencies]
 # The telemetry read-back tests install the metrics bridge on a `tracing` subscriber
