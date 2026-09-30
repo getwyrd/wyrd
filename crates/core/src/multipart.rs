@@ -129,8 +129,8 @@ use wyrd_traits::{ChunkId, DServerId, SCAN_CAP};
 
 use crate::erasure;
 use crate::metadata::{
-    self, ChunkRef, EcScheme, InodeId, SegmentGroup, MAX_ROOT_SEGMENTS, MAX_ROOT_VALUE_BYTES,
-    MAX_VALUE_BYTES,
+    self, ChunkRef, EcScheme, InodeId, SegmentGroup, SegmentNonce, MAX_ROOT_SEGMENTS,
+    MAX_ROOT_VALUE_BYTES, MAX_VALUE_BYTES,
 };
 
 // ===========================================================================
@@ -281,9 +281,10 @@ pub enum RecordError {
         target_name: String,
     },
     /// A session's `publish_target` carries a fence epoch that disagrees with the session's
-    /// own `epoch` — the F18 class (`0016:350`, `:560-563`): `publish_target`'s epoch is what
-    /// makes the `Completing` fence's segment-group nonce deterministic **for that attempt**,
-    /// so a record whose two epochs disagree addresses another attempt's segment-group.
+    /// own `epoch` — the F18 class (`0016:350`, `:560-563`): `publish_target`'s epoch is the
+    /// epoch half of the segment group **this** `Completing` attempt writes (the session's
+    /// own nonce at that epoch), so a record whose two epochs disagree addresses another
+    /// attempt's segment-group.
     PublishTargetEpochMismatch {
         /// The session's own epoch.
         session_epoch: u64,
@@ -1942,8 +1943,11 @@ fn require_canonical<T: Serialize>(
 
 /// The target dirent identity a `Completing` session's fence will flip: parent bucket inode +
 /// object name — **never** a frozen inode id (`0016:350`, `:561-563`), plus the `Completing`
-/// fence epoch `E` that makes the attempt's segment-group nonce deterministic. Stamped onto
-/// the session record the moment it fences into `Completing`.
+/// fence epoch `E`: the attempt's epoch within the session's segment group, so the group this
+/// attempt writes is the session's own `segment_nonce` at `E`
+/// ([`SessionRecord::attempt_segment_group`]). It carries no nonce of its own — the session
+/// names its nonce once, in every state. Stamped onto the session record the moment it fences
+/// into `Completing`.
 ///
 /// A plain value with no invariant of its own: its component types ([`InodeId`], `String`,
 /// `u64`) each validate their own shape, and the **identity** it must hold against the session
@@ -2068,11 +2072,25 @@ fn de_content_type<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<
     })
 }
 
+/// Decode the session's `segment_nonce` through [`SegmentNonce::new`], the nonce rule's one
+/// home (`metadata.rs:996-1006`). [`SegmentNonce`] deliberately has no `Deserialize`, so a
+/// derive cannot produce one unvalidated; this is the same route [`SegmentGroup`]'s own
+/// `Deserialize` takes (`metadata.rs:1060-1071`), for a nonce that stands alone on the record
+/// rather than inside a group. A present nonce that is not exactly
+/// [`crate::metadata::SEG_NONCE_HEX_LEN`] lowercase hex characters is a decode error naming
+/// the field — structural, so never a value (ADR-0045).
+fn de_segment_nonce<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SegmentNonce, D::Error> {
+    let nonce = String::deserialize(deserializer)
+        .map_err(|err| DeError::custom(format!("segment_nonce: {err}")))?;
+    SegmentNonce::new(nonce).map_err(|err| DeError::custom(format!("segment_nonce: {err}")))
+}
+
 /// The wire shape of [`SessionRecord`] — every field the session carries regardless of state,
 /// plus `state` itself, whose own [`SessionState`] `Deserialize` enforces which of the
 /// state-dependent fields may accompany it (leg 1j). `deny_unknown_fields` closes the shape
-/// against a field this build does not know (leg 1m), and `de_content_type` closes the one
-/// field that is genuinely optional against its second spelling.
+/// against a field this build does not know (leg 1m), `de_content_type` closes the one
+/// field that is genuinely optional against its second spelling, and `de_segment_nonce`
+/// validates the nonce through its one constructor.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionRecordWire {
@@ -2082,14 +2100,29 @@ struct SessionRecordWire {
     content_type: Option<String>,
     created_at_millis: u64,
     clock_source: String,
+    #[serde(deserialize_with = "de_segment_nonce")]
+    segment_nonce: SegmentNonce,
     epoch: u64,
     attempts: u32,
     state: SessionState,
 }
 
 /// A multipart upload **session**, the `mpu:<upload-id>` value (`0016:350`): target bucket
-/// (`parent`) + object name, `content_type`, `created_at_millis`, `clock_source`, `epoch`,
-/// `attempts`, and the lifecycle [`SessionState`].
+/// (`parent`) + object name, `content_type`, `created_at_millis`, `clock_source`,
+/// `segment_nonce`, `epoch`, `attempts`, and the lifecycle [`SessionState`].
+///
+/// # The segment-group nonce
+///
+/// **Stored** in every state, not derived: the nonce is independent of the upload id, since
+/// segment records outlive the `mpu:` tombstone (`0016:499-509`), so nothing else on the
+/// record reproduces it. Create mints it and reserves `seggrp:<nonce>` (`0016:508-518`,
+/// `:656`); each `Completing` attempt writes under `(nonce, publish_target.epoch)`
+/// ([`SessionRecord::attempt_segment_group`]), which the batch ending the attempt names for
+/// deletion (`0016:665`, X57 at `:880`); a rollback to `Open@E+1` drops `publish_target` but
+/// keeps the nonce for the next attempt (`0016:538-552`); and the terminal delete, from any
+/// state, names the marker Create reserved (`0016:673`). Its one accepted position is after
+/// `clock_source`, before `epoch` (the canonical-bytes check below). Proposal 0016's `mpu:`
+/// row (`0016:350`) does not list the field yet.
 ///
 /// # Serialization identity
 ///
@@ -2099,8 +2132,10 @@ struct SessionRecordWire {
 /// set rather than over the shapes this codec happens to write, so no accepted value can be
 /// one whose re-encode differs from what the store holds.
 ///
-/// Seven of the eight fields are required, so their spelling is forced. `content_type` is
-/// genuinely optional (`0016:350`) and is the whole of the argument:
+/// Eight of the nine fields are required, so their spelling is forced — `segment_nonce`
+/// entirely so, since [`SegmentNonce`] admits exactly one spelling of each nonce (32
+/// lowercase hex characters). `content_type` is genuinely optional (`0016:350`) and is the
+/// whole of the argument:
 ///
 /// * absent is spelled by **omitting** the field — `skip_serializing_if` below, the
 ///   convention [`crate::metadata::InodeRecord`] states at length for its own optional trio
@@ -2139,6 +2174,9 @@ pub struct SessionRecord {
     content_type: Option<String>,
     created_at_millis: u64,
     clock_source: String,
+    /// Present in every state; see this type's "The segment-group nonce". Serializes as its
+    /// plain 32-character string; the decode half is `de_segment_nonce`.
+    segment_nonce: SegmentNonce,
     epoch: u64,
     attempts: u32,
     state: SessionState,
@@ -2168,6 +2206,32 @@ impl SessionRecord {
     /// The clock source that stamped this session's timestamps (`0016:1957-1990`).
     pub fn clock_source(&self) -> &str {
         &self.clock_source
+    }
+
+    /// The session's segment-group nonce, in **every** state — already validated at decode,
+    /// so it can be handed straight to [`crate::metadata::seggrp_key`] (the marker the
+    /// terminal delete removes, `0016:673`) or [`crate::metadata::seg_group_prefix`] without
+    /// re-parsing.
+    pub const fn segment_nonce(&self) -> &SegmentNonce {
+        &self.segment_nonce
+    }
+
+    /// The segment group the current `Completing` attempt writes under: the session's own
+    /// [`segment_nonce`](Self::segment_nonce) at `publish_target.epoch` — the range a writer
+    /// that ends the attempt names for deletion ([`crate::metadata::seg_range_prefix`];
+    /// `0016:665`, `:2193-2196`). `None` in every other state: only `Completing` has an
+    /// attempt in its segment-write phase. Built from the nonce already validated at decode
+    /// ([`SegmentGroup::from_nonce`]), never re-parsed.
+    pub fn attempt_segment_group(&self) -> Option<SegmentGroup> {
+        match &self.state {
+            SessionState::Completing { publish_target, .. } => Some(SegmentGroup::from_nonce(
+                self.segment_nonce.clone(),
+                publish_target.epoch,
+            )),
+            SessionState::Open {} | SessionState::Aborting {} | SessionState::Completed { .. } => {
+                None
+            }
+        }
     }
 
     /// The session's current epoch; every transition is a fenced CAS that bumps it.
@@ -2234,6 +2298,7 @@ impl TryFrom<SessionRecordWire> for SessionRecord {
             content_type: wire.content_type,
             created_at_millis: wire.created_at_millis,
             clock_source: wire.clock_source,
+            segment_nonce: wire.segment_nonce,
             epoch: wire.epoch,
             attempts: wire.attempts,
             state: wire.state,
