@@ -402,7 +402,8 @@ fn per_verb_answers_agree_with_the_dispatcher() {
 fn completed_session_bytes(etag: &str, fingerprint: &Digest) -> Vec<u8> {
     format!(
         "{{\"parent\":42,\"object\":\"key/one\",\"created_at_millis\":1000,\
-         \"clock_source\":\"wall\",\"epoch\":3,\"attempts\":2,\"state\":{{\"kind\":\"Completed\",\
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":3,\"attempts\":2,\"state\":{{\"kind\":\"Completed\",\
          \"completion\":{{\"inode\":{INODE},\"version\":{VERSION},\"etag\":\"{etag}\",\
          \"completed_at_millis\":{COMPLETED_AT},\"complete_fingerprint\":\"{}\"}}}}}}",
         hex(fingerprint.as_bytes())
