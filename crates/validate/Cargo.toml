@@ -1,0 +1,28 @@
+[package]
+name = "wyrd-validate"
+description = "The blackbox validator (proposal 0017): an out-of-process tool that drives a Wyrd deployment through its S3 front door the way a client does. This slice is the crate skeleton and its argument surface — it parses, resolves credentials, echoes the resolved configuration, and exits."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The pure decisions (argument parsing, credential resolution, the resolved-configuration
+# echo) live in the library so the integration tests reach them directly; the binary is a
+# thin shell over it that owns only the I/O (proposal 0017 §2 "Layering").
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "wyrd-validate"
+path = "src/main.rs"
+
+# Deliberately NO dependencies — neither third-party nor `wyrd-*`. The argument surface is
+# hand-rolled (the shape of `wyrd`'s `ParsedArgs`) so this crate lands with no licence
+# decision attached; the S3 client and its dependency audit arrive in their own slice
+# (#741). The no-`wyrd-*` closure is the blackbox property (proposal 0017 §9).
+
+# Inherit the workspace lint policy (single source of truth).
+[lints]
+workspace = true
