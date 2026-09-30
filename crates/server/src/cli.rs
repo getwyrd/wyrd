@@ -1230,7 +1230,8 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
 /// What the post-restore one-shot tells the operator: every line it prints, and whether the run
 /// **needs a human** — which is also the command's exit status.
 struct RestoreVerdict {
-    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding.
+    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding,
+    /// then an informational line that does not set the status (untrusted staged records).
     lines: Vec<String>,
     /// Exit non-zero. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green.
     needs_human: bool,
@@ -1253,16 +1254,21 @@ struct RestoreVerdict {
 /// record a run that lost data — or one whose chunks could not be read — as a healthy one, which
 /// is the single worst thing this command could do. The pass itself succeeded; the restore did
 /// not.
+///
+/// An untrusted staged record is named WITHOUT that status, on an informational line: the
+/// report's predicate leaves it out on a recorded decision ([`RestoreReport::needs_human`]).
 fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
     let mut lines = vec![format!(
         "wyrd custodian: post-restore reconciliation {} — {} stranded fragment(s) marked \
-         collectable ({} already marked, {} left to a pending lease, {} displaced and kept); {} \
+         collectable ({} already marked, {} left to a pending lease, {} kept for multipart \
+         uploads' staged records, {} displaced and kept); {} \
          chunk(s) DANGLING (unreadable AND unreconstructible — the restore resurrected maps \
          whose bytes were already reclaimed), {} MISPLACED (bytes present but not where the \
          restored map looks — unreadable until the placement is fixed), {} under-replicated (the \
          repair loop rebuilds these); {} record(s) UNREADABLE (committed objects' chunk maps or \
          staged multipart records the pass could not read — so every count here is drawn over \
          the rest of the store); {} pending-ledger entr(y/ies) UNREADABLE (held unmarked, see \
+         below); {} staged multipart record(s) untrusted (their chunks held unmarked, see \
          below).",
         // NOT "complete" over a store the pass could only partly read: "complete" is a claim
         // about a reading that FINISHED, and an operator scanning this line for one word must
@@ -1275,12 +1281,14 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         report.stranded_marked,
         report.already_marked,
         report.pending_skipped,
+        report.staged_skipped,
         report.displaced_kept,
         report.dangling.len(),
         report.misplaced.len(),
         report.under_replicated.len(),
         report.unresolvable.len(),
         report.pending_unreadable.len(),
+        report.staged_untrusted.len(),
     )];
     if !report.pending_unreadable.is_empty() {
         lines.push(format!(
@@ -1357,6 +1365,23 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             report.unresolvable.len(),
             named_records(&report.unresolvable),
             report.stranded_marked,
+        ));
+    }
+    if !report.staged_untrusted.is_empty() {
+        lines.push(format!(
+            // INFORMATION, not NEEDS-HUMAN (`RestoreReport::needs_human` says why), but named.
+            // Says what the pass DID — marked none of these chunks' fragments — and no more: not
+            // that the staged bytes survived (only committed chunks are judged for missing
+            // bytes), and no cleanup promise (whether the retire drain removes one is #659's).
+            "wyrd custodian: note — {} staged multipart record(s) could not be TRUSTED about where \
+             their chunks' fragments are: {}. This pass held those chunks and marked none of their \
+             fragments; it did not check that their staged bytes survived the restore. A damaged \
+             staged record points at a bug or at corruption, and while one remains it blocks \
+             every drain in the cluster, so this run is not a clean bill. Reported for your \
+             information: it does not change the exit status. The audit log carries each one too \
+             (`action=untrusted-staged-record`).",
+            report.staged_untrusted.len(),
+            named_records(&report.staged_untrusted),
         ));
     }
     RestoreVerdict {
@@ -2931,6 +2956,13 @@ mod tests {
         let routine = RestoreReport {
             stranded_marked: 4,
             under_replicated: vec![3],
+            staged_skipped: 2,
+            ..Default::default()
+        };
+        // An untrusted staged record (#839): named and not clean, but not a human's.
+        let untrusted = RestoreReport {
+            staged_untrusted: vec!["part:0123456789abcdef0123456789abcdef:000001".to_owned()],
+            staged_skipped: 3,
             ..Default::default()
         };
         for (report, human) in [
@@ -2939,6 +2971,7 @@ mod tests {
             (&unreadable, true),
             (&pending, true),
             (&routine, false),
+            (&untrusted, false),
         ] {
             let verdict = restore_verdict(report);
             let printed = verdict.lines.join("\n");
@@ -2955,8 +2988,13 @@ mod tests {
                 human,
                 "a paragraph without the status behind it, or the reverse: {report:?} / {printed}"
             );
-            // `is_clean` is the strict superset: nothing that needs a human is ever clean.
+            // `is_clean` is the strict superset: nothing that needs a human is ever clean (nor is
+            // a run holding a chunk over an untrusted staged record).
             assert!(!(human && report.is_clean()), "{report:?}");
+            assert!(
+                report.staged_untrusted.is_empty() || !report.is_clean(),
+                "{report:?}"
+            );
             // "complete" is a claim about a reading that FINISHED, and an operator greps this
             // line for exactly that word — so it appears iff nothing was unreadable, and the
             // blocking record is NAMED where they read it rather than left to a log.
@@ -2980,14 +3018,82 @@ mod tests {
             // merely counted. A count tells them a repair is needed and not which record to
             // repair, and the operator this command is written for is mid-restore at a terminal
             // — the log collector is one of the things a restore brings back up.
-            for object in report.unresolvable.iter().chain(&report.pending_unreadable) {
+            for object in report
+                .unresolvable
+                .iter()
+                .chain(&report.pending_unreadable)
+                .chain(&report.staged_untrusted)
+            {
                 assert!(
                     printed.contains(object.as_str()),
-                    "the blocking record {object} is not named in what the operator reads: \
-                     {printed}"
+                    "the record {object} is not named in what the operator reads: {printed}"
                 );
             }
         }
+    }
+
+    /// Issue #839: the summary counts staged skips, and an untrusted staged record is named on an
+    /// INFORMATIONAL line — the status stays `needs_human()`. The line claims only that the pass
+    /// marked none of those fragments: not that the staged bytes survived, and no cleanup (#659).
+    #[test]
+    fn restore_verdict_counts_staged_skips_and_names_untrusted_staged_records_as_information() {
+        let upload = "0123456789abcdef0123456789abcdef";
+        let records = vec![
+            format!("part:{upload}:000001"),
+            format!("sidx:{upload}:000002:9"),
+        ];
+        let report = RestoreReport {
+            staged_skipped: 5,
+            staged_untrusted: records.clone(),
+            ..Default::default()
+        };
+        let verdict = restore_verdict(&report);
+        let printed = verdict.lines.join("\n");
+
+        assert!(!verdict.needs_human, "{printed}");
+        assert!(!report.is_clean(), "{report:?}");
+        // Counted on the summary line, whose reading still FINISHED ("complete").
+        for needle in [
+            "post-restore reconciliation complete",
+            "5 kept for multipart uploads' staged records",
+            "2 staged multipart record(s) untrusted",
+        ] {
+            assert!(verdict.lines[0].contains(needle), "{needle:?}: {printed}");
+        }
+        let note = verdict
+            .lines
+            .iter()
+            .find(|line| line.contains("could not be TRUSTED"))
+            .unwrap_or_else(|| panic!("no line names the untrusted records: {printed}"));
+        for needle in records.iter().map(String::as_str).chain([
+            "marked none of their fragments",
+            "did not check that their staged bytes survived the restore",
+            "not a clean bill",
+            "does not change the exit status",
+            "action=untrusted-staged-record",
+        ]) {
+            assert!(note.contains(needle), "{needle:?}: {note}");
+        }
+        for never in [
+            "NEEDS-HUMAN",
+            "automatic",
+            "clean up",
+            "cleanup",
+            "will be removed",
+        ] {
+            assert!(
+                !note.to_lowercase().contains(&never.to_lowercase()),
+                "{never:?}: {note}"
+            );
+        }
+        // Kept fragments alone are protection, not a finding: no such line, and clean.
+        let kept_only = RestoreReport {
+            staged_skipped: 5,
+            ..Default::default()
+        };
+        let printed = restore_verdict(&kept_only).lines.join("\n");
+        assert!(!printed.contains("could not be TRUSTED"), "{printed}");
+        assert!(kept_only.is_clean(), "{kept_only:?}");
     }
 
     /// The bound on that naming, from both sides: up to [`NAMED_UNREADABLE_RECORDS`] blockers are
