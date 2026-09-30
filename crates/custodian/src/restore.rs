@@ -72,9 +72,10 @@
 //! owned staging entry names ([`crate::gc::StagedSet`], proposal 0016 decision 2). The pass reads
 //! that class through the reader GC uses, before either reading of the committed namespace, and
 //! gates on it by the same rules: a staged record it cannot read withholds every mark and is named
-//! in the report, one it cannot trust holds its chunk, and a store fault under one of its reads
-//! fails the pass. The protection covers the upload records already durable when the pass read
-//! them; a write or an upload that starts while the pass runs is not yet covered (#805).
+//! in the report, one it cannot trust holds its chunk and is named there too, and a store fault
+//! under one of its reads fails the pass; what the class keeps is counted. The protection covers
+//! the upload records already durable when the pass read them; a write or an upload that starts
+//! while the pass runs is not yet covered (#805).
 //!
 //! # Idempotent, and running it twice is not a way to lose data
 //!
@@ -124,6 +125,15 @@ pub struct RestoreReport {
     /// Unreferenced fragments left alone because their chunk still holds a `pending:`
     /// lease — an in-flight write, whose lease TTL is already its grace. GC owns them.
     pub pending_skipped: usize,
+    /// Fragments left unmarked because the **staged protection class** keeps them
+    /// ([`crate::gc::StagedSet`], `0016:823`): a multipart upload's own record places them, or
+    /// names their chunk untrustworthily ([`RestoreReport::staged_untrusted`]).
+    ///
+    /// Each kept fragment is counted once, under the FIRST protection that keeps it in the pass's
+    /// order: the committed readings (uncounted), the staged class, the displaced check, the
+    /// pending lease. So one a committed map protects is never counted here, and one counted here
+    /// is not counted again under `displaced_kept` or `pending_skipped`.
+    pub staged_skipped: usize,
     /// `pending:` entries this pass could **not read as an ordinary lease** — torn, malformed,
     /// or an owned staging entry filed under the wrong key — named by key as
     /// [`RestoreReport::unresolvable`] names a record. Their chunks are **held** exactly as a
@@ -135,6 +145,17 @@ pub struct RestoreReport {
     /// not make the reading of the **committed** namespace partial, so it withholds no mark and
     /// does not take "complete" off the summary line.
     pub pending_unreadable: Vec<String>,
+    /// Staged multipart records this pass read but could **not trust** about where a chunk's
+    /// fragments are — a placement of the wrong length, or an owned `sidx:` value that will not
+    /// decode under a key that still names its chunk ([`crate::gc::StagedSet::held`]). Named by
+    /// key as [`RestoreReport::unresolvable`] names a record, once per record, in key order.
+    ///
+    /// The pass held every fragment of each such chunk and marked none; that is all it claims. It
+    /// does not claim the staged bytes survived: it judges missing bytes for committed chunks
+    /// only. The run is then not [clean](RestoreReport::is_clean), and does **not** need a human
+    /// ([`RestoreReport::needs_human`] says why). Not in `unresolvable`: the record was read, so
+    /// the reading is not partial.
+    pub staged_untrusted: Vec<String>,
     /// Fragments the restored map still needs but whose bytes have MOVED — a repair or
     /// rebalance after the restore point wrote them to a new D server and repointed the
     /// placement, and the restore rewound the map but not the bytes. These are the **only
@@ -187,15 +208,20 @@ impl RestoreReport {
     /// finish?
     ///
     /// The strict superset of [`Self::needs_human`]: it also counts the work this pass DID
-    /// (fragments marked collectable) and the work the repair loop will do (under-replicated
-    /// chunks), neither of which is a human's. Written **in terms of** that predicate rather
-    /// than beside it, so the two cannot drift as fields are added.
+    /// (fragments marked collectable), the work the repair loop will do (under-replicated
+    /// chunks), and the [untrusted staged records](RestoreReport::staged_untrusted) it held chunks
+    /// over, none of which is a human's. Written **in terms of** that predicate rather than
+    /// beside it, so the two cannot drift as fields are added.
     ///
     /// An [unresolvable object](RestoreReport::unresolvable) counts: "clean" is a claim about a
     /// reading that FINISHED, and this one did not — so a store the pass could only partly read
-    /// is never certified clean (`docs/principles.md` §5 C-1).
+    /// is never certified clean (`docs/principles.md` §5 C-1). An untrusted staged record counts
+    /// on the same ground: the pass could not tell where that chunk's fragments are.
     pub fn is_clean(&self) -> bool {
-        self.stranded_marked == 0 && self.under_replicated.is_empty() && !self.needs_human()
+        self.stranded_marked == 0
+            && self.under_replicated.is_empty()
+            && self.staged_untrusted.is_empty()
+            && !self.needs_human()
     }
 
     /// Does this run need a **human** — the question `wyrd custodian --reconcile-after-restore`
@@ -209,6 +235,18 @@ impl RestoreReport {
     /// a restore script on either would train an operator to ignore the status. It lives on the
     /// report rather than in the command because a caller that never prints the summary still
     /// needs the same verdict, and would otherwise re-derive it slightly differently.
+    ///
+    /// **A deliberate exception to that rule:** an untrusted staged record
+    /// ([`RestoreReport::staged_untrusted`]) is left out, although no loop removes one yet
+    /// (whether the retire drain does is #659's call). It rests on the human's decision at #664's
+    /// plan revision (2026-09-18), not on the rule above: once the session is fenced its staged
+    /// bytes are garbage whatever the record says, so what is left is cleanup — automatic work,
+    /// not a judgement — and keep-on-doubt protects user data, not system residue (#811). Its
+    /// condition is that fence (#841, #842); until then the session is still `Open`, a window no
+    /// production client reaches, since none can create a session before #508, which lands after
+    /// it. The record is still named, and the run is not [clean](Self::is_clean): a damaged staged
+    /// record points at a bug or corruption and blocks every drain in the cluster, so the operator
+    /// should hear of it at restore time rather than when a drain stalls.
     pub fn needs_human(&self) -> bool {
         !self.dangling.is_empty()
             || !self.misplaced.is_empty()
@@ -241,7 +279,9 @@ impl RestoreReport {
 /// inode while the pass runs leaves it protected by one reading or the other. A staged record the
 /// pass cannot read is named in [`RestoreReport::unresolvable`] and withholds every mark, as an
 /// unreadable committed object does; one it can read but not trust holds its chunk and is named on
-/// the audit seam; a store fault under a staged read fails the pass with an `Err` naming the read.
+/// the audit seam and in [`RestoreReport::staged_untrusted`]; a store fault under a staged read
+/// fails the pass with an `Err` naming the read. What the class keeps is counted
+/// ([`RestoreReport::staged_skipped`]).
 ///
 /// What this covers is the upload records **already durable when the pass read them**. A write or
 /// an upload that starts after that read is not protected by it — the runbook's writers-stopped
@@ -346,7 +386,7 @@ pub async fn reconcile_after_restore(
     // then, never reaches them at all. Attribution that a later transient fault can swallow is
     // not attribution.
     let mut unreadable = BTreeSet::new();
-    attribute_staged(&staged, &mut unreadable);
+    let staged_untrusted = attribute_staged(&staged, &mut unreadable);
     let referenced = referenced_fragments(ctx.meta).await?;
     attribute_unresolvable(&referenced.unresolvable, &mut unreadable);
     let PendingLedger {
@@ -374,6 +414,7 @@ pub async fn reconcile_after_restore(
         // that class as well, so its hole is this run's hole.
         unresolvable: unreadable.iter().map(|key| object_name(key)).collect(),
         pending_unreadable,
+        staged_untrusted,
         ..Default::default()
     };
     // ONE READING, ONE CONCLUSION. `gc::ReferenceSet::protects` already withholds every fragment
@@ -427,16 +468,17 @@ pub async fn reconcile_after_restore(
         // says so. Otherwise an object committed in the instant between the two reads — absent
         // from `referenced` and present in `committed` — would have its live fragments marked
         // collectable, and GC would take the only copy after the grace window.
-        //
+        if incomplete || referenced.protects(dserver, frag) || appeared.protects(dserver, frag) {
+            continue;
+        }
+
         // And never a fragment the staged class protects: a multipart upload's committed part or
-        // owned staging entry names it, or names its chunk untrustworthily, or a staged record
-        // could not be read. (Staged counters are #664's; such a fragment is skipped uncounted,
-        // as a referenced one is.)
-        if incomplete
-            || referenced.protects(dserver, frag)
-            || appeared.protects(dserver, frag)
-            || staged.protects(dserver, frag)
-        {
+        // owned staging entry names it, or names its chunk untrustworthily (an unreadable staged
+        // record is `incomplete`, above). COUNTED, once, by the FIRST protection that keeps it:
+        // after the committed readings, before the displaced check and the pending lease below
+        // (`RestoreReport::staged_skipped`, `0016:823`).
+        if staged.protects(dserver, frag) {
+            report.staged_skipped += 1;
             continue;
         }
 
@@ -808,22 +850,25 @@ fn attribute_unresolvable(faults: &BTreeMap<Vec<u8>, String>, named: &mut BTreeS
 ///
 /// An unreadable staged record joins `named`, so it is reported in
 /// [`RestoreReport::unresolvable`] beside the committed objects and withholds every mark. A record
-/// it read but cannot trust holds its chunk (the mark gate skips every fragment bearing its id) and
-/// is named on the audit seam only.
-fn attribute_staged(staged: &StagedSet, named: &mut BTreeSet<Vec<u8>>) {
+/// it read but cannot trust holds its chunk (the mark gate skips every fragment bearing its id), is
+/// named on the audit seam, and is returned, once per record, for
+/// [`RestoreReport::staged_untrusted`].
+fn attribute_staged(staged: &StagedSet, named: &mut BTreeSet<Vec<u8>>) -> Vec<String> {
     for (record, fault) in &staged.unresolvable {
         if named.insert(record.clone()) {
             emit_unresolvable_staged(&object_name(record), fault);
         }
     }
-    // deferred: #664 — whether a held (untrusted) staged record also needs a human, and so sets
-    // `RestoreReport::needs_human`, is that slice's, with restore's staged counters. Until then it
-    // is named here and holds its chunk, and the report's verdict is unchanged by it.
+    // Named in the report too (not clean, and no human: `RestoreReport::needs_human` says why).
+    // By record, not chunk: one part record may hold several chunks.
+    let mut untrusted = BTreeSet::new();
     for (&chunk, records) in &staged.held {
         for (record, fault) in records {
             emit_untrusted_staged(&object_name(record), chunk, fault);
+            untrusted.insert(record.as_slice());
         }
     }
+    untrusted.into_iter().map(object_name).collect()
 }
 
 /// How many fragments must survive for this chunk to be rebuildable: `k` under
@@ -1025,7 +1070,9 @@ fn emit_summary(report: &RestoreReport) {
         stranded_marked = report.stranded_marked,
         already_marked = report.already_marked,
         pending_skipped = report.pending_skipped,
+        staged_skipped = report.staged_skipped,
         pending_unreadable = report.pending_unreadable.len(),
+        staged_untrusted = report.staged_untrusted.len(),
         displaced_kept = report.displaced_kept,
         dangling = report.dangling.len(),
         misplaced = report.misplaced.len(),

@@ -622,6 +622,15 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #                  marked, which is 0 while any record is unreadable: such a record hides
 #                  which chunks it owns, so no fragment can be shown to be a stray. Repair or
 #                  remove those records, then re-run.
+#
+#    The summary also counts the fragments the pass kept because a multipart upload's own
+#    staged records name them — an upload's bytes, not strays, so never marked. A staged record
+#    the pass could read but not TRUST about where its chunk's fragments are (a placement of
+#    the wrong length, say) is not one of the bills above: the exit status ignores it. It gets
+#    a line of its own that names the record: the pass held that chunk and marked none of its
+#    fragments (it did not check that the staged bytes survived the restore), and the run is
+#    not reported clean, because such a record points at a bug or corruption and blocks every
+#    drain in the cluster while it remains (action=untrusted-staged-record in the audit log).
 
 # 8. Resume writers, then run a scrub pass (see below).
 ```
