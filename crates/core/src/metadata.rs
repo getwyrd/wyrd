@@ -593,8 +593,11 @@ const _: () = assert!(MAX_ROOT_VALUE_BYTES * 2 <= MAX_VALUE_BYTES);
 /// Bound by the FULL ceiling ([`MAX_VALUE_BYTES`]), not the [`MAX_ROOT_VALUE_BYTES`] half:
 /// that half exists to budget a **segmented** root's segment table against the reserve its
 /// object metadata is spent from, and a flat record has no segment table — its whole value
-/// *is* the record. A segmented root's placement write is #682's, and it is the one that
-/// must weigh [`MAX_ROOT_VALUE_BYTES`].
+/// *is* the record. The segmented arm of [`repoint_chunk`] weighs its record here too, for
+/// the same reason: what it rewrites is one **segment** record, whose whole value is
+/// likewise the record and which the resolver reads up to exactly this ceiling
+/// (`read_group_range`). A placement move never re-encodes a segmented root, so
+/// [`MAX_ROOT_VALUE_BYTES`] bounds only the publication that writes a segment table.
 ///
 /// A record landing EXACTLY on [`MAX_VALUE_BYTES`] is admissible and is **not** refused —
 /// the same `>` boundary the resolver's read side refuses a stored row on (`:2493`), so
@@ -3096,6 +3099,277 @@ pub async fn resolve_current_chunk_map(
     .into())
 }
 
+// ---------------------------------------------------------------------------
+// The placement move — the maintenance WRITE side of a resolved chunk map
+// (proposal 0016 decision 7(f))
+// ---------------------------------------------------------------------------
+
+/// What preparing a placement move produced ([`repoint_chunk`]).
+///
+/// **No arm has written anything.** The move reads, weighs and builds; only the caller's
+/// own [`MetadataStore::commit`] of a [`Self::Prepared`] batch changes the store, so a
+/// refusal and a conflict alike leave every record byte-identical.
+#[derive(Debug)]
+pub enum Repoint {
+    /// The move as ONE compare-and-swap batch, carrying the three pins [`repoint_chunk`]
+    /// documents.
+    ///
+    /// Handed back rather than committed so the caller can add **its own evidence for the
+    /// same move** — an obligation's delete, an orphan mark per displaced fragment — and
+    /// land all of it in ONE atomic mutation (`0005:277`, ADR-0015). Committing the
+    /// placement and the evidence separately would leave a window in which a fragment has
+    /// moved and nothing records where it went.
+    Prepared(WriteBatch),
+    /// The record the move would leave behind crosses the value ceiling every backend
+    /// inherits ([`flat_value_ceiling_crossed`]): refused before anything was written.
+    /// Weighed on the generation the caller planned from alone — a refusal carries no
+    /// batch, so no pin confirms the root still names it. While it does, this is not
+    /// transient: it fails every pass until the record shrinks, an operator signal rather
+    /// than a retry — so confirm the generation is still current (a fresh resolve) before
+    /// escalating; on one the root has since left, the next plan ends it.
+    Refused {
+        /// The re-encoded record's own length.
+        bytes: usize,
+        /// The ceiling it crossed.
+        ceiling: usize,
+    },
+    /// The flat record's `version` is already `u64::MAX`: refused before anything was
+    /// written rather than wrapped, since a wrapped version is a smaller number a stale
+    /// reader could mistake for an older generation. Like [`Self::Refused`], judged on the
+    /// planned generation alone: the object's own state rather than a race, so not
+    /// transient while that generation is live.
+    VersionExhausted {
+        /// The version that cannot be advanced.
+        version: u64,
+    },
+    /// The chunk is no longer where, or what, the caller planned from: no chunk starting at
+    /// the offset equals the planned [`ChunkRef`], or the generation was retired under the
+    /// plan. Nothing is written — a stale plan never lands over a newer placement; the
+    /// caller keeps its obligation and re-plans next pass.
+    Conflict,
+}
+
+/// [`repoint_chunk`] was handed a replacement placement that does not name exactly one D
+/// server per fragment of the chunk it moves. A fault of the **call**, not of the object —
+/// so deliberately not a [`ChunkMapError`], which a maintenance loop contains as "this
+/// object is unreadable": a planner that builds a wrong-length vector surfaces as a bug.
+/// Stricter than [`ChunkRef::placement_is_valid`], which admits the empty vector for pre-M3
+/// records: a move says where every fragment now lives, and an empty or short vector would
+/// be identity-filled on read ([`ChunkRef::placed_dserver`]) to servers the fragments are
+/// not on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MalformedReplacement {
+    /// The chunk's fragment count ([`ChunkRef::fragment_count`]).
+    pub expected: u16,
+    /// The length of the placement the move was handed.
+    pub actual: usize,
+}
+
+impl fmt::Display for MalformedReplacement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { expected, actual } = self;
+        write!(f, "replacement needs {expected} D servers, got {actual}")
+    }
+}
+
+impl std::error::Error for MalformedReplacement {}
+
+/// Move ONE chunk's fragment `placement` in whichever record holds its [`ChunkRef`] — the
+/// flat inode record, or the one `seg:` record of a segmented map — and hand back the
+/// compare-and-swap batch that lands it ([`Repoint`]). The write counterpart of
+/// [`resolve_chunk_map`]: without it a chunk living in a `seg:` record can be read by every
+/// consumer and repaired by none.
+///
+/// # Addressing
+///
+/// `byte_offset` is the first object byte the chunk covers and `prior` is the reference the
+/// caller planned from. The chunk moved is the one that **begins at that offset and equals
+/// `prior`** (`chunk_at`); anything else is [`Repoint::Conflict`]. A zero-length chunk can
+/// begin exactly where a segment ends, so both segments touching that offset are candidates
+/// (`segment_may_hold`) and equality, not the offset, decides which record is written.
+///
+/// # The three pins
+///
+/// 1. The **root generation's** bytes, `encode(generation)`, in both arms: a supersede
+///    moves the root first (`0016:2452-2462`), so a move racing one loses the CAS. The
+///    segmented arm never `put`s the root — its placement lives in the segment — so the
+///    root's bytes are unchanged by the move.
+/// 2. In the segmented arm, the **segment record's own bytes as read here** — a fresh
+///    read, not the bytes the caller's resolve saw ([`ResolvedChunkMap`] keeps only the
+///    flattened chunks). A concurrent edit to a *sibling* chunk that landed before this
+///    read is therefore merged; one that lands after it fails the CAS.
+/// 3. The **`ChunkRef` itself**: the moved chunk must equal `prior`, placement included,
+///    so an edit to the planned chunk is a [`Repoint::Conflict`] rather than an overwrite.
+///
+/// The flat arm is [`commit_chunk_map`]'s idiom — the next version and `..generation.clone()`,
+/// so ADR-0047 metadata is preserved — with the version advanced **checked**
+/// ([`Repoint::VersionExhausted`]) and `state` left as it was: a move is not a publication,
+/// so unlike [`commit_chunk_map`] it never marks a generation `Committed`.
+///
+/// The re-encoded record — flat root or segment — is weighed against the full
+/// [`MAX_VALUE_BYTES`] through [`flat_value_ceiling_crossed`] before anything is built.
+///
+/// `placement` must name one D server per fragment of `prior`, or the call fails with
+/// [`MalformedReplacement`] before anything is read.
+///
+/// # Anomalies
+///
+/// A candidate segment record that is absent, is larger than [`MAX_VALUE_BYTES`] (weighed
+/// before it is decoded, as `read_group_range` weighs a row), will not decode, or disagrees
+/// with the root's table goes through the resolver's own arbiter (`retired_or`): a retired
+/// generation is a [`Repoint::Conflict`], one the root still names is structural
+/// corruption and surfaces as the typed [`ChunkMapError`] — never a silent skip, and never
+/// a rewrite of a record the read side refuses.
+///
+/// # Bounded
+///
+/// Segments are found in the root's own table; no `seg:` range is walked. At most two
+/// records are read (two only for a zero-length chunk on a segment boundary), one at a time.
+///
+/// deferred: #777 — the living architecture doc (`06-runtime-view.md` §6.3,
+/// `08-crosscutting-concepts.md` §8.7) describes what the maintenance loops **do**, and
+/// nothing calls this yet. It moves with the custodian wiring in #777, which changes that.
+pub async fn repoint_chunk(
+    store: &dyn MetadataStore,
+    inode: InodeId,
+    generation: &InodeRecord,
+    byte_offset: u64,
+    prior: &ChunkRef,
+    placement: Vec<DServerId>,
+) -> Result<Repoint> {
+    let expected = prior.fragment_count();
+    if placement.len() != usize::from(expected) {
+        return Err(MalformedReplacement {
+            expected,
+            actual: placement.len(),
+        }
+        .into());
+    }
+    let root_key = inode_key(inode);
+    let root_pin = WriteBatch::new().require(root_key.clone(), encode(generation));
+    let map = match &generation.chunk_map {
+        ChunkMap::Flat(chunks) => {
+            let Some(at) = chunk_at(chunks, byte_offset, prior) else {
+                return Ok(Repoint::Conflict);
+            };
+            let Some(version) = generation.version.checked_add(1) else {
+                return Ok(Repoint::VersionExhausted {
+                    version: generation.version,
+                });
+            };
+            let mut next_chunks = chunks.clone();
+            next_chunks[at].placement = placement;
+            let next = InodeRecord {
+                chunk_map: ChunkMap::Flat(next_chunks),
+                version,
+                ..generation.clone()
+            };
+            return Ok(weighed(root_pin, root_key, encode(&next)));
+        }
+        ChunkMap::Segmented(map) => map,
+    };
+    let group = map.group();
+    for segment in map
+        .segments()
+        .iter()
+        .filter(|segment| segment_may_hold(segment, byte_offset, prior.len))
+    {
+        // Infallible for a table that decoded: `SegmentedMap::new` refused every index
+        // this could reject.
+        let key = seg_key(group, segment.index)?;
+        let fault = match store.get(&key).await? {
+            None => ChunkMapError::SegmentAbsent {
+                nonce: group.nonce().to_string(),
+                epoch: group.epoch(),
+                index: segment.index,
+            },
+            // `read_group_range`'s own refusal: never decoded, so never rewritten either.
+            Some(bytes) if bytes.len() > MAX_VALUE_BYTES => {
+                ChunkMapError::SegmentValueOverCeiling {
+                    index: segment.index,
+                    bytes: bytes.len(),
+                    ceiling: MAX_VALUE_BYTES,
+                }
+            }
+            Some(bytes) => match decode_segment_record(segment.index, &bytes) {
+                Err(undecodable) => undecodable,
+                Ok(record)
+                    if record.byte_offset() != segment.byte_offset
+                        || record.byte_len() != segment.byte_len =>
+                {
+                    ChunkMapError::SegmentBoundsMismatch {
+                        index: segment.index,
+                        root: (segment.byte_offset, segment.byte_len),
+                        segment: (record.byte_offset(), record.byte_len()),
+                    }
+                }
+                Ok(record) => {
+                    // `segment_may_hold` admitted only offsets at or past the start.
+                    let within = byte_offset - segment.byte_offset;
+                    let Some(at) = chunk_at(record.chunks(), within, prior) else {
+                        continue;
+                    };
+                    let mut chunks = record.into_chunks();
+                    chunks[at].placement = placement;
+                    let next = SegmentRecord::new(chunks, segment.byte_offset)?;
+                    return Ok(weighed(
+                        root_pin.require(key.clone(), bytes),
+                        key,
+                        encode(&next),
+                    ));
+                }
+            },
+        };
+        // Only a dropped generation comes back `Ok`; one the root still names is `Err`.
+        retired_or::<()>(store, &root_key, group, fault).await?;
+        return Ok(Repoint::Conflict);
+    }
+    Ok(Repoint::Conflict)
+}
+
+/// Finish a move: refuse `next` past the value ceiling, else add its `put` to `pins`.
+fn weighed(pins: WriteBatch, key: Vec<u8>, next: Bytes) -> Repoint {
+    match flat_value_ceiling_crossed(&next) {
+        Some(ceiling) => Repoint::Refused {
+            bytes: next.len(),
+            ceiling,
+        },
+        None => Repoint::Prepared(pins.put(key, next)),
+    }
+}
+
+/// Whether `segment` can hold a chunk of length `len` that begins at object byte
+/// `byte_offset`: the offset falls inside the segment, or — for a zero-length chunk
+/// only — exactly on its end, where a trailing empty chunk begins. A chunk with bytes
+/// lives only in the segment its first byte falls in. Total: the table's spans are
+/// checked at decode, so nothing here overflows.
+fn segment_may_hold(segment: &SegmentRef, byte_offset: u64, len: u64) -> bool {
+    let Some(within) = byte_offset.checked_sub(segment.byte_offset) else {
+        return false;
+    };
+    within < segment.byte_len || (len == 0 && within == segment.byte_len)
+}
+
+/// The position in `chunks` of the chunk that **begins at `byte_offset`** and **equals
+/// `prior`** — the whole addressing rule of a placement move, shared by both shapes. The
+/// offset is an address a caller can carry across a segment boundary it never saw; the
+/// equality is the pin that turns a map rewritten under the plan into a conflict instead
+/// of an overwrite. Several chunks can begin at one offset only when some are empty, so
+/// equality — not position — picks among them.
+fn chunk_at(chunks: &[ChunkRef], byte_offset: u64, prior: &ChunkRef) -> Option<usize> {
+    let mut at = 0u64;
+    for (index, chunk) in chunks.iter().enumerate() {
+        if at > byte_offset {
+            break;
+        }
+        if at == byte_offset && chunk == prior {
+            return Some(index);
+        }
+        at = at.checked_add(chunk.len)?;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4156,5 +4430,819 @@ mod orphan_mark_codec {
                 version: 2
             })
         );
+    }
+}
+
+/// [`repoint_chunk`]: each arm, each pin, the ceiling, and the two addressing helpers.
+/// Every test builds the batch and applies it to a real (in-memory redb) store that the
+/// test mutates by hand in between, so "nothing written" is a byte comparison of the whole
+/// store rather than an assumption about the batch.
+#[cfg(test)]
+mod placement_move {
+    use super::*;
+    use wyrd_testkit::Sim;
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+    const INODE: InodeId = 7;
+
+    fn store() -> wyrd_metadata_redb::RedbMetadataStore {
+        wyrd_metadata_redb::RedbMetadataStore::in_memory().expect("in-memory redb store")
+    }
+
+    fn chunk(id: ChunkId, len: u64, placement: Vec<DServerId>) -> ChunkRef {
+        ChunkRef {
+            id,
+            scheme: EcScheme::None,
+            len,
+            placement,
+        }
+    }
+
+    fn put(store: &dyn MetadataStore, key: Vec<u8>, value: impl Into<Bytes>) {
+        let outcome = pollster::block_on(store.commit(WriteBatch::new().put(key, value)));
+        assert_eq!(outcome.unwrap(), CommitOutcome::Committed);
+    }
+
+    fn get(store: &dyn MetadataStore, key: &[u8]) -> Option<Bytes> {
+        pollster::block_on(store.get(key)).unwrap()
+    }
+
+    /// Every key and value in the store — "nothing was written" is this, unchanged.
+    fn snapshot(store: &dyn MetadataStore) -> Vec<(Vec<u8>, Bytes)> {
+        pollster::block_on(store.scan(b"")).unwrap()
+    }
+
+    fn repoint(
+        store: &dyn MetadataStore,
+        generation: &InodeRecord,
+        byte_offset: u64,
+        prior: &ChunkRef,
+        placement: Vec<DServerId>,
+    ) -> Result<Repoint> {
+        pollster::block_on(repoint_chunk(
+            store,
+            INODE,
+            generation,
+            byte_offset,
+            prior,
+            placement,
+        ))
+    }
+
+    fn prepared(repoint: Result<Repoint>) -> WriteBatch {
+        match repoint.expect("the move is prepared") {
+            Repoint::Prepared(batch) => batch,
+            other => panic!("expected a prepared batch, got {other:?}"),
+        }
+    }
+
+    fn commit(store: &dyn MetadataStore, batch: WriteBatch) -> CommitOutcome {
+        pollster::block_on(store.commit(batch)).unwrap()
+    }
+
+    fn chunk_map_error(result: Result<Repoint>) -> ChunkMapError {
+        let err = result.expect_err("the move must fail closed");
+        *err.downcast::<ChunkMapError>()
+            .expect("a structural fault surfaces as a typed ChunkMapError")
+    }
+
+    fn flat_root(chunks: Vec<ChunkRef>, version: u64) -> InodeRecord {
+        InodeRecord {
+            size: checked_chunk_bytes(&chunks).unwrap(),
+            chunk_map: ChunkMap::Flat(chunks),
+            state: InodeState::Committed,
+            version,
+            etag: Some("\"e\"".into()),
+            content_type: Some("text/plain".into()),
+            modified: Some(1_700_000_000_000),
+        }
+    }
+
+    fn group() -> SegmentGroup {
+        SegmentGroup::new(NONCE, 1).unwrap()
+    }
+
+    /// A segmented root over `segments`, each `(byte_offset, chunks)`, with every segment
+    /// record stored. Returns the root as stored.
+    fn seed_segmented(store: &dyn MetadataStore, segments: &[(u64, Vec<ChunkRef>)]) -> InodeRecord {
+        let mut table = Vec::new();
+        for (index, (byte_offset, chunks)) in segments.iter().enumerate() {
+            let record = SegmentRecord::new(chunks.clone(), *byte_offset).unwrap();
+            table.push(SegmentRef {
+                index: index as u32,
+                byte_offset: *byte_offset,
+                byte_len: record.byte_len(),
+            });
+            put(
+                store,
+                seg_key(&group(), index as u32).unwrap(),
+                encode(&record),
+            );
+        }
+        let map = SegmentedMap::new(group(), table).unwrap();
+        let root = InodeRecord {
+            size: map.span(),
+            chunk_map: ChunkMap::Segmented(map),
+            ..flat_root(Vec::new(), 3)
+        };
+        put(store, inode_key(INODE), encode(&root));
+        root
+    }
+
+    fn segment(store: &dyn MetadataStore, index: u32) -> SegmentRecord {
+        decode(&get(store, &seg_key(&group(), index).unwrap()).unwrap()).unwrap()
+    }
+
+    /// seg 0 = [A] over 0..5; seg 1 = [B, C] over 5..12 (C begins at 8).
+    fn a() -> ChunkRef {
+        chunk(1, 5, vec![10])
+    }
+    fn b() -> ChunkRef {
+        chunk(2, 3, vec![20])
+    }
+    fn c() -> ChunkRef {
+        chunk(3, 4, vec![30])
+    }
+    fn two_segments(store: &dyn MetadataStore) -> InodeRecord {
+        seed_segmented(store, &[(0, vec![a()]), (5, vec![b(), c()])])
+    }
+
+    #[test]
+    fn flat_arm_moves_the_placement_and_advances_the_version_preserving_metadata() {
+        let store = store();
+        // `Pending`, and it stays so: a move is not a publication.
+        let root = InodeRecord {
+            state: InodeState::Pending,
+            ..flat_root(vec![a(), b()], 3)
+        };
+        put(&store, inode_key(INODE), encode(&root));
+
+        let batch = prepared(repoint(&store, &root, 5, &b(), vec![99]));
+        assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+
+        let stored: InodeRecord = decode(&get(&store, &inode_key(INODE)).unwrap()).unwrap();
+        assert_eq!(
+            stored,
+            InodeRecord {
+                chunk_map: ChunkMap::Flat(vec![a(), chunk(2, 3, vec![99])]),
+                version: 4,
+                ..root
+            },
+            "only B's placement and the version move; size, state and ADR-0047 metadata stay"
+        );
+    }
+
+    #[test]
+    fn flat_arm_refuses_a_version_it_cannot_advance() {
+        let store = store();
+        let root = flat_root(vec![a()], u64::MAX);
+        put(&store, inode_key(INODE), encode(&root));
+        let before = snapshot(&store);
+        assert!(matches!(
+            repoint(&store, &root, 0, &a(), vec![99]),
+            Ok(Repoint::VersionExhausted { version: u64::MAX })
+        ));
+        assert_eq!(snapshot(&store), before);
+    }
+
+    #[test]
+    fn flat_arm_conflicts_on_a_changed_chunk_and_on_a_superseded_root() {
+        let store = store();
+        let root = flat_root(vec![a(), b()], 3);
+        put(&store, inode_key(INODE), encode(&root));
+        // The planned chunk is not the one at that offset (placement differs, or wrong offset).
+        let edited = chunk(2, 3, vec![21]);
+        assert!(matches!(
+            repoint(&store, &root, 5, &edited, vec![99]),
+            Ok(Repoint::Conflict)
+        ));
+        assert!(matches!(
+            repoint(&store, &root, 0, &b(), vec![99]),
+            Ok(Repoint::Conflict)
+        ));
+        // Planned against `root`, which is then superseded: the root pin fails the batch.
+        let batch = prepared(repoint(&store, &root, 5, &b(), vec![99]));
+        put(&store, inode_key(INODE), encode(&flat_root(vec![a()], 4)));
+        let before = snapshot(&store);
+        assert_eq!(commit(&store, batch), CommitOutcome::Conflict);
+        assert_eq!(snapshot(&store), before);
+    }
+
+    #[test]
+    fn segmented_arm_rewrites_only_the_covering_segment_and_never_the_root() {
+        let store = store();
+        let root = two_segments(&store);
+        let root_bytes = get(&store, &inode_key(INODE)).unwrap();
+        // Segment 0 is garbage: were it read or decoded, the move would fail.
+        put(
+            &store,
+            seg_key(&group(), 0).unwrap(),
+            b"not a segment".to_vec(),
+        );
+
+        // C inside segment 1; then B at object byte 5 — segment 1's first byte, and exactly
+        // where segment 0 ends: a chunk with bytes is looked for in segment 1 alone.
+        for (offset, prior) in [(8, c()), (5, b())] {
+            let batch = prepared(repoint(&store, &root, offset, &prior, vec![99]));
+            assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+        }
+
+        assert_eq!(
+            segment(&store, 1).chunks(),
+            &[chunk(2, 3, vec![99]), chunk(3, 4, vec![99])][..]
+        );
+        assert_eq!(get(&store, &inode_key(INODE)).unwrap(), root_bytes);
+        assert_eq!(
+            get(&store, &seg_key(&group(), 0).unwrap())
+                .unwrap()
+                .as_ref(),
+            b"not a segment"
+        );
+    }
+
+    #[test]
+    fn a_sibling_edit_is_merged_and_an_edit_to_the_planned_chunk_conflicts() {
+        let store = store();
+        let root = two_segments(&store);
+        let key = seg_key(&group(), 1).unwrap();
+        let sibling = chunk(2, 3, vec![21]);
+        // After the plan, a concurrent writer moved sibling B: the move reads the record
+        // fresh, so it lands on top of that edit.
+        put(
+            &store,
+            key.clone(),
+            encode(&SegmentRecord::new(vec![sibling.clone(), c()], 5).unwrap()),
+        );
+        let batch = prepared(repoint(&store, &root, 8, &c(), vec![99]));
+        assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+        assert_eq!(
+            segment(&store, 1).chunks(),
+            &[sibling.clone(), chunk(3, 4, vec![99])][..]
+        );
+
+        // The planned chunk itself was edited: conflict, nothing written.
+        let before = snapshot(&store);
+        assert!(matches!(
+            repoint(&store, &root, 8, &c(), vec![98]),
+            Ok(Repoint::Conflict)
+        ));
+        assert_eq!(snapshot(&store), before);
+
+        // An edit landing between the read and the commit fails the segment pin.
+        let planned = chunk(3, 4, vec![99]);
+        let batch = prepared(repoint(&store, &root, 8, &planned, vec![97]));
+        put(
+            &store,
+            key,
+            encode(&SegmentRecord::new(vec![b(), planned], 5).unwrap()),
+        );
+        let before = snapshot(&store);
+        assert_eq!(commit(&store, batch), CommitOutcome::Conflict);
+        assert_eq!(snapshot(&store), before);
+    }
+
+    #[test]
+    fn a_superseded_root_fails_the_batch_or_the_move() {
+        let store = store();
+        let root = two_segments(&store);
+        let batch = prepared(repoint(&store, &root, 8, &c(), vec![99]));
+        // The root flips to another generation; the old records are still there.
+        put(&store, inode_key(INODE), encode(&flat_root(vec![a()], 4)));
+        let before = snapshot(&store);
+        assert_eq!(commit(&store, batch), CommitOutcome::Conflict);
+        assert_eq!(snapshot(&store), before);
+
+        // Its segment record already reclaimed: a retirement, answered as a conflict.
+        let gone = WriteBatch::new().delete(seg_key(&group(), 1).unwrap());
+        assert_eq!(commit(&store, gone), CommitOutcome::Committed);
+        assert!(matches!(
+            repoint(&store, &root, 8, &c(), vec![99]),
+            Ok(Repoint::Conflict)
+        ));
+        // The object deleted outright: likewise.
+        let deleted = WriteBatch::new().delete(inode_key(INODE));
+        assert_eq!(commit(&store, deleted), CommitOutcome::Committed);
+        assert!(matches!(
+            repoint(&store, &root, 8, &c(), vec![99]),
+            Ok(Repoint::Conflict)
+        ));
+    }
+
+    #[test]
+    fn a_damaged_segment_of_the_live_generation_is_structural_corruption() {
+        let store = store();
+        let root = two_segments(&store);
+        let key = seg_key(&group(), 1).unwrap();
+
+        put(&store, key.clone(), b"{\"chunks\":".to_vec());
+        assert!(matches!(
+            chunk_map_error(repoint(&store, &root, 8, &c(), vec![99])),
+            ChunkMapError::SegmentRecordUndecodable { index: 1, .. }
+        ));
+
+        // Same length, shifted start.
+        put(
+            &store,
+            key.clone(),
+            encode(&SegmentRecord::new(vec![b(), c()], 6).unwrap()),
+        );
+        assert_eq!(
+            chunk_map_error(repoint(&store, &root, 8, &c(), vec![99])),
+            ChunkMapError::SegmentBoundsMismatch {
+                index: 1,
+                root: (5, 7),
+                segment: (6, 7),
+            }
+        );
+
+        // Same start, different length.
+        put(
+            &store,
+            key.clone(),
+            encode(&SegmentRecord::new(vec![b(), chunk(3, 5, vec![30])], 5).unwrap()),
+        );
+        assert_eq!(
+            chunk_map_error(repoint(&store, &root, 8, &c(), vec![99])),
+            ChunkMapError::SegmentBoundsMismatch {
+                index: 1,
+                root: (5, 7),
+                segment: (5, 8),
+            }
+        );
+
+        let absent = WriteBatch::new().delete(key);
+        assert_eq!(commit(&store, absent), CommitOutcome::Committed);
+        let before = snapshot(&store);
+        assert_eq!(
+            chunk_map_error(repoint(&store, &root, 8, &c(), vec![99])),
+            ChunkMapError::SegmentAbsent {
+                nonce: NONCE.into(),
+                epoch: 1,
+                index: 1,
+            }
+        );
+        assert_eq!(snapshot(&store), before);
+    }
+
+    #[test]
+    fn a_zero_length_chunk_on_a_segment_boundary_is_found_by_equality() {
+        // seg 0 = [A, Z] over 0..5 — Z is empty and begins at 5, exactly where seg 1's
+        // B also begins. seg 1 = [Y, B] over 5..8 — Y is empty and begins at 5 too.
+        let z = chunk(8, 0, vec![80]);
+        let y = chunk(9, 0, vec![90]);
+        let store = store();
+        let root = seed_segmented(
+            &store,
+            &[(0, vec![a(), z.clone()]), (5, vec![y.clone(), b()])],
+        );
+
+        // Z lives in seg 0 even though seg 1 is the one covering byte 5.
+        let batch = prepared(repoint(&store, &root, 5, &z, vec![81]));
+        assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+        assert_eq!(
+            segment(&store, 0).chunks(),
+            &[a(), chunk(8, 0, vec![81])][..]
+        );
+        assert_eq!(segment(&store, 1).chunks(), &[y.clone(), b()][..]);
+
+        // Y lives in seg 1: seg 0 is a candidate too, but equality rules it out.
+        let batch = prepared(repoint(&store, &root, 5, &y, vec![91]));
+        assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+        assert_eq!(
+            segment(&store, 1).chunks(),
+            &[chunk(9, 0, vec![91]), b()][..]
+        );
+
+        // A planned empty chunk no candidate holds: conflict in both, nothing written.
+        let before = snapshot(&store);
+        assert!(matches!(
+            repoint(&store, &root, 5, &z, vec![82]),
+            Ok(Repoint::Conflict)
+        ));
+        assert_eq!(snapshot(&store), before);
+    }
+
+    /// `lead` then zero-length fillers, sized so `measure` of the list is exactly `target`.
+    /// Built programmatically: tuned by a last filler's placement width and id digits.
+    fn padded(
+        lead: ChunkRef,
+        target: usize,
+        measure: impl Fn(&[ChunkRef]) -> usize,
+    ) -> Vec<ChunkRef> {
+        let filler = |id: ChunkId, placement: Vec<DServerId>| chunk(id, 0, placement);
+        let base = measure(&[lead.clone(), filler(0, vec![])]);
+        let per = measure(&[lead.clone(), filler(0, vec![0]), filler(0, vec![])]) - base;
+        let mut chunks = vec![lead];
+        chunks.extend((0..(target - base - 200) / per).map(|_| filler(0, vec![0])));
+        chunks.push(filler(0, vec![]));
+        // `p` zeros of placement add `2p - 1` bytes; an id of `d` digits adds `d - 1`.
+        let gap = target - measure(&chunks);
+        let p = if gap <= 19 { 0 } else { (gap - 17) / 2 };
+        let digits = gap - if p == 0 { 0 } else { 2 * p - 1 };
+        *chunks.last_mut().unwrap() = filler(ChunkId::pow(10, digits as u32), vec![0; p]);
+        assert_eq!(measure(&chunks), target);
+        chunks
+    }
+
+    /// Moving the lead from `[0]` to `[u64::MAX]` grows its record by 19 bytes.
+    const GROWTH: usize = 19;
+
+    #[test]
+    fn flat_arm_refuses_a_record_the_move_would_push_past_the_value_ceiling() {
+        let lead = chunk(1, 5, vec![0]);
+        let root_of = |chunks: &[ChunkRef]| flat_root(chunks.to_vec(), 3);
+        let chunks = padded(lead.clone(), MAX_VALUE_BYTES - GROWTH + 1, |c| {
+            encode(&root_of(c)).len()
+        });
+        let store = store();
+        let root = root_of(&chunks);
+        put(&store, inode_key(INODE), encode(&root));
+        let before = snapshot(&store);
+        assert!(matches!(
+            repoint(&store, &root, 0, &lead, vec![u64::MAX]),
+            Ok(Repoint::Refused { bytes, ceiling: MAX_VALUE_BYTES }) if bytes == MAX_VALUE_BYTES + 1
+        ));
+        assert_eq!(snapshot(&store), before);
+    }
+
+    #[test]
+    fn segmented_arm_weighs_its_record_against_the_full_value_ceiling() {
+        let lead = chunk(1, 5, vec![0]);
+        let measure = |c: &[ChunkRef]| encode(&SegmentRecord::new(c.to_vec(), 0).unwrap()).len();
+
+        // One byte under the reach of the ceiling: refused, and the record byte-identical.
+        let store = store();
+        let over = padded(lead.clone(), MAX_VALUE_BYTES - GROWTH + 1, measure);
+        let root = seed_segmented(&store, &[(0, over)]);
+        let before = snapshot(&store);
+        assert!(matches!(
+            repoint(&store, &root, 0, &lead, vec![u64::MAX]),
+            Ok(Repoint::Refused { bytes, ceiling: MAX_VALUE_BYTES }) if bytes == MAX_VALUE_BYTES + 1
+        ));
+        assert_eq!(snapshot(&store), before);
+
+        // Landing exactly on the full ceiling — well past V/2 — is admitted and applies.
+        let store = self::store();
+        let exact = padded(lead.clone(), MAX_VALUE_BYTES - GROWTH, measure);
+        let root = seed_segmented(&store, &[(0, exact)]);
+        let batch = prepared(repoint(&store, &root, 0, &lead, vec![u64::MAX]));
+        assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+        let stored = get(&store, &seg_key(&group(), 0).unwrap()).unwrap();
+        assert_eq!(stored.len(), MAX_VALUE_BYTES);
+
+        // A stored row exactly at the ceiling is read, not refused: move it again, same width.
+        let moved = chunk(1, 5, vec![u64::MAX]);
+        let batch = prepared(repoint(&store, &root, 0, &moved, vec![u64::MAX - 1]));
+        assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+        let stored = get(&store, &seg_key(&group(), 0).unwrap()).unwrap();
+        assert_eq!(stored.len(), MAX_VALUE_BYTES);
+    }
+
+    #[test]
+    fn a_segment_row_over_the_ceiling_is_never_decoded_nor_rewritten() {
+        // One byte over V, and the move would SHRINK it under V: were the row decoded, the
+        // move would "repair" a record the resolver refuses as corrupt.
+        let lead = chunk(1, 5, vec![u64::MAX]);
+        let measure = |c: &[ChunkRef]| encode(&SegmentRecord::new(c.to_vec(), 0).unwrap()).len();
+        let store = store();
+        let root = seed_segmented(
+            &store,
+            &[(0, padded(lead.clone(), MAX_VALUE_BYTES + 1, measure))],
+        );
+        let before = snapshot(&store);
+        assert_eq!(
+            chunk_map_error(repoint(&store, &root, 0, &lead, vec![0])),
+            ChunkMapError::SegmentValueOverCeiling {
+                index: 0,
+                bytes: MAX_VALUE_BYTES + 1,
+                ceiling: MAX_VALUE_BYTES,
+            }
+        );
+        assert_eq!(snapshot(&store), before);
+
+        // The same row in a generation the root has left: a retirement, not corruption.
+        put(&store, inode_key(INODE), encode(&flat_root(vec![a()], 4)));
+        let before = snapshot(&store);
+        assert!(matches!(
+            repoint(&store, &root, 0, &lead, vec![0]),
+            Ok(Repoint::Conflict)
+        ));
+        assert_eq!(snapshot(&store), before);
+    }
+
+    #[test]
+    fn a_replacement_placement_must_name_every_fragment() {
+        // RS(2,1): three fragments, so exactly three servers — empty is refused too, since a
+        // read would identity-fill it to servers 0, 1 and 2.
+        let rs = ChunkRef {
+            scheme: EcScheme::ReedSolomon { k: 2, m: 1 },
+            ..chunk(4, 6, vec![10, 11, 12])
+        };
+        let flat = self::store();
+        let flat_gen = flat_root(vec![a(), rs.clone()], 3);
+        put(&flat, inode_key(INODE), encode(&flat_gen));
+        let segmented = self::store();
+        let seg_gen = seed_segmented(&segmented, &[(0, vec![a()]), (5, vec![rs.clone()])]);
+        for (store, generation) in [(&flat, &flat_gen), (&segmented, &seg_gen)] {
+            let before = snapshot(store);
+            for wrong in [vec![], vec![20], vec![20, 21], vec![20, 21, 22, 23]] {
+                let actual = wrong.len();
+                let err = repoint(store, generation, 5, &rs, wrong).unwrap_err();
+                // The call's fault, typed apart from the object's `ChunkMapError`.
+                let malformed = MalformedReplacement {
+                    expected: 3,
+                    actual,
+                };
+                assert_eq!(err.downcast_ref(), Some(&malformed));
+                let shown = format!("replacement needs 3 D servers, got {actual}");
+                assert_eq!(err.to_string(), shown);
+                assert_eq!(snapshot(store), before);
+            }
+            let batch = prepared(repoint(store, generation, 5, &rs, vec![20, 21, 22]));
+            assert_eq!(commit(store, batch), CommitOutcome::Committed);
+        }
+    }
+
+    #[test]
+    fn segment_may_hold_is_the_half_open_span_plus_an_empty_chunks_end() {
+        let segment = SegmentRef {
+            index: 1,
+            byte_offset: 5,
+            byte_len: 7,
+        };
+        for (offset, len, holds) in [
+            (4, 1, false),
+            (4, 0, false),
+            (5, 1, true),
+            (5, 0, true),
+            (11, 1, true),
+            (12, 1, false),
+            (12, 0, true),
+            (13, 0, false),
+        ] {
+            assert_eq!(
+                segment_may_hold(&segment, offset, len),
+                holds,
+                "offset {offset}, len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_at_needs_both_the_offset_and_the_reference() {
+        let z = chunk(8, 0, vec![80]);
+        let chunks = [a(), z.clone(), b(), c()];
+        assert_eq!(chunk_at(&chunks, 0, &a()), Some(0));
+        assert_eq!(chunk_at(&chunks, 5, &z), Some(1));
+        assert_eq!(chunk_at(&chunks, 5, &b()), Some(2));
+        assert_eq!(chunk_at(&chunks, 8, &c()), Some(3));
+        // Right reference, wrong offset — before, inside, and past it.
+        assert_eq!(chunk_at(&chunks, 0, &c()), None);
+        assert_eq!(chunk_at(&chunks, 9, &c()), None);
+        assert_eq!(chunk_at(&chunks, 12, &c()), None);
+        // Right offset, different reference (same id, moved placement).
+        assert_eq!(chunk_at(&chunks, 8, &chunk(3, 4, vec![31])), None);
+        // Lengths that cannot be summed are no address at all: chunk 2 begins at `u64::MAX`,
+        // and `c()` would begin one byte past it — a sum that overflows, not a match.
+        let huge = [chunk(1, u64::MAX, vec![]), chunk(2, 1, vec![]), c()];
+        assert_eq!(chunk_at(&huge, u64::MAX, &chunk(2, 1, vec![])), Some(1));
+        assert_eq!(chunk_at(&huge, u64::MAX, &c()), None);
+    }
+
+    /// The object as a campaign believes it is: blind to a batch's pins, it knows only
+    /// which records were written since a mover last looked.
+    struct World {
+        segmented: bool,
+        /// Each record's chunks: the flat map's one list, or one list per segment.
+        records: Vec<Vec<ChunkRef>>,
+        /// Moves landed per record (a flat map's one record is the root itself).
+        writes: Vec<u64>,
+        /// The root as last written; `None` once deleted.
+        root: Option<InodeRecord>,
+        root_writes: u64,
+        /// The root still names the drawn generation.
+        live: bool,
+        reclaimed: bool,
+    }
+
+    /// What a mover planned from, and the writes it had seen when it did.
+    struct Plan {
+        generation: InodeRecord,
+        offset: u64,
+        prior: ChunkRef,
+        record: usize,
+        root_seen: u64,
+        record_seen: u64,
+    }
+
+    enum Mover {
+        Unplanned,
+        Planned(Plan),
+        /// The batch, the placement it lands, and the record's writes at the prepare.
+        Prepared(Plan, WriteBatch, Vec<DServerId>, u64),
+    }
+
+    /// Every server id a campaign draws is new, so no record's bytes ever recur and no CAS
+    /// can pass on an A-B-A.
+    fn fresh(server: &mut DServerId, fragments: u16) -> Vec<DServerId> {
+        (0..fragments)
+            .map(|_| {
+                *server += 1;
+                *server
+            })
+            .collect()
+    }
+
+    /// The store holds exactly the model: the root as last written and every segment's
+    /// chunks — each landed move, and nothing a losing batch carried.
+    fn assert_matches(store: &dyn MetadataStore, world: &World, seed: u64) {
+        let root = get(store, &inode_key(INODE)).map(|b| decode::<InodeRecord>(&b).unwrap());
+        assert_eq!(root, world.root, "seed {seed}: the root");
+        if world.segmented {
+            for (index, chunks) in world.records.iter().enumerate() {
+                let stored = get(store, &seg_key(&group(), index as u32).unwrap());
+                let stored = stored.map(|b| decode::<SegmentRecord>(&b).unwrap().into_chunks());
+                let expected = (!world.reclaimed).then(|| chunks.clone());
+                assert_eq!(stored, expected, "seed {seed}: segment {index}");
+            }
+        }
+    }
+
+    /// One seed: an object — flat or segmented, empty chunks included — two to five movers,
+    /// and a root that stays, is overwritten, or is deleted (a segmented one's records then
+    /// reclaimed), every actor's steps interleaved by the seed. A move writes nothing until
+    /// its batch commits, so a race lands between its steps: plan (the production resolver),
+    /// prepare ([`repoint_chunk`]), commit. `tally` counts the races that ran: merged,
+    /// stale, lost to a move, lost to the retirement.
+    fn campaign(seed: u64, tally: &mut [usize; 4]) {
+        let mut sim = Sim::new(seed);
+        let store = store();
+        let root_key = inode_key(INODE);
+        let mut server: DServerId = 100;
+        let segmented = sim.gen::<bool>();
+        let (mut records, mut id) = (Vec::new(), 0);
+        for _ in 0..1 + sim.gen::<u32>() % 3 {
+            let mut chunks = Vec::new();
+            for _ in 0..1 + sim.gen::<u32>() % 3 {
+                id += 1;
+                let mut made = chunk(id, sim.gen::<u64>() % 4, Vec::new());
+                if sim.gen::<bool>() {
+                    made.scheme = EcScheme::ReedSolomon { k: 2, m: 1 };
+                }
+                made.placement = fresh(&mut server, made.fragment_count());
+                chunks.push(made);
+            }
+            if chunks.iter().all(|chunk| chunk.len == 0) {
+                chunks[0].len = 1;
+            }
+            records.push(chunks);
+        }
+        let root = if segmented {
+            let mut offset = 0;
+            let mut segments = Vec::new();
+            for chunks in &records {
+                segments.push((offset, chunks.clone()));
+                offset += chunks.iter().map(|chunk| chunk.len).sum::<u64>();
+            }
+            seed_segmented(&store, &segments)
+        } else {
+            records = vec![records.concat()];
+            let root = flat_root(records[0].clone(), 3);
+            put(&store, root_key.clone(), encode(&root));
+            root
+        };
+        let mut world = World {
+            segmented,
+            writes: vec![0; records.len()],
+            records,
+            root: Some(root),
+            root_writes: 0,
+            live: true,
+            reclaimed: false,
+        };
+        let mut movers: Vec<Option<Mover>> = (0..2 + sim.gen::<u32>() % 4)
+            .map(|_| Some(Mover::Unplanned))
+            .collect();
+        // 0: the root stays; 1: it is overwritten; 2: it is deleted.
+        let retire = sim.gen::<u32>() % 3;
+        let mut retirement = u32::from(retire > 0) * (1 + u32::from(segmented));
+        loop {
+            let mut ready: Vec<usize> =
+                (0..movers.len()).filter(|&m| movers[m].is_some()).collect();
+            if retirement > 0 {
+                ready.push(movers.len());
+            }
+            if ready.is_empty() {
+                break;
+            }
+            let actor = ready[sim.gen::<u32>() as usize % ready.len()];
+            if actor == movers.len() {
+                retirement -= 1;
+                let batch = if world.live {
+                    world.live = false;
+                    world.root_writes += 1;
+                    world.root = (retire == 1).then(|| flat_root(vec![chunk(999, 1, vec![1])], 9));
+                    match &world.root {
+                        Some(next) => WriteBatch::new().put(root_key.clone(), encode(next)),
+                        None => WriteBatch::new().delete(root_key.clone()),
+                    }
+                } else {
+                    world.reclaimed = true;
+                    (0..world.records.len() as u32).fold(WriteBatch::new(), |batch, index| {
+                        batch.delete(seg_key(&group(), index).unwrap())
+                    })
+                };
+                assert_eq!(commit(&store, batch), CommitOutcome::Committed);
+                assert_matches(&store, &world, seed);
+                continue;
+            }
+            movers[actor] = match movers[actor].take().unwrap() {
+                // Planning after the retirement would plan the successor: another campaign.
+                Mover::Unplanned if !world.live => None,
+                Mover::Unplanned => {
+                    let resolved = resolve_current_chunk_map(&store, &root_key);
+                    let resolved = pollster::block_on(resolved).unwrap().unwrap();
+                    let flat = world.records.concat();
+                    assert_eq!(*resolved.chunks, flat[..], "seed {seed}: every landed move");
+                    let pick = sim.gen::<u32>() as usize % flat.len();
+                    let prior = flat[pick].clone();
+                    let record = world.records.iter().position(|r| r.contains(&prior));
+                    let record = record.unwrap();
+                    Some(Mover::Planned(Plan {
+                        generation: resolved.record.into_owned(),
+                        offset: flat[..pick].iter().map(|chunk| chunk.len).sum(),
+                        prior,
+                        record,
+                        root_seen: world.root_writes,
+                        record_seen: world.writes[record],
+                    }))
+                }
+                Mover::Planned(plan) => {
+                    let placement = fresh(&mut server, plan.prior.fragment_count());
+                    let before = snapshot(&store);
+                    let (generation, prior) = (&plan.generation, &plan.prior);
+                    let prepared =
+                        repoint(&store, generation, plan.offset, prior, placement.clone());
+                    assert_eq!(snapshot(&store), before, "seed {seed}: a prepare wrote");
+                    // The flat arm reads nothing past the plan; the segmented arm reads its
+                    // record fresh, so it sees an edit to the planned chunk, or a reclaim.
+                    let current = world.records[plan.record].contains(&plan.prior);
+                    let stale = segmented && (!current || world.reclaimed);
+                    match prepared {
+                        Ok(Repoint::Prepared(batch)) if !stale => {
+                            let seen = world.writes[plan.record];
+                            Some(Mover::Prepared(plan, batch, placement, seen))
+                        }
+                        Ok(Repoint::Conflict) if stale => {
+                            tally[1] += 1;
+                            None
+                        }
+                        other => panic!("seed {seed}: the prepare answered {other:?}"),
+                    }
+                }
+                Mover::Prepared(plan, batch, placement, seen) => {
+                    let before = snapshot(&store);
+                    let outcome = commit(&store, batch);
+                    let at = plan.record;
+                    if world.root_writes == plan.root_seen && world.writes[at] == seen {
+                        assert_eq!(outcome, CommitOutcome::Committed, "seed {seed}");
+                        tally[0] += usize::from(seen != plan.record_seen);
+                        let moved = world.records[at].iter_mut().find(|c| **c == plan.prior);
+                        moved.unwrap().placement = placement;
+                        world.writes[at] += 1;
+                        if !segmented {
+                            world.root_writes += 1;
+                            world.root = Some(InodeRecord {
+                                chunk_map: ChunkMap::Flat(world.records[0].clone()),
+                                version: plan.generation.version + 1,
+                                ..plan.generation
+                            });
+                        }
+                    } else {
+                        assert_eq!(outcome, CommitOutcome::Conflict, "seed {seed}");
+                        assert_eq!(snapshot(&store), before, "seed {seed}: a lost batch wrote");
+                        tally[2 + usize::from(!world.live)] += 1;
+                    }
+                    None
+                }
+            };
+            assert_matches(&store, &world, seed);
+        }
+    }
+
+    /// Seeded Tier 0 (ADR-0009), `wyrd_testkit::Sim` drawing every campaign, with the seed
+    /// in each failure. Each step is judged against [`World`], a model blind to the pins: a
+    /// prepare writes nothing and conflicts exactly when its planned chunk has moved or been
+    /// reclaimed; a batch commits exactly when its root is untouched since the plan and its
+    /// record since the prepare — so a sibling's move before the read is merged — and a
+    /// losing batch leaves the store byte-identical; the store always holds the model.
+    #[test]
+    fn seeded_moves_race_each_other_and_the_roots_retirement() {
+        let mut tally = [0; 4];
+        for seed in 0..256 {
+            campaign(seed, &mut tally);
+        }
+        // Every race ran, so no seed range can pass vacuously.
+        assert!(tally.iter().all(|&count| count > 0), "{tally:?}");
     }
 }
