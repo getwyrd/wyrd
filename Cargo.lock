@@ -5272,6 +5272,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-validate"
+version = "0.0.0"
+
+[[package]]
 name = "xml"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
