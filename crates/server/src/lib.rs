@@ -47,8 +47,27 @@ use wyrd_gateway_core::{
 const ROOT: InodeId = 0;
 /// Default durability: Reed-Solomon RS(6,3) — k=6 data, m=3 parity (proposal 0003).
 pub const DEFAULT_DURABILITY: EcScheme = EcScheme::ReedSolomon { k: 6, m: 3 };
-/// Default chunk size (1 MiB). Tests override it to exercise multi-chunk objects.
+/// Default chunk size (1 MiB): what [`Gateway::new`] composes, and so what `wyrd s3` runs
+/// when it is given no `--chunk-size`.
 const DEFAULT_CHUNK_SIZE: usize = 1 << 20;
+/// The largest chunk size `wyrd s3 --chunk-size` accepts: 16 MiB, inclusive.
+///
+/// The ceiling comes from the D-server transport, not from memory. Each chunk is
+/// erasure-coded on its own ([`DEFAULT_DURABILITY`], RS(6,3)), so one fragment is about a
+/// sixth of the chunk plus its header and checksum, and each fragment crosses the wire whole
+/// in ONE unary gRPC message (`PutFragment` / `GetFragment`,
+/// `crates/proto/proto/wyrd/v0/chunk.proto`). Every receiver of those messages keeps
+/// tonic's default 4 MiB receive limit: the D server for a PUT (`ChunkStoreServer::new` in
+/// `dserver.rs`) and the gateway's gRPC client for a GET (`ChunkStoreClient::new` in
+/// `crates/chunkstore-grpc/src/client.rs`). A 24 MiB chunk already makes a 4 MiB fragment
+/// payload and its PUT fails; 16 MiB keeps each fragment near 2.67 MiB, leaving room for
+/// the envelope to grow. Two things move this bound: a default durability with a smaller k
+/// (bigger fragments per chunk), and a change to the transport limit. Raising the ceiling
+/// means raising the transport limit first.
+///
+/// One ceiling for both chunk planes: the local-FS plane has no gRPC hop, but a value that
+/// works on one node must not start failing when `--endpoints` is added.
+pub(crate) const MAX_CHUNK_SIZE: usize = 16 << 20;
 /// Default pending-ledger lease lifetime.
 const DEFAULT_LEASE_TTL_MILLIS: u64 = 30_000;
 /// Coordination group under which gateway nodes register for discovery.
@@ -141,7 +160,13 @@ where
         crate::cli::seed_next_inode_floor(&self.meta, max_inode.saturating_add(1)).await
     }
 
-    /// Set the chunk size (mainly so tests can force multi-chunk objects).
+    /// Set the chunk size every object is split into before erasure coding.
+    ///
+    /// This is the `wyrd s3` role's configuration seam: `--chunk-size N` reaches the
+    /// gateway through here on every composition (`cli::serve_s3_role`). The role refuses a
+    /// value outside `1..=MAX_CHUNK_SIZE` (16 MiB) before it starts; this builder itself only
+    /// floors `0` to `1`, so a library caller cannot divide by zero. Tests also use it to
+    /// force multi-chunk objects.
     pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
         self.chunk_size = chunk_size.max(1);
         self
