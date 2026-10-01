@@ -36,7 +36,7 @@
 
 #![forbid(unsafe_code)]
 
-use wyrd_core::metadata::{self, ChunkRef, EcScheme};
+use wyrd_core::metadata::{self, ChunkRef, EcScheme, SegmentGroup};
 use wyrd_core::multipart::{
     decode_part_record, decode_part_summary, decode_session_record, decode_slot_record, Completion,
     PartSummary, PublishTarget, RecordError, SessionState,
@@ -57,6 +57,9 @@ const CONTENT_TYPE: &str = "text/plain";
 /// carries — non-zero for the same reason [`ATTEMPTS`] is.
 const SEGMENTS_WRITTEN: u32 = 2;
 const VERSION: u64 = 4;
+/// The session's segment-group nonce every witness carries: 32 lowercase hex characters, the
+/// only spelling [`wyrd_core::metadata::SegmentNonce`] admits.
+const SEGMENT_NONCE: &str = "0123456789abcdef0123456789abcdef";
 
 /// 64 lowercase-hex characters from a 2-character pair, so a hand-authored digest is always
 /// exactly the length [`wyrd_core::multipart::Digest::from_hex`] demands — no fencepost
@@ -92,7 +95,8 @@ fn session_with(content_type: Option<&str>, epoch: u64, state_json: &str) -> Vec
     };
     format!(
         "{{\"parent\":{PARENT},\"object\":\"{OBJECT}\",{content_type}\
-         \"created_at_millis\":1000,\"clock_source\":\"wall\",\"epoch\":{epoch},\
+         \"created_at_millis\":1000,\"clock_source\":\"wall\",\
+         \"segment_nonce\":\"{SEGMENT_NONCE}\",\"epoch\":{epoch},\
          \"attempts\":{ATTEMPTS},\"state\":{state_json}}}"
     )
     .into_bytes()
@@ -436,8 +440,8 @@ fn leg_1c_publish_target_key_mismatch_is_rejected() {
 
 /// **1c-epoch** — `publish_target.epoch` disagrees with the session's own `epoch`;
 /// `parent`/`name` both agree, isolating the epoch identity from leg 1c. The F18 class:
-/// `publish_target`'s epoch is what makes the `Completing` fence's segment-group nonce
-/// deterministic for *this* attempt (`0016:350`, `:560-563`).
+/// `publish_target`'s epoch is the epoch half of the segment group *this* attempt writes
+/// (`0016:350`, `:560-563`).
 #[test]
 fn leg_1c_epoch_publish_target_epoch_mismatch_is_rejected() {
     let bytes = session(EPOCH, &completing_json(1, PARENT, OBJECT, EPOCH + 1));
@@ -643,7 +647,8 @@ fn part_chunk_omitted_placement_is_rejected() {
 fn session_null_content_type_spelling_is_rejected() {
     let bytes = format!(
         "{{\"parent\":{PARENT},\"object\":\"{OBJECT}\",\"content_type\":null,\
-         \"created_at_millis\":1000,\"clock_source\":\"wall\",\"epoch\":{EPOCH},\
+         \"created_at_millis\":1000,\"clock_source\":\"wall\",\
+         \"segment_nonce\":\"{SEGMENT_NONCE}\",\"epoch\":{EPOCH},\
          \"attempts\":{ATTEMPTS},\"state\":{OPEN_JSON}}}"
     )
     .into_bytes();
@@ -708,7 +713,8 @@ fn leg_1i_chunk_ref_wrong_placement_length_still_decodes() {
 fn noncanonical_field_order_is_rejected_for_session() {
     let bytes = format!(
         "{{\"object\":\"{OBJECT}\",\"parent\":{PARENT},\
-         \"created_at_millis\":1000,\"clock_source\":\"wall\",\"epoch\":{EPOCH},\
+         \"created_at_millis\":1000,\"clock_source\":\"wall\",\
+         \"segment_nonce\":\"{SEGMENT_NONCE}\",\"epoch\":{EPOCH},\
          \"attempts\":{ATTEMPTS},\"state\":{OPEN_JSON}}}"
     )
     .into_bytes();
@@ -824,4 +830,70 @@ fn part_summary_omitted_digest_is_rejected() {
         .as_bytes()
         .to_vec();
     assert_malformed(decode_both(&bytes, decode_part_summary), "psum:", "digest");
+}
+
+// ===========================================================================
+// The segment-group nonce (#840) — the accessors, as the validated types the key helpers
+// take. The codec legs live in `multipart_segment_nonce.rs`.
+// ===========================================================================
+
+/// One witness per [`SessionState`].
+fn session_in_every_state() -> [(&'static str, Vec<u8>); 4] {
+    let completed = format!(
+        "{{\"kind\":\"Completed\",\"completion\":{}}}",
+        completion_json(9, &format!("{}-3", hex64("ab")), 6000, &hex64("cd"))
+    );
+    [
+        ("Open", session(EPOCH, OPEN_JSON)),
+        (
+            "Completing",
+            session(EPOCH, &completing_json(500, PARENT, OBJECT, EPOCH)),
+        ),
+        ("Aborting", session(EPOCH, ABORTING_JSON)),
+        ("Completed", session(EPOCH, &completed)),
+    ]
+}
+
+/// Every state exposes its nonce, so the terminal delete can mint the `seggrp:` key from the
+/// record alone (`0016:673`) — `Open` and `Aborting` included.
+#[test]
+fn session_exposes_its_segment_nonce_in_every_state() {
+    for (state, bytes) in session_in_every_state() {
+        let record = decode_both(&bytes, decode_session_record).expect(state);
+        assert_eq!(record.segment_nonce().as_str(), SEGMENT_NONCE, "{state}");
+        assert_eq!(
+            metadata::seggrp_key(record.segment_nonce()),
+            format!("seggrp:{SEGMENT_NONCE}").into_bytes(),
+            "{state}"
+        );
+    }
+}
+
+/// A `Completing` session names its attempt's group, the nonce at `publish_target.epoch`, so
+/// a writer ending the attempt can mint its `seg:` range (`0016:665`). At an epoch other than
+/// [`EPOCH`], so a group not built from this record fails.
+#[test]
+fn completing_session_exposes_its_attempt_segment_group() {
+    let fence = EPOCH + 4;
+    let bytes = session(fence, &completing_json(500, PARENT, OBJECT, fence));
+    let record = decode_both(&bytes, decode_session_record).expect("a Completing session decodes");
+    let group = record.attempt_segment_group().expect("an attempt group");
+    assert_eq!(group, SegmentGroup::new(SEGMENT_NONCE, fence).unwrap());
+    assert_eq!(
+        metadata::seg_range_prefix(&group),
+        format!("seg:{SEGMENT_NONCE}:{fence}:").into_bytes()
+    );
+}
+
+/// Only `Completing` has an attempt in its segment-write phase; every other state has none.
+#[test]
+fn only_completing_sessions_have_an_attempt_segment_group() {
+    for (state, bytes) in session_in_every_state() {
+        let record = decode_both(&bytes, decode_session_record).expect(state);
+        assert_eq!(
+            record.attempt_segment_group().is_some(),
+            state == "Completing",
+            "{state}"
+        );
+    }
 }

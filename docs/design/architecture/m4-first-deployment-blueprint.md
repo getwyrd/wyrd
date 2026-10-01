@@ -622,6 +622,15 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #                  marked, which is 0 while any record is unreadable: such a record hides
 #                  which chunks it owns, so no fragment can be shown to be a stray. Repair or
 #                  remove those records, then re-run.
+#
+#    The summary also counts the fragments the pass kept because a multipart upload's own
+#    staged records name them — an upload's bytes, not strays, so never marked. A staged record
+#    the pass could read but not TRUST about where its chunk's fragments are (a placement of
+#    the wrong length, say) is not one of the bills above: the exit status ignores it. It gets
+#    a line of its own that names the record: the pass held that chunk and marked none of its
+#    fragments (it did not check that the staged bytes survived the restore), and the run is
+#    not reported clean, because such a record points at a bug or corruption and blocks every
+#    drain in the cluster while it remains (action=untrusted-staged-record in the audit log).
 
 # 8. Resume writers, then run a scrub pass (see below).
 ```
@@ -1105,12 +1114,16 @@ export WYRD_S3_ACCESS_KEY=... WYRD_S3_SECRET_KEY=...
 
 # S3 gateway — stateless front door. --metadata-backend is the redb|tikv|fdb selector;
 # --coordination-backend etcd needs the `etcd` cargo feature (see Prerequisites);
+# --chunk-size is bytes per chunk (the erasure-coding unit); 1048576 is the default,
+# stated so the invocation records it. Accepted 1..=16777216 (16 MiB), a ceiling set by
+# the D-server gRPC message limit; any other value refuses to start.
 # --endpoints are the D servers from B.4.
 wyrd s3 \
   --metadata-backend fdb \
   --coordination-backend etcd \
   --s3-listen 0.0.0.0:8080 \
   --region <your-region> \
+  --chunk-size 1048576 \
   --endpoints http://10.0.1.<d0>:50051,...
 
 # custodian — reconstruction/repair; emits durability telemetry.

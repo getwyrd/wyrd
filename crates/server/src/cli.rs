@@ -489,7 +489,7 @@ fn usage() {
     eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
     eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
     eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--chunk-size N] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  every command also accepts:");
@@ -508,6 +508,13 @@ fn usage() {
     eprintln!("  --failure-domain); the role never fabricates identity or topology from endpoint");
     eprintln!(
         "  order. Omit all three to run the leader-elected role with no reconstruction plane."
+    );
+    eprintln!();
+    eprintln!("  s3: --chunk-size N sets the bytes per chunk (default 1 MiB). Accepted: 1 to");
+    eprintln!(
+        "  {} ({} MiB), the ceiling set by the D-server gRPC message limit.",
+        crate::MAX_CHUNK_SIZE,
+        crate::MAX_CHUNK_SIZE >> 20
     );
 }
 
@@ -1230,7 +1237,8 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
 /// What the post-restore one-shot tells the operator: every line it prints, and whether the run
 /// **needs a human** — which is also the command's exit status.
 struct RestoreVerdict {
-    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding.
+    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding,
+    /// then an informational line that does not set the status (untrusted staged records).
     lines: Vec<String>,
     /// Exit non-zero. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green.
     needs_human: bool,
@@ -1253,16 +1261,21 @@ struct RestoreVerdict {
 /// record a run that lost data — or one whose chunks could not be read — as a healthy one, which
 /// is the single worst thing this command could do. The pass itself succeeded; the restore did
 /// not.
+///
+/// An untrusted staged record is named WITHOUT that status, on an informational line: the
+/// report's predicate leaves it out on a recorded decision ([`RestoreReport::needs_human`]).
 fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
     let mut lines = vec![format!(
         "wyrd custodian: post-restore reconciliation {} — {} stranded fragment(s) marked \
-         collectable ({} already marked, {} left to a pending lease, {} displaced and kept); {} \
+         collectable ({} already marked, {} left to a pending lease, {} kept for multipart \
+         uploads' staged records, {} displaced and kept); {} \
          chunk(s) DANGLING (unreadable AND unreconstructible — the restore resurrected maps \
          whose bytes were already reclaimed), {} MISPLACED (bytes present but not where the \
          restored map looks — unreadable until the placement is fixed), {} under-replicated (the \
          repair loop rebuilds these); {} record(s) UNREADABLE (committed objects' chunk maps or \
          staged multipart records the pass could not read — so every count here is drawn over \
          the rest of the store); {} pending-ledger entr(y/ies) UNREADABLE (held unmarked, see \
+         below); {} staged multipart record(s) untrusted (their chunks held unmarked, see \
          below).",
         // NOT "complete" over a store the pass could only partly read: "complete" is a claim
         // about a reading that FINISHED, and an operator scanning this line for one word must
@@ -1275,12 +1288,14 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         report.stranded_marked,
         report.already_marked,
         report.pending_skipped,
+        report.staged_skipped,
         report.displaced_kept,
         report.dangling.len(),
         report.misplaced.len(),
         report.under_replicated.len(),
         report.unresolvable.len(),
         report.pending_unreadable.len(),
+        report.staged_untrusted.len(),
     )];
     if !report.pending_unreadable.is_empty() {
         lines.push(format!(
@@ -1357,6 +1372,23 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             report.unresolvable.len(),
             named_records(&report.unresolvable),
             report.stranded_marked,
+        ));
+    }
+    if !report.staged_untrusted.is_empty() {
+        lines.push(format!(
+            // INFORMATION, not NEEDS-HUMAN (`RestoreReport::needs_human` says why), but named.
+            // Says what the pass DID — marked none of these chunks' fragments — and no more: not
+            // that the staged bytes survived (only committed chunks are judged for missing
+            // bytes), and no cleanup promise (whether the retire drain removes one is #659's).
+            "wyrd custodian: note — {} staged multipart record(s) could not be TRUSTED about where \
+             their chunks' fragments are: {}. This pass held those chunks and marked none of their \
+             fragments; it did not check that their staged bytes survived the restore. A damaged \
+             staged record points at a bug or at corruption, and while one remains it blocks \
+             every drain in the cluster, so this run is not a clean bill. Reported for your \
+             information: it does not change the exit status. The audit log carries each one too \
+             (`action=untrusted-staged-record`).",
+            report.staged_untrusted.len(),
+            named_records(&report.staged_untrusted),
         ));
     }
     RestoreVerdict {
@@ -2172,6 +2204,11 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
         .map(str::to_string)
         .or_else(|| std::env::var("WYRD_S3_SECRET_KEY").ok())
         .ok_or("s3: --secret-key (or WYRD_S3_SECRET_KEY) is required")?;
+    // `--chunk-size` is a deployment property (the erasure-coding unit and the per-object
+    // fan-out), so a value the role cannot carry is refused HERE, before the runtime starts
+    // or the listener binds, never found later as a failed PUT. Absent, the gateway keeps
+    // its own 1 MiB default, composed exactly as before the flag existed.
+    let chunk_size = parse_s3_chunk_size(parsed.flag("chunk-size"))?;
 
     // Select the gateway's backends BY CONFIGURATION, exactly as every other
     // cluster-facing role does — `resolve_backend` for put/get/custodian (#255) and
@@ -2247,6 +2284,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             coordination,
             data_dir,
             endpoints.as_deref(),
+            chunk_size,
             credentials,
             region,
             listener,
@@ -2275,6 +2313,13 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
 ///     shared cluster state, the invariant #454 restores.
 ///   * `None` — the single-node local-FS front door (today's #367 behaviour preserved).
 ///
+/// `chunk_size` is the role's `--chunk-size`: `Some(n)` is applied to the gateway on
+/// every composition below, both chunk planes and every metadata × coordination arm;
+/// `None` composes the gateway at its own default (1 MiB). A value outside
+/// `1..=MAX_CHUNK_SIZE` is refused here before anything is opened or served, the same
+/// check `cmd_s3` runs before it binds, so no caller can start a role whose first large
+/// PUT would fail on the gRPC transport.
+///
 /// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
 /// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
 #[allow(clippy::too_many_arguments)]
@@ -2283,11 +2328,15 @@ pub async fn serve_s3_role(
     coordination: CoordinationBackend,
     data_dir: &str,
     endpoints: Option<&[String]>,
+    chunk_size: Option<usize>,
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
     metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError> {
+    if let Some(chunk_size) = chunk_size {
+        check_s3_chunk_size(chunk_size)?;
+    }
     match endpoints {
         // Cluster front door: the chunk plane is the gRPC fan-out over the configured
         // D servers, so a chunk's fragments cross the wire to real D servers rather than
@@ -2299,6 +2348,7 @@ pub async fn serve_s3_role(
                 coordination,
                 data_dir,
                 chunks,
+                chunk_size,
                 credentials,
                 region,
                 listener,
@@ -2315,6 +2365,7 @@ pub async fn serve_s3_role(
                 coordination,
                 data_dir,
                 chunks,
+                chunk_size,
                 credentials,
                 region,
                 listener,
@@ -2332,12 +2383,17 @@ pub async fn serve_s3_role(
 /// roles' single-axis matches are (`cluster_put` `cli.rs:1266`, `cmd_d_server`
 /// `cli.rs:530`), so the default build compiles only the redb + mem arm and the
 /// production `tikv` + `etcd` arms build under their respective cargo features.
+///
+/// Every arm composes its gateway through [`compose_s3_gateway`], so the role's
+/// `chunk_size` reaches the gateway on all six arms, including the feature-gated ones the
+/// default build does not compile.
 #[allow(clippy::too_many_arguments)]
 async fn serve_s3_dispatch<C>(
     backend: MetadataBackend,
     coordination: CoordinationBackend,
     data_dir: &str,
     chunks: C,
+    chunk_size: Option<usize>,
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
@@ -2349,43 +2405,95 @@ where
     match (backend, coordination) {
         (MetadataBackend::Redb, CoordinationBackend::Mem) => {
             let meta = open_local_meta_redb(data_dir)?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "tikv")]
         (MetadataBackend::Tikv, CoordinationBackend::Mem) => {
             let meta = open_tikv_meta().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "etcd")]
         (MetadataBackend::Redb, CoordinationBackend::Etcd) => {
             let meta = open_local_meta_redb(data_dir)?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "tikv", feature = "etcd"))]
         (MetadataBackend::Tikv, CoordinationBackend::Etcd) => {
             let meta = open_tikv_meta().await?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "fdb")]
         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
             let meta = open_fdb_meta().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "fdb", feature = "etcd"))]
         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
             let meta = open_fdb_meta().await?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
     }
+}
+
+/// Compose one [`serve_s3_dispatch`] arm's gateway. `Some(chunk_size)` (the role's
+/// `--chunk-size`, already range-checked by [`serve_s3_role`]) is applied through
+/// [`Gateway::with_chunk_size`]; `None` is plain [`Gateway::new`], the composition from
+/// before the flag existed.
+fn compose_s3_gateway<M, C, Co>(
+    meta: M,
+    chunks: C,
+    coord: Co,
+    chunk_size: Option<usize>,
+) -> Arc<Gateway<M, C, Co>>
+where
+    M: MetadataStore,
+    C: PlacementChunkStore,
+    Co: wyrd_traits::Coordination,
+{
+    let gateway = Gateway::new(meta, chunks, coord);
+    Arc::new(match chunk_size {
+        Some(chunk_size) => gateway.with_chunk_size(chunk_size),
+        None => gateway,
+    })
+}
+
+/// Parse `wyrd s3 --chunk-size`. Absent (`None`) keeps the gateway's own default. A value
+/// is parsed the way `wyrd put` parses its `--chunk-size` (`str::parse::<usize>`,
+/// [`cmd_put`]) and must then pass [`check_s3_chunk_size`].
+fn parse_s3_chunk_size(raw: Option<&str>) -> Result<Option<usize>, BoxError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let chunk_size: usize = raw
+        .parse()
+        .map_err(|_| format!("s3: invalid --chunk-size `{raw}` (expected a byte count)"))?;
+    check_s3_chunk_size(chunk_size)?;
+    Ok(Some(chunk_size))
+}
+
+/// Refuse a chunk size the `s3` role cannot carry: `0`, or anything above
+/// [`crate::MAX_CHUNK_SIZE`] (set by the D-server gRPC message limit; the reason is on the
+/// constant). Refused rather than clamped, so the operator learns at startup.
+fn check_s3_chunk_size(chunk_size: usize) -> Result<(), BoxError> {
+    if (1..=crate::MAX_CHUNK_SIZE).contains(&chunk_size) {
+        return Ok(());
+    }
+    Err(format!(
+        "s3: --chunk-size {chunk_size} is out of range: it must be 1 to {} bytes ({} MiB, \
+         the largest chunk whose fragments fit the D-server gRPC message limit)",
+        crate::MAX_CHUNK_SIZE,
+        crate::MAX_CHUNK_SIZE >> 20
+    )
+    .into())
 }
 
 /// Seed the gateway's shared, persisted inode allocator from persisted state (#364 durability
@@ -2894,6 +3002,86 @@ mod tests {
         assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
     }
 
+    /// `wyrd s3 --chunk-size` (#738): the accept/refuse decision, pinned in-process. The
+    /// binding test drives the built binary (`tests/s3_chunk_size_flag.rs`); this one makes
+    /// the same decision visible to coverage. Absent keeps the gateway default; the range is
+    /// `1..=16 MiB` inclusive; every refusal names the flag in the role's `s3:` style.
+    #[test]
+    fn s3_chunk_size_accepts_exactly_one_to_sixteen_mib() {
+        assert_eq!(parse_s3_chunk_size(None).unwrap(), None);
+        assert_eq!(parse_s3_chunk_size(Some("1")).unwrap(), Some(1));
+        assert_eq!(parse_s3_chunk_size(Some("1048576")).unwrap(), Some(1 << 20));
+        assert_eq!(
+            parse_s3_chunk_size(Some("16777216")).unwrap(),
+            Some(16 << 20)
+        );
+        for refused in ["0", "16777217", "1MiB", "", "-1", "18446744073709551616"] {
+            let err = parse_s3_chunk_size(Some(refused))
+                .expect_err(refused)
+                .to_string();
+            assert!(
+                err.starts_with("s3: ") && err.contains("--chunk-size"),
+                "`{refused}` must be refused naming the flag, got: {err}"
+            );
+        }
+    }
+
+    /// Every `serve_s3_dispatch` arm builds its gateway through `compose_s3_gateway`, so this
+    /// pins what each arm gets: `Some(n)` reaches the gateway, `None` leaves
+    /// `Gateway::new`'s 1 MiB default untouched.
+    #[test]
+    fn compose_s3_gateway_applies_the_chunk_size_only_when_given() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let compose = |chunk_size| {
+            compose_s3_gateway(
+                RedbMetadataStore::in_memory().expect("redb"),
+                FsChunkStore::open(dir.path()).expect("fs store"),
+                MemCoordination::new(),
+                chunk_size,
+            )
+        };
+        assert_eq!(compose(Some(524_288)).chunk_size, 524_288);
+        assert_eq!(compose(Some(16 << 20)).chunk_size, 16 << 20);
+        assert_eq!(compose(None).chunk_size, 1 << 20);
+    }
+
+    /// `serve_s3_role` is `pub`, so it re-checks the range itself: a caller that skips
+    /// `cmd_s3` still cannot start a role whose first large PUT would fail on the gRPC
+    /// transport. The refusal comes before anything is opened, so no local chunk store
+    /// appears. Bounded, because a role that wrongly starts serves forever.
+    #[tokio::test]
+    async fn serve_s3_role_refuses_an_out_of_range_chunk_size_before_opening_anything() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().to_str().expect("utf-8 path");
+        for refused in [0, (16 << 20) + 1] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let served = tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_s3_role(
+                    MetadataBackend::Redb,
+                    CoordinationBackend::Mem,
+                    data_dir,
+                    None,
+                    Some(refused),
+                    Vec::new(),
+                    "us-east-1".to_string(),
+                    listener,
+                    None,
+                ),
+            )
+            .await
+            .expect("an out-of-range chunk size must be refused, not served");
+            let err = served.expect_err("refused").to_string();
+            assert!(err.contains("--chunk-size"), "{refused}: {err}");
+            assert!(
+                !dir.path().join("chunks").exists(),
+                "{refused}: the refusal must come before the chunk store is opened"
+            );
+        }
+    }
+
     /// THE HOLLOW GREEN this command must never print (#651): the exit status and the text are
     /// **one** decision, and each finding ALONE must both print its NEEDS-HUMAN paragraph and
     /// flip the status. One finding at a time, because a chain of `||`s is green for the wrong
@@ -2931,6 +3119,13 @@ mod tests {
         let routine = RestoreReport {
             stranded_marked: 4,
             under_replicated: vec![3],
+            staged_skipped: 2,
+            ..Default::default()
+        };
+        // An untrusted staged record (#839): named and not clean, but not a human's.
+        let untrusted = RestoreReport {
+            staged_untrusted: vec!["part:0123456789abcdef0123456789abcdef:000001".to_owned()],
+            staged_skipped: 3,
             ..Default::default()
         };
         for (report, human) in [
@@ -2939,6 +3134,7 @@ mod tests {
             (&unreadable, true),
             (&pending, true),
             (&routine, false),
+            (&untrusted, false),
         ] {
             let verdict = restore_verdict(report);
             let printed = verdict.lines.join("\n");
@@ -2955,8 +3151,13 @@ mod tests {
                 human,
                 "a paragraph without the status behind it, or the reverse: {report:?} / {printed}"
             );
-            // `is_clean` is the strict superset: nothing that needs a human is ever clean.
+            // `is_clean` is the strict superset: nothing that needs a human is ever clean (nor is
+            // a run holding a chunk over an untrusted staged record).
             assert!(!(human && report.is_clean()), "{report:?}");
+            assert!(
+                report.staged_untrusted.is_empty() || !report.is_clean(),
+                "{report:?}"
+            );
             // "complete" is a claim about a reading that FINISHED, and an operator greps this
             // line for exactly that word — so it appears iff nothing was unreadable, and the
             // blocking record is NAMED where they read it rather than left to a log.
@@ -2980,14 +3181,82 @@ mod tests {
             // merely counted. A count tells them a repair is needed and not which record to
             // repair, and the operator this command is written for is mid-restore at a terminal
             // — the log collector is one of the things a restore brings back up.
-            for object in report.unresolvable.iter().chain(&report.pending_unreadable) {
+            for object in report
+                .unresolvable
+                .iter()
+                .chain(&report.pending_unreadable)
+                .chain(&report.staged_untrusted)
+            {
                 assert!(
                     printed.contains(object.as_str()),
-                    "the blocking record {object} is not named in what the operator reads: \
-                     {printed}"
+                    "the record {object} is not named in what the operator reads: {printed}"
                 );
             }
         }
+    }
+
+    /// Issue #839: the summary counts staged skips, and an untrusted staged record is named on an
+    /// INFORMATIONAL line — the status stays `needs_human()`. The line claims only that the pass
+    /// marked none of those fragments: not that the staged bytes survived, and no cleanup (#659).
+    #[test]
+    fn restore_verdict_counts_staged_skips_and_names_untrusted_staged_records_as_information() {
+        let upload = "0123456789abcdef0123456789abcdef";
+        let records = vec![
+            format!("part:{upload}:000001"),
+            format!("sidx:{upload}:000002:9"),
+        ];
+        let report = RestoreReport {
+            staged_skipped: 5,
+            staged_untrusted: records.clone(),
+            ..Default::default()
+        };
+        let verdict = restore_verdict(&report);
+        let printed = verdict.lines.join("\n");
+
+        assert!(!verdict.needs_human, "{printed}");
+        assert!(!report.is_clean(), "{report:?}");
+        // Counted on the summary line, whose reading still FINISHED ("complete").
+        for needle in [
+            "post-restore reconciliation complete",
+            "5 kept for multipart uploads' staged records",
+            "2 staged multipart record(s) untrusted",
+        ] {
+            assert!(verdict.lines[0].contains(needle), "{needle:?}: {printed}");
+        }
+        let note = verdict
+            .lines
+            .iter()
+            .find(|line| line.contains("could not be TRUSTED"))
+            .unwrap_or_else(|| panic!("no line names the untrusted records: {printed}"));
+        for needle in records.iter().map(String::as_str).chain([
+            "marked none of their fragments",
+            "did not check that their staged bytes survived the restore",
+            "not a clean bill",
+            "does not change the exit status",
+            "action=untrusted-staged-record",
+        ]) {
+            assert!(note.contains(needle), "{needle:?}: {note}");
+        }
+        for never in [
+            "NEEDS-HUMAN",
+            "automatic",
+            "clean up",
+            "cleanup",
+            "will be removed",
+        ] {
+            assert!(
+                !note.to_lowercase().contains(&never.to_lowercase()),
+                "{never:?}: {note}"
+            );
+        }
+        // Kept fragments alone are protection, not a finding: no such line, and clean.
+        let kept_only = RestoreReport {
+            staged_skipped: 5,
+            ..Default::default()
+        };
+        let printed = restore_verdict(&kept_only).lines.join("\n");
+        assert!(!printed.contains("could not be TRUSTED"), "{printed}");
+        assert!(kept_only.is_clean(), "{kept_only:?}");
     }
 
     /// The bound on that naming, from both sides: up to [`NAMED_UNREADABLE_RECORDS`] blockers are
