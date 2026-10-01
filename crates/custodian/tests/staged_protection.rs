@@ -31,8 +31,8 @@
 //!   and the post-restore pass's across a publication.
 //! - **D** neither pass scans the bare `part:` or `sidx:` prefix (a guard).
 //! - **E** a staged record a pass cannot read, one it cannot trust, and a store fault under a
-//!   staged read each fail closed — while a session VALUE, which no pass decodes, changes neither
-//!   pass's answer.
+//!   staged read each fail closed — while a session VALUE, which no staged read decodes, changes
+//!   neither pass's answer.
 //! - **F** scrub checks a session's committed `part:` fragments the same way it already checks a
 //!   committed chunk map's, but never reads an owned `sidx:` entry (a guard, still). The
 //!   drain-status query's own half of the ORIGINAL leg F is gone, discharged by #808 (#664's
@@ -1726,7 +1726,7 @@ async fn a_session_key_naming_no_upload_withholds_both_passes() {
 
 /// **(E)** A listed session whose **value** will not decode at all, under a key that parses.
 ///
-/// Neither pass reads that value: the staged class is found through each session's KEY
+/// Neither staged read decodes it: the staged class is found through each session's KEY
 /// (`gc.rs:820-836`), because protection does not depend on the upload's state, and a damaged value
 /// still names its records' key ranges. So this session's committed part and owned staging entry are
 /// protected exactly as a healthy session's, both ranges are still walked, the pass is not withheld
@@ -1736,7 +1736,8 @@ async fn a_session_key_naming_no_upload_withholds_both_passes() {
 /// This is the boundary the operator text may claim and no more: the post-restore command's
 /// UNREADABLE paragraph and the runbook name a session by its KEY alone
 /// (`crates/server/src/cli.rs:1346-1356`, `m4-first-deployment-blueprint.md:609-614`) — telling an
-/// operator a session's value was checked would send a repair at bytes no pass ever reads.
+/// operator a session's value was checked would send a repair at bytes the staged read never
+/// reads. The session fence (#841) does decode it, and names it as a session it cannot fence.
 ///
 /// Base: both staged fragments marked, then reclaimed.
 #[tokio::test]
@@ -1774,14 +1775,27 @@ async fn a_session_whose_value_will_not_decode_still_protects_its_records() {
     assert_eq!(report.stranded_marked, 1, "{report:?}");
     assert!(
         report.unresolvable.is_empty(),
-        "the post-restore pass reported the session {name} as unreadable although it never decodes \
-         a session's value — the operator text names a session by its key alone: {report:?}"
+        "the post-restore pass reported the session {name} as an unreadable staged record although \
+         its staged read never decodes a session's value — the operator text names a session \
+         there by its key alone: {report:?}"
     );
-    assert!(
-        !named_on_audit_seam(RESTORE_AUDIT, name.as_bytes()),
-        "the post-restore pass named the session {name} on its audit seam although it never \
-         decodes a session's value"
-    );
+    // Named by the session fence as unfenced, never by the staged read as unreadable.
+    let thread = std::thread::current().id();
+    let actions = ["session-unsettled", "unresolvable-staged-record"];
+    let named: Vec<String> = audit_log()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.thread == thread && e.target == RESTORE_AUDIT)
+        .filter(|e| e.fields.iter().any(|field| field.contains(&name)))
+        .filter_map(|e| {
+            e.fields
+                .iter()
+                .find(|f| actions.contains(&f.as_str()))
+                .cloned()
+        })
+        .collect();
+    assert_eq!(named, ["session-unsettled"], "{name} on the audit seam");
     // Both of the session's ranges were walked from its key, as they are for a healthy session.
     let subjects: Vec<Vec<u8>> = meta
         .reads()

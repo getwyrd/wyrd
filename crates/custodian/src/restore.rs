@@ -60,6 +60,11 @@
 //! as **healthy while every read of it fails**. So it is kept (never marked), and its chunk is
 //! reported as *misplaced* — recoverable by fixing the **placement**, never as *dangling*.
 //!
+//! ## 4. Upload sessions come back live
+//!
+//! A resurrected `Open` upload could be completed over reclaimed bytes, so, last, this pass
+//! **fences** every `Open` session (0016 D-B; see [`reconcile_after_restore`]).
+//!
 //! # The safety gate, unchanged
 //!
 //! Marking is the front half of a deletion, so the invariant [`crate::gc`] is built around
@@ -95,11 +100,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
-use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
+use wyrd_core::multipart::{
+    decode_session_record, parse_mpu_key, OpenTeardown, SessionState, MPU_PREFIX,
+};
+use wyrd_traits::{
+    ChunkId, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
+};
 
 use crate::gc::{
     marked_among, object_name, orphan_key, parse_pending_chunk, referenced_fragments,
-    staged_fragments, GcContext, ReferenceSet, StagedSet,
+    staged_fragments, staged_page, GcContext, ReferenceSet, StagedSet,
 };
 
 /// How many orphan marks to commit at once.
@@ -201,6 +211,59 @@ pub struct RestoreReport {
     /// non-empty list here is a clean report about **part** of the store, and an operator
     /// reading it as a clean bill would decommission on it.
     pub unresolvable: Vec<String>,
+    /// `Open` sessions **fenced** to `Aborting`, each counted once its commit landed (`0016:823`).
+    pub sessions_fenced: usize,
+    /// Sessions the fence could **not** fence, by `mpu:` key and why, in key order: each left as
+    /// read, with no obligation — a human's (also `action=session-unsettled` on the audit seam).
+    pub sessions_unsettled: Vec<UnsettledSession>,
+}
+
+/// One session the post-restore fence could not fence, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledSession {
+    /// Its `mpu:` key, escaped as every name in the report is ([`crate::gc::object_name`]).
+    pub session: String,
+    /// Why the fence left it as read.
+    pub cause: SessionUnsettled,
+}
+
+/// Why the post-restore fence left a session unfenced — byte-identical, with no obligation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionUnsettled {
+    /// Its key names no upload (the staged read names it in [`RestoreReport::unresolvable`]).
+    KeyNamesNoUpload,
+    /// Its value will not decode (ADR-0045); the staged class still protects it by key.
+    ValueUndecodable {
+        /// The decoder's rejection.
+        fault: String,
+    },
+    /// `Open` at `u64::MAX`: every fence bumps the epoch, and there is no next.
+    EpochExhausted,
+    /// `Completing`: its fence must also retire that attempt's segments (`0016:665`, #842).
+    Completing,
+    /// Its record changed between the pass's read and the fence's commit.
+    ChangedUnderPass,
+    /// The obligation key was already taken (`require_absent`, `0016:369-373`): never retried.
+    ObligationKeyTaken {
+        /// The taken key, escaped.
+        key: String,
+    },
+    /// The commit lost a conflict whose cause a re-read no longer finds.
+    LostConflict,
+}
+
+impl std::fmt::Display for SessionUnsettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeyNamesNoUpload => write!(f, "its key names no upload"),
+            Self::ValueUndecodable { fault } => write!(f, "its value will not decode: {fault}"),
+            Self::EpochExhausted => write!(f, "it is Open at the last epoch, with no next"),
+            Self::Completing => write!(f, "it is Completing, which this build does not fence"),
+            Self::ChangedUnderPass => write!(f, "it changed after the pass read it"),
+            Self::ObligationKeyTaken { key } => write!(f, "its obligation key {key} is taken"),
+            Self::LostConflict => write!(f, "its commit lost a conflict a re-read cannot explain"),
+        }
+    }
 }
 
 impl RestoreReport {
@@ -212,6 +275,7 @@ impl RestoreReport {
     /// chunks), and the [untrusted staged records](RestoreReport::staged_untrusted) it held chunks
     /// over, none of which is a human's. Written **in terms of** that predicate rather than
     /// beside it, so the two cannot drift as fields are added.
+    /// A [fenced session](RestoreReport::sessions_fenced) is work this pass DID, too.
     ///
     /// An [unresolvable object](RestoreReport::unresolvable) counts: "clean" is a claim about a
     /// reading that FINISHED, and this one did not — so a store the pass could only partly read
@@ -219,6 +283,7 @@ impl RestoreReport {
     /// on the same ground: the pass could not tell where that chunk's fragments are.
     pub fn is_clean(&self) -> bool {
         self.stranded_marked == 0
+            && self.sessions_fenced == 0
             && self.under_replicated.is_empty()
             && self.staged_untrusted.is_empty()
             && !self.needs_human()
@@ -236,6 +301,9 @@ impl RestoreReport {
     /// report rather than in the command because a caller that never prints the summary still
     /// needs the same verdict, and would otherwise re-derive it slightly differently.
     ///
+    /// A session the fence could not fence counts — nothing stops it publishing; a `Completing`
+    /// one is among them until #842 — and one it fenced does not: that is this pass's job.
+    ///
     /// **A deliberate exception to that rule:** an untrusted staged record
     /// ([`RestoreReport::staged_untrusted`]) is left out, although no loop removes one yet
     /// (whether the retire drain does is #659's call). It rests on the human's decision at #664's
@@ -252,6 +320,7 @@ impl RestoreReport {
             || !self.misplaced.is_empty()
             || !self.unresolvable.is_empty()
             || !self.pending_unreadable.is_empty()
+            || !self.sessions_unsettled.is_empty()
     }
 }
 
@@ -266,7 +335,10 @@ impl RestoreReport {
 /// 2. every **committed chunk** is checked against the fragments actually present, and those
 ///    that can no longer be read *or rebuilt* are reported as [`RestoreReport::dangling`].
 ///
-/// Deletes nothing. Marks only. Run it with **writers stopped**, after a restore.
+/// Then, last, every session the image holds `Open` is fenced (below).
+///
+/// Deletes nothing: it writes marks and session fences. Run it with **writers stopped**, after a
+/// restore.
 ///
 /// # Staged bytes are never marked
 ///
@@ -286,6 +358,17 @@ impl RestoreReport {
 /// What this covers is the upload records **already durable when the pass read them**. A write or
 /// an upload that starts after that read is not protected by it — the runbook's writers-stopped
 /// rule is what covers that window today (#805).
+///
+/// # Every session the image held `Open` is fenced — last
+///
+/// A resurrected session could be completed over reclaimed bytes (0016 D-B, `0016:717-728`). So
+/// after Pass 3 the pass re-lists `mpu:` in bounded pages and moves each `Open@E` session to
+/// `Aborting@E+1` in **one** commit with its `{session, all}` obligation
+/// ([`wyrd_core::multipart::SessionRecord::open_teardown`]), requiring the bytes it read and the
+/// obligation key absent (`0016:369-373`). What it cannot fence is named, classified once and
+/// never retried ([`RestoreReport::sessions_unsettled`]). A failed commit — an unknown outcome
+/// included, never read as a `Conflict` — ends the pass with that `Err` after the summary records
+/// every count as INCOMPLETE, never clean; the re-run is idempotent.
 ///
 /// # An object it cannot read is CONTAINED, and the run is not certified
 ///
@@ -626,8 +709,114 @@ pub async fn reconcile_after_restore(
         }
     }
 
-    emit_summary(&report);
+    // THE SESSION FENCE — after Pass 3, so a fence fault never takes a verdict with it (#651's
+    // class): the summary is emitted first, INCOMPLETE, and is where the counts survive an `Err`.
+    let fenced = fence_open_sessions(ctx.meta, &mut report).await;
+    emit_summary(&report, fenced.is_ok());
+    fenced?;
     Ok(report)
+}
+
+/// The session fence: re-list `mpu:` in bounded pages ([`staged_page`]) and fence each session.
+/// Every read's and commit's await is bounded by the `MetadataStore` implementation (#508/#636).
+// deferred: #843 — seeded Tier-0 DST coverage of this fence (809.5).
+async fn fence_open_sessions(meta: &dyn MetadataStore, report: &mut RestoreReport) -> Result<()> {
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (sessions, next) = staged_page(meta, MPU_PREFIX, after.as_deref()).await?;
+        for (key, value) in &sessions {
+            fence_session(meta, key, value, report).await?;
+        }
+        match (next, sessions.into_iter().last()) {
+            (Some(_), Some((last, _))) => after = Some(last),
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Fence one listed session, or name why not ([`SessionUnsettled`]).
+async fn fence_session(
+    meta: &dyn MetadataStore,
+    key: &[u8],
+    read: &[u8],
+    report: &mut RestoreReport,
+) -> Result<()> {
+    let session = object_name(key);
+    let teardown = match open_teardown(key, read) {
+        Ok(Some(teardown)) => teardown,
+        Ok(None) => return Ok(()),
+        Err(cause) => {
+            unsettled(report, session, cause);
+            return Ok(());
+        }
+    };
+    let obligation_key = teardown.obligation().key();
+    let fence = WriteBatch::new()
+        .require(key.to_vec(), read.to_vec())
+        .require_absent(obligation_key.clone())
+        .put(key.to_vec(), metadata::encode(teardown.session()))
+        .put(
+            obligation_key.clone(),
+            metadata::encode(teardown.obligation().payload()),
+        );
+    match meta.commit(fence).await {
+        Ok(CommitOutcome::Committed) => {
+            let epoch = teardown.session().epoch();
+            emit_session_fenced(&session, epoch, &object_name(&obligation_key));
+            report.sessions_fenced += 1;
+        }
+        Ok(CommitOutcome::Conflict) => {
+            // Which precondition lost is read afresh, once: a token is minted once
+            // (`0016:358-373`), so a taken key is damage a retry cannot settle.
+            let cause = if meta.get(key).await?.as_deref() != Some(read) {
+                SessionUnsettled::ChangedUnderPass
+            } else if meta.get(&obligation_key).await?.is_some() {
+                SessionUnsettled::ObligationKeyTaken {
+                    key: object_name(&obligation_key),
+                }
+            } else {
+                SessionUnsettled::LostConflict
+            };
+            unsettled(report, session, cause);
+        }
+        // Never read as a `Conflict`: the outcome may be unknown (`CommitUnknownResult`).
+        Err(fault) => {
+            emit_session_fence_failed(&session, &fault.to_string());
+            return Err(fault);
+        }
+    }
+    Ok(())
+}
+
+/// The `Open` teardown of the session read as (`key`, `read`); `None` for an `Aborting` or
+/// `Completed` one, which can no longer publish; or why it cannot be fenced.
+fn open_teardown(
+    key: &[u8],
+    read: &[u8],
+) -> std::result::Result<Option<OpenTeardown>, SessionUnsettled> {
+    let upload = parse_mpu_key(key).map_err(|_| SessionUnsettled::KeyNamesNoUpload)?;
+    let record = decode_session_record(read).map_err(|fault| {
+        let fault = fault.to_string();
+        SessionUnsettled::ValueUndecodable { fault }
+    })?;
+    match record.state() {
+        SessionState::Open {} => {
+            let teardown = record.open_teardown(&upload);
+            teardown.map(Some).ok_or(SessionUnsettled::EpochExhausted)
+        }
+        // deferred: #842 — a `Completing` session's fence also retires that attempt's `seg:`
+        // records (`0016:665`, `:823`); until then it is named, never fenced as if `Open`.
+        SessionState::Completing { .. } => Err(SessionUnsettled::Completing),
+        SessionState::Aborting {} | SessionState::Completed { .. } => Ok(None),
+    }
+}
+
+/// Name a session the fence could not fence, on the audit seam and in the report.
+fn unsettled(report: &mut RestoreReport, session: String, cause: SessionUnsettled) {
+    emit_session_unsettled(&session, &cause);
+    report
+        .sessions_unsettled
+        .push(UnsettledSession { session, cause });
 }
 
 /// A committed chunk's reconstruction threshold and where its fragments are meant to live.
@@ -1058,12 +1247,53 @@ fn emit_untrusted_staged(record: &str, chunk: ChunkId, fault: &str) {
     );
 }
 
+/// A session fenced to `Aborting@epoch` with its obligation, once that commit landed.
+fn emit_session_fenced(session: &str, epoch: u64, obligation: &str) {
+    tracing::info!(monotonic_counter.restore_sessions_fenced = 1_u64);
+    tracing::info!(
+        target: "wyrd.custodian.restore.audit",
+        action = "session-fenced",
+        session = %session,
+        epoch,
+        obligation = %obligation,
+        "post-restore: an Open upload session is fenced to Aborting with the obligation owing its \
+         records; it can no longer be completed",
+    );
+}
+
+/// A session the fence could **not** fence, and why — left as read. Operator signal.
+fn emit_session_unsettled(session: &str, cause: &SessionUnsettled) {
+    tracing::warn!(monotonic_counter.restore_sessions_unsettled = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "session-unsettled",
+        session = %session,
+        cause = %cause,
+        "post-restore: could not fence an upload session; it is left as read — NEEDS-HUMAN",
+    );
+}
+
+/// A fence commit that answered `Err` (its outcome possibly unknown): nothing is claimed for it.
+fn emit_session_fence_failed(session: &str, fault: &str) {
+    tracing::error!(
+        target: "wyrd.custodian.restore.audit",
+        action = "session-fence-failed",
+        session = %session,
+        fault = %fault,
+        "post-restore: a session's fence commit failed, landed or not; the pass stops — re-run it",
+    );
+}
+
 /// The pass's own verdict, so a restore's true cost lands in one line an operator can read.
 ///
-/// It says **complete** only when the reading finished. Over a store with an unreadable
-/// committed or staged record in it the same line would otherwise be the certification the rest
-/// of this pass refuses to give, in the one place an operator greps for it.
-fn emit_summary(report: &RestoreReport) {
+/// It says **complete** only when the reading finished and the session fence did. Over a store
+/// with an unreadable committed or staged record in it the same line would otherwise be the
+/// certification the rest of this pass refuses to give, in the one place an operator greps for
+/// it. It is emitted even when a fence commit failed: it is the only record of some counts.
+fn emit_summary(report: &RestoreReport, fence_finished: bool) {
+    const PARTIAL_READ: &str = "every count above covers only the records this pass could read";
+    const FENCE_CUT: &str =
+        "the session fence did not finish, and the pass returns an error — re-run it";
     tracing::info!(
         target: "wyrd.custodian.restore.audit",
         action = "summary",
@@ -1077,18 +1307,24 @@ fn emit_summary(report: &RestoreReport) {
         dangling = report.dangling.len(),
         misplaced = report.misplaced.len(),
         under_replicated = report.under_replicated.len(),
+        sessions_fenced = report.sessions_fenced,
+        sessions_unsettled = report.sessions_unsettled.len(),
+        fence_finished,
         // The qualifier on every count above: they are drawn over the records this pass could
         // read, and this is how many it could not.
         unresolvable = report.unresolvable.len(),
         // The pass's own two-word verdict, so the predicate the report offers its callers is the
-        // one its audit trail states rather than a third rendering of the same fields.
-        clean = report.is_clean(),
-        needs_human = report.needs_human(),
+        // one its audit trail states rather than a third rendering of the same fields — except
+        // that a fence cut short may have left an `Open` session live, which no partial report
+        // can call clean and only a human's re-run settles.
+        clean = fence_finished && report.is_clean(),
+        needs_human = !fence_finished || report.needs_human(),
         "post-restore reconciliation {}",
-        if report.unresolvable.is_empty() {
-            "complete"
-        } else {
-            "INCOMPLETE — every count above covers only the records this pass could read"
+        match (report.unresolvable.is_empty(), fence_finished) {
+            (true, true) => "complete".to_owned(),
+            (false, true) => format!("INCOMPLETE — {PARTIAL_READ}"),
+            (true, false) => format!("INCOMPLETE — {FENCE_CUT}"),
+            (false, false) => format!("INCOMPLETE — {PARTIAL_READ}; and {FENCE_CUT}"),
         },
     );
 }
