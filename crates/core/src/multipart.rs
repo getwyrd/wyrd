@@ -88,10 +88,11 @@
 //! Structural validity is checked **at decode**, never by convention at a call site
 //! (`0016:390-414`).
 //!
-//! # Nothing here is written yet — and the living-architecture doc says exactly that
+//! # Almost nothing here is written yet — and the living-architecture doc says exactly that
 //!
-//! This module is the key **grammar** plus the record **shapes**: it has no writer, no store
-//! call and no production consumer (the first writers are the store round trips, #656–#659).
+//! This module is the key **grammar** plus the record **shapes**: it makes no store call, and its
+//! one writer-side API is the `Open` teardown ([`SessionRecord::open_teardown`], first called by
+//! the post-restore fence, #841); every other first writer is a store round trip (#656–#659).
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -129,8 +130,8 @@ use wyrd_traits::{ChunkId, DServerId, SCAN_CAP};
 
 use crate::erasure;
 use crate::metadata::{
-    self, ChunkRef, EcScheme, InodeId, SegmentGroup, MAX_ROOT_SEGMENTS, MAX_ROOT_VALUE_BYTES,
-    MAX_VALUE_BYTES,
+    self, ChunkRef, EcScheme, InodeId, SegmentGroup, SegmentNonce, MAX_ROOT_SEGMENTS,
+    MAX_ROOT_VALUE_BYTES, MAX_VALUE_BYTES,
 };
 
 // ===========================================================================
@@ -281,9 +282,10 @@ pub enum RecordError {
         target_name: String,
     },
     /// A session's `publish_target` carries a fence epoch that disagrees with the session's
-    /// own `epoch` — the F18 class (`0016:350`, `:560-563`): `publish_target`'s epoch is what
-    /// makes the `Completing` fence's segment-group nonce deterministic **for that attempt**,
-    /// so a record whose two epochs disagree addresses another attempt's segment-group.
+    /// own `epoch` — the F18 class (`0016:350`, `:560-563`): `publish_target`'s epoch is the
+    /// epoch half of the segment group **this** `Completing` attempt writes (the session's
+    /// own nonce at that epoch), so a record whose two epochs disagree addresses another
+    /// attempt's segment-group.
     PublishTargetEpochMismatch {
         /// The session's own epoch.
         session_epoch: u64,
@@ -1942,8 +1944,11 @@ fn require_canonical<T: Serialize>(
 
 /// The target dirent identity a `Completing` session's fence will flip: parent bucket inode +
 /// object name — **never** a frozen inode id (`0016:350`, `:561-563`), plus the `Completing`
-/// fence epoch `E` that makes the attempt's segment-group nonce deterministic. Stamped onto
-/// the session record the moment it fences into `Completing`.
+/// fence epoch `E`: the attempt's epoch within the session's segment group, so the group this
+/// attempt writes is the session's own `segment_nonce` at `E`
+/// ([`SessionRecord::attempt_segment_group`]). It carries no nonce of its own — the session
+/// names its nonce once, in every state. Stamped onto the session record the moment it fences
+/// into `Completing`.
 ///
 /// A plain value with no invariant of its own: its component types ([`InodeId`], `String`,
 /// `u64`) each validate their own shape, and the **identity** it must hold against the session
@@ -2068,11 +2073,25 @@ fn de_content_type<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<
     })
 }
 
+/// Decode the session's `segment_nonce` through [`SegmentNonce::new`], the nonce rule's one
+/// home (`metadata.rs:996-1006`). [`SegmentNonce`] deliberately has no `Deserialize`, so a
+/// derive cannot produce one unvalidated; this is the same route [`SegmentGroup`]'s own
+/// `Deserialize` takes (`metadata.rs:1060-1071`), for a nonce that stands alone on the record
+/// rather than inside a group. A present nonce that is not exactly
+/// [`crate::metadata::SEG_NONCE_HEX_LEN`] lowercase hex characters is a decode error naming
+/// the field — structural, so never a value (ADR-0045).
+fn de_segment_nonce<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SegmentNonce, D::Error> {
+    let nonce = String::deserialize(deserializer)
+        .map_err(|err| DeError::custom(format!("segment_nonce: {err}")))?;
+    SegmentNonce::new(nonce).map_err(|err| DeError::custom(format!("segment_nonce: {err}")))
+}
+
 /// The wire shape of [`SessionRecord`] — every field the session carries regardless of state,
 /// plus `state` itself, whose own [`SessionState`] `Deserialize` enforces which of the
 /// state-dependent fields may accompany it (leg 1j). `deny_unknown_fields` closes the shape
-/// against a field this build does not know (leg 1m), and `de_content_type` closes the one
-/// field that is genuinely optional against its second spelling.
+/// against a field this build does not know (leg 1m), `de_content_type` closes the one
+/// field that is genuinely optional against its second spelling, and `de_segment_nonce`
+/// validates the nonce through its one constructor.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionRecordWire {
@@ -2082,14 +2101,29 @@ struct SessionRecordWire {
     content_type: Option<String>,
     created_at_millis: u64,
     clock_source: String,
+    #[serde(deserialize_with = "de_segment_nonce")]
+    segment_nonce: SegmentNonce,
     epoch: u64,
     attempts: u32,
     state: SessionState,
 }
 
 /// A multipart upload **session**, the `mpu:<upload-id>` value (`0016:350`): target bucket
-/// (`parent`) + object name, `content_type`, `created_at_millis`, `clock_source`, `epoch`,
-/// `attempts`, and the lifecycle [`SessionState`].
+/// (`parent`) + object name, `content_type`, `created_at_millis`, `clock_source`,
+/// `segment_nonce`, `epoch`, `attempts`, and the lifecycle [`SessionState`].
+///
+/// # The segment-group nonce
+///
+/// **Stored** in every state, not derived: the nonce is independent of the upload id, since
+/// segment records outlive the `mpu:` tombstone (`0016:499-509`), so nothing else on the
+/// record reproduces it. Create mints it and reserves `seggrp:<nonce>` (`0016:508-518`,
+/// `:656`); each `Completing` attempt writes under `(nonce, publish_target.epoch)`
+/// ([`SessionRecord::attempt_segment_group`]), which the batch ending the attempt names for
+/// deletion (`0016:665`, X57 at `:880`); a rollback to `Open@E+1` drops `publish_target` but
+/// keeps the nonce for the next attempt (`0016:538-552`); and the terminal delete, from any
+/// state, names the marker Create reserved (`0016:673`). Its one accepted position is after
+/// `clock_source`, before `epoch` (the canonical-bytes check below). Proposal 0016's `mpu:`
+/// row (`0016:350`) does not list the field yet.
 ///
 /// # Serialization identity
 ///
@@ -2099,8 +2133,10 @@ struct SessionRecordWire {
 /// set rather than over the shapes this codec happens to write, so no accepted value can be
 /// one whose re-encode differs from what the store holds.
 ///
-/// Seven of the eight fields are required, so their spelling is forced. `content_type` is
-/// genuinely optional (`0016:350`) and is the whole of the argument:
+/// Eight of the nine fields are required, so their spelling is forced — `segment_nonce`
+/// entirely so, since [`SegmentNonce`] admits exactly one spelling of each nonce (32
+/// lowercase hex characters). `content_type` is genuinely optional (`0016:350`) and is the
+/// whole of the argument:
 ///
 /// * absent is spelled by **omitting** the field — `skip_serializing_if` below, the
 ///   convention [`crate::metadata::InodeRecord`] states at length for its own optional trio
@@ -2124,10 +2160,10 @@ struct SessionRecordWire {
 /// whitespace inserted — is [`RecordError::NoncanonicalRecordValue`], never a value whose
 /// re-encoding a CAS could not match against the store.
 ///
-/// No writer-side constructor: the first writer is the store round trip (#656–#659), and a
-/// `SessionRecord` this module minted directly could not be relied on to hold the identity
-/// [`decode_session_record`] enforces — precisely the reason [`AdmissionRecord`] and
-/// [`Budget`] omit one too.
+/// No free constructor: a `SessionRecord` minted from loose fields could not be relied on to hold
+/// the identity [`decode_session_record`] enforces — precisely the reason [`AdmissionRecord`] and
+/// [`Budget`] omit one too. The one writer-side route transitions a record that already decoded
+/// ([`Self::open_teardown`]), changing only `epoch` and `state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SessionRecordWire")]
 pub struct SessionRecord {
@@ -2139,6 +2175,9 @@ pub struct SessionRecord {
     content_type: Option<String>,
     created_at_millis: u64,
     clock_source: String,
+    /// Present in every state; see this type's "The segment-group nonce". Serializes as its
+    /// plain 32-character string; the decode half is `de_segment_nonce`.
+    segment_nonce: SegmentNonce,
     epoch: u64,
     attempts: u32,
     state: SessionState,
@@ -2170,6 +2209,32 @@ impl SessionRecord {
         &self.clock_source
     }
 
+    /// The session's segment-group nonce, in **every** state — already validated at decode,
+    /// so it can be handed straight to [`crate::metadata::seggrp_key`] (the marker the
+    /// terminal delete removes, `0016:673`) or [`crate::metadata::seg_group_prefix`] without
+    /// re-parsing.
+    pub const fn segment_nonce(&self) -> &SegmentNonce {
+        &self.segment_nonce
+    }
+
+    /// The segment group the current `Completing` attempt writes under: the session's own
+    /// [`segment_nonce`](Self::segment_nonce) at `publish_target.epoch` — the range a writer
+    /// that ends the attempt names for deletion ([`crate::metadata::seg_range_prefix`];
+    /// `0016:665`, `:2193-2196`). `None` in every other state: only `Completing` has an
+    /// attempt in its segment-write phase. Built from the nonce already validated at decode
+    /// ([`SegmentGroup::from_nonce`]), never re-parsed.
+    pub fn attempt_segment_group(&self) -> Option<SegmentGroup> {
+        match &self.state {
+            SessionState::Completing { publish_target, .. } => Some(SegmentGroup::from_nonce(
+                self.segment_nonce.clone(),
+                publish_target.epoch,
+            )),
+            SessionState::Open {} | SessionState::Aborting {} | SessionState::Completed { .. } => {
+                None
+            }
+        }
+    }
+
     /// The session's current epoch; every transition is a fenced CAS that bumps it.
     pub const fn epoch(&self) -> u64 {
         self.epoch
@@ -2186,6 +2251,48 @@ impl SessionRecord {
     /// The session's lifecycle state.
     pub const fn state(&self) -> &SessionState {
         &self.state
+    }
+
+    /// The **teardown fence of an `Open@E` session**: this session at `Aborting@E+1`, and the
+    /// `retire:bytes:s:<upload-id>:<E>` obligation `{session, all}` owing its staged residue
+    /// **and** every part (`0016:2187`), for a writer to commit together (`0016:664`, `:823`).
+    /// `{session}` alone would leave the committed parts with no deleter; `all` is sound because
+    /// no part commits outside `Open` (`0016:711-716`), so the fence freezes the part range.
+    ///
+    /// `upload_id` is the one the session's own `mpu:` key names. `None` unless the session is
+    /// `Open` below `u64::MAX`: every fence bumps the epoch (`0016:704-708`).
+    pub fn open_teardown(&self, upload_id: &UploadId) -> Option<OpenTeardown> {
+        if !matches!(self.state, SessionState::Open {}) {
+            return None;
+        }
+        let next = self.epoch.checked_add(1)?;
+        Some(OpenTeardown {
+            session: Self {
+                epoch: next,
+                state: SessionState::Aborting {},
+                ..self.clone()
+            },
+            obligation: RetireObligation::session_teardown(upload_id, self.epoch),
+        })
+    }
+}
+
+/// What [`SessionRecord::open_teardown`] mints, committed together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenTeardown {
+    session: SessionRecord,
+    obligation: RetireObligation,
+}
+
+impl OpenTeardown {
+    /// The session as the fence leaves it; its encoding is the codec's own spelling.
+    pub const fn session(&self) -> &SessionRecord {
+        &self.session
+    }
+
+    /// The obligation installed beside it, under `require_absent` (`0016:369-373`).
+    pub const fn obligation(&self) -> &RetireObligation {
+        &self.obligation
     }
 }
 
@@ -2234,6 +2341,7 @@ impl TryFrom<SessionRecordWire> for SessionRecord {
             content_type: wire.content_type,
             created_at_millis: wire.created_at_millis,
             clock_source: wire.clock_source,
+            segment_nonce: wire.segment_nonce,
             epoch: wire.epoch,
             attempts: wire.attempts,
             state: wire.state,
@@ -2878,7 +2986,7 @@ struct RetireGenerationWire {
 /// Its arms are open, as [`crate::metadata::ChunkMap`]'s are, so the **non-emptiness** of a
 /// `Flat` list is not a property of this type but of the decode that reads one (`checked_chunks`
 /// — an obligation owing nothing is residue no drain can clear). That is sound here for the same
-/// reason no record type in this module has a writer-side constructor: a [`RetireGeneration`] can
+/// reason a generation has no writer-side constructor: a [`RetireGeneration`] can
 /// only come into existence by decoding, so a hand-built `RetiredMap` has nowhere to go. The
 /// first writers (#656–#659) inherit that obligation with the constructor they add.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3061,8 +3169,8 @@ const PARTS_COMPONENT: Component = Component {
 };
 
 /// `{parts: "all"}` — the wildcard, a **different writer row** from an explicit set and therefore
-/// its own entry in this table: exactly one batch installs it, the reaper's `Open` teardown
-/// `retire:bytes:{session, all}` (`0016:2187`), and it is legal only in that shape. Under
+/// its own entry in this table: one shape installs it, an `Open` teardown (the reaper's or the
+/// restore fence's) `retire:bytes:{session, all}` (`0016:2187`), legal only in that shape. Under
 /// `retire:records:` it would tell a drain to delete **every** part record of a live session —
 /// including the staged parts whose records are the only thing protecting their bytes and the only
 /// source of their placements, the precise deletion `0016:919-921` (iteration-14 finding 3, X104)
@@ -3139,7 +3247,7 @@ struct RetirePayloadWire {
 /// | Key | Payload | Row |
 /// |---|---|---|
 /// | `retire:bytes:s:<id>:<E>` | `{session}` | the abort/reap fence's own spelling (`0016:664`) — the session's staged residue, no part |
-/// | `retire:bytes:s:<id>:<E>` | `{session, all}` | the reaper's `Open` teardown, that residue **and** every part (`0016:2187`) — the **only** row the `all` wildcard has |
+/// | `retire:bytes:s:<id>:<E>` | `{session, all}` | the `Open` teardown, that residue **and** every part: the reaper's (`0016:2187`) and the restore fence's ([`SessionRecord::open_teardown`]) — the **only** row the `all` wildcard has |
 /// | `retire:bytes:s:<id>:<E>` | `{session, parts: <set>}` | the `Completing`→`Aborting` fence, incl. the restore fence (`0016:665`, `:823`, `:2193`) |
 /// | `retire:bytes:s:<id>:<E>` | `{parts: <set>}` | the root flip's **unnamed** staged parts (`0016:662`, `:919-921`) |
 /// | `retire:bytes:s:<id>:<E>:<n>:<a>` | `{chunks: […]}` | a losing writer / re-upload compensation (`0016:659`, `:672`, `:1620`) |
@@ -3177,9 +3285,10 @@ struct RetirePayloadWire {
 /// the store-wide seam the sibling records use. [`Serialize`] stays: encoding an
 /// already-validated payload is what the canonical-bytes gate and every future writer need.
 ///
-/// There is no writer-side constructor either, as for every record type in this module: the
-/// first writers are the store round trips (#656–#659), and a value that could be built without
-/// passing decode's rules is a value those writers could make durable without them.
+/// There is no free constructor either: a value built without decode's rules is one a writer
+/// could make durable without them. The one writer-side route, [`RetireObligation`], mints a
+/// payload **with the key it goes under**, for one row (the `Open` teardown); the store round
+/// trips (#656–#659) add their rows there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetirePayload {
     /// Omitted when absent rather than spelled `false` (`AGENTS.md:170-172`), so the accepted
@@ -3465,6 +3574,49 @@ pub fn decode_retire_obligation(
     let payload = RetirePayload::try_from(wire)?;
     payload.checked_against_key(mode, &token)?;
     Ok((mode, token, require_canonical(payload, value, "retire:")?))
+}
+
+/// A retirement obligation **as a writer installs it**: key and payload minted by one constructor,
+/// so they cannot disagree — the writer-side mirror of [`decode_retire_obligation`]. Its only
+/// constructor is the `Open` teardown ([`SessionRecord::open_teardown`]); a later writer's row is
+/// added as its own constructor, never as a payload handed in beside a key the caller chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireObligation {
+    mode: RetireMode,
+    token: RetireToken,
+    payload: RetirePayload,
+}
+
+impl RetireObligation {
+    /// `retire:bytes:s:<upload-id>:<epoch>` owing `{session, parts: "all"}` (`0016:2187`) — a pair
+    /// [`decode_retire_obligation`] accepts (pinned by this module's `open_teardown` test).
+    fn session_teardown(upload_id: &UploadId, epoch: u64) -> Self {
+        Self {
+            mode: RetireMode::Bytes,
+            token: RetireToken::Session {
+                upload_id: upload_id.clone(),
+                epoch,
+                part: None,
+            },
+            payload: RetirePayload {
+                session: true,
+                parts: Some(PartScope::All),
+                chunks: Vec::new(),
+                generation: None,
+                seg: None,
+            },
+        }
+    }
+
+    /// The key it is installed under ([`retire_key`]).
+    pub fn key(&self) -> Vec<u8> {
+        retire_key(self.mode, &self.token)
+    }
+
+    /// What it owes: the value, through [`crate::metadata::encode`].
+    pub const fn payload(&self) -> &RetirePayload {
+        &self.payload
+    }
 }
 
 // ===========================================================================
@@ -4910,4 +5062,60 @@ pub fn knob_clamps_hold(set: &KnobSet) -> Result<(), KnobClamp> {
     }
     let contention = u64::from(set.max_admission_cas_attempts);
     ensure(contention >= sessions, AdmissionCasBelowSessions)
+}
+
+/// [`SessionRecord::open_teardown`]: only an `Open` session below `u64::MAX` has one, and what it
+/// mints is the same record at `Aborting@E+1` and a `{session, all}` obligation that decodes
+/// against the very key it carries.
+#[cfg(test)]
+mod open_teardown {
+    use super::*;
+
+    fn session(state: &str, epoch: u64) -> SessionRecord {
+        let json = format!(
+            "{{\"parent\":42,\"object\":\"o\",\"created_at_millis\":100,\"clock_source\":\"wall\",\
+             \"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\"epoch\":{epoch},\
+             \"attempts\":1,\"state\":{state}}}"
+        );
+        decode_session_record(json.as_bytes()).expect("a canonical session")
+    }
+
+    #[test]
+    fn only_an_open_session_has_a_teardown_and_its_obligation_matches_its_key() {
+        let id = UploadId::new("ab".repeat(16)).expect("an upload id");
+        let open = session(r#"{"kind":"Open"}"#, 3);
+        let teardown = open.open_teardown(&id).expect("Open@3 has a teardown");
+        assert_eq!(teardown.session(), &session(r#"{"kind":"Aborting"}"#, 4));
+        let obligation = teardown.obligation();
+        let token = RetireToken::Session {
+            upload_id: id.clone(),
+            epoch: 3,
+            part: None,
+        };
+        assert_eq!(obligation.key(), retire_key(RetireMode::Bytes, &token));
+        let value = metadata::encode(obligation.payload());
+        let decoded = decode_retire_obligation(&obligation.key(), &value).expect("it decodes");
+        let payload = obligation.payload().clone();
+        assert!(payload.session() && payload.parts() == Some(&PartScope::All));
+        assert_eq!(decoded, (RetireMode::Bytes, token, payload));
+
+        assert_eq!(
+            session(r#"{"kind":"Open"}"#, u64::MAX).open_teardown(&id),
+            None
+        );
+        let target = "{\"parent\":42,\"name\":\"o\",\"epoch\":3}";
+        let completing = format!(
+            "{{\"kind\":\"Completing\",\"fenced_at_millis\":900,\"segments_written\":0,\
+             \"publish_target\":{target}}}"
+        );
+        let completed = format!(
+            "{{\"kind\":\"Completed\",\"completion\":{{\"inode\":7,\"version\":1,\"etag\":\
+             \"{}-1\",\"completed_at_millis\":950,\"complete_fingerprint\":\"{}\"}}}}",
+            "ab".repeat(32),
+            "cd".repeat(32)
+        );
+        for state in [r#"{"kind":"Aborting"}"#, &completing, &completed] {
+            assert_eq!(session(state, 3).open_teardown(&id), None, "{state}");
+        }
+    }
 }

@@ -38,6 +38,7 @@ use crate::custodian::{connect_fleet, ConfiguredDServer, CustodianService, DServ
 use crate::dserver::{self, DServer};
 use crate::logging::{self, LogConfig};
 use crate::{Gateway, DEFAULT_DURABILITY};
+use wyrd_custodian::restore::{SessionUnsettled, UnsettledSession};
 use wyrd_custodian::RestoreReport;
 use wyrd_gateway_s3 as s3;
 
@@ -1230,7 +1231,8 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
 /// What the post-restore one-shot tells the operator: every line it prints, and whether the run
 /// **needs a human** — which is also the command's exit status.
 struct RestoreVerdict {
-    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding.
+    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding,
+    /// then an informational line that does not set the status (untrusted staged records).
     lines: Vec<String>,
     /// Exit non-zero. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green.
     needs_human: bool,
@@ -1253,17 +1255,23 @@ struct RestoreVerdict {
 /// record a run that lost data — or one whose chunks could not be read — as a healthy one, which
 /// is the single worst thing this command could do. The pass itself succeeded; the restore did
 /// not.
+///
+/// An untrusted staged record is named WITHOUT that status, on an informational line: the
+/// report's predicate leaves it out on a recorded decision ([`RestoreReport::needs_human`]).
 fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
     let mut lines = vec![format!(
         "wyrd custodian: post-restore reconciliation {} — {} stranded fragment(s) marked \
-         collectable ({} already marked, {} left to a pending lease, {} displaced and kept); {} \
+         collectable ({} already marked, {} left to a pending lease, {} kept for multipart \
+         uploads' staged records, {} displaced and kept); {} \
          chunk(s) DANGLING (unreadable AND unreconstructible — the restore resurrected maps \
          whose bytes were already reclaimed), {} MISPLACED (bytes present but not where the \
          restored map looks — unreadable until the placement is fixed), {} under-replicated (the \
          repair loop rebuilds these); {} record(s) UNREADABLE (committed objects' chunk maps or \
          staged multipart records the pass could not read — so every count here is drawn over \
          the rest of the store); {} pending-ledger entr(y/ies) UNREADABLE (held unmarked, see \
-         below).",
+         below); {} staged multipart record(s) untrusted (their chunks held unmarked, see \
+         below); {} upload session(s) fenced (Open in the restored image, now aborted — none of \
+         them can be completed), {} upload session(s) NOT fenced (see below).",
         // NOT "complete" over a store the pass could only partly read: "complete" is a claim
         // about a reading that FINISHED, and an operator scanning this line for one word must
         // not find it while a record is still unreadable.
@@ -1275,12 +1283,16 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         report.stranded_marked,
         report.already_marked,
         report.pending_skipped,
+        report.staged_skipped,
         report.displaced_kept,
         report.dangling.len(),
         report.misplaced.len(),
         report.under_replicated.len(),
         report.unresolvable.len(),
         report.pending_unreadable.len(),
+        report.staged_untrusted.len(),
+        report.sessions_fenced,
+        report.sessions_unsettled.len(),
     )];
     if !report.pending_unreadable.is_empty() {
         lines.push(format!(
@@ -1337,12 +1349,12 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             // was never published.
             //
             // The staged half says exactly WHICH half of a record the pass judged, per class,
-            // because that is what the operator repairs. The pass never decodes an upload
+            // because that is what the operator repairs. The staged read never decodes an upload
             // session's or a staging entry's VALUE to build this class (`custodian::gc`'s
             // `staged_fragments` reads a session by key alone, and an undecodable `sidx:` value
             // under a key that still names its chunk HOLDS that chunk rather than landing here) —
             // so promising that a value was checked would send a repair at a record the pass
-            // never read.
+            // never read (the session fence names an undecodable session below, NOT fenced).
             "wyrd custodian: NEEDS-HUMAN — {} record(s) could not be READ: {}. Each is a \
              committed object whose chunk map is missing segments or will not decode, or a staged \
              multipart record: an upload session (`mpu:`) or an in-flight staging entry (`sidx:`) \
@@ -1357,6 +1369,42 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             report.unresolvable.len(),
             named_records(&report.unresolvable),
             report.stranded_marked,
+        ));
+    }
+    if !report.sessions_unsettled.is_empty() {
+        let sessions: Vec<String> = report
+            .sessions_unsettled
+            .iter()
+            .map(|unsettled| unsettled.session.clone())
+            .collect();
+        lines.push(format!(
+            // Named by key, as the UNREADABLE paragraph names its records, and counted by cause:
+            // the cause decides the repair.
+            "wyrd custodian: NEEDS-HUMAN — {} upload session(s) the restored image holds could \
+             NOT be fenced: {}. Why: {}. This pass left each as it found it, so nothing yet stops \
+             one from being completed over bytes the restore may have lost. Keep multipart \
+             uploads off this store until each is repaired or torn down, then re-run this pass. \
+             The audit log carries each one with its cause (`action=session-unsettled`).",
+            report.sessions_unsettled.len(),
+            named_records(&sessions),
+            unsettled_causes(&report.sessions_unsettled),
+        ));
+    }
+    if !report.staged_untrusted.is_empty() {
+        lines.push(format!(
+            // INFORMATION, not NEEDS-HUMAN (`RestoreReport::needs_human` says why), but named.
+            // Says what the pass DID — marked none of these chunks' fragments — and no more: not
+            // that the staged bytes survived (only committed chunks are judged for missing
+            // bytes), and no cleanup promise (whether the retire drain removes one is #659's).
+            "wyrd custodian: note — {} staged multipart record(s) could not be TRUSTED about where \
+             their chunks' fragments are: {}. This pass held those chunks and marked none of their \
+             fragments; it did not check that their staged bytes survived the restore. A damaged \
+             staged record points at a bug or at corruption, and while one remains it blocks \
+             every drain in the cluster, so this run is not a clean bill. Reported for your \
+             information: it does not change the exit status. The audit log carries each one too \
+             (`action=untrusted-staged-record`).",
+            report.staged_untrusted.len(),
+            named_records(&report.staged_untrusted),
         ));
     }
     RestoreVerdict {
@@ -1374,7 +1422,8 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
 /// store whose whole `inode:` namespace is damaged would otherwise print its every key into it.
 /// Every name is still carried in full by [`RestoreReport::unresolvable`] and by the audit trail
 /// (`action=unresolvable-chunk-map`, and `action=unresolvable-staged-record` for a staged
-/// multipart record), and the remainder is stated as a count rather than dropped — so the line is
+/// multipart record; `RestoreReport::sessions_unsettled` and `action=session-unsettled` for an
+/// unfenced session), and the remainder is stated as a count rather than dropped — so the line is
 /// never a silent truncation, and repairing the ones it names and re-running is the operator's
 /// loop out of the tail.
 const NAMED_UNREADABLE_RECORDS: usize = 20;
@@ -1397,6 +1446,40 @@ fn named_records(names: &[String]) -> String {
         0 => shown,
         rest => format!("{shown}, and {rest} more (the audit log names every one)"),
     }
+}
+
+/// The unfenced sessions counted by cause, only the causes that occur. The match is exhaustive,
+/// so a cause the pass adds cannot reach an operator uncounted.
+fn unsettled_causes(sessions: &[UnsettledSession]) -> String {
+    const WHY: [&str; 7] = [
+        "whose key names no upload",
+        "whose value will not decode",
+        "Open at the last epoch the record can spell",
+        "Completing (this build does not fence a Completing session)",
+        "changed while this pass ran",
+        "whose retirement key was already taken by another obligation",
+        "lost a conflict whose cause a re-read no longer finds",
+    ];
+    let mut counts = [0_usize; WHY.len()];
+    for unsettled in sessions {
+        let slot = match unsettled.cause {
+            SessionUnsettled::KeyNamesNoUpload => 0,
+            SessionUnsettled::ValueUndecodable { .. } => 1,
+            SessionUnsettled::EpochExhausted => 2,
+            SessionUnsettled::Completing => 3,
+            SessionUnsettled::ChangedUnderPass => 4,
+            SessionUnsettled::ObligationKeyTaken { .. } => 5,
+            SessionUnsettled::LostConflict => 6,
+        };
+        counts[slot] += 1;
+    }
+    counts
+        .iter()
+        .zip(WHY)
+        .filter(|(count, _)| **count > 0)
+        .map(|(count, why)| format!("{count} {why}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Open the SAME metadata store the cluster wrote to and run ONE post-restore reconciliation
@@ -2931,6 +3014,26 @@ mod tests {
         let routine = RestoreReport {
             stranded_marked: 4,
             under_replicated: vec![3],
+            staged_skipped: 2,
+            ..Default::default()
+        };
+        // An untrusted staged record (#839): named and not clean, but not a human's.
+        let untrusted = RestoreReport {
+            staged_untrusted: vec!["part:0123456789abcdef0123456789abcdef:000001".to_owned()],
+            staged_skipped: 3,
+            ..Default::default()
+        };
+        // A session the fence could not fence (#841): a human's — the restore has not declared it
+        // dead. Sessions it DID fence are this pass doing its job: not a human's, and not clean.
+        let unsettled = RestoreReport {
+            sessions_unsettled: vec![UnsettledSession {
+                session: "mpu:0123456789abcdef0123456789abcdef".to_owned(),
+                cause: SessionUnsettled::Completing,
+            }],
+            ..Default::default()
+        };
+        let fenced = RestoreReport {
+            sessions_fenced: 2,
             ..Default::default()
         };
         for (report, human) in [
@@ -2938,7 +3041,10 @@ mod tests {
             (&misplaced, true),
             (&unreadable, true),
             (&pending, true),
+            (&unsettled, true),
             (&routine, false),
+            (&untrusted, false),
+            (&fenced, false),
         ] {
             let verdict = restore_verdict(report);
             let printed = verdict.lines.join("\n");
@@ -2955,8 +3061,18 @@ mod tests {
                 human,
                 "a paragraph without the status behind it, or the reverse: {report:?} / {printed}"
             );
-            // `is_clean` is the strict superset: nothing that needs a human is ever clean.
+            // `is_clean` is the strict superset: nothing that needs a human is ever clean (nor is
+            // a run holding a chunk over an untrusted staged record).
             assert!(!(human && report.is_clean()), "{report:?}");
+            assert!(
+                report.staged_untrusted.is_empty() || !report.is_clean(),
+                "{report:?}"
+            );
+            // A fence is work this pass did, so a run that fenced a session is never clean.
+            assert!(
+                report.sessions_fenced == 0 || !report.is_clean(),
+                "{report:?}"
+            );
             // "complete" is a claim about a reading that FINISHED, and an operator greps this
             // line for exactly that word — so it appears iff nothing was unreadable, and the
             // blocking record is NAMED where they read it rather than left to a log.
@@ -2980,14 +3096,174 @@ mod tests {
             // merely counted. A count tells them a repair is needed and not which record to
             // repair, and the operator this command is written for is mid-restore at a terminal
             // — the log collector is one of the things a restore brings back up.
-            for object in report.unresolvable.iter().chain(&report.pending_unreadable) {
+            for object in report
+                .unresolvable
+                .iter()
+                .chain(&report.pending_unreadable)
+                .chain(&report.staged_untrusted)
+                .chain(report.sessions_unsettled.iter().map(|s| &s.session))
+            {
                 assert!(
                     printed.contains(object.as_str()),
-                    "the blocking record {object} is not named in what the operator reads: \
-                     {printed}"
+                    "the record {object} is not named in what the operator reads: {printed}"
                 );
             }
+            // ...and the NOT-fenced paragraph appears exactly when a session was left unfenced.
+            assert_eq!(
+                printed.contains("could NOT be fenced"),
+                !report.sessions_unsettled.is_empty(),
+                "{printed}"
+            );
         }
+    }
+
+    /// Issue #841: the summary counts fenced and unfenced sessions, and a NEEDS-HUMAN paragraph
+    /// names each unfenced one by key, counted by cause (fenced alone: the agreement test).
+    #[test]
+    fn restore_verdict_counts_fenced_sessions_and_names_the_ones_it_could_not_fence() {
+        let unsettled = |pair: &str, cause| UnsettledSession {
+            session: format!("mpu:{}", pair.repeat(16)),
+            cause,
+        };
+        let fault = "malformed".to_owned();
+        let key = "retire:bytes:s:x:3".to_owned();
+        let sessions = vec![
+            unsettled("a1", SessionUnsettled::Completing),
+            unsettled("a2", SessionUnsettled::ValueUndecodable { fault }),
+            unsettled("a3", SessionUnsettled::ObligationKeyTaken { key }),
+            unsettled("a4", SessionUnsettled::Completing),
+        ];
+        let report = RestoreReport {
+            sessions_fenced: 3,
+            sessions_unsettled: sessions.clone(),
+            ..Default::default()
+        };
+        let verdict = restore_verdict(&report);
+        let printed = verdict.lines.join("\n");
+        assert!(verdict.needs_human, "{printed}");
+        for needle in [
+            "3 upload session(s) fenced",
+            "4 upload session(s) NOT fenced",
+        ] {
+            assert!(verdict.lines[0].contains(needle), "{needle:?}: {printed}");
+        }
+        let paragraph = verdict
+            .lines
+            .iter()
+            .find(|l| l.contains("could NOT be fenced"));
+        let paragraph = paragraph.unwrap_or_else(|| panic!("no unfenced paragraph: {printed}"));
+        for needle in sessions.iter().map(|s| s.session.as_str()).chain([
+            "2 Completing",
+            "1 whose value will not decode",
+            "1 whose retirement key was already taken",
+            "action=session-unsettled",
+        ]) {
+            assert!(paragraph.contains(needle), "{needle:?}: {paragraph}");
+        }
+        assert!(
+            !paragraph.contains("last epoch"),
+            "only the causes that occur: {paragraph}"
+        );
+    }
+
+    /// The bound on naming unfenced sessions is [`named_records`]' own: of 21, the first 20 are
+    /// named and the last counted, while the total is the report's.
+    #[test]
+    fn restore_verdict_names_unfenced_sessions_and_counts_the_ones_it_cannot_fit() {
+        let sessions: Vec<UnsettledSession> = (0..=NAMED_UNREADABLE_RECORDS)
+            .map(|n| UnsettledSession {
+                session: format!("mpu:{n:032x}"),
+                cause: SessionUnsettled::Completing,
+            })
+            .collect();
+        let report = RestoreReport {
+            sessions_unsettled: sessions.clone(),
+            ..Default::default()
+        };
+        let printed = restore_verdict(&report).lines.join("\n");
+        let (named, last) = sessions.split_at(NAMED_UNREADABLE_RECORDS);
+        for session in named {
+            assert!(
+                printed.contains(&session.session),
+                "{}: {printed}",
+                session.session
+            );
+        }
+        assert!(
+            !printed.contains(&last[0].session),
+            "the bound must bind: {printed}"
+        );
+        for needle in [
+            "and 1 more (the audit log names every one)",
+            "21 upload session(s) the restored image holds could NOT be fenced",
+            "21 Completing",
+        ] {
+            assert!(printed.contains(needle), "{needle:?}: {printed}");
+        }
+    }
+
+    /// Issue #839: the summary counts staged skips, and an untrusted staged record is named on an
+    /// INFORMATIONAL line — the status stays `needs_human()`. The line claims only that the pass
+    /// marked none of those fragments: not that the staged bytes survived, and no cleanup (#659).
+    #[test]
+    fn restore_verdict_counts_staged_skips_and_names_untrusted_staged_records_as_information() {
+        let upload = "0123456789abcdef0123456789abcdef";
+        let records = vec![
+            format!("part:{upload}:000001"),
+            format!("sidx:{upload}:000002:9"),
+        ];
+        let report = RestoreReport {
+            staged_skipped: 5,
+            staged_untrusted: records.clone(),
+            ..Default::default()
+        };
+        let verdict = restore_verdict(&report);
+        let printed = verdict.lines.join("\n");
+
+        assert!(!verdict.needs_human, "{printed}");
+        assert!(!report.is_clean(), "{report:?}");
+        // Counted on the summary line, whose reading still FINISHED ("complete").
+        for needle in [
+            "post-restore reconciliation complete",
+            "5 kept for multipart uploads' staged records",
+            "2 staged multipart record(s) untrusted",
+        ] {
+            assert!(verdict.lines[0].contains(needle), "{needle:?}: {printed}");
+        }
+        let note = verdict
+            .lines
+            .iter()
+            .find(|line| line.contains("could not be TRUSTED"))
+            .unwrap_or_else(|| panic!("no line names the untrusted records: {printed}"));
+        for needle in records.iter().map(String::as_str).chain([
+            "marked none of their fragments",
+            "did not check that their staged bytes survived the restore",
+            "not a clean bill",
+            "does not change the exit status",
+            "action=untrusted-staged-record",
+        ]) {
+            assert!(note.contains(needle), "{needle:?}: {note}");
+        }
+        for never in [
+            "NEEDS-HUMAN",
+            "automatic",
+            "clean up",
+            "cleanup",
+            "will be removed",
+        ] {
+            assert!(
+                !note.to_lowercase().contains(&never.to_lowercase()),
+                "{never:?}: {note}"
+            );
+        }
+        // Kept fragments alone are protection, not a finding: no such line, and clean.
+        let kept_only = RestoreReport {
+            staged_skipped: 5,
+            ..Default::default()
+        };
+        let printed = restore_verdict(&kept_only).lines.join("\n");
+        assert!(!printed.contains("could not be TRUSTED"), "{printed}");
+        assert!(kept_only.is_clean(), "{kept_only:?}");
     }
 
     /// The bound on that naming, from both sides: up to [`NAMED_UNREADABLE_RECORDS`] blockers are

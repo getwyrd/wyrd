@@ -981,8 +981,9 @@ impl std::error::Error for ChunkMapError {}
 ///
 /// `Serialize` is `transparent`, so the stored form is the plain JSON string it always
 /// was — the type is a compile-time rule, not a wire change. There is deliberately no
-/// `Deserialize`: the only decode path is [`SegmentGroup`]'s, which routes through the
-/// validating constructor, so no derive can produce one of these unvalidated.
+/// `Deserialize`: each decode path — [`SegmentGroup`]'s, and the session record's
+/// `segment_nonce` (`multipart.rs`) — routes through the validating constructor, so no
+/// derive can produce one of these unvalidated.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct SegmentNonce(String);
@@ -1026,14 +1027,22 @@ pub struct SegmentGroup {
 }
 
 impl SegmentGroup {
-    /// The validating constructor — the **only** way to obtain a `SegmentGroup`, so a
-    /// nonce that could not key a reproducible `seg:` range is never representable
-    /// (ADR-0045, parse-don't-validate).
+    /// The validating constructor from a raw string — with [`SegmentGroup::from_nonce`], the
+    /// only way to obtain a `SegmentGroup`, so a nonce that could not key a reproducible
+    /// `seg:` range is never representable (ADR-0045, parse-don't-validate).
     pub fn new(nonce: impl Into<String>, epoch: u64) -> std::result::Result<Self, ChunkMapError> {
         Ok(Self {
             nonce: SegmentNonce::new(nonce)?,
             epoch,
         })
+    }
+
+    /// A group from a nonce that is **already** a [`SegmentNonce`] — infallible, because the
+    /// only way to hold one is [`SegmentNonce::new`], so the rule has run exactly once. For a
+    /// holder that names a group from a nonce it validated at its own decode (a `Completing`
+    /// session's attempt group, `multipart.rs`) and must not re-parse it.
+    pub fn from_nonce(nonce: SegmentNonce, epoch: u64) -> Self {
+        Self { nonce, epoch }
     }
 
     /// The group nonce (32 lowercase hex characters), validated — so it can be handed
