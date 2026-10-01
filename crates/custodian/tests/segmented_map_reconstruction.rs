@@ -1,8 +1,8 @@
 //! Issue #697 (child 3 of 3 of the #681 split, 0016 decision 7(e)): **the maintenance pass
 //! that restores redundancy reads every committed object through the resolver every other
 //! consumer already shares — ONCE per pass, not once per obligation — contains per object
-//! what it cannot read, and REFUSES, rather than aborts or silently drains, the repair it
-//! does not own.**
+//! what it cannot read, and never aborts or silently drains a repair inside a segmented
+//! object.** Leg 2 asserted #697's refusal; since #777 it asserts the repair lands.
 //!
 //! On the base one `seg:`-backed committed object (or one record that will not decode) made
 //! `reconstruction::reconcile` return `Err` for the WHOLE store, so a store holding one
@@ -74,14 +74,6 @@ impl MemMeta {
             self.inode_scans.load(Ordering::SeqCst),
             self.seg_pages.load(Ordering::SeqCst),
         )
-    }
-
-    /// Every committed record and every `seg:` row, byte for byte — what a refusal, which
-    /// writes nothing at all, must leave untouched.
-    fn records(&self) -> BTreeMap<Vec<u8>, Bytes> {
-        let kv = self.kv.lock().unwrap();
-        let rows = kv.iter().filter(|(k, _)| !k.starts_with(b"repair:"));
-        rows.map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 }
 
@@ -195,8 +187,8 @@ impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
     }
 }
 
-/// How many audit rows carried `action` — the accounting legs 2, 3 and 5 are stated over (one
-/// refusal per OBJECT, one name per damaged record).
+/// How many audit rows carried `action` — the accounting legs 3 and 5 are stated over (one name
+/// per damaged record).
 fn rows(logged: &str, action: &str) -> usize {
     logged.matches(&format!(r#""action":"{action}""#)).count()
 }
@@ -305,13 +297,7 @@ async fn seed(meta: &MemMeta, d0: &MemDServer, inode: InodeId, what: Seed<'_>) {
             return;
         }
         UnderReplicated { chunks } => {
-            for &chunk in chunks {
-                let data = vec![b'w'; CHUNK_LEN as usize];
-                let shards = erasure::encode(K.into(), M.into(), &data).expect("shards encode");
-                let frag = FragmentId { chunk, index: 0 };
-                let bytes = encode_ec_fragment(chunk, 0, K, M, &shards[0]);
-                d0.put_fragment(frag, bytes, None).await.unwrap();
-            }
+            survivors(d0, chunks).await;
             let refs: Vec<ChunkRef> = chunks.iter().copied().map(chunk_ref).collect();
             (ChunkMap::from(refs), chunks.len() as u64 * CHUNK_LEN)
         }
@@ -333,6 +319,18 @@ async fn seed(meta: &MemMeta, d0: &MemDServer, inode: InodeId, what: Seed<'_>) {
         matches!(what, SegmentHole),
         "fixture: exactly the seeded hole may fail to resolve"
     );
+}
+
+/// Store each chunk's fragment 0 on `d0` — real shards through the production encoder, so the
+/// verify passes. Fragment 1, on server 1, is the loss.
+async fn survivors(d0: &MemDServer, chunks: &[ChunkId]) {
+    for &chunk in chunks {
+        let data = vec![b'w'; CHUNK_LEN as usize];
+        let shards = erasure::encode(K.into(), M.into(), &data).expect("shards encode");
+        let frag = FragmentId { chunk, index: 0 };
+        let bytes = encode_ec_fragment(chunk, 0, K, M, &shards[0]);
+        d0.put_fragment(frag, bytes, None).await.unwrap();
+    }
 }
 
 /// Write the first `written` of `chunks.len()` `seg:` records and return the root map naming
@@ -481,52 +479,53 @@ async fn a_healthy_segmented_object_neither_ends_the_pass_nor_blocks_it() {
     );
 }
 
-// ---- leg 2: an obligation inside a `seg:` record is refused, not discarded ----
+// ---- leg 2: an obligation inside a `seg:` record is repaired, not discarded ----
 
-/// A chunk whose `ChunkRef` lives in a `seg:` record is **refused**: the segmented write path
-/// is #682's, so nothing is written, the obligation stays queued (it is the last record saying
-/// live data is under-replicated), and the pass does not certify. Two obligations inside ONE
-/// segmented object are ONE refusal — the accounting is per object.
+/// A chunk whose `ChunkRef` lives in a `seg:` record is **repaired** through the placement move
+/// (#777): each `seg:` record names its chunk's rebuilt fragment, both obligations drain, and the
+/// root — which holds no placement — is byte-identical. The two chunks sit in DIFFERENT segments
+/// of one object, and a segmented move pins only the root and its own record, so both land in
+/// ONE pass: neither loses a CAS to the other.
 #[tokio::test]
-async fn an_obligation_inside_a_segmented_object_is_refused_never_discarded() {
+async fn an_obligation_inside_a_segmented_object_is_repaired_never_discarded() {
     let (meta, d0, d2) = doubles();
     seed(&meta, &d0, 1, HEALTHY_SEGMENTED).await;
+    survivors(&d0, &SEG).await;
     enqueue(&meta, &SEG).await;
-    let before = meta.records();
+    let root_key = metadata::inode_key(1);
+    let root_before = meta.get(&root_key).await.unwrap();
 
     let (outcome, logged) = run(&meta, (&d0, &d2)).await;
 
     assert_eq!(
-        outcome.expect("a refusal is a refusal, not an abort of the whole pass"),
-        Reconciled::Blocked,
-        "a pass holding back a repair it may not perform must not certify: {logged}"
-    );
-    assert_eq!(
-        queued(&meta).await,
-        SEG.to_vec(),
-        "both obligations still queued: refused, never discarded for want of a writer"
-    );
-    assert_eq!(
-        meta.records(),
-        before,
-        "a refusal writes NOTHING: the `seg:` records and the root are byte-identical"
-    );
-    assert_eq!(
-        (
-            rows(&logged, "refused-segmented"),
-            ticks(&logged, "reconstruction_refused_records")
-        ),
-        (1, 1),
-        "ONE refusal row and ONE count per object, not one per chunk: {logged}"
+        outcome.expect("a segmented repair is not an abort of the whole pass"),
+        Reconciled::Changed,
+        "the repairs landed: {logged}"
     );
     assert!(
-        names(&logged, "inode:1"),
-        "the refusal names the object an operator has to act on: {logged}"
+        queued(&meta).await.is_empty(),
+        "both obligations were discharged by the repairs that landed"
+    );
+    let group = SegmentGroup::new(NONCE, EPOCH).unwrap();
+    for index in 0..SEG.len() as u32 {
+        let key = metadata::seg_key(&group, index).unwrap();
+        let record: SegmentRecord = metadata::decode(&meta.get(&key).await.unwrap().unwrap())
+            .expect("the repointed `seg:` record still decodes");
+        let placements: Vec<_> = record.chunks().iter().map(|c| &c.placement).collect();
+        assert_eq!(
+            placements,
+            vec![&vec![0, 2]],
+            "segment {index}'s own record names the rebuilt fragment's server: {logged}"
+        );
+    }
+    assert_eq!(
+        meta.get(&root_key).await.unwrap(),
+        root_before,
+        "a segmented move never rewrites the root"
     );
     assert!(
-        logged.contains(r#""gauge.reconstruction_under_replicated":0"#),
-        "a refused chunk is never repaired, so counting it on the repairable backlog would \
-         floor the day-one return-to-zero signal: {logged}"
+        logged.contains(r#""gauge.reconstruction_under_replicated":2"#),
+        "both chunks were counted on the repairable backlog: {logged}"
     );
 }
 

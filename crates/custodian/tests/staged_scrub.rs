@@ -427,7 +427,8 @@ fn part_no(n: u32) -> PartNumber {
 fn session(state_json: &str) -> Bytes {
     let bytes = format!(
         "{{\"parent\":{PARENT},\"object\":\"{OBJECT}\",\"created_at_millis\":100,\
-         \"clock_source\":\"wall\",\"epoch\":{EPOCH},\"attempts\":1,\"state\":{state_json}}}"
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":{EPOCH},\"attempts\":1,\"state\":{state_json}}}"
     )
     .into_bytes();
     let record = decode_session_record(&bytes)
