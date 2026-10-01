@@ -569,3 +569,30 @@ fn a_failed_write_or_flush_of_the_echo_exits_non_zero() {
     assert!(out.flushed, "the echo was never flushed");
     assert!(text(&out.written).contains("  --run-id = run-0017\n"));
 }
+
+/// An argument that is not UTF-8 — a legitimate filesystem path on Unix — is refused as a
+/// usage error with the usage text, never a panic (`std::env::args` would panic on it).
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_is_a_usage_error_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wyrd-validate"));
+    command
+        .arg("--out")
+        .arg(std::ffi::OsStr::from_bytes(b"/tmp/report-\xff.json"))
+        .env_clear()
+        .envs(wyrd_pair().iter().cloned());
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = command.output().expect("spawn wyrd-validate");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(EXIT_USAGE)),
+        "{stderr}"
+    );
+    assert!(stderr.contains("argument 2 is not valid UTF-8"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
