@@ -227,15 +227,14 @@ fn part_no(n: u32) -> PartNumber {
 
 /// An `Open` session record. EVERY session this file seeds is built here, and only here.
 ///
-/// No segment nonce, and deliberately no check through the session decoder: this base's codec
-/// refuses the nonce, and this pass never decodes a session value. The slice that first decodes
-/// one here adds the nonce to this helper; a decode check would instead refuse every nonce-less
-/// record once the nonce lands, and fail the file for a reason neither leg is about.
+/// It carries the segment nonce in the session codec's spelling (after `clock_source`): the
+/// post-restore session fence (#841) decodes a session's value, and one without the nonce does
+/// not decode.
 fn open_session() -> Bytes {
     Bytes::from(format!(
         "{{\"parent\":{PARENT},\"object\":\"{OBJECT}\",\"created_at_millis\":100,\
-         \"clock_source\":\"wall\",\"epoch\":{EPOCH},\"attempts\":1,\
-         \"state\":{{\"kind\":\"Open\"}}}}"
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":{EPOCH},\"attempts\":1,\"state\":{{\"kind\":\"Open\"}}}}"
     ))
 }
 
