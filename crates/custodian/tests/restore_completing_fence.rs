@@ -584,7 +584,8 @@ async fn what_cannot_be_fenced_cleanly_is_never_passed_off_as_done() {
 /// **(K)** Over H(ii), H(iv) (both pages), H(v), a clean `Completing`, an `Open`, and `Aborting@4`
 /// sessions whose `retire:records:s:<id>:3` owes another group (`fa`), will not decode (`fb`),
 /// owes only parts (`fc`), owes its own group AND parts (`f1`, X104) or is absent (`fd`), a second
-/// pass writes nothing and names again each session (and record) the first named. With those
+/// pass writes nothing but its own generation record (#810) and names again each session (and
+/// record) the first named. With those
 /// obligations dropped, a third names all five at their first `seg:` record. Each naming is one
 /// audit event, its fault in words. `fe` (`Aborting@4`, no obligation, no segment) is never named.
 #[tokio::test]
@@ -641,7 +642,13 @@ async fn a_second_pass_is_idempotent_and_still_names_what_needs_a_human() {
     assert_open_fenced(&meta, &control, &first);
     let fenced = (first.sessions_fenced, second.sessions_fenced);
     assert_eq!(fenced, (6, 0), "{first:?}\n{second:?}");
-    assert!(meta.snapshot() == after_first, "the second pass wrote");
+    // Every pass rewrites its own restore-fence generation record (#810); outside it, nothing.
+    let outside_generation = |mut kv: BTreeMap<Vec<u8>, Bytes>| {
+        kv.remove(mp::MPUFENCE_KEY);
+        kv
+    };
+    let unchanged = outside_generation(meta.snapshot()) == outside_generation(after_first);
+    assert!(unchanged, "the second pass wrote");
     for (id, record) in cases.iter().chain(&aborted) {
         for key in [&mp::mpu_key(id), record] {
             let both = names(&first, key) && names(&second, key);

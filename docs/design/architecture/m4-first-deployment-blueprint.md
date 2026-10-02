@@ -644,6 +644,14 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #    re-run it — a second run fences nothing twice. Serve no multipart uploads until a run has
 #    fenced every upload.
 #
+#    Each run then says whether it completed its RESTORE-FENCE GENERATION (the mpufence record,
+#    numbered per run): "restore-fence generation N COMPLETE" only when every upload is fenced
+#    or settled and none is left for a human (the NOT FENCED and SEGMENTS bills hold it back;
+#    the other bills do not), "NOT complete" otherwise — repair, re-run, until a run says
+#    COMPLETE. Nothing reads that record yet (#508), and step 5 brought back whatever generation
+#    record the backup held, possibly an old "complete" — so what keeps multipart safe is THIS
+#    ORDER: re-enable no gateway (step 8) until a run of this step has said COMPLETE.
+#
 #    The summary also counts the fragments the pass kept because a multipart upload's own
 #    staged records name them — an upload's bytes, not strays, so never marked. A staged record
 #    the pass could read but not TRUST about where its chunk's fragments are (a placement of

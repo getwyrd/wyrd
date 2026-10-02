@@ -26,6 +26,7 @@ use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_chunkstore_grpc::{FanoutChunkStore, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
+use wyrd_core::multipart::FenceGeneration;
 use wyrd_core::{read, write};
 use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone};
 use wyrd_metadata_redb::RedbMetadataStore;
@@ -1238,8 +1239,9 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
 /// What the post-restore one-shot tells the operator: every line it prints, and whether the run
 /// **needs a human** — which is also the command's exit status.
 struct RestoreVerdict {
-    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding,
-    /// then an informational line that does not set the status (untrusted staged records).
+    /// The lines to print, in order: the summary, the restore-fence generation, then one
+    /// NEEDS-HUMAN paragraph per finding, then an informational line that does not set the
+    /// status (untrusted staged records).
     lines: Vec<String>,
     /// Exit non-zero. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green.
     needs_human: bool,
@@ -1265,6 +1267,7 @@ struct RestoreVerdict {
 ///
 /// An untrusted staged record is named WITHOUT that status, on an informational line: the
 /// report's predicate leaves it out on a recorded decision ([`RestoreReport::needs_human`]).
+/// So is whether the run completed its restore-fence generation ([`fence_generation_line`]).
 fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
     let mut lines = vec![format!(
         "wyrd custodian: post-restore reconciliation {} — {} stranded fragment(s) marked \
@@ -1303,6 +1306,13 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         report.sessions_unsettled.len(),
         report.segments_unaccounted.len(),
     )];
+    // Whether this run's restore-fence generation completed (#810) — information beside the
+    // findings, never a status of its own: the pass leaves it not complete only over a session
+    // finding, whose NEEDS-HUMAN paragraph below already sets the status
+    // (`RestoreReport::sessions_settled`).
+    if let Some(generation) = report.fence_generation {
+        lines.push(fence_generation_line(generation));
+    }
     if !report.pending_unreadable.is_empty() {
         lines.push(format!(
             // Named for the same reason `unresolvable` is named below: the operator's next move
@@ -1438,6 +1448,33 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         // "healthy".
         needs_human: report.needs_human(),
         lines,
+    }
+}
+
+/// The line that says whether this run completed its restore-fence generation, and what the
+/// operator may do on each answer.
+///
+/// "COMPLETE" licenses multipart only in the runbook's order: no gateway reads the record yet
+/// (#508), and a restore brings back whatever generation record its image held, a `complete`
+/// included, so the line says that the guarantee is this run having come before the gateways.
+fn fence_generation_line(generation: FenceGeneration) -> String {
+    let at = generation.generation();
+    if generation.is_complete() {
+        format!(
+            "wyrd custodian: restore-fence generation {at} COMPLETE — no upload session the \
+             restored image holds can be completed any more, and none is left for a human. \
+             Multipart uploads may be served once this run is done and the writers are resumed: \
+             no gateway checks this record yet, and a record restored with an older image reads \
+             complete too, so what keeps multipart off until then is running this pass BEFORE \
+             re-enabling any gateway."
+        )
+    } else {
+        format!(
+            "wyrd custodian: restore-fence generation {at} NOT complete — an upload session \
+             needs a human (named below). Keep multipart uploads off this store: repair what is \
+             named, then re-run this pass; the generation completes on the first run that finds \
+             no such session."
+        )
     }
 }
 
@@ -3361,6 +3398,119 @@ mod tests {
             !paragraph.contains("last epoch"),
             "only the causes that occur: {paragraph}"
         );
+    }
+
+    /// Issue #810: the operator reads whether the run completed its restore-fence generation, by
+    /// number — complete beside a finding that is not a session's (a dangling chunk), not
+    /// complete beside a session that needs a human — and the line moves no exit status: the
+    /// status stays the report's own predicate. A report no pass returned prints no such line.
+    #[test]
+    fn restore_verdict_says_whether_the_fence_generation_completed() {
+        let first = FenceGeneration::next(None).expect("generation 1");
+        let second = FenceGeneration::next(Some(&first)).expect("generation 2");
+        let complete = RestoreReport {
+            dangling: vec![1],
+            sessions_fenced: 1,
+            fence_generation: Some(second.completed()),
+            ..Default::default()
+        };
+        let open = RestoreReport {
+            sessions_unsettled: vec![UnsettledSession {
+                session: "mpu:0123456789abcdef0123456789abcdef".to_owned(),
+                cause: SessionUnsettled::ChangedUnderPass,
+            }],
+            fence_generation: Some(second),
+            ..Default::default()
+        };
+        let clean = RestoreReport {
+            fence_generation: Some(first.completed()),
+            ..Default::default()
+        };
+        for (report, line, human) in [
+            (&complete, "restore-fence generation 2 COMPLETE", true),
+            (&open, "restore-fence generation 2 NOT complete", true),
+            (&clean, "restore-fence generation 1 COMPLETE", false),
+        ] {
+            let verdict = restore_verdict(report);
+            let printed = verdict.lines.join("\n");
+            assert!(printed.contains(line), "{line:?}: {printed}");
+            let other = if line.ends_with("COMPLETE") {
+                "NOT complete"
+            } else {
+                "COMPLETE"
+            };
+            assert!(!printed.contains(other), "{other:?}: {printed}");
+            assert_eq!((verdict.needs_human, report.needs_human()), (human, human));
+        }
+        let complete = restore_verdict(&complete).lines.join("\n");
+        assert!(
+            complete.contains("BEFORE re-enabling any gateway"),
+            "{complete}"
+        );
+        let none = restore_verdict(&RestoreReport::default()).lines.join("\n");
+        assert!(!none.contains("restore-fence generation"), "{none}");
+    }
+
+    /// Issue #810: what the operator reads about the restore-fence generation is what the pass
+    /// left in the store, not a report built by hand. Two runs of the one-shot's own backend
+    /// dispatch ([`run_restore_reconcile_over_backend`]) over one real redb store: the first,
+    /// over an `Open` session, leaves generation 1 complete; the second, over an `mpu:` key that
+    /// names no upload, leaves generation 2 NOT complete. Each time the report carries the record
+    /// the store holds, and the verdict prints that generation and not its opposite.
+    #[tokio::test]
+    async fn restore_verdict_prints_the_generation_the_pass_left_in_the_store() {
+        use wyrd_core::multipart::{decode_fence_generation, decode_session_record, MPUFENCE_KEY};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().to_str().expect("utf-8 path");
+        let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).expect("telemetry");
+        let service = CustodianService::new(telemetry);
+        let session = "{\"parent\":42,\"object\":\"o\",\"created_at_millis\":100,\
+                       \"clock_source\":\"wall\",\"segment_nonce\":\
+                       \"0123456789abcdef0123456789abcdef\",\"epoch\":3,\"attempts\":1,\
+                       \"state\":{\"kind\":\"Open\"}}"
+            .as_bytes();
+        decode_session_record(session).expect("a session the fence can fence");
+        let runs = [
+            (format!("mpu:{}", "a1".repeat(16)), (1, true), false),
+            ("mpu:not-an-upload".to_owned(), (2, false), true),
+        ];
+        for (key, (generation, complete), human) in runs {
+            let meta = open_local_meta_redb(data_dir).expect("redb");
+            let seeded = WriteBatch::new().put(key.into_bytes(), session.to_vec());
+            let outcome = meta.commit(seeded).await.expect("seeded");
+            assert_eq!(outcome, CommitOutcome::Committed);
+            drop(meta);
+
+            let report = run_restore_reconcile_over_backend(
+                MetadataBackend::Redb,
+                data_dir,
+                &service,
+                &[],
+                RESTORE_GRACE_WINDOW_MILLIS,
+                10_000,
+            )
+            .await
+            .expect("the pass runs");
+
+            let meta = open_local_meta_redb(data_dir).expect("redb");
+            let stored = meta.get(MPUFENCE_KEY).await.expect("read");
+            let stored = decode_fence_generation(&stored.expect("the pass wrote its generation"));
+            let stored = stored.expect("the record decodes");
+            assert_eq!(
+                (stored.generation(), stored.is_complete()),
+                (generation, complete)
+            );
+            assert_eq!(report.fence_generation, Some(stored), "{report:?}");
+            let verdict = restore_verdict(&report);
+            let printed = verdict.lines.join("\n");
+            let says = |complete: bool| {
+                let state = if complete { "COMPLETE" } else { "NOT complete" };
+                format!("restore-fence generation {generation} {state}")
+            };
+            assert!(printed.contains(&says(complete)), "{printed}");
+            assert!(!printed.contains(&says(!complete)), "{printed}");
+            assert_eq!(verdict.needs_human, human, "{printed}");
+        }
     }
 
     /// The bound on naming unfenced sessions is [`named_records`]' own: of 21, the first 20 are

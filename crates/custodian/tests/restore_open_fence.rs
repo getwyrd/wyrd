@@ -5,7 +5,8 @@
 //!
 //! Legs: **F** fenced whole; **F-atomic** all or nothing; **F-race** never fenced blind;
 //! **F-collision** never over an obligation; **H** what cannot be fenced is named; **K** a second
-//! pass is idempotent; **P3** a fence fault hides no verdict; **Paging**.
+//! pass is idempotent; **P3** a fence fault hides no verdict; **G** the report and the summary
+//! carry the restore-fence generation the pass wrote (#810); **Paging**.
 //!
 //! Every leg drives the production `reconcile_after_restore` over the doubles in this file. Every
 //! session is seeded as raw JSON in the codec's own spelling (`segment_nonce` included) and
@@ -29,8 +30,9 @@ use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 use wyrd_core::metadata::{self, inode_key, orphan_key, ChunkRef, EcScheme, InodeRecord};
 use wyrd_core::multipart::{
-    decode_retire_obligation, decode_session_record, mpu_key, part_key, retire_key,
-    retire_session_range, PartNumber, PartScope, RetireMode, RetireToken, UploadId, MPU_PREFIX,
+    decode_fence_generation, decode_retire_obligation, decode_session_record, mpu_key, part_key,
+    retire_key, retire_session_range, FenceGeneration, PartNumber, PartScope, RetireMode,
+    RetireToken, UploadId, MPUFENCE_KEY, MPU_PREFIX,
 };
 use wyrd_custodian::{reconcile_after_restore, ExpiredPendingPolicy, GcContext, RestoreReport};
 use wyrd_traits::{
@@ -721,9 +723,9 @@ async fn what_the_pass_cannot_fence_is_named_never_passed_off_as_done() {
 // ---- (K) a second pass is idempotent ------------------------------------------------------------
 
 /// **(K)** Over leg H's store, an `Aborting` session and an untrusted part on the fenced session:
-/// a second pass leaves the WHOLE store byte-identical — no second obligation, no mark re-stamped
-/// — and names the same sessions and the same untrusted record again (#664 iteration 1 dropped an
-/// already-`Aborting` session's findings).
+/// a second pass leaves the WHOLE store byte-identical but for its own generation record (#810) —
+/// no second obligation, no mark re-stamped — and names the same sessions and the same untrusted
+/// record again (#664 iteration 1 dropped an already-`Aborting` session's findings).
 ///
 /// Base: the first pass fences and names nothing.
 #[tokio::test]
@@ -744,15 +746,26 @@ async fn a_second_pass_is_idempotent() {
         fenced_count(&first, 1) && fenced_count(&second, 0),
         "{first:?}\n{second:?}"
     );
+    // Every pass rewrites its own restore-fence generation record (#810); outside it, nothing.
+    let outside_generation = |mut kv: BTreeMap<Vec<u8>, Bytes>| {
+        kv.remove(MPUFENCE_KEY);
+        kv
+    };
     assert!(
-        meta.snapshot() == after_first,
+        outside_generation(meta.snapshot()) == outside_generation(after_first),
         "the second pass changed the store"
     );
     for id in [&i, &ii, &iii] {
         let named = names_unsettled(&first, id) && names_unsettled(&second, id);
         assert!(named, "{}: {first:?}\n{second:?}", name(&mpu_key(id)));
     }
-    assert_eq!(unsettled_debug(&first), unsettled_debug(&second));
+    // The same sessions, for the same causes: every field the report's `Debug` held past
+    // `sessions_unsettled` before #810, compared field to field, because that `Debug` now ends
+    // with the pass's own generation, one higher each pass.
+    assert_eq!(
+        (&first.sessions_unsettled, &first.segments_unaccounted),
+        (&second.sessions_unsettled, &second.segments_unaccounted)
+    );
     let untrusted = vec![name(&part_key(&control, PartNumber::new(1).unwrap()))];
     assert_eq!(
         (&first.staged_untrusted, &second.staged_untrusted),
@@ -804,6 +817,11 @@ async fn a_fence_fault_never_hides_the_pass_verdicts() {
             && !message.contains("reconciliation complete"),
         "{message}"
     );
+    // ...and says which part was cut short (#810 gave the cut a second spelling).
+    assert!(
+        message.contains("the session fence did not finish"),
+        "{message}"
+    );
     assert_eq!(meta.value(&mpu_key(&id)), Some(open(EPOCH)));
     assert!(retire_keys_of(&meta, &id).is_empty());
 }
@@ -829,6 +847,90 @@ async fn a_fence_fault_on_an_otherwise_clean_store_is_never_certified_clean() {
     };
     let verdict = (&*summary["clean"], &*summary["needs_human"]);
     assert_eq!(verdict, ("false", "true"), "{summary:?}");
+}
+
+// ---- (G) the report and the summary carry the generation the pass wrote (#810) -----------------
+
+/// The restore-fence generation record the pass left in `meta`, decoded.
+fn stored_generation(meta: &Meta) -> FenceGeneration {
+    let bytes = meta
+        .value(MPUFENCE_KEY)
+        .expect("the pass wrote its generation");
+    decode_fence_generation(&bytes).expect("the record decodes")
+}
+
+/// **(G)** The operator command prints the report's `fence_generation`, so it must be the record
+/// the pass wrote: generation 1 complete over an `Open` session fenced cleanly, and generation 1
+/// NOT complete over leg H's sessions, which need a human. The audit summary carries the same
+/// generation and whether it completed.
+#[tokio::test]
+async fn the_report_carries_the_generation_the_pass_wrote() {
+    capture_audit();
+    let (meta, d) = (Meta::new(), <[Disk; 4]>::default());
+    meta.seed(mpu_key(&upload("a1")), open(EPOCH));
+    let settled = restore_pass(&meta, &d).await.expect("the pass runs");
+    let (held, held_d) = (Meta::new(), <[Disk; 4]>::default());
+    seed_unfenceable(&held, &held_d, 'b');
+    let human = restore_pass(&held, &held_d)
+        .await
+        .expect("named, never an Err");
+
+    let (complete, open) = (stored_generation(&meta), stored_generation(&held));
+    assert_eq!((complete.generation(), complete.is_complete()), (1, true));
+    assert_eq!((open.generation(), open.is_complete()), (1, false));
+    assert_eq!(settled.fence_generation, Some(complete), "{settled:?}");
+    assert_eq!(human.fence_generation, Some(open), "{human:?}");
+    let summaries = audited("summary");
+    let summaries: Vec<(&str, &str)> = summaries
+        .iter()
+        .map(|line| {
+            (
+                &*line["fence_generation"],
+                &*line["fence_generation_complete"],
+            )
+        })
+        .collect();
+    assert_eq!(summaries, [("1", "true"), ("1", "false")]);
+}
+
+/// **(G)** A newer pass opens generation 2 while this one is fencing, so this pass's completion,
+/// which requires its own not-complete record, conflicts. The pass is `Err`, the record stays the
+/// newer pass's, and the summary still lands: it says the fence finished and the generation's
+/// completion did not land — never "complete", never "clean".
+#[tokio::test]
+async fn a_completion_that_does_not_land_says_so_in_the_summary() {
+    capture_audit();
+    let (meta, d) = (Meta::new(), <[Disk; 4]>::default());
+    let id = upload("a2");
+    meta.seed(mpu_key(&id), open(EPOCH));
+    let newer = Bytes::from_static(br#"{"generation":2,"complete":false}"#);
+    let newer_pass = WriteBatch::new().put(MPUFENCE_KEY, newer.clone());
+    meta.before_commit_putting(&mpu_key(&id), newer_pass);
+
+    let outcome = restore_pass(&meta, &d).await;
+
+    assert!(outcome.is_err(), "{:?}", outcome.ok());
+    assert_eq!(meta.value(MPUFENCE_KEY), Some(newer));
+    assert_fenced(&meta, &id, EPOCH, &RestoreReport::default());
+    let summaries = audited("summary");
+    let [summary] = summaries.as_slice() else {
+        panic!("one summary must survive the failed completion: {summaries:?}");
+    };
+    let message = &summary["message"];
+    assert!(
+        message.contains("completion write did not land")
+            && !message.contains("the session fence did not finish"),
+        "{message}"
+    );
+    let fields = [
+        "fence_finished",
+        "fence_generation",
+        "fence_generation_complete",
+        "clean",
+        "needs_human",
+    ];
+    let read = fields.map(|field| &*summary[field]);
+    assert_eq!(read, ["true", "1", "false", "false", "true"], "{summary:?}");
 }
 
 // ---- (Paging) sessions across several pages are all fenced --------------------------------------
