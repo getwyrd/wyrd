@@ -1,6 +1,8 @@
-//! Repo-hygiene guards (#616): two invariants that review kept re-finding or
-//! that would be expensive to discover late, made mechanical in the ADR-0016
-//! single-source style (alongside `run_statics` and `deploy_guard`).
+//! Repo-hygiene guards (#616, #775): three invariants that review kept
+//! re-finding or that would be expensive to discover late, made mechanical in
+//! the ADR-0016 single-source style (alongside `run_statics` and
+//! `deploy_guard`). [`CI_GUARDS`] is the list `cargo xtask ci` runs them from,
+//! kept here in the lib target as data so the gate's wiring is testable.
 //!
 //! **(1) No stray gitlinks.** Four PRs (#594, #595, #597, #600) accidentally
 //! committed `.claude/worktrees/*` gitlink entries — mode-160000 index records
@@ -28,8 +30,23 @@
 //! drift this gate exists to stop. Target discovery comes from `cargo
 //! metadata` ([`target_src_paths`]) so no manifest override or unconventional
 //! layout can hide a root from the scan; [`scan_roots`] then checks each one.
+//!
+//! **(3) The blackbox validator links no Wyrd crate** (#775, proposal 0017
+//! §9). `wyrd-validate` judges a Wyrd deployment from the outside; the moment
+//! its binary links a `wyrd-*` crate it checks Wyrd's types against Wyrd's own
+//! types and its verdict is self-referential. [`scan_blackbox_closure`] walks
+//! the package's NORMAL dependency closure in the `--all-features` resolve
+//! graph — transitively, optional feature-gated edges included — and,
+//! separately, its declared normal dependencies. Dev-dependencies are
+//! deliberately unconstrained: the proposal's §14 test fixtures are dev-only.
+//! The input comes from `cargo metadata` ([`blackbox_metadata`]), the same
+//! discovery route as (2).
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
+use std::process::Command;
+
+use serde_json::Value;
 
 /// Normalize source for the preamble walk: strip `//` line comments and
 /// (nesting-aware) `/* */` block comments — so an attribute commented OUT,
@@ -552,4 +569,309 @@ pub fn scan_roots(
         }
     }
     Ok(violations)
+}
+
+/// One repo-hygiene guard `cargo xtask ci` runs before its cargo steps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiGuard {
+    /// (1) No stray gitlinks or tracked agent worktrees (#616).
+    Gitlink,
+    /// (2) `#![forbid(unsafe_code)]` in every crate root (#616).
+    UnsafeForbid,
+    /// (3) The blackbox validator's normal dependency closure holds no Wyrd
+    /// crate (#775).
+    BlackboxClosure,
+}
+
+/// The guards `cargo xtask ci` runs, in order, before any cargo step.
+///
+/// Data in the lib target rather than a sequence of calls in `main.rs`'s
+/// `run_ci`, for the same reason [`crate::feature_gated_checks`] lives here: a
+/// guard that is defined and tested but never called would pass every test of
+/// the guard itself. `main.rs`'s `run_ci_steps` iterates this list, so its
+/// recording-executor unit tests and `cargo xtask ci-dry-run` (which
+/// `xtask/tests/blackbox_dependency_guard.rs` drives over planted workspaces)
+/// see exactly the guards the gate runs.
+pub const CI_GUARDS: &[CiGuard] = &[
+    CiGuard::Gitlink,
+    CiGuard::UnsafeForbid,
+    CiGuard::BlackboxClosure,
+];
+
+/// The package whose normal dependency closure must hold no Wyrd crate
+/// (proposal 0017 §9).
+pub const BLACKBOX_PACKAGE: &str = "wyrd-validate";
+
+/// The package-name prefix every Wyrd workspace crate carries.
+pub const WYRD_CRATE_PREFIX: &str = "wyrd-";
+
+/// The `cargo` arguments [`blackbox_metadata`] runs.
+///
+/// NOT `--no-deps` (the unsafe guard's form): that omits the `resolve` graph
+/// this guard walks. `--locked`, so the audit can never rewrite the
+/// `Cargo.lock` it audits — a stale or missing lock file is an error instead.
+/// `--all-features`, because the resolve graph depends on the feature
+/// selection: an optional dependency behind an off-by-default feature (the
+/// `crates/metadata-tikv/Cargo.toml` pattern) is absent from a default-feature
+/// graph. Resolving is all it does — nothing is compiled, so it needs neither
+/// the TiKV nor the FoundationDB toolchain.
+pub const BLACKBOX_METADATA_ARGS: &[&str] = &[
+    "metadata",
+    "--format-version",
+    "1",
+    "--locked",
+    "--all-features",
+];
+
+/// Run `cargo` with [`BLACKBOX_METADATA_ARGS`] in the workspace at `dir` and
+/// return the JSON document it prints — the input [`scan_blackbox_closure`]
+/// reads.
+pub fn blackbox_metadata(dir: &Path) -> Result<String, String> {
+    let meta = Command::new("cargo")
+        .args(BLACKBOX_METADATA_ARGS)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("blackbox-guard: failed to spawn cargo metadata: {e}"))?;
+    if !meta.status.success() {
+        return Err(format!(
+            "blackbox-guard: `cargo {}` failed with {}:\n{}",
+            BLACKBOX_METADATA_ARGS.join(" "),
+            meta.status,
+            String::from_utf8_lossy(&meta.stderr)
+        ));
+    }
+    String::from_utf8(meta.stdout)
+        .map_err(|e| format!("blackbox-guard: cargo metadata output is not UTF-8: {e}"))
+}
+
+/// Is a dependency `kind` from `cargo metadata` a NORMAL one? `null` is
+/// normal; `"dev"` and `"build"` are not (neither links into the shipped
+/// binary). A missing field or any other value is an error: the guard does
+/// not guess whether a dependency it cannot classify links into the binary.
+fn is_normal_kind(kind: Option<&Value>, what: &str) -> Result<bool, String> {
+    match kind {
+        Some(Value::Null) => Ok(true),
+        Some(Value::String(k)) if k == "dev" || k == "build" => Ok(false),
+        Some(other) => Err(format!(
+            "blackbox-guard: {what} has unknown dependency kind {other} — refusing to guess \
+             whether it links into the binary"
+        )),
+        None => Err(format!(
+            "blackbox-guard: {what} has no `kind` field — refusing to guess whether it links \
+             into the binary"
+        )),
+    }
+}
+
+/// Is a resolve-graph edge (`resolve.nodes[].deps[]`) a NORMAL one? An edge
+/// carries one `dep_kinds` entry per way the dependency is declared (normal,
+/// dev, build — each per target), so it is normal when ANY entry is.
+///
+/// Fails closed: a missing or EMPTY `dep_kinds` list says nothing about how
+/// the dependency links, and skipping the edge would hide everything below
+/// it, so both are `Err`. Every entry is classified — not just up to the
+/// first normal one — so an unknown kind anywhere in the list is `Err` too.
+fn edge_is_normal(edge: &Value, what: &str) -> Result<bool, String> {
+    let kinds = edge
+        .get("dep_kinds")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "blackbox-guard: {what} has no `dep_kinds` list (cargo too old?) — cannot \
+                 tell normal from dev edges"
+            )
+        })?;
+    if kinds.is_empty() {
+        return Err(format!(
+            "blackbox-guard: {what} has an empty `dep_kinds` list — refusing to guess whether \
+             it links into the binary"
+        ));
+    }
+    let mut normal = false;
+    for kind in kinds {
+        if is_normal_kind(kind.get("kind"), what)? {
+            normal = true;
+        }
+    }
+    Ok(normal)
+}
+
+/// What the blackbox scan found about one offending crate. Both checks can
+/// fire for the same crate (a direct normal dependency is both declared and
+/// in the graph); they are merged so each crate is reported once, saying
+/// which checks fired.
+#[derive(Default)]
+struct BlackboxFinding<'a> {
+    /// Declared as a normal dependency in the manifest; `true` when optional.
+    declared_optional: Option<bool>,
+    /// A shortest normal-edge path from [`BLACKBOX_PACKAGE`] to the crate.
+    path: Option<Vec<&'a str>>,
+}
+
+/// Scan a `cargo metadata` document (produced with [`BLACKBOX_METADATA_ARGS`])
+/// for Wyrd crates that [`BLACKBOX_PACKAGE`] could link, returning one
+/// violation per offending crate (empty ⇒ clean). Pure text in, violations
+/// out: the SAME function `cargo xtask ci` runs over the real workspace is the
+/// one `cargo xtask blackbox-guard --metadata <file>` runs over a planted
+/// document.
+///
+/// Two checks, reported as one invariant:
+///
+/// * **the graph** — follow only normal edges of `resolve.nodes`, transitively
+///   from the blackbox package, and report every reached package whose name
+///   starts with [`WYRD_CRATE_PREFIX`], with the path that reaches it;
+/// * **the manifest** — the package's declared `dependencies`, which do not
+///   depend on the feature selection: any normal `wyrd-*` entry, optional or
+///   not. This still catches a declaration if some feature-resolution
+///   subtlety keeps it out of the graph.
+///
+/// Fails CLOSED, like [`scan_roots`], refusing to pass a closure it cannot
+/// see: a document it cannot parse, no `resolve` graph, no blackbox package
+/// (or more than one), a package that is in no resolve node, a package record
+/// with no decodable `id` or `name`, and an edge or declaration whose kind it
+/// cannot classify are all `Err`, never a clean pass. Package names come from
+/// the package records, never from parsing an id or an edge's extern name:
+/// an id is opaque and an edge name follows a rename, so reading the name
+/// from either could let the prefix check miss.
+pub fn scan_blackbox_closure(metadata_json: &str) -> Result<Vec<String>, String> {
+    let meta: Value = serde_json::from_str(metadata_json)
+        .map_err(|e| format!("blackbox-guard: cannot parse cargo metadata: {e}"))?;
+    let packages = meta
+        .get("packages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "blackbox-guard: cargo metadata has no `packages` array".to_string())?;
+
+    // Every package record's identity, decoded strictly up front.
+    let mut name_of: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut subject = None;
+    for package in packages {
+        let id = package
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "blackbox-guard: a package record has no decodable `id`".to_string())?;
+        let name = package.get("name").and_then(Value::as_str).ok_or_else(|| {
+            format!("blackbox-guard: package record `{id}` has no decodable `name`")
+        })?;
+        name_of.insert(id, name);
+        if name == BLACKBOX_PACKAGE {
+            if subject.is_some() {
+                return Err(format!(
+                    "blackbox-guard: cargo metadata has more than one `{BLACKBOX_PACKAGE}` \
+                     package — cannot tell which one ships"
+                ));
+            }
+            subject = Some((id, package));
+        }
+    }
+    let Some((subject_id, subject)) = subject else {
+        return Err(format!(
+            "blackbox-guard: cargo metadata has no `{BLACKBOX_PACKAGE}` package — refusing to \
+             pass a guard whose subject it cannot see (is `crates/validate` still a \
+             [workspace] member?)"
+        ));
+    };
+
+    let mut findings: BTreeMap<&str, BlackboxFinding> = BTreeMap::new();
+
+    // (a) The manifest: declared normal dependencies, optional ones included.
+    let declared = subject
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!("blackbox-guard: `{BLACKBOX_PACKAGE}` has no `dependencies` list")
+        })?;
+    for dep in declared {
+        // `name` is the PACKAGE name; a rename lives in its own `rename` field.
+        let name = dep.get("name").and_then(Value::as_str).ok_or_else(|| {
+            format!("blackbox-guard: a declared dependency of `{BLACKBOX_PACKAGE}` has no `name`")
+        })?;
+        let what = format!("declared dependency `{name}` of `{BLACKBOX_PACKAGE}`");
+        if is_normal_kind(dep.get("kind"), &what)? && name.starts_with(WYRD_CRATE_PREFIX) {
+            // Wording only: an optional declaration is a violation all the same.
+            let optional = dep.get("optional") == Some(&Value::Bool(true));
+            findings.entry(name).or_default().declared_optional = Some(optional);
+        }
+    }
+
+    // (b) The graph: normal edges only, transitively. Breadth-first, so the
+    // reported path is a shortest one.
+    let nodes = meta
+        .get("resolve")
+        .and_then(|r| r.get("nodes"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "blackbox-guard: cargo metadata has no `resolve.nodes` graph (was it run with \
+             --no-deps?)"
+                .to_string()
+        })?;
+    let mut node_of: BTreeMap<&str, &Value> = BTreeMap::new();
+    for node in nodes {
+        let id = node
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "blackbox-guard: a resolve node has no decodable `id`".to_string())?;
+        node_of.insert(id, node);
+    }
+    if !node_of.contains_key(subject_id) {
+        return Err(format!(
+            "blackbox-guard: `{BLACKBOX_PACKAGE}` appears in no resolve node — refusing to \
+             pass a closure it cannot see"
+        ));
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::from([subject_id]);
+    let mut queue: VecDeque<(&str, Vec<&str>)> =
+        VecDeque::from([(subject_id, vec![BLACKBOX_PACKAGE])]);
+    while let Some((id, path)) = queue.pop_front() {
+        let node = node_of.get(id).ok_or_else(|| {
+            format!("blackbox-guard: package `{id}` is reached but appears in no resolve node")
+        })?;
+        let deps = node
+            .get("deps")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("blackbox-guard: resolve node `{id}` has no `deps` list"))?;
+        for dep in deps {
+            let pkg = dep.get("pkg").and_then(Value::as_str).ok_or_else(|| {
+                format!("blackbox-guard: an edge of resolve node `{id}` has no `pkg`")
+            })?;
+            // Classify before the `seen` check, so every edge of every reached
+            // node is classified; and only a NORMAL edge marks its target seen,
+            // so a crate first met through a dev edge is still walked when a
+            // normal path reaches it.
+            if !edge_is_normal(dep, &format!("edge `{id}` -> `{pkg}`"))? || !seen.insert(pkg) {
+                continue;
+            }
+            let name = *name_of.get(pkg).ok_or_else(|| {
+                format!("blackbox-guard: edge `{id}` -> `{pkg}` reaches a package with no record")
+            })?;
+            let mut next = path.clone();
+            next.push(name);
+            if name.starts_with(WYRD_CRATE_PREFIX) {
+                findings.entry(name).or_default().path = Some(next.clone());
+            }
+            queue.push_back((pkg, next));
+        }
+    }
+
+    Ok(findings
+        .into_iter()
+        .map(|(name, finding)| {
+            let mut how = Vec::new();
+            if let Some(optional) = finding.declared_optional {
+                how.push(format!(
+                    "declared as a normal{} dependency in its manifest",
+                    if optional { " optional" } else { "" }
+                ));
+            }
+            if let Some(path) = finding.path {
+                how.push(format!(
+                    "reached through the normal dependency graph (all features): {}",
+                    path.join(" -> ")
+                ));
+            }
+            format!(
+                "{BLACKBOX_PACKAGE} must not link Wyrd crate `{name}`: {}",
+                how.join("; ")
+            )
+        })
+        .collect())
 }

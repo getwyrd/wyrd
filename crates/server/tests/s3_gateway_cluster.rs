@@ -155,6 +155,9 @@ async fn s3_gateway_composed_over_cluster_backends_lands_fragments_on_dservers()
             CoordinationBackend::Mem,
             &serve_data_dir,
             Some(&serve_endpoints),
+            // No `--chunk-size`: the gateway's own 1 MiB default, as `cmd_s3` composes it
+            // when the flag is absent.
+            None,
             credentials,
             REGION.to_string(),
             listener,

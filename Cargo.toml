@@ -28,6 +28,9 @@ members = [
     "crates/gateway-s3",
     "crates/server",
     "crates/dst",
+    # The blackbox validator (proposal 0017): a separate binary, deliberately NOT a
+    # `wyrd` subcommand, that depends on no `wyrd-*` crate (0017 §9).
+    "crates/validate",
     "xtask",
 ]
 
