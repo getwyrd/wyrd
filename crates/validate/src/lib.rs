@@ -3,27 +3,32 @@
 //! `docs/design/proposals/draft/0017-blackbox-validation-tool.md`).
 //!
 //! An out-of-process tool that drives a Wyrd deployment through its S3 front door the way a
-//! client does, knowing nothing about Wyrd but its address. **This slice is the skeleton:** it
-//! parses the argument surface, resolves credentials, echoes the resolved configuration, and
-//! exits. It issues no request; the S3 client lands in #741, the capability matrix and
-//! `smoke` in #743.
+//! client does, knowing nothing about Wyrd but its address. The binary parses the argument
+//! surface, resolves credentials, echoes the resolved configuration, and exits; the library
+//! also carries the S3 client every scenario calls through ([`s3`]). No scenario drives that
+//! client yet: the capability matrix and `smoke` arrive in #743.
 //!
 //! Layering (proposal 0017 §2): everything decision-shaped lives here, pure and tested; the
 //! binary (`src/main.rs`) owns only the I/O — the real argv, the real environment, the real
 //! stdout/stderr — and hands them to [`run`].
 //!
-//! The invariant this slice holds: **the binary never silently discards an argument it was
-//! given.** Every declared flag is either resolved into the echoed configuration or refused
-//! by name, and every token the parser does not understand is refused rather than absorbed.
+//! The invariant the argument surface holds: **the binary never silently discards an
+//! argument it was given.** Every declared flag is either resolved into the echoed
+//! configuration or refused by name, and every token the parser does not understand is
+//! refused rather than absorbed. The S3 client's invariants are stated in [`s3`].
 
 pub mod access_keys;
 pub mod args;
+pub mod s3;
 
 use std::ffi::OsString;
 use std::io::Write;
 
 pub use access_keys::{resolve, CredentialError, CredentialSource, Credentials};
 pub use args::{parse, usage, ArgError, Args, FLAGS};
+pub use s3::{
+    BodyError, Deadlines, ErrorCode, ObjectBody, Phase, PutOutcome, PutSource, S3Client, S3Error,
+};
 
 /// Exit status for a run that resolved its configuration.
 pub const EXIT_OK: u8 = 0;
@@ -115,7 +120,7 @@ pub fn run(
             let _ = writeln!(
                 err,
                 "wyrd-validate: configuration resolved; no requests were issued and nothing \
-                 was validated (the S3 client is not wired yet)"
+                 was validated (no scenario drives the S3 client yet)"
             );
             EXIT_OK
         }
