@@ -63,7 +63,10 @@
 //! ## 4. Upload sessions come back live
 //!
 //! A resurrected `Open` or `Completing` upload could be completed over reclaimed bytes, so, last,
-//! this pass **fences** every such session (0016 D-B; see [`reconcile_after_restore`]).
+//! this pass **fences** every such session (0016 D-B; see [`reconcile_after_restore`]), and keeps
+//! a record of its own progress, the **restore-fence generation**
+//! ([`wyrd_core::multipart::FenceGeneration`]): written not complete before the pass's first
+//! write, and complete after its last, only once no upload session needs a human.
 //!
 //! # The safety gate, unchanged
 //!
@@ -104,9 +107,9 @@ use wyrd_core::metadata::{
     SegmentRecord,
 };
 use wyrd_core::multipart::{
-    decode_part_record, decode_retire_obligation, decode_session_record, parse_mpu_key,
-    parse_part_key, part_range, retire_key, RetireMode, RetireObligation, RetireToken,
-    SessionRecord, SessionState, UploadId, MPU_PREFIX,
+    decode_fence_generation, decode_part_record, decode_retire_obligation, decode_session_record,
+    parse_mpu_key, parse_part_key, part_range, retire_key, FenceGeneration, RetireMode,
+    RetireObligation, RetireToken, SessionRecord, SessionState, UploadId, MPUFENCE_KEY, MPU_PREFIX,
 };
 use wyrd_traits::{
     ChunkId, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
@@ -225,6 +228,15 @@ pub struct RestoreReport {
     /// Sessions fenced from `Completing` (by this pass or an earlier one) that still need a human
     /// ([`UnaccountedSegments`]), in key order (also `action=session-segments-unaccounted`).
     pub segments_unaccounted: Vec<UnaccountedSegments>,
+    /// This pass's **restore-fence generation** as it last wrote it under [`MPUFENCE_KEY`]
+    /// (`0016:723-728`, X17b): `Some` on every report the pass returns, and complete exactly when
+    /// [`RestoreReport::sessions_settled`] holds — so a run can need a human over a dangling chunk
+    /// and still complete it. `None` only on a report no pass returned (a default).
+    ///
+    /// It says this pass finished its fence. It does not say this restore's pass ran: a restore
+    /// brings back whatever generation record its image held, `complete` included (see
+    /// [`FenceGeneration`]).
+    pub fence_generation: Option<FenceGeneration>,
 }
 
 /// A fenced `Completing` session whose attempt's `seg:` range holds a record nothing accounts for
@@ -381,7 +393,70 @@ impl RestoreReport {
             || !self.sessions_unsettled.is_empty()
             || !self.segments_unaccounted.is_empty()
     }
+
+    /// Did the fence leave **no** upload session for a human — the condition this pass's
+    /// [restore-fence generation](RestoreReport::fence_generation) completes on?
+    ///
+    /// Session findings only (#810): a session the fence could not read or could not fence
+    /// ([`RestoreReport::sessions_unsettled`] — a key naming no upload, a value that will not
+    /// decode, a commit it could not land), and a fenced one that still needs a human
+    /// ([`RestoreReport::segments_unaccounted`]), whether this pass fenced it or an earlier one
+    /// did: both are judged afresh from the store on every run. Findings about committed objects
+    /// (dangling, misplaced, an unreadable `inode:` record), the pending ledger, and staged
+    /// `part:` / `sidx:` records (an untrusted one included) are [`Self::needs_human`]'s and do not
+    /// withhold it: none of them lets a session publish. So a generation left not complete on a
+    /// returned report always comes with a NEEDS-HUMAN finding, and the reverse does not hold.
+    pub fn sessions_settled(&self) -> bool {
+        self.sessions_unsettled.is_empty() && self.segments_unaccounted.is_empty()
+    }
 }
+
+/// Why the post-restore pass could not open or close its restore-fence generation
+/// ([`FenceGeneration`], under [`MPUFENCE_KEY`]). Each ends the pass with an `Err`: one met while
+/// opening it, before the pass writes anything else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceGenerationFault {
+    /// The record will not decode (ADR-0045), so the pass cannot tell which generation comes
+    /// next. Repair it, or remove it (absent reads as "no pass has run"), and re-run.
+    Unreadable {
+        /// The decoder's rejection.
+        fault: String,
+    },
+    /// Generation `u64::MAX` has already run: there is no next.
+    Exhausted,
+    /// The record changed between this pass's read and its write: another pass ran meanwhile.
+    ChangedUnderPass {
+        /// The generation this pass was writing.
+        generation: u64,
+    },
+}
+
+impl std::fmt::Display for FenceGenerationFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key = object_name(MPUFENCE_KEY);
+        match self {
+            Self::Unreadable { fault } => write!(
+                f,
+                "the restore-fence generation record {key} will not decode ({fault}); this pass \
+                 wrote nothing. Repair or remove it (absent reads as no pass has run), then re-run"
+            ),
+            Self::Exhausted => write!(
+                f,
+                "the restore-fence generation record {key} is at generation {}, with no next; \
+                 this pass wrote nothing",
+                u64::MAX
+            ),
+            Self::ChangedUnderPass { generation } => write!(
+                f,
+                "the restore-fence generation record {key} changed while this pass wrote \
+                 generation {generation}: another pass ran meanwhile, so this one's generation is \
+                 not complete. Let the other pass finish, then re-run"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FenceGenerationFault {}
 
 /// Reconcile the fragment tier against a **restored** metadata store, at logical time
 /// `now_millis`.
@@ -396,8 +471,8 @@ impl RestoreReport {
 ///
 /// Then, last, every session the image holds `Open` or `Completing` is fenced (below).
 ///
-/// Deletes nothing: it writes marks and session fences. Run it with **writers stopped**, after a
-/// restore.
+/// Deletes nothing: it writes marks, session fences and its generation record. Run it with
+/// **writers stopped**, after a restore.
 ///
 /// # Staged bytes are never marked
 ///
@@ -432,6 +507,24 @@ impl RestoreReport {
 /// A `Completing@E` session is fenced the same way, its commit also installing its attempt's
 /// `retire:records:{seg}` ([`SessionRecord::completing_teardown`]), that key required absent too;
 /// the attempt's range is then judged on every run ([`RestoreReport::segments_unaccounted`]).
+///
+/// # Its restore-fence generation: opened first, completed last
+///
+/// Before it writes anything else the pass opens its **restore-fence generation** under
+/// [`MPUFENCE_KEY`] — `{N+1, complete: false}` over the `{N, ..}` it read, generation 1 over an
+/// absent record — and runs no mark and no fence until that commit is acknowledged
+/// (`0016:723-728`, X17b). After its last write it records that generation complete, conditioned
+/// on the not-complete bytes it wrote, only if every write it made was acknowledged and
+/// [`RestoreReport::sessions_settled`] holds. A fenced session's residue is never carried in
+/// memory or on the generation record: every run re-reads each `Aborting` session's records and
+/// names it again while it needs a human, and an undecodable session is named again by the fence,
+/// so no later pass completes a generation over residue an earlier one could not repair — however
+/// the earlier one ended.
+///
+/// The record says this pass finished its fence; it cannot say this restore's pass ran, because a
+/// restore rewinds it with everything else ([`FenceGeneration`]). Until a gateway reads it beside
+/// a restore-scoped signal (#508), what keeps multipart off a restored image is the runbook: this
+/// pass runs with writers stopped, before any gateway is re-enabled (`0016:3017-3021`).
 ///
 /// # An object it cannot read is CONTAINED, and the run is not certified
 ///
@@ -499,6 +592,11 @@ pub async fn reconcile_after_restore(
     ctx: &GcContext<'_>,
     now_millis: u64,
 ) -> Result<RestoreReport> {
+    // FIRST OF ALL, this pass's restore-fence generation, NOT complete — acknowledged before the
+    // pass writes anything else, so no mark or fence it makes runs under a `complete` reading
+    // (a restored image may carry one), and "complete" is observable only after its last write
+    // (`close_generation`, below).
+    let generation = open_generation(ctx.meta).await?;
     // The SAME committed reference set GC and scrub gate on, built through the shared resolver
     // — so a **segmented** object's chunks are in it here too, and a committed record the build
     // cannot read is contained rather than raised (`gc::ReferenceSet::unresolvable`).
@@ -561,6 +659,7 @@ pub async fn reconcile_after_restore(
         unresolvable: unreadable.iter().map(|key| object_name(key)).collect(),
         pending_unreadable,
         staged_untrusted,
+        fence_generation: Some(generation),
         ..Default::default()
     };
     // ONE READING, ONE CONCLUSION. `gc::ReferenceSet::protects` already withholds every fragment
@@ -697,7 +796,7 @@ pub async fn reconcile_after_restore(
         // intact. So a batch that lands is durable progress, and one that fails costs only the
         // work since the last commit.
         if batched.len() >= MARK_BATCH {
-            ctx.meta.commit(std::mem::take(&mut marks)).await?;
+            commit_marks(ctx.meta, std::mem::take(&mut marks)).await?;
             // Durable now — and only now is a mark real.
             for &(d, f) in &batched {
                 emit_strand(d, f);
@@ -709,7 +808,7 @@ pub async fn reconcile_after_restore(
 
     // The tail of the final batch, on the same terms.
     if !batched.is_empty() {
-        ctx.meta.commit(std::mem::take(&mut marks)).await?;
+        commit_marks(ctx.meta, std::mem::take(&mut marks)).await?;
         for &(d, f) in &batched {
             emit_strand(d, f);
         }
@@ -774,10 +873,125 @@ pub async fn reconcile_after_restore(
 
     // THE SESSION FENCE — after Pass 3, so a fence fault never takes a verdict with it (#651's
     // class): the summary is emitted first, INCOMPLETE, and is where the counts survive an `Err`.
-    let fenced = fence_open_sessions(ctx.meta, &mut report).await;
-    emit_summary(&report, fenced.is_ok());
-    fenced?;
+    // Then, LAST, the generation's completion — reached only when every write above was
+    // acknowledged, since every path where one was not has already returned its `Err`.
+    let (finished, cut) = match fence_open_sessions(ctx.meta, &mut report).await {
+        Err(fault) => (Err(fault), Some(Cut::Fence)),
+        Ok(()) => match close_generation(ctx.meta, generation, &mut report).await {
+            Ok(()) => (Ok(()), None),
+            Err(fault) => (Err(fault), Some(Cut::Generation)),
+        },
+    };
+    emit_summary(&report, cut);
+    finished?;
     Ok(report)
+}
+
+/// Open this pass's restore-fence generation: write `{N+1, complete: false}` over the `{N, ..}`
+/// read there (generation 1 over an absent record), conditioned on the bytes read, and return it
+/// only once that commit is **acknowledged** — the pass's first write, ahead of every mark and
+/// fence.
+///
+/// Anything else ends the pass here, having written nothing else: a record that will not decode
+/// or has no next generation ([`FenceGenerationFault`]), a `Conflict` (it changed under the
+/// pass), and an `Err`. An unknown outcome is that `Err` whether or not it applied
+/// (`crates/traits/src/lib.rs:204-247`): until the pass knows its not-complete record landed, a
+/// fence it ran could run under the `complete` a restored image carried. Its read's and commit's
+/// awaits are bounded by the `MetadataStore` implementation (#508/#636), as the fence's are.
+async fn open_generation(meta: &dyn MetadataStore) -> Result<FenceGeneration> {
+    let read = meta.get(MPUFENCE_KEY).await?;
+    let prior = match read.as_deref().map(decode_fence_generation).transpose() {
+        Ok(prior) => prior,
+        Err(fault) => {
+            let fault = fault.to_string();
+            return Err(generation_fault(FenceGenerationFault::Unreadable { fault }));
+        }
+    };
+    let Some(opened) = FenceGeneration::next(prior.as_ref()) else {
+        return Err(generation_fault(FenceGenerationFault::Exhausted));
+    };
+    let batch = match read {
+        Some(bytes) => WriteBatch::new().require(MPUFENCE_KEY, bytes),
+        None => WriteBatch::new().require_absent(MPUFENCE_KEY),
+    };
+    let batch = batch.put(MPUFENCE_KEY, metadata::encode(&opened));
+    match meta.commit(batch).await {
+        Ok(CommitOutcome::Committed) => {
+            emit_generation(&opened);
+            Ok(opened)
+        }
+        Ok(CommitOutcome::Conflict) => {
+            let generation = opened.generation();
+            let fault = FenceGenerationFault::ChangedUnderPass { generation };
+            Err(generation_fault(fault))
+        }
+        Err(fault) => {
+            emit_generation_write_failed(&opened, &fault.to_string());
+            Err(fault)
+        }
+    }
+}
+
+/// Close this pass's generation: write it complete, conditioned on the not-complete bytes the pass
+/// opened it with — only when no session needs a human ([`RestoreReport::sessions_settled`]), and
+/// only once every earlier write was acknowledged (the caller reaches here on no other path).
+///
+/// The precondition is what keeps a late landing honest: a completion whose commit answered an
+/// unknown outcome and lands after a newer pass opened its own generation finds that newer record,
+/// not the bytes it requires, and writes nothing — a stale `complete` never masks a newer pass.
+/// An `Err` here is the pass's `Err`: an unknown outcome is never read as a clean finish
+/// (`AGENTS.md`), though if it applied, the record it wrote is true — every earlier write was
+/// acknowledged — and if it did not, the next pass opens and completes its own generation. Its
+/// commit's await is bounded by the `MetadataStore` implementation (#508/#636).
+async fn close_generation(
+    meta: &dyn MetadataStore,
+    opened: FenceGeneration,
+    report: &mut RestoreReport,
+) -> Result<()> {
+    if !report.sessions_settled() {
+        emit_generation_left_open(&opened, report);
+        return Ok(());
+    }
+    let closed = opened.completed();
+    let batch = WriteBatch::new()
+        .require(MPUFENCE_KEY, metadata::encode(&opened))
+        .put(MPUFENCE_KEY, metadata::encode(&closed));
+    match meta.commit(batch).await {
+        Ok(CommitOutcome::Committed) => {
+            emit_generation(&closed);
+            report.fence_generation = Some(closed);
+            Ok(())
+        }
+        Ok(CommitOutcome::Conflict) => {
+            let generation = opened.generation();
+            let fault = FenceGenerationFault::ChangedUnderPass { generation };
+            Err(generation_fault(fault))
+        }
+        Err(fault) => {
+            emit_generation_write_failed(&closed, &fault.to_string());
+            Err(fault)
+        }
+    }
+}
+
+/// Name a [`FenceGenerationFault`] on the audit seam and box it as the pass's `Err`.
+fn generation_fault(fault: FenceGenerationFault) -> wyrd_traits::BoxError {
+    emit_generation_fault(&fault);
+    fault.into()
+}
+
+/// Commit one batch of orphan marks: acknowledged, or the pass's `Err`. The batch carries no
+/// precondition, so a `Conflict` is the store answering that none of it was written — never
+/// counted and audited as marks GC will act on, and never a write the pass's generation may be
+/// completed over.
+async fn commit_marks(meta: &dyn MetadataStore, marks: WriteBatch) -> Result<()> {
+    match meta.commit(marks).await? {
+        CommitOutcome::Committed => Ok(()),
+        CommitOutcome::Conflict => Err("post-restore: a batch of orphan marks, which carries no \
+                                        precondition, answered Conflict — none of it was \
+                                        written; re-run the pass"
+            .into()),
+    }
 }
 
 /// The session fence: re-list `mpu:` in bounded pages ([`staged_page`]) and fence each session.
@@ -1524,16 +1738,92 @@ fn emit_session_fence_failed(session: &str, fault: &str) {
     );
 }
 
+/// The restore-fence generation this pass just wrote: opened not complete, or completed.
+fn emit_generation(generation: &FenceGeneration) {
+    tracing::info!(
+        target: "wyrd.custodian.restore.audit",
+        action = "fence-generation",
+        generation = generation.generation(),
+        complete = generation.is_complete(),
+        "post-restore: the restore-fence generation record now names this pass's generation{}",
+        if generation.is_complete() {
+            ", complete: every upload session the store held is fenced or settled"
+        } else {
+            ", not complete"
+        },
+    );
+}
+
+/// The generation left not complete because a session needs a human. Operator signal.
+fn emit_generation_left_open(generation: &FenceGeneration, report: &RestoreReport) {
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "fence-generation-not-complete",
+        generation = generation.generation(),
+        sessions_unsettled = report.sessions_unsettled.len(),
+        segments_unaccounted = report.segments_unaccounted.len(),
+        "post-restore: the restore-fence generation is left NOT complete — an upload session \
+         needs a human; keep multipart uploads off this store, repair it and re-run — NEEDS-HUMAN",
+    );
+}
+
+/// A generation write that answered `Err` (its outcome possibly unknown): nothing is claimed.
+fn emit_generation_write_failed(generation: &FenceGeneration, fault: &str) {
+    tracing::error!(
+        target: "wyrd.custodian.restore.audit",
+        action = "fence-generation-write-failed",
+        generation = generation.generation(),
+        complete = generation.is_complete(),
+        fault = %fault,
+        "post-restore: a restore-fence generation write failed, landed or not; the pass stops — \
+         re-run it",
+    );
+}
+
+/// The generation record could not be opened or closed ([`FenceGenerationFault`]).
+fn emit_generation_fault(fault: &FenceGenerationFault) {
+    tracing::error!(
+        target: "wyrd.custodian.restore.audit",
+        action = "fence-generation-fault",
+        fault = %fault,
+        "post-restore: the restore-fence generation record could not be written; the pass stops",
+    );
+}
+
+/// Where a pass stopped short of finishing.
+#[derive(Clone, Copy)]
+enum Cut {
+    /// A session fence commit failed.
+    Fence,
+    /// The fence finished, but the generation's completion write did not land as acknowledged.
+    Generation,
+}
+
+impl Cut {
+    fn text(self) -> &'static str {
+        match self {
+            Self::Fence => {
+                "the session fence did not finish, and the pass returns an error — re-run it"
+            }
+            Self::Generation => {
+                "the restore-fence generation's completion write did not land as acknowledged, \
+                 and the pass returns an error — re-run it"
+            }
+        }
+    }
+}
+
 /// The pass's own verdict, so a restore's true cost lands in one line an operator can read.
 ///
-/// It says **complete** only when the reading finished and the session fence did. Over a store
-/// with an unreadable committed or staged record in it the same line would otherwise be the
+/// It says **complete** only when the reading finished and the pass did (`cut` is `None`). Over a
+/// store with an unreadable committed or staged record in it the same line would otherwise be the
 /// certification the rest of this pass refuses to give, in the one place an operator greps for
-/// it. It is emitted even when a fence commit failed: it is the only record of some counts.
-fn emit_summary(report: &RestoreReport, fence_finished: bool) {
+/// it. It is emitted even when a fence commit failed: it is the only record of some counts. The
+/// restore-fence generation is reported beside it, as its own two fields.
+fn emit_summary(report: &RestoreReport, cut: Option<Cut>) {
     const PARTIAL_READ: &str = "every count above covers only the records this pass could read";
-    const FENCE_CUT: &str =
-        "the session fence did not finish, and the pass returns an error — re-run it";
+    let finished = cut.is_none();
+    let generation = report.fence_generation;
     tracing::info!(
         target: "wyrd.custodian.restore.audit",
         action = "summary",
@@ -1550,22 +1840,25 @@ fn emit_summary(report: &RestoreReport, fence_finished: bool) {
         sessions_fenced = report.sessions_fenced,
         sessions_unsettled = report.sessions_unsettled.len(),
         segments_unaccounted = report.segments_unaccounted.len(),
-        fence_finished,
+        fence_finished = !matches!(cut, Some(Cut::Fence)),
+        // The generation this pass opened, and whether it completed (0: none was opened).
+        fence_generation = generation.map_or(0, |at| at.generation()),
+        fence_generation_complete = generation.is_some_and(|at| at.is_complete()),
         // The qualifier on every count above: they are drawn over the records this pass could
         // read, and this is how many it could not.
         unresolvable = report.unresolvable.len(),
         // The pass's own two-word verdict, so the predicate the report offers its callers is the
         // one its audit trail states rather than a third rendering of the same fields — except
-        // that a fence cut short may have left an `Open` session live, which no partial report
+        // that a pass cut short may have left an `Open` session live, which no partial report
         // can call clean and only a human's re-run settles.
-        clean = fence_finished && report.is_clean(),
-        needs_human = !fence_finished || report.needs_human(),
+        clean = finished && report.is_clean(),
+        needs_human = !finished || report.needs_human(),
         "post-restore reconciliation {}",
-        match (report.unresolvable.is_empty(), fence_finished) {
-            (true, true) => "complete".to_owned(),
-            (false, true) => format!("INCOMPLETE — {PARTIAL_READ}"),
-            (true, false) => format!("INCOMPLETE — {FENCE_CUT}"),
-            (false, false) => format!("INCOMPLETE — {PARTIAL_READ}; and {FENCE_CUT}"),
+        match (report.unresolvable.is_empty(), cut) {
+            (true, None) => "complete".to_owned(),
+            (false, None) => format!("INCOMPLETE — {PARTIAL_READ}"),
+            (true, Some(cut)) => format!("INCOMPLETE — {}", cut.text()),
+            (false, Some(cut)) => format!("INCOMPLETE — {PARTIAL_READ}; and {}", cut.text()),
         },
     );
 }

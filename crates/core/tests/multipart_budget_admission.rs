@@ -27,14 +27,19 @@
 //! * **P1–P3** — the other direction: a decoder that refuses a stored record on a number this
 //!   deployment merely chose is as wrong as one that admits a torn record;
 //! * **P-arith** — decode's verdict equals the verdict exact (unbounded) integer arithmetic
-//!   gives, at the field maxima, with no panic and no wrap.
+//!   gives, at the field maxima, with no panic and no wrap;
+//! * **the sibling singleton** (#810) — `mpufence`, the restore-fence generation
+//!   (`FenceGeneration`), round-trips byte-identically, counts from 1, and refuses a torn or
+//!   foreign spelling as a typed error.
 //!
 //! No `#![cfg(...)]` here — this file always compiles and always runs.
 
 #![forbid(unsafe_code)]
 
 use wyrd_core::metadata;
-use wyrd_core::multipart::{decode_admission_record, AdmissionRecord, RecordError};
+use wyrd_core::multipart::{
+    decode_admission_record, decode_fence_generation, AdmissionRecord, FenceGeneration, RecordError,
+};
 
 /// `SCAN_CAP/2` — the seam constant two of the record's rules are stated against
 /// (`crates/traits/src/lib.rs:286`, `SCAN_CAP = 1 << 20`; `0016:1470`, `:1471`).
@@ -445,5 +450,82 @@ fn an_unknown_field_or_unreadable_bytes_are_refused_rather_than_dropped() {
         b"{}".as_slice(),
     ] {
         assert!(is_malformed_mpuctl(bytes), "{}", String::from_utf8_lossy(bytes));
+    }
+}
+
+// ===========================================================================
+// The sibling singleton: the restore-fence generation, `mpufence` (#810)
+// ===========================================================================
+
+/// One `mpufence` value's stored bytes, in this codec's own spelling.
+fn fence_bytes(generation: u64, complete: bool) -> String {
+    format!(r#"{{"generation":{generation},"complete":{complete}}}"#)
+}
+
+/// `mpufence` is CAS'd whole too (both of the post-restore pass's writes require the bytes it
+/// last saw), so decode→encode is byte-identical, generations count from 1 (absent is "no pass
+/// has run"), and the record a pass writes after one is the next generation, not complete.
+#[test]
+fn the_fence_generation_round_trips_and_counts_from_one() {
+    for (generation, complete) in [(1, false), (1, true), (7, false), (u64::MAX, true)] {
+        let bytes = fence_bytes(generation, complete);
+        let record = decode_fence_generation(bytes.as_bytes()).expect(&bytes);
+        assert_eq!(metadata::encode(&record), bytes.as_bytes(), "{bytes}");
+        let read = (record.generation(), record.is_complete());
+        assert_eq!(read, (generation, complete), "{bytes}");
+    }
+    let first = FenceGeneration::next(None).expect("generation 1");
+    assert_eq!(metadata::encode(&first), fence_bytes(1, false).as_bytes());
+    assert_eq!(
+        metadata::encode(&first.completed()),
+        fence_bytes(1, true).as_bytes()
+    );
+    let done = decode_fence_generation(fence_bytes(7, true).as_bytes()).unwrap();
+    let next = FenceGeneration::next(Some(&done)).expect("generation 8");
+    assert_eq!(metadata::encode(&next), fence_bytes(8, false).as_bytes());
+    let last = decode_fence_generation(fence_bytes(u64::MAX, false).as_bytes()).unwrap();
+    assert_eq!(
+        FenceGeneration::next(Some(&last)),
+        None,
+        "no generation after u64::MAX"
+    );
+}
+
+/// Generation 0, an unknown or missing field, a value that is not this record, or another
+/// spelling of a valid one: each a typed error, never a value.
+#[test]
+fn a_torn_or_foreign_fence_generation_is_refused() {
+    let malformed = |bytes: &[u8]| {
+        matches!(
+            decode_fence_generation(bytes),
+            Err(RecordError::MalformedRecordValue {
+                namespace: "mpufence",
+                ..
+            })
+        )
+    };
+    for bytes in [
+        br#"{"generation":0,"complete":false}"#.as_slice(),
+        br#"{"generation":3,"complete":true,"at":9}"#.as_slice(),
+        br#"{"generation":3}"#.as_slice(),
+        br#"{"generation":3,"complete":"yes"}"#.as_slice(),
+        b"not json".as_slice(),
+    ] {
+        assert!(malformed(bytes), "{}", String::from_utf8_lossy(bytes));
+    }
+    for bytes in [
+        br#"{"complete":true,"generation":3}"#.as_slice(),
+        br#"{"generation":3, "complete":true}"#.as_slice(),
+    ] {
+        let refused = decode_fence_generation(bytes);
+        let noncanonical = RecordError::NoncanonicalRecordValue {
+            namespace: "mpufence",
+        };
+        assert_eq!(
+            refused,
+            Err(noncanonical),
+            "{}",
+            String::from_utf8_lossy(bytes)
+        );
     }
 }
