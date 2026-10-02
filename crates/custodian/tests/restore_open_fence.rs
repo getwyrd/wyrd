@@ -672,13 +672,13 @@ fn seed_unfenceable(meta: &Meta, d: &[Disk; 4], digit: char) -> [UploadId; 4] {
     seed_part(meta, &id(1), 1, chunk_ref(0xD11, EcScheme::None, &[1]));
     place(d, 1, frag(0xD11, 0));
     meta.seed(mpu_key(&id(2)), open(u64::MAX));
-    meta.seed(mpu_key(&id(3)), completing(EPOCH));
+    meta.seed(mpu_key(&id(3)), completing(u64::MAX));
     meta.seed(mpu_key(&id(4)), open(EPOCH));
     place(d, 3, frag(0xD1F, 0));
     [id(1), id(2), id(3), id(4)]
 }
 
-/// **(H)** An undecodable session, an `Open` one at `u64::MAX` and a `Completing` one are each
+/// **(H)** An undecodable session and an `Open` and a `Completing` one at `u64::MAX` are each
 /// left byte-identical with no `retire:` key, and named for a human in the report and on the
 /// audit seam. The undecodable one's part stays protected, the control is fenced, the stray marked.
 ///

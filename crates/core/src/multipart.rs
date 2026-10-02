@@ -91,8 +91,9 @@
 //! # Almost nothing here is written yet — and the living-architecture doc says exactly that
 //!
 //! This module is the key **grammar** plus the record **shapes**: it makes no store call, and its
-//! one writer-side API is the `Open` teardown ([`SessionRecord::open_teardown`], first called by
-//! the post-restore fence, #841); every other first writer is a store round trip (#656–#659).
+//! writer-side API is the post-restore fence's two teardowns ([`SessionRecord::open_teardown`],
+//! #841, and [`SessionRecord::completing_teardown`], #842); every other first writer is a store
+//! round trip (#656–#659).
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -2162,8 +2163,8 @@ struct SessionRecordWire {
 ///
 /// No free constructor: a `SessionRecord` minted from loose fields could not be relied on to hold
 /// the identity [`decode_session_record`] enforces — precisely the reason [`AdmissionRecord`] and
-/// [`Budget`] omit one too. The one writer-side route transitions a record that already decoded
-/// ([`Self::open_teardown`]), changing only `epoch` and `state`.
+/// [`Budget`] omit one too. The writer-side routes transition a record that already decoded
+/// ([`Self::open_teardown`], [`Self::completing_teardown`]), changing only `epoch` and `state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SessionRecordWire")]
 pub struct SessionRecord {
@@ -2274,6 +2275,56 @@ impl SessionRecord {
             },
             obligation: RetireObligation::session_teardown(upload_id, self.epoch),
         })
+    }
+
+    /// The **restore fence of a `Completing@E` session** (0016 D-B, `0016:665`): this session at
+    /// `Aborting@E+1`, and two obligations to commit with it, each under `require_absent`:
+    ///
+    /// * `retire:bytes:s:<upload-id>:<E>` owing `{session, all}`, not `0016:665`'s
+    ///   `{session, parts: <set>}` (why: the [`RetirePayload`] rows table);
+    /// * `retire:records:s:<upload-id>:<E>` owing `{seg: <nonce, E>}`
+    ///   ([`Self::attempt_segment_group`]), the only deleter of that attempt's segment records
+    ///   (X57, `0016:880`) — whatever `segments_written` says: a damaged cursor must not decide.
+    ///
+    /// `upload_id` is the one the session's `mpu:` key names. `None` unless the session is
+    /// `Completing` below `u64::MAX`: every fence bumps the epoch (`0016:704-708`).
+    pub fn completing_teardown(&self, upload_id: &UploadId) -> Option<CompletingTeardown> {
+        let group = self.attempt_segment_group()?;
+        let next = self.epoch.checked_add(1)?;
+        Some(CompletingTeardown {
+            session: Self {
+                epoch: next,
+                state: SessionState::Aborting {},
+                ..self.clone()
+            },
+            bytes: RetireObligation::session_teardown(upload_id, self.epoch),
+            records: RetireObligation::attempt_segments(upload_id, group),
+        })
+    }
+}
+
+/// What [`SessionRecord::completing_teardown`] mints, committed together or not at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletingTeardown {
+    session: SessionRecord,
+    bytes: RetireObligation,
+    records: RetireObligation,
+}
+
+impl CompletingTeardown {
+    /// The session at `Aborting@E+1`.
+    pub const fn session(&self) -> &SessionRecord {
+        &self.session
+    }
+
+    /// The `retire:bytes:` obligation, `{session, all}`.
+    pub const fn bytes(&self) -> &RetireObligation {
+        &self.bytes
+    }
+
+    /// The `retire:records:` obligation, `{seg}`.
+    pub const fn records(&self) -> &RetireObligation {
+        &self.records
     }
 }
 
@@ -3169,8 +3220,8 @@ const PARTS_COMPONENT: Component = Component {
 };
 
 /// `{parts: "all"}` — the wildcard, a **different writer row** from an explicit set and therefore
-/// its own entry in this table: one shape installs it, an `Open` teardown (the reaper's or the
-/// restore fence's) `retire:bytes:{session, all}` (`0016:2187`), legal only in that shape. Under
+/// its own entry in this table: one shape installs it, a teardown's `retire:bytes:{session, all}`
+/// (`0016:2187`; [`SessionRecord::completing_teardown`] too), legal only in that shape. Under
 /// `retire:records:` it would tell a drain to delete **every** part record of a live session —
 /// including the staged parts whose records are the only thing protecting their bytes and the only
 /// source of their placements, the precise deletion `0016:919-921` (iteration-14 finding 3, X104)
@@ -3247,8 +3298,8 @@ struct RetirePayloadWire {
 /// | Key | Payload | Row |
 /// |---|---|---|
 /// | `retire:bytes:s:<id>:<E>` | `{session}` | the abort/reap fence's own spelling (`0016:664`) — the session's staged residue, no part |
-/// | `retire:bytes:s:<id>:<E>` | `{session, all}` | the `Open` teardown, that residue **and** every part: the reaper's (`0016:2187`) and the restore fence's ([`SessionRecord::open_teardown`]) — the **only** row the `all` wildcard has |
-/// | `retire:bytes:s:<id>:<E>` | `{session, parts: <set>}` | the `Completing`→`Aborting` fence, incl. the restore fence (`0016:665`, `:823`, `:2193`) |
+/// | `retire:bytes:s:<id>:<E>` | `{session, all}` | a teardown, that residue **and** every part: the `Open` one, the reaper's (`0016:2187`) and the restore fence's ([`SessionRecord::open_teardown`]), and the restore fence of a `Completing` session ([`SessionRecord::completing_teardown`]: no part commits outside `Open`, [`upload_part_answer`], `0016:1030`; and 10,000 sparse part numbers encode to 128,916 bytes, past [`crate::metadata::MAX_VALUE_BYTES`], #842) — the **only** row the `all` wildcard has |
+/// | `retire:bytes:s:<id>:<E>` | `{session, parts: <set>}` | the `Completing`→`Aborting` fence of the reaper and of an operator abort (`0016:665`, `:2193`) — not the restore fence's, above |
 /// | `retire:bytes:s:<id>:<E>` | `{parts: <set>}` | the root flip's **unnamed** staged parts (`0016:662`, `:919-921`) |
 /// | `retire:bytes:s:<id>:<E>:<n>:<a>` | `{chunks: […]}` | a losing writer / re-upload compensation (`0016:659`, `:672`, `:1620`) |
 /// | `retire:bytes:g:<inode>:<version>` | `{generation: {…, chunks}}` | supersede or unlink of a **flat** generation, by the chunk list its root carried (`0016:355`, `:668`) |
@@ -3287,8 +3338,8 @@ struct RetirePayloadWire {
 ///
 /// There is no free constructor either: a value built without decode's rules is one a writer
 /// could make durable without them. The one writer-side route, [`RetireObligation`], mints a
-/// payload **with the key it goes under**, for one row (the `Open` teardown); the store round
-/// trips (#656–#659) add their rows there.
+/// payload **with the key it goes under**, for the restore fence's two rows (`{session, all}` and
+/// a `Completing` attempt's `{seg}`); the store round trips (#656–#659) add their rows there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetirePayload {
     /// Omitted when absent rather than spelled `false` (`AGENTS.md:170-172`), so the accepted
@@ -3578,8 +3629,9 @@ pub fn decode_retire_obligation(
 
 /// A retirement obligation **as a writer installs it**: key and payload minted by one constructor,
 /// so they cannot disagree — the writer-side mirror of [`decode_retire_obligation`]. Its only
-/// constructor is the `Open` teardown ([`SessionRecord::open_teardown`]); a later writer's row is
-/// added as its own constructor, never as a payload handed in beside a key the caller chose.
+/// constructors are the restore fence's rows ([`SessionRecord::open_teardown`],
+/// [`SessionRecord::completing_teardown`]); a later writer's row is added as its own constructor,
+/// never as a payload handed in beside a key the caller chose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireObligation {
     mode: RetireMode,
@@ -3604,6 +3656,26 @@ impl RetireObligation {
                 chunks: Vec::new(),
                 generation: None,
                 seg: None,
+            },
+        }
+    }
+
+    /// `retire:records:s:<upload-id>:<E>` owing `{seg: group}` (`0016:665`), the token's epoch the
+    /// group's, as [`decode_retire_obligation`] requires.
+    fn attempt_segments(upload_id: &UploadId, group: SegmentGroup) -> Self {
+        Self {
+            mode: RetireMode::Records,
+            token: RetireToken::Session {
+                upload_id: upload_id.clone(),
+                epoch: group.epoch(),
+                part: None,
+            },
+            payload: RetirePayload {
+                session: false,
+                parts: None,
+                chunks: Vec::new(),
+                generation: None,
+                seg: Some(group),
             },
         }
     }
@@ -5116,6 +5188,56 @@ mod open_teardown {
         );
         for state in [r#"{"kind":"Aborting"}"#, &completing, &completed] {
             assert_eq!(session(state, 3).open_teardown(&id), None, "{state}");
+        }
+    }
+
+    /// [`SessionRecord::completing_teardown`]: only `Completing` below `u64::MAX` has one, minting
+    /// `Aborting@E+1`, `{session, all}` and `{seg: (nonce, E)}`, each decoding against its key.
+    #[test]
+    fn only_a_completing_session_has_one_and_both_obligations_match_their_keys() {
+        let completing = |epoch: u64| {
+            format!(
+                "{{\"kind\":\"Completing\",\"fenced_at_millis\":900,\"segments_written\":0,\
+                 \"publish_target\":{{\"parent\":42,\"name\":\"o\",\"epoch\":{epoch}}}}}"
+            )
+        };
+        let id = UploadId::new("ab".repeat(16)).expect("an upload id");
+        let teardown = session(&completing(3), 3).completing_teardown(&id);
+        let teardown = teardown.expect("Completing@3 has a teardown");
+        assert_eq!(teardown.session(), &session(r#"{"kind":"Aborting"}"#, 4));
+        let (upload_id, epoch, part) = (id.clone(), 3, None);
+        let token = RetireToken::Session {
+            upload_id,
+            epoch,
+            part,
+        };
+        let owed = [
+            (RetireMode::Bytes, teardown.bytes()),
+            (RetireMode::Records, teardown.records()),
+        ];
+        for (mode, obligation) in owed {
+            assert_eq!(obligation.key(), retire_key(mode, &token));
+            let value = metadata::encode(obligation.payload());
+            let decoded = decode_retire_obligation(&obligation.key(), &value).expect("it decodes");
+            let payload = obligation.payload().clone();
+            assert_eq!(decoded, (mode, token.clone(), payload), "{mode:?}");
+        }
+        let bytes = teardown.bytes().payload();
+        assert!(bytes.session() && bytes.parts() == Some(&PartScope::All));
+        let records = teardown.records().payload();
+        let group = SegmentGroup::new("0123456789abcdef0123456789abcdef", 3).expect("a group");
+        assert!(!records.session() && records.parts().is_none());
+        assert_eq!(records.segments(), Some(&group));
+
+        let last = session(&completing(u64::MAX), u64::MAX);
+        assert_eq!(last.completing_teardown(&id), None);
+        let completed = format!(
+            "{{\"kind\":\"Completed\",\"completion\":{{\"inode\":7,\"version\":1,\"etag\":\
+             \"{0}-1\",\"completed_at_millis\":950,\"complete_fingerprint\":\"{0}\"}}}}",
+            "ab".repeat(32)
+        );
+        for state in [r#"{"kind":"Open"}"#, r#"{"kind":"Aborting"}"#, &completed] {
+            assert_eq!(session(state, 3).completing_teardown(&id), None, "{state}");
         }
     }
 }
