@@ -60,6 +60,11 @@
 //! as **healthy while every read of it fails**. So it is kept (never marked), and its chunk is
 //! reported as *misplaced* — recoverable by fixing the **placement**, never as *dangling*.
 //!
+//! ## 4. Upload sessions come back live
+//!
+//! A resurrected `Open` or `Completing` upload could be completed over reclaimed bytes, so, last,
+//! this pass **fences** every such session (0016 D-B; see [`reconcile_after_restore`]).
+//!
 //! # The safety gate, unchanged
 //!
 //! Marking is the front half of a deletion, so the invariant [`crate::gc`] is built around
@@ -72,9 +77,10 @@
 //! owned staging entry names ([`crate::gc::StagedSet`], proposal 0016 decision 2). The pass reads
 //! that class through the reader GC uses, before either reading of the committed namespace, and
 //! gates on it by the same rules: a staged record it cannot read withholds every mark and is named
-//! in the report, one it cannot trust holds its chunk, and a store fault under one of its reads
-//! fails the pass. The protection covers the upload records already durable when the pass read
-//! them; a write or an upload that starts while the pass runs is not yet covered (#805).
+//! in the report, one it cannot trust holds its chunk and is named there too, and a store fault
+//! under one of its reads fails the pass; what the class keeps is counted. The protection covers
+//! the upload records already durable when the pass read them; a write or an upload that starts
+//! while the pass runs is not yet covered (#805).
 //!
 //! # Idempotent, and running it twice is not a way to lose data
 //!
@@ -93,12 +99,22 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use wyrd_core::metadata::{self, ChunkMapError, InodeRecord, InodeState};
-use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
+use wyrd_core::metadata::{
+    self, parse_seg_key, seg_range_prefix, ChunkMapError, InodeRecord, InodeState, SegmentGroup,
+    SegmentRecord,
+};
+use wyrd_core::multipart::{
+    decode_part_record, decode_retire_obligation, decode_session_record, parse_mpu_key,
+    parse_part_key, part_range, retire_key, RetireMode, RetireObligation, RetireToken,
+    SessionRecord, SessionState, UploadId, MPU_PREFIX,
+};
+use wyrd_traits::{
+    ChunkId, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
+};
 
 use crate::gc::{
     marked_among, object_name, orphan_key, parse_pending_chunk, referenced_fragments,
-    staged_fragments, GcContext, ReferenceSet, StagedSet,
+    staged_fragments, staged_page, GcContext, ReferenceSet, StagedSet,
 };
 
 /// How many orphan marks to commit at once.
@@ -124,6 +140,15 @@ pub struct RestoreReport {
     /// Unreferenced fragments left alone because their chunk still holds a `pending:`
     /// lease — an in-flight write, whose lease TTL is already its grace. GC owns them.
     pub pending_skipped: usize,
+    /// Fragments left unmarked because the **staged protection class** keeps them
+    /// ([`crate::gc::StagedSet`], `0016:823`): a multipart upload's own record places them, or
+    /// names their chunk untrustworthily ([`RestoreReport::staged_untrusted`]).
+    ///
+    /// Each kept fragment is counted once, under the FIRST protection that keeps it in the pass's
+    /// order: the committed readings (uncounted), the staged class, the displaced check, the
+    /// pending lease. So one a committed map protects is never counted here, and one counted here
+    /// is not counted again under `displaced_kept` or `pending_skipped`.
+    pub staged_skipped: usize,
     /// `pending:` entries this pass could **not read as an ordinary lease** — torn, malformed,
     /// or an owned staging entry filed under the wrong key — named by key as
     /// [`RestoreReport::unresolvable`] names a record. Their chunks are **held** exactly as a
@@ -135,6 +160,17 @@ pub struct RestoreReport {
     /// not make the reading of the **committed** namespace partial, so it withholds no mark and
     /// does not take "complete" off the summary line.
     pub pending_unreadable: Vec<String>,
+    /// Staged multipart records this pass read but could **not trust** about where a chunk's
+    /// fragments are — a placement of the wrong length, or an owned `sidx:` value that will not
+    /// decode under a key that still names its chunk ([`crate::gc::StagedSet::held`]). Named by
+    /// key as [`RestoreReport::unresolvable`] names a record, once per record, in key order.
+    ///
+    /// The pass held every fragment of each such chunk and marked none; that is all it claims. It
+    /// does not claim the staged bytes survived: it judges missing bytes for committed chunks
+    /// only. The run is then not [clean](RestoreReport::is_clean), and does **not** need a human
+    /// ([`RestoreReport::needs_human`] says why). Not in `unresolvable`: the record was read, so
+    /// the reading is not partial.
+    pub staged_untrusted: Vec<String>,
     /// Fragments the restored map still needs but whose bytes have MOVED — a repair or
     /// rebalance after the restore point wrote them to a new D server and repointed the
     /// placement, and the restore rewound the map but not the bytes. These are the **only
@@ -180,6 +216,111 @@ pub struct RestoreReport {
     /// non-empty list here is a clean report about **part** of the store, and an operator
     /// reading it as a clean bill would decommission on it.
     pub unresolvable: Vec<String>,
+    /// `Open` and `Completing` sessions **fenced** to `Aborting`, each counted once its commit
+    /// landed (`0016:823`).
+    pub sessions_fenced: usize,
+    /// Sessions the fence could **not** fence, by `mpu:` key and why, in key order: each left as
+    /// read, with no obligation — a human's (also `action=session-unsettled` on the audit seam).
+    pub sessions_unsettled: Vec<UnsettledSession>,
+    /// Sessions fenced from `Completing` (by this pass or an earlier one) that still need a human
+    /// ([`UnaccountedSegments`]), in key order (also `action=session-segments-unaccounted`).
+    pub segments_unaccounted: Vec<UnaccountedSegments>,
+}
+
+/// A fenced `Completing` session whose attempt's `seg:` range holds a record nothing accounts for
+/// (or whose records obligation is missing, or not that range's deleter): that obligation deletes
+/// the range without marking a byte (`0016:2347-2350`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnaccountedSegments {
+    /// Its `mpu:` key, escaped as every name in the report is ([`crate::gc::object_name`]).
+    pub session: String,
+    /// The first record at fault, by key, escaped: a `seg:` record, or the `retire:records:` one.
+    pub record: String,
+    /// What is wrong with it.
+    pub fault: SegmentFault,
+}
+
+/// What is wrong with the record [`UnaccountedSegments`] names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentFault {
+    /// It names a chunk no `part:` record of the session (that this pass could read) holds.
+    ChunkInNoPart {
+        /// The chunk.
+        chunk: ChunkId,
+    },
+    /// It will not decode (ADR-0045): a segment, naming chunks no one can read; or the records
+    /// obligation, deleting a range no one can read.
+    Undecodable {
+        /// The decoder's rejection.
+        fault: String,
+    },
+    /// Its key is not a segment key of the attempt's group, yet it sits in the range deleted.
+    KeyNotOfGroup,
+    /// The records obligation decodes but is not the fence's `{seg: <own group>}`: it owes another
+    /// group (nothing deletes the attempt's records, X57), or `part:` records as well (X104).
+    NotOfAttempt,
+    /// A segment record of the attempt, with no records obligation there at all to delete it.
+    NoDeleter,
+}
+
+impl std::fmt::Display for SegmentFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChunkInNoPart { chunk } => {
+                let chunk = wyrd_traits::chunk_hex(*chunk);
+                write!(f, "it names chunk {chunk}, held by no readable part")
+            }
+            Self::Undecodable { fault } => write!(f, "it will not decode: {fault}"),
+            Self::KeyNotOfGroup => write!(f, "its key is not a segment key of the attempt"),
+            Self::NotOfAttempt => write!(f, "it does not owe only the attempt's own segments"),
+            Self::NoDeleter => write!(f, "no `retire:records:` obligation is there to delete it"),
+        }
+    }
+}
+
+/// One session the post-restore fence could not fence, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsettledSession {
+    /// Its `mpu:` key, escaped as every name in the report is ([`crate::gc::object_name`]).
+    pub session: String,
+    /// Why the fence left it as read.
+    pub cause: SessionUnsettled,
+}
+
+/// Why the post-restore fence left a session unfenced — byte-identical, with no obligation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionUnsettled {
+    /// Its key names no upload (the staged read names it in [`RestoreReport::unresolvable`]).
+    KeyNamesNoUpload,
+    /// Its value will not decode (ADR-0045); the staged class still protects it by key.
+    ValueUndecodable {
+        /// The decoder's rejection.
+        fault: String,
+    },
+    /// `Open` or `Completing` at `u64::MAX`: every fence bumps the epoch, and there is no next.
+    EpochExhausted,
+    /// Its record changed between the pass's read and the fence's commit.
+    ChangedUnderPass,
+    /// An obligation key was already taken (`require_absent`, `0016:369-373`): never retried.
+    ObligationKeyTaken {
+        /// The taken key, escaped.
+        key: String,
+    },
+    /// The commit lost a conflict whose cause a re-read no longer finds.
+    LostConflict,
+}
+
+impl std::fmt::Display for SessionUnsettled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KeyNamesNoUpload => write!(f, "its key names no upload"),
+            Self::ValueUndecodable { fault } => write!(f, "its value will not decode: {fault}"),
+            Self::EpochExhausted => write!(f, "it is at the last epoch, with no next"),
+            Self::ChangedUnderPass => write!(f, "it changed after the pass read it"),
+            Self::ObligationKeyTaken { key } => write!(f, "its obligation key {key} is taken"),
+            Self::LostConflict => write!(f, "its commit lost a conflict a re-read cannot explain"),
+        }
+    }
 }
 
 impl RestoreReport {
@@ -187,15 +328,22 @@ impl RestoreReport {
     /// finish?
     ///
     /// The strict superset of [`Self::needs_human`]: it also counts the work this pass DID
-    /// (fragments marked collectable) and the work the repair loop will do (under-replicated
-    /// chunks), neither of which is a human's. Written **in terms of** that predicate rather
-    /// than beside it, so the two cannot drift as fields are added.
+    /// (fragments marked collectable), the work the repair loop will do (under-replicated
+    /// chunks), and the [untrusted staged records](RestoreReport::staged_untrusted) it held chunks
+    /// over, none of which is a human's. Written **in terms of** that predicate rather than
+    /// beside it, so the two cannot drift as fields are added.
+    /// A [fenced session](RestoreReport::sessions_fenced) is work this pass DID, too.
     ///
     /// An [unresolvable object](RestoreReport::unresolvable) counts: "clean" is a claim about a
     /// reading that FINISHED, and this one did not — so a store the pass could only partly read
-    /// is never certified clean (`docs/principles.md` §5 C-1).
+    /// is never certified clean (`docs/principles.md` §5 C-1). An untrusted staged record counts
+    /// on the same ground: the pass could not tell where that chunk's fragments are.
     pub fn is_clean(&self) -> bool {
-        self.stranded_marked == 0 && self.under_replicated.is_empty() && !self.needs_human()
+        self.stranded_marked == 0
+            && self.sessions_fenced == 0
+            && self.under_replicated.is_empty()
+            && self.staged_untrusted.is_empty()
+            && !self.needs_human()
     }
 
     /// Does this run need a **human** — the question `wyrd custodian --reconcile-after-restore`
@@ -209,11 +357,29 @@ impl RestoreReport {
     /// a restore script on either would train an operator to ignore the status. It lives on the
     /// report rather than in the command because a caller that never prints the summary still
     /// needs the same verdict, and would otherwise re-derive it slightly differently.
+    ///
+    /// A session the fence could not fence counts — nothing stops it publishing — and one it
+    /// fenced does not: that is this pass's job; unless its segment records need a human
+    /// ([`RestoreReport::segments_unaccounted`]).
+    ///
+    /// **A deliberate exception to that rule:** an untrusted staged record
+    /// ([`RestoreReport::staged_untrusted`]) is left out, although no loop removes one yet
+    /// (whether the retire drain does is #659's call). It rests on the human's decision at #664's
+    /// plan revision (2026-09-18), not on the rule above: once the session is fenced its staged
+    /// bytes are garbage whatever the record says, so what is left is cleanup — automatic work,
+    /// not a judgement — and keep-on-doubt protects user data, not system residue (#811). Its
+    /// condition is that fence (#841, #842); until then the session is still `Open`, a window no
+    /// production client reaches, since none can create a session before #508, which lands after
+    /// it. The record is still named, and the run is not [clean](Self::is_clean): a damaged staged
+    /// record points at a bug or corruption and blocks every drain in the cluster, so the operator
+    /// should hear of it at restore time rather than when a drain stalls.
     pub fn needs_human(&self) -> bool {
         !self.dangling.is_empty()
             || !self.misplaced.is_empty()
             || !self.unresolvable.is_empty()
             || !self.pending_unreadable.is_empty()
+            || !self.sessions_unsettled.is_empty()
+            || !self.segments_unaccounted.is_empty()
     }
 }
 
@@ -228,7 +394,10 @@ impl RestoreReport {
 /// 2. every **committed chunk** is checked against the fragments actually present, and those
 ///    that can no longer be read *or rebuilt* are reported as [`RestoreReport::dangling`].
 ///
-/// Deletes nothing. Marks only. Run it with **writers stopped**, after a restore.
+/// Then, last, every session the image holds `Open` or `Completing` is fenced (below).
+///
+/// Deletes nothing: it writes marks and session fences. Run it with **writers stopped**, after a
+/// restore.
 ///
 /// # Staged bytes are never marked
 ///
@@ -241,11 +410,28 @@ impl RestoreReport {
 /// inode while the pass runs leaves it protected by one reading or the other. A staged record the
 /// pass cannot read is named in [`RestoreReport::unresolvable`] and withholds every mark, as an
 /// unreadable committed object does; one it can read but not trust holds its chunk and is named on
-/// the audit seam; a store fault under a staged read fails the pass with an `Err` naming the read.
+/// the audit seam and in [`RestoreReport::staged_untrusted`]; a store fault under a staged read
+/// fails the pass with an `Err` naming the read. What the class keeps is counted
+/// ([`RestoreReport::staged_skipped`]).
 ///
 /// What this covers is the upload records **already durable when the pass read them**. A write or
 /// an upload that starts after that read is not protected by it — the runbook's writers-stopped
 /// rule is what covers that window today (#805).
+///
+/// # Every session the image held `Open` or `Completing` is fenced — last
+///
+/// A resurrected session could be completed over reclaimed bytes (0016 D-B, `0016:717-728`). So
+/// after Pass 3 the pass re-lists `mpu:` in bounded pages and moves each `Open@E` session to
+/// `Aborting@E+1` in **one** commit with its `{session, all}` obligation
+/// ([`wyrd_core::multipart::SessionRecord::open_teardown`]), requiring the bytes it read and the
+/// obligation key absent (`0016:369-373`). What it cannot fence is named, classified once and
+/// never retried ([`RestoreReport::sessions_unsettled`]). A failed commit — an unknown outcome
+/// included, never read as a `Conflict` — ends the pass with that `Err` after the summary records
+/// every count as INCOMPLETE, never clean; the re-run is idempotent.
+///
+/// A `Completing@E` session is fenced the same way, its commit also installing its attempt's
+/// `retire:records:{seg}` ([`SessionRecord::completing_teardown`]), that key required absent too;
+/// the attempt's range is then judged on every run ([`RestoreReport::segments_unaccounted`]).
 ///
 /// # An object it cannot read is CONTAINED, and the run is not certified
 ///
@@ -346,7 +532,7 @@ pub async fn reconcile_after_restore(
     // then, never reaches them at all. Attribution that a later transient fault can swallow is
     // not attribution.
     let mut unreadable = BTreeSet::new();
-    attribute_staged(&staged, &mut unreadable);
+    let staged_untrusted = attribute_staged(&staged, &mut unreadable);
     let referenced = referenced_fragments(ctx.meta).await?;
     attribute_unresolvable(&referenced.unresolvable, &mut unreadable);
     let PendingLedger {
@@ -374,6 +560,7 @@ pub async fn reconcile_after_restore(
         // that class as well, so its hole is this run's hole.
         unresolvable: unreadable.iter().map(|key| object_name(key)).collect(),
         pending_unreadable,
+        staged_untrusted,
         ..Default::default()
     };
     // ONE READING, ONE CONCLUSION. `gc::ReferenceSet::protects` already withholds every fragment
@@ -427,16 +614,17 @@ pub async fn reconcile_after_restore(
         // says so. Otherwise an object committed in the instant between the two reads — absent
         // from `referenced` and present in `committed` — would have its live fragments marked
         // collectable, and GC would take the only copy after the grace window.
-        //
+        if incomplete || referenced.protects(dserver, frag) || appeared.protects(dserver, frag) {
+            continue;
+        }
+
         // And never a fragment the staged class protects: a multipart upload's committed part or
-        // owned staging entry names it, or names its chunk untrustworthily, or a staged record
-        // could not be read. (Staged counters are #664's; such a fragment is skipped uncounted,
-        // as a referenced one is.)
-        if incomplete
-            || referenced.protects(dserver, frag)
-            || appeared.protects(dserver, frag)
-            || staged.protects(dserver, frag)
-        {
+        // owned staging entry names it, or names its chunk untrustworthily (an unreadable staged
+        // record is `incomplete`, above). COUNTED, once, by the FIRST protection that keeps it:
+        // after the committed readings, before the displaced check and the pending lease below
+        // (`RestoreReport::staged_skipped`, `0016:823`).
+        if staged.protects(dserver, frag) {
+            report.staged_skipped += 1;
             continue;
         }
 
@@ -584,8 +772,277 @@ pub async fn reconcile_after_restore(
         }
     }
 
-    emit_summary(&report);
+    // THE SESSION FENCE — after Pass 3, so a fence fault never takes a verdict with it (#651's
+    // class): the summary is emitted first, INCOMPLETE, and is where the counts survive an `Err`.
+    let fenced = fence_open_sessions(ctx.meta, &mut report).await;
+    emit_summary(&report, fenced.is_ok());
+    fenced?;
     Ok(report)
+}
+
+/// The session fence: re-list `mpu:` in bounded pages ([`staged_page`]) and fence each session.
+/// Every read's and commit's await is bounded by the `MetadataStore` implementation (#508/#636).
+// deferred: #843 — seeded Tier-0 DST coverage of this fence (809.5).
+async fn fence_open_sessions(meta: &dyn MetadataStore, report: &mut RestoreReport) -> Result<()> {
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (sessions, next) = staged_page(meta, MPU_PREFIX, after.as_deref()).await?;
+        for (key, value) in &sessions {
+            fence_session(meta, key, value, report).await?;
+        }
+        match (next, sessions.into_iter().last()) {
+            (Some(_), Some((last, _))) => after = Some(last),
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Fence one listed session, or name why not ([`SessionUnsettled`]).
+async fn fence_session(
+    meta: &dyn MetadataStore,
+    key: &[u8],
+    read: &[u8],
+    report: &mut RestoreReport,
+) -> Result<()> {
+    let session = object_name(key);
+    let fence = match plan_fence(key, read) {
+        Ok(Plan::Fence(fence)) => *fence,
+        Ok(Plan::Fenced(upload, group)) => {
+            return recheck_fenced(meta, &session, &upload, &group, report).await;
+        }
+        Ok(Plan::Settled) => return Ok(()),
+        Err(cause) => {
+            unsettled(report, session, cause);
+            return Ok(());
+        }
+    };
+    let keys: Vec<Vec<u8>> = fence
+        .obligations
+        .iter()
+        .map(RetireObligation::key)
+        .collect();
+    let mut batch = WriteBatch::new().require(key.to_vec(), read.to_vec());
+    for obligation in &keys {
+        batch = batch.require_absent(obligation.clone());
+    }
+    batch = batch.put(key.to_vec(), metadata::encode(&fence.session));
+    for (obligation, at) in fence.obligations.iter().zip(&keys) {
+        batch = batch.put(at.clone(), metadata::encode(obligation.payload()));
+    }
+    match meta.commit(batch).await {
+        Ok(CommitOutcome::Committed) => {
+            let named: Vec<String> = keys.iter().map(|at| object_name(at)).collect();
+            emit_session_fenced(&session, fence.session.epoch(), &named.join(" "));
+            report.sessions_fenced += 1;
+            if let Some((upload, group)) = &fence.attempt {
+                check_attempt(meta, &session, upload, group, report).await?;
+            }
+        }
+        Ok(CommitOutcome::Conflict) => {
+            // Which precondition lost is read afresh, once: a token is minted once
+            // (`0016:358-373`), so a taken key is damage a retry cannot settle.
+            let cause = if meta.get(key).await?.as_deref() != Some(read) {
+                SessionUnsettled::ChangedUnderPass
+            } else {
+                let mut cause = SessionUnsettled::LostConflict;
+                for taken in &keys {
+                    if meta.get(taken).await?.is_some() {
+                        let key = object_name(taken);
+                        cause = SessionUnsettled::ObligationKeyTaken { key };
+                        break;
+                    }
+                }
+                cause
+            };
+            unsettled(report, session, cause);
+        }
+        // Never read as a `Conflict`: the outcome may be unknown (`CommitUnknownResult`).
+        Err(fault) => {
+            emit_session_fence_failed(&session, &fault.to_string());
+            return Err(fault);
+        }
+    }
+    Ok(())
+}
+
+/// What the fence does with one listed session ([`plan_fence`]).
+enum Plan {
+    /// Commit this fence.
+    Fence(Box<Fence>),
+    /// `Aborting@E'`: nothing to write, but see [`recheck_fenced`] for its own group at `E'-1`.
+    Fenced(UploadId, SegmentGroup),
+    /// `Completed`, or `Aborting@0`: it can no longer publish, and no attempt is owed.
+    Settled,
+}
+
+/// One session's teardown, and for a `Completing` one the attempt to check once it lands.
+struct Fence {
+    session: SessionRecord,
+    obligations: Vec<RetireObligation>,
+    attempt: Option<(UploadId, SegmentGroup)>,
+}
+
+/// What to do with the session read as (`key`, `read`), or why it cannot be fenced.
+fn plan_fence(key: &[u8], read: &[u8]) -> std::result::Result<Plan, SessionUnsettled> {
+    let upload = parse_mpu_key(key).map_err(|_| SessionUnsettled::KeyNamesNoUpload)?;
+    let record = decode_session_record(read).map_err(|fault| {
+        let fault = fault.to_string();
+        SessionUnsettled::ValueUndecodable { fault }
+    })?;
+    let fence = match record.state() {
+        SessionState::Open {} => record.open_teardown(&upload).map(|teardown| Fence {
+            session: teardown.session().clone(),
+            obligations: vec![teardown.obligation().clone()],
+            attempt: None,
+        }),
+        SessionState::Completing { .. } => {
+            let group = record.attempt_segment_group();
+            let teardown = record.completing_teardown(&upload);
+            teardown.zip(group).map(|(teardown, group)| Fence {
+                session: teardown.session().clone(),
+                obligations: vec![teardown.bytes().clone(), teardown.records().clone()],
+                attempt: Some((upload, group)),
+            })
+        }
+        SessionState::Aborting {} => {
+            let Some(attempt) = record.epoch().checked_sub(1) else {
+                return Ok(Plan::Settled);
+            };
+            let group = SegmentGroup::from_nonce(record.segment_nonce().clone(), attempt);
+            return Ok(Plan::Fenced(upload, group));
+        }
+        SessionState::Completed { .. } => return Ok(Plan::Settled),
+    };
+    let fence = fence.ok_or(SessionUnsettled::EpochExhausted)?;
+    Ok(Plan::Fence(Box::new(fence)))
+}
+
+/// Name a session the fence could not fence, on the audit seam and in the report.
+fn unsettled(report: &mut RestoreReport, session: String, cause: SessionUnsettled) {
+    emit_session_unsettled(&session, &cause);
+    report
+        .sessions_unsettled
+        .push(UnsettledSession { session, cause });
+}
+
+/// Re-check the attempt (`group`, the session's own at `E'-1`) of an `Aborting@E'` session, so a
+/// re-run names it again. Its deleter is `retire:records:s:<id>:<E'-1>`, filed by a `Completing`
+/// fence, and trusted only if it owes `group` and nothing else: any other is the first record at
+/// fault. Its absence proves nothing (a damaged or hand-repaired store): the range must be empty.
+// deferred: #659 — a retire drain may delete part of this range, or the parts it is checked
+// against, between two runs; a half-drained range can then read as chunks no part holds, or,
+// its obligation dropped first, as records with no deleter.
+async fn recheck_fenced(
+    meta: &dyn MetadataStore,
+    session: &str,
+    upload: &UploadId,
+    group: &SegmentGroup,
+    report: &mut RestoreReport,
+) -> Result<()> {
+    let (upload_id, epoch, part) = (upload.clone(), group.epoch(), None);
+    let token = RetireToken::Session {
+        upload_id,
+        epoch,
+        part,
+    };
+    let key = retire_key(RetireMode::Records, &token);
+    let Some(value) = meta.get(&key).await? else {
+        let (left, _) = staged_page(meta, &seg_range_prefix(group), None).await?;
+        if let Some((first, _)) = left.first() {
+            unaccounted(report, session, object_name(first), SegmentFault::NoDeleter);
+        }
+        return Ok(());
+    };
+    let fault = match decode_retire_obligation(&key, &value) {
+        Ok((_, _, owed)) if owed.segments() == Some(group) && owed.parts().is_none() => {
+            return check_attempt(meta, session, upload, group, report).await;
+        }
+        Ok(_) => SegmentFault::NotOfAttempt,
+        Err(fault) => SegmentFault::Undecodable {
+            fault: fault.to_string(),
+        },
+    };
+    unaccounted(report, session, object_name(&key), fault);
+    Ok(())
+}
+
+/// Read a fenced attempt's `seg:` range (frozen: a segment write requires `Completing@E`) in bounded
+/// pages ([`staged_page`]), and name the session at its first faulty record.
+async fn check_attempt(
+    meta: &dyn MetadataStore,
+    session: &str,
+    upload: &UploadId,
+    group: &SegmentGroup,
+    report: &mut RestoreReport,
+) -> Result<()> {
+    let range = seg_range_prefix(group);
+    let (mut page, mut next) = staged_page(meta, &range, None).await?;
+    if page.is_empty() {
+        return Ok(());
+    }
+    let held = part_chunks(meta, upload).await?;
+    loop {
+        for (key, value) in &page {
+            if let Some(fault) = segment_fault(key, value, &held) {
+                unaccounted(report, session, object_name(key), fault);
+                return Ok(());
+            }
+        }
+        let after = match (next, page.last()) {
+            (Some(_), Some((last, _))) => last.clone(),
+            _ => return Ok(()),
+        };
+        (page, next) = staged_page(meta, &range, Some(&after)).await?;
+    }
+}
+
+/// What is wrong with one record under the attempt's range, if anything. The range is the group's
+/// own `seg:<nonce>:<E>:`, so a key there that parses is one of the group's.
+fn segment_fault(key: &[u8], value: &[u8], held: &HashSet<ChunkId>) -> Option<SegmentFault> {
+    if parse_seg_key(key).is_err() {
+        return Some(SegmentFault::KeyNotOfGroup);
+    }
+    match metadata::decode::<SegmentRecord>(value) {
+        Ok(segment) => segment
+            .chunks()
+            .iter()
+            .find(|chunk| !held.contains(&chunk.id))
+            .map(|chunk| SegmentFault::ChunkInNoPart { chunk: chunk.id }),
+        Err(fault) => Some(SegmentFault::Undecodable {
+            fault: fault.to_string(),
+        }),
+    }
+}
+
+/// Every chunk a `part:` record of `upload` holds. One that will not decode is skipped (the staged
+/// read names it): it can only make a chunk look held by no part, naming the session.
+async fn part_chunks(meta: &dyn MetadataStore, upload: &UploadId) -> Result<HashSet<ChunkId>> {
+    let (range, mut held) = (part_range(upload), HashSet::new());
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (page, next) = staged_page(meta, &range, after.as_deref()).await?;
+        for (key, value) in &page {
+            if let Ok(part) = parse_part_key(key).and_then(|_| decode_part_record(value)) {
+                held.extend(part.chunks().iter().map(|chunk| chunk.id));
+            }
+        }
+        match (next, page.into_iter().last()) {
+            (Some(_), Some((last, _))) => after = Some(last),
+            _ => return Ok(held),
+        }
+    }
+}
+
+/// Name a fenced session whose attempt needs a human, on the audit seam and in the report.
+fn unaccounted(report: &mut RestoreReport, session: &str, record: String, fault: SegmentFault) {
+    let session = session.to_owned();
+    let found = UnaccountedSegments {
+        session,
+        record,
+        fault,
+    };
+    emit_segments_unaccounted(&found);
+    report.segments_unaccounted.push(found);
 }
 
 /// A committed chunk's reconstruction threshold and where its fragments are meant to live.
@@ -808,22 +1265,25 @@ fn attribute_unresolvable(faults: &BTreeMap<Vec<u8>, String>, named: &mut BTreeS
 ///
 /// An unreadable staged record joins `named`, so it is reported in
 /// [`RestoreReport::unresolvable`] beside the committed objects and withholds every mark. A record
-/// it read but cannot trust holds its chunk (the mark gate skips every fragment bearing its id) and
-/// is named on the audit seam only.
-fn attribute_staged(staged: &StagedSet, named: &mut BTreeSet<Vec<u8>>) {
+/// it read but cannot trust holds its chunk (the mark gate skips every fragment bearing its id), is
+/// named on the audit seam, and is returned, once per record, for
+/// [`RestoreReport::staged_untrusted`].
+fn attribute_staged(staged: &StagedSet, named: &mut BTreeSet<Vec<u8>>) -> Vec<String> {
     for (record, fault) in &staged.unresolvable {
         if named.insert(record.clone()) {
             emit_unresolvable_staged(&object_name(record), fault);
         }
     }
-    // deferred: #664 — whether a held (untrusted) staged record also needs a human, and so sets
-    // `RestoreReport::needs_human`, is that slice's, with restore's staged counters. Until then it
-    // is named here and holds its chunk, and the report's verdict is unchanged by it.
+    // Named in the report too (not clean, and no human: `RestoreReport::needs_human` says why).
+    // By record, not chunk: one part record may hold several chunks.
+    let mut untrusted = BTreeSet::new();
     for (&chunk, records) in &staged.held {
         for (record, fault) in records {
             emit_untrusted_staged(&object_name(record), chunk, fault);
+            untrusted.insert(record.as_slice());
         }
     }
+    untrusted.into_iter().map(object_name).collect()
 }
 
 /// How many fragments must survive for this chunk to be rebuildable: `k` under
@@ -1013,35 +1473,99 @@ fn emit_untrusted_staged(record: &str, chunk: ChunkId, fault: &str) {
     );
 }
 
+/// A session fenced to `Aborting@epoch` with its obligation, once that commit landed.
+fn emit_session_fenced(session: &str, epoch: u64, obligation: &str) {
+    tracing::info!(monotonic_counter.restore_sessions_fenced = 1_u64);
+    tracing::info!(
+        target: "wyrd.custodian.restore.audit",
+        action = "session-fenced",
+        session = %session,
+        epoch,
+        obligation = %obligation,
+        "post-restore: an Open or Completing upload session is fenced to Aborting with the \
+         obligations owing its records; it can no longer be completed",
+    );
+}
+
+/// A fenced session whose attempt's segment records need a human. Operator signal.
+fn emit_segments_unaccounted(found: &UnaccountedSegments) {
+    tracing::warn!(monotonic_counter.restore_segments_unaccounted = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "session-segments-unaccounted",
+        session = %found.session,
+        record = %found.record,
+        fault = %found.fault,
+        "post-restore: a fenced upload session's segment records, or the retirement obligation \
+         owing them, include a record nothing accounts for — NEEDS-HUMAN",
+    );
+}
+
+/// A session the fence could **not** fence, and why — left as read. Operator signal.
+fn emit_session_unsettled(session: &str, cause: &SessionUnsettled) {
+    tracing::warn!(monotonic_counter.restore_sessions_unsettled = 1_u64);
+    tracing::warn!(
+        target: "wyrd.custodian.restore.audit",
+        action = "session-unsettled",
+        session = %session,
+        cause = %cause,
+        "post-restore: could not fence an upload session; it is left as read — NEEDS-HUMAN",
+    );
+}
+
+/// A fence commit that answered `Err` (its outcome possibly unknown): nothing is claimed for it.
+fn emit_session_fence_failed(session: &str, fault: &str) {
+    tracing::error!(
+        target: "wyrd.custodian.restore.audit",
+        action = "session-fence-failed",
+        session = %session,
+        fault = %fault,
+        "post-restore: a session's fence commit failed, landed or not; the pass stops — re-run it",
+    );
+}
+
 /// The pass's own verdict, so a restore's true cost lands in one line an operator can read.
 ///
-/// It says **complete** only when the reading finished. Over a store with an unreadable
-/// committed or staged record in it the same line would otherwise be the certification the rest
-/// of this pass refuses to give, in the one place an operator greps for it.
-fn emit_summary(report: &RestoreReport) {
+/// It says **complete** only when the reading finished and the session fence did. Over a store
+/// with an unreadable committed or staged record in it the same line would otherwise be the
+/// certification the rest of this pass refuses to give, in the one place an operator greps for
+/// it. It is emitted even when a fence commit failed: it is the only record of some counts.
+fn emit_summary(report: &RestoreReport, fence_finished: bool) {
+    const PARTIAL_READ: &str = "every count above covers only the records this pass could read";
+    const FENCE_CUT: &str =
+        "the session fence did not finish, and the pass returns an error — re-run it";
     tracing::info!(
         target: "wyrd.custodian.restore.audit",
         action = "summary",
         stranded_marked = report.stranded_marked,
         already_marked = report.already_marked,
         pending_skipped = report.pending_skipped,
+        staged_skipped = report.staged_skipped,
         pending_unreadable = report.pending_unreadable.len(),
+        staged_untrusted = report.staged_untrusted.len(),
         displaced_kept = report.displaced_kept,
         dangling = report.dangling.len(),
         misplaced = report.misplaced.len(),
         under_replicated = report.under_replicated.len(),
+        sessions_fenced = report.sessions_fenced,
+        sessions_unsettled = report.sessions_unsettled.len(),
+        segments_unaccounted = report.segments_unaccounted.len(),
+        fence_finished,
         // The qualifier on every count above: they are drawn over the records this pass could
         // read, and this is how many it could not.
         unresolvable = report.unresolvable.len(),
         // The pass's own two-word verdict, so the predicate the report offers its callers is the
-        // one its audit trail states rather than a third rendering of the same fields.
-        clean = report.is_clean(),
-        needs_human = report.needs_human(),
+        // one its audit trail states rather than a third rendering of the same fields — except
+        // that a fence cut short may have left an `Open` session live, which no partial report
+        // can call clean and only a human's re-run settles.
+        clean = fence_finished && report.is_clean(),
+        needs_human = !fence_finished || report.needs_human(),
         "post-restore reconciliation {}",
-        if report.unresolvable.is_empty() {
-            "complete"
-        } else {
-            "INCOMPLETE — every count above covers only the records this pass could read"
+        match (report.unresolvable.is_empty(), fence_finished) {
+            (true, true) => "complete".to_owned(),
+            (false, true) => format!("INCOMPLETE — {PARTIAL_READ}"),
+            (true, false) => format!("INCOMPLETE — {FENCE_CUT}"),
+            (false, false) => format!("INCOMPLETE — {PARTIAL_READ}; and {FENCE_CUT}"),
         },
     );
 }

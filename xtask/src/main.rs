@@ -2,11 +2,23 @@
 //! laptop and in CI (ADR-0016, ADR-0009).
 //!
 //! Subcommands:
-//! - `ci` — typos + docs lint/render (the prose gates, #598), then fmt, clippy,
+//! - `ci` — typos + docs lint/render (the prose gates, #598), the repo-hygiene
+//!   guards (`xtask::repo_guard::CI_GUARDS`: no stray gitlinks, `forbid(unsafe_code)`
+//!   in every crate root, no `wyrd-*` crate in `wyrd-validate`'s normal dependency
+//!   closure), then fmt, clippy,
 //!   build, test, cargo-machete, cargo-deny, conformance,
 //!   and the madsim DST tier; the single gate CI calls. The clippy/warnings
 //!   levels come from `[workspace.lints]` in the root Cargo.toml (single source
 //!   of truth), so no `-D warnings` flag is passed here.
+//! - `ci-dry-run [--workspace DIR]` — the part of `ci` between the prose gates
+//!   and `cargo-machete`, over the workspace at DIR (default: this one): the
+//!   repo-hygiene guards run for real, the cargo steps after them are only
+//!   printed. Same wiring as `ci`, so a guard failure stops it the same way.
+//! - `blackbox-guard [--metadata FILE]` — the #775 guard on its own (proposal
+//!   0017 §9): `wyrd-validate`'s normal dependency closure, under every
+//!   feature, holds no `wyrd-*` crate. With no argument it checks this
+//!   workspace exactly as `ci` does; `--metadata` scans a saved `cargo
+//!   metadata` document.
 //! - `conformance` — run the `chunk-format` reader against the committed
 //!   conformance vectors.
 //! - `dst` — run the madsim commit-protocol tests (`wyrd-dst`) under
@@ -105,6 +117,14 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1);
     let result = match task.as_deref() {
         Some("ci") => run_ci(),
+        Some("ci-dry-run") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            run_ci_dry_run_cmd(&rest)
+        }
+        Some("blackbox-guard") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            run_blackbox_guard_cmd(&rest)
+        }
         Some("conformance") => run_conformance(),
         Some("gen-vectors") => run_gen_vectors(),
         Some("dst") => run_dst(),
@@ -151,7 +171,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|consistency-run|etcd-conformance|deploy-small-multi-node|dist|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|ci-dry-run|blackbox-guard|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|consistency-run|etcd-conformance|deploy-small-multi-node|dist|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
     );
 }
 
@@ -1369,16 +1389,16 @@ fn run_orchestrator_guard() -> Result<(), String> {
 /// caught by review each time — the "found twice becomes a gate" rule. Runs
 /// the SAME scan `xtask/tests/repo_hygiene_guards.rs` drives over planted
 /// index listings (`xtask::repo_guard::scan_gitlinks`) — one guard, two call
-/// sites.
-fn run_gitlink_guard() -> Result<(), String> {
+/// sites. Reads the index of the repository at `root` (`run_ci` passes this
+/// workspace).
+fn run_gitlink_guard(root: &Path) -> Result<(), String> {
     print_step(&["xtask", "gitlink-guard", "(#616 no stray gitlinks)"]);
-    let root = workspace_root();
     // `-z`: NUL-delimited raw paths — the newline form C-quotes non-ASCII
     // paths under the default `core.quotePath`, which would let a quoted
     // `.claude/worktrees/…` entry dodge the prefix check.
     let output = Command::new("git")
         .args(["ls-files", "-s", "-z"])
-        .current_dir(&root)
+        .current_dir(root)
         .output()
         .map_err(|e| format!("gitlink-guard: failed to spawn git: {e}"))?;
     if !output.status.success() {
@@ -1404,7 +1424,7 @@ fn run_gitlink_guard() -> Result<(), String> {
                 "--get-regexp",
                 r"^submodule\..*\.(path|url)$",
             ])
-            .current_dir(&root)
+            .current_dir(root)
             .output()
             .map_err(|e| format!("gitlink-guard: failed to spawn git config: {e}"))?;
         // Exit 1 with empty output = no matches (a .gitmodules with no path
@@ -1439,8 +1459,9 @@ fn run_gitlink_guard() -> Result<(), String> {
 /// (`metadata-fdb` holds the sole FFI-motivated `deny` exception — see
 /// `xtask::repo_guard::UNSAFE_FORBID_ALLOWLIST`). The convention held by
 /// habit until the two newest crates shipped without the attribute; this
-/// makes it load-bearing. Same scan the fixture test drives.
-fn run_unsafe_forbid_guard() -> Result<(), String> {
+/// makes it load-bearing. Same scan the fixture test drives. Checks the cargo
+/// workspace at `root` (`run_ci` passes this workspace).
+fn run_unsafe_forbid_guard(root: &Path) -> Result<(), String> {
     print_step(&[
         "xtask",
         "unsafe-guard",
@@ -1448,10 +1469,9 @@ fn run_unsafe_forbid_guard() -> Result<(), String> {
     ]);
     // Authoritative target list from cargo itself: manifest `path` overrides
     // and unconventional layouts cannot hide a root from the scan (#616).
-    let root = workspace_root();
     let meta = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(&root)
+        .current_dir(root)
         .output()
         .map_err(|e| format!("unsafe-guard: failed to spawn cargo metadata: {e}"))?;
     if !meta.status.success() {
@@ -1463,7 +1483,7 @@ fn run_unsafe_forbid_guard() -> Result<(), String> {
     }
     let metadata = String::from_utf8_lossy(&meta.stdout);
     let roots = xtask::repo_guard::target_src_paths(&metadata)?;
-    let mut violations = xtask::repo_guard::scan_roots(&roots, &root)?;
+    let mut violations = xtask::repo_guard::scan_roots(&roots, root)?;
     // A crate under `crates/` that is missing from `[workspace] members` never
     // reaches metadata, so the scan above would pass over it silently.
     violations.extend(xtask::repo_guard::unregistered_manifests(
@@ -1483,11 +1503,88 @@ fn run_unsafe_forbid_guard() -> Result<(), String> {
     }
 }
 
-/// The ordered `cargo` steps of the CI gate, executed via the injected `exec`
-/// (`run_ci` passes `cargo`; the unit test passes a recording closure so the real
-/// wiring is exercised without spawning `cargo`).
+/// Run one repo-hygiene guard for real over the workspace at `root` — the
+/// dispatch every guard step of the gate goes through ([`run_ci_steps_in`]).
+/// The `match` is exhaustive, so a guard added to
+/// `xtask::repo_guard::CI_GUARDS` does not compile until it has a body here.
+fn run_ci_guard(guard: xtask::repo_guard::CiGuard, root: &Path) -> Result<(), String> {
+    use xtask::repo_guard::CiGuard;
+    match guard {
+        CiGuard::Gitlink => run_gitlink_guard(root),
+        CiGuard::UnsafeForbid => run_unsafe_forbid_guard(root),
+        CiGuard::BlackboxClosure => run_blackbox_guard(root),
+    }
+}
+
+/// The step banner the blackbox guard prints.
+const BLACKBOX_STEP: [&str; 3] = [
+    "xtask",
+    "blackbox-guard",
+    "(#775 wyrd-validate links no wyrd-* crate)",
+];
+
+/// #775: nothing that ships in the `wyrd-validate` binary reaches a Wyrd
+/// workspace crate (proposal 0017 §9) — the property that keeps the blackbox
+/// validator's verdict from being Wyrd's types checked against Wyrd's types.
+/// It held only by a manifest comment until this gate. Reads the workspace at
+/// `root` through `xtask::repo_guard::blackbox_metadata` (`cargo metadata
+/// --locked --all-features`) and runs the same scan the fixture tests drive.
+fn run_blackbox_guard(root: &Path) -> Result<(), String> {
+    print_step(&BLACKBOX_STEP);
+    blackbox_verdict(&xtask::repo_guard::blackbox_metadata(root)?)
+}
+
+/// The blackbox guard's verdict over one `cargo metadata` document: `Ok` when
+/// `xtask::repo_guard::scan_blackbox_closure` finds nothing, otherwise an `Err`
+/// listing every violation (or the scan's own fail-closed error).
+fn blackbox_verdict(metadata: &str) -> Result<(), String> {
+    let violations = xtask::repo_guard::scan_blackbox_closure(metadata)?;
+    if violations.is_empty() {
+        println!(
+            "xtask blackbox-guard: wyrd-validate's normal dependency closure holds no wyrd-* \
+             crate (#775)"
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "the blackbox validator reaches a Wyrd crate (#775, proposal 0017 §9) — its verdict \
+             would check Wyrd against Wyrd's own types. Only a dev-dependency may name a \
+             wyrd-* crate:\n  {}",
+            violations.join("\n  ")
+        ))
+    }
+}
+
+/// `cargo xtask blackbox-guard [--metadata FILE]`: the #775 guard on its own.
+/// No argument checks this workspace through the same dispatch the gate uses;
+/// `--metadata` scans a saved `cargo metadata` document instead, which is how
+/// `xtask/tests/blackbox_dependency_guard.rs` plants the graphs the guard must
+/// refuse without committing the dependency it forbids.
+fn run_blackbox_guard_cmd(args: &[String]) -> Result<(), String> {
+    match args {
+        [] => run_ci_guard(
+            xtask::repo_guard::CiGuard::BlackboxClosure,
+            &workspace_root(),
+        ),
+        [flag, file] if flag == "--metadata" => {
+            print_step(&BLACKBOX_STEP);
+            let metadata = std::fs::read_to_string(file)
+                .map_err(|e| format!("blackbox-guard: cannot read {file}: {e}"))?;
+            blackbox_verdict(&metadata)
+        }
+        _ => Err("usage: cargo xtask blackbox-guard [--metadata FILE]".to_string()),
+    }
+}
+
+/// The ordered steps of the CI gate that follow the prose gates: first the
+/// repo-hygiene guards in `xtask::repo_guard::CI_GUARDS` order, through the
+/// injected `guard`, then the `cargo` steps, through the injected `exec`. The
+/// first error stops the run, so a failing guard means no cargo step runs.
+/// Production callers reach it through [`run_ci_steps_in`], which supplies
+/// the real guards; the unit tests pass recording closures, so the wiring is
+/// exercised without spawning `git` or `cargo`.
 ///
-/// `toolchain` is the injected **environment lookup** — `run_ci` passes
+/// `toolchain` is the injected **environment lookup** — `run_ci_steps_in` passes
 /// `std::env::var_os(..).is_some()`; the unit test passes a fixed set of declared
 /// names. Reading the two feature gates *here*, by name
 /// (`xtask::TIKV_TOOLCHAIN_ENV`, `xtask::FDB_TOOLCHAIN_ENV`), rather than accepting
@@ -1505,8 +1602,16 @@ fn run_unsafe_forbid_guard() -> Result<(), String> {
 /// `xtask/tests/fdb_harness.rs` can assert its content directly.
 fn run_ci_steps(
     toolchain: &mut dyn FnMut(&str) -> bool,
+    guard: &mut dyn FnMut(xtask::repo_guard::CiGuard) -> Result<(), String>,
     exec: &mut dyn FnMut(&[&str]) -> Result<(), String>,
 ) -> Result<(), String> {
+    // The repo-hygiene guards first (#616, #775): sub-second, and their failure
+    // modes (a committed worktree gitlink, a crate root missing the unsafe-code
+    // attribute, a `wyrd-*` crate in the blackbox validator's dependency
+    // closure) should surface before a multi-minute build, not after.
+    for &check in xtask::repo_guard::CI_GUARDS {
+        guard(check)?;
+    }
     // `wyrd-dst` only compiles under `--cfg madsim`; it is excluded from the
     // normal workspace commands and built solely by `run_dst`.
     exec(&["fmt", "--all", "--", "--check"])?;
@@ -1543,6 +1648,24 @@ fn run_ci_steps(
     Ok(())
 }
 
+/// [`run_ci_steps`] over the workspace at `root` with the REAL guards: each
+/// `xtask::repo_guard::CI_GUARDS` entry runs through [`run_ci_guard`] against
+/// `root`, and the cargo steps go to `exec`. `run_ci` calls this with this
+/// workspace and `cargo`; `cargo xtask ci-dry-run` calls it with any workspace
+/// and a printing `exec`. That is the only difference, so dry-running a
+/// workspace that holds a forbidden dependency exercises the exact guard
+/// dispatch the gate uses (#775).
+fn run_ci_steps_in(
+    root: &Path,
+    exec: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    run_ci_steps(
+        &mut |name| std::env::var_os(name).is_some(),
+        &mut |guard| run_ci_guard(guard, root),
+        exec,
+    )
+}
+
 /// The full CI gate (ADR-0009). Each step runs in workspace order; the first
 /// failure stops the run.
 fn run_ci() -> Result<(), String> {
@@ -1551,14 +1674,11 @@ fn run_ci() -> Result<(), String> {
     // failing on. Fail fast before the expensive clippy/build/test.
     typos_check()?;
     docs_check()?;
-    // The repo-hygiene guards next (#616): also sub-second, and their failure
-    // modes (a committed worktree gitlink, a crate root missing the unsafe-code
-    // attribute) should surface before a multi-minute build, not after.
-    run_gitlink_guard()?;
-    run_unsafe_forbid_guard()?;
-    run_ci_steps(&mut |name| std::env::var_os(name).is_some(), &mut |args| {
-        cargo(args)
-    })?;
+    // Then the repo-hygiene guards (#616, #775) and the cargo steps. The guards
+    // run INSIDE `run_ci_steps_in`, from the lib-side
+    // `xtask::repo_guard::CI_GUARDS` list, so `cargo xtask ci-dry-run` and the
+    // recording-executor tests see every guard the gate runs.
+    run_ci_steps_in(&workspace_root(), &mut |args| cargo(args))?;
     cargo_machete_check()?;
     cargo_deny_check()?;
     run_conformance()?;
@@ -1566,6 +1686,29 @@ fn run_ci() -> Result<(), String> {
     run_orchestrator_guard()?;
     run_dst()?;
     println!("\nxtask ci: all checks passed");
+    Ok(())
+}
+
+/// `cargo xtask ci-dry-run [--workspace DIR]`: the gate's guard-and-cargo
+/// phase ([`run_ci_steps_in`]) over the workspace at DIR (default: this
+/// one). The repo-hygiene guards run for real; the cargo steps are only
+/// printed. A failing guard stops the run before the first cargo step, just
+/// as it stops `cargo xtask ci`. `xtask/tests/blackbox_dependency_guard.rs`
+/// dry-runs planted workspaces to show the gate itself refusing a forbidden
+/// dependency (#775).
+fn run_ci_dry_run_cmd(args: &[String]) -> Result<(), String> {
+    let root = match args {
+        [] => workspace_root(),
+        [flag, dir] if flag == "--workspace" => std::fs::canonicalize(dir)
+            .map_err(|e| format!("ci-dry-run: cannot open workspace {dir}: {e}"))?,
+        _ => return Err("usage: cargo xtask ci-dry-run [--workspace DIR]".to_string()),
+    };
+    println!("xtask ci-dry-run: {}", root.display());
+    run_ci_steps_in(&root, &mut |args| {
+        println!("dry-run: would run `cargo {}`", args.join(" "));
+        Ok(())
+    })?;
+    println!("\nxtask ci-dry-run: every repo-hygiene guard passed");
     Ok(())
 }
 
@@ -1959,13 +2102,87 @@ mod tests {
     // resolves both gates from this lookup ITSELF, reading `WYRD_TIKV_TOOLCHAIN` where it
     // should read `WYRD_FDB_TOOLCHAIN` (the #439 coupling hazard) is visible here.
     fn recorded_invocations(declared: &[&str]) -> Vec<String> {
-        let mut calls = Vec::new();
-        run_ci_steps(&mut |name| declared.contains(&name), &mut |args| {
-            calls.push(args.join(" "));
-            Ok(())
-        })
-        .expect("recording executor never errors");
-        calls
+        recorded_steps(declared)
+            .into_iter()
+            .filter_map(|step| step.strip_prefix("cargo ").map(str::to_string))
+            .collect()
+    }
+
+    // Drive `run_ci_steps` with recording executors: every step, guards included,
+    // in order — a guard as `guard <CiGuard>`, a cargo invocation as `cargo
+    // <args>`. `failing` names the guard whose executor returns `Err`, as a real
+    // guard does on a violation; the run's result comes back with the steps.
+    fn recorded_run(
+        declared: &[&str],
+        failing: Option<xtask::repo_guard::CiGuard>,
+    ) -> (Result<(), String>, Vec<String>) {
+        let steps = RefCell::new(Vec::new());
+        let result = run_ci_steps(
+            &mut |name| declared.contains(&name),
+            &mut |guard| {
+                steps.borrow_mut().push(format!("guard {guard:?}"));
+                if failing == Some(guard) {
+                    Err(format!("{guard:?} found a violation"))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |args| {
+                steps.borrow_mut().push(format!("cargo {}", args.join(" ")));
+                Ok(())
+            },
+        );
+        (result, steps.into_inner())
+    }
+
+    fn recorded_steps(declared: &[&str]) -> Vec<String> {
+        let (result, steps) = recorded_run(declared, None);
+        result.expect("recording executors never error");
+        steps
+    }
+
+    // #775: the repo-hygiene guards run INSIDE the gate's wiring, every one of
+    // `CI_GUARDS`, before the first cargo step. Drives `run_ci_steps` itself (the
+    // function `run_ci` reaches through `run_ci_steps_in`), so deleting the guard
+    // loop, dropping the blackbox guard from the lib-side list, or moving the
+    // guards after the multi-minute build flips this red — the "defined, tested,
+    // never called" hazard.
+    #[test]
+    fn ci_runs_every_repo_guard_before_the_cargo_steps() {
+        let steps = recorded_steps(&[]);
+        let head: Vec<&str> = steps.iter().map(String::as_str).take(4).collect();
+        assert_eq!(
+            head,
+            [
+                "guard Gitlink",
+                "guard UnsafeForbid",
+                "guard BlackboxClosure",
+                "cargo fmt --all -- --check",
+            ],
+            "{steps:?}"
+        );
+    }
+
+    // #775: a guard's `Err` is the gate's `Err`, and nothing runs after it — not
+    // swallowed, not deferred until after the build.
+    #[test]
+    fn a_failing_guard_stops_ci_before_any_cargo_step() {
+        use xtask::repo_guard::CiGuard;
+        let (result, steps) = recorded_run(&[], Some(CiGuard::BlackboxClosure));
+        assert_eq!(
+            result,
+            Err("BlackboxClosure found a violation".to_string()),
+            "{steps:?}"
+        );
+        assert_eq!(
+            steps,
+            [
+                "guard Gitlink",
+                "guard UnsafeForbid",
+                "guard BlackboxClosure"
+            ],
+            "no step may run after a failing guard"
+        );
     }
 
     // The feature list is matched EXACTLY (`--features <list> `, trailing space), not by
