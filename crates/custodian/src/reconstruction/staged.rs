@@ -366,7 +366,6 @@ pub(super) async fn assess(
             destinations,
             next,
         }),
-        chunk_index: site.index,
         chunk_id: chunk,
         k,
         m,

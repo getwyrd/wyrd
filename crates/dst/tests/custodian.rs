@@ -2760,7 +2760,8 @@ impl MetadataStore for HandoffMeta {
 fn handoff_session(state: &str) -> Bytes {
     let bytes = format!(
         "{{\"parent\":{ROOT},\"object\":\"{HANDOFF_OBJECT}\",\"created_at_millis\":100,\
-         \"clock_source\":\"wall\",\"epoch\":1,\"attempts\":1,\"state\":{state}}}"
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":1,\"attempts\":1,\"state\":{state}}}"
     )
     .into_bytes();
     decode_session_record(&bytes).expect("the seeded session record decodes");
@@ -4531,7 +4532,8 @@ fn sim_now_millis() -> u64 {
 fn replace_session(state: &str, epoch: u64) -> Bytes {
     let bytes = format!(
         "{{\"parent\":{ROOT},\"object\":\"{REPLACE_OBJECT}\",\"created_at_millis\":100,\
-         \"clock_source\":\"wall\",\"epoch\":{epoch},\"attempts\":1,\"state\":{state}}}"
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":{epoch},\"attempts\":1,\"state\":{state}}}"
     )
     .into_bytes();
     decode_session_record(&bytes).expect("the seeded session record decodes");

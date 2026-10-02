@@ -38,6 +38,7 @@ use crate::custodian::{connect_fleet, ConfiguredDServer, CustodianService, DServ
 use crate::dserver::{self, DServer};
 use crate::logging::{self, LogConfig};
 use crate::{Gateway, DEFAULT_DURABILITY};
+use wyrd_custodian::restore::{SessionUnsettled, UnsettledSession};
 use wyrd_custodian::RestoreReport;
 use wyrd_gateway_s3 as s3;
 
@@ -489,7 +490,7 @@ fn usage() {
     eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
     eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
     eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--chunk-size N] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  every command also accepts:");
@@ -508,6 +509,13 @@ fn usage() {
     eprintln!("  --failure-domain); the role never fabricates identity or topology from endpoint");
     eprintln!(
         "  order. Omit all three to run the leader-elected role with no reconstruction plane."
+    );
+    eprintln!();
+    eprintln!("  s3: --chunk-size N sets the bytes per chunk (default 1 MiB). Accepted: 1 to");
+    eprintln!(
+        "  {} ({} MiB), the ceiling set by the D-server gRPC message limit.",
+        crate::MAX_CHUNK_SIZE,
+        crate::MAX_CHUNK_SIZE >> 20
     );
 }
 
@@ -1230,7 +1238,8 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
 /// What the post-restore one-shot tells the operator: every line it prints, and whether the run
 /// **needs a human** — which is also the command's exit status.
 struct RestoreVerdict {
-    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding.
+    /// The lines to print, in order: the summary, then one NEEDS-HUMAN paragraph per finding,
+    /// then an informational line that does not set the status (untrusted staged records).
     lines: Vec<String>,
     /// Exit non-zero. Printing "NEEDS-HUMAN" and exiting 0 is a hollow green.
     needs_human: bool,
@@ -1253,17 +1262,24 @@ struct RestoreVerdict {
 /// record a run that lost data — or one whose chunks could not be read — as a healthy one, which
 /// is the single worst thing this command could do. The pass itself succeeded; the restore did
 /// not.
+///
+/// An untrusted staged record is named WITHOUT that status, on an informational line: the
+/// report's predicate leaves it out on a recorded decision ([`RestoreReport::needs_human`]).
 fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
     let mut lines = vec![format!(
         "wyrd custodian: post-restore reconciliation {} — {} stranded fragment(s) marked \
-         collectable ({} already marked, {} left to a pending lease, {} displaced and kept); {} \
+         collectable ({} already marked, {} left to a pending lease, {} kept for multipart \
+         uploads' staged records, {} displaced and kept); {} \
          chunk(s) DANGLING (unreadable AND unreconstructible — the restore resurrected maps \
          whose bytes were already reclaimed), {} MISPLACED (bytes present but not where the \
          restored map looks — unreadable until the placement is fixed), {} under-replicated (the \
          repair loop rebuilds these); {} record(s) UNREADABLE (committed objects' chunk maps or \
          staged multipart records the pass could not read — so every count here is drawn over \
          the rest of the store); {} pending-ledger entr(y/ies) UNREADABLE (held unmarked, see \
-         below).",
+         below); {} staged multipart record(s) untrusted (their chunks held unmarked, see \
+         below); {} upload session(s) fenced (Open or Completing in the restored image, now \
+         aborted — none of them can be completed), {} upload session(s) NOT fenced (see below), \
+         {} fenced upload session(s) whose segment records need a human (see below).",
         // NOT "complete" over a store the pass could only partly read: "complete" is a claim
         // about a reading that FINISHED, and an operator scanning this line for one word must
         // not find it while a record is still unreadable.
@@ -1275,12 +1291,17 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         report.stranded_marked,
         report.already_marked,
         report.pending_skipped,
+        report.staged_skipped,
         report.displaced_kept,
         report.dangling.len(),
         report.misplaced.len(),
         report.under_replicated.len(),
         report.unresolvable.len(),
         report.pending_unreadable.len(),
+        report.staged_untrusted.len(),
+        report.sessions_fenced,
+        report.sessions_unsettled.len(),
+        report.segments_unaccounted.len(),
     )];
     if !report.pending_unreadable.is_empty() {
         lines.push(format!(
@@ -1337,12 +1358,12 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             // was never published.
             //
             // The staged half says exactly WHICH half of a record the pass judged, per class,
-            // because that is what the operator repairs. The pass never decodes an upload
+            // because that is what the operator repairs. The staged read never decodes an upload
             // session's or a staging entry's VALUE to build this class (`custodian::gc`'s
             // `staged_fragments` reads a session by key alone, and an undecodable `sidx:` value
             // under a key that still names its chunk HOLDS that chunk rather than landing here) —
             // so promising that a value was checked would send a repair at a record the pass
-            // never read.
+            // never read (the session fence names an undecodable session below, NOT fenced).
             "wyrd custodian: NEEDS-HUMAN — {} record(s) could not be READ: {}. Each is a \
              committed object whose chunk map is missing segments or will not decode, or a staged \
              multipart record: an upload session (`mpu:`) or an in-flight staging entry (`sidx:`) \
@@ -1357,6 +1378,58 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             report.unresolvable.len(),
             named_records(&report.unresolvable),
             report.stranded_marked,
+        ));
+    }
+    if !report.sessions_unsettled.is_empty() {
+        let sessions: Vec<String> = report
+            .sessions_unsettled
+            .iter()
+            .map(|unsettled| unsettled.session.clone())
+            .collect();
+        lines.push(format!(
+            // Named by key, as the UNREADABLE paragraph names its records, and counted by cause:
+            // the cause decides the repair.
+            "wyrd custodian: NEEDS-HUMAN — {} upload session(s) the restored image holds could \
+             NOT be fenced: {}. Why: {}. This pass left each as it found it, so nothing yet stops \
+             one from being completed over bytes the restore may have lost. Keep multipart \
+             uploads off this store until each is repaired or torn down, then re-run this pass. \
+             The audit log carries each one with its cause (`action=session-unsettled`).",
+            report.sessions_unsettled.len(),
+            named_records(&sessions),
+            unsettled_causes(&report.sessions_unsettled),
+        ));
+    }
+    if !report.segments_unaccounted.is_empty() {
+        let sessions: Vec<String> = report
+            .segments_unaccounted
+            .iter()
+            .map(|f| format!("{} (first {}: {})", f.session, f.record, f.fault))
+            .collect();
+        lines.push(format!(
+            "wyrd custodian: NEEDS-HUMAN — {} fenced upload session(s) (none can be completed), \
+             each with the first `seg:` or `retire:records:` record at fault, and why: {}. A \
+             retire drain deletes segment records without marking any bytes; inspect the named \
+             record before one runs, then re-run this pass \
+             (`action=session-segments-unaccounted` in the audit log).",
+            report.segments_unaccounted.len(),
+            named_records(&sessions),
+        ));
+    }
+    if !report.staged_untrusted.is_empty() {
+        lines.push(format!(
+            // INFORMATION, not NEEDS-HUMAN (`RestoreReport::needs_human` says why), but named.
+            // Says what the pass DID — marked none of these chunks' fragments — and no more: not
+            // that the staged bytes survived (only committed chunks are judged for missing
+            // bytes), and no cleanup promise (whether the retire drain removes one is #659's).
+            "wyrd custodian: note — {} staged multipart record(s) could not be TRUSTED about where \
+             their chunks' fragments are: {}. This pass held those chunks and marked none of their \
+             fragments; it did not check that their staged bytes survived the restore. A damaged \
+             staged record points at a bug or at corruption, and while one remains it blocks \
+             every drain in the cluster, so this run is not a clean bill. Reported for your \
+             information: it does not change the exit status. The audit log carries each one too \
+             (`action=untrusted-staged-record`).",
+            report.staged_untrusted.len(),
+            named_records(&report.staged_untrusted),
         ));
     }
     RestoreVerdict {
@@ -1374,7 +1447,8 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
 /// store whose whole `inode:` namespace is damaged would otherwise print its every key into it.
 /// Every name is still carried in full by [`RestoreReport::unresolvable`] and by the audit trail
 /// (`action=unresolvable-chunk-map`, and `action=unresolvable-staged-record` for a staged
-/// multipart record), and the remainder is stated as a count rather than dropped — so the line is
+/// multipart record; `RestoreReport::sessions_unsettled` and `action=session-unsettled` for an
+/// unfenced session), and the remainder is stated as a count rather than dropped — so the line is
 /// never a silent truncation, and repairing the ones it names and re-running is the operator's
 /// loop out of the tail.
 const NAMED_UNREADABLE_RECORDS: usize = 20;
@@ -1397,6 +1471,38 @@ fn named_records(names: &[String]) -> String {
         0 => shown,
         rest => format!("{shown}, and {rest} more (the audit log names every one)"),
     }
+}
+
+/// The unfenced sessions counted by cause, only the causes that occur. The match is exhaustive,
+/// so a cause the pass adds cannot reach an operator uncounted.
+fn unsettled_causes(sessions: &[UnsettledSession]) -> String {
+    const WHY: [&str; 6] = [
+        "whose key names no upload",
+        "whose value will not decode",
+        "at the last epoch the record can spell",
+        "changed while this pass ran",
+        "whose retirement key was already taken by another obligation",
+        "lost a conflict whose cause a re-read no longer finds",
+    ];
+    let mut counts = [0_usize; WHY.len()];
+    for unsettled in sessions {
+        let slot = match unsettled.cause {
+            SessionUnsettled::KeyNamesNoUpload => 0,
+            SessionUnsettled::ValueUndecodable { .. } => 1,
+            SessionUnsettled::EpochExhausted => 2,
+            SessionUnsettled::ChangedUnderPass => 3,
+            SessionUnsettled::ObligationKeyTaken { .. } => 4,
+            SessionUnsettled::LostConflict => 5,
+        };
+        counts[slot] += 1;
+    }
+    counts
+        .iter()
+        .zip(WHY)
+        .filter(|(count, _)| **count > 0)
+        .map(|(count, why)| format!("{count} {why}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Open the SAME metadata store the cluster wrote to and run ONE post-restore reconciliation
@@ -2172,6 +2278,11 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
         .map(str::to_string)
         .or_else(|| std::env::var("WYRD_S3_SECRET_KEY").ok())
         .ok_or("s3: --secret-key (or WYRD_S3_SECRET_KEY) is required")?;
+    // `--chunk-size` is a deployment property (the erasure-coding unit and the per-object
+    // fan-out), so a value the role cannot carry is refused HERE, before the runtime starts
+    // or the listener binds, never found later as a failed PUT. Absent, the gateway keeps
+    // its own 1 MiB default, composed exactly as before the flag existed.
+    let chunk_size = parse_s3_chunk_size(parsed.flag("chunk-size"))?;
 
     // Select the gateway's backends BY CONFIGURATION, exactly as every other
     // cluster-facing role does — `resolve_backend` for put/get/custodian (#255) and
@@ -2247,6 +2358,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             coordination,
             data_dir,
             endpoints.as_deref(),
+            chunk_size,
             credentials,
             region,
             listener,
@@ -2275,6 +2387,13 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
 ///     shared cluster state, the invariant #454 restores.
 ///   * `None` — the single-node local-FS front door (today's #367 behaviour preserved).
 ///
+/// `chunk_size` is the role's `--chunk-size`: `Some(n)` is applied to the gateway on
+/// every composition below, both chunk planes and every metadata × coordination arm;
+/// `None` composes the gateway at its own default (1 MiB). A value outside
+/// `1..=MAX_CHUNK_SIZE` is refused here before anything is opened or served, the same
+/// check `cmd_s3` runs before it binds, so no caller can start a role whose first large
+/// PUT would fail on the gRPC transport.
+///
 /// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
 /// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
 #[allow(clippy::too_many_arguments)]
@@ -2283,11 +2402,15 @@ pub async fn serve_s3_role(
     coordination: CoordinationBackend,
     data_dir: &str,
     endpoints: Option<&[String]>,
+    chunk_size: Option<usize>,
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
     metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError> {
+    if let Some(chunk_size) = chunk_size {
+        check_s3_chunk_size(chunk_size)?;
+    }
     match endpoints {
         // Cluster front door: the chunk plane is the gRPC fan-out over the configured
         // D servers, so a chunk's fragments cross the wire to real D servers rather than
@@ -2299,6 +2422,7 @@ pub async fn serve_s3_role(
                 coordination,
                 data_dir,
                 chunks,
+                chunk_size,
                 credentials,
                 region,
                 listener,
@@ -2315,6 +2439,7 @@ pub async fn serve_s3_role(
                 coordination,
                 data_dir,
                 chunks,
+                chunk_size,
                 credentials,
                 region,
                 listener,
@@ -2332,12 +2457,17 @@ pub async fn serve_s3_role(
 /// roles' single-axis matches are (`cluster_put` `cli.rs:1266`, `cmd_d_server`
 /// `cli.rs:530`), so the default build compiles only the redb + mem arm and the
 /// production `tikv` + `etcd` arms build under their respective cargo features.
+///
+/// Every arm composes its gateway through [`compose_s3_gateway`], so the role's
+/// `chunk_size` reaches the gateway on all six arms, including the feature-gated ones the
+/// default build does not compile.
 #[allow(clippy::too_many_arguments)]
 async fn serve_s3_dispatch<C>(
     backend: MetadataBackend,
     coordination: CoordinationBackend,
     data_dir: &str,
     chunks: C,
+    chunk_size: Option<usize>,
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
@@ -2349,43 +2479,95 @@ where
     match (backend, coordination) {
         (MetadataBackend::Redb, CoordinationBackend::Mem) => {
             let meta = open_local_meta_redb(data_dir)?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "tikv")]
         (MetadataBackend::Tikv, CoordinationBackend::Mem) => {
             let meta = open_tikv_meta().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "etcd")]
         (MetadataBackend::Redb, CoordinationBackend::Etcd) => {
             let meta = open_local_meta_redb(data_dir)?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "tikv", feature = "etcd"))]
         (MetadataBackend::Tikv, CoordinationBackend::Etcd) => {
             let meta = open_tikv_meta().await?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "fdb")]
         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
             let meta = open_fdb_meta().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "fdb", feature = "etcd"))]
         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
             let meta = open_fdb_meta().await?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
     }
+}
+
+/// Compose one [`serve_s3_dispatch`] arm's gateway. `Some(chunk_size)` (the role's
+/// `--chunk-size`, already range-checked by [`serve_s3_role`]) is applied through
+/// [`Gateway::with_chunk_size`]; `None` is plain [`Gateway::new`], the composition from
+/// before the flag existed.
+fn compose_s3_gateway<M, C, Co>(
+    meta: M,
+    chunks: C,
+    coord: Co,
+    chunk_size: Option<usize>,
+) -> Arc<Gateway<M, C, Co>>
+where
+    M: MetadataStore,
+    C: PlacementChunkStore,
+    Co: wyrd_traits::Coordination,
+{
+    let gateway = Gateway::new(meta, chunks, coord);
+    Arc::new(match chunk_size {
+        Some(chunk_size) => gateway.with_chunk_size(chunk_size),
+        None => gateway,
+    })
+}
+
+/// Parse `wyrd s3 --chunk-size`. Absent (`None`) keeps the gateway's own default. A value
+/// is parsed the way `wyrd put` parses its `--chunk-size` (`str::parse::<usize>`,
+/// [`cmd_put`]) and must then pass [`check_s3_chunk_size`].
+fn parse_s3_chunk_size(raw: Option<&str>) -> Result<Option<usize>, BoxError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let chunk_size: usize = raw
+        .parse()
+        .map_err(|_| format!("s3: invalid --chunk-size `{raw}` (expected a byte count)"))?;
+    check_s3_chunk_size(chunk_size)?;
+    Ok(Some(chunk_size))
+}
+
+/// Refuse a chunk size the `s3` role cannot carry: `0`, or anything above
+/// [`crate::MAX_CHUNK_SIZE`] (set by the D-server gRPC message limit; the reason is on the
+/// constant). Refused rather than clamped, so the operator learns at startup.
+fn check_s3_chunk_size(chunk_size: usize) -> Result<(), BoxError> {
+    if (1..=crate::MAX_CHUNK_SIZE).contains(&chunk_size) {
+        return Ok(());
+    }
+    Err(format!(
+        "s3: --chunk-size {chunk_size} is out of range: it must be 1 to {} bytes ({} MiB, \
+         the largest chunk whose fragments fit the D-server gRPC message limit)",
+        crate::MAX_CHUNK_SIZE,
+        crate::MAX_CHUNK_SIZE >> 20
+    )
+    .into())
 }
 
 /// Seed the gateway's shared, persisted inode allocator from persisted state (#364 durability
@@ -2894,6 +3076,86 @@ mod tests {
         assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
     }
 
+    /// `wyrd s3 --chunk-size` (#738): the accept/refuse decision, pinned in-process. The
+    /// binding test drives the built binary (`tests/s3_chunk_size_flag.rs`); this one makes
+    /// the same decision visible to coverage. Absent keeps the gateway default; the range is
+    /// `1..=16 MiB` inclusive; every refusal names the flag in the role's `s3:` style.
+    #[test]
+    fn s3_chunk_size_accepts_exactly_one_to_sixteen_mib() {
+        assert_eq!(parse_s3_chunk_size(None).unwrap(), None);
+        assert_eq!(parse_s3_chunk_size(Some("1")).unwrap(), Some(1));
+        assert_eq!(parse_s3_chunk_size(Some("1048576")).unwrap(), Some(1 << 20));
+        assert_eq!(
+            parse_s3_chunk_size(Some("16777216")).unwrap(),
+            Some(16 << 20)
+        );
+        for refused in ["0", "16777217", "1MiB", "", "-1", "18446744073709551616"] {
+            let err = parse_s3_chunk_size(Some(refused))
+                .expect_err(refused)
+                .to_string();
+            assert!(
+                err.starts_with("s3: ") && err.contains("--chunk-size"),
+                "`{refused}` must be refused naming the flag, got: {err}"
+            );
+        }
+    }
+
+    /// Every `serve_s3_dispatch` arm builds its gateway through `compose_s3_gateway`, so this
+    /// pins what each arm gets: `Some(n)` reaches the gateway, `None` leaves
+    /// `Gateway::new`'s 1 MiB default untouched.
+    #[test]
+    fn compose_s3_gateway_applies_the_chunk_size_only_when_given() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let compose = |chunk_size| {
+            compose_s3_gateway(
+                RedbMetadataStore::in_memory().expect("redb"),
+                FsChunkStore::open(dir.path()).expect("fs store"),
+                MemCoordination::new(),
+                chunk_size,
+            )
+        };
+        assert_eq!(compose(Some(524_288)).chunk_size, 524_288);
+        assert_eq!(compose(Some(16 << 20)).chunk_size, 16 << 20);
+        assert_eq!(compose(None).chunk_size, 1 << 20);
+    }
+
+    /// `serve_s3_role` is `pub`, so it re-checks the range itself: a caller that skips
+    /// `cmd_s3` still cannot start a role whose first large PUT would fail on the gRPC
+    /// transport. The refusal comes before anything is opened, so no local chunk store
+    /// appears. Bounded, because a role that wrongly starts serves forever.
+    #[tokio::test]
+    async fn serve_s3_role_refuses_an_out_of_range_chunk_size_before_opening_anything() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().to_str().expect("utf-8 path");
+        for refused in [0, (16 << 20) + 1] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let served = tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_s3_role(
+                    MetadataBackend::Redb,
+                    CoordinationBackend::Mem,
+                    data_dir,
+                    None,
+                    Some(refused),
+                    Vec::new(),
+                    "us-east-1".to_string(),
+                    listener,
+                    None,
+                ),
+            )
+            .await
+            .expect("an out-of-range chunk size must be refused, not served");
+            let err = served.expect_err("refused").to_string();
+            assert!(err.contains("--chunk-size"), "{refused}: {err}");
+            assert!(
+                !dir.path().join("chunks").exists(),
+                "{refused}: the refusal must come before the chunk store is opened"
+            );
+        }
+    }
+
     /// THE HOLLOW GREEN this command must never print (#651): the exit status and the text are
     /// **one** decision, and each finding ALONE must both print its NEEDS-HUMAN paragraph and
     /// flip the status. One finding at a time, because a chain of `||`s is green for the wrong
@@ -2931,6 +3193,35 @@ mod tests {
         let routine = RestoreReport {
             stranded_marked: 4,
             under_replicated: vec![3],
+            staged_skipped: 2,
+            ..Default::default()
+        };
+        // An untrusted staged record (#839): named and not clean, but not a human's.
+        let untrusted = RestoreReport {
+            staged_untrusted: vec!["part:0123456789abcdef0123456789abcdef:000001".to_owned()],
+            staged_skipped: 3,
+            ..Default::default()
+        };
+        // A session the fence could not fence (#841): a human's — the restore has not declared it
+        // dead. Sessions it DID fence are this pass doing its job: not a human's, and not clean.
+        let unsettled = RestoreReport {
+            sessions_unsettled: vec![UnsettledSession {
+                session: "mpu:0123456789abcdef0123456789abcdef".to_owned(),
+                cause: SessionUnsettled::EpochExhausted,
+            }],
+            ..Default::default()
+        };
+        let fenced = RestoreReport {
+            sessions_fenced: 2,
+            ..Default::default()
+        };
+        let segments = RestoreReport {
+            sessions_fenced: 1,
+            segments_unaccounted: vec![wyrd_custodian::restore::UnaccountedSegments {
+                session: "mpu:abababababababababababababababab".to_owned(),
+                record: "seg:0123456789abcdef0123456789abcdef:3:000001".to_owned(),
+                fault: wyrd_custodian::restore::SegmentFault::KeyNotOfGroup,
+            }],
             ..Default::default()
         };
         for (report, human) in [
@@ -2938,7 +3229,11 @@ mod tests {
             (&misplaced, true),
             (&unreadable, true),
             (&pending, true),
+            (&unsettled, true),
+            (&segments, true),
             (&routine, false),
+            (&untrusted, false),
+            (&fenced, false),
         ] {
             let verdict = restore_verdict(report);
             let printed = verdict.lines.join("\n");
@@ -2955,8 +3250,18 @@ mod tests {
                 human,
                 "a paragraph without the status behind it, or the reverse: {report:?} / {printed}"
             );
-            // `is_clean` is the strict superset: nothing that needs a human is ever clean.
+            // `is_clean` is the strict superset: nothing that needs a human is ever clean (nor is
+            // a run holding a chunk over an untrusted staged record).
             assert!(!(human && report.is_clean()), "{report:?}");
+            assert!(
+                report.staged_untrusted.is_empty() || !report.is_clean(),
+                "{report:?}"
+            );
+            // A fence is work this pass did, so a run that fenced a session is never clean.
+            assert!(
+                report.sessions_fenced == 0 || !report.is_clean(),
+                "{report:?}"
+            );
             // "complete" is a claim about a reading that FINISHED, and an operator greps this
             // line for exactly that word — so it appears iff nothing was unreadable, and the
             // blocking record is NAMED where they read it rather than left to a log.
@@ -2980,14 +3285,182 @@ mod tests {
             // merely counted. A count tells them a repair is needed and not which record to
             // repair, and the operator this command is written for is mid-restore at a terminal
             // — the log collector is one of the things a restore brings back up.
-            for object in report.unresolvable.iter().chain(&report.pending_unreadable) {
+            for object in report
+                .unresolvable
+                .iter()
+                .chain(&report.pending_unreadable)
+                .chain(&report.staged_untrusted)
+                .chain(report.sessions_unsettled.iter().map(|s| &s.session))
+                .chain(report.segments_unaccounted.iter().map(|s| &s.session))
+                .chain(report.segments_unaccounted.iter().map(|s| &s.record))
+            {
                 assert!(
                     printed.contains(object.as_str()),
-                    "the blocking record {object} is not named in what the operator reads: \
-                     {printed}"
+                    "the record {object} is not named in what the operator reads: {printed}"
                 );
             }
+            // ...and the NOT-fenced paragraph appears exactly when a session was left unfenced.
+            assert_eq!(
+                printed.contains("could NOT be fenced"),
+                !report.sessions_unsettled.is_empty(),
+                "{printed}"
+            );
+            // ...and the fenced-but-a-human's paragraph exactly when one was named.
+            assert_eq!(
+                printed.contains("action=session-segments-unaccounted"),
+                !report.segments_unaccounted.is_empty(),
+                "{printed}"
+            );
         }
+    }
+
+    /// Issue #841: the summary counts fenced and unfenced sessions, and a NEEDS-HUMAN paragraph
+    /// names each unfenced one by key, counted by cause (fenced alone: the agreement test).
+    #[test]
+    fn restore_verdict_counts_fenced_sessions_and_names_the_ones_it_could_not_fence() {
+        let unsettled = |pair: &str, cause| UnsettledSession {
+            session: format!("mpu:{}", pair.repeat(16)),
+            cause,
+        };
+        let fault = "malformed".to_owned();
+        let key = "retire:bytes:s:x:3".to_owned();
+        let sessions = vec![
+            unsettled("a1", SessionUnsettled::ChangedUnderPass),
+            unsettled("a2", SessionUnsettled::ValueUndecodable { fault }),
+            unsettled("a3", SessionUnsettled::ObligationKeyTaken { key }),
+            unsettled("a4", SessionUnsettled::ChangedUnderPass),
+        ];
+        let report = RestoreReport {
+            sessions_fenced: 3,
+            sessions_unsettled: sessions.clone(),
+            ..Default::default()
+        };
+        let verdict = restore_verdict(&report);
+        let printed = verdict.lines.join("\n");
+        assert!(verdict.needs_human, "{printed}");
+        for needle in [
+            "3 upload session(s) fenced",
+            "4 upload session(s) NOT fenced",
+        ] {
+            assert!(verdict.lines[0].contains(needle), "{needle:?}: {printed}");
+        }
+        let paragraph = verdict
+            .lines
+            .iter()
+            .find(|l| l.contains("could NOT be fenced"));
+        let paragraph = paragraph.unwrap_or_else(|| panic!("no unfenced paragraph: {printed}"));
+        for needle in sessions.iter().map(|s| s.session.as_str()).chain([
+            "2 changed while this pass ran",
+            "1 whose value will not decode",
+            "1 whose retirement key was already taken",
+            "action=session-unsettled",
+        ]) {
+            assert!(paragraph.contains(needle), "{needle:?}: {paragraph}");
+        }
+        assert!(
+            !paragraph.contains("last epoch"),
+            "only the causes that occur: {paragraph}"
+        );
+    }
+
+    /// The bound on naming unfenced sessions is [`named_records`]' own: of 21, the first 20 are
+    /// named and the last counted, while the total is the report's.
+    #[test]
+    fn restore_verdict_names_unfenced_sessions_and_counts_the_ones_it_cannot_fit() {
+        let sessions: Vec<UnsettledSession> = (0..=NAMED_UNREADABLE_RECORDS)
+            .map(|n| UnsettledSession {
+                session: format!("mpu:{n:032x}"),
+                cause: SessionUnsettled::ChangedUnderPass,
+            })
+            .collect();
+        let report = RestoreReport {
+            sessions_unsettled: sessions.clone(),
+            ..Default::default()
+        };
+        let printed = restore_verdict(&report).lines.join("\n");
+        let (named, last) = sessions.split_at(NAMED_UNREADABLE_RECORDS);
+        for session in named {
+            assert!(
+                printed.contains(&session.session),
+                "{}: {printed}",
+                session.session
+            );
+        }
+        assert!(
+            !printed.contains(&last[0].session),
+            "the bound must bind: {printed}"
+        );
+        for needle in [
+            "and 1 more (the audit log names every one)",
+            "21 upload session(s) the restored image holds could NOT be fenced",
+            "21 changed while this pass ran",
+        ] {
+            assert!(printed.contains(needle), "{needle:?}: {printed}");
+        }
+    }
+
+    /// Issue #839: the summary counts staged skips, and an untrusted staged record is named on an
+    /// INFORMATIONAL line — the status stays `needs_human()`. The line claims only that the pass
+    /// marked none of those fragments: not that the staged bytes survived, and no cleanup (#659).
+    #[test]
+    fn restore_verdict_counts_staged_skips_and_names_untrusted_staged_records_as_information() {
+        let upload = "0123456789abcdef0123456789abcdef";
+        let records = vec![
+            format!("part:{upload}:000001"),
+            format!("sidx:{upload}:000002:9"),
+        ];
+        let report = RestoreReport {
+            staged_skipped: 5,
+            staged_untrusted: records.clone(),
+            ..Default::default()
+        };
+        let verdict = restore_verdict(&report);
+        let printed = verdict.lines.join("\n");
+
+        assert!(!verdict.needs_human, "{printed}");
+        assert!(!report.is_clean(), "{report:?}");
+        // Counted on the summary line, whose reading still FINISHED ("complete").
+        for needle in [
+            "post-restore reconciliation complete",
+            "5 kept for multipart uploads' staged records",
+            "2 staged multipart record(s) untrusted",
+        ] {
+            assert!(verdict.lines[0].contains(needle), "{needle:?}: {printed}");
+        }
+        let note = verdict
+            .lines
+            .iter()
+            .find(|line| line.contains("could not be TRUSTED"))
+            .unwrap_or_else(|| panic!("no line names the untrusted records: {printed}"));
+        for needle in records.iter().map(String::as_str).chain([
+            "marked none of their fragments",
+            "did not check that their staged bytes survived the restore",
+            "not a clean bill",
+            "does not change the exit status",
+            "action=untrusted-staged-record",
+        ]) {
+            assert!(note.contains(needle), "{needle:?}: {note}");
+        }
+        for never in [
+            "NEEDS-HUMAN",
+            "automatic",
+            "clean up",
+            "cleanup",
+            "will be removed",
+        ] {
+            assert!(
+                !note.to_lowercase().contains(&never.to_lowercase()),
+                "{never:?}: {note}"
+            );
+        }
+        // Kept fragments alone are protection, not a finding: no such line, and clean.
+        let kept_only = RestoreReport {
+            staged_skipped: 5,
+            ..Default::default()
+        };
+        let printed = restore_verdict(&kept_only).lines.join("\n");
+        assert!(!printed.contains("could not be TRUSTED"), "{printed}");
+        assert!(kept_only.is_clean(), "{kept_only:?}");
     }
 
     /// The bound on that naming, from both sides: up to [`NAMED_UNREADABLE_RECORDS`] blockers are
