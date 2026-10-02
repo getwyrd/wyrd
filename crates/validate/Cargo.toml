@@ -1,6 +1,6 @@
 [package]
 name = "wyrd-validate"
-description = "The blackbox validator (proposal 0017): an out-of-process tool that drives a Wyrd deployment through its S3 front door the way a client does. This slice is the crate skeleton and its argument surface — it parses, resolves credentials, echoes the resolved configuration, and exits."
+description = "The blackbox validator (proposal 0017): an out-of-process tool that drives a Wyrd deployment through its S3 front door the way a client does. The library carries the argument surface and the S3 client every scenario calls through; the binary still resolves its configuration, echoes it, and exits."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,8 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 # The pure decisions (argument parsing, credential resolution, the resolved-configuration
-# echo) live in the library so the integration tests reach them directly; the binary is a
-# thin shell over it that owns only the I/O (proposal 0017 §2 "Layering").
+# echo) and the S3 client live in the library so the integration tests reach them directly;
+# the binary is a thin shell over it that owns only the I/O (proposal 0017 §2 "Layering").
 [lib]
 path = "src/lib.rs"
 
@@ -18,10 +18,35 @@ path = "src/lib.rs"
 name = "wyrd-validate"
 path = "src/main.rs"
 
-# Deliberately NO dependencies — neither third-party nor `wyrd-*`. The argument surface is
-# hand-rolled (the shape of `wyrd`'s `ParsedArgs`) so this crate lands with no licence
-# decision attached; the S3 client and its dependency audit arrive in their own slice
-# (#741). The no-`wyrd-*` closure is the blackbox property (proposal 0017 §9).
+# Third-party only, never `wyrd-*`: the no-`wyrd-*` closure of the normal graph is the
+# blackbox property (proposal 0017 §9), enforced by `cargo xtask blackbox-guard`. The
+# ADR-0003 §2 adoption audit for the AWS SDK sits by its pins in the root manifest.
+[dependencies]
+aws-sdk-s3.workspace = true
+# The SDK's hyper-backed HTTP client, built without TLS (`build_http`): plain HTTP only,
+# with TLS terminated in front of the gateway (proposal 0017 §10).
+aws-smithy-http-client.workspace = true
+bytes.workspace = true
+# `Stream`, the shape of a caller's PUT source.
+futures-util.workspace = true
+# `Body`/`Frame`, to hand a caller's source to the SDK as a request body with a declared
+# length and no buffering.
+http-body.workspace = true
+# The body-idle deadline (`tokio::time::timeout`); the SDK's own deadlines sleep on the same
+# runtime clock.
+tokio.workspace = true
+
+# Wyrd crates are allowed here and only here (proposal 0017 §9; the blackbox guard leaves
+# dev-dependencies unconstrained): the client is proven against a real Wyrd S3 gateway served
+# in-process on loopback, the composition `crates/server/tests/s3_http_wire.rs` uses.
+[dev-dependencies]
+roxmltree.workspace = true
+tempfile.workspace = true
+wyrd-chunkstore-fs.workspace = true
+wyrd-coordination-mem.workspace = true
+wyrd-gateway-s3.workspace = true
+wyrd-metadata-redb.workspace = true
+wyrd-server = { path = "../server" }
 
 # Inherit the workspace lint policy (single source of truth).
 [lints]

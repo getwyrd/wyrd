@@ -5274,6 +5274,21 @@ dependencies = [
 [[package]]
 name = "wyrd-validate"
 version = "0.0.0"
+dependencies = [
+ "aws-sdk-s3",
+ "aws-smithy-http-client",
+ "bytes",
+ "futures-util",
+ "http-body 1.1.0",
+ "roxmltree",
+ "tempfile",
+ "tokio",
+ "wyrd-chunkstore-fs",
+ "wyrd-coordination-mem",
+ "wyrd-gateway-s3",
+ "wyrd-metadata-redb",
+ "wyrd-server",
+]
 
 [[package]]
 name = "xml"
