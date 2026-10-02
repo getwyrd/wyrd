@@ -69,8 +69,9 @@ use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
 use wyrd_core::multipart::{
-    decode_part_record, decode_session_record, mpu_key, part_key, part_range, sidx_key, sidx_range,
-    OwnedEntry, PartNumber, StagedPlacement, UploadId,
+    decode_part_record, decode_retire_obligation, decode_session_record, mpu_key, part_key,
+    part_range, sidx_key, sidx_range, OwnedEntry, PartNumber, PartScope, RetireMode, RetireToken,
+    StagedPlacement, UploadId, MPU_PREFIX,
 };
 use wyrd_core::placement::Topology;
 use wyrd_core::read::{read_object, read_object_from};
@@ -2760,7 +2761,8 @@ impl MetadataStore for HandoffMeta {
 fn handoff_session(state: &str) -> Bytes {
     let bytes = format!(
         "{{\"parent\":{ROOT},\"object\":\"{HANDOFF_OBJECT}\",\"created_at_millis\":100,\
-         \"clock_source\":\"wall\",\"epoch\":1,\"attempts\":1,\"state\":{state}}}"
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":1,\"attempts\":1,\"state\":{state}}}"
     )
     .into_bytes();
     decode_session_record(&bytes).expect("the seeded session record decodes");
@@ -4531,7 +4533,8 @@ fn sim_now_millis() -> u64 {
 fn replace_session(state: &str, epoch: u64) -> Bytes {
     let bytes = format!(
         "{{\"parent\":{ROOT},\"object\":\"{REPLACE_OBJECT}\",\"created_at_millis\":100,\
-         \"clock_source\":\"wall\",\"epoch\":{epoch},\"attempts\":1,\"state\":{state}}}"
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":{epoch},\"attempts\":1,\"state\":{state}}}"
     )
     .into_bytes();
     decode_session_record(&bytes).expect("the seeded session record decodes");
@@ -4990,6 +4993,913 @@ async fn prop_staged_replace_reaches_every_point_of_the_fence() {
     assert!(adopted && not_adopted, "the sweep is stuck in one outcome");
 }
 
+// ---- property 18: the post-restore session fence races a concurrent session writer (#843) ----
+//
+// `reconcile_after_restore` ends by fencing every `Open` or `Completing` upload session the
+// restored image holds (0016 D-B, `0016:717-728`): ONE commit moves `@E` to `Aborting@E+1` and
+// installs the `retire:` obligations owing the session's records, preconditioned on the exact
+// bytes the pass read. A gateway that never learnt of the restore may be moving the same session
+// out of `@E` at the same instant — the Complete fence `Open@E → Completing@E+1` (`0016:704-708`)
+// or the root flip `Completing@E → Completed@E+1` (`0016:662`) — and every transition out of an
+// epoch lands at `E+1` (`0016:538-552`). Both are compare-and-swaps on one record, so exactly one
+// may win, and the loser's commit must leave nothing of itself: the fence's obligations lead to
+// deletes, so half a fence is a delete aimed at an upload that is publishing, or has published.
+//
+// The per-pass legs in `crates/custodian/tests/restore_open_fence.rs` and
+// `restore_completing_fence.rs` land the writer at scripted seams. Here the session is seeded into
+// the simulated-TiKV model (no client can create one before #508), the PRODUCTION pass runs over a
+// recording tap, and a genuinely concurrent task makes the writer's transition at an instant the
+// seed picks. Every verdict is conditioned on what the pass's own read of the session returned, as
+// the tap recorded it. A second property answers the fence's commit with an unknown outcome and
+// requires the re-run to settle it; the coverage leg proves, per arm, a landing between the pass's
+// read and its commit — the stale-preimage conflict — and the other two regimes.
+
+/// The upload whose session the pass fences: 32 lowercase-hex characters.
+const FENCE_UPLOAD: &str = "84384384384384384384384384384384";
+/// The session's segment-group nonce — on the record in every state, and left as it is by every
+/// transition this property makes.
+const FENCE_NONCE: &str = "84308430843084308430843084308430";
+/// The contested preimage epoch `E`. The restored image holds the session `@E`; every transition out
+/// of it lands at `E+1`.
+const FENCE_EPOCH: u64 = 3;
+const FENCE_OBJECT: &str = "fenced";
+/// The chunk the session's one committed part holds — one un-erasure-coded fragment on server 1,
+/// on disk all run — and, in the Completing arm, the chunk of the attempt's one segment record.
+const FENCE_PART_CHUNK: ChunkId = 0x8431;
+/// A committed chunk whose only fragment is gone: the pass reports it dangling on every run, before
+/// it fences anything.
+const FENCE_DANGLING: ChunkId = 0x8432;
+const FENCE_DANGLING_INODE: InodeId = 9;
+/// The inode the root flip publishes.
+const FENCE_INODE: InodeId = 8;
+const FENCE_NOW: u64 = 10_000;
+/// How far into the pass the writer's landing is drawn, in whole simulated milliseconds, each
+/// landing offset by half a millisecond so it never ties with a step of the pass (as
+/// [`REPLACE_SPAN`]'s are). One pass over this store is about a dozen hops: the staged reads
+/// (session listing, owned range, part range), the two `inode:` readings with the `pending:` scan
+/// between them, the fence's own listing (the seventh hop), its commit (two hops), and, after a
+/// `Completing` fence, the attempt's `seg:` and `part:` ranges. The writer's commit takes two hops
+/// of its own, so the span reaches from landings that apply well before the fence's listing to
+/// landings whose commit starts after the whole pass, with a few milliseconds' margin for a pass
+/// that grows a read; the coverage leg proves the window between the fence's read and its commit
+/// is still inside it.
+const RESTORE_FENCE_SPAN: u32 = 14;
+/// How many landings the campaign leg draws per arm per seed. The landing this property exists for
+/// — the writer's commit applying between the fence's read and its commit — is one of the span's
+/// fifteen, so one draw per seed would leave a 50-seed campaign without it about one run in thirty;
+/// four leave it out about one run in a million (`(14/15)^200`).
+const RESTORE_FENCE_DRAWS: usize = 4;
+
+/// Which session the restored image holds, and so which writer races the fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FenceArm {
+    /// `Open@E`, raced by the Complete fence `Open@E → Completing@E+1`, which installs no
+    /// obligation.
+    Open,
+    /// `Completing@E` with its attempt's `seg:` record, raced by the root flip
+    /// `Completing@E → Completed@E+1`, which installs its own `retire:records:` obligation.
+    Completing,
+}
+
+/// How a commit that writes the session was answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FenceAnswer {
+    Committed,
+    Conflict,
+    /// Out of flight with an unknown outcome; the tap applied it whole or not at all.
+    Unknown(Fate),
+}
+
+/// One observation at the store seam, in the order the simulation produced them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FenceEvent {
+    /// A post-restore pass began.
+    Pass,
+    /// A page of the pass's `mpu:` listing was answered, holding this value of the session —
+    /// logged the instant the store answered.
+    SessionRead(Option<Bytes>),
+    /// A point read of the session was answered with this value — the pass's re-read of a session
+    /// whose fence commit lost, which decides the cause it names — logged the instant the store
+    /// answered.
+    SessionGot(Option<Bytes>),
+    /// The pass's commit writing the session was answered.
+    FenceAnswered(FenceAnswer),
+    /// The concurrent writer's transition was answered.
+    WriterAnswered(CommitOutcome),
+}
+
+/// A recording tap over the simulated-TiKV store. Every trait call is forwarded unchanged, network
+/// hops included; each `mpu:` listing's value of the session, each point read of it, and each
+/// answer to a commit writing the session are logged the instant the store gives them. The
+/// concurrent writer commits through
+/// [`FenceMeta::writer_commit`], so its answer is logged as the writer's. With `strike` set, the
+/// pass's first commit writing the session is answered `CommitUnknownResult` out of flight, applied
+/// whole or not at all by that fate, as [`AmbiguousSweepMeta`] answers the sweep's. Instance state
+/// only (ADR-0035).
+struct FenceMeta {
+    inner: SimTikvMetadataStore,
+    /// The session's `mpu:` key.
+    session: Vec<u8>,
+    strike: Option<Fate>,
+    /// The nemesis fires once.
+    struck: AtomicBool,
+    events: Mutex<Vec<FenceEvent>>,
+}
+
+impl FenceMeta {
+    fn new(strike: Option<Fate>) -> Self {
+        Self {
+            inner: SimTikvMetadataStore::new(),
+            session: mpu_key(&fence_upload()),
+            strike,
+            struck: AtomicBool::new(false),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn log(&self, event: FenceEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+
+    fn events(&self) -> Vec<FenceEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// The concurrent writer's commit, forwarded unchanged; its answer is logged the instant the
+    /// store gives it. A conditional batch is answered `Committed` or `Conflict`, never `Err`.
+    async fn writer_commit(&self, batch: WriteBatch) -> CommitOutcome {
+        let outcome = self
+            .inner
+            .commit(batch)
+            .await
+            .expect("the writer's conditional batch is answered, never Err");
+        self.log(FenceEvent::WriterAnswered(outcome));
+        outcome
+    }
+}
+
+#[async_trait]
+impl MetadataStore for FenceMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let value = self.inner.get(key).await?;
+        if key == self.session.as_slice() {
+            self.log(FenceEvent::SessionGot(value.clone()));
+        }
+        Ok(value)
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        let page = self.inner.scan_page(prefix, after, limit).await?;
+        if prefix == MPU_PREFIX {
+            let value = page
+                .0
+                .iter()
+                .find(|(key, _)| *key == self.session)
+                .map(|(_, value)| value.clone());
+            self.log(FenceEvent::SessionRead(value));
+        }
+        Ok(page)
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        if !batch.puts.iter().any(|(key, _)| *key == self.session) {
+            return self.inner.commit(batch).await;
+        }
+        if let Some(fate) = self.strike {
+            if !self.struck.swap(true, Ordering::SeqCst) {
+                // The resolver accepts the batch and the reply is lost. Landed: applied whole, by the
+                // store itself. Not landed: nothing is applied, and the two round-trips still pass.
+                match fate {
+                    Fate::Landed => {
+                        let outcome = self.inner.commit(batch).await?;
+                        assert_eq!(
+                            outcome,
+                            CommitOutcome::Committed,
+                            "fixture: the struck fence commit's preconditions hold"
+                        );
+                    }
+                    Fate::NotLanded => madsim::time::sleep(Duration::from_millis(2)).await,
+                }
+                self.log(FenceEvent::FenceAnswered(FenceAnswer::Unknown(fate)));
+                return Err(BoxError::from(sim_commit_unknown_result(
+                    SIM_COMMIT_UNKNOWN_RESULT,
+                )));
+            }
+        }
+        let outcome = self.inner.commit(batch).await?;
+        self.log(FenceEvent::FenceAnswered(match outcome {
+            CommitOutcome::Committed => FenceAnswer::Committed,
+            CommitOutcome::Conflict => FenceAnswer::Conflict,
+        }));
+        Ok(outcome)
+    }
+}
+
+fn fence_upload() -> UploadId {
+    UploadId::new(FENCE_UPLOAD).expect("32 lowercase-hex characters")
+}
+
+/// The session at `epoch` with `attempts` in `state` (its JSON), as the base decoder spells it and
+/// checked against it. Every field but those three is the same in every state this property writes,
+/// the nonce included.
+fn fence_session(epoch: u64, attempts: u32, state: &str) -> Bytes {
+    let bytes = format!(
+        "{{\"parent\":{ROOT},\"object\":\"{FENCE_OBJECT}\",\"created_at_millis\":100,\
+         \"clock_source\":\"wall\",\"segment_nonce\":\"{FENCE_NONCE}\",\"epoch\":{epoch},\
+         \"attempts\":{attempts},\"state\":{state}}}"
+    )
+    .into_bytes();
+    decode_session_record(&bytes).expect("the seeded session record decodes");
+    Bytes::from(bytes)
+}
+
+/// A `Completing` state publishing under `epoch`, its Complete fence stamped at 1 ms.
+fn fence_completing(epoch: u64, segments_written: u32) -> String {
+    format!(
+        "{{\"kind\":\"Completing\",\"fenced_at_millis\":1,\"segments_written\":{segments_written},\
+         \"publish_target\":{{\"parent\":{ROOT},\"name\":\"{FENCE_OBJECT}\",\"epoch\":{epoch}}}}}"
+    )
+}
+
+const FENCE_OPEN: &str = "{\"kind\":\"Open\"}";
+const FENCE_ABORTING: &str = "{\"kind\":\"Aborting\"}";
+
+fn fence_chunk_ref() -> ChunkRef {
+    ChunkRef {
+        id: FENCE_PART_CHUNK,
+        scheme: EcScheme::None,
+        len: 5,
+        placement: vec![1],
+    }
+}
+
+/// `retire:<mode>:s:<upload>:<epoch>`, spelled out rather than minted by the production key writer.
+fn fence_retire_key(mode: &str, epoch: u64) -> Vec<u8> {
+    format!("retire:{mode}:s:{FENCE_UPLOAD}:{epoch}").into_bytes()
+}
+
+/// The root flip's own records: its `retire:records:` obligation, and the inode and dirent it
+/// publishes.
+struct FlipRecords {
+    records_key: Vec<u8>,
+    records: Bytes,
+    inode: Bytes,
+    dirent: Bytes,
+}
+
+/// One arm's restored image and the writer's transition out of `@E`.
+struct FenceFixture {
+    /// The session as the restored image holds it: `Open@E` or `Completing@E`.
+    preimage: Bytes,
+    /// The writer's one batch.
+    transition: WriteBatch,
+    /// The session as the writer's transition leaves it.
+    moved: Bytes,
+    /// The root flip's own records (the Completing arm).
+    flip: Option<FlipRecords>,
+}
+
+/// Seed the restored image straight into the model (never through the tap, so nothing the fixture
+/// writes is logged or struck): the arm's session, its one committed part, the attempt's segment
+/// record in the Completing arm, and a committed object whose only fragment is gone.
+async fn seed_restored_session(
+    meta: &FenceMeta,
+    d: &[MemDServer; 4],
+    arm: FenceArm,
+) -> FenceFixture {
+    let upload = fence_upload();
+    let part = PartNumber::new(1).expect("a part number in range");
+    let group = metadata::SegmentGroup::new(FENCE_NONCE, FENCE_EPOCH).expect("a valid nonce");
+    d[1].put_fragment(frag_of(FENCE_PART_CHUNK), Bytes::from_static(b"part"), None)
+        .await
+        .unwrap();
+
+    let chunk = String::from_utf8(metadata::encode(&fence_chunk_ref()).to_vec()).unwrap();
+    let part_record = Bytes::from(
+        format!(
+            "{{\"chunks\":[{chunk}],\"len\":5,\"digest\":\"{}\",\"committed_at_millis\":1,\
+             \"session_epoch\":1}}",
+            "ef".repeat(32)
+        )
+        .into_bytes(),
+    );
+    decode_part_record(&part_record).expect("the part record decodes");
+
+    let (preimage, transition, moved, flip) = match arm {
+        // The Complete fence: one commit pinned to the session's exact `Open@E` bytes, stamping the
+        // fence time, the segment cursor and the publish target and bumping `attempts`, with no
+        // obligation (0016's Complete-fence row, `0016:660`). The nonce stays as it is.
+        FenceArm::Open => {
+            let preimage = fence_session(FENCE_EPOCH, 1, FENCE_OPEN);
+            let moved = fence_session(FENCE_EPOCH + 1, 2, &fence_completing(FENCE_EPOCH + 1, 0));
+            let transition = WriteBatch::new()
+                .require(mpu_key(&upload), preimage.clone())
+                .put(mpu_key(&upload), moved.clone());
+            (preimage, transition, moved, None)
+        }
+        // The root flip, as 0016's row (`0016:662`): one commit pinned to the session's exact
+        // `Completing@E` bytes writing the session, the published inode and its dirent, and the
+        // flip's own `retire:records:s:<id>:<E>` owing the published part set. The fixture names
+        // every part, so there is no `retire:bytes:{parts}` for unnamed ones.
+        FenceArm::Completing => {
+            let preimage = fence_session(FENCE_EPOCH, 2, &fence_completing(FENCE_EPOCH, 1));
+            let segment = metadata::SegmentRecord::new(vec![fence_chunk_ref()], 0)
+                .expect("a non-empty segment");
+            assert_eq!(
+                meta.inner
+                    .commit(WriteBatch::new().put(
+                        metadata::seg_key(&group, 0).expect("an addressable index"),
+                        metadata::encode(&segment),
+                    ))
+                    .await
+                    .unwrap(),
+                CommitOutcome::Committed
+            );
+            let moved = fence_session(
+                FENCE_EPOCH + 1,
+                2,
+                &format!(
+                    "{{\"kind\":\"Completed\",\"completion\":{{\"inode\":{FENCE_INODE},\
+                     \"version\":1,\"etag\":\"{}-1\",\"completed_at_millis\":2,\
+                     \"complete_fingerprint\":\"{}\"}}}}",
+                    "ab".repeat(32),
+                    "cd".repeat(32)
+                ),
+            );
+            let published = InodeRecord {
+                size: 5,
+                chunk_map: metadata::ChunkMap::Segmented(
+                    metadata::SegmentedMap::new(
+                        group.clone(),
+                        vec![metadata::SegmentRef {
+                            index: 0,
+                            byte_offset: 0,
+                            byte_len: 5,
+                        }],
+                    )
+                    .expect("one segment tiling the object"),
+                ),
+                state: InodeState::Committed,
+                version: 1,
+                ..Default::default()
+            };
+            let records_key = fence_retire_key("records", FENCE_EPOCH);
+            let records = Bytes::from_static(b"{\"parts\":[[1,1]]}");
+            let (mode, _, payload) = decode_retire_obligation(&records_key, &records)
+                .expect("the flip's obligation decodes under its own key");
+            assert!(
+                mode == RetireMode::Records && matches!(payload.parts(), Some(PartScope::Set(_))),
+                "fixture: the flip owes its published parts' records"
+            );
+            let flip = FlipRecords {
+                records_key: records_key.clone(),
+                records: records.clone(),
+                inode: metadata::encode(&published),
+                dirent: metadata::encode(&metadata::DirentRecord { inode: FENCE_INODE }),
+            };
+            let transition = WriteBatch::new()
+                .require(mpu_key(&upload), preimage.clone())
+                .require_absent(metadata::inode_key(FENCE_INODE))
+                .require_absent(metadata::dirent_key(ROOT, FENCE_OBJECT))
+                .require_absent(records_key.clone())
+                .put(metadata::inode_key(FENCE_INODE), flip.inode.clone())
+                .put(
+                    metadata::dirent_key(ROOT, FENCE_OBJECT),
+                    flip.dirent.clone(),
+                )
+                .put(records_key, records)
+                .put(mpu_key(&upload), moved.clone());
+            (preimage, transition, moved, Some(flip))
+        }
+    };
+
+    assert_eq!(
+        meta.inner
+            .commit(
+                WriteBatch::new()
+                    .put(mpu_key(&upload), preimage.clone())
+                    .put(part_key(&upload, part), part_record)
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed
+    );
+    assert_eq!(
+        metadata::create(
+            &meta.inner,
+            ROOT,
+            "fence-dangling",
+            FENCE_DANGLING_INODE,
+            &flat_committed(FENCE_DANGLING, 2),
+        )
+        .await
+        .unwrap(),
+        CommitOutcome::Committed
+    );
+    FenceFixture {
+        preimage,
+        transition,
+        moved,
+        flip,
+    }
+}
+
+/// What one `retire:` record must owe — judged by its payload through the production decoder
+/// ([`decode_retire_obligation`]), never by its key alone.
+#[derive(Clone, Debug)]
+enum Owed {
+    /// The fence's teardown, `retire:bytes:` owing `{session, all}`.
+    Teardown,
+    /// The fence's deleter of a `Completing` attempt's segment records, `retire:records:` owing
+    /// `{seg: (nonce, epoch)}` at the epoch its token names.
+    AttemptSegments,
+    /// The root flip's own `retire:records:` owing its published parts, byte for byte.
+    Published(Bytes),
+}
+
+/// The fence's obligations for a session fenced out of `epoch`: the teardown, and for a
+/// `Completing` one the deleter of its attempt's segments.
+fn fence_obligations(epoch: u64, completing: bool) -> Vec<(Vec<u8>, Owed)> {
+    let mut owed = vec![(fence_retire_key("bytes", epoch), Owed::Teardown)];
+    if completing {
+        owed.push((fence_retire_key("records", epoch), Owed::AttemptSegments));
+    }
+    owed
+}
+
+/// The whole `retire:` namespace holds exactly `expected`, and each record owes what it says.
+async fn assert_owed(meta: &FenceMeta, expected: &[(Vec<u8>, Owed)], context: &str) {
+    let found: BTreeMap<Vec<u8>, Bytes> = meta
+        .inner
+        .scan(b"retire:")
+        .await
+        .unwrap()
+        .into_iter()
+        .collect();
+    let names = |keys: Vec<&Vec<u8>>| -> Vec<String> {
+        keys.into_iter()
+            .map(|key| String::from_utf8_lossy(key).into_owned())
+            .collect()
+    };
+    let mut want: Vec<&Vec<u8>> = expected.iter().map(|(key, _)| key).collect();
+    want.sort();
+    assert_eq!(
+        names(found.keys().collect()),
+        names(want),
+        "the `retire:` namespace holds an obligation without its transition, or misses one — \
+         {context}"
+    );
+    for (key, owed) in expected {
+        let value = &found[key];
+        let name = String::from_utf8_lossy(key);
+        let (mode, token, payload) = decode_retire_obligation(key, value)
+            .unwrap_or_else(|fault| panic!("{name} does not decode ({fault}) — {context}"));
+        let RetireToken::Session {
+            epoch, part: None, ..
+        } = token
+        else {
+            panic!("{name} names no session-wide token — {context}");
+        };
+        let owes = match owed {
+            Owed::Teardown => {
+                mode == RetireMode::Bytes
+                    && payload.session()
+                    && payload.parts() == Some(&PartScope::All)
+                    && payload.segments().is_none()
+            }
+            Owed::AttemptSegments => {
+                let group = metadata::SegmentGroup::new(FENCE_NONCE, epoch).unwrap();
+                mode == RetireMode::Records
+                    && !payload.session()
+                    && payload.parts().is_none()
+                    && payload.segments() == Some(&group)
+            }
+            // Never a fence payload under the key the writer's transition owns.
+            Owed::Published(bytes) => {
+                value == bytes
+                    && mode == RetireMode::Records
+                    && !payload.session()
+                    && matches!(payload.parts(), Some(PartScope::Set(_)))
+                    && payload.segments().is_none()
+            }
+        };
+        assert!(
+            owes && payload.chunks().is_empty() && payload.generation().is_none(),
+            "{name} owes {payload:?}, not {owed:?} — {context}"
+        );
+    }
+}
+
+/// Where the writer's landing fell, judged from what the pass's own read of the session returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FenceRegime {
+    /// The writer's transition landed before the pass's fence read the session.
+    WriterFirst,
+    /// The pass read `@E` and its fence won; the writer's commit was refused.
+    FenceWon,
+    /// The pass read `@E` and the writer won; the fence's commit was refused. `stale` when the
+    /// recorded order shows the writer's commit APPLIED between that read and the fence's refused
+    /// commit — a stale-preimage conflict, not a lock the writer still held.
+    WriterWon { stale: bool },
+}
+
+/// One run of the post-restore pass against the arm's writer landing `delay_micros` into it.
+/// Asserts the invariant over what the pass's own read of the session returned, and returns where
+/// the landing fell.
+async fn restore_fence_under_a_concurrent_writer(arm: FenceArm, delay_micros: u64) -> FenceRegime {
+    let d = servers();
+    let meta = Arc::new(FenceMeta::new(None));
+    let fixture = seed_restored_session(&meta, &d, arm).await;
+    let session = meta.session.clone();
+
+    meta.log(FenceEvent::Pass);
+    let writer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let transition = fixture.transition.clone();
+        async move {
+            madsim::time::sleep(Duration::from_micros(delay_micros)).await;
+            meta.writer_commit(transition).await
+        }
+    });
+    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    let ctx = GcContext {
+        meta: &*meta,
+        fleet: &fleet,
+        grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+    let report = reconcile_after_restore(&ctx, FENCE_NOW)
+        .await
+        .unwrap_or_else(|err| {
+            panic!("the pass failed ({arm:?} arm, writer at {delay_micros} µs): {err}")
+        });
+    let written = writer
+        .await
+        .expect("the concurrent writer ran to completion");
+    let events = meta.events();
+    let context = format!("{arm:?} arm, writer at {delay_micros} µs: {events:?}");
+
+    // What the pass's own read of the session returned: its LAST `mpu:` listing, the fence's.
+    let (read_at, read) = events
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(at, event)| match event {
+            FenceEvent::SessionRead(value) => Some((at, value.clone())),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the pass never listed the session — {context}"));
+    let read = read.unwrap_or_else(|| panic!("the fence's listing missed the session — {context}"));
+    let fenced: Vec<(usize, FenceAnswer)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(at, event)| match event {
+            FenceEvent::FenceAnswered(answer) => Some((at, *answer)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        fenced.len() <= 1 && fenced.iter().all(|&(at, _)| at > read_at),
+        "the pass commits the session at most once, after its fence read it — {context}"
+    );
+    let fence = fenced.first().copied();
+    let writer_at = events
+        .iter()
+        .position(|event| matches!(event, FenceEvent::WriterAnswered(_)))
+        .unwrap_or_else(|| panic!("the writer's answer was never logged — {context}"));
+
+    // EXACTLY ONE TRANSITION OUT OF `@E`: the writer's, whenever it committed, or the fence's from
+    // a read of `@E` — never both, never neither.
+    let fence_won_e =
+        read == fixture.preimage && fence.map(|(_, answer)| answer) == Some(FenceAnswer::Committed);
+    let writer_won = written == CommitOutcome::Committed;
+    assert_eq!(
+        usize::from(fence_won_e) + usize::from(writer_won),
+        1,
+        "the fence (read {}, answered {fence:?}) and the writer ({written:?}) — exactly one \
+         transition out of @{FENCE_EPOCH} may land — {context}",
+        String::from_utf8_lossy(&read)
+    );
+
+    let regime = if read == fixture.preimage {
+        match (fence, written) {
+            (Some((_, FenceAnswer::Committed)), CommitOutcome::Conflict) => FenceRegime::FenceWon,
+            (Some((fence_at, FenceAnswer::Conflict)), CommitOutcome::Committed) => {
+                FenceRegime::WriterWon {
+                    stale: read_at < writer_at && writer_at < fence_at,
+                }
+            }
+            other => panic!("the pass read @{FENCE_EPOCH}, then {other:?} — {context}"),
+        }
+    } else if read == fixture.moved {
+        assert!(
+            writer_won && writer_at < read_at,
+            "the pass read the writer's state, so the writer landed before that read — {context}"
+        );
+        FenceRegime::WriterFirst
+    } else {
+        panic!(
+            "the fence read {} — neither the restored session nor the writer's — {context}",
+            String::from_utf8_lossy(&read)
+        );
+    };
+
+    let state = meta.inner.get(&session).await.unwrap();
+    let inode = meta
+        .inner
+        .get(&metadata::inode_key(FENCE_INODE))
+        .await
+        .unwrap();
+    let dirent = meta
+        .inner
+        .get(&metadata::dirent_key(ROOT, FENCE_OBJECT))
+        .await
+        .unwrap();
+    let named: Vec<&wyrd_custodian::restore::UnsettledSession> = report
+        .sessions_unsettled
+        .iter()
+        .filter(|unsettled| unsettled.session.as_bytes() == session.as_slice())
+        .collect();
+    let flip_owned = |flip: &FlipRecords| {
+        vec![(
+            flip.records_key.clone(),
+            Owed::Published(flip.records.clone()),
+        )]
+    };
+    let completing = arm == FenceArm::Completing;
+
+    match regime {
+        // THE FENCE WON: `Aborting@E+1`, every obligation under token `E` with the fence's payload,
+        // and nothing published.
+        FenceRegime::FenceWon => {
+            let attempts = if completing { 2 } else { 1 };
+            assert_eq!(
+                state,
+                Some(fence_session(FENCE_EPOCH + 1, attempts, FENCE_ABORTING)),
+                "the fence won, so the session is Aborting@{} — {context}",
+                FENCE_EPOCH + 1
+            );
+            assert_owed(&meta, &fence_obligations(FENCE_EPOCH, completing), &context).await;
+            assert!(
+                report.sessions_fenced == 1 && named.is_empty(),
+                "the fence won and is counted, unnamed: {report:?} — {context}"
+            );
+        }
+        // THE WRITER WON AFTER THE PASS READ `@E`: its state stands, every `retire:` record under
+        // token `E` is its own, and the pass named the session it could not fence — for the true
+        // cause. A lost fence commit is diagnosed by re-reading the session afresh, and that re-read
+        // returns the writer's state, so the only true cause is `ChangedUnderPass`. Never
+        // `ObligationKeyTaken`: in the Completing arm the taken `retire:records:` key is the root
+        // flip's own obligation, owed by an upload that simply published. Never `LostConflict`.
+        FenceRegime::WriterWon { .. } => {
+            assert_eq!(
+                state.as_ref(),
+                Some(&fixture.moved),
+                "the writer won, so its state stands — {context}"
+            );
+            let owned = fixture.flip.as_ref().map(flip_owned).unwrap_or_default();
+            assert_owed(&meta, &owned, &context).await;
+            assert!(
+                report.sessions_fenced == 0
+                    && named.len() == 1
+                    && named[0].cause
+                        == wyrd_custodian::restore::SessionUnsettled::ChangedUnderPass,
+                "the fence's commit lost to the writer, so the pass names the session it could \
+                 not fence, as changed under it: {report:?} — {context}"
+            );
+            let lost_at = fence.map_or(events.len(), |(at, _)| at);
+            let reread = events[lost_at..].iter().find_map(|event| match event {
+                FenceEvent::SessionGot(value) => Some(value.as_ref()),
+                _ => None,
+            });
+            assert_eq!(
+                reread,
+                Some(Some(&fixture.moved)),
+                "after its fence commit lost, the pass re-read the session and found the writer's \
+                 state — {context}"
+            );
+        }
+        // THE WRITER WON BEFORE THE PASS READ THE SESSION: the pass treats its state as it treats
+        // any session's — fences `Completing@E+1` to `Aborting@E+2` with obligations under token
+        // `E+1`, and leaves `Completed@E+1` untouched and unnamed.
+        FenceRegime::WriterFirst => {
+            if completing {
+                assert_eq!(state.as_ref(), Some(&fixture.moved), "{context}");
+                let owned = fixture.flip.as_ref().map(flip_owned).unwrap_or_default();
+                assert_owed(&meta, &owned, &context).await;
+                assert!(
+                    report.sessions_fenced == 0 && named.is_empty(),
+                    "a Completed session is settled — neither fenced nor named: {report:?} — \
+                     {context}"
+                );
+            } else {
+                assert_eq!(
+                    state,
+                    Some(fence_session(FENCE_EPOCH + 2, 2, FENCE_ABORTING)),
+                    "the pass read Completing@{}, so it fences it to Aborting@{} — {context}",
+                    FENCE_EPOCH + 1,
+                    FENCE_EPOCH + 2
+                );
+                assert_owed(&meta, &fence_obligations(FENCE_EPOCH + 1, true), &context).await;
+                assert!(
+                    report.sessions_fenced == 1 && named.is_empty(),
+                    "{report:?} — {context}"
+                );
+            }
+        }
+    }
+    if let Some(flip) = fixture.flip.as_ref().filter(|_| writer_won) {
+        assert!(
+            inode.as_ref() == Some(&flip.inode) && dirent.as_ref() == Some(&flip.dirent),
+            "the flip won, so its object is published — {context}"
+        );
+    } else {
+        assert!(
+            inode.is_none() && dirent.is_none(),
+            "no flip landed, yet the object is published — {context}"
+        );
+    }
+
+    // On every schedule: the verdict half ran (the dangling chunk is reported), no attempt needed a
+    // human, and the session's staged fragment was never marked.
+    assert_eq!(report.dangling, vec![FENCE_DANGLING], "{context}");
+    assert!(
+        report.segments_unaccounted.is_empty(),
+        "{report:?} — {context}"
+    );
+    assert!(
+        !is_marked(&meta.inner, 1, frag_of(FENCE_PART_CHUNK)).await,
+        "the session's part fragment is marked collectable — {context}"
+    );
+    regime
+}
+
+/// The campaign leg: the seed picks where each arm's writer lands, [`RESTORE_FENCE_DRAWS`] times
+/// per arm, so 50 seeds sweep the schedule space around the fence's read and its commit.
+async fn prop_restore_fence_never_shares_the_epoch(rng: &mut ChaCha8Rng) {
+    for _ in 0..RESTORE_FENCE_DRAWS {
+        for arm in [FenceArm::Open, FenceArm::Completing] {
+            let delay = u64::from(rng.next_u32() % (RESTORE_FENCE_SPAN + 1));
+            restore_fence_under_a_concurrent_writer(arm, delay * 1_000 + 500).await;
+        }
+    }
+}
+
+/// One run whose fence commit is answered `CommitUnknownResult`, applied whole or not at all by
+/// `fate`, then a re-run over the same store. The struck pass returns `Err` after naming the
+/// dangling chunk; the re-run leaves the session fenced with exactly one set of obligations.
+async fn restore_fence_after_an_ambiguous_commit(arm: FenceArm, fate: Fate) {
+    let d = servers();
+    let meta = FenceMeta::new(Some(fate));
+    let fixture = seed_restored_session(&meta, &d, arm).await;
+    let completing = arm == FenceArm::Completing;
+    let attempts = if completing { 2 } else { 1 };
+    let fenced = fence_session(FENCE_EPOCH + 1, attempts, FENCE_ABORTING);
+    let obligations = fence_obligations(FENCE_EPOCH, completing);
+    let fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d[0]), (1, &d[1]), (2, &d[2]), (3, &d[3])];
+    let ctx = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: 50,
+        expired_pending: ExpiredPendingPolicy::Reclaim,
+    };
+
+    meta.log(FenceEvent::Pass);
+    let capture = AuditCapture::default();
+    let struck = reconcile_after_restore(&ctx, FENCE_NOW)
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
+    let context = format!("{arm:?} arm, {fate:?}: {:?}", meta.events());
+    let err =
+        struck.expect_err("a fence commit answered with an unknown outcome ends the pass in Err");
+    let first: &(dyn std::error::Error + 'static) = &*err;
+    assert!(
+        std::iter::successors(Some(first), |at| at.source())
+            .any(|at| at.is::<wyrd_traits::CommitUnknownResult>()),
+        "the pass's Err is the unknown outcome itself ({err}) — {context}"
+    );
+    assert_eq!(
+        meta.events()
+            .iter()
+            .filter(|event| matches!(event, FenceEvent::FenceAnswered(_)))
+            .count(),
+        1,
+        "the struck commit is the pass's only commit of the session — {context}"
+    );
+    // The verdict half's operator signal is out BEFORE the fence's failure ends the pass.
+    let lines = capture.lines.lock().unwrap().clone();
+    let action_at = |action: &str, chunk: Option<ChunkId>| {
+        lines.iter().position(|line| {
+            line.get("action").map(String::as_str) == Some(action)
+                && chunk.is_none_or(|chunk| line.get("chunk") == Some(&chunk_hex(chunk)))
+        })
+    };
+    let dangling = action_at("dangling", Some(FENCE_DANGLING))
+        .unwrap_or_else(|| panic!("no DANGLING line for the dangling chunk — {context}"));
+    let failed = action_at("session-fence-failed", None)
+        .unwrap_or_else(|| panic!("the fence's failure is not on the audit seam — {context}"));
+    assert!(
+        dangling < failed,
+        "the DANGLING line came after the fence failed — {context}"
+    );
+    // Whole or not at all: never a transition without its obligations, nor the reverse.
+    let state = meta.inner.get(&meta.session).await.unwrap();
+    match fate {
+        Fate::Landed => {
+            assert_eq!(state.as_ref(), Some(&fenced), "{context}");
+            assert_owed(&meta, &obligations, &context).await;
+        }
+        Fate::NotLanded => {
+            assert_eq!(state.as_ref(), Some(&fixture.preimage), "{context}");
+            assert_owed(&meta, &[], &context).await;
+        }
+    }
+
+    // THE NEXT PASS SETTLES IT, whichever fate the store took.
+    meta.log(FenceEvent::Pass);
+    let report = reconcile_after_restore(&ctx, FENCE_NOW)
+        .await
+        .unwrap_or_else(|err| panic!("the re-run failed ({err}) — {context}"));
+    let context = format!("{arm:?} arm, {fate:?}, re-run: {:?}", meta.events());
+    assert_eq!(
+        meta.inner.get(&meta.session).await.unwrap().as_ref(),
+        Some(&fenced),
+        "the re-run leaves the session fenced — {context}"
+    );
+    assert_owed(&meta, &obligations, &context).await;
+    assert!(
+        meta.inner
+            .get(&metadata::inode_key(FENCE_INODE))
+            .await
+            .unwrap()
+            .is_none(),
+        "nothing is published — {context}"
+    );
+    assert!(
+        report.sessions_fenced == usize::from(fate == Fate::NotLanded)
+            && report.sessions_unsettled.is_empty()
+            && report.segments_unaccounted.is_empty(),
+        "the re-run fences the session once in all, and needs no human: {report:?} — {context}"
+    );
+    assert_eq!(report.dangling, vec![FENCE_DANGLING], "{context}");
+}
+
+/// The campaign leg: the seed picks each arm's fate.
+async fn prop_restore_fence_settles_an_ambiguous_commit(rng: &mut ChaCha8Rng) {
+    for arm in [FenceArm::Open, FenceArm::Completing] {
+        let fate = if rng.next_u32().is_multiple_of(2) {
+            Fate::Landed
+        } else {
+            Fate::NotLanded
+        };
+        restore_fence_after_an_ambiguous_commit(arm, fate).await;
+    }
+}
+
+/// **The contested window is REACHED, and shown to be reached.** Walks each arm's writer across the
+/// whole span, asserting the invariant at every point, then asserts on the RECORDED order: a landing
+/// where the pass's read returned `@E` and its fence commit was then refused because the writer's
+/// commit had applied in between (a stale-preimage conflict), one where the fence won, and one where
+/// the writer landed before the pass read the session. The first is the one this property exists
+/// for: a fence won and a writer won are both produced by serial runs too. Only the Open arm's
+/// stale-preimage conflict is decided by the fence's precondition on the session bytes alone: the
+/// root flip also writes the `retire:records:` key the fence requires absent, so the Completing
+/// arm's fence would lose on that key even without the session precondition.
+async fn prop_restore_fence_reaches_the_contested_window() {
+    for arm in [FenceArm::Open, FenceArm::Completing] {
+        let mut seen: Vec<(u64, FenceRegime)> = Vec::new();
+        for delay in 0..=u64::from(RESTORE_FENCE_SPAN) {
+            let regime = restore_fence_under_a_concurrent_writer(arm, delay * 1_000 + 500).await;
+            seen.push((delay, regime));
+        }
+        let reached = |regime: FenceRegime| seen.iter().any(|&(_, at)| at == regime);
+        assert!(
+            reached(FenceRegime::WriterWon { stale: true }),
+            "{arm:?}: no landing in 0..={RESTORE_FENCE_SPAN} ms applied the writer's transition \
+             between the fence's read and its commit — the stale-preimage conflict this property \
+             exists for was never exercised: {seen:?}"
+        );
+        assert!(
+            reached(FenceRegime::FenceWon),
+            "{arm:?}: no landing let the fence win — the span no longer reaches past the fence's \
+             commit: {seen:?}"
+        );
+        assert!(
+            reached(FenceRegime::WriterFirst),
+            "{arm:?}: no landing preceded the pass's read of the session: {seen:?}"
+        );
+    }
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -5156,6 +6066,24 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn restore_fence_never_shares_the_epoch_with_a_session_writer() {
+        prop_restore_fence_never_shares_the_epoch(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn restore_fence_settles_an_ambiguous_commit_on_the_next_pass() {
+        prop_restore_fence_settles_an_ambiguous_commit(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn restore_fence_reaches_the_contested_window() {
+        prop_restore_fence_reaches_the_contested_window().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -5195,6 +6123,8 @@ dst_campaign_test! {
             prop_gc_fragment_less_sweep_never_deletes_a_restamped_mark(&mut rng).await;
             prop_gc_sweep_judges_an_ambiguous_commit_as_one_batch(&mut rng).await;
             prop_staged_replace_under_the_fence_strands_nothing(&mut rng).await;
+            prop_restore_fence_never_shares_the_epoch(&mut rng).await;
+            prop_restore_fence_settles_an_ambiguous_commit(&mut rng).await;
         }
     }
 }

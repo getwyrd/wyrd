@@ -597,7 +597,8 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #    partial fleet rather than guess.
 #
 #    It exits NON-ZERO if the restore cost you anything — or if it could not read all of the
-#    metadata — and distinguishes three different bills; read which one before you act:
+#    metadata, or could not fence every upload cleanly — and distinguishes five bills; read
+#    which one before you act:
 #      DANGLING  — fewer than k fragments exist ANYWHERE: the file is LOST. You restored past
 #                  a delete, and GC had already taken the bytes. Nothing can rebuild it.
 #      MISPLACED — the bytes EXIST, but not where the restored map points: a repair moved
@@ -608,8 +609,9 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #                  (the audit log gives each chunk id), then re-run the pass.
 #      UNREADABLE — a record the pass could not READ at all: a committed object whose chunk
 #                  map is missing segments or will not decode; an upload session (mpu:) or an
-#                  in-flight staging entry (sidx:) whose KEY will not parse — the pass never
-#                  decodes their values, so a damaged one is not what you are looking at; or a
+#                  in-flight staging entry (sidx:) whose KEY will not parse — for this bill the
+#                  pass reads them by key alone, so a damaged value is not what you are looking
+#                  at (a session whose VALUE will not decode is the NOT FENCED bill below); or a
 #                  committed part (part:) whose key will not parse or whose value will not
 #                  decode. The pass NAMES the records to repair
 #                  — in the paragraph it prints (the first 20 of them, with any remainder
@@ -622,6 +624,34 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #                  marked, which is 0 while any record is unreadable: such a record hides
 #                  which chunks it owns, so no fragment can be shown to be a stray. Repair or
 #                  remove those records, then re-run.
+#      NOT FENCED — an upload session the pass could not fence (below): its record will not
+#                  decode, it is at its last epoch, it changed while the pass ran, its
+#                  retirement key was taken, or its commit lost an unexplained conflict. Each is
+#                  left as found and NAMED (the first 20, the rest counted; every one in the
+#                  audit log, action=session-unsettled, with the cause). Repair or tear each
+#                  one down, then re-run.
+#      SEGMENTS   — an upload FENCED mid-Complete with a segment record naming a chunk none
+#                  of its parts holds, not decoding, or under a stray key, or whose
+#                  retire:records: obligation will not decode, owes anything but those
+#                  records, or is missing. A drain deletes them without marking any bytes, or
+#                  never does, so every run NAMES the upload and that record
+#                  (action=session-segments-unaccounted). Inspect it first.
+#
+#    Last, the pass FENCES every multipart upload the restored image holds open or mid-Complete
+#    (to Aborting, with the obligations owing its records, in one commit), so no such upload can
+#    be completed over bytes GC took. If a fence commit fails it exits with that error and no
+#    verdict, but the audit log has the summary (action=summary, INCOMPLETE, clean=false);
+#    re-run it — a second run fences nothing twice. Serve no multipart uploads until a run has
+#    fenced every upload.
+#
+#    The summary also counts the fragments the pass kept because a multipart upload's own
+#    staged records name them — an upload's bytes, not strays, so never marked. A staged record
+#    the pass could read but not TRUST about where its chunk's fragments are (a placement of
+#    the wrong length, say) is not one of the bills above: the exit status ignores it. It gets
+#    a line of its own that names the record: the pass held that chunk and marked none of its
+#    fragments (it did not check that the staged bytes survived the restore), and the run is
+#    not reported clean, because such a record points at a bug or corruption and blocks every
+#    drain in the cluster while it remains (action=untrusted-staged-record in the audit log).
 
 # 8. Resume writers, then run a scrub pass (see below).
 ```
@@ -1105,12 +1135,16 @@ export WYRD_S3_ACCESS_KEY=... WYRD_S3_SECRET_KEY=...
 
 # S3 gateway — stateless front door. --metadata-backend is the redb|tikv|fdb selector;
 # --coordination-backend etcd needs the `etcd` cargo feature (see Prerequisites);
+# --chunk-size is bytes per chunk (the erasure-coding unit); 1048576 is the default,
+# stated so the invocation records it. Accepted 1..=16777216 (16 MiB), a ceiling set by
+# the D-server gRPC message limit; any other value refuses to start.
 # --endpoints are the D servers from B.4.
 wyrd s3 \
   --metadata-backend fdb \
   --coordination-backend etcd \
   --s3-listen 0.0.0.0:8080 \
   --region <your-region> \
+  --chunk-size 1048576 \
   --endpoints http://10.0.1.<d0>:50051,...
 
 # custodian — reconstruction/repair; emits durability telemetry.

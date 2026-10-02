@@ -1729,8 +1729,9 @@ async fn walk_staged_range(
     }
 }
 
-/// One checked page of a staged read, its failure named by the range it was reading.
-async fn staged_page(
+/// One checked page of a staged read, its failure named by the range it was reading. Also the
+/// page read of the post-restore session fence's `mpu:` listing (`crate::restore`).
+pub(crate) async fn staged_page(
     meta: &dyn MetadataStore,
     range: &[u8],
     after: Option<&[u8]>,
