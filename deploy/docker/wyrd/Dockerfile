@@ -23,6 +23,16 @@
 # A silent drift between the baked client and the deployed cluster is exactly the
 # failure mode #441's version-skew guard exists to diagnose; `xtask/tests/fdb_image.rs`
 # mechanically pins all three together so drift fails the gate, not production.
+#
+# ── Two binaries, one build (#742) ──
+# The image carries BOTH shipped binaries: `wyrd` (every role; the ENTRYPOINT) and
+# `wyrd-validate` (the blackbox validator, proposal 0017 §2 — present in the image, never
+# invoked by it). `cargo xtask dist` extracts both out of this one image, so the operator
+# tarball's copies are bit-identical to the image's (maintainer decision 2026-08-17,
+# option A). The set is DECLARED once, in `xtask::dist::shipped_binaries()`;
+# `xtask/tests/dist_two_binary_layout.rs` pins the `--bin` and `COPY --from=build` lines
+# below to it, so a binary added to the table fails the gate here until it is built and
+# copied too.
 
 # Default matches `deploy/fdb-single-node/docker-compose.yml`'s pinned cluster tag.
 ARG FDB_VERSION=7.3.77
@@ -62,10 +72,12 @@ RUN set -eux; \
 WORKDIR /src
 COPY . .
 # `--locked` so the container build uses the committed `Cargo.lock` exactly, matching
-# the gated workspace rather than silently resolving newer deps.
-RUN cargo build --release --locked --bin wyrd ${FEATURES:+--features "$FEATURES"}
+# the gated workspace rather than silently resolving newer deps. ONE build for both
+# binaries: `--features` applies to the packages that declare them (`wyrd`), and
+# `wyrd-validate` is featureless by construction (it depends on no `wyrd-*` crate).
+RUN cargo build --release --locked --bin wyrd --bin wyrd-validate ${FEATURES:+--features "$FEATURES"}
 
-# ── Runtime stage — a minimal image hosting just the `wyrd` binary. ──
+# ── Runtime stage — a minimal image hosting the two shipped binaries and nothing else. ──
 FROM debian:bookworm-slim
 ARG FEATURES
 ARG FDB_VERSION
@@ -115,11 +127,14 @@ ENV WYRD_FDB_EXTERNAL_CLIENT_DIR=/var/lib/wyrd/fdb/external-clients
 # OCI labels record the baked client/cli version so an operator (and #441's doctor) can
 # read the image's FDB line without unpacking it.
 LABEL org.opencontainers.image.title="wyrd" \
-      org.opencontainers.image.description="Wyrd binary with the FoundationDB metadata backend (ADR-0042)" \
+      org.opencontainers.image.description="Wyrd binary with the FoundationDB metadata backend (ADR-0042), plus the wyrd-validate blackbox validator" \
       org.opencontainers.image.source="https://github.com/getwyrd/wyrd" \
       dev.wyrd.fdb.libfdb_c.version="${FDB_VERSION}" \
       dev.wyrd.fdb.fdbcli.version="${FDB_VERSION}"
 COPY --from=build /src/target/release/wyrd /usr/local/bin/wyrd
+# The validator links no `libfdb_c` and takes no config from this image; it is here so
+# the tarball's copy can be extracted from the same build as `wyrd`'s.
+COPY --from=build /src/target/release/wyrd-validate /usr/local/bin/wyrd-validate
 # Drop root (issue #286, mirroring the dserver fixture at `:56-64`): a dedicated
 # unprivileged system user/group with the stable fixed 10001:10001 id, and `/data`
 # pre-created and owned by it so a compose service's `--data-dir /data` is writable

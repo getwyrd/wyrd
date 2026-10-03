@@ -40,6 +40,11 @@ on:
       - "crates/server/**"
       - "crates/coordination-etcd/**"
       - ".dockerignore"
+      # The image's SECOND binary (#742). `wyrd-validate` is featureless and the default
+      # gate compiles and tests it, so this entry is not about a feature tree: this job
+      # is the only one that RUNS the validator inside the built image, and its smoke
+      # greps the usage line that crate prints — a change there must re-run that smoke.
+      - "crates/validate/**"
   workflow_dispatch: {}
 
 permissions:
@@ -88,6 +93,20 @@ jobs:
             exit 1
           fi
           grep -Eq 'redb\|tikv\|fdb' usage.txt
+
+      # The image carries the blackbox validator beside `wyrd` (#742; the set is
+      # `xtask::dist::shipped_binaries()`): a no-args invocation must print its usage and
+      # exit non-zero. Same shape as above — assert on captured stderr, not on the exit
+      # status alone, so a binary that cannot load (exit 127) fails the grep rather than
+      # being taken for a correct refusal.
+      - name: wyrd-validate usage smoke
+        run: |
+          set -eu
+          if docker run --rm --entrypoint wyrd-validate wyrd:fdb 2> validate-usage.txt; then
+            echo 'expected wyrd-validate with no arguments to exit non-zero' >&2
+            exit 1
+          fi
+          grep -q 'usage: wyrd-validate' validate-usage.txt
 
       # Confirm the runtime stage actually carries the pinned FDB client tooling the
       # doctor (#439) and operators depend on.
