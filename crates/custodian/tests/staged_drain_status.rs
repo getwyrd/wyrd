@@ -275,7 +275,8 @@ fn place(disks: &[Disk; 4], dserver: DServerId, frag: FragmentId) {
 fn session_open() -> Bytes {
     let bytes = format!(
         "{{\"parent\":{PARENT},\"object\":\"{OBJECT}\",\"created_at_millis\":100,\
-         \"clock_source\":\"wall\",\"epoch\":{EPOCH},\"attempts\":1,\
+         \"clock_source\":\"wall\",\"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\
+         \"epoch\":{EPOCH},\"attempts\":1,\
          \"state\":{{\"kind\":\"Open\"}}}}"
     )
     .into_bytes();

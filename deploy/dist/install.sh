@@ -2,10 +2,12 @@
 # wyrd @VERSION@ — installer for the bare-metal role deployment (ADR-0010:
 # systemd on the storage hosts; the OCI image is the container path).
 #
-# Installs: the `wyrd` binary, systemd units for the three long-running roles
-# (d-server, custodian, s3), and /etc/wyrd/<role>.env config files (from the
-# bundled examples, NEVER overwriting an existing one). It does NOT enable or
-# start anything — wiring a host into a cluster is an operator decision.
+# Installs: the `wyrd` binary, the `wyrd-validate` blackbox validator (a plain
+# binary beside it — no unit, no config file; run by hand against a deployment),
+# systemd units for the three long-running roles (d-server, custodian, s3), and
+# /etc/wyrd/<role>.env config files (from the bundled examples, NEVER overwriting
+# an existing one). It does NOT enable or start anything — wiring a host into a
+# cluster is an operator decision.
 #
 # Usage:
 #   sudo ./install.sh [--prefix /usr/local]
@@ -33,7 +35,7 @@ while [ $# -gt 0 ]; do
         --purge) PURGE=1; shift ;;
         --yes) YES=1; shift ;;
         -h|--help)
-            sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -113,12 +115,13 @@ if [ "$UNINSTALL" = 1 ]; then
         rm -f "$UNITDIR/$unit"
     done
     rm -f "$BINDIR/wyrd"
+    rm -f "$BINDIR/wyrd-validate"
     if systemd_running; then systemctl daemon-reload; fi
     if [ "$PURGE" = 1 ]; then
         rm -rf "$CONFDIR" "$DATADIR"
-        echo "wyrd uninstalled ($BINDIR/wyrd, units); purged $CONFDIR and $DATADIR."
+        echo "wyrd uninstalled ($BINDIR/wyrd, $BINDIR/wyrd-validate, units); purged $CONFDIR and $DATADIR."
     else
-        echo "wyrd uninstalled ($BINDIR/wyrd, units). Config and data kept:"
+        echo "wyrd uninstalled ($BINDIR/wyrd, $BINDIR/wyrd-validate, units). Config and data kept:"
         echo "  $CONFDIR  $DATADIR"
     fi
     exit 0
@@ -133,7 +136,11 @@ if ! getent passwd wyrd >/dev/null 2>&1; then
 fi
 
 install -d -m 0755 "$BINDIR"
+# Every shipped binary. The validator is a binary and nothing else: no unit, no
+# /etc/wyrd entry (ROLES above must not grow it — that list drives units, env files
+# and `systemctl disable`).
 install -m 0755 "$HERE/bin/wyrd" "$BINDIR/wyrd"
+install -m 0755 "$HERE/bin/wyrd-validate" "$BINDIR/wyrd-validate"
 
 install -d -m 0750 -o root -g wyrd "$CONFDIR"
 install -d -m 0750 -o wyrd -g wyrd "$DATADIR"
@@ -193,6 +200,7 @@ fi
 cat <<EOF
 wyrd @VERSION@ installed:
   binary   $BINDIR/wyrd
+  tool     $BINDIR/wyrd-validate                            (blackbox validator; no unit)
   units    $UNITDIR/wyrd-{d-server,custodian,s3}.service   (installed, NOT enabled)
   config   $CONFDIR/<role>.env                              (edit before starting)
   data     $DATADIR                                         (StateDirectory parent)
