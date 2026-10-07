@@ -188,7 +188,7 @@ fn env_examples_name_every_load_bearing_flag() {
     // `--chunk-size` must be on the LIVE `WYRD_S3_ARGS=` line, not just somewhere in the
     // file: its comment block names the flag too, so a whole-file `contains` would still
     // pass with the flag deleted from the args the unit actually runs (#738). Its value must
-    // be one the role accepts (1..=16777216), or the shipped template would not start.
+    // be one the role accepts (1048576..=16777216), or the shipped template would not start.
     let s3_args: Vec<&str> = s
         .lines()
         .filter_map(|line| line.strip_prefix("WYRD_S3_ARGS="))
@@ -209,8 +209,8 @@ fn env_examples_name_every_load_bearing_flag() {
     assert!(
         chunk_size
             .parse::<usize>()
-            .is_ok_and(|n| (1..=16_777_216).contains(&n)),
-        "s3.env.example's `--chunk-size {chunk_size}` is outside what `wyrd s3` accepts (1..=16777216)"
+            .is_ok_and(|n| (1_048_576..=16_777_216).contains(&n)),
+        "s3.env.example's `--chunk-size {chunk_size}` is outside what `wyrd s3` accepts (1048576..=16777216)"
     );
     // The credential assignments must ship COMMENTED OUT: the CLI checks the
     // variables for PRESENCE, so an empty-but-set `WYRD_S3_ACCESS_KEY=` would
