@@ -32,8 +32,8 @@ futures-util.workspace = true
 # `Body`/`Frame`, to hand a caller's source to the SDK as a request body with a declared
 # length and no buffering.
 http-body.workspace = true
-# The body-idle deadline (`tokio::time::timeout`); the SDK's own deadlines sleep on the same
-# runtime clock.
+# The body-idle and body deadlines (`tokio::time::timeout`); the SDK's own deadlines sleep on
+# the same runtime clock.
 tokio.workspace = true
 
 # Wyrd crates are allowed here and only here (proposal 0017 §9; the blackbox guard leaves
