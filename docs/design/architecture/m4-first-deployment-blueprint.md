@@ -624,7 +624,8 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #                  remove those records, then re-run.
 #
 #    The summary also counts the fragments the pass kept because a multipart upload's own
-#    staged records name them — an upload's bytes, not strays, so never marked. A staged record
+#    staged records name them — an upload's bytes, not strays, so never marked (while a staged
+#    record is unreadable, that is every fragment no committed object names). A staged record
 #    the pass could read but not TRUST about where its chunk's fragments are (a placement of
 #    the wrong length, say) is not one of the bills above: the exit status ignores it. It gets
 #    a line of its own that names the record: the pass held that chunk and marked none of its

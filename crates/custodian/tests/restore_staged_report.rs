@@ -484,6 +484,68 @@ async fn staged_skips_are_counted_once_by_the_first_protection_that_keeps_them()
     }
 }
 
+// ---- (E-ii) an unreadable staged record's protection is counted too ----------------------------
+
+/// **(E-ii)** One `Open` session with one `part:` record that will not decode and one that places
+/// a fragment; a committed object placing another; and two fragments nothing names. The unreadable
+/// record is named and withholds every mark — and the staged class is then the FIRST protection
+/// keeping every fragment the committed reading does not, so `staged_skipped` counts the staged
+/// fragment AND both would-be strays, while the committed object's fragment stays uncounted.
+///
+/// Base: the hole short-circuited the gate before the staged class, and `staged_skipped` read 0
+/// precisely when the staged class had held the whole fleet.
+#[tokio::test]
+async fn an_unreadable_staged_records_protection_is_counted_as_staged() {
+    let meta = Meta::default();
+    let d = disks();
+    let id = upload("e2");
+    meta.seed(mpu_key(&id), open_session());
+
+    let unreadable = part_key(&id, part_no(1));
+    meta.seed(unreadable.clone(), Bytes::from_static(b"not a part record"));
+    meta.seed(
+        part_key(&id, part_no(2)),
+        part(&[chunk_ref(0xE7, EcScheme::None, &[1])]),
+    );
+    let staged = (1, frag(0xE7, 0));
+
+    commit_object(&meta, 1, chunk_ref(0xE8, EcScheme::None, &[0]));
+    let committed = (0, frag(0xE8, 0));
+
+    let unnamed = [(2, frag(0xE9, 0)), (3, frag(0xEA, 0))];
+
+    let all: Vec<(DServerId, FragmentId)> =
+        [staged, committed].into_iter().chain(unnamed).collect();
+    for &(dserver, fragment) in &all {
+        place(&d, dserver, fragment);
+    }
+
+    let report = restore_pass(&meta, &d).await;
+
+    let name = String::from_utf8(unreadable).expect("an ASCII key");
+    assert_eq!(report.unresolvable, vec![name], "{report:?}");
+    assert_eq!(report.stranded_marked, 0, "a mark over a hole: {report:?}");
+    assert_eq!(
+        debug_field(&report, "staged_skipped").as_deref(),
+        Some("3"),
+        "the staged fragment and both unnamed ones, kept by the staged class; not the committed \
+         one: {report:?}"
+    );
+    for (field, expected) in [("pending_skipped", "0"), ("displaced_kept", "0")] {
+        assert_eq!(
+            debug_field(&report, field).as_deref(),
+            Some(expected),
+            "{field}: {report:?}"
+        );
+    }
+    for (dserver, fragment) in all {
+        assert!(
+            !meta.holds(&orphan_key(dserver, fragment)),
+            "{fragment:?} on server {dserver} was marked while a staged record was unreadable"
+        );
+    }
+}
+
 // ---- (H-iii) an untrusted staged record is named, and needs no human ----------------------------
 
 /// **(H-iii)** Session 1 holds one `part:` record whose two chunks each have a wrong-length
