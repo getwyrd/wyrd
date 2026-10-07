@@ -1282,8 +1282,9 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
          staged multipart records the pass could not read — so every count here is drawn over \
          the rest of the store); {} pending-ledger entr(y/ies) UNREADABLE (held unmarked, see \
          below); {} staged multipart record(s) untrusted (their chunks held unmarked, see \
-         below); {} upload session(s) fenced (Open in the restored image, now aborted — none of \
-         them can be completed), {} upload session(s) NOT fenced (see below).",
+         below); {} upload session(s) fenced (Open or Completing in the restored image, now \
+         aborted — none of them can be completed), {} upload session(s) NOT fenced (see below), \
+         {} fenced upload session(s) whose segment records need a human (see below).",
         // NOT "complete" over a store the pass could only partly read: "complete" is a claim
         // about a reading that FINISHED, and an operator scanning this line for one word must
         // not find it while a record is still unreadable.
@@ -1305,6 +1306,7 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
         report.staged_untrusted.len(),
         report.sessions_fenced,
         report.sessions_unsettled.len(),
+        report.segments_unaccounted.len(),
     )];
     if !report.pending_unreadable.is_empty() {
         lines.push(format!(
@@ -1402,6 +1404,22 @@ fn restore_verdict(report: &RestoreReport) -> RestoreVerdict {
             unsettled_causes(&report.sessions_unsettled),
         ));
     }
+    if !report.segments_unaccounted.is_empty() {
+        let sessions: Vec<String> = report
+            .segments_unaccounted
+            .iter()
+            .map(|f| format!("{} (first {}: {})", f.session, f.record, f.fault))
+            .collect();
+        lines.push(format!(
+            "wyrd custodian: NEEDS-HUMAN — {} fenced upload session(s) (none can be completed), \
+             each with the first `seg:` or `retire:records:` record at fault, and why: {}. A \
+             retire drain deletes segment records without marking any bytes; inspect the named \
+             record before one runs, then re-run this pass \
+             (`action=session-segments-unaccounted` in the audit log).",
+            report.segments_unaccounted.len(),
+            named_records(&sessions),
+        ));
+    }
     if !report.staged_untrusted.is_empty() {
         lines.push(format!(
             // INFORMATION, not NEEDS-HUMAN (`RestoreReport::needs_human` says why), but named.
@@ -1463,11 +1481,10 @@ fn named_records(names: &[String]) -> String {
 /// The unfenced sessions counted by cause, only the causes that occur. The match is exhaustive,
 /// so a cause the pass adds cannot reach an operator uncounted.
 fn unsettled_causes(sessions: &[UnsettledSession]) -> String {
-    const WHY: [&str; 7] = [
+    const WHY: [&str; 6] = [
         "whose key names no upload",
         "whose value will not decode",
-        "Open at the last epoch the record can spell",
-        "Completing (this build does not fence a Completing session)",
+        "at the last epoch the record can spell",
         "changed while this pass ran",
         "whose retirement key was already taken by another obligation",
         "lost a conflict whose cause a re-read no longer finds",
@@ -1478,10 +1495,9 @@ fn unsettled_causes(sessions: &[UnsettledSession]) -> String {
             SessionUnsettled::KeyNamesNoUpload => 0,
             SessionUnsettled::ValueUndecodable { .. } => 1,
             SessionUnsettled::EpochExhausted => 2,
-            SessionUnsettled::Completing => 3,
-            SessionUnsettled::ChangedUnderPass => 4,
-            SessionUnsettled::ObligationKeyTaken { .. } => 5,
-            SessionUnsettled::LostConflict => 6,
+            SessionUnsettled::ChangedUnderPass => 3,
+            SessionUnsettled::ObligationKeyTaken { .. } => 4,
+            SessionUnsettled::LostConflict => 5,
         };
         counts[slot] += 1;
     }
@@ -3251,12 +3267,21 @@ mod tests {
         let unsettled = RestoreReport {
             sessions_unsettled: vec![UnsettledSession {
                 session: "mpu:0123456789abcdef0123456789abcdef".to_owned(),
-                cause: SessionUnsettled::Completing,
+                cause: SessionUnsettled::EpochExhausted,
             }],
             ..Default::default()
         };
         let fenced = RestoreReport {
             sessions_fenced: 2,
+            ..Default::default()
+        };
+        let segments = RestoreReport {
+            sessions_fenced: 1,
+            segments_unaccounted: vec![wyrd_custodian::restore::UnaccountedSegments {
+                session: "mpu:abababababababababababababababab".to_owned(),
+                record: "seg:0123456789abcdef0123456789abcdef:3:000001".to_owned(),
+                fault: wyrd_custodian::restore::SegmentFault::KeyNotOfGroup,
+            }],
             ..Default::default()
         };
         for (report, human) in [
@@ -3265,6 +3290,7 @@ mod tests {
             (&unreadable, true),
             (&pending, true),
             (&unsettled, true),
+            (&segments, true),
             (&routine, false),
             (&untrusted, false),
             (&fenced, false),
@@ -3325,6 +3351,8 @@ mod tests {
                 .chain(&report.pending_unreadable)
                 .chain(&report.staged_untrusted)
                 .chain(report.sessions_unsettled.iter().map(|s| &s.session))
+                .chain(report.segments_unaccounted.iter().map(|s| &s.session))
+                .chain(report.segments_unaccounted.iter().map(|s| &s.record))
             {
                 assert!(
                     printed.contains(object.as_str()),
@@ -3335,6 +3363,12 @@ mod tests {
             assert_eq!(
                 printed.contains("could NOT be fenced"),
                 !report.sessions_unsettled.is_empty(),
+                "{printed}"
+            );
+            // ...and the fenced-but-a-human's paragraph exactly when one was named.
+            assert_eq!(
+                printed.contains("action=session-segments-unaccounted"),
+                !report.segments_unaccounted.is_empty(),
                 "{printed}"
             );
         }
@@ -3351,10 +3385,10 @@ mod tests {
         let fault = "malformed".to_owned();
         let key = "retire:bytes:s:x:3".to_owned();
         let sessions = vec![
-            unsettled("a1", SessionUnsettled::Completing),
+            unsettled("a1", SessionUnsettled::ChangedUnderPass),
             unsettled("a2", SessionUnsettled::ValueUndecodable { fault }),
             unsettled("a3", SessionUnsettled::ObligationKeyTaken { key }),
-            unsettled("a4", SessionUnsettled::Completing),
+            unsettled("a4", SessionUnsettled::ChangedUnderPass),
         ];
         let report = RestoreReport {
             sessions_fenced: 3,
@@ -3376,7 +3410,7 @@ mod tests {
             .find(|l| l.contains("could NOT be fenced"));
         let paragraph = paragraph.unwrap_or_else(|| panic!("no unfenced paragraph: {printed}"));
         for needle in sessions.iter().map(|s| s.session.as_str()).chain([
-            "2 Completing",
+            "2 changed while this pass ran",
             "1 whose value will not decode",
             "1 whose retirement key was already taken",
             "action=session-unsettled",
@@ -3396,7 +3430,7 @@ mod tests {
         let sessions: Vec<UnsettledSession> = (0..=NAMED_UNREADABLE_RECORDS)
             .map(|n| UnsettledSession {
                 session: format!("mpu:{n:032x}"),
-                cause: SessionUnsettled::Completing,
+                cause: SessionUnsettled::ChangedUnderPass,
             })
             .collect();
         let report = RestoreReport {
@@ -3419,7 +3453,7 @@ mod tests {
         for needle in [
             "and 1 more (the audit log names every one)",
             "21 upload session(s) the restored image holds could NOT be fenced",
-            "21 Completing",
+            "21 changed while this pass ran",
         ] {
             assert!(printed.contains(needle), "{needle:?}: {printed}");
         }
