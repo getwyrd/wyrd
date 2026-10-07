@@ -46,7 +46,9 @@ pub enum S3Error {
         /// The limit that was exceeded.
         limit: Duration,
     },
-    /// The SDK refused to build the request (an empty key, for one). Nothing was sent.
+    /// The request was never started: the SDK refused to build it (an empty key, for one),
+    /// or the client could not start the thread or the runtime a PUT runs on. Nothing was
+    /// sent.
     RequestNotBuilt {
         /// What the SDK reported, with its source chain.
         detail: String,
@@ -92,6 +94,20 @@ pub enum BodyError {
     SourceLength { declared: u64, produced: u64 },
     /// PUT: the caller's source failed after yielding `produced` bytes.
     SourceFailed { produced: u64, detail: String },
+    /// PUT: the endpoint answered with success before the caller's source had ended, that is,
+    /// before it had yielded its whole declared length and then reported its end. It had
+    /// yielded `produced` of its `declared` bytes by then. Never a receipt, even when
+    /// `produced` equals `declared`: until the source reports its end the body's final chunk
+    /// has not been written, so the server cannot hold the object the caller sent. The source
+    /// is not polled again once the client has the answer, so a source that would have
+    /// reported its end, given its last piece, failed, or run past its declared length after
+    /// that is reported here too.
+    AcknowledgedEarly {
+        declared: u64,
+        produced: u64,
+        /// The answer's `x-amz-request-id` header.
+        request_id: Option<String>,
+    },
     /// GET: reading the body failed after `received` of its `declared` bytes (a cut
     /// connection, a framing error).
     Transport {
@@ -181,6 +197,18 @@ impl fmt::Display for BodyError {
                 f,
                 "the PUT source failed after yielding {produced} bytes: {detail}"
             ),
+            Self::AcknowledgedEarly {
+                declared,
+                produced,
+                request_id,
+            } => {
+                write!(
+                    f,
+                    "the endpoint acknowledged the PUT before its source had ended, when it had \
+                     yielded {produced} of {declared} bytes"
+                )?;
+                write_request_id(f, request_id.as_deref())
+            }
             Self::Transport {
                 declared,
                 received,

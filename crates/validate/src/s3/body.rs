@@ -7,16 +7,20 @@
 //! `collect`, no aggregation, and no growing buffer in either path.
 
 use std::error::Error;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::task::{ready, Context, Poll};
+use std::task::{ready, Context, Poll, Wake, Waker};
 use std::time::Duration;
 
 use aws_sdk_s3::error::{BoxError, DisplayErrorContext};
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use futures_util::stream::{Stream, StreamExt};
+use futures_util::task::AtomicWaker;
 use http_body::Frame;
+use tokio::task::Unconstrained;
 use tokio::time::Instant;
 
 use super::error::{BodyError, Phase, S3Error};
@@ -53,19 +57,200 @@ impl PutSource {
         self.length
     }
 
-    /// The request body handed to the SDK, plus the slot it records its own failure in.
-    /// The slot is how a source failure reaches the caller as itself, whatever the SDK and
-    /// hyper wrap it in on the way out.
-    pub(super) fn into_body(self) -> (DeclaredLengthBody, Arc<OnceLock<BodyError>>) {
-        let failure = Arc::new(OnceLock::new());
+    /// The request body handed to the SDK, plus the [`Upload`] record it keeps. The record is
+    /// how a source failure reaches the caller as itself, whatever the SDK and hyper wrap it
+    /// in on the way out, and how the caller learns whether the source had ended when the
+    /// response arrived.
+    pub(super) fn into_body(self) -> (DeclaredLengthBody, Arc<Upload>) {
+        let upload = Arc::new(Upload {
+            declared: self.length,
+            produced: AtomicU64::new(0),
+            ended: AtomicBool::new(false),
+            failure: OnceLock::new(),
+            answer: OnceLock::new(),
+            turn: Arc::new(Turn::default()),
+        });
         let body = DeclaredLengthBody {
             pieces: self.pieces,
-            declared: self.length,
-            produced: 0,
-            ended: false,
-            failure: Arc::clone(&failure),
+            upload: Arc::clone(&upload),
         };
-        (body, failure)
+        (body, upload)
+    }
+}
+
+/// What one PUT's body has done, shared between the body, the request that carries it
+/// ([`Upload::request_first`]), the hook that sees the response arrive, and
+/// [`super::S3Client::put_object`], which judges the outcome on it.
+#[derive(Debug)]
+pub(super) struct Upload {
+    declared: u64,
+    /// Bytes the source has given, all of them handed on to the SDK. Only the body writes it.
+    produced: AtomicU64,
+    /// The source has ended: it gave its whole declared length and then reported its end.
+    /// Only the body writes it, and it never polls the source again after.
+    ended: AtomicBool,
+    /// The source's first failure; the body never polls the source again after one.
+    failure: OnceLock<BodyError>,
+    /// Set once, when the request sees the response head.
+    answer: OnceLock<Answer>,
+    /// Keeps the body from running ahead of the request.
+    turn: Arc<Turn>,
+}
+
+/// The response head as the request first saw it.
+#[derive(Debug)]
+struct Answer {
+    /// Whether the source had ended when hyper handed the response over.
+    source_ended: bool,
+    /// The response's `x-amz-request-id` header.
+    request_id: Option<String>,
+}
+
+impl Upload {
+    /// Wrap a PUT's request future so its body never runs ahead of it ([`Turn`]).
+    pub(super) fn request_first<F: Future>(&self, request: F) -> RequestFirst<F> {
+        RequestFirst {
+            request: Box::pin(tokio::task::unconstrained(request)),
+            waker: Waker::from(Arc::clone(&self.turn)),
+            turn: Arc::clone(&self.turn),
+        }
+    }
+
+    /// Record that the request has seen the response head. From here on the body takes
+    /// nothing more from the source, so whether it has ended by now is final for judging the
+    /// outcome.
+    pub(super) fn answered(&self, request_id: Option<String>) {
+        // This runs inside a poll of the request, and the body takes nothing until that poll
+        // has ended ([`Turn`]), so `ended` still stands as it did when hyper handed the
+        // response over.
+        let _ = self.answer.set(Answer {
+            source_ended: self.ended.load(Ordering::SeqCst),
+            request_id,
+        });
+    }
+
+    /// The source's own failure, if it failed.
+    pub(super) fn failure(&self) -> Option<&BodyError> {
+        self.failure.get()
+    }
+
+    /// The error for a success that arrived before the source had ended; `None` when the
+    /// source had ended first, which makes the success a receipt. Having given its whole
+    /// declared length is not enough: a source that has not reported its end may still run
+    /// past that length, and until it does report it the SDK has not written the body's
+    /// final chunk.
+    ///
+    /// A success with no record of its arrival is not a receipt either, since nothing then
+    /// shows that the source had ended first. The SDK calls the hook that makes the record
+    /// for every response it hands back ([`Upload::answered`]), so that is not expected.
+    ///
+    /// The byte count in the error is read now. It is still the count at the response's
+    /// arrival: the body takes nothing from the source once the response has arrived
+    /// ([`DeclaredLengthBody`]).
+    pub(super) fn acknowledged_early(&self) -> Option<BodyError> {
+        let answer = self.answer.get();
+        if answer.is_some_and(|answer| answer.source_ended) {
+            return None;
+        }
+        Some(BodyError::AcknowledgedEarly {
+            declared: self.declared,
+            produced: self.produced.load(Ordering::SeqCst),
+            request_id: answer.and_then(|answer| answer.request_id.clone()),
+        })
+    }
+}
+
+/// The order between a PUT's request and its body.
+///
+/// hyper reads the response in its connection task. When the response head arrives it hands
+/// the response to the request and wakes it, and then, in the same poll of the connection,
+/// asks the body for more. Left alone, the body would take from the source after the
+/// response had arrived and before the request had seen it, and a source that ended in that
+/// gap would turn an early answer into a receipt.
+///
+/// So the request is polled with a waker that counts its wakes ([`RequestFirst`]). While the
+/// request has a wake it has not finished a poll for, the body takes nothing: it waits for
+/// that poll to end. The response's wake is one of them, so the request has always seen the
+/// response, and recorded it ([`Upload::answered`]), before the body can take another piece.
+/// A wake for anything else (a deadline, say) only makes the body wait one poll of the
+/// request. The connection task is also the only one that polls the body, so a response
+/// cannot arrive in the middle of a body poll.
+#[derive(Debug, Default)]
+struct Turn {
+    /// How many times the request has been woken.
+    wakes: AtomicU64,
+    /// `wakes` as it stood when the request's latest finished poll began: that poll saw
+    /// everything those wakes were for.
+    seen: AtomicU64,
+    /// The waker of the task that polls the request.
+    request: AtomicWaker,
+    /// The body's waker while it waits for the request.
+    body: AtomicWaker,
+}
+
+impl Turn {
+    /// Whether the request has finished a poll since its latest wake.
+    fn caught_up(&self) -> bool {
+        // `seen` first: it never runs ahead of `wakes`, so equal means caught up when `seen`
+        // was read.
+        let seen = self.seen.load(Ordering::SeqCst);
+        seen == self.wakes.load(Ordering::SeqCst)
+    }
+
+    /// Whether the body has to wait for the request, in which case it is woken when the
+    /// request's next poll ends.
+    fn body_waits(&self, cx: &Context<'_>) -> bool {
+        if self.caught_up() {
+            return false;
+        }
+        self.body.register(cx.waker());
+        // The request may have finished a poll between the check and the registration.
+        !self.caught_up()
+    }
+}
+
+impl Wake for Turn {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.wakes.fetch_add(1, Ordering::SeqCst);
+        self.request.wake();
+    }
+}
+
+/// A PUT's request future, polled so its body never runs ahead of it ([`Turn`]).
+///
+/// The request is polled unconstrained by tokio's cooperative budget. An exhausted budget
+/// makes a ready resource return pending and defers its wake-up, and the request would then
+/// end a poll with the response in hand, unrecorded, and no wake counted yet.
+///
+/// A wake that comes after the request has finished is never caught up with, so the body
+/// would wait for good. It never gets the chance: the request's runtime is shut down as soon
+/// as the request finishes, before any task polls the body again (`put_object`).
+pub(super) struct RequestFirst<F> {
+    request: Pin<Box<Unconstrained<F>>>,
+    /// Counts into `turn` and passes the wake on to the task that polls this.
+    waker: Waker,
+    turn: Arc<Turn>,
+}
+
+impl<F: Future> Future for RequestFirst<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = self.get_mut();
+        // Registered before the count is read, so a wake from here on reaches this task.
+        this.turn.request.register(cx.waker());
+        let wakes = this.turn.wakes.load(Ordering::SeqCst);
+        let polled = this
+            .request
+            .as_mut()
+            .poll(&mut Context::from_waker(&this.waker));
+        this.turn.seen.store(wakes, Ordering::SeqCst);
+        this.turn.body.wake();
+        polled
     }
 }
 
@@ -73,7 +258,16 @@ impl PutSource {
 ///
 /// Each piece is handed on by value as it arrives. After the declared length is reached the
 /// source is polled once more, so excess bytes in a separate piece are caught before the
-/// body reports its end.
+/// body reports its end. Only that poll, answered with the source's end, makes the source
+/// ended ([`Upload::acknowledged_early`]). The SDK always asks for it: its aws-chunked layer,
+/// which wraps this body, polls it until it reports its end, because only then can it write
+/// the final chunk and the checksum trailer (`aws-runtime` 1.10.0,
+/// `content_encoding/body/http_body_1_x.rs:56-83`).
+///
+/// From the moment hyper hands the response over, the source is not polled again and the
+/// body sends nothing more: until the request has seen the response the body waits for it
+/// ([`Turn`]), and once the request has recorded it ([`Upload::answered`]) the body stops for
+/// good. The outcome is judged on whether the source had ended by then.
 ///
 /// One poll handles at most one item of the source, so the work a poll does is bounded
 /// whatever the source yields. That is what lets the operation deadline and a cancellation
@@ -84,10 +278,7 @@ impl PutSource {
 /// body's own hint only when that header is absent.
 pub(super) struct DeclaredLengthBody {
     pieces: Pieces,
-    declared: u64,
-    produced: u64,
-    ended: bool,
-    failure: Arc<OnceLock<BodyError>>,
+    upload: Arc<Upload>,
 }
 
 impl http_body::Body for DeclaredLengthBody {
@@ -99,12 +290,27 @@ impl http_body::Body for DeclaredLengthBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
         let this = self.get_mut();
-        if let Some(failure) = this.failure.get() {
+        let upload = &*this.upload;
+        if let Some(failure) = upload.failure.get() {
             return Poll::Ready(Some(Err(failure.clone())));
         }
-        if this.ended {
+        if upload.ended.load(Ordering::SeqCst) {
             return Poll::Ready(None);
         }
+        // The request has seen the response: take nothing more from the source and send
+        // nothing more. Pending, not an error, because an error makes hyper fail the
+        // connection, and with it a response body the SDK may still be reading. Nothing wakes
+        // this poll again; the connection ends with the PUT's runtime (`put_object`).
+        if upload.answer.get().is_some() {
+            return Poll::Pending;
+        }
+        // The request has a wake it has not been polled for, perhaps the response: let it see
+        // that first.
+        if upload.turn.body_waits(cx) {
+            return Poll::Pending;
+        }
+        let declared = upload.declared;
+        let given = upload.produced.load(Ordering::SeqCst);
         let failure = match ready!(this.pieces.as_mut().poll_next(cx)) {
             // An empty piece carries nothing to send, and it is not skipped in a loop either:
             // a source that is always ready with empty pieces would then spin inside this one
@@ -117,31 +323,28 @@ impl http_body::Body for DeclaredLengthBody {
                 return Poll::Pending;
             }
             Some(Ok(piece)) => {
-                let produced = this.produced.saturating_add(piece.len() as u64);
-                if produced <= this.declared {
-                    this.produced = produced;
+                let produced = given.saturating_add(piece.len() as u64);
+                if produced <= declared {
+                    upload.produced.store(produced, Ordering::SeqCst);
                     return Poll::Ready(Some(Ok(Frame::data(piece))));
                 }
-                BodyError::SourceLength {
-                    declared: this.declared,
-                    produced,
-                }
+                BodyError::SourceLength { declared, produced }
             }
             Some(Err(e)) => BodyError::SourceFailed {
-                produced: this.produced,
+                produced: given,
                 detail: error_chain(e.as_ref()),
             },
-            None if this.produced == this.declared => {
-                this.ended = true;
+            None if given == declared => {
+                upload.ended.store(true, Ordering::SeqCst);
                 return Poll::Ready(None);
             }
             None => BodyError::SourceLength {
-                declared: this.declared,
-                produced: this.produced,
+                declared,
+                produced: given,
             },
         };
         // First failure wins; the body never polls its source again after one.
-        let failure = this.failure.get_or_init(|| failure).clone();
+        let failure = upload.failure.get_or_init(|| failure).clone();
         Poll::Ready(Some(Err(failure)))
     }
 }
