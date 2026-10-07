@@ -1,7 +1,8 @@
 # Release pipeline (#570): on a v* tag, build the distribution artifacts with
-# `cargo xtask dist` — the operator tarball (binary + systemd units + install.sh,
-# `deploy/dist/`) and the OCI image (`deploy/docker/wyrd/Dockerfile`, #470) — smoke
-# the installer in a bookworm container, and attach everything to the GitHub Release.
+# `cargo xtask dist` — the operator tarball (the `wyrd` and `wyrd-validate` binaries +
+# systemd units + install.sh, `deploy/dist/`) and the OCI image carrying the same two
+# binaries (`deploy/docker/wyrd/Dockerfile`, #470, #742) — smoke the installer in a
+# bookworm container, and attach everything to the GitHub Release.
 #
 # Built SIGNED FROM THE START (ADR-0030: "the release workflow is built signed from
 # the start rather than retrofitted"): every artifact gets a keyless-cosign blob
@@ -56,6 +57,20 @@ jobs:
       # The deferred half of xtask/tests/dist_templates.rs (which pins the template
       # SHAPES container-free in `ci`): actually install the tarball in a clean
       # bookworm container, verify the units parse, prove idempotence and uninstall.
+      #
+      # This step is PINNED AS EXACT TEXT by `xtask/tests/dist_two_binary_layout.rs`: the
+      # test rebuilds the whole step from the shipped-binary set (each binary's
+      # run-and-grep block and its `test ! -e` after the uninstall are generated, the
+      # rest is literal) and fails the gate on any difference. So an edit here — a new
+      # check, a reworded comment, a loop over the binaries instead of one block each —
+      # is made in both places, and no check can be quietly weakened in between.
+      #
+      # What the pin cannot judge is whether the text is RIGHT, so one hazard to keep in
+      # mind when editing: the in-container script is ONE double-quoted word of this
+      # step's shell, its `#` comment lines included. A bare `"` in it (outside a `$(…)`)
+      # ends that word, and every later line silently never runs in the container while
+      # the step stays green; a backtick is run by the runner. Keep both out of the
+      # script, comments too.
       - name: smoke the installer in a bookworm container
         run: |
           set -eu
@@ -68,21 +83,31 @@ jobs:
             cd /tmp/wyrd-*
             ./install.sh
             systemd-analyze verify /etc/systemd/system/wyrd-*.service
+            # A tool shipped beside wyrd (the validator) has no unit and no config, and
+            # links no libfdb_c, so it is run BEFORE the client is installed below. Its
+            # no-args invocation must print its usage and exit non-zero. The grep is what
+            # fails the smoke if the binary cannot load at all: a loader error exits 127,
+            # and the if-branch alone would take that for a correct refusal.
+            if /usr/local/bin/wyrd-validate >/tmp/wyrd-validate-usage.txt 2>&1; then
+              echo 'wyrd-validate with no arguments must exit non-zero'; exit 1
+            fi
+            grep -q 'usage: wyrd-validate' /tmp/wyrd-validate-usage.txt
             # The binary loads libfdb_c at process start: install the exact pinned
             # client, then the no-args invocation must print usage and exit non-zero.
             curl -fsSLo /tmp/fdb.deb https://github.com/apple/foundationdb/releases/download/${fdb_version}/foundationdb-clients_${fdb_version}-1_amd64.deb
             dpkg -i /tmp/fdb.deb >/dev/null
-            if /usr/local/bin/wyrd >/tmp/usage.txt 2>&1; then
+            if /usr/local/bin/wyrd >/tmp/wyrd-usage.txt 2>&1; then
               echo 'wyrd with no arguments must exit non-zero'; exit 1
             fi
-            grep -q 'usage:' /tmp/usage.txt
+            grep -q 'usage:' /tmp/wyrd-usage.txt
             # Idempotence: a re-run upgrades without clobbering live config.
             echo '# operator-owned' >>/etc/wyrd/d-server.env
             ./install.sh
             grep -q 'operator-owned' /etc/wyrd/d-server.env
-            # Uninstall removes the binary and units, keeps config and data.
+            # Uninstall removes every shipped binary and the units, keeps config and data.
             ./install.sh --uninstall
             test ! -e /usr/local/bin/wyrd
+            test ! -e /usr/local/bin/wyrd-validate
             test ! -e /etc/systemd/system/wyrd-d-server.service
             test -d /etc/wyrd
           "

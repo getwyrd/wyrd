@@ -2,13 +2,24 @@
 //! order: binary primary, OCI image the same binary).
 //!
 //! One build serves both artifacts: the pipeline drives `docker build` on the
-//! production Dockerfile (`deploy/docker/wyrd/Dockerfile`, #470, unchanged) and then
-//! **extracts the binary out of the image** (`docker create` + `docker cp`), so the
-//! tarball's `bin/wyrd` is bit-identical to the image's `/usr/local/bin/wyrd`, carries
-//! the image's glibc floor (Debian bookworm, 2.36), and the packaging host needs none
-//! of the fdb/etcd build toolchain (`libfdb_c`, `protoc`, `cmake`, `clang`). The
-//! `--host` fallback builds with the host `cargo` instead, for developers who have the
-//! toolchain and want a quick host-glibc tarball.
+//! production Dockerfile (`deploy/docker/wyrd/Dockerfile`, #470) and then **extracts
+//! every shipped binary out of the image** (`docker create` + one `docker cp` per
+//! entry of [`shipped_binaries`]), so the tarball's `bin/wyrd` is bit-identical to the
+//! image's `/usr/local/bin/wyrd` — and `bin/wyrd-validate` to `/usr/local/bin/wyrd-validate`
+//! (#742: the image carries both, maintainer decision 2026-08-17) — carries the image's
+//! glibc floor (Debian bookworm, 2.36), and the packaging host needs none of the
+//! fdb/etcd build toolchain (`libfdb_c`, `protoc`, `cmake`, `clang`). The `--host`
+//! fallback builds the same set with the host `cargo` instead, for developers who have
+//! the toolchain and want a quick host-glibc tarball.
+//!
+//! The shipped-binary SET is declared once, as data ([`shipped_binaries`]), and every
+//! Rust consumer reads it: the `--host` argv ([`host_build_args`]), the extraction list
+//! ([`docker_cp_args`] / [`extracted_binary_path`]) and the staging step
+//! ([`stage_binaries`]). The Dockerfile, `install.sh`, the release smoke step and the
+//! tarball README cannot read a Rust function, so they keep their own literal spelling
+//! of the set and `xtask/tests/dist_two_binary_layout.rs` pins each of them to the
+//! table — the `FDB_VERSION` shape (`xtask/tests/fdb_image.rs`): declared once,
+//! duplication checked by the gate.
 //!
 //! The tarball's operator-facing content — systemd units, env examples, `install.sh`,
 //! README — are REAL FILES under `deploy/dist/` (reviewable as content, greppable by
@@ -37,8 +48,54 @@ use std::process::Command;
 pub const DEFAULT_FEATURES: &str = "fdb,etcd";
 /// Artifact flavor suffix for the default feature set (`wyrd:<version>-fdb`).
 pub const DEFAULT_FLAVOR: &str = "fdb";
-/// Where the production image build puts the binary (`deploy/docker/wyrd/Dockerfile`).
-pub const IMAGE_BINARY_PATH: &str = "/usr/local/bin/wyrd";
+/// One binary the distribution ships: where the production image build puts it and
+/// where the tarball carries it. The set these rows form is the one declaration every
+/// pipeline stage must agree with (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShippedBinary {
+    /// Absolute path inside the OCI image — the destination of the Dockerfile's
+    /// `COPY --from=build … <image_path>`, and what `docker cp` extracts.
+    pub image_path: &'static str,
+    /// Staging-relative destination in the tarball (`bin/<name>`) — what `install.sh`
+    /// installs from.
+    pub dest: &'static str,
+}
+
+impl ShippedBinary {
+    /// The binary's file name: the cargo `--bin` name, the name under the tarball's
+    /// `bin/`, and the name `install.sh` places under `<prefix>/bin/`.
+    pub fn name(&self) -> &'static str {
+        self.dest.rsplit('/').next().unwrap_or(self.dest)
+    }
+}
+
+/// The shipped-binary set, in image order: `wyrd` (every role; the image's ENTRYPOINT)
+/// and `wyrd-validate` (the blackbox validator, proposal 0017 §2 — present in the image,
+/// never invoked by it). Both come out of ONE image build (#742, option A), so the
+/// tarball's copies stay bit-identical to the image's. Pure — the layout tests pin every
+/// row, every Rust consumer, and every pipeline file to it. `wyrd` stays FIRST: the
+/// release smoke runs every later entry before the FoundationDB client is installed (a
+/// tool beside `wyrd` must not need `libfdb_c`), and `wyrd` after it.
+pub fn shipped_binaries() -> Vec<ShippedBinary> {
+    vec![
+        ShippedBinary {
+            image_path: "/usr/local/bin/wyrd",
+            dest: "bin/wyrd",
+        },
+        ShippedBinary {
+            image_path: "/usr/local/bin/wyrd-validate",
+            dest: "bin/wyrd-validate",
+        },
+    ]
+}
+
+/// Where a `--host` build leaves its binaries (cargo's release profile directory): one
+/// file per shipped binary, named after it.
+pub const HOST_BUILD_DIR: &str = "target/release";
+/// Where the default path extracts the image's binaries on the packaging host — the same
+/// `<dir>/<name>` layout as [`HOST_BUILD_DIR`], so [`stage_binaries`] reads one shape
+/// whichever build vehicle produced them.
+pub const EXTRACTED_DIR: &str = "target/dist/extracted";
 /// The single platform the pipeline builds and advertises: the tarball name says
 /// `x86_64-unknown-linux-gnu`, so the image build is pinned to linux/amd64 rather
 /// than following the host default (an arm64 host would otherwise ship an aarch64
@@ -188,8 +245,9 @@ pub struct StagedFile {
     pub substitute: bool,
 }
 
-/// The tarball layout (everything except `bin/wyrd` and the generated `VERSION`
-/// file, which the runner adds). Pure — the layout test pins every row.
+/// The tarball layout (everything except the shipped binaries — [`shipped_binaries`],
+/// staged by [`stage_binaries`] — and the generated `VERSION` file, which the runner
+/// adds). Pure — the layout test pins every row.
 ///
 /// The systemd units are staged VERBATIM (`substitute: false`): their `@BINDIR@`
 /// token belongs to `install.sh`'s install-time substitution, not to staging.
@@ -312,6 +370,92 @@ pub fn find_placeholder(content: &str) -> Option<String> {
     None
 }
 
+// ─── the shipped-binary set, read by every Rust consumer ────────────────────────
+
+/// The host path the default build vehicle extracts `binary` onto —
+/// `<root>/target/dist/extracted/<name>`, the destination of its `docker cp`. Pure;
+/// pinned pairwise distinct across the table, so no two entries can extract onto one
+/// file.
+pub fn extracted_binary_path(root: &Path, binary: &ShippedBinary) -> PathBuf {
+    root.join(EXTRACTED_DIR).join(binary.name())
+}
+
+/// The `cargo build` argv of the `--host` branch: ONE build naming every shipped
+/// binary, so a host-built tarball has the same contents as an image-built one (a
+/// `--host` tarball silently missing the validator is the bug class #742 removes).
+/// Pure — asserted container-free.
+pub fn host_build_args(binaries: &[ShippedBinary], features: &str) -> Vec<String> {
+    let mut args: Vec<String> = ["build", "--release", "--locked"]
+        .map(str::to_string)
+        .to_vec();
+    for binary in binaries {
+        args.push("--bin".into());
+        args.push(binary.name().into());
+    }
+    args.push("--features".into());
+    args.push(features.into());
+    args
+}
+
+/// The `docker cp` argv that extracts one binary out of the throwaway container `cid`
+/// onto [`extracted_binary_path`]. Pure — asserted container-free, so the extraction
+/// list is the table and cannot drift from it.
+pub fn docker_cp_args(cid: &str, binary: &ShippedBinary, root: &Path) -> Vec<String> {
+    vec![
+        "cp".to_string(),
+        format!("{cid}:{}", binary.image_path),
+        extracted_binary_path(root, binary)
+            .to_string_lossy()
+            .into_owned(),
+    ]
+}
+
+/// A fresh, empty extraction directory (`<root>/`[`EXTRACTED_DIR`]): whatever an earlier
+/// run left there is removed first, so a stale file can never stand in for a binary THIS
+/// run failed to extract. The extraction's only fallible host-side step — which is why
+/// `obtain_binaries` runs it BEFORE the throwaway container exists: a failure here
+/// returns with no container to leak.
+pub fn prepare_extraction_dir(root: &Path) -> Result<PathBuf, String> {
+    let extracted = root.join(EXTRACTED_DIR);
+    if extracted.exists() {
+        std::fs::remove_dir_all(&extracted)
+            .map_err(|e| format!("dist: clean {EXTRACTED_DIR}: {e}"))?;
+    }
+    std::fs::create_dir_all(&extracted).map_err(|e| format!("dist: mkdir {EXTRACTED_DIR}: {e}"))?;
+    Ok(extracted)
+}
+
+/// Stage every shipped binary: copy `<source_dir>/<name>` to `<stage>/<dest>` at 0755.
+/// A missing source is an error, never a silently thinner tarball. Exercised for real
+/// (over dummy binaries in a tempdir) inside `ci`; `assemble` is its only production
+/// caller.
+pub fn stage_binaries(
+    binaries: &[ShippedBinary],
+    source_dir: &Path,
+    stage: &Path,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for binary in binaries {
+        let source = source_dir.join(binary.name());
+        let dest = stage.join(binary.dest);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("dist: mkdir {}: {e}", parent.display()))?;
+        }
+        std::fs::copy(&source, &dest).map_err(|e| {
+            format!(
+                "dist: copy binary {} -> {}: {e}",
+                source.display(),
+                dest.display()
+            )
+        })?;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("dist: chmod {}: {e}", dest.display()))?;
+    }
+    Ok(())
+}
+
 // ─── imperative runner ──────────────────────────────────────────────────────────
 
 fn workspace_root() -> PathBuf {
@@ -409,25 +553,19 @@ fn check_templates(root: &Path, version: &str, fdb_version: &str) -> Result<(), 
     Ok(())
 }
 
-/// Build the image and extract `bin/wyrd` from it (the default path), or `--host`
-/// build with the local cargo.
-fn obtain_binary(root: &Path, cfg: &DistConfig, version: &str) -> Result<PathBuf, String> {
+/// Build the image and extract every shipped binary from it (the default path), or
+/// `--host` build the same set with the local cargo. Returns the SOURCE DIRECTORY
+/// holding one file per binary, named after it — what [`stage_binaries`] consumes.
+fn obtain_binaries(root: &Path, cfg: &DistConfig, version: &str) -> Result<PathBuf, String> {
+    let binaries = shipped_binaries();
     if cfg.host_build {
         run(
             Command::new("cargo")
-                .args([
-                    "build",
-                    "--release",
-                    "--locked",
-                    "--bin",
-                    "wyrd",
-                    "--features",
-                    &cfg.features,
-                ])
+                .args(host_build_args(&binaries, &cfg.features))
                 .current_dir(root),
             "cargo build --release",
         )?;
-        return Ok(root.join("target/release/wyrd"));
+        return Ok(root.join(HOST_BUILD_DIR));
     }
 
     let sha = capture(
@@ -492,22 +630,23 @@ fn obtain_binary(root: &Path, cfg: &DistConfig, version: &str) -> Result<PathBuf
         "docker buildx build",
     )?;
 
+    // Host-side preparation FIRST, while there is no container yet: an early return
+    // here (a directory that cannot be cleaned or created) leaves nothing behind.
+    let extracted = prepare_extraction_dir(root)?;
     let cid = capture(
         Command::new("docker").args(["create", "--platform", DIST_PLATFORM, &versioned_tag]),
         "docker create",
     )?;
     let cid = cid.trim().to_string();
-    let extracted = root.join(DIST_DIR).join("wyrd.extracted");
-    std::fs::create_dir_all(root.join(DIST_DIR))
-        .map_err(|e| format!("dist: mkdir {DIST_DIR}: {e}"))?;
-    let cp = run(
-        Command::new("docker").args([
-            "cp",
-            &format!("{cid}:{IMAGE_BINARY_PATH}"),
-            &extracted.to_string_lossy(),
-        ]),
-        "docker cp (extract binary)",
-    );
+    // The container exists from here to the `docker rm` below, and NOTHING in between
+    // may return early: the `docker cp` results are collected, not `?`-propagated.
+    // One container, N `docker cp`s — the binaries come out of the SAME image build.
+    let cp = binaries.iter().try_for_each(|binary| {
+        run(
+            Command::new("docker").args(docker_cp_args(&cid, binary, root)),
+            &format!("docker cp (extract {})", binary.name()),
+        )
+    });
     // Remove the throwaway container regardless of the cp outcome.
     let _ = Command::new("docker").args(["rm", "-f", &cid]).output();
     cp?;
@@ -522,7 +661,7 @@ fn assemble(
     cfg: &DistConfig,
     version: &str,
     fdb_version: &str,
-    binary: &Path,
+    binaries_dir: &Path,
 ) -> Result<String, String> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -556,12 +695,7 @@ fn assemble(
             .map_err(|e| format!("dist: chmod {}: {e}", dest.display()))?;
     }
 
-    let bin_dest = stage.join("bin/wyrd");
-    std::fs::create_dir_all(stage.join("bin")).map_err(|e| format!("dist: mkdir bin: {e}"))?;
-    std::fs::copy(binary, &bin_dest)
-        .map_err(|e| format!("dist: copy binary {}: {e}", binary.display()))?;
-    std::fs::set_permissions(&bin_dest, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("dist: chmod bin/wyrd: {e}"))?;
+    stage_binaries(&shipped_binaries(), binaries_dir, &stage)?;
 
     let version_file = format!(
         "version: {version}\nflavor: {flavor}\nfoundationdb-clients: {fdb_version}\n",
@@ -619,13 +753,13 @@ pub fn run_dist(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
-    let binary = obtain_binary(&root, &cfg, &version)?;
-    let tarball = assemble(&root, &cfg, &version, &fdb_version, &binary)?;
+    let binaries_dir = obtain_binaries(&root, &cfg, &version)?;
+    let tarball = assemble(&root, &cfg, &version, &fdb_version, &binaries_dir)?;
 
     let mut artifacts = vec![tarball.clone()];
     if cfg.oci_archive {
         // The archive was written by the SAME build that produced the extracted
-        // binary (a second exporter on one build, `obtain_binary`); this step
+        // binaries (a second exporter on one build, `obtain_binaries`); this step
         // only compresses it.
         let archive = oci_archive_name(&version, &cfg.flavor);
         run(

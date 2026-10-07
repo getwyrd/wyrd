@@ -316,19 +316,139 @@ fn workflow_exists_resolves_and_filters_the_fdb_surface() {
     // (c) The PR path filter must fire on every image build input the required gate does
     //     NOT already cover. `cargo xtask ci` default-compiles core/traits/chunkstore/…,
     //     so those are guarded there; what only THIS job builds is the OFF-by-default
-    //     feature surface the image bakes (`--features fdb,etcd`) plus the Docker context.
-    //     (Substring is enough — a `paths:` entry is the literal glob string.)
+    //     feature surface the image bakes (`--features fdb,etcd`) plus the Docker context —
+    //     and the image's second binary, whose in-image usage smoke only this job runs.
+    //     Matched against the REAL `paths:` entries: the workflow's comments name these
+    //     globs too, and a comment must not be able to stand in for a deleted entry.
+    let filters = pull_request_path_filters(&wf);
     for entry in [
         "crates/metadata-fdb/**",      // the fdb backend + its client version pin
         "deploy/docker/wyrd/**",       // the image home
         "crates/server/**",            // the baked bin: its fdb/etcd cfg arms + usage smoke
         "crates/coordination-etcd/**", // the etcd feature tree — no other CI builds it
         ".dockerignore",               // decides what `COPY . .` ships into the build
+        "crates/validate/**",          // the second baked bin (#742): its usage smoke
     ] {
         assert!(
-            wf.contains(entry),
+            filters.iter().any(|f| f == entry),
             "{WORKFLOW} path filter omits `{entry}` — a change there can break the \
-             `fdb,etcd` image with no other CI job catching it"
+             `fdb,etcd` image (or the smokes run inside it) with no other CI job catching \
+             it (entries: {filters:?})"
+        );
+    }
+
+    // The `crates/validate/**` entry exists FOR the validator's in-image smoke (it greps
+    // the usage line that crate prints): the entry and the smoke stand or fall together.
+    assert!(
+        wf.contains(VALIDATOR_SMOKE_STEP),
+        "{WORKFLOW} filters on `crates/validate/**` but no longer carries the validator's \
+         in-image smoke step exactly as pinned — the path filter has lost its reason, or \
+         the smoke no longer fails the job on a `wyrd-validate` that cannot run. Expected, \
+         followed by a blank line:\n{VALIDATOR_SMOKE_STEP}"
+    );
+}
+
+/// The validator's in-image smoke (#742), WHOLE — the step is pinned as exact text rather
+/// than recognised line by line, so a `|| true` after the grep, a `grep -v`, a guard
+/// around the check or a `continue-on-error:` under the step is simply not this step.
+/// The `if` lets the expected non-zero exit through; the `grep` on the line after `fi` is
+/// what fails the job when the binary cannot load at all (exit 127 skips the if-branch
+/// too). The blank line that ends it is part of the pin: nothing may be keyed onto the
+/// step after its script. A deliberate change to the step updates this text.
+const VALIDATOR_SMOKE_STEP: &str = "      - name: wyrd-validate usage smoke
+        run: |
+          set -eu
+          if docker run --rm --entrypoint wyrd-validate wyrd:fdb 2> validate-usage.txt; then
+            echo 'expected wyrd-validate with no arguments to exit non-zero' >&2
+            exit 1
+          fi
+          grep -q 'usage: wyrd-validate' validate-usage.txt
+
+";
+
+/// The globs under `on.pull_request.paths:` — the list items themselves, comments
+/// skipped, up to the first line that is neither.
+fn pull_request_path_filters(workflow: &str) -> Vec<String> {
+    workflow
+        .lines()
+        .skip_while(|l| l.trim() != "paths:")
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map_while(|l| l.strip_prefix("- "))
+        .map(|glob| glob.trim().trim_matches('"').to_string())
+        .collect()
+}
+
+/// A path filter that survives only as a comment is not a filter: the parser the check
+/// above relies on must not count it.
+#[test]
+fn a_commented_out_path_filter_is_not_a_filter() {
+    let wf = read(WORKFLOW);
+    const ENTRY: &str = "      - \"crates/validate/**\"\n";
+    assert!(
+        wf.contains(ENTRY),
+        "{WORKFLOW} lost its `crates/validate/**` entry — update this case"
+    );
+    assert!(pull_request_path_filters(&wf)
+        .iter()
+        .any(|f| f == "crates/validate/**"));
+
+    let commented = wf.replacen(ENTRY, "      # - \"crates/validate/**\"\n", 1);
+    let filters = pull_request_path_filters(&commented);
+    assert!(
+        !filters.iter().any(|f| f == "crates/validate/**"),
+        "a commented-out entry still counts as a filter: {filters:?}"
+    );
+    // Every other entry is still seen — the parser did not just stop early.
+    assert!(
+        filters.iter().any(|f| f == ".dockerignore"),
+        "the parser lost the entries around the comment: {filters:?}"
+    );
+}
+
+/// The pin above is what stops the validator's smoke from being quietly weakened: each
+/// of these one-line edits to the REAL workflow keeps the job green in a real shell when
+/// `wyrd-validate` cannot load, and none of them is the pinned step any more.
+#[test]
+fn a_weakened_validator_smoke_is_not_the_pinned_step() {
+    let wf = read(WORKFLOW);
+    assert!(wf.contains(VALIDATOR_SMOKE_STEP));
+    const GREP: &str = "          grep -q 'usage: wyrd-validate' validate-usage.txt\n";
+    const NAME: &str = "      - name: wyrd-validate usage smoke\n";
+    let grep_as = |line: &str| wf.replacen(GREP, &format!("          {line}\n"), 1);
+    let cases = [
+        (
+            "usage grep suppressed by || true",
+            grep_as("grep -q 'usage: wyrd-validate' validate-usage.txt || true"),
+        ),
+        (
+            "usage grep inverted with -v",
+            grep_as("grep -qv 'usage: wyrd-validate' validate-usage.txt"),
+        ),
+        (
+            "usage grep negated",
+            grep_as("! grep -q 'usage: wyrd-validate' validate-usage.txt"),
+        ),
+        ("usage grep deleted", wf.replacen(GREP, "", 1)),
+        (
+            "errexit turned off above the grep",
+            wf.replacen(GREP, &format!("          set +e\n{GREP}"), 1),
+        ),
+        (
+            "the step allowed to fail, keyed on after its script",
+            wf.replacen(GREP, &format!("{GREP}        continue-on-error: true\n"), 1),
+        ),
+        (
+            "the step skipped by an if: key",
+            wf.replacen(NAME, &format!("{NAME}        if: false\n"), 1),
+        ),
+    ];
+    for (case, edited) in cases {
+        assert_ne!(edited, wf, "{case}: the planted edit changed nothing");
+        assert!(
+            !edited.contains(VALIDATOR_SMOKE_STEP),
+            "{case}: still counts as the pinned validator smoke step"
         );
     }
 }

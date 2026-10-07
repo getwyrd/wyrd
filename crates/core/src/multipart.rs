@@ -7,7 +7,8 @@
 //! `async fn`. After this module a reader can name every key the protocol will ever write
 //! (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
 //! names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
-//! derivations that profile establishes, `0016:348`, `:1469-1470`), the in-flight lifecycle
+//! derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence` singleton
+//! ([`FenceGeneration`], the restore-fence generation of `0016:723-728`), the in-flight lifecycle
 //! records ([`SessionRecord`], [`SlotRecord`], [`PartRecord`], [`PartSummary`]), and the two
 //! whose identity lives partly in their **key**: the retirement obligation ([`RetirePayload`])
 //! and the owned staging entry ([`OwnedEntry`] — `sidx:`'s [`crate::metadata::PendingEntry`]
@@ -52,6 +53,7 @@
 //! | Key | What it addresses |
 //! |---|---|
 //! | `mpuctl` | the fleet **admission ledger** singleton — no id, no parser |
+//! | `mpufence` | the **restore-fence generation** singleton ([`FenceGeneration`]) — no id, no parser |
 //! | `mpu:<id>` | one **session** |
 //! | `slot:<id>:<k>` | one **in-flight part slot**; the key space *is* the per-session cap |
 //! | `part:<id>:<n>` | a **committed part** |
@@ -92,8 +94,8 @@
 //!
 //! This module is the key **grammar** plus the record **shapes**: it makes no store call, and its
 //! writer-side API is the post-restore fence's two teardowns ([`SessionRecord::open_teardown`],
-//! #841, and [`SessionRecord::completing_teardown`], #842); every other first writer is a store
-//! round trip (#656–#659).
+//! #841, and [`SessionRecord::completing_teardown`], #842) and the generation record that pass
+//! keeps ([`FenceGeneration`], #810); every other first writer is a store round trip (#656–#659).
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -120,6 +122,7 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::num::NonZeroU64;
 
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1128,6 +1131,15 @@ pub fn hex_lower(bytes: &[u8]) -> String {
 /// that constant's doc.
 pub const MPUCTL_KEY: &[u8] = b"mpuctl";
 
+/// The **restore-fence generation** singleton key: the post-restore pass's record of its own
+/// progress ([`FenceGeneration`]), the generation `0016:723-728` and X17b (`:3017-3021`) require
+/// to complete before any gateway serves multipart verbs on a restored image. `0016` names the
+/// generation but gives it no key; this is that key. Like [`MPUCTL_KEY`] it is a whole key with
+/// no trailing `:`, disjoint from [`MPU_PREFIX`] (its 4th byte is `f`, not `:`) and from
+/// `mpuctl` (neither is a prefix of the other), so no namespace scan reaches it. **Absent** is
+/// the only spelling of "no post-restore pass has run on this store": generations count from 1.
+pub const MPUFENCE_KEY: &[u8] = b"mpufence";
+
 /// Key prefix for session records. The trailing `:` is what keeps this **disjoint from**
 /// [`MPUCTL_KEY`] — `"mpuctl".starts_with("mpu:")` is `false` because `mpuctl`'s 4th byte is
 /// `c`, not `:` — so `scan(MPU_PREFIX)` can never return the admission singleton
@@ -1906,6 +1918,89 @@ pub fn decode_admission_record(value: &[u8]) -> Result<AdmissionRecord, RecordEr
             detail: err.to_string(),
         })?;
     require_canonical(AdmissionRecord::try_from(wire)?, value, "mpuctl")
+}
+
+// ===========================================================================
+// 5b. The restore-fence generation — the `mpufence` record VALUE (`0016:723-728`, X17b)
+// ===========================================================================
+
+/// The **restore-fence generation**, the value under [`MPUFENCE_KEY`]: which post-restore pass
+/// last started on this store (`generation`, counted from 1) and whether that pass finished its
+/// fence (`complete`). One record, written whole.
+///
+/// The post-restore pass (`wyrd_custodian::restore`) writes it twice: `{generation: N+1,
+/// complete: false}` before its first write of any other record, and `{N+1, complete: true}`
+/// after its last, only if every write it made was acknowledged committed and no upload
+/// session needs a human. Both writes carry a precondition on the bytes the pass last saw
+/// there, so a write that lands late never overwrites a newer pass's generation.
+///
+/// # What it cannot say
+///
+/// It is a claim about the pass that **wrote** it, kept in the store that pass fenced. A
+/// metadata restore rewinds the whole store, this record included, so an image captured after
+/// an earlier pass completed comes back reading `complete` until the next pass starts and
+/// overwrites it. Read alone, it cannot tell this restore's completion from one the image
+/// carried; a gateway gate on it needs a restore-scoped signal beside it (#508). Until then the
+/// guarantee is the deployment ordering `0016:3017-3021` allows: the post-restore pass runs
+/// before any gateway is re-enabled.
+///
+/// # Serialization identity
+///
+/// Closed and canonical, as [`AdmissionRecord`] is and for the same reason (both writes are a
+/// compare-and-set on exact bytes): every field is required, unknown fields are refused, and
+/// [`decode_fence_generation`] requires the input to be this codec's own spelling. A
+/// `generation` of 0 is outside the field's wire type and refused at decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FenceGeneration {
+    generation: NonZeroU64,
+    complete: bool,
+}
+
+impl FenceGeneration {
+    /// The not-complete record the pass that follows `prior` writes before anything else:
+    /// generation 1 on a store whose record is absent, else `prior`'s generation plus one,
+    /// whether or not `prior` completed. `None` after generation `u64::MAX`: there is no next.
+    pub fn next(prior: Option<&Self>) -> Option<Self> {
+        let generation = match prior {
+            None => NonZeroU64::MIN,
+            Some(prior) => prior.generation.checked_add(1)?,
+        };
+        Some(Self {
+            generation,
+            complete: false,
+        })
+    }
+
+    /// This generation, recorded complete.
+    pub const fn completed(self) -> Self {
+        Self {
+            generation: self.generation,
+            complete: true,
+        }
+    }
+
+    /// Which post-restore pass this is, counted from 1.
+    pub const fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    /// Whether that pass finished its fence with no upload session left for a human.
+    pub const fn is_complete(&self) -> bool {
+        self.complete
+    }
+}
+
+/// Decode the `mpufence` value ([`MPUFENCE_KEY`]): a value that is not a well-formed
+/// [`FenceGeneration`] (generation 0 included) is [`RecordError::MalformedRecordValue`], and
+/// another spelling of a valid one is [`RecordError::NoncanonicalRecordValue`].
+pub fn decode_fence_generation(value: &[u8]) -> Result<FenceGeneration, RecordError> {
+    let record: FenceGeneration =
+        metadata::decode(value).map_err(|err| RecordError::MalformedRecordValue {
+            namespace: "mpufence",
+            detail: err.to_string(),
+        })?;
+    require_canonical(record, value, "mpufence")
 }
 
 /// The canonical-bytes gate every `decode_*` in this module closes with: re-encode what

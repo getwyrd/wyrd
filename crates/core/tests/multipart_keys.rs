@@ -28,9 +28,9 @@ use wyrd_core::multipart::{
     parse_retire_mode, parse_sidx_key, parse_slot_key, part_key, part_range, psum_key, psum_range,
     retire_key, retire_session_range, sidx_key, sidx_range, slot_key, slot_range, AttemptId,
     Digest, PartNumber, RecordError, RetireMode, RetireToken, SlotIndex, UploadId, MAX_PART_NUMBER,
-    MAX_SLOT_INDEX, MPUCTL_KEY, MPU_PREFIX, PART_NUMBER_WIDTH, PART_PREFIX, PSUM_PREFIX,
-    RETIRE_BYTES_PREFIX, RETIRE_RECORDS_PREFIX, SIDX_PREFIX, SLOT_INDEX_WIDTH, SLOT_PREFIX,
-    TOKEN_HEX_LEN,
+    MAX_SLOT_INDEX, MPUCTL_KEY, MPUFENCE_KEY, MPU_PREFIX, PART_NUMBER_WIDTH, PART_PREFIX,
+    PSUM_PREFIX, RETIRE_BYTES_PREFIX, RETIRE_RECORDS_PREFIX, SIDX_PREFIX, SLOT_INDEX_WIDTH,
+    SLOT_PREFIX, TOKEN_HEX_LEN,
 };
 
 // ===========================================================================
@@ -624,7 +624,14 @@ fn no_key_prefix_is_a_prefix_of_another() {
             !MPUCTL_KEY.starts_with(a) && !a.starts_with(MPUCTL_KEY),
             "the mpuctl singleton and {a_text:?} are not disjoint"
         );
+        // The restore-fence generation singleton (#810) joins the same way.
+        assert!(
+            !MPUFENCE_KEY.starts_with(a) && !a.starts_with(MPUFENCE_KEY),
+            "the mpufence singleton and {a_text:?} are not disjoint"
+        );
     }
+    // ...and the two singletons are not one another's prefix either.
+    assert!(!MPUFENCE_KEY.starts_with(MPUCTL_KEY) && !MPUCTL_KEY.starts_with(MPUFENCE_KEY));
 }
 
 #[test]
@@ -716,6 +723,7 @@ fn a_session_range_selects_exactly_its_own_class_and_session() {
         for (what, foreign) in [
             ("the session record", mpu_key(&mine)),
             ("the admission singleton", MPUCTL_KEY.to_vec()),
+            ("the fence-generation singleton", MPUFENCE_KEY.to_vec()),
             ("a generation obligation", generation.clone()),
         ] {
             assert!(
