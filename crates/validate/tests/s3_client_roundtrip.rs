@@ -26,6 +26,7 @@
 //! * **Integrity and bounded waits** (criterion 4): a PUT source that ends short, runs long
 //!   or fails is the body error and stores nothing; a GET cut mid-body is the body error;
 //!   the connect, operation and body-idle deadlines each expire as their own typed timeout,
+//!   a GET body trickled inside every idle window still expires at the whole-body deadline,
 //!   and a refused connection is no response, not a timeout; a source that is always ready
 //!   with empty pieces still yields to the operation deadline, on a current-thread runtime
 //!   too, and its connection is closed; an empty key is a request never built, and nothing
@@ -352,6 +353,7 @@ fn deadlines() -> Deadlines {
         connect: Duration::from_secs(5),
         operation: Duration::from_secs(120),
         body_idle: Duration::from_secs(10),
+        body: Duration::from_secs(120),
     }
 }
 
@@ -438,6 +440,8 @@ enum Downstream {
     HoldAfter { body: u64 },
     /// Forward the head and the first `body` bytes of the body, then close both connections.
     CutAfter { body: u64 },
+    /// Forward the head and the first `body` bytes of the body, then one byte per `every`.
+    TrickleAfter { body: u64, every: Duration },
 }
 
 /// The relay's counters. Body counts start after the first head on a connection; each test
@@ -791,6 +795,21 @@ async fn pump_down(
                         std::future::pending::<()>().await;
                     }
                     return;
+                }
+            }
+            Downstream::TrickleAfter { body: limit, every } => {
+                let room = limit.saturating_sub(written).min(body.len() as u64) as usize;
+                if to.write_all(&body[..room]).await.is_err() {
+                    return;
+                }
+                written += room as u64;
+                for byte in body[room..].chunks(1) {
+                    tokio::time::sleep(every).await;
+                    if to.write_all(byte).await.is_err() {
+                        return;
+                    }
+                    written += 1;
+                    stats.downstream_body.store(written, Ordering::SeqCst);
                 }
             }
         }
@@ -1305,6 +1324,70 @@ async fn body_idle_deadline_expires_as_a_body_idle_timeout() {
         handed, hold_at,
         "everything before the held tail was handed over"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trickled_body_expires_at_the_whole_body_deadline() {
+    let gateway = start_gateway().await;
+    let len = 8 * GATEWAY_CHUNK as u64;
+    put_generated(&client_direct(&gateway), "trickled", len).await;
+
+    // A byte every 200 ms never trips a 500 ms idle deadline, and the 1.75 MiB left would take
+    // the relay days; only the 2 s whole-body deadline can end the read.
+    let trickle_at = GATEWAY_CHUNK as u64;
+    let every = Duration::from_millis(200);
+    let relay = Relay::start(
+        gateway.addr,
+        Downstream::TrickleAfter {
+            body: trickle_at,
+            every,
+        },
+    )
+    .await;
+    let limits = Deadlines {
+        body_idle: Duration::from_millis(500),
+        body: Duration::from_secs(2),
+        ..deadlines()
+    };
+    let client = S3Client::with_deadlines(&resolved(relay.addr, SECRET_KEY), limits);
+    let mut body = get(&client, "trickled").await.expect("GET head");
+    let started = Instant::now();
+    let mut handed = 0u64;
+    // Every piece arrives inside the idle window, so only a bound on the whole read can
+    // turn a missing body deadline into a failure rather than a hang.
+    let read = async {
+        loop {
+            match body.next_piece().await {
+                Ok(Some(piece)) => handed += piece.len() as u64,
+                Ok(None) => panic!("the trickled GET ended as a {handed}-byte object of {len}"),
+                Err(e) => break e,
+            }
+        }
+    };
+    let err = timeout(STALL, read)
+        .await
+        .expect("the whole-body deadline bounds a trickled read");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        err,
+        S3Error::Timeout {
+            phase: Phase::Body,
+            limit: limits.body,
+        }
+    );
+    // The deadline runs from the response head, read just before `started`, and the wait
+    // that expires it is cut short to end there rather than running a full idle window on.
+    assert!(
+        elapsed < limits.body + limits.body_idle,
+        "expired {elapsed:?} after the head, not within the {:?} deadline",
+        limits.body
+    );
+    assert!(
+        handed > trickle_at,
+        "trickled bytes arrived, so the idle deadline was restarted: {handed} of {len}"
+    );
+    // Sticky, like every body failure.
+    assert_eq!(body.next_piece().await, Err(err));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

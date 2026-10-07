@@ -17,6 +17,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use futures_util::stream::{Stream, StreamExt};
 use http_body::Frame;
+use tokio::time::Instant;
 
 use super::error::{BodyError, Phase, S3Error};
 
@@ -160,25 +161,39 @@ fn error_chain(err: &(dyn Error + 'static)) -> String {
 /// A GET body, read piece by piece.
 ///
 /// Every piece is handed over as the SDK yields it. Each wait for the next piece is bounded
-/// by the body-idle deadline. The body is trusted only up to its declared `Content-Length`:
-/// a body that fails, ends short or runs past it is a [`BodyError`], never a shorter or
-/// longer object. After the first error every later call returns that error again.
+/// by the body-idle deadline, and the body as a whole by the body deadline, which runs from
+/// the moment the response head was read: a peer that trickles a byte just inside every idle
+/// window cannot keep the caller pending past it. The body is trusted only up to its
+/// declared `Content-Length`: a body that fails, ends short or runs past it is a
+/// [`BodyError`], never a shorter or longer object. After the first error every later call
+/// returns that error again.
 pub struct ObjectBody {
     stream: ByteStream,
     declared: u64,
     received: u64,
     idle: Duration,
+    /// The whole-body limit, kept for the error it expires as.
+    limit: Duration,
+    /// When the whole body must have been read. `None` only when the limit lies beyond what
+    /// the runtime clock can represent; every wait is then still bounded by the idle limit.
+    deadline: Option<Instant>,
     ended: bool,
     failed: Option<S3Error>,
 }
 
 impl ObjectBody {
-    pub(super) fn new(stream: ByteStream, declared: u64, idle: Duration) -> Self {
+    /// A body over `stream`, whose whole-body deadline starts now: call it as soon as the
+    /// response head is read.
+    pub(super) fn new(stream: ByteStream, declared: u64, idle: Duration, limit: Duration) -> Self {
+        // Clock: tokio's runtime clock, as for the idle deadline in `read`.
+        let deadline = Instant::now().checked_add(limit);
         Self {
             stream,
             declared,
             received: 0,
             idle,
+            limit,
+            deadline,
             ended: false,
             failed: None,
         }
@@ -208,12 +223,19 @@ impl ObjectBody {
     async fn read(&mut self) -> Result<Option<Bytes>, S3Error> {
         // Clock: tokio's runtime clock, the one the SDK's connect and operation deadlines
         // also sleep on, so every deadline of one request reads the same source.
-        let next = tokio::time::timeout(self.idle, self.stream.next())
+        //
+        // One wait, bounded by whichever deadline comes first, and reported as that one. On a
+        // tie the whole-body deadline is reported: waiting longer would not have helped.
+        let left = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let (wait, expired) = match left {
+            Some(left) if left <= self.idle => (left, self.body_timeout()),
+            _ => (self.idle, self.idle_timeout()),
+        };
+        let next = tokio::time::timeout(wait, self.stream.next())
             .await
-            .map_err(|_| S3Error::Timeout {
-                phase: Phase::BodyIdle,
-                limit: self.idle,
-            })?;
+            .map_err(|_| expired)?;
         // deferred: #853 — the two length checks below (a piece past the declared length, an
         // end short of it) can fire only when the response's framing disagrees with its
         // `Content-Length`. With a conforming response hyper reads exactly the declared
@@ -244,6 +266,20 @@ impl ObjectBody {
                 declared: self.declared,
                 received: self.received,
             })),
+        }
+    }
+
+    fn idle_timeout(&self) -> S3Error {
+        S3Error::Timeout {
+            phase: Phase::BodyIdle,
+            limit: self.idle,
+        }
+    }
+
+    fn body_timeout(&self) -> S3Error {
+        S3Error::Timeout {
+            phase: Phase::Body,
+            limit: self.limit,
         }
     }
 }

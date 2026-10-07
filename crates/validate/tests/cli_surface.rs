@@ -16,7 +16,9 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::{Command, Output};
 
-use wyrd_validate::{resolve_config, run, CredentialSource, EXIT_IO, EXIT_OK, EXIT_USAGE, FLAGS};
+use wyrd_validate::{
+    resolve_config, run, CredentialSource, EXIT_INCONCLUSIVE, EXIT_IO, EXIT_OK, EXIT_USAGE, FLAGS,
+};
 
 /// A distinct value for every flag, so a swapped or dropped value cannot pass.
 const GIVEN: [(&str, &str); 10] = [
@@ -120,7 +122,7 @@ fn all_ten_flags_are_echoed_each_with_its_own_value() {
     let out = bin(&argv(&GIVEN), &wyrd_pair());
     let stdout = text(&out.stdout);
     assert!(
-        out.status.success(),
+        out.status.code() == Some(i32::from(EXIT_INCONCLUSIVE)),
         "exit {:?}, stderr: {}",
         out.status,
         text(&out.stderr)
@@ -140,7 +142,11 @@ fn flag_order_on_the_command_line_does_not_matter() {
     let mut reversed = GIVEN;
     reversed.reverse();
     let out = bin(&argv(&reversed), &wyrd_pair());
-    assert!(out.status.success(), "stderr: {}", text(&out.stderr));
+    assert!(
+        out.status.code() == Some(i32::from(EXIT_INCONCLUSIVE)),
+        "stderr: {}",
+        text(&out.stderr)
+    );
     let stdout = text(&out.stdout);
     for (flag, value) in GIVEN {
         assert!(
@@ -251,7 +257,7 @@ fn check_credentials(case: &str, vars: &Env, expect: &Expect) {
             source,
             source_line,
         } => {
-            assert_eq!(status, EXIT_OK, "{case}: {stderr}");
+            assert_eq!(status, EXIT_INCONCLUSIVE, "{case}: {stderr}");
             let lines: Vec<&str> = stdout.lines().collect();
             let id_line = format!("  access-key-id = {id}");
             assert!(lines.contains(&id_line.as_str()), "{case}: {stdout}");
@@ -394,7 +400,10 @@ fn a_non_utf8_variable_is_refused_by_name_rather_than_treated_as_unset() {
 fn the_real_binary_reads_its_environment_aws_first() {
     let out = bin(&argv(&GIVEN), &joined(&[wyrd_pair(), aws_pair()]));
     let (stdout, stderr) = (text(&out.stdout), text(&out.stderr));
-    assert!(out.status.success(), "{stderr}");
+    assert!(
+        out.status.code() == Some(i32::from(EXIT_INCONCLUSIVE)),
+        "{stderr}"
+    );
     assert!(stdout.contains(&format!("  access-key-id = {AWS_ID}\n")));
     for secret in [AWS_SECRET, WYRD_SECRET] {
         assert!(!stdout.contains(secret) && !stderr.contains(secret));
@@ -565,7 +574,49 @@ fn a_failed_write_or_flush_of_the_echo_exits_non_zero() {
     // And the success path both writes and flushes the echo.
     let mut out = Stdout::default();
     let status = run(&args, &lookup, &mut out, &mut Vec::new());
-    assert_eq!(status, EXIT_OK);
+    assert_eq!(status, EXIT_INCONCLUSIVE);
     assert!(out.flushed, "the echo was never flushed");
     assert!(text(&out.written).contains("  --run-id = run-0017\n"));
+}
+
+/// An argument that is not UTF-8 — a legitimate filesystem path on Unix — is refused as a
+/// usage error with the usage text, never a panic (`std::env::args` would panic on it).
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_is_a_usage_error_not_a_panic() {
+    use std::os::unix::ffi::OsStrExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wyrd-validate"));
+    command
+        .arg("--out")
+        .arg(std::ffi::OsStr::from_bytes(b"/tmp/report-\xff.json"))
+        .env_clear()
+        .envs(wyrd_pair().iter().cloned());
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        command.env("LLVM_PROFILE_FILE", profile);
+    }
+    let output = command.output().expect("spawn wyrd-validate");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(EXIT_USAGE)),
+        "{stderr}"
+    );
+    assert!(stderr.contains("argument 2 is not valid UTF-8"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+/// Proposal 0017's vacuity rule: a run that validated nothing is INCONCLUSIVE — non-zero, and
+/// never the pass status — so a script reading only the exit status cannot see it as green.
+#[test]
+fn a_run_that_validates_nothing_never_exits_as_a_pass() {
+    let output = bin(&argv(&GIVEN), &wyrd_pair());
+    let stderr = text(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(i32::from(EXIT_INCONCLUSIVE)),
+        "{stderr}"
+    );
+    assert_ne!(EXIT_INCONCLUSIVE, EXIT_OK);
+    assert!(stderr.contains("INCONCLUSIVE"), "{stderr}");
 }

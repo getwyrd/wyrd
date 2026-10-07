@@ -10,8 +10,8 @@
 //!   measurement — in particular the request id is read from the `x-amz-request-id` header
 //!   itself, because the SDK's generic accessor prefers `x-amzn-requestid` when both are
 //!   present;
-//! * bounded waits ([`Deadlines`]): connect, operation, and body-idle, each expiring as a
-//!   typed timeout naming its phase;
+//! * bounded waits ([`Deadlines`]): connect, operation, body-idle, and whole body, each
+//!   expiring as a typed timeout naming its phase;
 //! * bodies that stream both ways ([`PutSource`], [`ObjectBody`]), so what the client holds
 //!   of an object is bounded independently of the object's size.
 
@@ -36,10 +36,11 @@ use crate::ResolvedConfig;
 /// stamps it on every response.
 const REQUEST_ID_HEADER: &str = "x-amz-request-id";
 
-/// The bound on every wait for the endpoint. All three run on tokio's runtime clock: the
+/// The bound on every wait for the endpoint. All four run on tokio's runtime clock: the
 /// SDK's connect and operation timeouts sleep on its default tokio sleep, and the body-idle
-/// deadline is a `tokio::time::timeout`. The SDK also reads the wall clock, to date SigV4
-/// signatures; that stamp belongs to the server's freshness check, not to any deadline here.
+/// and body deadlines bound a `tokio::time::timeout`. The SDK also reads the wall clock, to
+/// date SigV4 signatures; that stamp belongs to the server's freshness check, not to any
+/// deadline here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deadlines {
     /// Establishing a TCP connection.
@@ -48,9 +49,14 @@ pub struct Deadlines {
     /// covers the upload, so the default is sized for a large object rather than a small
     /// one.
     pub operation: Duration,
-    /// The wait for each next piece of a GET body. The body as a whole is bounded by its
-    /// declared length times this.
+    /// The wait for each next piece of a GET body.
     pub body_idle: Duration,
+    /// A whole GET body, from the moment its response head is read to its end. The operation
+    /// deadline ends with the response head, and the idle deadline restarts at every piece,
+    /// so without this a peer that trickles a byte inside every idle window could hold a
+    /// worker for as long as its declared length lasts. The default matches `operation`:
+    /// the same object read back gets the budget its upload had.
+    pub body: Duration,
 }
 
 impl Default for Deadlines {
@@ -59,6 +65,7 @@ impl Default for Deadlines {
             connect: Duration::from_secs(10),
             operation: Duration::from_secs(15 * 60),
             body_idle: Duration::from_secs(60),
+            body: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -176,6 +183,7 @@ impl S3Client {
             output.body,
             declared,
             self.deadlines.body_idle,
+            self.deadlines.body,
         ))
     }
 
