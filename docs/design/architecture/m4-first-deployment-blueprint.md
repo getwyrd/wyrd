@@ -645,7 +645,8 @@ wyrd custodian --reconcile-after-restore --metadata-backend fdb \
 #    fenced every upload.
 #
 #    The summary also counts the fragments the pass kept because a multipart upload's own
-#    staged records name them — an upload's bytes, not strays, so never marked. A staged record
+#    staged records name them — an upload's bytes, not strays, so never marked (while a staged
+#    record is unreadable, that is every fragment no committed object names). A staged record
 #    the pass could read but not TRUST about where its chunk's fragments are (a placement of
 #    the wrong length, say) is not one of the bills above: the exit status ignores it. It gets
 #    a line of its own that names the record: the pass held that chunk and marked none of its
@@ -1136,8 +1137,9 @@ export WYRD_S3_ACCESS_KEY=... WYRD_S3_SECRET_KEY=...
 # S3 gateway — stateless front door. --metadata-backend is the redb|tikv|fdb selector;
 # --coordination-backend etcd needs the `etcd` cargo feature (see Prerequisites);
 # --chunk-size is bytes per chunk (the erasure-coding unit); 1048576 is the default,
-# stated so the invocation records it. Accepted 1..=16777216 (16 MiB), a ceiling set by
-# the D-server gRPC message limit; any other value refuses to start.
+# stated so the invocation records it. Accepted 1048576..=16777216 (1 to 16 MiB): the
+# floor keeps a single PUT's flat chunk map inside the metadata value ceiling, the ceiling
+# is set by the D-server gRPC message limit; any other value refuses to start.
 # --endpoints are the D servers from B.4.
 wyrd s3 \
   --metadata-backend fdb \

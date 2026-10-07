@@ -25,12 +25,18 @@ use std::io::Write;
 pub use access_keys::{resolve, CredentialError, CredentialSource, Credentials};
 pub use args::{parse, usage, ArgError, Args, FLAGS};
 
-/// Exit status for a run that resolved its configuration.
+/// Exit status for a run whose validation passed. No run returns it yet: this slice issues no
+/// requests, so it has nothing to pass (see [`EXIT_INCONCLUSIVE`]).
 pub const EXIT_OK: u8 = 0;
 /// Exit status when writing the resolved configuration to stdout failed.
 pub const EXIT_IO: u8 = 1;
 /// Exit status for a refused invocation: bad arguments or no usable credentials.
 pub const EXIT_USAGE: u8 = 2;
+/// Exit status for a run that proved nothing: proposal 0017's vacuity rule makes such a run
+/// INCONCLUSIVE — non-zero, never a pass — so a CI job or script reading only the status never
+/// takes it as a green validation. This slice resolves the configuration and stops there, so
+/// every run that gets that far ends here until the S3 client and scenarios are wired.
+pub const EXIT_INCONCLUSIVE: u8 = 3;
 
 /// Everything a run needs, resolved: the ten flags plus the credential pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,14 +116,15 @@ pub fn run(
                 );
                 return EXIT_IO;
             }
-            // Said on stderr so an operator never reads this slice's exit 0 as a passed
-            // validation. Best-effort: stderr is the last place left to report to.
+            // Nothing was validated, so the run is INCONCLUSIVE (proposal 0017's vacuity rule):
+            // the status says so for a script, and stderr says why for an operator.
+            // Best-effort: stderr is the last place left to report to.
             let _ = writeln!(
                 err,
                 "wyrd-validate: configuration resolved; no requests were issued and nothing \
-                 was validated (the S3 client is not wired yet)"
+                 was validated (the S3 client is not wired yet) — INCONCLUSIVE"
             );
-            EXIT_OK
+            EXIT_INCONCLUSIVE
         }
         Err(e) => {
             let _ = writeln!(err, "wyrd-validate: {e}");
