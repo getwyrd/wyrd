@@ -1057,7 +1057,8 @@ enum RepairOutcome {
     /// [`Self::Aborted`] precisely because those are transient: this shape fails again every
     /// pass until the record shrinks, so it is the object's own defect, an operator signal,
     /// and — like an object the reading could not read — a repair this pass may not certify over
-    /// (see [`emit_ceiling_refused`]).
+    /// (see [`emit_ceiling_refused`]). Answered only while the root still names the generation
+    /// the move was weighed on; one it has left is a [`Self::Conflict`].
     Refused {
         /// The re-encoded record's own length.
         bytes: usize,
@@ -1179,6 +1180,17 @@ async fn repair_chunk(
     };
     let mut batch = match move_ {
         Ok(metadata::Repoint::Prepared(batch)) => batch,
+        // The two terminal verdicts are weighed on the PLANNED generation alone: they carry no
+        // batch, so no root pin ever tested it. A generation superseded after the reading
+        // resolved it — its old `seg:` records not yet collected — would otherwise be escalated
+        // as this object's own defect and block the pass. Confirm the root still names it
+        // first, as `Repoint::Refused` documents; one it has left is a stale plan, the same
+        // retry a lost CAS is.
+        Ok(metadata::Repoint::Refused { .. } | metadata::Repoint::VersionExhausted { .. })
+            if !still_current(ctx.meta, object).await? =>
+        {
+            return Ok(RepairOutcome::Conflict)
+        }
         Ok(metadata::Repoint::Refused { bytes, ceiling }) => {
             return Ok(RepairOutcome::Refused { bytes, ceiling })
         }
@@ -1217,6 +1229,15 @@ async fn repair_chunk(
         // collectable garbage; the obligation stays queued for the next pass.
         CommitOutcome::Conflict => Ok(RepairOutcome::Conflict),
     }
+}
+
+/// Whether the object's root still holds exactly the generation the move was planned from —
+/// the same bytes [`metadata::repoint_chunk`]'s root pin would require, read fresh. A store
+/// fault is the pass's, not the object's, and ends it. The read is bounded as every other
+/// metadata read in the pass is: by the `MetadataStore` implementation (#508/#636).
+async fn still_current(meta: &dyn MetadataStore, object: &Object) -> Result<bool> {
+    let current = meta.get(&metadata::inode_key(object.inode_id)).await?;
+    Ok(current.as_deref() == Some(&metadata::encode(&object.prior)[..]))
 }
 
 fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
