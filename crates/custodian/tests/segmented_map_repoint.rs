@@ -18,10 +18,13 @@
 //! * Leg 11: a STORE fault under the move ends the pass, never read as the object's damage.
 //! * Leg 12: a segmented object under a non-canonical key (`inode:01`) is contained (#698).
 //! * Leg 13: a repair planned over a RESTARTED resolve pins the root the resolve answered from.
+//! * Leg 5b: a ceiling refusal weighed on a generation superseded under the plan is a
+//!   conflict, never a ceiling fault that blocks the pass.
 //!
 //! **Reaching the race window:** the resolver reads a group's `seg:` range with `scan_page`,
 //! never `get`; the move's own read is the only `get` on a `seg:` key. So [`MemMeta`] lands a
-//! racing batch **after the resolver's page**, and leg 11 faults that `get`. A root flip lands
+//! racing batch **after the resolver's page** (or, for leg 5b, on that `get` itself, once the
+//! resolve has finished), and leg 11 faults that `get`. A root flip lands
 //! **on the way into `commit`**. These are scripted interleavings; the seeded Tier-0 DST
 //! property for the move (repoint versus supersede) is deferred: #682.
 
@@ -61,6 +64,9 @@ enum Race {
     AfterSegmentPage,
     /// On the way into a commit, after the resolve (a root moving *during* it restarts it).
     IntoCommit,
+    /// On the move's own `get` of a `seg:` key, before answering it: after the resolve has
+    /// finished, so the plan holds the generation the race then supersedes.
+    AtSegmentGet,
 }
 
 /// What the racing writer lands: raw puts with no preconditions — it got there first.
@@ -105,6 +111,9 @@ impl MetadataStore for MemMeta {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         if key.starts_with(b"seg:") && self.faulting.swap(false, Ordering::SeqCst) {
             return Err(Box::new(std::io::Error::other(STORE_FAULT)));
+        }
+        if key.starts_with(b"seg:") {
+            self.fire(Race::AtSegmentGet);
         }
         Ok(self.kv.lock().unwrap().get(key).cloned())
     }
@@ -699,6 +708,64 @@ async fn a_repoint_one_byte_past_the_value_ceiling_is_refused() {
         outcome,
         Reconciled::Blocked,
         "a ceiling refusal is a hole in what the pass may certify"
+    );
+}
+
+/// Leg 5's over-ceiling record, but its root is SUPERSEDED after the resolve and before the
+/// move's own read — a new generation under a new group, the old `seg:` records left behind
+/// uncollected. The move weighs the retired record and refuses it with no root pin to lose;
+/// that refusal is a stale plan, not this object's defect, so the pass answers the lost race
+/// (`Satisfied`, one conflict) rather than a ceiling refusal that blocks it. Named negation:
+/// escalate the refusal without confirming the planned generation is still current.
+#[tokio::test]
+async fn a_ceiling_refusal_on_a_superseded_generation_is_a_conflict_not_a_block() {
+    let growth = {
+        let wide = metadata::encode(&segment_one(vec![SURVIVOR, HUGE], vec![SURVIVOR, LOST]));
+        let seeded = metadata::encode(&segment_one(vec![SURVIVOR, LOST], vec![SURVIVOR, LOST]));
+        wide.len() - seeded.len()
+    };
+    let (meta, d0, free) = <(MemMeta, MemDServer, MemDServer)>::default();
+    let seeded = padded(vec![SURVIVOR, LOST], MAX_VALUE_BYTES + 1 - growth);
+    let decoy = SegmentRecord::new(vec![chunk_ref(DECOY, vec![SURVIVOR, LOST])], 0).unwrap();
+    seed(&meta, &metadata::inode_key(INODE), &[decoy, seeded]).await;
+    owe(&meta, &d0, CHUNK).await;
+    let before = segment(&meta, 1).await;
+    let successor = SegmentGroup::new(NONCE, EPOCH + 1).unwrap();
+    let superseding = generation(&successor, 2, &metadata::inode_key(INODE), &records());
+    let new_root = superseding.last().expect("the root row").1.clone();
+    meta.arm(Race::AtSegmentGet, superseding);
+
+    let (outcome, logged) = run(&meta, &d0, (HUGE, &free)).await;
+
+    assert!(meta.raced(), "fixture: the supersede never landed");
+    assert_eq!(
+        root(&meta).await,
+        new_root,
+        "fixture: the root left the plan"
+    );
+    assert_eq!(
+        segment(&meta, 1).await,
+        before,
+        "the retired record is not rewritten"
+    );
+    assert_eq!(
+        queued(&meta).await,
+        vec![CHUNK],
+        "the obligation stays queued for the next pass to re-plan"
+    );
+    assert_eq!(
+        (
+            ticks(&logged, "ceiling_refused"),
+            ticks(&logged, "conflict")
+        ),
+        (0, 1),
+        "a refusal weighed on a retired generation is a stale plan, never a ceiling fault: \
+         {logged}"
+    );
+    assert_eq!(
+        outcome,
+        Reconciled::Satisfied,
+        "a stale plan is a retry, not a hole: {logged}"
     );
 }
 

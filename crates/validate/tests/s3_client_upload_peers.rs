@@ -258,6 +258,8 @@ fn client(endpoint: SocketAddr, operation: Duration) -> S3Client {
         connect: Duration::from_secs(2),
         operation,
         body_idle: Duration::from_secs(2),
+        // GET-only; these peers only answer PUTs. Equal to `operation`, as the default is.
+        body: operation,
     };
     S3Client::with_deadlines(&resolved(endpoint), deadlines)
 }

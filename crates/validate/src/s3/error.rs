@@ -81,6 +81,8 @@ pub enum Phase {
     Operation,
     /// Waiting for the next piece of a GET body.
     BodyIdle,
+    /// Reading a whole GET body, from its response head to its end.
+    Body,
 }
 
 /// Why an object body failed or cannot be trusted.
@@ -179,6 +181,7 @@ impl fmt::Display for Phase {
             Self::Connect => "connect",
             Self::Operation => "operation",
             Self::BodyIdle => "body-idle",
+            Self::Body => "body",
         })
     }
 }

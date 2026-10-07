@@ -145,7 +145,9 @@ pub struct RestoreReport {
     pub pending_skipped: usize,
     /// Fragments left unmarked because the **staged protection class** keeps them
     /// ([`crate::gc::StagedSet`], `0016:823`): a multipart upload's own record places them, or
-    /// names their chunk untrustworthily ([`RestoreReport::staged_untrusted`]).
+    /// names their chunk untrustworthily ([`RestoreReport::staged_untrusted`]), or a staged record
+    /// could not be read at all — which keeps every fragment the committed readings do not, and is
+    /// named in [`RestoreReport::unresolvable`].
     ///
     /// Each kept fragment is counted once, under the FIRST protection that keeps it in the pass's
     /// order: the committed readings (uncounted), the staged class, the displaced check, the
@@ -667,6 +669,11 @@ pub async fn reconcile_after_restore(
     // a hole the verdict read found, so the pass can never both mark a fragment and report a
     // record it could not read. Whichever read met the damage, the answer is the same one.
     let incomplete = !report.unresolvable.is_empty();
+    // The COMMITTED half of that hole: a record either reading of the committed namespace could
+    // not read. The rest of `incomplete` is the staged class's own, and the gate below keeps it
+    // under that class (and counts it there), not as a committed protection.
+    let committed_incomplete =
+        !referenced.unresolvable.is_empty() || !committed.unresolvable.is_empty();
     let mut marks = WriteBatch::new();
     // The fragments queued in the CURRENT batch, held back until it commits. Counting or
     // auditing a mark before its transaction lands would let a failed commit (an FDB
@@ -713,16 +720,21 @@ pub async fn reconcile_after_restore(
         // says so. Otherwise an object committed in the instant between the two reads — absent
         // from `referenced` and present in `committed` — would have its live fragments marked
         // collectable, and GC would take the only copy after the grace window.
-        if incomplete || referenced.protects(dserver, frag) || appeared.protects(dserver, frag) {
+        if committed_incomplete
+            || referenced.protects(dserver, frag)
+            || appeared.protects(dserver, frag)
+        {
             continue;
         }
 
         // And never a fragment the staged class protects: a multipart upload's committed part or
-        // owned staging entry names it, or names its chunk untrustworthily (an unreadable staged
-        // record is `incomplete`, above). COUNTED, once, by the FIRST protection that keeps it:
-        // after the committed readings, before the displaced check and the pending lease below
-        // (`RestoreReport::staged_skipped`, `0016:823`).
-        if staged.protects(dserver, frag) {
+        // owned staging entry names it, or names its chunk untrustworthily, or a staged record
+        // could not be read — which keeps EVERY fragment the committed readings left (`incomplete`
+        // past `committed_incomplete` is that record's hole alone; `StagedSet::protects` says the
+        // same, and the gate does not lean on it to). COUNTED, once, by the FIRST protection that
+        // keeps it: after the committed readings, before the displaced check and the pending lease
+        // below (`RestoreReport::staged_skipped`, `0016:823`).
+        if incomplete || staged.protects(dserver, frag) {
             report.staged_skipped += 1;
             continue;
         }
