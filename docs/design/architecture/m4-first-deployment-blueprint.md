@@ -1115,12 +1115,17 @@ export WYRD_S3_ACCESS_KEY=... WYRD_S3_SECRET_KEY=...
 
 # S3 gateway — stateless front door. --metadata-backend is the redb|tikv|fdb selector;
 # --coordination-backend etcd needs the `etcd` cargo feature (see Prerequisites);
+# --chunk-size is bytes per chunk (the erasure-coding unit); 1048576 is the default,
+# stated so the invocation records it. Accepted 1048576..=16777216 (1 to 16 MiB): the
+# floor keeps a single PUT's flat chunk map inside the metadata value ceiling, the ceiling
+# is set by the D-server gRPC message limit; any other value refuses to start.
 # --endpoints are the D servers from B.4.
 wyrd s3 \
   --metadata-backend fdb \
   --coordination-backend etcd \
   --s3-listen 0.0.0.0:8080 \
   --region <your-region> \
+  --chunk-size 1048576 \
   --endpoints http://10.0.1.<d0>:50051,...
 
 # custodian — reconstruction/repair; emits durability telemetry.

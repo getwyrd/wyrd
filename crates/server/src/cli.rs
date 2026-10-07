@@ -489,7 +489,7 @@ fn usage() {
     eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
     eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
     eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
-    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
+    eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--chunk-size N] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  every command also accepts:");
@@ -509,6 +509,18 @@ fn usage() {
     eprintln!(
         "  order. Omit all three to run the leader-elected role with no reconstruction plane."
     );
+    eprintln!();
+    eprintln!(
+        "  s3: --chunk-size N sets the bytes per chunk (default 1 MiB). Accepted: {} to {}",
+        crate::MIN_CHUNK_SIZE,
+        crate::MAX_CHUNK_SIZE
+    );
+    eprintln!(
+        "  ({} to {} MiB): the floor keeps a single PUT's flat chunk map inside the metadata",
+        crate::MIN_CHUNK_SIZE >> 20,
+        crate::MAX_CHUNK_SIZE >> 20
+    );
+    eprintln!("  value ceiling, the ceiling is set by the D-server gRPC message limit.");
 }
 
 /// Parse a `--durability` value: `rs(k,m)` (Reed-Solomon) or `none`/`replication(1)`.
@@ -2197,6 +2209,11 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
         .map(str::to_string)
         .or_else(|| std::env::var("WYRD_S3_SECRET_KEY").ok())
         .ok_or("s3: --secret-key (or WYRD_S3_SECRET_KEY) is required")?;
+    // `--chunk-size` is a deployment property (the erasure-coding unit and the per-object
+    // fan-out), so a value the role cannot carry is refused HERE, before the runtime starts
+    // or the listener binds, never found later as a failed PUT. Absent, the gateway keeps
+    // its own 1 MiB default, composed exactly as before the flag existed.
+    let chunk_size = parse_s3_chunk_size(parsed.flag("chunk-size"))?;
 
     // Select the gateway's backends BY CONFIGURATION, exactly as every other
     // cluster-facing role does — `resolve_backend` for put/get/custodian (#255) and
@@ -2272,6 +2289,7 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             coordination,
             data_dir,
             endpoints.as_deref(),
+            chunk_size,
             credentials,
             region,
             listener,
@@ -2300,6 +2318,13 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
 ///     shared cluster state, the invariant #454 restores.
 ///   * `None` — the single-node local-FS front door (today's #367 behaviour preserved).
 ///
+/// `chunk_size` is the role's `--chunk-size`: `Some(n)` is applied to the gateway on
+/// every composition below, both chunk planes and every metadata × coordination arm;
+/// `None` composes the gateway at its own default (1 MiB). A value outside
+/// `MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE` is refused here before anything is opened or served,
+/// the same check `cmd_s3` runs before it binds, so no caller can start a role whose
+/// PUTs would fail on the gRPC transport or at the metadata value ceiling.
+///
 /// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
 /// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
 #[allow(clippy::too_many_arguments)]
@@ -2308,11 +2333,15 @@ pub async fn serve_s3_role(
     coordination: CoordinationBackend,
     data_dir: &str,
     endpoints: Option<&[String]>,
+    chunk_size: Option<usize>,
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
     metrics: Option<tracing::Dispatch>,
 ) -> Result<(), BoxError> {
+    if let Some(chunk_size) = chunk_size {
+        check_s3_chunk_size(chunk_size)?;
+    }
     match endpoints {
         // Cluster front door: the chunk plane is the gRPC fan-out over the configured
         // D servers, so a chunk's fragments cross the wire to real D servers rather than
@@ -2324,6 +2353,7 @@ pub async fn serve_s3_role(
                 coordination,
                 data_dir,
                 chunks,
+                chunk_size,
                 credentials,
                 region,
                 listener,
@@ -2340,6 +2370,7 @@ pub async fn serve_s3_role(
                 coordination,
                 data_dir,
                 chunks,
+                chunk_size,
                 credentials,
                 region,
                 listener,
@@ -2357,12 +2388,17 @@ pub async fn serve_s3_role(
 /// roles' single-axis matches are (`cluster_put` `cli.rs:1266`, `cmd_d_server`
 /// `cli.rs:530`), so the default build compiles only the redb + mem arm and the
 /// production `tikv` + `etcd` arms build under their respective cargo features.
+///
+/// Every arm composes its gateway through [`compose_s3_gateway`], so the role's
+/// `chunk_size` reaches the gateway on all six arms, including the feature-gated ones the
+/// default build does not compile.
 #[allow(clippy::too_many_arguments)]
 async fn serve_s3_dispatch<C>(
     backend: MetadataBackend,
     coordination: CoordinationBackend,
     data_dir: &str,
     chunks: C,
+    chunk_size: Option<usize>,
     credentials: Vec<s3::sigv4::Credentials>,
     region: String,
     listener: tokio::net::TcpListener,
@@ -2374,43 +2410,108 @@ where
     match (backend, coordination) {
         (MetadataBackend::Redb, CoordinationBackend::Mem) => {
             let meta = open_local_meta_redb(data_dir)?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "tikv")]
         (MetadataBackend::Tikv, CoordinationBackend::Mem) => {
             let meta = open_tikv_meta().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "etcd")]
         (MetadataBackend::Redb, CoordinationBackend::Etcd) => {
             let meta = open_local_meta_redb(data_dir)?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "tikv", feature = "etcd"))]
         (MetadataBackend::Tikv, CoordinationBackend::Etcd) => {
             let meta = open_tikv_meta().await?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(feature = "fdb")]
         (MetadataBackend::Fdb, CoordinationBackend::Mem) => {
             let meta = open_fdb_meta().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, MemCoordination::new()));
+            let gateway = compose_s3_gateway(meta, chunks, MemCoordination::new(), chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
         #[cfg(all(feature = "fdb", feature = "etcd"))]
         (MetadataBackend::Fdb, CoordinationBackend::Etcd) => {
             let meta = open_fdb_meta().await?;
             let coord = open_etcd_coordination().await?;
-            let gateway = Arc::new(Gateway::new(meta, chunks, coord));
+            let gateway = compose_s3_gateway(meta, chunks, coord, chunk_size);
             serve_s3(gateway, credentials, region, listener, metrics).await
         }
     }
+}
+
+/// Compose one [`serve_s3_dispatch`] arm's gateway. `Some(chunk_size)` (the role's
+/// `--chunk-size`, already range-checked by [`serve_s3_role`]) is applied through
+/// [`Gateway::with_chunk_size`]; `None` is plain [`Gateway::new`], the composition from
+/// before the flag existed.
+fn compose_s3_gateway<M, C, Co>(
+    meta: M,
+    chunks: C,
+    coord: Co,
+    chunk_size: Option<usize>,
+) -> Arc<Gateway<M, C, Co>>
+where
+    M: MetadataStore,
+    C: PlacementChunkStore,
+    Co: wyrd_traits::Coordination,
+{
+    let gateway = Gateway::new(meta, chunks, coord);
+    Arc::new(match chunk_size {
+        Some(chunk_size) => gateway.with_chunk_size(chunk_size),
+        None => gateway,
+    })
+}
+
+/// Parse `wyrd s3 --chunk-size`. Absent (`None`) keeps the gateway's own default. A value
+/// is parsed the way `wyrd put` parses its `--chunk-size` (`str::parse::<usize>`,
+/// [`cmd_put`]) and must then pass [`check_s3_chunk_size`].
+fn parse_s3_chunk_size(raw: Option<&str>) -> Result<Option<usize>, BoxError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let chunk_size: usize = raw
+        .parse()
+        .map_err(|_| format!("s3: invalid --chunk-size `{raw}` (expected a byte count)"))?;
+    check_s3_chunk_size(chunk_size)?;
+    Ok(Some(chunk_size))
+}
+
+/// Refuse a chunk size the `s3` role cannot carry: anything below [`crate::MIN_CHUNK_SIZE`]
+/// (a single PUT's flat chunk map must keep fitting the metadata value ceiling) or above
+/// [`crate::MAX_CHUNK_SIZE`] (set by the D-server gRPC message limit); each reason is on
+/// its constant. Refused rather than clamped, so the operator learns at startup.
+fn check_s3_chunk_size(chunk_size: usize) -> Result<(), BoxError> {
+    if chunk_size < crate::MIN_CHUNK_SIZE {
+        return Err(format!(
+            "s3: --chunk-size {chunk_size} is too small: it must be at least {} bytes ({} MiB). \
+             A single PUT publishes one chunk ref per chunk in one metadata value, which \
+             holds at most {} refs, so a smaller chunk would accept objects whose metadata \
+             commit then fails after their fragments are written",
+            crate::MIN_CHUNK_SIZE,
+            crate::MIN_CHUNK_SIZE >> 20,
+            wyrd_core::multipart::MAX_MAP_CHUNKS
+        )
+        .into());
+    }
+    if chunk_size > crate::MAX_CHUNK_SIZE {
+        return Err(format!(
+            "s3: --chunk-size {chunk_size} is too large: it must be at most {} bytes ({} MiB, \
+             the largest chunk whose fragments fit the D-server gRPC message limit)",
+            crate::MAX_CHUNK_SIZE,
+            crate::MAX_CHUNK_SIZE >> 20
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Seed the gateway's shared, persisted inode allocator from persisted state (#364 durability
@@ -2917,6 +3018,128 @@ mod tests {
     #[test]
     fn default_chunk_size_is_one_mib() {
         assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
+    }
+
+    /// `wyrd s3 --chunk-size` (#738): the accept/refuse decision, pinned in-process. The
+    /// binding test drives the built binary (`tests/s3_chunk_size_flag.rs`); this one makes
+    /// the same decision visible to coverage. Absent keeps the gateway default; the range is
+    /// `1 MiB..=16 MiB` inclusive; every refusal names the flag in the role's `s3:` style.
+    #[test]
+    fn s3_chunk_size_accepts_exactly_one_to_sixteen_mib() {
+        assert_eq!(parse_s3_chunk_size(None).unwrap(), None);
+        assert_eq!(parse_s3_chunk_size(Some("1048576")).unwrap(), Some(1 << 20));
+        assert_eq!(
+            parse_s3_chunk_size(Some("16777216")).unwrap(),
+            Some(16 << 20)
+        );
+        for refused in [
+            "0",
+            "1",
+            "524288",
+            "1048575",
+            "16777217",
+            "1MiB",
+            "",
+            "-1",
+            "18446744073709551616",
+        ] {
+            let err = parse_s3_chunk_size(Some(refused))
+                .expect_err(refused)
+                .to_string();
+            assert!(
+                err.starts_with("s3: ") && err.contains("--chunk-size"),
+                "`{refused}` must be refused naming the flag, got: {err}"
+            );
+        }
+    }
+
+    /// The `--chunk-size` floor (#738 review): a single PUT publishes ONE flat chunk map
+    /// (one `ChunkRef` per chunk, one metadata value), so a chunk below the floor would accept
+    /// objects the default gateway stores but this one cannot publish — the metadata commit
+    /// failing only after every fragment is written. The floor is derived from the flat-map
+    /// capacity, lands on 1 MiB, and the refusal names it and the reason.
+    #[test]
+    fn s3_chunk_size_floor_keeps_the_default_single_put_envelope_representable() {
+        use wyrd_core::multipart::MAX_MAP_CHUNKS;
+        let map_chunks = MAX_MAP_CHUNKS as usize;
+        let default_envelope = map_chunks * (1 << 20);
+        assert_eq!(crate::MIN_CHUNK_SIZE, 1 << 20);
+        // The floor holds the default envelope in a flat map; one byte less does not.
+        assert!(crate::MIN_CHUNK_SIZE * map_chunks >= default_envelope);
+        assert!((crate::MIN_CHUNK_SIZE - 1) * map_chunks < default_envelope);
+
+        assert_eq!(
+            parse_s3_chunk_size(Some("1048576")).unwrap(),
+            Some(crate::MIN_CHUNK_SIZE)
+        );
+        for refused in ["1", "1048575"] {
+            let err = parse_s3_chunk_size(Some(refused))
+                .expect_err(refused)
+                .to_string();
+            assert!(
+                err.starts_with("s3: --chunk-size ")
+                    && err.contains("too small")
+                    && err.contains("1048576")
+                    && err.contains(&format!("{MAX_MAP_CHUNKS} refs")),
+                "`{refused}` must be refused naming the floor and why, got: {err}"
+            );
+        }
+    }
+
+    /// Every `serve_s3_dispatch` arm builds its gateway through `compose_s3_gateway`, so this
+    /// pins what each arm gets: `Some(n)` reaches the gateway, `None` leaves
+    /// `Gateway::new`'s 1 MiB default untouched.
+    #[test]
+    fn compose_s3_gateway_applies_the_chunk_size_only_when_given() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let compose = |chunk_size| {
+            compose_s3_gateway(
+                RedbMetadataStore::in_memory().expect("redb"),
+                FsChunkStore::open(dir.path()).expect("fs store"),
+                MemCoordination::new(),
+                chunk_size,
+            )
+        };
+        assert_eq!(compose(Some(2 << 20)).chunk_size, 2 << 20);
+        assert_eq!(compose(Some(16 << 20)).chunk_size, 16 << 20);
+        assert_eq!(compose(None).chunk_size, 1 << 20);
+    }
+
+    /// `serve_s3_role` is `pub`, so it re-checks the range itself: a caller that skips
+    /// `cmd_s3` still cannot start a role whose first large PUT would fail on the gRPC
+    /// transport. The refusal comes before anything is opened, so no local chunk store
+    /// appears. Bounded, because a role that wrongly starts serves forever.
+    #[tokio::test]
+    async fn serve_s3_role_refuses_an_out_of_range_chunk_size_before_opening_anything() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().to_str().expect("utf-8 path");
+        for refused in [0, 1, (1 << 20) - 1, (16 << 20) + 1] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback");
+            let served = tokio::time::timeout(
+                Duration::from_secs(10),
+                serve_s3_role(
+                    MetadataBackend::Redb,
+                    CoordinationBackend::Mem,
+                    data_dir,
+                    None,
+                    Some(refused),
+                    Vec::new(),
+                    "us-east-1".to_string(),
+                    listener,
+                    None,
+                ),
+            )
+            .await
+            .expect("an out-of-range chunk size must be refused, not served");
+            let err = served.expect_err("refused").to_string();
+            assert!(err.contains("--chunk-size"), "{refused}: {err}");
+            assert!(
+                !dir.path().join("chunks").exists(),
+                "{refused}: the refusal must come before the chunk store is opened"
+            );
+        }
     }
 
     /// THE HOLLOW GREEN this command must never print (#651): the exit status and the text are

@@ -378,13 +378,16 @@ services:
   #    Wired `--metadata-backend fdb` (`WYRD_FDB_CLUSTER_FILE`) + `--coordination-backend
   #    etcd` (`WYRD_ETCD_ENDPOINTS`) + `--endpoints` fanning chunks to the 9 D servers over
   #    gRPC — mirroring the custodian wiring. SigV4 mandatory; test credentials via env.
+  #    `--chunk-size 1048576` is the 1 MiB default, stated so the stack records the value
+  #    it runs (accepted 1048576..=16777216; the floor keeps a single PUT's flat chunk map
+  #    inside the metadata value ceiling, the ceiling is the D-server gRPC message limit).
   #    Honest limit (#454): `cmd_s3` currently hardcodes local backends, so each gateway is
   #    a standalone island — the role starts and serves, an object does not yet round-trip.
   gateway0:
     image: wyrd:fdb
     networks: [cluster]
     depends_on: [fdb0, fdb1, fdb2, etcd0, etcd1, etcd2, dserver0, dserver8]
-    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--chunk-size", "1048576", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
     environment:
       WYRD_S3_ACCESS_KEY: "wyrd-test"
       WYRD_S3_SECRET_KEY: "wyrd-test-secret"
@@ -401,7 +404,7 @@ services:
     image: wyrd:fdb
     networks: [cluster]
     depends_on: [fdb0, fdb1, fdb2, etcd0, etcd1, etcd2, dserver0, dserver8]
-    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--chunk-size", "1048576", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
     environment:
       WYRD_S3_ACCESS_KEY: "wyrd-test"
       WYRD_S3_SECRET_KEY: "wyrd-test-secret"
@@ -418,7 +421,7 @@ services:
     image: wyrd:fdb
     networks: [cluster]
     depends_on: [fdb0, fdb1, fdb2, etcd0, etcd1, etcd2, dserver0, dserver8]
-    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
+    command: ["s3", "--s3-listen", "0.0.0.0:8080", "--data-dir", "/data", "--region", "us-east-1", "--chunk-size", "1048576", "--metadata-backend", "fdb", "--coordination-backend", "etcd", "--endpoints", "http://dserver0:50051,http://dserver1:50051,http://dserver2:50051,http://dserver3:50051,http://dserver4:50051,http://dserver5:50051,http://dserver6:50051,http://dserver7:50051,http://dserver8:50051"]
     environment:
       WYRD_S3_ACCESS_KEY: "wyrd-test"
       WYRD_S3_SECRET_KEY: "wyrd-test-secret"
