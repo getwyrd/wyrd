@@ -27,8 +27,10 @@
 //!   `0005:200-203`, ADR-0015): the rebuilt fragments are written **before** the
 //!   commit, so a crash mid-repair leaves only **collectable garbage** (orphaned
 //!   fragments GC reclaims), never a torn or hybrid chunk. The repoint is CAS'd on the
-//!   prior inode record, so a superseded custodian or a racing writer loses the commit
-//!   rather than corrupting the placement record.
+//!   root generation, on the record that actually holds the chunk's `ChunkRef` — the flat
+//!   inode record or one `seg:` record — and on that reference itself
+//!   ([`wyrd_core::metadata::repoint_chunk`]), so a superseded custodian or a racing writer
+//!   loses the commit rather than corrupting the placement record.
 //! - **A checksum-failing shard is never decoded** (`0005:275`): every surviving
 //!   fragment is verified via [`wyrd_core::repair::fragment_intact`] before it is fed
 //!   to the decoder; a corrupt one is **excluded** and treated as missing.
@@ -160,7 +162,6 @@ struct RepairPlan {
     /// The record the repair repoints: a committed object of this pass's reading, or a staged
     /// multipart upload's committed part.
     target: Target,
-    chunk_index: usize,
     chunk_id: ChunkId,
     k: usize,
     m: usize,
@@ -178,12 +179,11 @@ struct RepairPlan {
 
 /// The record a [`RepairPlan`] repoints.
 enum Target {
-    /// Which committed object of this pass's ONE reading holds the chunk ([`Reading::objects`],
-    /// which carries that object's identity and the generation the scan returned) — an index,
-    /// never a copy: every obligation inside an N-entry object shares that one snapshot, so Q
-    /// obligations cost N decoded entries **once**, not Q×N. The rest of the plan is scalars
-    /// plus this chunk's own survivors.
-    Committed(usize),
+    /// Where this pass's ONE reading found the chunk ([`Site`]): which committed object holds it
+    /// — an index into [`Reading::objects`], never a copy: every obligation inside an N-entry
+    /// object shares that one snapshot, so Q obligations cost N decoded entries **once**, not
+    /// Q×N — plus the chunk's own address and reference, which the move is pinned to.
+    Committed(Site),
     /// A multipart upload's committed part, in an `Open` session, and where the rebuilt
     /// fragments go ([`staged::StagedTarget`]).
     Staged(staged::StagedTarget),
@@ -194,9 +194,9 @@ enum Target {
 /// parallel entry. Returns [`Reconciled::Changed`] if any chunk's placement record was
 /// repointed, [`Reconciled::Satisfied`] otherwise — and [`Reconciled::Blocked`] when the pass
 /// cannot certify what it did not do: a committed object it could not read (its reading has a
-/// hole in it, see [`read_committed`]), a repair it refused because the chunk's committed
-/// reference lives in a `seg:` record (#682 owns that write path), or one it refused because
-/// the repointed record would not survive the backend value ceiling ([`RepairOutcome::Refused`]).
+/// hole in it, see [`read_committed`] and [`RepairOutcome::Contained`]), or a repair it refused
+/// because the repointed record would not survive the backend value ceiling
+/// ([`RepairOutcome::Refused`]).
 pub(crate) async fn reconcile(
     ctx: &ReconstructionContext<'_>,
     now_millis: u64,
@@ -231,7 +231,7 @@ pub(crate) async fn reconcile(
     // classes (see the leg this guards, `staged_protection.rs`'s (E)/(D) appendix for #663.1).
     // The same walk keeps, for each owed chunk, the committed part that names it, with the exact
     // bytes the staged re-place pins its commits to ([`staged::read`]).
-    let (staged, reading) = if queue.is_empty() {
+    let (staged, mut reading) = if queue.is_empty() {
         (staged::StagedReading::default(), Reading::default())
     } else {
         let staged = staged::read(ctx.meta, &queue).await?;
@@ -313,10 +313,10 @@ pub(crate) async fn reconcile(
     // Whether this pass kept at least one obligation queued because a staged multipart record
     // — never a committed map — names its chunk and this pass may not repair it
     // (`Assessment::Staged`), or withheld a staged repair over a record it cannot read
-    // (`Assessment::Withheld`). Like the `seg:` refusal, this pass may not drain it (nothing
-    // resolved it, and a staged record still names or holds the chunk, so deleting it would be
-    // a discard), so it withholds certification below exactly as `!reading.refused.is_empty()`
-    // already does for a segmented refusal.
+    // (`Assessment::Withheld`). This pass may not drain it (nothing resolved it, and a staged
+    // record still names or holds the chunk, so deleting it would be a discard), so it
+    // withholds certification below exactly as `reading.incomplete` does for an object this
+    // pass could not read.
     let mut staged_kept = false;
     for &chunk in &queue {
         match assess(ctx, &stores, &reading, &staged, &staged_chunks, chunk).await? {
@@ -358,14 +358,6 @@ pub(crate) async fn reconcile(
             // BLOCKING #1). `emit_needs_human` carries the `reconstruction_malformed_placement`
             // counter so the corruption is not lost.
             Assessment::Malformed => emit_needs_human(chunk),
-            // A repair this pass may NOT perform: the chunk's committed reference lives in a
-            // `seg:` record and the segmented write path is #682's. Already counted and named
-            // ONCE PER OBJECT by the reading above — never once per chunk — and, like every
-            // other never-repaired condition, kept OFF the repairable-backlog gauge so it
-            // cannot floor the day-one "returns to zero" signal. The obligation stays queued
-            // (it is the last record saying live data is under-replicated) and the pass
-            // refuses to certify below.
-            Assessment::Refused => {}
             // A staged multipart record — never a committed map — names this chunk, and this
             // pass may not repair it: only an in-flight owned entry names it, its upload has
             // left `Open`, or a staged record holds it with a placement that cannot be used
@@ -394,7 +386,7 @@ pub(crate) async fn reconcile(
     // time-to-repair sample. Every non-success is offset on its own counter so the
     // up-front count nets back to true successes: a repair that loses the CAS race is
     // recorded on `reconstruction_conflict`, one that cannot proceed (the selector
-    // chose a server outside the fleet view, so nothing is committed) on
+    // chose a server outside the fleet view, or the move found its object unusable) on
     // `reconstruction_aborted`, and one refused because the repointed record would cross the
     // backend value ceiling on `reconstruction_ceiling_refused` — so successful repairs are
     // `reconstruction_repaired − conflict − aborted − ceiling_refused`. Every offset leaves
@@ -416,38 +408,47 @@ pub(crate) async fn reconcile(
     }
 
     // The repair loop is the base's, chunk by chunk and in its priority order: ONE
-    // version-conditional commit per repaired chunk, each built from and conditioned on the
-    // generation THE SCAN returned — which is now the shared snapshot the reading holds
-    // rather than a namespace scan of this obligation's own, and is the only thing that
-    // changed here. So a chunk that lands is durable whatever a later one does, an urgent
-    // repair is never run behind a less urgent one to keep its object's writes together, and
-    // a second obligation inside the same object still loses the CAS it always lost (its
-    // precondition is the generation the first repoint superseded) and stays queued for the
-    // next pass — exactly as on `origin/main`, where every plan is likewise assessed before
-    // any repair commits.
+    // version-conditional commit per repaired chunk, each conditioned on the generation the
+    // reading resolved for its object — the shared snapshot the reading holds, never a
+    // namespace scan of this obligation's own. So a chunk that lands is durable whatever a later
+    // one does, and an urgent repair is never run behind a less urgent one to keep its object's
+    // writes together. What a second obligation inside the same object meets depends on which
+    // record holds its chunk ([`metadata::repoint_chunk`]): in a FLAT object the first repoint
+    // rewrote the root the second is pinned to, so the second loses the CAS and stays queued
+    // for the next pass, exactly as on `origin/main`; in a SEGMENTED object the root is never
+    // rewritten and each move re-reads its own `seg:` record, so both land in this pass.
     //
     // A staged plan takes its turn in the same order, through its own fenced sequence
-    // (`staged::repair`). **One degraded chunk per part per pass**, accepted for the same reason:
-    // every plan inside one part pins the part record's bytes this pass read, as every plan
-    // inside one object pins that object's generation, so a second plan in a part whose first
-    // one was adopted loses its pre-mark to that adoption, writes nothing, and is repaired on
-    // the next pass.
+    // (`staged::repair`). **One degraded chunk per part per pass**, accepted for the same reason
+    // as in a flat object: every plan inside one part pins the part record's bytes this pass
+    // read, as every plan inside one flat object pins that object's generation, so a second plan
+    // in a part whose first one was adopted loses its pre-mark to that adoption, writes nothing,
+    // and is repaired on the next pass.
     let mut changed = false;
     // A repair this pass REFUSED because the repointed record would not survive the backend
     // value ceiling: it wrote nothing at all, the obligation stays queued, and — exactly like
-    // the segmented refusal the reading records — the pass may not certify over it.
+    // an object the reading could not read — the pass may not certify over it.
     let mut ceiling_refused = false;
     for plan in &plans {
         let outcome = match &plan.target {
-            Target::Committed(object) => {
-                repair_chunk(ctx, &stores, &reading.objects[*object], plan, now_millis).await?
+            Target::Committed(site) => {
+                let object = &reading.objects[site.object];
+                repair_chunk(ctx, &stores, object, site, plan, now_millis).await?
             }
             Target::Staged(target) => staged::repair(ctx, &stores, &staged, target, plan).await?,
         };
         match outcome {
             RepairOutcome::Committed => changed = true,
             RepairOutcome::Conflict => emit_conflict(plan.chunk_id),
-            RepairOutcome::Aborted => emit_aborted(plan.chunk_id),
+            RepairOutcome::Aborted => emit_aborted(plan.chunk_id, "unplaced"),
+            // The move found this object's own records unusable: contained exactly as the
+            // reading contains an object it cannot resolve — named once per OBJECT, however many
+            // obligations meet it, nothing drained and nothing certified — and offset as an
+            // abort, so the up-front count still nets to true successes.
+            RepairOutcome::Contained { object, fault } => {
+                reading.contain(&object, &fault);
+                emit_aborted(plan.chunk_id, "unresolvable-chunk-map");
+            }
             RepairOutcome::Refused { bytes, ceiling } => {
                 ceiling_refused = true;
                 emit_ceiling_refused(plan.chunk_id, bytes, ceiling);
@@ -481,15 +482,12 @@ pub(crate) async fn reconcile(
         ctx.meta.commit(batch).await?;
     }
 
-    // A hole in what this pass may claim: an object it could not read, a staged record it
-    // could not read, a repair it may not perform, an obligation it kept queued on a staged
-    // record's word rather than a committed one, or one it refused because the record it
-    // would leave behind could not survive.
-    let hole = reading.incomplete
-        || staged_incomplete
-        || !reading.refused.is_empty()
-        || staged_kept
-        || ceiling_refused;
+    // A hole in what this pass may claim: an object it could not read (at the reading or at the
+    // move's own re-read), a staged record it could not read, an obligation it kept queued on a
+    // staged record's word rather than a committed one, or one it refused because the record it
+    // would leave behind could not survive. A lost CAS is NOT a hole: nothing repair-owned was
+    // written, the obligation stays queued, and the next pass re-plans onto the winner's bytes.
+    let hole = reading.incomplete || staged_incomplete || staged_kept || ceiling_refused;
     Ok(if hole {
         // **This pass certifies only over the reading it performed.** It either could not
         // read every committed object, or held back a repair it may not perform — either way
@@ -515,9 +513,9 @@ pub(crate) async fn reconcile(
 /// and then exactly **once**, however many obligations fall in it.
 #[derive(Default)]
 struct Reading {
-    /// One entry per committed **flat** object this pass owes a repair inside: the scanned
-    /// generation, held once and SHARED by every obligation that falls in it.
-    objects: Vec<FlatObject>,
+    /// One entry per committed object this pass owes a repair inside, flat or segmented alike:
+    /// the generation the resolve answered from, held once and SHARED by every obligation in it.
+    objects: Vec<Object>,
     /// The committed reference this pass acts on for each queued chunk. **Absent** means no
     /// committed chunk map references it — the chunk was deleted out from under the
     /// obligation, which is the only fact that permits discarding one.
@@ -525,61 +523,60 @@ struct Reading {
     /// At least one committed object could not be read at all, so this reading has a HOLE in
     /// it: every conclusion drawn over the whole namespace (both drain paths) is withheld and
     /// the pass cannot certify. Each such object is named on the audit seam the moment it is
-    /// met — see [`read_committed`].
+    /// met — see [`read_committed`] — or, for one the move's own re-read finds unusable, by
+    /// the repair loop ([`RepairOutcome::Contained`]).
     incomplete: bool,
-    /// Committed objects holding a queued chunk whose reference lives in a `seg:` record,
-    /// keyed by the store's own key bytes so a refusal is counted and named exactly ONCE PER
-    /// OBJECT: two obligations inside one segmented object are one refusal, not two. Ordered
-    /// (the store's own byte order), so the audit trail is deterministic.
-    refused: BTreeSet<Vec<u8>>,
+    /// Every committed object contained so far, keyed by the store's own key bytes, so one is
+    /// named and counted exactly ONCE PER OBJECT: two obligations inside one damaged object are
+    /// one name, not two.
+    contained: BTreeSet<Vec<u8>>,
 }
 
 impl Reading {
     /// Contain one committed object this reading could not read: name it for the operator
-    /// where it was met, and record that the reading now has a hole in it.
+    /// where it was first met, and record that the reading now has a hole in it.
     fn contain(&mut self, key: &[u8], fault: &str) {
-        emit_unresolvable(&object_name(key), fault);
+        if self.contained.insert(key.to_vec()) {
+            emit_unresolvable(&object_name(key), fault);
+        }
         self.incomplete = true;
     }
 }
 
-/// One committed **flat** object as the scan returned it — the generation every repair inside
-/// it is built from and conditioned on, held ONCE for the whole pass.
-struct FlatObject {
+/// One committed object as the resolve answered it — the generation every repair inside it is
+/// built from and conditioned on, held ONCE for the whole pass. Flat or segmented alike: the
+/// placement move ([`metadata::repoint_chunk`]) addresses either.
+struct Object {
     /// Parsed from the scanned key, exactly as the per-obligation scan this walk replaces
-    /// parsed it; the repair CASes under a key re-derived from it. A row under a
+    /// parsed it; the repair CASes under a key re-derived from it. A FLAT row under a
     /// non-canonical spelling would then be read at one key and written at another — real,
     /// pre-existing, unreachable while [`metadata::inode_key`] is the sole writer of the
-    /// prefix, and tracked as #698. Identity is a property of the OBJECT, so it is held here
+    /// prefix, and tracked as #698; a segmented one is contained by the reading and never
+    /// reaches here. Identity is a property of the OBJECT, so it is held here
     /// once beside the record it names rather than copied into every obligation's plan.
     inode_id: InodeId,
-    /// The scanned record, whole: the CAS precondition and the object metadata a repair
-    /// preserves (ADR-0047) are both taken from it. Its `chunk_map` is flat — the reading
-    /// admits no other shape here.
+    /// The root record **the resolve answered from** (`ResolvedChunkMap::record`) — the
+    /// scanned generation, or the live one a retired segmented resolution restarted onto — so
+    /// the move is conditioned on the very generation its chunks were read from. The CAS
+    /// precondition and the object metadata a repair preserves (ADR-0047) both come from it.
     prior: InodeRecord,
-}
-
-/// Where a queued chunk's **first** committed reference in key order was found — the same one
-/// reference the base's own scan chose (a duplicate committed id is #700's).
-enum Site {
-    /// A **flat** committed generation: repairable.
-    Flat(FlatSite),
-    /// A **segmented** committed generation. The segmented write path is #682's, so this pass
-    /// REFUSES the repair: it writes nothing at all, keeps the obligation, and does not
-    /// certify. Never a drain — a refusal is "I may not repair this", not "nothing references
-    /// this chunk".
-    Refused,
 }
 
 /// One queued chunk's place in this reading: which shared snapshot holds it, where, and its
 /// own committed reference. The only per-obligation material, and O(1) in the object's size.
-struct FlatSite {
+///
+/// This is the **first** committed reference in key order — the same one reference the base's
+/// own scan chose (a duplicate committed id is #700's), so a queued chunk gets ONE plan however
+/// many committed maps name it.
+#[derive(Clone)]
+struct Site {
     /// Index into [`Reading::objects`] — the ONE snapshot of that object.
     object: usize,
-    /// This chunk's index within that generation's own flat chunk list.
-    index: usize,
-    /// This chunk's committed reference (scheme, length, placement), copied out of that list
-    /// so the assessment reads it without re-deriving the map's shape.
+    /// The first object byte this chunk covers, summed over the resolved list: the address the
+    /// move finds its record by, whichever record — flat root or one segment — holds it.
+    byte_offset: u64,
+    /// This chunk's committed reference (scheme, length, placement), copied out of the resolved
+    /// list so the assessment never re-derives the map's shape — and what the move pins.
     chunk_ref: ChunkRef,
 }
 
@@ -648,58 +645,68 @@ async fn read_committed(meta: &dyn MetadataStore, queue: &[ChunkId]) -> Result<R
                 Err(err) => return Err(err),
             },
         };
-        // Whether this pass may write for the object is decided off **the generation the scan
-        // returned** — its own `chunk_map`, already in hand — never off the shape a resolve
-        // answered after restarting onto a newer root. A flat snapshot resolves to a borrow of
-        // the record and reads nothing, so it can never be superseded and never restarts
-        // (`crates/core/src/metadata.rs:2585`); only a segmented snapshot can, and a segmented
-        // snapshot is one this pass refuses. So the restart path reaches no write at all, by
-        // construction.
-        let flat = match (record.chunk_map.as_flat(), parse_inode_key(&key)) {
-            (Some(_), Some(inode_id)) => Some(inode_id),
+        // Every write for the object is conditioned on the generation the resolve ANSWERED from
+        // (`resolved.record`): the scanned one, or the live root a superseded segmented snapshot
+        // restarted onto — so a move pins exactly what its chunks were read from. Whether the
+        // walk may skip the object is still decided off the SCANNED generation's own shape.
+        let inode_id = match (record.chunk_map.as_flat(), parse_inode_key(&key)) {
+            // A SEGMENTED record under a non-canonical spelling of its id (`inode:01`): the move
+            // pins the root at the key re-derived from the id, which is not the row the scan
+            // read, so every pass would rewrite the fragment, lose that CAS and answer
+            // `Satisfied` with the obligation never drained. Contained below instead. The guard
+            // is this arm's alone: the parse itself, and a flat record under such a key, stay
+            // #698's.
+            (None, Some(inode_id)) if key != metadata::inode_key(inode_id) => None,
+            (_, Some(inode_id)) => Some(inode_id),
             // A record whose key this pass cannot parse claims nothing and the walk goes on —
             // the `if let Some(inode_id) = parse_inode_key(&key)` the per-obligation scan made
             // here, moved with the walk and unchanged in meaning (#698 owns the fix).
             (Some(_), None) => continue,
-            (None, _) => None,
+            // A SEGMENTED one, which the base refused and never drained: contained below, on
+            // the first chunk it is owed, rather than skipped.
+            (None, None) => None,
         };
         // The ONE snapshot of this object, allocated on the first chunk it is owed a repair on
         // and shared by every later one: Q obligations inside an N-entry object cost N entries
         // once, never Q×N. An object owed nothing is not held at all.
         let mut object = None;
-        // `index` addresses the SCANNED generation's own list too, for the only shape this
-        // pass writes for: a flat snapshot resolves to a borrow of that very list, so the two
-        // are one slice. A segmented one is refused, and a refusal indexes nothing.
-        for (index, chunk) in resolved.chunks.iter().enumerate() {
+        // The chunk's own address in the object's bytes, summed as the resolved list is walked —
+        // the same tiling the map is, so it addresses a flat list and a segment's alike. `None`
+        // past the point where the lengths leave `u64`, which only a flat map can reach (a
+        // segmented one is checked at decode).
+        let mut byte_offset = Some(0u64);
+        for chunk in resolved.chunks.iter() {
+            let at = byte_offset;
+            byte_offset = at.and_then(|at| at.checked_add(chunk.len));
             // Nothing is owed on this chunk, or an earlier object in key order already claimed
             // it: the FIRST committed reference wins, exactly the one the base's own scan
             // chose.
             if !owed.contains(&chunk.id) || reading.sites.contains_key(&chunk.id) {
                 continue;
             }
-            let site = match flat {
-                Some(inode_id) => {
-                    let at = *object.get_or_insert_with(|| {
-                        reading.objects.push(FlatObject {
-                            inode_id,
-                            prior: record.clone(),
-                        });
-                        reading.objects.len() - 1
-                    });
-                    Site::Flat(FlatSite {
-                        object: at,
-                        index,
-                        chunk_ref: chunk.clone(),
-                    })
-                }
-                None => {
-                    // Per OBJECT, before the work loop: the second obligation inside the same
-                    // segmented object adds no row and no count.
-                    if reading.refused.insert(key.clone()) {
-                        emit_refused(&object_name(&key));
-                    }
-                    Site::Refused
-                }
+            let Some(inode_id) = inode_id else {
+                // A segmented record under a key no repair can CAS under. Contained, so its
+                // owed chunks are never read as "referenced by nothing" and drained.
+                reading.contain(&key, "the row's key is not the canonical `inode:<id>` key");
+                break;
+            };
+            let Some(at) = at else {
+                // No address the move could find this chunk by: contained, never a conflict
+                // every pass with the obligation stuck behind it.
+                reading.contain(&key, "the chunk lengths overflow the object's byte range");
+                break;
+            };
+            let object = *object.get_or_insert_with(|| {
+                reading.objects.push(Object {
+                    inode_id,
+                    prior: resolved.record.as_ref().clone(),
+                });
+                reading.objects.len() - 1
+            });
+            let site = Site {
+                object,
+                byte_offset: at,
+                chunk_ref: chunk.clone(),
             };
             reading.sites.insert(chunk.id, site);
         }
@@ -735,12 +742,6 @@ enum Assessment {
     /// over its fabricated identity tail is forbidden (ADR-0040 decision 4). Skip the
     /// chunk and flag it NEEDS-HUMAN; the obligation stays queued.
     Malformed,
-    /// The chunk's committed reference lives in a **`seg:` record**, whose write path is
-    /// #682's: this pass may not perform the repair, so it **refuses** it — the segmented
-    /// record is left byte-identical, the obligation stays queued, and the pass does not
-    /// certify. Named and counted once per *object* by [`read_committed`], and kept off the
-    /// repairable-backlog gauge like every other never-repaired condition.
-    Refused,
     /// No committed chunk map references this chunk, a **staged multipart record** still does
     /// (`staged_chunks`, `reconcile`'s own read, before `inode:` is committed), and this pass
     /// may not repair it: only an in-flight owned staging entry names it (its part has no
@@ -749,7 +750,7 @@ enum Assessment {
     /// `0016:825`), or a staged record holds it with a placement that cannot be used. A
     /// committed part's chunk in an `Open` upload is not this: it is assessed and repaired
     /// ([`staged`]). This pass only refuses to discard the one record still saying the chunk is
-    /// short a fragment. Like [`Self::Refused`] the pass does not certify, and the obligation
+    /// short a fragment. The pass does not certify over it, and the obligation
     /// stays queued — the Invariant to restore: "I could not read a record" never counts as
     /// "no record names it", and neither does "no COMMITTED record names it" while a staged
     /// one still does.
@@ -778,9 +779,7 @@ async fn assess(
     chunk: ChunkId,
 ) -> Result<Assessment> {
     let site = match reading.sites.get(&chunk) {
-        Some(Site::Flat(site)) => site,
-        // Refused, not repaired and not discarded: the reference is in a `seg:` record.
-        Some(Site::Refused) => return Ok(Assessment::Refused),
+        Some(site) => site,
         // No COMMITTED chunk map references this chunk. A staged record may still name it —
         // checked BEFORE concluding "deleted, drain it": the staged reading ran first
         // (`reconcile`), specifically so a publish racing this pass cannot make both reads
@@ -811,11 +810,10 @@ async fn assess(
             return Ok(Assessment::Drain);
         }
     };
-    // The reading proved this generation's own map is flat and carried this chunk's own
-    // reference along, so the shape is settled before the assessment starts rather than
-    // re-derived here — a segmented map never reaches this point and so can never end the
-    // pass. Everything below is O(1) in the object's size: the snapshot itself stays in the
-    // reading, shared by every other obligation inside it.
+    // The reading carried this chunk's own committed reference along, so the assessment never
+    // re-derives the map's shape — which record holds it is the move's business. Everything
+    // below is O(1) in the object's size: the snapshot itself stays in the reading, shared by
+    // every other obligation inside it.
     let chunk_ref = &site.chunk_ref;
 
     // Classify the committed placement BEFORE any scheme-specific handling
@@ -864,8 +862,7 @@ async fn assess(
     }
 
     Ok(Assessment::Repairable(Box::new(RepairPlan {
-        target: Target::Committed(site.object),
-        chunk_index: site.index,
+        target: Target::Committed(site.clone()),
         chunk_id: chunk,
         k,
         m,
@@ -1041,6 +1038,8 @@ enum RepairOutcome {
     /// The version-conditional commit landed; the rebuilt shard(s) were re-placed.
     Committed,
     /// The commit lost the CAS race (rebuilt fragments are now collectable garbage).
+    /// Also the answer when the move, as it was prepared, already found the chunk no longer
+    /// as planned ([`metadata::Repoint::Conflict`]) — then nothing at all was written.
     Conflict,
     /// The repair could not proceed (e.g. the selector chose a server outside the
     /// fleet view); nothing was committed. Offset on `reconstruction_aborted` so an
@@ -1057,28 +1056,41 @@ enum RepairOutcome {
     /// was written — no rebuilt fragment, no record. Distinct from [`Self::Conflict`] and
     /// [`Self::Aborted`] precisely because those are transient: this shape fails again every
     /// pass until the record shrinks, so it is the object's own defect, an operator signal,
-    /// and — like the segmented refusal — a repair this pass may not certify over
-    /// (see [`emit_ceiling_refused`]).
+    /// and — like an object the reading could not read — a repair this pass may not certify over
+    /// (see [`emit_ceiling_refused`]). Answered only while the root still names the generation
+    /// the move was weighed on; one it has left is a [`Self::Conflict`].
     Refused {
         /// The re-encoded record's own length.
         bytes: usize,
         /// The ceiling it crossed.
         ceiling: usize,
     },
+    /// The move found this committed object's own records unusable — a `seg:` record that is
+    /// absent, torn, or disagrees with a root that still names it, or a flat record whose
+    /// `version` cannot advance ([`metadata::Repoint::VersionExhausted`]) — so nothing was
+    /// written. Not a race: [`reconcile`] contains the object as it contains one the reading
+    /// could not resolve.
+    Contained {
+        /// The object's `inode:` key, which [`Reading::contain`] names it by.
+        object: Vec<u8>,
+        /// What the move found.
+        fault: String,
+    },
 }
 
 /// Rebuild `plan`'s missing fragment(s), re-place them in distinct failure domains, and
 /// repoint the chunk's placement record with **one version-conditional commit**.
 ///
-/// `object` is the generation THIS PASS'S ONE READING returned for the chunk's committed
-/// object — the same snapshot the base's own per-obligation scan handed this function, shared
-/// rather than re-scanned and re-copied per obligation. Everything the commit is built from
-/// and conditioned on is taken from it, so the write is decided by the generation the scan
-/// returned and by nothing a resolve answered after restarting onto a newer root.
+/// `object` is the generation THIS PASS'S ONE READING resolved the chunk's committed object from
+/// — shared rather than re-scanned and re-copied per obligation — and `site` is where in it the
+/// chunk was found. The move ([`metadata::repoint_chunk`]) is conditioned on that generation, on
+/// the record holding the chunk as it re-reads it, and on the chunk's own reference, so nothing a
+/// later reader saw decides this write.
 async fn repair_chunk(
     ctx: &ReconstructionContext<'_>,
     stores: &HashMap<DServerId, &dyn ChunkStore>,
-    object: &FlatObject,
+    object: &Object,
+    site: &Site,
     plan: &RepairPlan,
     now_millis: u64,
 ) -> Result<RepairOutcome> {
@@ -1134,48 +1146,68 @@ async fn repair_chunk(
         new_placement[index] = target;
     }
 
-    // The record THE binding commit below would leave behind, built here from the rebuild's
-    // own targets — no store touched yet — so the repair is judged on it before anything is
-    // written. That commit is ONE version-conditional mutation that atomically repoints the
-    // placement record, drains the obligation, and orphans the displaced fragments; the CAS on
-    // the prior inode record is the second fence (`0005:200-203`, ADR-0015), so a racing
-    // writer / superseded custodian loses there rather than corrupting the record.
-    let Some(prior_chunk_map) = object.prior.chunk_map.as_flat() else {
-        // Unreachable by construction — a plan exists only for a generation the reading found
-        // FLAT, and the reading is the only producer of one. Fail-SAFE rather than fatal all
-        // the same: nothing is committed, the obligation stays queued for the next pass, and
-        // the abort is offset on `reconstruction_aborted` — never a repoint of a map this
-        // pass cannot read, and never the whole-store abort this slice exists to remove.
-        return Ok(RepairOutcome::Aborted);
+    // THE placement move the binding commit below is built from, prepared from the rebuild's
+    // own targets with no store written yet, so the repair is judged before anything is
+    // written. It addresses whichever record holds the chunk's `ChunkRef` — flat root or one
+    // `seg:` record — and the caller's own evidence joins the batch it hands back, so ONE
+    // version-conditional mutation repoints the placement, drains the obligation, and orphans
+    // the displaced fragments (`0005:277`, `0005:200-203`, ADR-0015). A racing writer or a
+    // superseded custodian loses there rather than corrupting the record; a sibling chunk's
+    // edit to the same `seg:` record is merged, since the move pins the record as IT re-reads it.
+    // That re-read is bounded as the reading's resolve is: by the `MetadataStore`
+    // implementation (#508/#636), fail-closed either way.
+    //
+    // Every answer but `Prepared` WRITES NOTHING AT ALL — judged after the transient check above
+    // and still ahead of the fragment writes below, so none strands an unreferenced shard. A
+    // repoint whose record would cross the value ceiling the tightest backend enforces is
+    // weighed inside the move (`metadata::flat_value_ceiling_crossed`) on the very bytes it
+    // would commit; see `crates/core/src/metadata.rs:333-341` for what committing one costs.
+    //
+    // deferred: #682 — the seeded Tier-0 DST property for this move (repoint versus supersede);
+    // until it lands, its interleavings are scripted in `tests/segmented_map_repoint.rs`.
+    let move_ = metadata::repoint_chunk(
+        ctx.meta,
+        object.inode_id,
+        &object.prior,
+        site.byte_offset,
+        &site.chunk_ref,
+        new_placement,
+    )
+    .await;
+    let contained = |fault: String| RepairOutcome::Contained {
+        object: metadata::inode_key(object.inode_id),
+        fault,
     };
-    let mut next_chunk_map = prior_chunk_map.to_vec();
-    next_chunk_map[plan.chunk_index].placement = new_placement;
-    let next = InodeRecord {
-        size: object.prior.size,
-        chunk_map: next_chunk_map.into(),
-        state: InodeState::Committed,
-        version: object.prior.version + 1,
-        // Reconstruction rebuilds the SAME content, so it PRESERVES the object metadata
-        // (ADR-0047): a repair commit must not move `Last-Modified` or drop the content
-        // type.
-        ..object.prior.clone()
+    let mut batch = match move_ {
+        Ok(metadata::Repoint::Prepared(batch)) => batch,
+        // The two terminal verdicts are weighed on the PLANNED generation alone: they carry no
+        // batch, so no root pin ever tested it. A generation superseded after the reading
+        // resolved it — its old `seg:` records not yet collected — would otherwise be escalated
+        // as this object's own defect and block the pass. Confirm the root still names it
+        // first, as `Repoint::Refused` documents; one it has left is a stale plan, the same
+        // retry a lost CAS is.
+        Ok(metadata::Repoint::Refused { .. } | metadata::Repoint::VersionExhausted { .. })
+            if !still_current(ctx.meta, object).await? =>
+        {
+            return Ok(RepairOutcome::Conflict)
+        }
+        Ok(metadata::Repoint::Refused { bytes, ceiling }) => {
+            return Ok(RepairOutcome::Refused { bytes, ceiling })
+        }
+        Ok(metadata::Repoint::Conflict) => return Ok(RepairOutcome::Conflict),
+        Ok(metadata::Repoint::VersionExhausted { version }) => {
+            return Ok(contained(format!(
+                "the record's version {version} cannot be advanced"
+            )));
+        }
+        // The move's typed verdict that THIS object's records cannot be rewritten, recovered
+        // by downcast as `read_committed` recovers the resolver's. Anything else — a store
+        // fault under the read — is not this object's, and ends the pass.
+        Err(err) => match err.downcast::<ChunkMapError>() {
+            Ok(fault) => return Ok(contained(fault.to_string())),
+            Err(err) => return Err(err),
+        },
     };
-
-    // REFUSE, AND WRITE NOTHING AT ALL. A repoint whose re-encoded record would cross the
-    // value ceiling the tightest backend enforces must never be attempted: on a store with
-    // native enforcement it returns a raw `Err` indistinguishable from a transient fault,
-    // and on one without it, it COMMITS a record every later repair of the object then fails
-    // to overwrite (`crates/core/src/metadata.rs:333-341`). Judged here — after the transient
-    // check above, and still ahead of the fragment writes below — so a refusal leaves no
-    // unreferenced shard for GC to hold with no grace evidence for it. The very bytes weighed
-    // are the bytes committed, so no re-encode can drift past the check.
-    let next_bytes = metadata::encode(&next);
-    if let Some(ceiling) = metadata::flat_value_ceiling_crossed(&next_bytes) {
-        return Ok(RepairOutcome::Refused {
-            bytes: next_bytes.len(),
-            ceiling,
-        });
-    }
 
     // Write the rebuilt fragments to their new D servers FIRST — before the commit, so a
     // crash here leaves only collectable garbage, never a torn chunk (`0005:277`).
@@ -1183,11 +1215,7 @@ async fn repair_chunk(
         target_store.put_fragment(frag, frag_bytes, None).await?;
     }
 
-    let inode_key = metadata::inode_key(object.inode_id);
-    let mut batch = WriteBatch::new()
-        .require(inode_key.clone(), metadata::encode(&object.prior))
-        .put(inode_key, next_bytes)
-        .delete(repair::repair_key(chunk_id));
+    batch = batch.delete(repair::repair_key(chunk_id));
     for (dserver, frag) in &displaced {
         batch = batch.put(
             crate::gc::orphan_key(*dserver, *frag),
@@ -1201,6 +1229,15 @@ async fn repair_chunk(
         // collectable garbage; the obligation stays queued for the next pass.
         CommitOutcome::Conflict => Ok(RepairOutcome::Conflict),
     }
+}
+
+/// Whether the object's root still holds exactly the generation the move was planned from —
+/// the same bytes [`metadata::repoint_chunk`]'s root pin would require, read fresh. A store
+/// fault is the pass's, not the object's, and ends it. The read is bounded as every other
+/// metadata read in the pass is: by the `MetadataStore` implementation (#508/#636).
+async fn still_current(meta: &dyn MetadataStore, object: &Object) -> Result<bool> {
+    let current = meta.get(&metadata::inode_key(object.inode_id)).await?;
+    Ok(current.as_deref() == Some(&metadata::encode(&object.prior)[..]))
 }
 
 fn parse_inode_key(key: &[u8]) -> Option<InodeId> {
@@ -1364,24 +1401,6 @@ fn emit_unresolvable_staged(record: &str, fault: &str) {
     );
 }
 
-/// Emit a repair this pass may **not** perform on the same seam: the chunk's committed
-/// reference lives in a `seg:` record, whose write path is #682's. Once per **object**, not
-/// once per chunk — two obligations inside one segmented object are one refusal.
-///
-/// A refusal writes nothing at all: the segmented record and its root are left byte-identical,
-/// and the obligation stays queued so the under-replication it records is not lost. The pass
-/// answers `Blocked` for it, because an operator reading `Satisfied` would be told redundancy
-/// is restored for a chunk nothing restored.
-fn emit_refused(object: &str) {
-    tracing::warn!(monotonic_counter.reconstruction_refused_records = 1_u64);
-    tracing::warn!(
-        target: "wyrd.custodian.reconstruction.audit",
-        action = "refused-segmented",
-        inode = %object,
-        "reconstruction refused a repair for a chunk whose committed reference lives in a segmented record; nothing was written, the obligation stays queued, and the pass does not certify",
-    );
-}
-
 /// Emit an obligation this pass **kept queued** on a staged record's word alone, on the same
 /// seam: no committed chunk map references `chunk`, but a staged multipart record — a
 /// committed part or an in-flight owned staging entry — still does, so draining it would
@@ -1392,7 +1411,7 @@ fn emit_refused(object: &str) {
 /// record holds it with a placement that cannot be used) or `aliased-staged-record` (more than
 /// one committed part names it; only the first is repaired, so its full redundancy cannot
 /// certify the others — an inconsistent record a human must resolve). Nothing is written, and the pass
-/// answers `Blocked` for it, the same reason [`emit_refused`] does: an operator reading
+/// answers `Blocked` for it, the same reason [`emit_unresolvable`] does: an operator reading
 /// `Satisfied` would be told redundancy is restored for a chunk nothing restored.
 fn emit_staged(chunk: ChunkId, reason: &'static str) {
     tracing::warn!(monotonic_counter.reconstruction_kept_staged = 1_u64);
@@ -1418,20 +1437,23 @@ fn emit_conflict(chunk: ChunkId) {
     );
 }
 
-/// Emit an **aborted** repair on the same seam: the dispatched repair could not proceed
-/// (the selector chose a server outside the fleet view — or a staged re-place stopped before
-/// it could adopt anything, its own audit line saying why), so nothing was committed. Like
+/// Emit an **aborted** repair on the same seam: the dispatched repair could not proceed, so
+/// nothing was committed. `reason` says why: `unplaced` (the selector chose a server outside
+/// the fleet view, or a staged re-place stopped before it could adopt anything, its own audit
+/// line saying why) or `unresolvable-chunk-map` (the move found its object's records unusable;
+/// that action's row names the object). Like
 /// [`emit_conflict`], this offsets the up-front [`emit_repaired`] increment — the
 /// obligation stays queued and the durability-plane success identity holds
 /// (`reconstruction_repaired − conflict − aborted − ceiling_refused`), so an aborted plan
 /// never inflates the successful-repair count.
-fn emit_aborted(chunk: ChunkId) {
+fn emit_aborted(chunk: ChunkId, reason: &'static str) {
     tracing::info!(monotonic_counter.reconstruction_aborted = 1_u64);
     tracing::info!(
         target: "wyrd.custodian.reconstruction.audit",
         action = "aborted",
+        reason,
         chunk = %wyrd_traits::chunk_hex(chunk),
-        "reconstruction could not place the rebuilt shard(s); nothing was committed and the obligation stays queued",
+        "reconstruction aborted a dispatched repair; nothing was committed and the obligation stays queued",
     );
 }
 

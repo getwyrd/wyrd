@@ -3235,9 +3235,8 @@ impl std::error::Error for MalformedReplacement {}
 /// Segments are found in the root's own table; no `seg:` range is walked. At most two
 /// records are read (two only for a zero-length chunk on a segment boundary), one at a time.
 ///
-/// deferred: #777 — the living architecture doc (`06-runtime-view.md` §6.3,
-/// `08-crosscutting-concepts.md` §8.7) describes what the maintenance loops **do**, and
-/// nothing calls this yet. It moves with the custodian wiring in #777, which changes that.
+/// The custodian's reconstruction pass is the caller (#777); `06-runtime-view.md` §6.3 and
+/// `08-crosscutting-concepts.md` §8.7 describe the move from the maintenance loop's side.
 pub async fn repoint_chunk(
     store: &dyn MetadataStore,
     inode: InodeId,
