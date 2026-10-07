@@ -6,9 +6,11 @@
 //! four legs below pin the end result an operator sees:
 //!
 //! * **(A)** the flag sets the chunk size on the local-FS plane, and leaving it out keeps
-//!   1 MiB (a 2 MiB object makes 4 chunks at 512 KiB, 2 chunks with no flag);
-//! * **(B)** the accepted range is exactly `1..=16777216`: both ends start serving, while
-//!   `0`, `16777217` and `1MiB` exit non-zero naming `--chunk-size`, never binding;
+//!   1 MiB (a 4 MiB object makes 2 chunks at 2 MiB, 4 chunks with no flag);
+//! * **(B)** the accepted range is exactly `1048576..=16777216`: both ends start serving,
+//!   while `0`, `1`, `1048575`, `16777217` and `1MiB` exit non-zero naming `--chunk-size`,
+//!   never binding. The floor keeps a single PUT's flat chunk map (one ref per chunk, one
+//!   metadata value) able to hold every object the default 1 MiB gateway stores;
 //! * **(C)** the 16 MiB ceiling crosses today's cluster transport: a role fanning out to a
 //!   production `DServer` (gRPC limits untouched) stores a 16 MiB object as ONE chunk and
 //!   reads it back byte-equal;
@@ -438,22 +440,22 @@ fn count_chunk_dirs(root: &Path) -> usize {
 
 #[test]
 fn a_chunk_size_flag_sets_the_local_chunk_size_and_its_absence_keeps_one_mib() {
-    let data = object(2 * MIB, 0xA738);
-    let path = "/wyrd-bucket/two-mib-object";
+    let data = object(4 * MIB, 0xA738);
+    let path = "/wyrd-bucket/four-mib-object";
 
-    // --chunk-size 524288: a 2 MiB object is FOUR chunks.
+    // --chunk-size 2097152: a 4 MiB object is TWO chunks.
     let flagged = tempfile::tempdir().expect("temp dir");
     {
-        let (_role, addr) = serve(flagged.path(), &["--chunk-size", "524288"]);
+        let (_role, addr) = serve(flagged.path(), &["--chunk-size", "2097152"]);
         let put = signed_request(addr, "PUT", path, &data);
         assert_eq!(
             put.status,
             200,
-            "PUT with --chunk-size 524288: {:?}",
+            "PUT with --chunk-size 2097152: {:?}",
             String::from_utf8_lossy(&put.body)
         );
         let get = signed_request(addr, "GET", path, b"");
-        assert_eq!(get.status, 200, "GET with --chunk-size 524288");
+        assert_eq!(get.status, 200, "GET with --chunk-size 2097152");
         assert!(
             get.body == data,
             "GET body differs from the PUT body ({} bytes read)",
@@ -462,11 +464,11 @@ fn a_chunk_size_flag_sets_the_local_chunk_size_and_its_absence_keeps_one_mib() {
     }
     assert_eq!(
         count_chunk_dirs(&flagged.path().join("chunks")),
-        4,
-        "--chunk-size 524288 must split a 2 MiB object into 4 chunks"
+        2,
+        "--chunk-size 2097152 must split a 4 MiB object into 2 chunks"
     );
 
-    // No --chunk-size: the gateway's 1 MiB default, so the same object is TWO chunks.
+    // No --chunk-size: the gateway's 1 MiB default, so the same object is FOUR chunks.
     let default = tempfile::tempdir().expect("temp dir");
     {
         let (_role, addr) = serve(default.path(), &[]);
@@ -480,7 +482,7 @@ fn a_chunk_size_flag_sets_the_local_chunk_size_and_its_absence_keeps_one_mib() {
     }
     assert_eq!(
         count_chunk_dirs(&default.path().join("chunks")),
-        2,
+        4,
         "with no --chunk-size the role must keep 1 MiB chunks"
     );
 }
@@ -489,13 +491,13 @@ fn a_chunk_size_flag_sets_the_local_chunk_size_and_its_absence_keeps_one_mib() {
 
 #[test]
 fn b_chunk_size_accepts_exactly_one_to_sixteen_mib_and_refuses_the_rest_before_binding() {
-    for accepted in ["1", "16777216"] {
+    for accepted in ["1048576", "16777216"] {
         let dir = tempfile::tempdir().expect("temp dir");
         // `serve` panics unless the role prints its listen line.
         let (_role, _addr) = serve(dir.path(), &["--chunk-size", accepted]);
     }
 
-    for refused in ["0", "16777217", "1MiB"] {
+    for refused in ["0", "1", "1048575", "16777217", "1MiB"] {
         let dir = tempfile::tempdir().expect("temp dir");
         let data_dir = dir.path().to_str().expect("utf-8 path");
         match WyrdProcess::spawn(&s3_args(data_dir, &["--chunk-size", refused])).launch() {

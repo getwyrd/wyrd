@@ -379,7 +379,8 @@ services:
   #    etcd` (`WYRD_ETCD_ENDPOINTS`) + `--endpoints` fanning chunks to the 9 D servers over
   #    gRPC — mirroring the custodian wiring. SigV4 mandatory; test credentials via env.
   #    `--chunk-size 1048576` is the 1 MiB default, stated so the stack records the value
-  #    it runs (accepted 1..=16777216; the ceiling is the D-server gRPC message limit).
+  #    it runs (accepted 1048576..=16777216; the floor keeps a single PUT's flat chunk map
+  #    inside the metadata value ceiling, the ceiling is the D-server gRPC message limit).
   #    Honest limit (#454): `cmd_s3` currently hardcodes local backends, so each gateway is
   #    a standalone island — the role starts and serves, an object does not yet round-trip.
   gateway0:

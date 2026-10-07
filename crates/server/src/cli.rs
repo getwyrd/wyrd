@@ -510,12 +510,17 @@ fn usage() {
         "  order. Omit all three to run the leader-elected role with no reconstruction plane."
     );
     eprintln!();
-    eprintln!("  s3: --chunk-size N sets the bytes per chunk (default 1 MiB). Accepted: 1 to");
     eprintln!(
-        "  {} ({} MiB), the ceiling set by the D-server gRPC message limit.",
-        crate::MAX_CHUNK_SIZE,
+        "  s3: --chunk-size N sets the bytes per chunk (default 1 MiB). Accepted: {} to {}",
+        crate::MIN_CHUNK_SIZE,
+        crate::MAX_CHUNK_SIZE
+    );
+    eprintln!(
+        "  ({} to {} MiB): the floor keeps a single PUT's flat chunk map inside the metadata",
+        crate::MIN_CHUNK_SIZE >> 20,
         crate::MAX_CHUNK_SIZE >> 20
     );
+    eprintln!("  value ceiling, the ceiling is set by the D-server gRPC message limit.");
 }
 
 /// Parse a `--durability` value: `rs(k,m)` (Reed-Solomon) or `none`/`replication(1)`.
@@ -2316,9 +2321,9 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
 /// `chunk_size` is the role's `--chunk-size`: `Some(n)` is applied to the gateway on
 /// every composition below, both chunk planes and every metadata × coordination arm;
 /// `None` composes the gateway at its own default (1 MiB). A value outside
-/// `1..=MAX_CHUNK_SIZE` is refused here before anything is opened or served, the same
-/// check `cmd_s3` runs before it binds, so no caller can start a role whose first large
-/// PUT would fail on the gRPC transport.
+/// `MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE` is refused here before anything is opened or served,
+/// the same check `cmd_s3` runs before it binds, so no caller can start a role whose
+/// PUTs would fail on the gRPC transport or at the metadata value ceiling.
 ///
 /// The metadata (`backend`) × coordination (`coordination`) axes each monomorphize a
 /// distinct `Gateway<M, C, Co>`; every combination runs the identical [`serve_s3`] path.
@@ -2480,20 +2485,33 @@ fn parse_s3_chunk_size(raw: Option<&str>) -> Result<Option<usize>, BoxError> {
     Ok(Some(chunk_size))
 }
 
-/// Refuse a chunk size the `s3` role cannot carry: `0`, or anything above
-/// [`crate::MAX_CHUNK_SIZE`] (set by the D-server gRPC message limit; the reason is on the
-/// constant). Refused rather than clamped, so the operator learns at startup.
+/// Refuse a chunk size the `s3` role cannot carry: anything below [`crate::MIN_CHUNK_SIZE`]
+/// (a single PUT's flat chunk map must keep fitting the metadata value ceiling) or above
+/// [`crate::MAX_CHUNK_SIZE`] (set by the D-server gRPC message limit); each reason is on
+/// its constant. Refused rather than clamped, so the operator learns at startup.
 fn check_s3_chunk_size(chunk_size: usize) -> Result<(), BoxError> {
-    if (1..=crate::MAX_CHUNK_SIZE).contains(&chunk_size) {
-        return Ok(());
+    if chunk_size < crate::MIN_CHUNK_SIZE {
+        return Err(format!(
+            "s3: --chunk-size {chunk_size} is too small: it must be at least {} bytes ({} MiB). \
+             A single PUT publishes one chunk ref per chunk in one metadata value, which \
+             holds at most {} refs, so a smaller chunk would accept objects whose metadata \
+             commit then fails after their fragments are written",
+            crate::MIN_CHUNK_SIZE,
+            crate::MIN_CHUNK_SIZE >> 20,
+            wyrd_core::multipart::MAX_MAP_CHUNKS
+        )
+        .into());
     }
-    Err(format!(
-        "s3: --chunk-size {chunk_size} is out of range: it must be 1 to {} bytes ({} MiB, \
-         the largest chunk whose fragments fit the D-server gRPC message limit)",
-        crate::MAX_CHUNK_SIZE,
-        crate::MAX_CHUNK_SIZE >> 20
-    )
-    .into())
+    if chunk_size > crate::MAX_CHUNK_SIZE {
+        return Err(format!(
+            "s3: --chunk-size {chunk_size} is too large: it must be at most {} bytes ({} MiB, \
+             the largest chunk whose fragments fit the D-server gRPC message limit)",
+            crate::MAX_CHUNK_SIZE,
+            crate::MAX_CHUNK_SIZE >> 20
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Seed the gateway's shared, persisted inode allocator from persisted state (#364 durability
@@ -3005,23 +3023,65 @@ mod tests {
     /// `wyrd s3 --chunk-size` (#738): the accept/refuse decision, pinned in-process. The
     /// binding test drives the built binary (`tests/s3_chunk_size_flag.rs`); this one makes
     /// the same decision visible to coverage. Absent keeps the gateway default; the range is
-    /// `1..=16 MiB` inclusive; every refusal names the flag in the role's `s3:` style.
+    /// `1 MiB..=16 MiB` inclusive; every refusal names the flag in the role's `s3:` style.
     #[test]
     fn s3_chunk_size_accepts_exactly_one_to_sixteen_mib() {
         assert_eq!(parse_s3_chunk_size(None).unwrap(), None);
-        assert_eq!(parse_s3_chunk_size(Some("1")).unwrap(), Some(1));
         assert_eq!(parse_s3_chunk_size(Some("1048576")).unwrap(), Some(1 << 20));
         assert_eq!(
             parse_s3_chunk_size(Some("16777216")).unwrap(),
             Some(16 << 20)
         );
-        for refused in ["0", "16777217", "1MiB", "", "-1", "18446744073709551616"] {
+        for refused in [
+            "0",
+            "1",
+            "524288",
+            "1048575",
+            "16777217",
+            "1MiB",
+            "",
+            "-1",
+            "18446744073709551616",
+        ] {
             let err = parse_s3_chunk_size(Some(refused))
                 .expect_err(refused)
                 .to_string();
             assert!(
                 err.starts_with("s3: ") && err.contains("--chunk-size"),
                 "`{refused}` must be refused naming the flag, got: {err}"
+            );
+        }
+    }
+
+    /// The `--chunk-size` floor (#738 review): a single PUT publishes ONE flat chunk map
+    /// (one `ChunkRef` per chunk, one metadata value), so a chunk below the floor would accept
+    /// objects the default gateway stores but this one cannot publish — the metadata commit
+    /// failing only after every fragment is written. The floor is derived from the flat-map
+    /// capacity, lands on 1 MiB, and the refusal names it and the reason.
+    #[test]
+    fn s3_chunk_size_floor_keeps_the_default_single_put_envelope_representable() {
+        use wyrd_core::multipart::MAX_MAP_CHUNKS;
+        let map_chunks = MAX_MAP_CHUNKS as usize;
+        let default_envelope = map_chunks * (1 << 20);
+        assert_eq!(crate::MIN_CHUNK_SIZE, 1 << 20);
+        // The floor holds the default envelope in a flat map; one byte less does not.
+        assert!(crate::MIN_CHUNK_SIZE * map_chunks >= default_envelope);
+        assert!((crate::MIN_CHUNK_SIZE - 1) * map_chunks < default_envelope);
+
+        assert_eq!(
+            parse_s3_chunk_size(Some("1048576")).unwrap(),
+            Some(crate::MIN_CHUNK_SIZE)
+        );
+        for refused in ["1", "1048575"] {
+            let err = parse_s3_chunk_size(Some(refused))
+                .expect_err(refused)
+                .to_string();
+            assert!(
+                err.starts_with("s3: --chunk-size ")
+                    && err.contains("too small")
+                    && err.contains("1048576")
+                    && err.contains(&format!("{MAX_MAP_CHUNKS} refs")),
+                "`{refused}` must be refused naming the floor and why, got: {err}"
             );
         }
     }
@@ -3040,7 +3100,7 @@ mod tests {
                 chunk_size,
             )
         };
-        assert_eq!(compose(Some(524_288)).chunk_size, 524_288);
+        assert_eq!(compose(Some(2 << 20)).chunk_size, 2 << 20);
         assert_eq!(compose(Some(16 << 20)).chunk_size, 16 << 20);
         assert_eq!(compose(None).chunk_size, 1 << 20);
     }
@@ -3053,7 +3113,7 @@ mod tests {
     async fn serve_s3_role_refuses_an_out_of_range_chunk_size_before_opening_anything() {
         let dir = tempfile::tempdir().expect("temp dir");
         let data_dir = dir.path().to_str().expect("utf-8 path");
-        for refused in [0, (16 << 20) + 1] {
+        for refused in [0, 1, (1 << 20) - 1, (16 << 20) + 1] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("bind loopback");
