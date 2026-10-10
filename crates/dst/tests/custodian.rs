@@ -5900,6 +5900,302 @@ async fn prop_restore_fence_reaches_the_contested_window() {
     }
 }
 
+// ---- property 19: a drain's placement move inside a `seg:` record versus a writer that
+//      changes what it pinned — every attempt is all-or-nothing (#722, 0016 decision 7(f)) ----
+//
+// The rebalance pass moves a fragment off a draining server by repointing the `seg:` record
+// that holds its chunk, conditioned on two records: the ROOT generation it resolved (a
+// supersede always moves the root first, `0016:2452-2462`) and the `seg:` record as the move
+// itself re-reads it. A racing writer can change either before the move's commit. The seed
+// picks which record it changes and which write the store applies first, and each
+// interleaving has its own declared outcome:
+//
+// * the racing write lands FIRST — the move's precondition fails, so it writes NOTHING: no
+//   placement and no orphan mark, and the object still names its pre-move fragment;
+// * the move lands FIRST — it commits in full, placement AND orphan mark together, and the
+//   racer then loses its own CAS (same `seg:` key) or lands on a different key (the root).
+//
+// Across both: all-or-nothing per attempt, and the live generation never names a fragment
+// that does not exist.
+//
+// **What this proves, and what it does not.** It proves the move's two CAS preconditions —
+// delete either `require` from `metadata::repoint_chunk` and it goes red within the
+// `MADSIM_TEST_NUM` sweep. It does NOT reach the read→prepare window: the racing batch is
+// applied inside the move's own `commit()`, strictly after the move's read of the `seg:`
+// record, so it never exercises what the drain does with an answer the move gives BEFORE it
+// prepares a batch. That is scripted, not swept: the shared primitive's own re-read by the
+// deterministic legs of `crates/custodian/tests/segmented_map_repoint.rs` (which drive the
+// reconstruction caller), and the drain's handling of each prepare-time answer — a chunk
+// edited under the move, a ceiling refusal on a superseded root, a torn `seg:` record, a
+// store fault — by legs 5–9 of `crates/custodian/tests/segmented_map_evacuate.rs`.
+
+/// The segment-group nonce this property's fixture is keyed by (32 lowercase hex characters).
+const DRAIN_RACE_NONCE: &str = "abcdef0123456789abcdef0123456789";
+
+/// Which pinned record the racing writer changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainRacer {
+    /// The **root**: a fresh flat generation supersedes the segmented one, its own fragments
+    /// already on the fleet. The move never rewrites the root, so this write and a landed move
+    /// touch different keys — both may commit, in either order.
+    Supersede,
+    /// The **`seg:` record**: a competing writer moves the same fragment itself. Same key as
+    /// the move, so whichever commits second loses its CAS and writes nothing.
+    Rewrite,
+}
+
+/// A store that applies `pending` inside the move's own commit — the one batch a rebalance
+/// pass sends carrying a positive precondition, as [`CrashMeta`] identifies it.
+/// `move_first` picks the order the two batches are applied in.
+struct RaceAtDrainMove {
+    inner: MemMeta,
+    pending: Mutex<Option<WriteBatch>>,
+    move_first: bool,
+    /// What the racing write did once applied — `None` until it has run.
+    racer_outcome: Mutex<Option<CommitOutcome>>,
+}
+
+#[async_trait]
+impl MetadataStore for RaceAtDrainMove {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let pinned = batch.preconditions.iter().any(|pre| pre.expected.is_some());
+        let racer = if pinned {
+            self.pending.lock().unwrap().take()
+        } else {
+            None
+        };
+        let Some(racer) = racer else {
+            return self.inner.commit(batch).await;
+        };
+        if self.move_first {
+            let landed = self.inner.commit(batch).await?;
+            *self.racer_outcome.lock().unwrap() = Some(self.inner.commit(racer).await?);
+            Ok(landed)
+        } else {
+            *self.racer_outcome.lock().unwrap() = Some(self.inner.commit(racer).await?);
+            self.inner.commit(batch).await
+        }
+    }
+}
+
+/// Re-spell the committed RS(2,1) object at [`INODE`] as a **segmented** generation: one `seg:`
+/// record holding its chunk, plus a segmented root naming that group. Raw records written by
+/// hand, never a committer (this build ships no producer of segmented maps).
+async fn respell_as_one_segment(meta: &MemMeta, chunk: ChunkRef) -> Vec<u8> {
+    let group = metadata::SegmentGroup::new(DRAIN_RACE_NONCE, 1).unwrap();
+    let record = metadata::SegmentRecord::new(vec![chunk], 0).unwrap();
+    let table = vec![metadata::SegmentRef {
+        index: 0,
+        byte_offset: 0,
+        byte_len: record.byte_len(),
+    }];
+    let root = InodeRecord {
+        size: record.byte_len(),
+        chunk_map: metadata::ChunkMap::Segmented(
+            metadata::SegmentedMap::new(group.clone(), table).unwrap(),
+        ),
+        state: InodeState::Committed,
+        version: 2,
+        ..Default::default()
+    };
+    let key = seg_row(&group, 0);
+    let batch = WriteBatch::new()
+        .put(key.clone(), metadata::encode(&record))
+        .put(metadata::inode_key(INODE), metadata::encode(&root));
+    assert_eq!(meta.commit(batch).await.unwrap(), CommitOutcome::Committed);
+    key
+}
+
+async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8Rng) {
+    let d = servers();
+    let fleet = fleet_of(&d);
+    let meta = MemMeta::default();
+    write_rs_2_1(&meta, &fleet).await;
+    let chunk = read_inode(&meta).await.chunk_map.as_flat().unwrap()[0].clone();
+    let seg_key = respell_as_one_segment(&meta, chunk.clone()).await;
+    let seeded = meta.get(&seg_key).await.unwrap().unwrap();
+    let root_key = metadata::inode_key(INODE);
+    let root_before = meta.get(&root_key).await.unwrap().unwrap();
+
+    // The seed picks the draining server (fragment `i` lives on server `i`), which pinned
+    // record the racer changes, and which of the two writes the store applies first.
+    let drained = (rng.next_u32() as usize % N) as u16;
+    wyrd_custodian::desired_state::set_lifecycle(
+        &meta,
+        u64::from(drained),
+        wyrd_custodian::desired_state::DServerLifecycle::Draining,
+    )
+    .await
+    .unwrap();
+    let racer = if rng.next_u32().is_multiple_of(2) {
+        DrainRacer::Supersede
+    } else {
+        DrainRacer::Rewrite
+    };
+    let move_first = rng.next_u32().is_multiple_of(2);
+
+    // With the drained server's domain out of the pool, the only domain distinct from both
+    // survivors is D (server 3), so the move's answer is known up front.
+    let mut moved = chunk.clone();
+    moved.placement[drained as usize] = 3;
+    let repointed = metadata::encode(&metadata::SegmentRecord::new(vec![moved], 0).unwrap());
+    let (pending, after_racer) = match racer {
+        DrainRacer::Supersede => {
+            // A fresh generation, its fragments really on the fleet, CAS'd on the root the
+            // move pinned, as a real publish is.
+            let mut next = 0x2000u128;
+            let plan = write::plan_write(b"the superseding generation", 8, EcScheme::None, || {
+                next += 1;
+                next
+            })
+            .unwrap();
+            write::write_fragments(&fleet, &plan).await.unwrap();
+            let new_root = InodeRecord {
+                size: plan.size,
+                chunk_map: plan.chunk_refs().into(),
+                state: InodeState::Committed,
+                version: 3,
+                ..Default::default()
+            };
+            let batch = WriteBatch::new()
+                .require(root_key.clone(), root_before.clone())
+                .put(root_key.clone(), metadata::encode(&new_root));
+            (batch, seeded.clone())
+        }
+        DrainRacer::Rewrite => {
+            // A competing writer that already moved this very fragment to server 3 — bytes
+            // first, then the record, so whichever write wins names bytes that exist.
+            let bytes = d[drained as usize]
+                .get_fragment(frag(drained))
+                .await
+                .unwrap();
+            let bytes = bytes.expect("the fixture placed every fragment");
+            d[3].put_fragment(frag(drained), bytes, None).await.unwrap();
+            let batch = WriteBatch::new()
+                .require(seg_key.clone(), seeded.clone())
+                .put(seg_key.clone(), repointed.clone());
+            (batch, repointed.clone())
+        }
+    };
+
+    let store = RaceAtDrainMove {
+        inner: meta,
+        pending: Mutex::new(Some(pending)),
+        move_first,
+        racer_outcome: Mutex::new(None),
+    };
+    let topo = four_domains();
+    let all: Vec<(DServerId, &dyn ChunkStore)> = (0u64..4)
+        .map(|id| (id, &d[id as usize] as &dyn ChunkStore))
+        .collect();
+    let ctx = wyrd_custodian::RebalanceContext {
+        meta: &store,
+        fleet: &all,
+        topology: &topo,
+    };
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-drain-race").await;
+    let answer = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+        .await
+        .expect("a raced move is a lost CAS, never an error that ends the pass");
+
+    let arm = format!("drained {drained}, racer {racer:?}, move first: {move_first}");
+    assert!(
+        store.racer_outcome.lock().unwrap().is_some(),
+        "the racer never fired — the move never reached its commit ({arm})"
+    );
+    let stored = store.get(&seg_key).await.unwrap().expect("the seg: record");
+    let orphans: Vec<Vec<u8>> = store
+        .scan(b"orphan:")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    if move_first {
+        // The move landed WHOLE: placement and orphan mark are one commit.
+        assert_eq!(
+            stored, repointed,
+            "the move went first and its placement is missing ({arm})"
+        );
+        let vacated = metadata::orphan_key(u64::from(drained), frag(drained));
+        assert_eq!(
+            orphans,
+            vec![vacated],
+            "exactly the vacated position is marked ({arm})"
+        );
+        assert_eq!(
+            answer,
+            Reconciled::Changed,
+            "a landed move converges ({arm})"
+        );
+        // A writer that pinned the same record loses; one that pinned only the root does not,
+        // because a move never rewrites the root.
+        let expected = match racer {
+            DrainRacer::Supersede => CommitOutcome::Committed,
+            DrainRacer::Rewrite => CommitOutcome::Conflict,
+        };
+        let outcome = *store.racer_outcome.lock().unwrap();
+        assert_eq!(
+            outcome,
+            Some(expected),
+            "the racing write's outcome ({arm})"
+        );
+    } else {
+        // The move lost, so it wrote NOTHING: not the placement, not the orphan mark.
+        assert_eq!(
+            stored, after_racer,
+            "a lost move still rewrote the record ({arm})"
+        );
+        assert!(
+            orphans.is_empty(),
+            "a lost move still marked a fragment for reclamation ({arm}): {orphans:?}"
+        );
+        assert_eq!(
+            answer,
+            Reconciled::Blocked,
+            "a lost move never certifies ({arm})"
+        );
+        let outcome = *store.racer_outcome.lock().unwrap();
+        assert_eq!(
+            outcome,
+            Some(CommitOutcome::Committed),
+            "the racer went first ({arm})"
+        );
+    }
+
+    // However the race resolved, the LIVE generation names only fragments that exist.
+    let live = metadata::resolve_current_chunk_map(&store, &root_key)
+        .await
+        .expect("the live generation resolves")
+        .expect("the object is live here");
+    for (dserver, fragment) in fragments_of(&live.chunks) {
+        let held = d[dserver as usize].get_fragment(fragment).await.unwrap();
+        assert!(
+            held.is_some(),
+            "the live generation names {fragment:?} on server {dserver}, which holds no such \
+             bytes ({arm})"
+        );
+    }
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -6084,6 +6380,12 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn drain_repoint_versus_supersede_is_all_or_nothing() {
+        prop_drain_repoint_versus_supersede_is_all_or_nothing(&mut rand_seed()).await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -6125,6 +6427,7 @@ dst_campaign_test! {
             prop_staged_replace_under_the_fence_strands_nothing(&mut rng).await;
             prop_restore_fence_never_shares_the_epoch(&mut rng).await;
             prop_restore_fence_settles_an_ambiguous_commit(&mut rng).await;
+            prop_drain_repoint_versus_supersede_is_all_or_nothing(&mut rng).await;
         }
     }
 }
