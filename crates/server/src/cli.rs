@@ -2393,6 +2393,9 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             listen = %listener.local_addr()?,
             region = region,
             dservers = endpoints.as_deref().map_or(0, <[String]>::len),
+            // The checkout this binary was built from (#778) — `dist`'s own word for a
+            // released binary, the base commit for a hand-built one (`version` module docs).
+            version = crate::version::BUILD_IDENTITY,
             "role started",
         );
         let served = serve_s3_role(
@@ -2651,6 +2654,10 @@ where
     gateway.recover().await?;
     let mut config = s3::S3Config::new(credentials);
     config.region = region;
+    // The build identity the front door advertises as `Server: wyrd/<v>` on every response
+    // it produces (#779) — the same constant the `role started` event records, so the wire
+    // and the log name one build. The composition root knows it; the wire crate does not.
+    config.server_version = crate::version::BUILD_IDENTITY.to_string();
     // The request plane's sink (observability floor, item 4 + the item-3 role wiring): the
     // front door emits its RED metrics into the role's telemetry handle. `None` leaves them on
     // the ambient subscriber -- the composition an in-process caller gets.

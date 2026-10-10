@@ -12,7 +12,11 @@
 //! anyway because they are the only two that go red against an **over-broad** fix: one that
 //! blocks every store holding a segmented object (then no decommission ever certifies — this
 //! slice's own defect in mirror image), or one that contains a store fault as if it were one
-//! object's. Every leg drives the REAL fenced control point
+//! object's.
+//!
+//! Leg 2 originally pinned #696's refusal of a segmented evacuation; #722 built the move for a
+//! `seg:`-resident chunk, so it now pins the evacuation landing instead (the deeper legs live in
+//! `tests/segmented_map_evacuate.rs`). Every leg drives the REAL fenced control point
 //! [`reconcile_step`](wyrd_custodian::reconcile_step) over in-memory trait doubles —
 //! `rebalance::reconcile` is `pub(crate)`, and a test-only entry would prove nothing.
 
@@ -326,37 +330,58 @@ async fn a_segmented_object_no_longer_ends_the_pass_and_the_flat_work_still_happ
     fx.assert_flat_evacuated().await;
 }
 
-/// **Leg 2 — an evacuation this pass may not perform is refused ONCE, mutates nothing, and the
-/// pass does not certify.** Three chunks, two of them on the draining server: two evacuations
-/// owed, one object to name.
+/// **Leg 2 — an owed segmented evacuation now LANDS (#722), writing only the `seg:` records
+/// that hold the moved chunks.** Three chunks, two of them on the draining server: both are
+/// copied to [`TARGET`], each one's `seg:` record is repointed, each vacated position is
+/// orphan-marked, and the root and the untouched segment stay byte-identical.
 #[tokio::test]
-async fn an_owed_segmented_evacuation_is_refused_once_and_mutates_nothing() {
+async fn an_owed_segmented_evacuation_lands_in_the_seg_records() {
     let fx = Fixture::new().await;
     let owing = [(SEG[0], DRAINING), (SEG[1], DRAINING), (SEG[2], 2)];
     fx.seed_segmented(SEGMENTED, &owing, true).await;
-    let before = fx.meta.scan(b"").await.unwrap();
+    let group = SegmentGroup::new(NONCE, SEGMENTED).unwrap();
+    let key = |index: u32| seg_key(&group, index).unwrap();
+    let root_before = fx.meta.get(&inode_key(SEGMENTED)).await.unwrap();
+    let untouched_before = fx.meta.get(&key(2)).await.unwrap();
 
     let (answer, logged) = fx.pass().await;
 
-    assert_eq!(answered(answer), Reconciled::Blocked, "drain withheld");
-    for chunk in [SEG[0], SEG[1]] {
-        assert!(fx.holds(DRAINING, chunk).await, "fragment stayed put");
+    assert_eq!(answered(answer), Reconciled::Changed, "both moves landed");
+    for (index, chunk) in [(0, SEG[0]), (1, SEG[1])] {
+        let record: SegmentRecord =
+            decode(&fx.meta.get(&key(index)).await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            record.chunks()[0].placement,
+            vec![TARGET],
+            "seg: {index} repointed"
+        );
+        assert!(
+            fx.holds(TARGET, chunk).await,
+            "fragment copied to its new home"
+        );
+        let vacated = orphan_key(DRAINING, FragmentId { chunk, index: 0 });
+        assert!(
+            fx.meta.get(&vacated).await.unwrap().is_some(),
+            "vacated position marked"
+        );
     }
-    // A refusal writes NOTHING — the segmented write path is #682's. The compare is over EVERY
-    // key the store holds, byte for byte: every `seg:` record and the root record, whose
-    // encoding carries its `version` — so an unchanged root generation is part of the equality.
-    let after = fx.meta.scan(b"").await.unwrap();
-    assert_eq!(after, before, "a refusal wrote something");
-    // Once per OBJECT, not once per chunk — two evacuations are owed here.
-    let refusals = logged.matches(r#""action":"refused-segmented""#).count();
-    assert_eq!(refusals, 1, "one refusal per object: {logged}");
-    // ...and attributed: a blocker an operator cannot name is a stall with no way out. The
-    // counter is matched by its WHOLE emitted field, prefix and value — a bare name substring
-    // still passes if the emitter loses the `monotonic_counter.` prefix the metric needs.
-    let named = logged.contains(&format!(r#""inode":"inode:{SEGMENTED}""#));
-    let reason = logged.contains(r#""reason":"segmented-chunk-map""#);
-    let counted = logged.contains(r#""monotonic_counter.rebalance_refused_records":1"#);
-    assert!(named && reason && counted, "unattributed: {logged}");
+    let root_after = fx.meta.get(&inode_key(SEGMENTED)).await.unwrap();
+    assert_eq!(
+        root_after, root_before,
+        "a placement move never rewrites the root"
+    );
+    let untouched_after = fx.meta.get(&key(2)).await.unwrap();
+    assert_eq!(
+        untouched_after, untouched_before,
+        "a segment owing nothing was rewritten"
+    );
+    // The audit seam names each move, and no refusal survives.
+    assert_eq!(
+        logged.matches(r#""action":"evacuate""#).count(),
+        2,
+        "{logged}"
+    );
+    assert!(!logged.contains("refused-segmented"), "{logged}");
 }
 
 /// **Leg 3 — an unreadable committed object is named, the walk continues, and nothing
