@@ -69,7 +69,7 @@ use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use futures_util::StreamExt;
@@ -107,6 +107,67 @@ pub struct S3Config {
     pub service: String,
     /// The public S3 TLS identity, separate from internal mTLS (bound by #367).
     pub tls: Option<TlsIdentity>,
+    /// The build identity this front door advertises on every response it produces, as
+    /// `Server: wyrd/<server_version>` (#779). The composition root sets it to the
+    /// identity baked into the binary (`wyrd_server::version::BUILD_IDENTITY`); this crate
+    /// owns the header and its `wyrd/` shape, never the version. A caller that leaves it at
+    /// the [`S3Config::new`] default advertises [`UNKNOWN_SERVER_VERSION`], so the header
+    /// is still well-formed and makes no claim about a build it was not told.
+    pub server_version: String,
+}
+
+/// The `server_version` an [`S3Config`] carries until the composition root supplies the
+/// real build identity: an honest "not told", never a fabricated version.
+pub const UNKNOWN_SERVER_VERSION: &str = "unknown";
+
+/// The product token of the `Server` header — the one place `wyrd/` is spelled.
+const SERVER_PRODUCT: &str = "wyrd";
+
+/// The `Server` header value for `version`: `wyrd/<version>`. RFC 9110 §10.2.4 makes the
+/// value a `product`, `token ["/" token]`, so a version that is not a `token` (empty, or
+/// carrying a space, a control byte, a non-ASCII byte or a delimiter) is replaced by
+/// [`UNKNOWN_SERVER_VERSION`] with a warning rather than dropped or sent malformed: the
+/// header stays present and inside its grammar.
+fn server_header_value(version: &str) -> HeaderValue {
+    let usable = if is_token(version) {
+        version
+    } else {
+        tracing::warn!(
+            target: "wyrd.gateway.s3",
+            version = ?version,
+            "server_version is not an RFC 9110 token; advertising `{SERVER_PRODUCT}/{UNKNOWN_SERVER_VERSION}`",
+        );
+        UNKNOWN_SERVER_VERSION
+    };
+    // Every token byte is a visible ASCII character, so this cannot fail; the fallback
+    // keeps the header present even so.
+    HeaderValue::from_str(&format!("{SERVER_PRODUCT}/{usable}"))
+        .unwrap_or(HeaderValue::from_static(SERVER_PRODUCT))
+}
+
+/// RFC 9110 §5.6.2 `token`: one or more `tchar`.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 impl S3Config {
@@ -117,6 +178,7 @@ impl S3Config {
             region: "us-east-1".to_string(),
             service: "s3".to_string(),
             tls: None,
+            server_version: UNKNOWN_SERVER_VERSION.to_string(),
         }
     }
 }
@@ -135,6 +197,9 @@ struct AppState<G> {
     /// This process's request-id minter (#529). Shared, not per-request: the monotonic
     /// half of the id must be drawn from one counter.
     request_ids: Arc<RequestIds>,
+    /// The `Server` header value stamped on every response (#779), rendered once from
+    /// [`S3Config::server_version`] when the router is built rather than per request.
+    server: HeaderValue,
     /// The `tracing` dispatch the **request plane's RED metrics** are emitted into
     /// (observability floor, proposal 0010 item 4) — see
     /// [`S3Gateway::with_metrics_dispatch`]. `None` ⇒ emit into the ambient subscriber,
@@ -151,6 +216,7 @@ impl<G> Clone for AppState<G> {
             gateway: Arc::clone(&self.gateway),
             config: Arc::clone(&self.config),
             request_ids: Arc::clone(&self.request_ids),
+            server: self.server.clone(),
             // `Dispatch` is itself a cheap handle (an `Arc` inside), so cloning the state
             // per request does not clone the subscriber.
             metrics: self.metrics.clone(),
@@ -196,9 +262,11 @@ where
         // Mint every RED series this front door can ever report, at zero, before it serves
         // anything — see [`preregister_red`].
         preregister_red(self.metrics.as_ref());
+        let server = server_header_value(&self.config.server_version);
         let state = AppState {
             gateway: self.gateway,
             config: self.config,
+            server,
             request_ids: Arc::new(RequestIds::new()),
             metrics: self.metrics,
         };
@@ -1472,6 +1540,7 @@ where
         req.uri().query().unwrap_or_default(),
     );
     let metrics = state.metrics.clone();
+    let server = state.server.clone();
     let span = tracing::info_span!(
         "s3.request",
         request_id = %request_id,
@@ -1555,6 +1624,12 @@ where
     if let Ok(value) = HeaderValue::from_str(&request_id.to_string()) {
         response.headers_mut().insert(request_id::HEADER, value);
     }
+    // And name the build that produced it (#779). Same place, same reason: every response
+    // `dispatch` returns — success, 4xx, 5xx, and a streaming GET's head — passes through
+    // here, so no handler can forget it. Responses hyper produces before the service is
+    // entered (a malformed request line, an oversized header section) never reach `handle`
+    // and carry no `Server` header.
+    response.headers_mut().insert(header::SERVER, server);
     response
 }
 
@@ -3444,6 +3519,28 @@ mod tests {
     // fixtures; no test asserts on a clocked lifecycle (#619).
     #![allow(clippy::disallowed_methods)]
     use super::*;
+
+    /// The `Server` value is `wyrd/<version>` for a version that is a valid header value,
+    /// and falls back to `wyrd/unknown` — still present, still well-formed — for one that
+    /// is not, or when the composition root never set it (#779).
+    #[test]
+    fn server_header_value_renders_the_version_and_falls_back_when_unusable() {
+        assert_eq!(server_header_value("1.2.3"), "wyrd/1.2.3");
+        assert_eq!(
+            server_header_value("0.0.0+git.abc1234"),
+            "wyrd/0.0.0+git.abc1234"
+        );
+        assert_eq!(server_header_value("1.2.3.dirty"), "wyrd/1.2.3.dirty");
+        assert_eq!(server_header_value("bad\nversion"), "wyrd/unknown");
+        assert_eq!(server_header_value("v\u{e9}rsion"), "wyrd/unknown");
+        assert_eq!(server_header_value("1.2 beta"), "wyrd/unknown");
+        assert_eq!(server_header_value("1/2"), "wyrd/unknown");
+        assert_eq!(server_header_value(""), "wyrd/unknown");
+        assert_eq!(
+            server_header_value(&S3Config::new(Vec::new()).server_version),
+            "wyrd/unknown"
+        );
+    }
 
     /// An error whose real diagnosis lives in its `source()` chain — the shape every backend
     /// error arrives in. `metadata-fdb`'s `CommitUnknownResult` carries the FDB code and

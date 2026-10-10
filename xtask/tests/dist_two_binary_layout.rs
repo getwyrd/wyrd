@@ -353,12 +353,49 @@ const SMOKE_TAIL: &str = r#"            test ! -e /etc/systemd/system/wyrd-d-ser
           "
 "#;
 
+/// The roles binary's wire identity check, run once its FoundationDB client is installed:
+/// `wyrd s3` must answer an unsigned request with a `Server: wyrd/<identity>` header whose
+/// identity equals the `version:` line of the tarball's `VERSION` (#779).
+fn server_header_block(prefix: &str, roles: &str) -> String {
+    format!(
+        r#"            # The S3 front door names its build on every response it produces: an unsigned
+            # request is refused 403 and still carries Server: wyrd/<identity>, and that
+            # identity must equal the version: line of the shipped VERSION file. A role that
+            # never answers, a missing header, a second Server line, or a mismatch each fail
+            # the step. Every Server line is captured, the operands are quoted (escaped for
+            # the outer shell) so no value can split them, and only proven equality passes:
+            # an error inside the test takes the failing branch.
+            {prefix}/bin/{roles} s3 --s3-listen 127.0.0.1:18080 --data-dir /tmp/vsmoke --access-key k --secret-key s >/tmp/wyrd-s3.log 2>&1 &
+            s3_pid=\$!
+            served=0
+            for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+              if curl -sS --max-time 10 -o /dev/null -D /tmp/wyrd-s3-head.txt http://127.0.0.1:18080/; then served=1; break; fi
+              sleep 1
+            done
+            if [ \$served != 1 ]; then
+              echo 'wyrd s3 never answered on 127.0.0.1:18080'; cat /tmp/wyrd-s3.log; exit 1
+            fi
+            kill \$s3_pid
+            wait \$s3_pid || true
+            grep -q '^HTTP/1.1 403' /tmp/wyrd-s3-head.txt
+            wire=\$(sed -n 's/^[Ss][Ee][Rr][Vv][Ee][Rr]:[[:blank:]]*//p' /tmp/wyrd-s3-head.txt | tr -d '\r')
+            shipped=\$(sed -n 's/^version: //p' VERSION)
+            if [ -n \"\$shipped\" ] && [ \"\$wire\" = \"wyrd/\$shipped\" ]; then
+              echo \"Server: \$wire matches VERSION version: \$shipped\"
+            else
+              echo \"Server value(s): [\$wire], VERSION version: [\$shipped]\"; cat /tmp/wyrd-s3-head.txt; exit 1
+            fi
+"#
+    )
+}
+
 /// The release workflow's whole smoke step for a set whose roles binary is `roles` and
 /// whose other binaries are `tools`, installed under `prefix`. Per binary: a block that
 /// runs it with no arguments (the `if` lets the expected non-zero exit through; the grep
 /// on the next line is what fails the step when the binary cannot load at all — exit 127
 /// skips the if-branch too), and a `test ! -e` after the uninstall. Each tool's block
-/// sits BEFORE the FoundationDB client is installed, the roles binary's after it.
+/// sits BEFORE the FoundationDB client is installed, the roles binary's after it, followed
+/// by the roles binary's wire identity check ([`server_header_block`]).
 fn smoke_step(prefix: &str, roles: &str, tools: &[&str]) -> String {
     let block = |name: &str, usage: &str| {
         format!(
@@ -376,6 +413,7 @@ fn smoke_step(prefix: &str, roles: &str, tools: &[&str]) -> String {
     step.push_str(SMOKE_CLIENT);
     // `wyrd` prints a bare `usage:` line, then one line per role.
     step.push_str(&block(roles, "usage:"));
+    step.push_str(&server_header_block(prefix, roles));
     step.push_str(SMOKE_UNINSTALL);
     for name in std::iter::once(&roles).chain(tools) {
         step.push_str(&format!("            test ! -e {prefix}/bin/{name}\n"));
