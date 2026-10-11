@@ -27,6 +27,9 @@
 //! past `u64` (10) and a segmented root under a non-canonical key (11) contain the object at
 //! the scan, and the rest of the store still drains. Leg 12 pins which generation the move is
 //! conditioned on: a root superseded mid-resolve is moved on its successor in the same pass.
+//! Leg 13 pins that a ceiling refusal is confirmed on the `seg:` record itself before it is
+//! escalated: a sibling edit that shrinks the record right after the move read it leaves the
+//! root untouched, and the drain must retry rather than page an operator.
 //!
 //! On the base legs 1, 2 and 4 are red (the refusal plans no move at all — so leg 4 is red for
 //! the ordinary reason, not because it caught a race); leg 3 passes there for the other reason.
@@ -94,10 +97,11 @@ enum AtMoveRead {
     Fail,
 }
 
-/// A `BTreeMap` metadata store with two seams: a write or fault at the move's own `seg:` read
-/// (before the move has prepared anything), and a competing write applied inside `commit`,
-/// AFTER the move has read and prepared its batch and BEFORE the batch's preconditions are
-/// checked — the window a racing writer takes the record in.
+/// A `BTreeMap` metadata store with seams: a write or fault at the move's own `seg:` read
+/// (before the move has prepared anything), a write just AFTER that read (the move has its
+/// bytes, and is still weighing them), and a competing write applied inside `commit`, AFTER
+/// the move has read and prepared its batch and BEFORE the batch's preconditions are checked —
+/// the window a racing writer takes the record in.
 #[derive(Default)]
 struct MemMeta {
     kv: Mutex<BTreeMap<Vec<u8>, Bytes>>,
@@ -105,6 +109,9 @@ struct MemMeta {
     racer: Mutex<Option<(Vec<u8>, Bytes)>>,
     /// Legs 5 and 7–9: fired, once, by the first `seg:` `get`.
     at_move_read: Mutex<Option<AtMoveRead>>,
+    /// Leg 13: `(key, bytes)` written, once, right after the first `seg:` `get` has read its
+    /// answer.
+    after_move_read: Mutex<Option<(Vec<u8>, Bytes)>>,
     /// Leg 12: `(key, bytes)` written, once, right after the first `seg:` page is read — the
     /// resolve's own range read, before its root re-read.
     after_seg_page: Mutex<Option<(Vec<u8>, Bytes)>>,
@@ -122,6 +129,11 @@ impl MetadataStore for MemMeta {
                 Some(AtMoveRead::Fail) => return Err(STORE_FAULT.into()),
                 None => {}
             }
+            let read = self.kv.lock().unwrap().get(key).cloned();
+            if let Some((key, bytes)) = self.after_move_read.lock().unwrap().take() {
+                self.kv.lock().unwrap().insert(key, bytes);
+            }
+            return Ok(read);
         }
         Ok(self.kv.lock().unwrap().get(key).cloned())
     }
@@ -906,4 +918,54 @@ async fn a_root_superseded_mid_resolve_is_moved_on_the_successor() {
     assert!(fx.holds(FREE, frag(CHUNK, 0)).await, "fragment not copied");
     assert!(fx.orphaned(DRAINING, frag(CHUNK, 0)).await, "not marked");
     assert_eq!(fx.status().await, ReconciliationStatus::Satisfied);
+}
+
+// ---- leg 13: a ceiling refusal is confirmed on the record it was weighed on ----
+
+/// **Leg 13 — a `seg:` record that shrinks right after the move read it is a retry, not an
+/// operator signal.** Leg 3's at-ceiling record, refused on the move's read. Right after that
+/// read a sibling edit shrinks the record (two one-byte fillers merged into one two-byte chunk,
+/// so the segment's bounds are unchanged) — a rewrite of the `seg:` record alone, which leaves
+/// the root byte-identical. The refusal was weighed on bytes that are gone, so the drain names a
+/// conflict — never `refused-ceiling` — writes and copies nothing, and the next pass moves the
+/// fragment. Checking only that the root is unchanged would escalate here.
+#[tokio::test]
+async fn a_seg_record_shrunk_after_a_ceiling_refusal_is_a_conflict() {
+    let fx = Fixture::new().await;
+    let chunk = drained(CHUNK);
+    let record = padded_segment(chunk.clone(), MAX_VALUE_BYTES);
+    let mut chunks = record.chunks().to_vec();
+    chunks.remove(2);
+    chunks[1].len = 2;
+    let shrunk = encode(&segment(chunks, 0));
+    assert!(
+        shrunk.len() + 32 < MAX_VALUE_BYTES,
+        "fixture: the shrunk record must leave room for the move"
+    );
+    let keys = fx.seed_segmented(A, vec![record]).await;
+    fx.put_fragments(&chunk).await;
+    let root_before = fx.get(&inode_key(A)).await;
+    *fx.meta.after_move_read.lock().unwrap() = Some((keys[0].clone(), shrunk.clone()));
+
+    let (answer, logged) = fx.pass().await;
+
+    let fired = fx.meta.after_move_read.lock().unwrap().is_none();
+    assert!(fired, "the sibling edit never landed after the move's read");
+    assert_eq!(answered(answer), Reconciled::Blocked, "no certification");
+    let conflict = logged.contains(r#""action":"conflict""#);
+    let refused = logged.contains(r#""action":"refused-ceiling""#);
+    assert!(conflict && !refused, "a stale refusal escalated: {logged}");
+    assert_eq!(fx.get(&keys[0]).await, shrunk, "the sibling edit was lost");
+    assert_eq!(fx.get(&inode_key(A)).await, root_before, "root rewritten");
+    assert!(!fx.holds(FREE, frag(CHUNK, 0)).await, "a refusal copied");
+    assert!(fx.no_orphan_marks().await, "a refusal marked");
+
+    let (answer, logged) = fx.pass().await;
+
+    assert_eq!(answered(answer), Reconciled::Changed, "{logged}");
+    let moved = fx.segment(&keys[0]).await;
+    let placement = &moved.chunks()[0].placement;
+    assert_eq!(placement, &vec![FREE, SURVIVORS[0], SURVIVORS[1]]);
+    assert!(fx.holds(FREE, frag(CHUNK, 0)).await, "fragment not copied");
+    assert!(fx.orphaned(DRAINING, frag(CHUNK, 0)).await, "not marked");
 }

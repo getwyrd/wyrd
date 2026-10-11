@@ -593,7 +593,7 @@ async fn evacuate_chunk(
         &object.prior,
         plan.byte_offset,
         &plan.prior,
-        new_placement,
+        new_placement.clone(),
     )
     .await;
     let mut batch = match move_ {
@@ -602,13 +602,15 @@ async fn evacuate_chunk(
         // no batch, so no root pin tested it. On a generation the root has since left they are
         // a stale plan, the same retry a lost CAS is; only while it is still live are they the
         // object's own defect.
-        Ok(metadata::Repoint::Refused { .. } | metadata::Repoint::VersionExhausted { .. })
+        Ok(metadata::Repoint::VersionExhausted { .. })
             if !still_current(ctx.meta, object).await? =>
         {
             return Ok(EvacOutcome::Conflict)
         }
+        // A ceiling refusal is also weighed on the record the move READ, which for a
+        // segmented object is a `seg:` record no root check covers.
         Ok(metadata::Repoint::Refused { bytes, ceiling }) => {
-            return Ok(EvacOutcome::Refused { bytes, ceiling })
+            return confirm_refusal(ctx, object, plan, new_placement, bytes, ceiling).await
         }
         Ok(metadata::Repoint::VersionExhausted { version }) => {
             return Ok(EvacOutcome::Contained {
@@ -653,6 +655,55 @@ async fn evacuate_chunk(
         // collectable garbage; the drain is re-assessed next pass.
         CommitOutcome::Conflict => Ok(EvacOutcome::Conflict),
     }
+}
+
+/// Whether a ceiling refusal still stands, so it may be escalated as the object's own defect
+/// ([`EvacOutcome::Refused`]) rather than retried as a stale plan ([`EvacOutcome::Conflict`]).
+///
+/// The refusal was weighed on the record the move read and carries no batch, so nothing pinned
+/// that record. For a flat object that record IS the root, and [`still_current`] settles it.
+/// For a segmented object it is a `seg:` record, which placement maintenance rewrites WITHOUT
+/// moving the root: a sibling edit that shrank the segment after the move's read leaves the
+/// root byte-identical, so the root check alone would page an operator over a record that
+/// already fits. The move is therefore prepared again — a fresh read of the `seg:` record —
+/// and only a second refusal, on a root still current after it, is escalated (with the second
+/// read's numbers). Anything else is a stale plan: nothing has been written, and the next pass
+/// re-plans from what is there. A store fault under either read is the pass's, and ends it.
+async fn confirm_refusal(
+    ctx: &RebalanceContext<'_>,
+    object: &EvacObject,
+    plan: &EvacPlan,
+    placement: Vec<DServerId>,
+    bytes: usize,
+    ceiling: usize,
+) -> Result<EvacOutcome> {
+    let (bytes, ceiling) = if object.prior.chunk_map.as_flat().is_some() {
+        (bytes, ceiling)
+    } else {
+        let again = metadata::repoint_chunk(
+            ctx.meta,
+            object.inode_id,
+            &object.prior,
+            plan.byte_offset,
+            &plan.prior,
+            placement,
+        )
+        .await;
+        match again {
+            Ok(metadata::Repoint::Refused { bytes, ceiling }) => (bytes, ceiling),
+            Ok(_) => return Ok(EvacOutcome::Conflict),
+            // The record changed into one the move cannot address: not the refusal this pass
+            // saw. The next pass's scan reads it and contains it if it stays that way.
+            Err(err) => match err.downcast::<ChunkMapError>() {
+                Ok(_) => return Ok(EvacOutcome::Conflict),
+                Err(err) => return Err(err),
+            },
+        }
+    };
+    if !still_current(ctx.meta, object).await? {
+        return Ok(EvacOutcome::Conflict);
+    }
+    Ok(EvacOutcome::Refused { bytes, ceiling })
 }
 
 /// Whether the object's root still holds exactly the generation the move was planned from —
