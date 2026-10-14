@@ -173,43 +173,17 @@ pub fn parse_args(args: &[String]) -> Result<DistConfig, String> {
     Ok(cfg)
 }
 
-/// Normalize `git describe --tags --always --dirty` output into an artifact version.
-/// Pure — unit-tested in `ci`.
-///
-/// * no tags yet (`git describe --always` prints a bare short sha, optionally
-///   `-dirty`): `0.0.0+git.<sha>[.dirty]` — the workspace's own 0.0.0 stays the
-///   base, the sha disambiguates;
-/// * exactly on a tag `v0.1.0`: `0.1.0`;
-/// * past a tag `v0.1.0-3-gabc12de[-dirty]`: `0.1.0+git.3.abc12de[.dirty]`.
-pub fn normalize_describe(describe: &str, fallback: &str) -> String {
-    let d = describe.trim();
-    let (d, dirty) = match d.strip_suffix("-dirty") {
-        Some(clean) => (clean, true),
-        None => (d, false),
-    };
-    let dirty_suffix = if dirty { ".dirty" } else { "" };
-    if let Some(tagged) = d.strip_prefix('v') {
-        // `v0.1.0` or `v0.1.0-3-gabc12de`.
-        let mut parts = tagged.rsplitn(3, '-');
-        let (gsha, count) = (parts.next(), parts.next());
-        if let (Some(gsha), Some(count), Some(base)) = (gsha, count, parts.next()) {
-            if let Some(sha) = gsha.strip_prefix('g') {
-                if count.chars().all(|c| c.is_ascii_digit()) {
-                    return format!("{base}+git.{count}.{sha}{dirty_suffix}");
-                }
-            }
-        }
-        if dirty {
-            return format!("{tagged}+git.dirty");
-        }
-        return tagged.to_string();
-    }
-    if d.is_empty() {
-        return format!("{fallback}+git.unknown{dirty_suffix}");
-    }
-    // Bare short sha — no tag reachable.
-    format!("{fallback}+git.{d}{dirty_suffix}")
-}
+/// The build-identity derivation, SHARED with the product (#778): `crates/server/build.rs`
+/// compiles this same file to bake the `wyrd` binary's identity, so the version `dist`
+/// writes to `VERSION` and the one a binary derives come from one definition. Included by
+/// path rather than depended on, so the dependency runs tooling→product, never the
+/// reverse (`xtask` stays free of the `wyrd-server` crate graph).
+#[path = "../../crates/server/src/version/derivation.rs"]
+pub mod identity;
+
+/// Normalize `git describe` output into an artifact version — the shared definition,
+/// re-exported where `dist`'s callers and tests have always found it.
+pub use identity::normalize_describe;
 
 /// The artifact version rendered as a DOCKER TAG: a tag may not contain `+`
 /// (`[a-zA-Z0-9_.-]` only), so the semver build-metadata separator becomes `-`.
@@ -217,6 +191,68 @@ pub fn normalize_describe(describe: &str, fallback: &str) -> String {
 /// in `ci`.
 pub fn image_tag_version(version: &str) -> String {
     version.replace('+', "-")
+}
+
+/// The versioned image reference, `wyrd:<tag version>-<flavor>`. Pure.
+pub fn versioned_image_tag(version: &str, flavor: &str) -> String {
+    format!("wyrd:{}-{flavor}", image_tag_version(version))
+}
+
+/// The `docker buildx build` argv of the default build vehicle. Pure — asserted
+/// container-free, which is how the gate pins that the image build receives
+/// `WYRD_VERSION=<version>`: the SAME `version` binding this run writes to the tarball's
+/// `VERSION`, so the binary inside the image (whose build context has no `.git/`) carries
+/// `dist`'s word rather than the build script's fallback (#778). `revision` is the full
+/// commit sha for the OCI label; `oci_dest`, when set, adds the OCI-archive exporter.
+pub fn image_build_args(
+    cfg: &DistConfig,
+    version: &str,
+    revision: &str,
+    oci_dest: Option<&str>,
+) -> Vec<String> {
+    // `--platform linux/amd64`, PINNED: the tarball advertises
+    // `x86_64-unknown-linux-gnu` in its name, so the build must not silently
+    // follow an arm64 host's default platform and ship an aarch64 binary under
+    // an x86_64 filename (codex P1). An arm64 packaging host needs binfmt/qemu
+    // for this — a slow but honest build; release CI is amd64 anyway.
+    let mut args: Vec<String> = [
+        "buildx",
+        "build",
+        "--platform",
+        DIST_PLATFORM,
+        "--build-arg",
+        &format!("FEATURES={}", cfg.features),
+        "--build-arg",
+        &format!("WYRD_VERSION={version}"),
+        "--label",
+        &format!("org.opencontainers.image.version={version}"),
+        "--label",
+        &format!("org.opencontainers.image.revision={revision}"),
+        "-t",
+        &versioned_image_tag(version, &cfg.flavor),
+        "-t",
+        &format!("wyrd:{flavor}", flavor = cfg.flavor),
+        // The docker exporter loads the tagged image into the daemon (what the
+        // classic `docker build` did) — spelled explicitly because the OCI
+        // exporter below may join it.
+        "--output",
+        "type=docker",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    if let Some(dest) = oci_dest {
+        // The OCI archive is a SECOND EXPORTER on the SAME build (buildx ≥0.13
+        // multi-output), never a separate build: a cache miss or any
+        // nondeterministic input in a re-build could otherwise ship an archive
+        // whose binary differs from the tarball's, silently breaking the
+        // "identical binary" guarantee (codex P1). `docker save` is no
+        // alternative — its output is Docker's legacy archive format, which
+        // OCI-only consumers (`skopeo copy oci-archive:…`) reject.
+        args.push("--output".into());
+        args.push(format!("type=oci,dest={dest}"));
+    }
+    args.extend(["-f", "deploy/docker/wyrd/Dockerfile", "."].map(str::to_string));
+    args
 }
 
 /// The default value of `ARG FDB_VERSION=<v>` in the production Dockerfile — the
@@ -496,7 +532,10 @@ fn run(cmd: &mut Command, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The artifact version for this checkout (see [`normalize_describe`]).
+/// The artifact version for this checkout (see [`normalize_describe`]), validated HERE —
+/// before any build — by the same rule the `wyrd` build script applies to the value this
+/// pipeline hands it ([`identity::validate_identity`]): an exotic tag that would make an
+/// illegal Docker tag fails now, legibly, not minutes later inside `docker buildx build`.
 fn derive_version(root: &Path) -> Result<String, String> {
     let describe = capture(
         Command::new("git")
@@ -504,7 +543,15 @@ fn derive_version(root: &Path) -> Result<String, String> {
             .current_dir(root),
         "git describe",
     )?;
-    Ok(normalize_describe(&describe, "0.0.0"))
+    let version = normalize_describe(&describe, identity::FALLBACK_BASE);
+    identity::validate_identity(&version).map_err(|e| {
+        format!(
+            "dist: `git describe` printed `{}`, which does not make a usable artifact \
+             version: {e}",
+            describe.trim()
+        )
+    })?;
+    Ok(version)
 }
 
 /// The host target triple (`rustc -vV`'s `host:` line) — names the tarball honestly;
@@ -562,6 +609,9 @@ fn obtain_binaries(root: &Path, cfg: &DistConfig, version: &str) -> Result<PathB
         run(
             Command::new("cargo")
                 .args(host_build_args(&binaries, &cfg.features))
+                // The same hand-off as the image build's `--build-arg`: the binary's
+                // build identity is THIS run's `version`, not a re-derivation.
+                .env("WYRD_VERSION", version)
                 .current_dir(root),
             "cargo build --release",
         )?;
@@ -574,57 +624,18 @@ fn obtain_binaries(root: &Path, cfg: &DistConfig, version: &str) -> Result<PathB
             .current_dir(root),
         "git rev-parse HEAD",
     )?;
-    let versioned_tag = format!(
-        "wyrd:{tag}-{flavor}",
-        tag = image_tag_version(version),
-        flavor = cfg.flavor
-    );
-    let flavor_tag = format!("wyrd:{flavor}", flavor = cfg.flavor);
-    // `--platform linux/amd64`, PINNED: the tarball advertises
-    // `x86_64-unknown-linux-gnu` in its name, so the build must not silently
-    // follow an arm64 host's default platform and ship an aarch64 binary under
-    // an x86_64 filename (codex P1). An arm64 packaging host needs binfmt/qemu
-    // for this — a slow but honest build; release CI is amd64 anyway.
-    let mut args: Vec<String> = [
-        "buildx",
-        "build",
-        "--platform",
-        DIST_PLATFORM,
-        "--build-arg",
-        &format!("FEATURES={}", cfg.features),
-        "--label",
-        &format!("org.opencontainers.image.version={version}"),
-        "--label",
-        &format!("org.opencontainers.image.revision={}", sha.trim()),
-        "-t",
-        &versioned_tag,
-        "-t",
-        &flavor_tag,
-        // The docker exporter loads the tagged image into the daemon (what the
-        // classic `docker build` did) — spelled explicitly because the OCI
-        // exporter below may join it.
-        "--output",
-        "type=docker",
-    ]
-    .map(str::to_string)
-    .to_vec();
-    if cfg.oci_archive {
-        // The OCI archive is a SECOND EXPORTER on the SAME build (buildx ≥0.13
-        // multi-output), never a separate build: a cache miss or any
-        // nondeterministic input in a re-build could otherwise ship an archive
-        // whose binary differs from the tarball's, silently breaking the
-        // "identical binary" guarantee (codex P1). `docker save` is no
-        // alternative — its output is Docker's legacy archive format, which
-        // OCI-only consumers (`skopeo copy oci-archive:…`) reject.
+    let versioned_tag = versioned_image_tag(version, &cfg.flavor);
+    let oci_dest = if cfg.oci_archive {
         std::fs::create_dir_all(root.join(DIST_DIR))
             .map_err(|e| format!("dist: mkdir {DIST_DIR}: {e}"))?;
-        args.push("--output".into());
-        args.push(format!(
-            "type=oci,dest={DIST_DIR}/{}",
+        Some(format!(
+            "{DIST_DIR}/{}",
             oci_archive_name(version, &cfg.flavor)
-        ));
-    }
-    args.extend(["-f", "deploy/docker/wyrd/Dockerfile", "."].map(str::to_string));
+        ))
+    } else {
+        None
+    };
+    let args = image_build_args(cfg, version, sha.trim(), oci_dest.as_deref());
     run(
         Command::new("docker").args(&args).current_dir(root),
         "docker buildx build",
@@ -772,11 +783,7 @@ pub fn run_dist(args: &[String]) -> Result<(), String> {
     }
     write_checksums(&root, &artifacts)?;
 
-    let versioned_tag = format!(
-        "wyrd:{tag}-{flavor}",
-        tag = image_tag_version(&version),
-        flavor = cfg.flavor
-    );
+    let versioned_tag = versioned_image_tag(&version, &cfg.flavor);
     let flavor_tag = format!("wyrd:{flavor}", flavor = cfg.flavor);
     if cfg.image {
         println!("xtask dist: image {versioned_tag} (also {flavor_tag})");

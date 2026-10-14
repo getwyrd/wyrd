@@ -367,6 +367,123 @@ fn image_tags_sanitize_the_semver_plus() {
     assert_eq!(dist::image_tag_version("0.1.0"), "0.1.0");
 }
 
+// ─── the build identity hand-off (#778) ─────────────────────────────────────────
+
+/// One derivation, two compiled consumers: `dist` and the `wyrd` build script compile the
+/// SAME file, so the version `dist` writes to `VERSION` and the identity a binary derives
+/// cannot fork into two definitions. (`normalize_describe_covers_all_three_shapes` above
+/// pins the behaviour; this pins that both consumers include the one source.)
+#[test]
+fn the_build_identity_derivation_is_one_file_with_two_consumers() {
+    const SHARED: &str = "crates/server/src/version/derivation.rs";
+    assert!(
+        workspace_root().join(SHARED).is_file(),
+        "{SHARED} is missing"
+    );
+    let dist_src = read("xtask/src/dist.rs");
+    assert!(
+        dist_src.contains("#[path = \"../../crates/server/src/version/derivation.rs\"]"),
+        "xtask/src/dist.rs must compile {SHARED}, not its own copy of the normalizer"
+    );
+    let build_rs = read("crates/server/build.rs");
+    assert!(
+        build_rs.contains("#[path = \"src/version/derivation.rs\"]"),
+        "crates/server/build.rs must compile {SHARED}, not its own copy of the resolver"
+    );
+    assert!(
+        !dist_src.contains("pub fn normalize_describe"),
+        "xtask/src/dist.rs defines its own normalize_describe again — use the shared one"
+    );
+}
+
+/// The image build receives the version `dist` derived — the SAME string it writes to the
+/// tarball's `VERSION` — as `--build-arg WYRD_VERSION=<version>`, verbatim (a `.dirty`
+/// suffix included). Asserted on the real argv, container-free.
+#[test]
+fn the_image_build_hands_the_version_to_the_binary() {
+    let cfg = dist::DistConfig::default();
+    for version in ["0.0.0+git.abc12de", "0.1.0+git.3.abc12de.dirty", "0.1.0"] {
+        let args = dist::image_build_args(&cfg, version, "f00dfeed", None);
+        let build_args: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--build-arg")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(
+            build_args.contains(&format!("WYRD_VERSION={version}").as_str()),
+            "the image build must carry WYRD_VERSION={version}; build args: {build_args:?}"
+        );
+        assert_eq!(
+            build_args
+                .iter()
+                .filter(|a| a.starts_with("WYRD_VERSION="))
+                .count(),
+            1,
+            "exactly one WYRD_VERSION build arg: {build_args:?}"
+        );
+        assert!(build_args.contains(&format!("FEATURES={}", cfg.features).as_str()));
+        assert!(args.contains(&format!("org.opencontainers.image.version={version}")));
+        assert!(args.contains(&dist::versioned_image_tag(version, &cfg.flavor)));
+        assert!(!args.iter().any(|a| a.starts_with("type=oci")));
+        assert_eq!(
+            args[args.len() - 3..],
+            ["-f", "deploy/docker/wyrd/Dockerfile", "."]
+        );
+    }
+    let with_oci = dist::image_build_args(&cfg, "0.1.0", "f00dfeed", Some("target/dist/x.oci.tar"));
+    assert!(with_oci.contains(&"type=oci,dest=target/dist/x.oci.tar".to_string()));
+    assert!(with_oci.contains(&"WYRD_VERSION=0.1.0".to_string()));
+}
+
+/// The Dockerfile declares `WYRD_VERSION` the way it declares `FEATURES`: a global
+/// `ARG` with an empty default (an unset argument falls through to the build script's next
+/// rung, never an empty identity), re-declared INSIDE the `build` stage before the
+/// `cargo build` that reads it — an `ARG` outside the stage is invisible to its `RUN`s.
+#[test]
+fn the_dockerfile_declares_the_version_arg_in_the_build_stage() {
+    let dockerfile = read("deploy/docker/wyrd/Dockerfile");
+    let lines: Vec<&str> = dockerfile.lines().map(str::trim).collect();
+    let build_from = lines
+        .iter()
+        .position(|l| l.starts_with("FROM ") && l.ends_with(" AS build"))
+        .expect("the Dockerfile has a `FROM … AS build` stage");
+    assert!(
+        lines[..build_from].contains(&"ARG WYRD_VERSION=\"\""),
+        "a global `ARG WYRD_VERSION=\"\"` must precede the build stage"
+    );
+    let stage_end = lines[build_from + 1..]
+        .iter()
+        .position(|l| l.starts_with("FROM "))
+        .map_or(lines.len(), |i| build_from + 1 + i);
+    let stage = &lines[build_from..stage_end];
+    let arg = stage
+        .iter()
+        .position(|l| *l == "ARG WYRD_VERSION")
+        .expect("the build stage re-declares `ARG WYRD_VERSION`");
+    let build = stage
+        .iter()
+        .position(|l| l.starts_with("RUN cargo build "))
+        .expect("the build stage runs `cargo build`");
+    assert!(
+        arg < build,
+        "`ARG WYRD_VERSION` must be in scope for the `cargo build` step"
+    );
+}
+
+/// `dist` refuses, before any build, a version that could not be a Docker tag — by the
+/// same validator the build script applies to the value `dist` hands it.
+#[test]
+fn dist_validates_its_version_with_the_shared_rule() {
+    assert!(dist::identity::validate_identity("0.1.0+git.3.abc12de.dirty").is_ok());
+    for exotic in ["v.1", "v-1", "v1.0/rc"] {
+        let version = dist::normalize_describe(exotic, dist::identity::FALLBACK_BASE);
+        assert!(
+            dist::identity::validate_identity(&version).is_err(),
+            "`{exotic}` → `{version}` must be refused"
+        );
+    }
+}
+
 /// The staging plan stages every template that exists and nothing that doesn't:
 /// each source is a real repo file, install.sh is the only substituted file and is
 /// executable, units stage verbatim (their @BINDIR@ belongs to install time).

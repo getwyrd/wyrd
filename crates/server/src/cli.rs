@@ -2393,6 +2393,9 @@ fn cmd_s3(args: &[String]) -> Result<ExitCode, BoxError> {
             listen = %listener.local_addr()?,
             region = region,
             dservers = endpoints.as_deref().map_or(0, <[String]>::len),
+            // The checkout this binary was built from (#778) — `dist`'s own word for a
+            // released binary, the base commit for a hand-built one (`version` module docs).
+            version = crate::version::BUILD_IDENTITY,
             "role started",
         );
         let served = serve_s3_role(

@@ -39,6 +39,14 @@ ARG FDB_VERSION=7.3.77
 # Optional cargo feature set. Empty by default so a plain `docker build` produces the
 # default-feature binary unchanged, exactly like the dserver fixture.
 ARG FEATURES=""
+# The build identity baked into `wyrd` (#778). `cargo xtask dist` passes the version it
+# writes to the tarball's `VERSION` (`--build-arg WYRD_VERSION=…`), because this build's
+# context excludes `.git/` (`.dockerignore`) and so cannot derive one. Empty by default:
+# an unset argument falls through to the build script's next rung and never bakes an
+# empty identity — with no repository visible here that is `0.0.0+git.unknown`, and the
+# build log carries a `cargo:warning` saying so (what a compose fixture that builds this
+# file without the argument gets).
+ARG WYRD_VERSION=""
 
 # ── Build stage — compile `wyrd` against the image's pinned glibc. ──
 # Pin the exact patch (`1.96.0`) to match `rust-toolchain.toml` (`:4`) so a floating
@@ -75,6 +83,10 @@ COPY . .
 # the gated workspace rather than silently resolving newer deps. ONE build for both
 # binaries: `--features` applies to the packages that declare them (`wyrd`), and
 # `wyrd-validate` is featureless by construction (it depends on no `wyrd-*` crate).
+# `WYRD_VERSION` reaches `cargo build` as an environment variable (every `ARG` in scope
+# does), where `crates/server/build.rs` reads it. Declared HERE rather than at the top of
+# the stage so a new version busts the cache only from this step, not the toolchain layer.
+ARG WYRD_VERSION
 RUN cargo build --release --locked --bin wyrd --bin wyrd-validate ${FEATURES:+--features "$FEATURES"}
 
 # ── Runtime stage — a minimal image hosting the two shipped binaries and nothing else. ──
