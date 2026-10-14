@@ -147,7 +147,7 @@ foundationdb = { version = "0.11", default-features = false, features = ["fdb-7_
 # **NEEDS-HUMAN** at sign-off (INTEGRATION §4). Under `--cfg madsim` the store instead
 # uses `madsim-etcd-client` (specified inline in the crate), which needs no protoc.
 etcd-client = "0.14"
-protox = "0.9"
+protox = "0.10"
 rand = "0.10"
 rand_chacha = "0.10"
 redb = "4"
