@@ -70,7 +70,9 @@ jobs:
       # step's shell, its `#` comment lines included. A bare `"` in it (outside a `$(…)`)
       # ends that word, and every later line silently never runs in the container while
       # the step stays green; a backtick is run by the runner. Keep both out of the
-      # script, comments too.
+      # script, comments too. Where the script itself needs a quote (the Server-vs-VERSION
+      # comparison quotes its operands), write it escaped, as \", so the runner's shell
+      # passes it through to the container's.
       - name: smoke the installer in a bookworm container
         run: |
           set -eu
@@ -100,6 +102,33 @@ jobs:
               echo 'wyrd with no arguments must exit non-zero'; exit 1
             fi
             grep -q 'usage:' /tmp/wyrd-usage.txt
+            # The S3 front door names its build on every response it produces: an unsigned
+            # request is refused 403 and still carries Server: wyrd/<identity>, and that
+            # identity must equal the version: line of the shipped VERSION file. A role that
+            # never answers, a missing header, a second Server line, or a mismatch each fail
+            # the step. Every Server line is captured, the operands are quoted (escaped for
+            # the outer shell) so no value can split them, and only proven equality passes:
+            # an error inside the test takes the failing branch.
+            /usr/local/bin/wyrd s3 --s3-listen 127.0.0.1:18080 --data-dir /tmp/vsmoke --access-key k --secret-key s >/tmp/wyrd-s3.log 2>&1 &
+            s3_pid=\$!
+            served=0
+            for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+              if curl -sS --max-time 10 -o /dev/null -D /tmp/wyrd-s3-head.txt http://127.0.0.1:18080/; then served=1; break; fi
+              sleep 1
+            done
+            if [ \$served != 1 ]; then
+              echo 'wyrd s3 never answered on 127.0.0.1:18080'; cat /tmp/wyrd-s3.log; exit 1
+            fi
+            kill \$s3_pid
+            wait \$s3_pid || true
+            grep -q '^HTTP/1.1 403' /tmp/wyrd-s3-head.txt
+            wire=\$(sed -n 's/^[Ss][Ee][Rr][Vv][Ee][Rr]:[[:blank:]]*//p' /tmp/wyrd-s3-head.txt | tr -d '\r')
+            shipped=\$(sed -n 's/^version: //p' VERSION)
+            if [ -n \"\$shipped\" ] && [ \"\$wire\" = \"wyrd/\$shipped\" ]; then
+              echo \"Server: \$wire matches VERSION version: \$shipped\"
+            else
+              echo \"Server value(s): [\$wire], VERSION version: [\$shipped]\"; cat /tmp/wyrd-s3-head.txt; exit 1
+            fi
             # Idempotence: a re-run upgrades without clobbering live config.
             echo '# operator-owned' >>/etc/wyrd/d-server.env
             ./install.sh
