@@ -129,10 +129,10 @@ Everything is prebuilt; nothing needs the network.
   no arguments for its flags). An unsigned request gets 403.
 - D servers: `target/debug/wyrd d-server --bind 127.0.0.1:7001 --health-bind 127.0.0.1:7101 --data-dir /tmp/wyrd-d1`
   (and 7002/7102, 7003/7103 likewise); write through them with
-  `target/debug/wyrd put <file> --key k --durability "rs(2,1)" --data-dir /tmp/wyrd-meta --endpoints http://127.0.0.1:7001,http://127.0.0.1:7002,http://127.0.0.1:7003`.
-  and read back with `wyrd get k --out <file>` and the same `--data-dir` and `--endpoints`.
-  The default durability, `rs(6,3)`, needs nine D servers. `wyrd` with no arguments prints
-  full usage.
+  `target/debug/wyrd put <file> --key k --durability "rs(2,1)" --data-dir /tmp/wyrd-meta --endpoints http://127.0.0.1:7001,http://127.0.0.1:7002,http://127.0.0.1:7003`,
+  and read back with `target/debug/wyrd get k --out <file>` and the same `--data-dir` and
+  `--endpoints`. The default durability, `rs(6,3)`, needs nine D servers.
+  `target/debug/wyrd` with no arguments prints full usage.
 
 ## How we rate severity
 
@@ -159,5 +159,10 @@ form.
 ## How reports and patches should look
 
 Reproduce against the code in this image. Patches should follow the existing style: keep
-`#![forbid(unsafe_code)]`, add a test that fails before the fix, and pass
-`cargo clippy --all-targets` with the workspace lint settings.
+`#![forbid(unsafe_code)]`, add a test that fails before the fix, and pass both lint runs
+(the workspace lint settings deny warnings). `--all-targets` selects target kinds, not
+features, so the backend code needs `--all-features`, and the DST tests compile to nothing
+without `--cfg madsim`:
+
+- `cargo clippy --workspace --exclude wyrd-dst --all-targets --all-features`
+- `RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target-madsim cargo clippy -p wyrd-dst --all-targets`
