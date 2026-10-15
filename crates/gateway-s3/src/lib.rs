@@ -617,14 +617,24 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 /// (distinct from the IMF-fixdate [`http_date`] uses for the `Last-Modified` *header*).
 /// Shares [`civil_from_days`] with `http_date`, so no date dependency is pulled in.
 ///
+/// **Whole seconds, always (#767).** The fraction is always `.000`: the stored millisecond
+/// part is dropped, by the same `/ 1_000` truncation [`http_date`] applies to the
+/// `Last-Modified` header, whose IMF-fixdate has one-second resolution (RFC 7231 §7.1.1.1).
+/// The rule is that every S3 surface reporting an object's modification time names the
+/// **same instant**, at that one-second granularity, for every stored value — so a client
+/// that caches a listing's `LastModified` and revalidates with HEAD sees agreement, not a
+/// sub-second formatting artefact. S3's own listings are second-granular the same way (its
+/// `<LastModified>` values end `.000Z` and agree with HEAD to the second). The store still
+/// keeps `modified` in epoch milliseconds (ADR-0047); only the rendering truncates.
+///
 /// `None` past year 9999 — the same bound [`http_date`] applies, for the same reason: the
 /// stored `modified` is an unrestricted `u64`, and a five-digit year is not a valid RFC-3339
 /// timestamp, so a strict SDK date parser would reject the whole listing document over one
 /// pathological record. The caller omits the element instead (the ADR-0047 degradation).
 fn iso8601(epoch_millis: u64) -> Option<String> {
     const SECS_PER_DAY: u64 = 86_400;
+    // Whole seconds: the same truncation `http_date` applies (see the doc above).
     let secs = epoch_millis / 1_000;
-    let millis = epoch_millis % 1_000;
     let days = (secs / SECS_PER_DAY) as i64;
     let sod = secs % SECS_PER_DAY;
     let (hour, minute, second) = (sod / 3_600, (sod % 3_600) / 60, sod % 60);
@@ -633,7 +643,7 @@ fn iso8601(epoch_millis: u64) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z"
     ))
 }
 
@@ -3180,6 +3190,12 @@ fn content_type_header(content_type: Option<&str>) -> HeaderValue {
 /// HTTP-date/chrono dependency is pulled in — a new dependency would be a human-only
 /// sign-off item (ADR-0003 audit + `deny.toml`), and the formatter is small.
 ///
+/// **Whole seconds (#767).** IMF-fixdate has one-second resolution, so the stored
+/// millisecond part is dropped. A listing's `<LastModified>` ([`iso8601`]) truncates the same
+/// way and always renders `.000Z`, so the header and the listing name the same instant for
+/// every stored `modified` — the rule for every S3 surface that reports an object's
+/// modification time, and what S3 itself does.
+///
 /// Returns `None` past year 9999: IMF-fixdate's year is exactly four digits, so a later
 /// timestamp (metadata decoding accepts any `u64` — ADR-0045) has no valid rendering and
 /// the caller omits the header, symmetric with `etag_header` on a malformed stored etag.
@@ -4601,6 +4617,42 @@ mod tests {
             )),
             "a recorded modified time renders as ISO-8601: {out}"
         );
+    }
+
+    #[test]
+    fn listing_and_header_formatters_both_truncate_to_whole_seconds() {
+        // #767: the listing's `<LastModified>` and the `Last-Modified` header name the same
+        // instant at one-second granularity for every stored value — on a second boundary,
+        // off it, at the last millisecond of a second, and at the last renderable millisecond.
+        for (millis, iso, imf) in [
+            (
+                1_700_000_000_000,
+                "2023-11-14T22:13:20.000Z",
+                "Tue, 14 Nov 2023 22:13:20 GMT",
+            ),
+            (
+                1_700_000_000_750,
+                "2023-11-14T22:13:20.000Z",
+                "Tue, 14 Nov 2023 22:13:20 GMT",
+            ),
+            (
+                1_700_000_000_999,
+                "2023-11-14T22:13:20.000Z",
+                "Tue, 14 Nov 2023 22:13:20 GMT",
+            ),
+            (
+                253_402_300_799_999,
+                "9999-12-31T23:59:59.000Z",
+                "Fri, 31 Dec 9999 23:59:59 GMT",
+            ),
+        ] {
+            assert_eq!(iso8601(millis).as_deref(), Some(iso), "iso8601({millis})");
+            assert_eq!(
+                http_date(millis).as_deref(),
+                Some(imf),
+                "http_date({millis})"
+            );
+        }
     }
 
     #[test]
