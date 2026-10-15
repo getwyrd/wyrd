@@ -193,7 +193,9 @@ Hierarchical: **inode + dirent**, not path-as-key.
   is optional with a serde default *and* skipped when absent, so a record written before
   the fields decodes, degrades on the wire to the pre-metadata behaviour, and re-encodes
   byte-identically — the latter load-bearing because every commit is a full-value CAS on
-  the record's stored bytes.
+  the record's stored bytes. The store keeps `modified` in epoch milliseconds, and every
+  S3 surface reports it at whole seconds: a listing's `<LastModified>` always ends `.000Z`,
+  so it names the same instant as the `Last-Modified` header, as S3's own listings do.
 - `dirent:<parent_id>/<name>` → child inode id.
 
 Object metadata is stamped only at **content publication** (create / overwrite, in the
