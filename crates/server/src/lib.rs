@@ -41,8 +41,11 @@ use wyrd_traits::{
 // wire surface (`wyrd-gateway-s3`) is generic over `ObjectGateway`; `Gateway` implements it.
 pub use wyrd_gateway_core::GatewayError;
 use wyrd_gateway_core::{
-    resolve_byte_range, ByteRange, ContainerGateway, ContentHash, ListedObject, ObjectGateway,
-    ObjectMeta, ObjectRead, RangeOutcome, RangeRead,
+    resolve_byte_range, ByteRange, ContainerGateway, ContentHash, ListedObject,
+    MultipartAbortAnswer, MultipartCompleteAnswer, MultipartCreateAnswer, MultipartGateway,
+    MultipartListPartsAnswer, MultipartListUploadsAnswer, MultipartRefusal,
+    MultipartUploadPartAnswer, NamedParts, ObjectGateway, ObjectMeta, ObjectRead, RangeOutcome,
+    RangeRead,
 };
 
 /// The root inode every object key is bound under — a flat namespace at M0.
@@ -743,6 +746,98 @@ where
         // pagination require one deterministic order, so sort lexicographically by key here.
         listed.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(Some(listed))
+    }
+}
+
+/// `Gateway` is also the composition root's [`MultipartGateway`] — ADR-0046 decision 6, as for
+/// [`ContainerGateway`]: multipart crosses the seam as a narrow companion trait so
+/// [`ObjectGateway`] stays object-only. Every verb answers
+/// [`MultipartRefusal::NotImplemented`] for now. Each is written out (not left to the trait's
+/// default) so the slice that wires it to `wyrd_core::multipart` replaces only its body.
+impl<M, C, Co> MultipartGateway for Gateway<M, C, Co>
+where
+    M: MetadataStore + Send + Sync + 'static,
+    C: PlacementChunkStore + Send + Sync + 'static,
+    Co: Coordination + Send + Sync + 'static,
+{
+    async fn create_multipart_upload(
+        &self,
+        container: &str,
+        key: &str,
+        content_type: Option<String>,
+    ) -> Result<MultipartCreateAnswer> {
+        // #668 replaces this body.
+        let _ = (container, key, content_type);
+        Ok(MultipartCreateAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        ))
+    }
+
+    async fn upload_part<S>(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: S,
+        expected: ContentHash,
+    ) -> Result<MultipartUploadPartAnswer>
+    where
+        S: futures_util::Stream<Item = Result<Bytes>> + Send + Unpin + 'static,
+    {
+        // #669 replaces this body.
+        let _ = (container, key, upload_id, part_number, body, expected);
+        Ok(MultipartUploadPartAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        ))
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+        named_parts: NamedParts,
+    ) -> Result<MultipartCompleteAnswer> {
+        // #670 replaces this body.
+        let _ = (container, key, upload_id, named_parts);
+        Ok(MultipartCompleteAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        ))
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<MultipartAbortAnswer> {
+        // #668 replaces this body.
+        let _ = (container, key, upload_id);
+        Ok(MultipartAbortAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        ))
+    }
+
+    async fn list_parts(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<MultipartListPartsAnswer> {
+        // #668 replaces this body.
+        let _ = (container, key, upload_id);
+        Ok(MultipartListPartsAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        ))
+    }
+
+    async fn list_multipart_uploads(&self, container: &str) -> Result<MultipartListUploadsAnswer> {
+        // #668 replaces this body.
+        let _ = container;
+        Ok(MultipartListUploadsAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        ))
     }
 }
 

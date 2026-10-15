@@ -134,6 +134,8 @@ Stateless protocol translators. They hold no durable state, scale horizontally, 
 | WebDAV / Drive | Rust | The consumer Drive surface: sync, sharing links, web UI |
 | Native SDK | gRPC + prost | The real interface; streaming reads, atomic commit, append, CAS |
 
+The S3 gateway names no concrete backend. `gateway-s3` is generic over the gateway seam in `gateway-core`, and `wyrd-server`'s `Gateway` implements that seam at the composition root (ADR-0010). The seam is `ObjectGateway` (streaming object PUT, GET and ranged GET, HEAD, DELETE) plus narrow companion traits for what that trait deliberately leaves out (ADR-0046 decision 6): `ContainerGateway` lists a container, and `MultipartGateway` carries the six multipart-upload verbs (create, upload part, complete, abort, list parts, list uploads) in container/object vocabulary. Every multipart answer is a typed value, success or a refusal such as `NoSuchUpload`, and none names an HTTP status; the S3 crate maps them onto the wire. For now `MultipartGateway` answers every verb "not implemented" and the S3 wire still refuses every multipart form with `501`; the verbs are wired to the core multipart paths from #668 on.
+
 ---
 
 ### L2 — Global control plane

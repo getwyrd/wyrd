@@ -76,7 +76,7 @@ use futures_util::StreamExt;
 use tracing::Instrument;
 use wyrd_gateway_core::{
     resolve_byte_range, ByteRange, ContainerGateway, ContentHash, GatewayError, ListedObject,
-    ObjectGateway, ObjectMeta, ObjectRead, ObjectStream, RangeOutcome, RangeRead,
+    MultipartGateway, ObjectGateway, ObjectMeta, ObjectRead, ObjectStream, RangeOutcome, RangeRead,
 };
 use wyrd_traits::{BoxError, ErrorClass};
 
@@ -226,7 +226,7 @@ impl<G> Clone for AppState<G> {
 
 impl<G> S3Gateway<G>
 where
-    G: ObjectGateway + ContainerGateway,
+    G: ObjectGateway + ContainerGateway + MultipartGateway,
 {
     /// Compose the front door over a gateway and its config.
     pub fn new(gateway: Arc<G>, config: S3Config) -> Self {
@@ -794,7 +794,7 @@ async fn list_objects<G>(
     query: &str,
 ) -> Response
 where
-    G: ObjectGateway + ContainerGateway,
+    G: ObjectGateway + ContainerGateway + MultipartGateway,
 {
     // `encoding-type` (issue #507 Delta 1). botocore injects `encoding-type=url` into EVERY
     // ListObjects/V2 request (aws-cli, boto3, rclone), so it is load-bearing for the stock
@@ -1524,7 +1524,7 @@ fn finish_response(
 
 async fn handle<G>(State(state): State<AppState<G>>, req: Request) -> Response
 where
-    G: ObjectGateway + ContainerGateway,
+    G: ObjectGateway + ContainerGateway + MultipartGateway,
 {
     let request_id = state.request_ids.mint();
     // wall-clock exempt: request-latency observation stamp — owns no lifecycle
@@ -1635,7 +1635,7 @@ where
 
 async fn dispatch<G>(state: AppState<G>, req: Request, request_id: RequestId) -> Response
 where
-    G: ObjectGateway + ContainerGateway,
+    G: ObjectGateway + ContainerGateway + MultipartGateway,
 {
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();
@@ -1999,7 +1999,7 @@ async fn delete_objects<G>(
     body: Body,
 ) -> Response
 where
-    G: ObjectGateway + ContainerGateway,
+    G: ObjectGateway + ContainerGateway + MultipartGateway,
 {
     // Buffer the signed body whole under the byte cap (refused as read; see [`buffer_capped`]).
     // An over-cap body is `MalformedXML` — S3 refuses an over-large request body, and this fires
@@ -3705,8 +3705,10 @@ mod tests {
 
         struct NoGateway;
         // Object-focused double: the default `list_container` (`Ok(None)`) is exactly the
-        // no-container answer these tests need.
+        // no-container answer these tests need, and the multipart defaults answer "not
+        // implemented".
         impl ContainerGateway for NoGateway {}
+        impl MultipartGateway for NoGateway {}
         impl ObjectGateway for NoGateway {
             async fn put_object_streaming<S>(
                 &self,
@@ -3998,8 +4000,11 @@ mod tests {
     struct NoGateway;
 
     // Object-focused double: the default `list_container` (`Ok(None)`) is exactly the
-    // no-container answer these tests need.
+    // no-container answer these tests need, and the multipart defaults answer "not
+    // implemented".
     impl ContainerGateway for NoGateway {}
+
+    impl MultipartGateway for NoGateway {}
 
     impl ObjectGateway for NoGateway {
         async fn put_object_streaming<S>(
@@ -4689,6 +4694,8 @@ mod tests {
 
     impl ContainerGateway for StoredMetaGateway {}
 
+    impl MultipartGateway for StoredMetaGateway {}
+
     impl ObjectGateway for StoredMetaGateway {
         async fn put_object_streaming<S>(
             &self,
@@ -5138,7 +5145,7 @@ mod tests {
     /// Drive a signed request with arbitrary extra request headers (`range`, `if-*`) through the
     /// REAL router against `gateway`, returning the response — the generic sibling of
     /// `signed_through_router`, for the range-seam doubles below.
-    async fn signed_ranged_request<G: ObjectGateway + ContainerGateway>(
+    async fn signed_ranged_request<G: ObjectGateway + ContainerGateway + MultipartGateway>(
         gateway: Arc<G>,
         method: &str,
         extra_headers: &[(&str, &str)],
@@ -5192,6 +5199,8 @@ mod tests {
     }
 
     impl ContainerGateway for DefaultRangeSeamGateway {}
+
+    impl MultipartGateway for DefaultRangeSeamGateway {}
 
     impl ObjectGateway for DefaultRangeSeamGateway {
         async fn put_object_streaming<S>(
@@ -5312,6 +5321,8 @@ mod tests {
     }
 
     impl ContainerGateway for VersionSkewGateway {}
+
+    impl MultipartGateway for VersionSkewGateway {}
 
     impl ObjectGateway for VersionSkewGateway {
         async fn put_object_streaming<S>(

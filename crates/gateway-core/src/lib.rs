@@ -429,3 +429,394 @@ pub trait ContainerGateway: Send + Sync + 'static {
         std::future::ready(Ok(None))
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The multipart side of the seam (issue #666, the first slice of #508).
+//
+// Every answer below is a VALUE, never an error, and none names an HTTP status: the wire layer
+// maps each arm onto its protocol's answer. The vocabulary mirrors `wyrd_core::multipart`'s
+// typed outcomes arm for arm, with plain types in place of core's validated ones, so this crate
+// stays free of a `wyrd-core` dependency (ADR-0010: concretes meet only at the composition root).
+//
+// No enum here is `#[non_exhaustive]`, deliberately, as in core: every consumer is in this
+// workspace, and a new arm must break every wire mapping at compile time, never fall into a
+// `_ =>` arm that answers it with a silently wrong status.
+// ---------------------------------------------------------------------------------------------
+
+/// Why a part a multipart Complete named is invalid. Mirrors core's
+/// `multipart::InvalidPart` arm for arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultipartInvalidPart {
+    /// The named part was never committed under this upload, or was superseded.
+    Absent,
+    /// The ETag the client named is not the one the part recorded.
+    DigestMismatch,
+    /// The named part numbers are not strictly ascending: out of order, or one named twice.
+    OutOfOrder,
+}
+
+/// Which ceiling produced a [`MultipartRefusal::SlowDown`]: designed backpressure, not a
+/// failure. Mirrors core's `multipart::Backpressure` arm for arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultipartBackpressure {
+    /// The fleet's live-upload count is at its stored limit.
+    SessionCap {
+        /// The live upload count the ledger records.
+        count: u64,
+        /// The limit the ledger was checked against.
+        max_sessions: u64,
+    },
+    /// Every in-flight part slot of this upload is taken.
+    InflightParts {
+        /// How many parts one upload may have in flight at once.
+        max_inflight_parts: u32,
+    },
+    /// The create lost the serialized admission race this many times.
+    AdmissionContention {
+        /// Attempts spent.
+        attempts: u32,
+    },
+}
+
+/// A typed multipart answer other than success, shared by every [`MultipartGateway`] verb.
+///
+/// Mirrors core's `multipart::Refusal` arm for arm, plus two arms of the seam's own:
+/// [`PartNumberOutOfRange`](Self::PartNumberOutOfRange) (core only ever sees a validated part
+/// number, so it has no such arm) and [`NotImplemented`](Self::NotImplemented) (the answer of a
+/// gateway that does not serve multipart).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartRefusal {
+    /// No upload can serve this request: the upload id is unknown, does not parse as an upload
+    /// id at all, names an upload that has left the states this verb acts on, or names one that
+    /// already completed a **different** assembly.
+    NoSuchUpload,
+    /// The target container does not exist. Core's arm is `NoSuchBucket`; the seam speaks
+    /// container vocabulary, and the S3 crate alone projects containers as buckets.
+    NoSuchContainer,
+    /// The upload is being completed by a publisher that still owns it; no client verb resumes
+    /// it.
+    OperationAborted,
+    /// The named-part list of a Complete is invalid. The upload stays usable.
+    InvalidPart {
+        /// The offending part number.
+        part_number: u32,
+        /// What was wrong with it.
+        reason: MultipartInvalidPart,
+    },
+    /// A part, or the upload's cumulative staged chunks, is past a ceiling the protocol
+    /// enforces by refusal. The upload stays usable and abortable.
+    EntityTooLarge {
+        /// The chunk count the request would have installed.
+        chunks: u64,
+        /// The ceiling it crossed.
+        limit: u64,
+    },
+    /// Designed backpressure.
+    SlowDown {
+        /// Which ceiling engaged.
+        pressure: MultipartBackpressure,
+    },
+    /// This process's multipart budget disagrees with the one the fleet ledger records, so it
+    /// refuses rather than defer to either. Core's arm carries both budgets; they are an
+    /// operator's diagnosis (core raises the alarm), not anything a client is answered with, so
+    /// the seam carries the arm without them.
+    ProfileSkew,
+    /// The upload has spent all its Complete attempts; its only exit is Abort.
+    CompleteAttemptsExhausted,
+    /// The seam's own arm: a part number outside the range a part may take (S3 numbers parts
+    /// from 1), named by `upload_part` or in `complete_multipart_upload`'s list.
+    PartNumberOutOfRange {
+        /// The offending part number, as the caller sent it.
+        part_number: u32,
+    },
+    /// The seam's own arm: this gateway does not serve multipart uploads. It is what every
+    /// [`MultipartGateway`] default body answers.
+    NotImplemented,
+}
+
+/// What a completed upload published.
+///
+/// Core's publication also names the inode and version it flipped; the seam names no inode
+/// (as [`ObjectRead`] and [`ObjectMeta`] name none), so those stay behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartPublication {
+    /// The published object's ETag, its `-N` part-count suffix included. The wire layer quotes
+    /// it as S3's `ETag`.
+    pub etag: String,
+    /// When the publication landed (epoch millis).
+    pub modified: u64,
+}
+
+/// One part in a [`MultipartGateway::list_parts`] answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedPart {
+    /// The part number.
+    pub part_number: u32,
+    /// The part's ETag (its content digest, lowercase hex), unquoted.
+    pub etag: String,
+    /// The part's length in bytes.
+    pub size: u64,
+    /// When the part was committed (epoch millis).
+    pub modified: u64,
+}
+
+/// One in-progress upload in a [`MultipartGateway::list_multipart_uploads`] answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedUpload {
+    /// The object key the upload targets, relative to the container.
+    pub key: String,
+    /// The upload's id.
+    pub upload_id: String,
+    /// When the upload was created (epoch millis).
+    pub initiated: u64,
+}
+
+/// What [`MultipartGateway::create_multipart_upload`] answers. Mirrors core's
+/// `multipart::CreateOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartCreateAnswer {
+    /// The upload exists and is open for parts.
+    Created {
+        /// The upload's id, which every later verb on it names.
+        upload_id: String,
+    },
+    /// A typed refusal.
+    Refused(MultipartRefusal),
+}
+
+/// What [`MultipartGateway::upload_part`] answers. Mirrors core's
+/// `multipart::UploadPartOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartUploadPartAnswer {
+    /// The part is durable.
+    Committed {
+        /// The part number.
+        part_number: u32,
+        /// The part's ETag (its content digest, lowercase hex), unquoted.
+        etag: String,
+    },
+    /// A typed refusal.
+    Refused(MultipartRefusal),
+}
+
+/// What [`MultipartGateway::complete_multipart_upload`] answers. Mirrors core's
+/// `multipart::CompleteOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartCompleteAnswer {
+    /// The object is published by this call.
+    Published(MultipartPublication),
+    /// An identical earlier Complete already published it; this is that publication, as it was
+    /// recorded.
+    AlreadyCompleted(MultipartPublication),
+    /// A typed refusal; nothing was published.
+    Refused(MultipartRefusal),
+}
+
+/// What [`MultipartGateway::abort_multipart_upload`] answers. Mirrors core's
+/// `multipart::AbortOutcome`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartAbortAnswer {
+    /// The abort is accepted and durable. Reclaiming the parts' bytes happens afterwards, in
+    /// the background; it is not part of this answer.
+    Fenced,
+    /// The upload was already being aborted: an idempotent success.
+    AlreadyAborting,
+    /// A typed refusal.
+    Refused(MultipartRefusal),
+}
+
+/// What [`MultipartGateway::list_parts`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartListPartsAnswer {
+    /// The upload's **complete** part set, ascending by part number.
+    Listed(Vec<ListedPart>),
+    /// A typed refusal.
+    Refused(MultipartRefusal),
+}
+
+/// What [`MultipartGateway::list_multipart_uploads`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultipartListUploadsAnswer {
+    /// The container's **complete** set of in-progress uploads, sorted by key, then upload id.
+    Listed(Vec<ListedUpload>),
+    /// A typed refusal.
+    Refused(MultipartRefusal),
+}
+
+/// The parts a multipart Complete names: `(part number, ETag)` pairs in the order the client
+/// sent them, each ETag with the wire's quoting removed.
+///
+/// **Never empty.** [`NamedParts::new`] refuses an empty list, so a Complete that names no
+/// part (core refuses it as `RecordError::NoPartsNamed`) cannot reach the seam and needs no
+/// [`MultipartRefusal`] arm. The wire layer finds it while decoding the request and answers it
+/// as malformed there (S3: `MalformedXML`), as ADR-0045 places structural checks at decode.
+/// Nothing else is checked here: the part numbers' range and order are the implementer's (see
+/// [`MultipartGateway`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedParts(Vec<(u32, String)>);
+
+impl NamedParts {
+    /// The list, or `None` if it is empty.
+    pub fn new(parts: Vec<(u32, String)>) -> Option<Self> {
+        if parts.is_empty() {
+            None
+        } else {
+            Some(Self(parts))
+        }
+    }
+
+    /// The pairs, in the order the client sent them. Never empty.
+    pub fn as_slice(&self) -> &[(u32, String)] {
+        &self.0
+    }
+
+    /// The pairs by value, in the order the client sent them. Never empty.
+    pub fn into_vec(self) -> Vec<(u32, String)> {
+        self.0
+    }
+}
+
+/// The **multipart** side of the gateway seam — ADR-0046 decision 6, as for
+/// [`ContainerGateway`]: [`ObjectGateway`] stays object-only and bucket-free, and multipart
+/// uploads arrive as this narrow companion trait in neutral container/object vocabulary.
+/// Implemented by `wyrd-server` at the composition root per ADR-0010; the S3 crate alone
+/// speaks S3's multipart wire forms.
+///
+/// Each verb names the container and the object key as **separate** strings: an upload
+/// targets a container and an object in it.
+///
+/// **Answers are values.** Every protocol outcome, success or refusal, is an arm of the verb's
+/// answer type. `Err` means what it means on
+/// [`put_object_streaming`](ObjectGateway::put_object_streaming): the store failed, the body
+/// stream failed, or (for [`upload_part`](Self::upload_part) only) the body failed its
+/// [`ContentHash`] check as [`GatewayError::PayloadMismatch`]. It is never a protocol outcome.
+///
+/// **Arguments arrive unvalidated.** The upload id is a `&str` and the part number a `u32`;
+/// validating them is the implementer's. An upload id that does not parse answers
+/// [`MultipartRefusal::NoSuchUpload`] (it cannot name an upload), and a part number out of
+/// range answers [`MultipartRefusal::PartNumberOutOfRange`]. When a request has more than one
+/// fault, the part-number range check wins: it runs first, before the upload id is parsed or
+/// anything is looked up (as S3 servers order it). [`upload_part`](Self::upload_part) with an
+/// out-of-range part number therefore answers `PartNumberOutOfRange` whatever its upload id,
+/// and in [`complete_multipart_upload`](Self::complete_multipart_upload) the first
+/// out-of-range number in the list is the one carried. A Complete that names no part never
+/// reaches the seam: [`NamedParts`] cannot be empty.
+///
+/// **Listings are complete.** As with [`ContainerGateway::list_container`], the listing verbs
+/// return the whole set and the wire layer paginates.
+///
+/// Every method has a default body answering [`MultipartRefusal::NotImplemented`], so a
+/// gateway with no multipart support (the wire crate's own object-focused test doubles) needs
+/// only an empty `impl`.
+pub trait MultipartGateway: Send + Sync + 'static {
+    /// Open a new multipart upload of `key` in `container`. `content_type` is the writer's
+    /// declared `Content-Type` for the object the upload will publish (`None` if the client
+    /// sent none), round-tripped verbatim as on
+    /// [`put_object_streaming`](ObjectGateway::put_object_streaming).
+    fn create_multipart_upload(
+        &self,
+        container: &str,
+        key: &str,
+        content_type: Option<String>,
+    ) -> impl Future<Output = Result<MultipartCreateAnswer>> + Send {
+        let _ = (container, key, content_type);
+        std::future::ready(Ok(MultipartCreateAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        )))
+    }
+
+    /// Store part `part_number` of upload `upload_id`, its bytes arriving over `body`, without
+    /// ever holding the whole part in memory (the seam's streaming invariant, as on
+    /// [`put_object_streaming`](ObjectGateway::put_object_streaming)). `expected` is the
+    /// payload-integrity check, verified before the part commits; a body that fails it is
+    /// `Err(`[`GatewayError::PayloadMismatch`]`)`.
+    fn upload_part<S>(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: S,
+        expected: ContentHash,
+    ) -> impl Future<Output = Result<MultipartUploadPartAnswer>> + Send
+    where
+        S: Stream<Item = Result<Bytes>> + Send + Unpin + 'static,
+    {
+        let _ = (container, key, upload_id, part_number, body, expected);
+        std::future::ready(Ok(MultipartUploadPartAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        )))
+    }
+
+    /// Assemble upload `upload_id` into the object `key` from `named_parts`: the ordered,
+    /// non-empty list of `(part number, ETag)` the client sent (see [`NamedParts`]).
+    fn complete_multipart_upload(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+        named_parts: NamedParts,
+    ) -> impl Future<Output = Result<MultipartCompleteAnswer>> + Send {
+        let _ = (container, key, upload_id, named_parts);
+        std::future::ready(Ok(MultipartCompleteAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        )))
+    }
+
+    /// Abort upload `upload_id`, so it publishes nothing and its parts are reclaimed.
+    fn abort_multipart_upload(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> impl Future<Output = Result<MultipartAbortAnswer>> + Send {
+        let _ = (container, key, upload_id);
+        std::future::ready(Ok(MultipartAbortAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        )))
+    }
+
+    /// List the parts committed under upload `upload_id`: the complete set, ascending by part
+    /// number.
+    fn list_parts(
+        &self,
+        container: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> impl Future<Output = Result<MultipartListPartsAnswer>> + Send {
+        let _ = (container, key, upload_id);
+        std::future::ready(Ok(MultipartListPartsAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        )))
+    }
+
+    /// List `container`'s in-progress uploads: the complete set, sorted by key, then upload id.
+    fn list_multipart_uploads(
+        &self,
+        container: &str,
+    ) -> impl Future<Output = Result<MultipartListUploadsAnswer>> + Send {
+        let _ = container;
+        std::future::ready(Ok(MultipartListUploadsAnswer::Refused(
+            MultipartRefusal::NotImplemented,
+        )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NamedParts;
+
+    #[test]
+    fn named_parts_refuses_an_empty_list() {
+        assert_eq!(NamedParts::new(Vec::new()), None);
+    }
+
+    #[test]
+    fn named_parts_keeps_every_pair_in_the_order_sent() {
+        // Out of order on purpose: ordering is the implementer's check, never this type's.
+        let sent = vec![(3, "c".to_string()), (1, "a".to_string())];
+        let named = NamedParts::new(sent.clone()).expect("a non-empty list is accepted");
+        assert_eq!(named.as_slice(), sent.as_slice());
+        assert_eq!(named.into_vec(), sent);
+    }
+}
