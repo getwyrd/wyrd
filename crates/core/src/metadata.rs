@@ -1264,17 +1264,6 @@ impl ChunkMap {
         }
     }
 
-    /// The inline chunk list **by value**, or `None` when the map is segmented — the
-    /// owning counterpart of [`Self::as_flat`] for a consumer that holds the map (a
-    /// streamed read moving the list into its reader task) and would otherwise deep-clone
-    /// every placement vector just to get an owned copy.
-    pub fn into_flat(self) -> Option<Vec<ChunkRef>> {
-        match self {
-            Self::Flat(chunks) => Some(chunks),
-            Self::Segmented(_) => None,
-        }
-    }
-
     /// The segment table, or `None` when the map is flat.
     pub fn segmented(&self) -> Option<&SegmentedMap> {
         match self {
@@ -1613,12 +1602,13 @@ pub struct InodeRecord {
     /// Logical content length in bytes.
     pub size: u64,
     /// The ordered chunks making up the content — inline (**flat**) or named by a
-    /// segment table (**segmented**, proposal 0016 decision 7). Read it through
-    /// [`resolve_chunk_map`] (or [`resolve_current_chunk_map`], for a caller whose own
-    /// snapshot may already be stale): that is the ONE way a consumer able to reach the
-    /// store turns this field into an ordered chunk list (decision 7(e)). A consumer
-    /// that cannot — no store in hand — uses [`ChunkMap::as_flat`] and fails closed on a
-    /// segmented map; never treat [`ChunkMap::Segmented`] as an empty list.
+    /// segment table (**segmented**, proposal 0016 decision 7). Read it through the
+    /// resolver — [`resolve_chunk_map`], [`resolve_chunk_map_owned`] for a caller that owns
+    /// its snapshot and hands the list on, or [`resolve_current_chunk_map`] for a caller
+    /// whose own snapshot may already be stale: that is the ONE way a consumer able to
+    /// reach the store turns this field into an ordered chunk list (decision 7(e)). A
+    /// consumer that cannot — no store in hand — uses [`ChunkMap::as_flat`] and fails
+    /// closed on a segmented map; never treat [`ChunkMap::Segmented`] as an empty list.
     pub chunk_map: ChunkMap,
     /// Commit state.
     pub state: InodeState,
@@ -3007,21 +2997,30 @@ async fn resolve_snapshot<'a>(
         ChunkMap::Flat(chunks) => return Ok(Resolution::Answer(Cow::Borrowed(chunks))),
         ChunkMap::Segmented(map) => map,
     };
-    Ok(read_segments(store, root_key, map).await?.map(|segments| {
-        let mut chunks = Vec::new();
-        // Ordered by the segment's own parsed index — `BTreeMap`'s iteration order — so
-        // the object's bytes are assembled in the order its table names, never the order a
-        // page happened to answer in.
-        for (_index, segment) in segments {
-            chunks.extend(segment.into_chunks());
-        }
-        Cow::Owned(chunks)
-    }))
+    Ok(read_segments(store, root_key, map)
+        .await?
+        .map(|segments| Cow::Owned(assemble_segments(segments))))
+}
+
+/// A segmented generation's ordered chunk list, assembled from its `seg:` records.
+///
+/// Ordered by the segment's own parsed index — `BTreeMap`'s iteration order — so the
+/// object's bytes are assembled in the order its table names, never the order a page
+/// happened to answer in.
+fn assemble_segments(segments: BTreeMap<u32, SegmentRecord>) -> Vec<ChunkRef> {
+    let mut chunks = Vec::new();
+    for (_index, segment) in segments {
+        chunks.extend(segment.into_chunks());
+    }
+    chunks
 }
 
 /// Resolve a caller's own **committed snapshot** to its ordered chunk list — the entry
-/// for a consumer that has just read the root itself
-/// ([`read_object`](crate::read::read_object), the gateway's streaming and ranged reads).
+/// for a consumer that has just read the root itself and **borrows** it
+/// ([`read_object`](crate::read::read_object), the gateway's ranged read). A consumer that
+/// owns its snapshot and hands the list on (the gateway's streamed read) resolves through
+/// [`resolve_chunk_map_owned`] instead: borrowing here and then taking an owned list would
+/// deep-copy a flat map's every [`ChunkRef`].
 ///
 /// A flat map costs no read at all; a segmented one costs the bounded range
 /// `seg:<nonce>:<epoch>:` plus the one re-read that settles it (decision 7(e)).
@@ -3049,6 +3048,122 @@ pub async fn resolve_chunk_map<'a>(
             chunks,
         })),
         Resolution::Superseded => resolve_current_chunk_map(store, root_key).await,
+        Resolution::Gone => Ok(None),
+    }
+}
+
+/// A resolved chunk map **owned outright**, for a consumer that holds its committed
+/// snapshot by value and hands the list on (the gateway's streamed read moving it into
+/// its reader task) — the answer of [`resolve_chunk_map_owned`].
+///
+/// It carries the served generation's **framing** field by field instead of the whole
+/// [`InodeRecord`]: the record's `chunk_map` is what [`Self::chunks`] was moved out of, so
+/// keeping the record whole would mean either cloning it (and with it every chunk and
+/// placement vector) or carrying a record whose map no longer says what it held. Every
+/// field comes from the same generation the chunks came from — the caller's own snapshot,
+/// or the live root a retired resolution restarted onto — for the reason
+/// [`ResolvedChunkMap`] carries its `record`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedResolvedChunkMap {
+    /// That generation's logical content length ([`InodeRecord::size`]).
+    pub size: u64,
+    /// That generation's version ([`InodeRecord::version`]).
+    pub version: u64,
+    /// That generation's content digest ([`InodeRecord::etag`]).
+    pub etag: Option<String>,
+    /// That generation's declared `Content-Type` ([`InodeRecord::content_type`]).
+    pub content_type: Option<String>,
+    /// That generation's publication time ([`InodeRecord::modified`]).
+    pub modified: Option<u64>,
+    /// That generation's ordered chunk list.
+    pub chunks: Vec<ChunkRef>,
+}
+
+impl OwnedResolvedChunkMap {
+    /// Split an owned `record` into its framing plus `chunks`, dropping the record's own
+    /// `chunk_map` — the caller has already resolved that map into `chunks`.
+    fn framed_by(record: InodeRecord, chunks: Vec<ChunkRef>) -> Self {
+        let InodeRecord {
+            size,
+            version,
+            etag,
+            content_type,
+            modified,
+            chunk_map: _,
+            state: _,
+        } = record;
+        Self {
+            size,
+            version,
+            etag,
+            content_type,
+            modified,
+            chunks,
+        }
+    }
+}
+
+/// [`resolve_chunk_map`] for a caller that **owns** its committed snapshot and needs an
+/// owned chunk list: same resolution, same restart and deletion rules, same `Ok(None)`.
+///
+/// What owning the record buys is the flat case on a snapshot that is still live — the
+/// primary read path. Its chunk list is **moved** out of `record` (the record's own
+/// allocation, every placement vector untouched), where borrowing the record and then
+/// taking an owned list would deep-copy every [`ChunkRef`] (#686, restoring the move the
+/// streamed read made in `bbdb7c5`). A segmented map is assembled from its `seg:` records,
+/// owned already. A generation superseded mid-resolve restarts through
+/// [`resolve_current_chunk_map`], whose owned answer is passed on as is (that restart's
+/// own copy of a flat successor's list is unchanged here).
+pub async fn resolve_chunk_map_owned(
+    store: &dyn MetadataStore,
+    root_key: &[u8],
+    record: InodeRecord,
+) -> Result<Option<OwnedResolvedChunkMap>> {
+    let InodeRecord {
+        size,
+        version,
+        etag,
+        content_type,
+        modified,
+        chunk_map,
+        state: _,
+    } = record;
+    let map = match chunk_map {
+        // Nothing to read and nothing to settle — a flat map is one value, read atomically
+        // with the root — so the list leaves the record by move, never by copy.
+        ChunkMap::Flat(chunks) => {
+            return Ok(Some(OwnedResolvedChunkMap {
+                size,
+                version,
+                etag,
+                content_type,
+                modified,
+                chunks,
+            }))
+        }
+        ChunkMap::Segmented(map) => map,
+    };
+    match read_segments(store, root_key, &map).await? {
+        Resolution::Answer(segments) => Ok(Some(OwnedResolvedChunkMap {
+            size,
+            version,
+            etag,
+            content_type,
+            modified,
+            chunks: assemble_segments(segments),
+        })),
+        Resolution::Superseded => {
+            Ok(resolve_current_chunk_map(store, root_key)
+                .await?
+                .map(|resolved| {
+                    // `resolve_current_chunk_map` always builds both `Cow`s as `Owned` (it
+                    // owns the root it re-read), so `into_owned` unwraps them without copying.
+                    OwnedResolvedChunkMap::framed_by(
+                        resolved.record.into_owned(),
+                        resolved.chunks.into_owned(),
+                    )
+                }))
+        }
         Resolution::Gone => Ok(None),
     }
 }
