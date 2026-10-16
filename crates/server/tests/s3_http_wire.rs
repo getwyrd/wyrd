@@ -950,6 +950,7 @@ mod streaming_behaviour {
             .put_object_streaming(
                 "wyrd-bucket/streamed",
                 Box::pin(source),
+                (PIECES * CHUNK) as u64,
                 ContentHash::Unverified,
                 None,
             )
@@ -997,20 +998,27 @@ mod streaming_interop {
 
     /// The seed headers + the context to chain chunk signatures from, exactly as a real SDK
     /// derives them: the seed request is signed over the `STREAMING-…-PAYLOAD` sentinel (the
-    /// body is not available whole at signing time).
-    fn streaming_seed(path: &str, host: &str) -> (Vec<(String, String)>, StreamingContext) {
+    /// body is not available whole at signing time), and declares the object's length in a
+    /// signed `x-amz-decoded-content-length`, which the gateway requires (#671).
+    fn streaming_seed(
+        path: &str,
+        host: &str,
+        decoded_len: usize,
+    ) -> (Vec<(String, String)>, StreamingContext) {
         let creds = Credentials {
             access_key_id: ACCESS_KEY.to_string(),
             secret_access_key: SECRET_KEY.to_string(),
         };
         let amz_date = format_amz_date(SystemTime::now());
-        let signed = wyrd_gateway_s3::sigv4::sign_with_payload_hash(
+        let decoded_len = decoded_len.to_string();
+        let signed = wyrd_gateway_s3::sigv4::sign_with_payload_hash_and_headers(
             "PUT",
             path,
             "",
             host,
             &amz_date,
             STREAMING_SENTINEL,
+            &[("x-amz-decoded-content-length", &decoded_len)],
             &creds,
             REGION,
             "s3",
@@ -1031,12 +1039,14 @@ mod streaming_interop {
             signed: true,
             // The plain, no-trailer sentinel this module drives — no trailer declaration.
             trailer: None,
+            decoded_content_length: decoded_len.parse().ok(),
         };
         let headers = vec![
             ("authorization".to_string(), signed.authorization),
             ("x-amz-date".to_string(), signed.amz_date),
             ("x-amz-content-sha256".to_string(), signed.content_sha256),
             ("content-encoding".to_string(), "aws-chunked".to_string()),
+            ("x-amz-decoded-content-length".to_string(), decoded_len),
         ];
         (headers, ctx)
     }
@@ -1066,11 +1076,12 @@ mod streaming_interop {
         let host = addr.to_string();
         let path = "/wyrd-bucket/streamed-by-a-real-sdk";
         // Larger than the 8-byte chunk size AND spanning several aws-chunked frames, so the
-        // decode + re-chunk onto the store is genuinely exercised.
-        let object: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        // decode + re-chunk onto the store is genuinely exercised. Under the gateway's
+        // single-PUT ceiling (158 × 8 = 1,264 bytes, #671): 125 store chunks, 8 frames.
+        let object: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
 
-        let (headers, ctx) = streaming_seed(path, &host);
-        let framed = frame(&ctx, &object, 512);
+        let (headers, ctx) = streaming_seed(path, &host, object.len());
+        let framed = frame(&ctx, &object, 128);
         let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
         assert_eq!(
             status, 200,
@@ -1098,10 +1109,11 @@ mod streaming_interop {
         let (addr, _dir) = start_gateway().await;
         let host = addr.to_string();
         let path = "/wyrd-bucket/streamed-tampered";
-        let object = vec![b'q'; 2000];
+        // Under the single-PUT ceiling (#671), so the refusal is the tampered chunk's own.
+        let object = vec![b'q'; 1000];
 
-        let (headers, ctx) = streaming_seed(path, &host);
-        let mut framed = frame(&ctx, &object, 512);
+        let (headers, ctx) = streaming_seed(path, &host, object.len());
+        let mut framed = frame(&ctx, &object, 256);
         // Flip a byte inside the first chunk's DATA (past its header line): the chunk
         // signature no longer matches, so fail-closed auth must refuse the upload.
         let first_data = framed
@@ -1186,8 +1198,9 @@ mod real_sdk_interop {
         let bucket = "wyrd-bucket";
         let key = "real-sdk/round-trip-object";
         // Larger than the 8-byte chunk size so the object genuinely spans several chunks over
-        // whatever wire form (single-shot or aws-chunked) the SDK chooses.
-        let object: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+        // whatever wire form (single-shot or aws-chunked) the SDK chooses, and under the
+        // gateway's single-PUT ceiling (158 × 8 = 1,264 bytes, #671).
+        let object: Vec<u8> = (0..1200u32).map(|i| (i % 251) as u8).collect();
 
         // PUT — the SDK signs + frames this itself (its own SigV4 + aws-chunked codec).
         client

@@ -1148,6 +1148,13 @@ export WYRD_S3_ACCESS_KEY=... WYRD_S3_SECRET_KEY=...
 # stated so the invocation records it. Accepted 1048576..=16777216 (1 to 16 MiB): the
 # floor keeps a single PUT's flat chunk map inside the metadata value ceiling, the ceiling
 # is set by the D-server gRPC message limit; any other value refuses to start.
+# The chunk size c also sets the object size limit: one PUT holds at most 158 × c bytes
+# (158 MiB at 1 MiB, about 2.47 GiB at 16 MiB), and a PUT declaring more is refused
+# 400 EntityTooLarge before its body is read. A PUT must declare its length
+# (Content-Length, or x-amz-decoded-content-length for aws-chunked), else 411.
+# Multipart upload is not supported yet (it answers 501). Once it is, a part will hold up
+# to 158 × c and an object up to 80,896 × c in at most 10,000 parts (about 79 GiB at
+# 1 MiB, 1.23 TiB at 16 MiB). Until then, raise --chunk-size to accept larger objects.
 # --endpoints are the D servers from B.4.
 wyrd s3 \
   --metadata-backend fdb \

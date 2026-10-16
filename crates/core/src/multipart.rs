@@ -4754,8 +4754,9 @@ pub const VALUE_CHUNK_CAPACITY: u32 = value_chunk_capacity(MAX_CHUNKREF_BYTES);
 const _: () = assert!(VALUE_CHUNK_CAPACITY as usize * MAX_CHUNKREF_BYTES <= MAX_ROOT_VALUE_BYTES);
 
 /// The most chunks a **flat** inode chunk map may name (`0016:1464`). A multipart publication
-/// past it segments (decision 7); a single `PutObject` picks a larger chunk instead
-/// (`0016:1057-1060`). Never an over-budget value.
+/// past it segments (decision 7). A single `PutObject` is always one flat map at the
+/// deployment's chunk size, so it is capped at [`max_single_put_bytes`] and refused past it
+/// (#671). Never an over-budget value.
 pub const MAX_MAP_CHUNKS: u32 = VALUE_CHUNK_CAPACITY;
 
 /// The most chunks one `seg:` record may name (`0016:1465`) — the same one-value rule — and the
@@ -4777,9 +4778,34 @@ pub const MAX_PART_CHUNKS: u32 = VALUE_CHUNK_CAPACITY;
 /// `part:` commit, never discovered at the backend (`0016:1500`). `chunk_size` is #508's knob
 /// (`0016:1474`), hence an argument; a product past `u64` saturates, refusing nothing a `u64`
 /// length could name.
+///
+/// Derived through [`one_value_bytes`], the same rule as [`max_single_put_bytes`], so a part
+/// and a single PUT can never disagree about what one value holds.
 pub const fn max_part_bytes(chunk_size: u64) -> u64 {
-    (MAX_PART_CHUNKS as u64).saturating_mul(chunk_size)
+    one_value_bytes(chunk_size)
 }
+
+/// The largest single `PutObject` at `chunk_size` bytes per chunk:
+/// `MAX_MAP_CHUNKS × chunk_size` (158 MiB at the default 1 MiB chunk). A single PUT is
+/// published as ONE flat map, one value, so it holds at most [`MAX_MAP_CHUNKS`] refs; a PUT
+/// whose declared length is above this is refused before any of its bytes are written (#671),
+/// never published over budget. Saturates like [`max_part_bytes`].
+pub const fn max_single_put_bytes(chunk_size: u64) -> u64 {
+    one_value_bytes(chunk_size)
+}
+
+/// The bytes one value's chunk list holds at `chunk_size` bytes per chunk:
+/// [`VALUE_CHUNK_CAPACITY`] `× chunk_size`, saturating. The ONE derivation both
+/// [`max_single_put_bytes`] (a flat inode map) and [`max_part_bytes`] (a `part:` record) read,
+/// so `PutObject` and `UploadPart` share it (#671).
+const fn one_value_bytes(chunk_size: u64) -> u64 {
+    (VALUE_CHUNK_CAPACITY as u64).saturating_mul(chunk_size)
+}
+
+// Both ceilings are "one value's worth of refs": tie the two caps to the shared capacity, so
+// retuning either one alone fails the build instead of splitting the derivation.
+const _: () = assert!(MAX_MAP_CHUNKS == VALUE_CHUNK_CAPACITY);
+const _: () = assert!(MAX_PART_CHUNKS == VALUE_CHUNK_CAPACITY);
 
 /// The most parts one session may hold — S3's per-upload limit, the front door these verbs
 /// serve (#508; `0016:2845`). A **capacity**, checked where a part number is admitted; the key

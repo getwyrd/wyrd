@@ -5239,6 +5239,7 @@ dependencies = [
  "tokio",
  "wyrd-chunkstore-fs",
  "wyrd-coordination-mem",
+ "wyrd-core",
  "wyrd-gateway-s3",
  "wyrd-metadata-redb",
  "wyrd-server",
