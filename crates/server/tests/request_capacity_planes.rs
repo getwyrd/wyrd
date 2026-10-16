@@ -199,6 +199,7 @@ impl ObjectGateway for FaultyGateway {
         &self,
         _key: &str,
         _source: S,
+        _declared_len: u64,
         _expected: ContentHash,
         _content_type: Option<String>,
     ) -> Result<String>
@@ -270,6 +271,7 @@ impl ObjectGateway for MidStreamFaultGateway {
         &self,
         _key: &str,
         _source: S,
+        _declared_len: u64,
         _expected: ContentHash,
         _content_type: Option<String>,
     ) -> Result<String>

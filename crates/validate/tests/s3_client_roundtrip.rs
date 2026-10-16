@@ -91,6 +91,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_coordination_mem::MemCoordination;
+use wyrd_core::multipart::{max_single_put_bytes, MAX_MAP_CHUNKS};
 use wyrd_gateway_s3::sigv4::Credentials as GatewayCredentials;
 use wyrd_gateway_s3::{S3Config, S3Gateway};
 use wyrd_metadata_redb::RedbMetadataStore;
@@ -156,6 +157,32 @@ fn window() -> u64 {
 /// The streaming payload: at least `8 × W`, in whole pieces.
 fn streaming_payload(window: u64) -> u64 {
     (8 * window).div_ceil(PIECE as u64) * PIECE as u64
+}
+
+/// The largest chunk size `wyrd s3 --chunk-size` accepts (16 MiB).
+const LARGEST_CHUNK: u64 = 16 * 1024 * 1024;
+
+/// The chunk size for a gateway that must take a `len`-byte object in ONE PUT: a single PUT is
+/// one flat map of at most `MAX_MAP_CHUNKS` chunks, so the gateway refuses anything past
+/// [`max_single_put_bytes`] (#671). [`GATEWAY_CHUNK`] holds the streaming payload at the
+/// Linux default `tcp_wmem[2]` (4 MiB); a host with a larger send buffer makes a larger payload,
+/// and the chunk is raised just enough to keep it one PUT. Past the largest chunk a gateway
+/// runs, no gateway can take the payload in one PUT, and the test says so rather than failing
+/// on an `EntityTooLarge` it did not ask about.
+fn chunk_for_single_put(len: u64) -> usize {
+    let chunk = len
+        .div_ceil(u64::from(MAX_MAP_CHUNKS))
+        .max(GATEWAY_CHUNK as u64);
+    assert!(
+        chunk <= LARGEST_CHUNK,
+        "this host's tcp_wmem[2] ({} bytes) makes the streaming payload {len} bytes, past the \
+         largest single PUT any gateway publishes ({} bytes at a {LARGEST_CHUNK}-byte chunk); \
+         the streaming legs cannot run here",
+        client_send_queue_cap(),
+        max_single_put_bytes(LARGEST_CHUNK)
+    );
+    assert!(len <= max_single_put_bytes(chunk));
+    chunk as usize
 }
 
 // --- payload -------------------------------------------------------------------------------
@@ -289,6 +316,11 @@ struct GatewayFixture {
 }
 
 async fn start_gateway() -> GatewayFixture {
+    start_gateway_with_chunk(GATEWAY_CHUNK).await
+}
+
+/// As [`start_gateway`], at `chunk` bytes per chunk.
+async fn start_gateway_with_chunk(chunk: usize) -> GatewayFixture {
     let dir = tempfile::tempdir().expect("temp dir");
     let gateway = Arc::new(
         Gateway::new(
@@ -296,7 +328,7 @@ async fn start_gateway() -> GatewayFixture {
             FsChunkStore::open(dir.path()).expect("fs store"),
             MemCoordination::new(),
         )
-        .with_chunk_size(GATEWAY_CHUNK),
+        .with_chunk_size(chunk),
     );
     let config = S3Config::new(vec![GatewayCredentials {
         access_key_id: ACCESS_KEY.to_string(),
@@ -988,7 +1020,7 @@ async fn error_response_fields_equal_what_the_gateway_sent() {
 async fn put_streams_within_the_window_at_every_pull() {
     let w = window();
     let len = streaming_payload(w);
-    let gateway = start_gateway().await;
+    let gateway = start_gateway_with_chunk(chunk_for_single_put(len)).await;
     let relay = Relay::start(gateway.addr, Downstream::Free).await;
     let client = client(relay.addr);
 
@@ -1047,7 +1079,7 @@ async fn put_streams_within_the_window_at_every_pull() {
 async fn get_hands_over_pieces_within_the_window() {
     let w = window();
     let len = streaming_payload(w);
-    let gateway = start_gateway().await;
+    let gateway = start_gateway_with_chunk(chunk_for_single_put(len)).await;
     put_generated(&client_direct(&gateway), "streamed-get", len).await;
 
     let relay = Relay::start(gateway.addr, Downstream::Paced { window: w }).await;

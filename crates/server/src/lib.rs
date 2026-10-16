@@ -31,7 +31,9 @@ use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::Instrument;
 use wyrd_core::metadata::{self, EcScheme, InodeId};
-use wyrd_core::multipart::MAX_MAP_CHUNKS;
+use wyrd_core::multipart::{
+    max_part_bytes, max_single_put_bytes, MAX_MAP_CHUNKS, MAX_STAGED_CHUNKS,
+};
 use wyrd_core::{read, write};
 use wyrd_traits::{
     ChunkId, CommitOutcome, Coordination, MetadataStore, PlacementChunkStore, Result,
@@ -86,22 +88,35 @@ pub(crate) const MAX_CHUNK_SIZE: usize = 16 << 20;
 /// `MAX_CHUNKREF_BYTES`, `VALUE_CHUNK_CAPACITY`, `MAX_MAP_CHUNKS`), where
 /// `MAX_ROOT_VALUE_BYTES` is the half of FoundationDB's `MAX_VALUE_BYTES = 100_000` that a
 /// chunk table may spend (`crates/core/src/metadata.rs`). So the largest single-PUT object a
-/// gateway can publish is `MAX_MAP_CHUNKS × chunk_size`, linear in the chunk size.
-const SUPPORTED_FLAT_OBJECT_BYTES: usize = MAX_MAP_CHUNKS as usize * DEFAULT_CHUNK_SIZE;
+/// gateway can publish is `MAX_MAP_CHUNKS × chunk_size`, linear in the chunk size
+/// ([`max_single_put_bytes`], the one derivation the PUT refusal reads too, #671).
+const SUPPORTED_FLAT_OBJECT_BYTES: usize = max_single_put_bytes(DEFAULT_CHUNK_SIZE as u64) as usize;
 /// The smallest chunk size `wyrd s3 --chunk-size` accepts: 1 MiB, inclusive — derived, the
 /// smallest chunk whose flat map still holds [`SUPPORTED_FLAT_OBJECT_BYTES`] inside
 /// [`MAX_MAP_CHUNKS`] refs.
 ///
-/// Below it the gateway would accept objects it cannot publish: at 1 byte a ~1 KiB object
-/// already names over a thousand refs, and every PUT past `MAX_MAP_CHUNKS × chunk_size`
-/// writes all its chunks and fragments and only then fails the metadata commit, leaving
-/// leased garbage behind. The flag may move the single-PUT envelope up (with
-/// [`MAX_CHUNK_SIZE`]), never below what the default gateway stores. This is also the floor
+/// Below it the gateway would refuse objects the default gateway stores: at 1 byte a ~1 KiB
+/// object already names over a thousand refs, and every PUT past `MAX_MAP_CHUNKS ×
+/// chunk_size` is refused `EntityTooLarge` (#671). The flag may move the single-PUT envelope
+/// up (with [`MAX_CHUNK_SIZE`]), never below what the default gateway stores. This is also the floor
 /// of proposal 0016's `chunk_size` knob range, `[1 MiB, chunk_size_max]`. Lowering it means
 /// landing segmented publication for single PUTs first.
 pub(crate) const MIN_CHUNK_SIZE: usize =
     SUPPORTED_FLAT_OBJECT_BYTES.div_ceil(MAX_MAP_CHUNKS as usize);
 const _: () = assert!(MIN_CHUNK_SIZE <= DEFAULT_CHUNK_SIZE && DEFAULT_CHUNK_SIZE <= MAX_CHUNK_SIZE);
+/// S3's own limit on one PUT and on one part: 5 GiB.
+const S3_MAX_PUT_BYTES: u64 = 5 << 30;
+// S3's 5 GiB limit on a single PUT and on one part cannot be reached while the flat-map and
+// part ceilings at the largest chunk stay below it (158 × 16 MiB ≈ 2.47 GiB), so the gateway
+// carries no runtime 5 GiB check. Pinned here so raising `MAX_CHUNK_SIZE` past about 33 MiB
+// fails the build until that check arrives with it (#671).
+const _: () = assert!(max_single_put_bytes(MAX_CHUNK_SIZE as u64) <= S3_MAX_PUT_BYTES);
+const _: () = assert!(max_part_bytes(MAX_CHUNK_SIZE as u64) <= S3_MAX_PUT_BYTES);
+// Objects above the single-PUT ceiling are multipart's: at the smallest chunk `--chunk-size`
+// accepts, a multipart object still holds more than proposal 0016's 10 GiB launch requirement
+// (80,896 chunks of 1 MiB, about 79 GiB). Lowering the floor or the staged cap below that
+// fails the build (#671).
+const _: () = assert!(MAX_STAGED_CHUNKS as u64 * MIN_CHUNK_SIZE as u64 > 10 << 30);
 /// Default pending-ledger lease lifetime.
 const DEFAULT_LEASE_TTL_MILLIS: u64 = 30_000;
 /// Coordination group under which gateway nodes register for discovery.
@@ -235,7 +250,12 @@ where
     /// existing one. Runs the four-phase write protocol; the commit is atomic and
     /// conditional, so a concurrent writer would lose with an error rather than
     /// corrupt the object.
+    ///
+    /// A buffered PUT is one flat map like any other single PUT, so `data` longer than
+    /// [`max_single_put_bytes`] at this gateway's chunk size is refused with
+    /// [`GatewayError::EntityTooLarge`] before any chunk is planned or written (#671).
     pub async fn put_object(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.admit_single_put(data.len() as u64)?;
         let mut plan = write::plan_write(data, self.chunk_size, self.durability, || {
             self.mint_chunk_id()
         })?;
@@ -257,6 +277,23 @@ where
             modified: Some(now_millis()),
         };
         self.commit_written(key, &plan).await
+    }
+
+    /// The largest object one PUT can publish at this gateway's chunk size: one flat map of
+    /// at most `MAX_MAP_CHUNKS` refs ([`max_single_put_bytes`]).
+    fn single_put_limit(&self) -> u64 {
+        max_single_put_bytes(self.chunk_size as u64)
+    }
+
+    /// Admit a single PUT of `declared` bytes, or refuse it with
+    /// [`GatewayError::EntityTooLarge`] when its flat map would pass `MAX_MAP_CHUNKS` refs.
+    /// Every single-PUT path calls this before it writes anything (#671).
+    fn admit_single_put(&self, declared: u64) -> Result<()> {
+        let limit = self.single_put_limit();
+        if declared > limit {
+            return Err(GatewayError::EntityTooLarge { declared, limit }.into());
+        }
+        Ok(())
     }
 
     /// Phase 3–4 (commit + release) shared by the buffered and streaming PUT paths:
@@ -361,17 +398,24 @@ where
     /// authenticated request). The data phase is leased garbage until the commit, so a body
     /// whose running SHA-256 does not match [`ContentHash::Expected`] is rejected **before**
     /// it is published — the write never commits and the sweep reclaims it.
+    ///
+    /// `declared_len` is checked against the single-PUT ceiling **before `source` is polled**,
+    /// so an oversize PUT is refused from its headers with nothing read or written; the body
+    /// is then held to `declared_len` ([`DeclaredLengthSource`]), so no front door can stream
+    /// a flat map past `MAX_MAP_CHUNKS` refs by under-declaring (#671).
     async fn put_object_streaming<S>(
         &self,
         key: &str,
         source: S,
+        declared_len: u64,
         expected: ContentHash,
         content_type: Option<String>,
     ) -> Result<String>
     where
         S: futures_util::Stream<Item = Result<Bytes>> + Send + Unpin + 'static,
     {
-        let mut hashing = HashingSource::new(source);
+        self.admit_single_put(declared_len)?;
+        let mut hashing = HashingSource::new(DeclaredLengthSource::new(source, declared_len));
         let mut plan = write::stream_write_data(
             &self.meta,
             &self.chunks,
@@ -868,6 +912,75 @@ impl<S> HashingSource<S> {
     }
 }
 
+/// A PUT body held to its declared length (#671): forwards the inner stream's bytes
+/// unchanged, but answers [`GatewayError::LengthMismatch`] **instead of** the frame that
+/// would carry the running total past `declared` (so those bytes never reach the write
+/// path), and again if the inner stream ends short of `declared`. After either error, or a
+/// clean end, it yields nothing more and never polls the inner stream again. `Unpin` for the
+/// same reason [`HashingSource`] is.
+struct DeclaredLengthSource<S> {
+    inner: S,
+    declared: u64,
+    seen: u64,
+    finished: bool,
+}
+
+impl<S> DeclaredLengthSource<S> {
+    fn new(inner: S, declared: u64) -> Self {
+        Self {
+            inner,
+            declared,
+            seen: 0,
+            finished: false,
+        }
+    }
+}
+
+impl<S> futures_util::Stream for DeclaredLengthSource<S>
+where
+    S: futures_util::Stream<Item = Result<Bytes>> + Unpin,
+{
+    type Item = Result<Bytes>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+        let mismatch = GatewayError::LengthMismatch {
+            declared: this.declared,
+        };
+        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                let total = this.seen.saturating_add(bytes.len() as u64);
+                if total > this.declared {
+                    this.finished = true;
+                    return Poll::Ready(Some(Err(mismatch.into())));
+                }
+                this.seen = total;
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                this.finished = true;
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                this.finished = true;
+                if this.seen == this.declared {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Err(mismatch.into())))
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Lower-case hex encoding of `bytes` — used to render the streamed body's digest for the
 /// constant-time comparison against the wire layer's [`ContentHash::Expected`] claim.
 fn hex(bytes: &[u8]) -> String {
@@ -928,5 +1041,61 @@ mod tests {
     #[test]
     fn default_chunk_size_is_one_mib() {
         assert_eq!(DEFAULT_CHUNK_SIZE, 1 << 20);
+    }
+
+    fn frames(sizes: &[usize]) -> impl futures_util::Stream<Item = Result<Bytes>> + Unpin {
+        let items: Vec<Result<Bytes>> = sizes
+            .iter()
+            .map(|&n| Ok(Bytes::from(vec![7u8; n])))
+            .collect();
+        futures_util::stream::iter(items)
+    }
+
+    fn drain(
+        mut source: DeclaredLengthSource<impl futures_util::Stream<Item = Result<Bytes>> + Unpin>,
+    ) -> (usize, Option<wyrd_traits::BoxError>) {
+        pollster::block_on(async {
+            let mut passed = 0;
+            while let Some(item) = source.next().await {
+                match item {
+                    Ok(bytes) => passed += bytes.len(),
+                    Err(err) => {
+                        assert!(source.next().await.is_none(), "nothing after the error");
+                        return (passed, Some(err));
+                    }
+                }
+            }
+            (passed, None)
+        })
+    }
+
+    fn is_mismatch(err: &wyrd_traits::BoxError, declared: u64) -> bool {
+        err.downcast_ref::<GatewayError>() == Some(&GatewayError::LengthMismatch { declared })
+    }
+
+    /// #671: a body of exactly its declared length passes through whole.
+    #[test]
+    fn a_body_of_its_declared_length_passes_whole() {
+        let (passed, err) = drain(DeclaredLengthSource::new(frames(&[4, 4, 2]), 10));
+        assert_eq!(passed, 10);
+        assert!(err.is_none());
+    }
+
+    /// #671: the frame that would carry the total past the declared length is replaced by
+    /// `LengthMismatch`, so none of its bytes reach the write path, and the stream ends there.
+    #[test]
+    fn a_body_past_its_declared_length_is_cut_before_the_crossing_frame() {
+        let (passed, err) = drain(DeclaredLengthSource::new(frames(&[4, 4, 4, 4]), 10));
+        assert_eq!(passed, 8, "only the frames inside the declared length pass");
+        assert!(is_mismatch(&err.expect("refused"), 10));
+    }
+
+    /// #671: a body that ends short of its declared length ends in `LengthMismatch`, never a
+    /// clean end the write path would commit.
+    #[test]
+    fn a_body_short_of_its_declared_length_ends_in_an_error() {
+        let (passed, err) = drain(DeclaredLengthSource::new(frames(&[4, 4]), 10));
+        assert_eq!(passed, 8);
+        assert!(is_mismatch(&err.expect("refused"), 10));
     }
 }

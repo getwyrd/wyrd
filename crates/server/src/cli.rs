@@ -523,6 +523,27 @@ fn usage() {
         crate::MAX_CHUNK_SIZE >> 20
     );
     eprintln!("  value ceiling, the ceiling is set by the D-server gRPC message limit.");
+    // The size limits the chunk size implies (#671), from the one core derivation. Multipart
+    // still answers 501, so its limits are stated as future ones, not as a remedy.
+    eprintln!(
+        "  The chunk size c sets the object size limit: one PUT holds at most {} x c bytes",
+        wyrd_core::multipart::MAX_MAP_CHUNKS
+    );
+    eprintln!(
+        "  ({} MiB at 1 MiB, about 2.47 GiB at 16 MiB); a larger PUT is refused EntityTooLarge.",
+        wyrd_core::multipart::max_single_put_bytes(1 << 20) >> 20
+    );
+    eprintln!(
+        "  Multipart upload is not supported yet. Once it is, a part will hold up to {} x c",
+        wyrd_core::multipart::MAX_PART_CHUNKS
+    );
+    eprintln!(
+        "  bytes and an object up to {} x c in at most {} parts (about 79 GiB at 1 MiB,",
+        wyrd_core::multipart::MAX_STAGED_CHUNKS,
+        wyrd_core::multipart::MAX_PARTS_PER_SESSION
+    );
+    eprintln!("  1.23 TiB at 16 MiB). Until then, a larger --chunk-size is the way to accept");
+    eprintln!("  larger objects.");
 }
 
 /// Parse a `--durability` value: `rs(k,m)` (Reed-Solomon) or `none`/`replication(1)`.

@@ -36,6 +36,7 @@
 //! **before** any of its body is buffered, never read to a silent truncated `200 OK`.
 
 use std::fmt;
+use std::pin::Pin;
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -181,35 +182,45 @@ pub fn sign_trailer(
     ))
 }
 
+/// A decoded `aws-chunked` body: the raw object bytes, chunk by chunk.
+pub type DecodedStream = Pin<Box<dyn Stream<Item = Result<Bytes>> + Send>>;
+
 /// Decode an `aws-chunked` body: strip the chunk framing, verify each chunk (for a signed
 /// stream), and yield the raw object bytes as a stream — the same `Stream<Item = Result<Bytes>>`
 /// shape [`crate::Gateway::put_object_streaming`] consumes. Runs on a spawned task feeding a
 /// bounded channel, so the object is never resident whole.
-pub fn decode<S>(source: S, ctx: StreamingContext) -> ReceiverStream<Result<Bytes>>
+///
+/// The task is spawned **lazily**, on the stream's first poll: a write path that refuses the
+/// PUT from its headers (a declared length past its ceiling, #671) never polls, so not one
+/// body byte is read for it.
+pub fn decode<S>(source: S, ctx: StreamingContext) -> DecodedStream
 where
     S: Stream<Item = Result<Bytes>> + Send + Unpin + 'static,
 {
-    // A small bound so peak resident bytes stay O(chunk size): the decoder blocks here until
-    // the write path drains a decoded chunk.
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
-    tokio::spawn(async move {
-        let mut decoder = Decoder::new(source, ctx);
-        loop {
-            match decoder.next_chunk().await {
-                Ok(Some(data)) => {
-                    if tx.send(Ok(data)).await.is_err() {
-                        break; // receiver gone (write aborted) — stop decoding.
+    let started = futures_util::stream::once(async move {
+        // A small bound so peak resident bytes stay O(chunk size): the decoder blocks here
+        // until the write path drains a decoded chunk.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(4);
+        tokio::spawn(async move {
+            let mut decoder = Decoder::new(source, ctx);
+            loop {
+                match decoder.next_chunk().await {
+                    Ok(Some(data)) => {
+                        if tx.send(Ok(data)).await.is_err() {
+                            break; // receiver gone (write aborted) — stop decoding.
+                        }
+                    }
+                    Ok(None) => break, // final (zero-length) chunk consumed cleanly.
+                    Err(err) => {
+                        let _ = tx.send(Err(err)).await;
+                        break;
                     }
                 }
-                Ok(None) => break, // final (zero-length) chunk consumed cleanly.
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                }
             }
-        }
+        });
+        ReceiverStream::new(rx)
     });
-    ReceiverStream::new(rx)
+    Box::pin(started.flatten())
 }
 
 /// A stateful `aws-chunked` parser over a rolling byte buffer. Pulls from the inner stream
@@ -236,8 +247,9 @@ struct Decoder<S> {
     /// for the plain no-trailer sentinel) — checked against the declared trailer value once
     /// the trailer section is consumed (issue #505: validated, not consumed-and-trusted).
     checksum: Option<RunningChecksum>,
-    /// De-framed object bytes seen so far, checked against a declared
-    /// `x-amz-decoded-content-length` once the trailer is consumed.
+    /// De-framed object bytes seen so far, held to the declared
+    /// `x-amz-decoded-content-length` as each chunk header arrives and checked for a short
+    /// body at the terminating chunk (#671).
     decoded_len: u64,
 }
 
@@ -349,6 +361,19 @@ where
             )));
         }
 
+        // Hold the stream to its declared object length WHILE it streams (#671): a chunk
+        // whose declared size would carry the de-framed total past
+        // `x-amz-decoded-content-length` is refused on its header, before any of its data is
+        // buffered or forwarded — so a stream never writes more than it declared, and the
+        // write path's ceiling check on that declaration binds.
+        if let Some(declared) = self.ctx.decoded_content_length {
+            if self.decoded_len.saturating_add(size as u64) > declared {
+                return Err(framing(
+                    "the streamed body is longer than its x-amz-decoded-content-length",
+                ));
+            }
+        }
+
         // 2. The chunk data plus its trailing CRLF — EXCEPT for the terminating chunk of a
         // `-TRAILER` framing (issue #505), which has no data/CRLF of its own: the trailer
         // section follows directly after the chunk header's own CRLF, exactly as HTTP/1.1
@@ -395,7 +420,11 @@ where
 
         if size == 0 {
             if let Some(trailer) = self.ctx.trailer.clone() {
+                // The trailer path checks the decoded length itself, after the checksum —
+                // the order it has always reported a trailer stream's faults in.
                 self.consume_trailer(&trailer).await?;
+            } else {
+                self.check_decoded_length()?;
             }
             self.done = true;
             return Ok(None);
@@ -529,13 +558,7 @@ where
             return Err(Box::new(StreamingError::ChecksumMismatch));
         }
 
-        if let Some(expected_len) = trailer.decoded_content_length {
-            if expected_len != self.decoded_len {
-                return Err(framing(
-                    "x-amz-decoded-content-length does not match the streamed body",
-                ));
-            }
-        }
+        self.check_decoded_length()?;
 
         // No half-accept on trailing garbage either: pull once more (or until EOF) and
         // refuse if the client sent anything past the logical end of the aws-chunked body,
@@ -549,6 +572,20 @@ where
             return Err(framing("bytes present after the aws-chunked trailer block"));
         }
 
+        Ok(())
+    }
+
+    /// At the end of the stream, refuse a body that delivered a different number of
+    /// de-framed bytes than its declared `x-amz-decoded-content-length` (every variant, #671;
+    /// an over-long body was already refused at the chunk that passed it).
+    fn check_decoded_length(&self) -> Result<()> {
+        if let Some(expected_len) = self.ctx.decoded_content_length {
+            if expected_len != self.decoded_len {
+                return Err(framing(
+                    "x-amz-decoded-content-length does not match the streamed body",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -595,6 +632,7 @@ mod tests {
             scope: "20130524/us-east-1/s3/aws4_request".to_string(),
             signed: true,
             trailer: None,
+            decoded_content_length: None,
         }
     }
 
@@ -685,6 +723,62 @@ mod tests {
                 .expect("a well-signed body decodes");
             assert_eq!(decoded, object, "piece size {piece}");
         }
+    }
+
+    /// #671: the plain `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` form is held to its declared
+    /// `x-amz-decoded-content-length` too. The exact length decodes; a body that runs past it
+    /// is refused at the chunk that would pass it, with no byte of that chunk forwarded; a
+    /// body that ends short is refused at the terminating chunk.
+    #[tokio::test]
+    async fn the_plain_form_is_held_to_its_declared_length_while_it_streams() {
+        let object = vec![b'd'; 300];
+        let chunks: [&[u8]; 3] = [&object[..100], &object[100..200], &object[200..]];
+
+        let mut exact = aws_example_ctx();
+        exact.decoded_content_length = Some(300);
+        let framed = frame_signed(&exact, &chunks);
+        let decoded = decode_to_vec(framed, 64, exact)
+            .await
+            .expect("a body of exactly its declared length decodes");
+        assert_eq!(decoded, object);
+
+        // Declared 150, streamed 300: the second chunk (100 + 100 > 150) is refused on its
+        // header, so only the first chunk's 100 bytes ever reach the write path.
+        let mut long = aws_example_ctx();
+        long.decoded_content_length = Some(150);
+        let framed = frame_signed(&long, &chunks);
+        let pieces: Vec<Result<Bytes>> = framed
+            .chunks(64)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        let mut decoded = decode(Box::pin(futures_util::stream::iter(pieces)), long);
+        let mut forwarded = 0usize;
+        let err = loop {
+            match decoded.next().await {
+                Some(Ok(bytes)) => forwarded += bytes.len(),
+                Some(Err(err)) => break err,
+                None => panic!("a body longer than its declared length must be refused"),
+            }
+        };
+        assert!(matches!(
+            err.downcast_ref::<StreamingError>(),
+            Some(StreamingError::Framing(_))
+        ));
+        assert_eq!(
+            forwarded, 100,
+            "no byte of the chunk that passes the declared length may be forwarded"
+        );
+
+        let mut short = aws_example_ctx();
+        short.decoded_content_length = Some(301);
+        let framed = frame_signed(&short, &chunks);
+        let err = decode_to_vec(framed, 64, short)
+            .await
+            .expect_err("a body shorter than its declared length must be refused");
+        assert!(matches!(
+            err.downcast_ref::<StreamingError>(),
+            Some(StreamingError::Framing(_))
+        ));
     }
 
     #[tokio::test]
@@ -798,7 +892,6 @@ mod tests {
             trailer: Some(TrailerDeclaration {
                 name: name.to_string(),
                 algorithm,
-                decoded_content_length: None,
             }),
             ..aws_example_ctx()
         }
@@ -1190,7 +1283,7 @@ mod tests {
             "x-amz-checksum-crc32",
             checksum::ChecksumAlgorithm::Crc32,
         );
-        ctx.trailer.as_mut().unwrap().decoded_content_length = Some(9999);
+        ctx.decoded_content_length = Some(9999);
         let object = vec![b'z'; 100];
         let mut running = checksum::RunningChecksum::new(checksum::ChecksumAlgorithm::Crc32);
         running.update(&object);

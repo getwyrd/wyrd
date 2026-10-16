@@ -1824,6 +1824,44 @@ where
                 .get("content-type")
                 .and_then(|value| value.to_str().ok())
                 .map(|value| value.to_string());
+            // The object length the PUT declares, read from the head before any body byte
+            // (#671): `x-amz-decoded-content-length` for an `aws-chunked` upload (its
+            // `Content-Length` counts the framing), `Content-Length` for a single-shot body.
+            // S3 requires one; a PUT that declares none is refused `411`, since a length the
+            // gateway cannot see up front is one it cannot hold to its ceiling. The declared
+            // length then reaches the gateway, which refuses one past its single-PUT ceiling
+            // (`400 EntityTooLarge`) before polling the body, and holds the body to it.
+            let declared_len = match &payload {
+                sigv4::PayloadHash::Streaming(ctx) => Ok(ctx.decoded_content_length),
+                sigv4::PayloadHash::Signed(_) | sigv4::PayloadHash::Unsigned => {
+                    declared_content_length(&parts.headers)
+                }
+            };
+            let declared_len = match declared_len {
+                Ok(Some(len)) => len,
+                Ok(None) => {
+                    let what = match &payload {
+                        sigv4::PayloadHash::Streaming(_) => {
+                            "an aws-chunked PUT must declare x-amz-decoded-content-length"
+                        }
+                        _ => "a PUT must declare its length in Content-Length",
+                    };
+                    return error_response(
+                        request_id,
+                        StatusCode::LENGTH_REQUIRED,
+                        "MissingContentLength",
+                        what,
+                    );
+                }
+                Err(()) => {
+                    return error_response(
+                        request_id,
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        "Content-Length is not a valid integer",
+                    );
+                }
+            };
             // The raw request-body byte stream (never buffered whole).
             let raw = Box::pin(
                 body.into_data_stream()
@@ -1843,6 +1881,7 @@ where
                         .put_object_streaming(
                             &object_key,
                             decoded,
+                            declared_len,
                             ContentHash::Unverified,
                             content_type,
                         )
@@ -1856,6 +1895,7 @@ where
                         .put_object_streaming(
                             &object_key,
                             raw,
+                            declared_len,
                             ContentHash::Expected(hex),
                             content_type,
                         )
@@ -1868,6 +1908,7 @@ where
                         .put_object_streaming(
                             &object_key,
                             raw,
+                            declared_len,
                             ContentHash::Unverified,
                             content_type,
                         )
@@ -1906,6 +1947,25 @@ where
             "only object PUT, GET, HEAD, and DELETE are supported",
         ),
     }
+}
+
+/// A single-shot PUT body's declared length (#671): its `Content-Length`. `Ok(None)` when it
+/// declares none — no `Content-Length`, or a `Transfer-Encoding` body whose length is only
+/// known once it has all arrived — which the PUT arm answers `411`. `Err` for a value that is
+/// not a plain run of ASCII digits fitting a `u64` (stricter than `u64::from_str`, which takes
+/// a leading `+`).
+fn declared_content_length(headers: &axum::http::HeaderMap) -> Result<Option<u64>, ()> {
+    if headers.contains_key("transfer-encoding") {
+        return Ok(None);
+    }
+    let Some(value) = headers.get("content-length") else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| ())?;
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(());
+    }
+    raw.parse::<u64>().map(Some).map_err(|_| ())
 }
 
 /// Why buffering a bulk-delete body was refused: over the byte cap, or a broken read.
@@ -3521,6 +3581,20 @@ fn classify(err: &BoxError) -> (StatusCode, &'static str, String) {
             "XAmzContentSHA256Mismatch",
             "the delivered body does not match the signed x-amz-content-sha256".to_string(),
         ),
+        // A single PUT past the flat-map ceiling (#671), refused from its declared length
+        // before any body byte was read. The message names the limit; it does not point the
+        // client at multipart, which this gateway still answers `501`.
+        Some(GatewayError::EntityTooLarge { limit, .. }) => (
+            StatusCode::BAD_REQUEST,
+            "EntityTooLarge",
+            format!("the object exceeds this gateway's {limit}-byte limit for a single PUT"),
+        ),
+        // A body that delivered more or fewer bytes than it declared (#671); never published.
+        Some(GatewayError::LengthMismatch { .. }) => (
+            StatusCode::BAD_REQUEST,
+            "IncompleteBody",
+            "the request body does not match its declared length".to_string(),
+        ),
         _ => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "InternalError",
@@ -3730,6 +3804,7 @@ mod tests {
                 &self,
                 _key: &str,
                 _source: S,
+                _declared_len: u64,
                 _expected: ContentHash,
                 _content_type: Option<String>,
             ) -> wyrd_traits::Result<String>
@@ -4027,6 +4102,7 @@ mod tests {
             &self,
             _key: &str,
             _source: S,
+            _declared_len: u64,
             _expected: ContentHash,
             _content_type: Option<String>,
         ) -> wyrd_traits::Result<String>
@@ -4753,6 +4829,7 @@ mod tests {
             &self,
             _key: &str,
             _source: S,
+            _declared_len: u64,
             _expected: ContentHash,
             _content_type: Option<String>,
         ) -> wyrd_traits::Result<String>
@@ -4835,6 +4912,9 @@ mod tests {
                     .header("authorization", signed.authorization)
                     .header("x-amz-date", signed.amz_date)
                     .header("x-amz-content-sha256", signed.content_sha256)
+                    // The declared length an HTTP client always sends; a PUT without one is
+                    // refused `411` (#671).
+                    .header("content-length", body.len())
                     .body(Body::from(body))
                     .expect("request"),
             )
@@ -5259,6 +5339,7 @@ mod tests {
             &self,
             _key: &str,
             _source: S,
+            _declared_len: u64,
             _expected: ContentHash,
             _content_type: Option<String>,
         ) -> wyrd_traits::Result<String>
@@ -5381,6 +5462,7 @@ mod tests {
             &self,
             _key: &str,
             _source: S,
+            _declared_len: u64,
             _expected: ContentHash,
             _content_type: Option<String>,
         ) -> wyrd_traits::Result<String>

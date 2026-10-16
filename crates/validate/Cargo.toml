@@ -44,6 +44,7 @@ roxmltree.workspace = true
 tempfile.workspace = true
 wyrd-chunkstore-fs.workspace = true
 wyrd-coordination-mem.workspace = true
+wyrd-core.workspace = true
 wyrd-gateway-s3.workspace = true
 wyrd-metadata-redb.workspace = true
 wyrd-server = { path = "../server" }

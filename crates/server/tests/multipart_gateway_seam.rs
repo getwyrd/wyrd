@@ -362,6 +362,7 @@ impl ObjectGateway for Sentinel {
         &self,
         _key: &str,
         _source: S,
+        _declared_len: u64,
         _expected: ContentHash,
         _content_type: Option<String>,
     ) -> Result<String>
