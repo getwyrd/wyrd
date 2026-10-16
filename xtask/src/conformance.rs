@@ -12,8 +12,8 @@ use wyrd_chunk_format::decode;
 
 use crate::vectors::{invalid_dir, valid_dir, ExpectedFragment};
 
-/// Check every valid and invalid vector. Returns an error describing the first
-/// failure, or the count of vectors that passed.
+/// Check every valid and invalid vector. Every vector is checked even after one
+/// fails; the error lists each failing vector.
 pub fn run() -> Result<(), String> {
     let valid = list_fragments(&valid_dir())?;
     let invalid = list_fragments(&invalid_dir())?;
@@ -25,11 +25,22 @@ pub fn run() -> Result<(), String> {
         ));
     }
 
-    for fragment in &valid {
-        check_valid(fragment)?;
-    }
-    for fragment in &invalid {
-        check_invalid(fragment)?;
+    let mut failed: Vec<String> = valid
+        .iter()
+        .filter_map(|fragment| check_valid(fragment).err())
+        .collect();
+    failed.extend(
+        invalid
+            .iter()
+            .filter_map(|fragment| check_invalid(fragment).err()),
+    );
+    if !failed.is_empty() {
+        return Err(format!(
+            "{} of {} vectors failed:\n    {}",
+            failed.len(),
+            valid.len() + invalid.len(),
+            failed.join("\n    ")
+        ));
     }
 
     println!(

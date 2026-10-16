@@ -127,7 +127,7 @@ fn main() -> ExitCode {
         }
         Some("conformance") => run_conformance(),
         Some("gen-vectors") => run_gen_vectors(),
-        Some("dst") => run_dst(),
+        Some("dst") => run_dst().into_result(),
         Some("statics") => run_statics(),
         Some("integration") => run_integration(),
         Some("tikv-conformance") => run_tikv_conformance(),
@@ -1609,6 +1609,19 @@ impl CiFailures {
     }
 }
 
+/// A spawned command's outcome as a step result: `Err` when it could not be
+/// spawned or exited non-zero.
+fn exit_result(
+    status: std::io::Result<std::process::ExitStatus>,
+    program: &str,
+) -> Result<(), String> {
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("exited with {s}")),
+        Err(e) => Err(format!("failed to spawn {program}: {e}")),
+    }
+}
+
 /// The ordered steps of the CI gate that follow the prose gates: first the
 /// repo-hygiene guards in `xtask::repo_guard::CI_GUARDS` order, through the
 /// injected `guard`, then the `cargo` steps, through the injected `exec`. Every
@@ -1718,18 +1731,18 @@ fn run_ci() -> Result<(), String> {
     // as GitHub-side jobs — the one gate class a locally-green tree kept
     // failing on. They report before the expensive clippy/build/test start.
     failures.record("typos", typos_check());
-    failures.record("docs check", docs_check());
+    failures.extend(docs_check());
     // Then the repo-hygiene guards (#616, #775) and the cargo steps. The guards
     // run INSIDE `run_ci_steps_in`, from the lib-side
     // `xtask::repo_guard::CI_GUARDS` list, so `cargo xtask ci-dry-run` and the
     // recording-executor tests see every guard the gate runs.
     failures.extend(run_ci_steps_in(&workspace_root(), &mut |args| cargo(args)));
     failures.record("cargo-machete", cargo_machete_check());
-    failures.record("cargo-deny", cargo_deny_check());
+    failures.extend(cargo_deny_check());
     failures.record("conformance", run_conformance());
     failures.record("statics", run_statics());
     failures.record("orchestrator guard", run_orchestrator_guard());
-    failures.record("dst", run_dst());
+    failures.extend(run_dst());
     failures.into_result()?;
     println!("\nxtask ci: all checks passed");
     Ok(())
@@ -1765,7 +1778,8 @@ const DST_SEEDS: &str = "50";
 /// Run the madsim commit-protocol tests under `--cfg madsim` (ADR-0009). The
 /// flag and seed count are set on this child process only, so the normal build
 /// is untouched; this recompiles `wyrd-dst` and its deps under the simulator.
-fn run_dst() -> Result<(), String> {
+fn run_dst() -> CiFailures {
+    let mut failures = CiFailures::default();
     // Append `--cfg madsim` to any existing RUSTFLAGS rather than clobbering it.
     let rustflags = match std::env::var("RUSTFLAGS") {
         Ok(existing) if !existing.is_empty() => format!("{existing} --cfg madsim"),
@@ -1779,15 +1793,16 @@ fn run_dst() -> Result<(), String> {
     // read is a reviewed decision. Same RUSTFLAGS as the test run below, so
     // one `--cfg madsim` build serves both.
     print_step(&["cargo", "clippy", "-p", "wyrd-dst", "(--cfg madsim)"]);
+    // A lint failure does not skip the seeded tests: both results are reported.
     let status = Command::new("cargo")
         .args(["clippy", "-p", "wyrd-dst", "--all-targets"])
         .current_dir(workspace_root())
         .env("RUSTFLAGS", &rustflags)
-        .status()
-        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
-    if !status.success() {
-        return Err(format!("madsim DST clippy failed with {status}"));
-    }
+        .status();
+    failures.record(
+        "cargo clippy -p wyrd-dst (--cfg madsim)",
+        exit_result(status, "cargo"),
+    );
 
     print_step(&["cargo", "test", "-p", "wyrd-dst", "(--cfg madsim)"]);
     let status = Command::new("cargo")
@@ -1795,14 +1810,12 @@ fn run_dst() -> Result<(), String> {
         .current_dir(workspace_root())
         .env("RUSTFLAGS", &rustflags)
         .env("MADSIM_TEST_NUM", DST_SEEDS)
-        .status()
-        .map_err(|e| format!("failed to spawn cargo: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("madsim DST tests failed with {status}"))
-    }
+        .status();
+    failures.record(
+        "cargo test -p wyrd-dst (--cfg madsim)",
+        exit_result(status, "cargo"),
+    );
+    failures
 }
 
 /// Run the committed conformance vectors against the reference reader.
@@ -1900,7 +1913,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 ///
 /// If cargo-deny is not installed locally, warn and skip; in CI (where `CI` is set) a missing
 /// binary is a hard failure, so the wall is always enforced on every PR.
-fn cargo_deny_check() -> Result<(), String> {
+fn cargo_deny_check() -> CiFailures {
     let invocations = xtask::dependency_wall_invocations();
     // Both walls run even when the first is red: a default-graph failure and an
     // all-features advisory are separate fixes, and the second must not hide
@@ -1925,19 +1938,23 @@ fn cargo_deny_check() -> Result<(), String> {
                 Err(format!("exited with {s}")),
             ),
             Err(_) if is_ci() => {
-                return Err("cargo-deny is not installed but is required in CI".to_string());
+                failures.record(
+                    "cargo-deny",
+                    Err("cargo-deny is not installed but is required in CI".to_string()),
+                );
+                return failures;
             }
             Err(_) => {
                 eprintln!(
                     "warning: cargo-deny not installed; skipping the license/advisory \
                      wall locally. Install it with `cargo install cargo-deny --locked`."
                 );
-                return Ok(());
+                return failures;
             }
         }
     }
 
-    failures.into_result()
+    failures
 }
 
 /// Run `cargo machete` — flag dependencies declared in a `Cargo.toml` but never
@@ -2023,16 +2040,15 @@ fn typos_check() -> Result<(), String> {
 /// `markdown-it-py`/`PyYAML` renderer deps — probed first, warn-and-skip
 /// locally when absent, hard failure in CI, the `cargo_machete_check`
 /// convention). Part of the #598 CI-parity fix alongside [`typos_check`].
-fn docs_check() -> Result<(), String> {
+fn docs_check() -> CiFailures {
+    let mut failures = CiFailures::default();
     print_step(&["python3", "docs/publishing/tools/lint_docs.py"]);
     let status = Command::new("python3")
         .arg("docs/publishing/tools/lint_docs.py")
         .current_dir(workspace_root())
-        .status()
-        .map_err(|e| format!("failed to spawn python3: {e}"))?;
-    if !status.success() {
-        return Err(format!("`lint_docs.py` failed with {status}"));
-    }
+        .status();
+    // A lint failure does not skip the render: broken links are a separate fix.
+    failures.record("lint_docs.py", exit_result(status, "python3"));
 
     let deps_present = Command::new("python3")
         .args(["-c", "import markdown_it, yaml"])
@@ -2041,18 +2057,22 @@ fn docs_check() -> Result<(), String> {
         .unwrap_or(false);
     if !deps_present {
         if is_ci() {
-            return Err(
-                "the docs renderer deps (markdown-it-py, PyYAML) are not installed \
-                 but are required in CI"
-                    .to_string(),
+            failures.record(
+                "render_site.py --check",
+                Err(
+                    "the docs renderer deps (markdown-it-py, PyYAML) are not installed \
+                     but are required in CI"
+                        .to_string(),
+                ),
             );
+            return failures;
         }
         eprintln!(
             "warning: docs renderer deps not installed; skipping the site-render \
              link audit locally. Install them with \
              `pip install \"markdown-it-py[linkify]==3.0.0\" \"PyYAML==6.0.2\"`."
         );
-        return Ok(());
+        return failures;
     }
     // A per-process output path: `render_site.py` DELETES its --out directory before
     // rebuilding it, so a shared fixed path would let two concurrent `cargo xtask ci`
@@ -2076,13 +2096,10 @@ fn docs_check() -> Result<(), String> {
             &out,
         ])
         .current_dir(workspace_root())
-        .status()
-        .map_err(|e| format!("failed to spawn python3: {e}"))?;
+        .status();
     let _ = std::fs::remove_dir_all(&out_dir);
-    match status.success() {
-        true => Ok(()),
-        false => Err(format!("`render_site.py --check` failed with {status}")),
-    }
+    failures.record("render_site.py --check", exit_result(status, "python3"));
+    failures
 }
 
 /// Run a `cargo` subcommand from the workspace root, echoing it first.
@@ -2245,6 +2262,26 @@ mod tests {
             "{steps:?}"
         );
         assert_eq!(steps, recorded_steps(&[]), "every step must still run");
+    }
+
+    // A group of steps (the two deny walls, docs lint + render, DST lint +
+    // tests) joins the run's list one entry per step, so the count in the
+    // summary is the number of failed commands, not the number of groups.
+    #[test]
+    fn a_group_of_failed_steps_is_counted_per_step() {
+        let mut group = CiFailures::default();
+        group.record("cargo deny check", Err("exited with 1".to_string()));
+        group.record(
+            "cargo deny --all-features",
+            Err("exited with 1".to_string()),
+        );
+        let mut run = CiFailures::default();
+        run.record("cargo fmt", Err("exited with 1".to_string()));
+        run.extend(group);
+        let report = run
+            .into_result()
+            .expect_err("three failures make a red run");
+        assert!(report.starts_with("3 checks failed:"), "{report}");
     }
 
     // One failing step must not hide the next: a red `cargo test` still lets
