@@ -76,3 +76,31 @@ macro_rules! dst_campaign_test {
         }
     };
 }
+
+/// [`dst_campaign_test`] for a body that replays a **fixed** seed list (the committed
+/// regression seeds, ADR-0009): it runs **once** per `cargo test`, whatever
+/// `MADSIM_TEST_NUM` asks of the sweep tests (#905).
+///
+/// `#[madsim::test]` is `Builder::from_env().run(..)`, which runs the body
+/// `MADSIM_TEST_NUM` times. A sweep test draws fresh inputs each time, so that is
+/// coverage; a fixed-seed replay draws the same inputs each time, so the repeats only
+/// vary scheduling and multiply the cost. Under the gate's `MADSIM_TEST_NUM=50`, eight
+/// seeds × every custodian property × 50 cost about 40 minutes of the `rust` job.
+///
+/// Everything else `from_env` reads still applies: `MADSIM_TEST_SEED` (to reproduce a
+/// failure), `MADSIM_TEST_CHECK_DETERMINISM`, the config and the time limit.
+#[macro_export]
+macro_rules! dst_replay_test {
+    ($(#[$meta:meta])* async fn $name:ident() $body:block) => {
+        $(#[$meta])*
+        #[test]
+        fn $name() {
+            let mut builder = ::madsim::runtime::Builder::from_env();
+            builder.count = 1;
+            builder.run(|| async {
+                $crate::install_dst_barrier();
+                $body
+            })
+        }
+    };
+}

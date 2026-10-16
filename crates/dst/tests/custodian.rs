@@ -84,7 +84,7 @@ use wyrd_custodian::{
 };
 // The DST determinism barrier preamble (ADR-0035): declaring every campaign property
 // through this macro installs the permissive global `tracing` default unbypassably.
-use wyrd_dst::dst_campaign_test;
+use wyrd_dst::{dst_campaign_test, dst_replay_test};
 use wyrd_testkit::{SeededStorageFaults, StorageFault};
 use wyrd_traits::{
     chunk_hex, BoxError, ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health,
@@ -6634,7 +6634,8 @@ dst_campaign_test! {
 /// replays this fixed set on every run, independent of the madsim sweep, so a seed that
 /// ever surfaces a custodian bug stays green forever after the fix. Seeded directly
 /// (not via the madsim scheduler), so each is a deterministic, reproducible run of all
-/// six properties. New bug-finding seeds are appended here.
+/// six properties. New bug-finding seeds are appended here. The list is replayed once
+/// per run (`dst_replay_test!`, #905), not once per `MADSIM_TEST_NUM` seed.
 const REGRESSION_SEEDS: &[u64] = &[
     0x5EED_0000_0000_0001,
     0x5EED_0000_0000_0002,
@@ -6646,7 +6647,7 @@ const REGRESSION_SEEDS: &[u64] = &[
     0x5EED_0000_0000_0022,
 ];
 
-dst_campaign_test! {
+dst_replay_test! {
     async fn committed_regression_seeds_stay_green() {
         for &seed in REGRESSION_SEEDS {
             let mut rng = ChaCha8Rng::seed_from_u64(seed);
