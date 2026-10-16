@@ -1576,10 +1576,43 @@ fn run_blackbox_guard_cmd(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// The failed steps of one gate run. Every step runs whatever came before it,
+/// so one red bundle reports every failing check at once instead of one per
+/// round; the run is red if any step failed. `record` prints only the step's
+/// name as it goes (the step's own output already shows why); the reasons are
+/// printed once, in the summary `into_result` returns.
+#[derive(Debug, Default)]
+struct CiFailures(Vec<String>);
+
+impl CiFailures {
+    fn record(&mut self, step: &str, result: Result<(), String>) {
+        if let Err(reason) = result {
+            println!("\nxtask ci: {step} failed; continuing with the remaining checks");
+            self.0.push(format!("{step}: {reason}"));
+        }
+    }
+
+    fn extend(&mut self, other: CiFailures) {
+        self.0.extend(other.0);
+    }
+
+    fn into_result(self) -> Result<(), String> {
+        match self.0.as_slice() {
+            [] => Ok(()),
+            [only] => Err(only.clone()),
+            all => Err(format!(
+                "{} checks failed:\n  - {}",
+                all.len(),
+                all.join("\n  - ")
+            )),
+        }
+    }
+}
+
 /// The ordered steps of the CI gate that follow the prose gates: first the
 /// repo-hygiene guards in `xtask::repo_guard::CI_GUARDS` order, through the
-/// injected `guard`, then the `cargo` steps, through the injected `exec`. The
-/// first error stops the run, so a failing guard means no cargo step runs.
+/// injected `guard`, then the `cargo` steps, through the injected `exec`. Every
+/// step runs even when an earlier one fails; the failures come back together.
 /// Production callers reach it through [`run_ci_steps_in`], which supplies
 /// the real guards; the unit tests pass recording closures, so the wiring is
 /// exercised without spawning `git` or `cargo`.
@@ -1604,34 +1637,47 @@ fn run_ci_steps(
     toolchain: &mut dyn FnMut(&str) -> bool,
     guard: &mut dyn FnMut(xtask::repo_guard::CiGuard) -> Result<(), String>,
     exec: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-) -> Result<(), String> {
+) -> CiFailures {
+    let mut failures = CiFailures::default();
+    let mut step = |failures: &mut CiFailures, args: &[&str]| {
+        failures.record(&format!("cargo {}", args.join(" ")), exec(args));
+    };
     // The repo-hygiene guards first (#616, #775): sub-second, and their failure
     // modes (a committed worktree gitlink, a crate root missing the unsafe-code
     // attribute, a `wyrd-*` crate in the blackbox validator's dependency
     // closure) should surface before a multi-minute build, not after.
     for &check in xtask::repo_guard::CI_GUARDS {
-        guard(check)?;
+        failures.record(&format!("{check:?} guard"), guard(check));
     }
     // `wyrd-dst` only compiles under `--cfg madsim`; it is excluded from the
     // normal workspace commands and built solely by `run_dst`.
-    exec(&["fmt", "--all", "--", "--check"])?;
+    step(&mut failures, &["fmt", "--all", "--", "--check"]);
     // Lint levels (incl. warnings-as-errors) come from `[workspace.lints]` in
     // the root Cargo.toml — the single source of truth — not a CLI flag here.
-    exec(&[
-        "clippy",
-        "--workspace",
-        "--exclude",
-        "wyrd-dst",
-        "--all-targets",
-    ])?;
-    exec(&[
-        "build",
-        "--workspace",
-        "--exclude",
-        "wyrd-dst",
-        "--all-targets",
-    ])?;
-    exec(&["test", "--workspace", "--exclude", "wyrd-dst"])?;
+    step(
+        &mut failures,
+        &[
+            "clippy",
+            "--workspace",
+            "--exclude",
+            "wyrd-dst",
+            "--all-targets",
+        ],
+    );
+    step(
+        &mut failures,
+        &[
+            "build",
+            "--workspace",
+            "--exclude",
+            "wyrd-dst",
+            "--all-targets",
+        ],
+    );
+    step(
+        &mut failures,
+        &["test", "--workspace", "--exclude", "wyrd-dst"],
+    );
     // Type-check the feature-gated backend bodies the default `--workspace` build skips
     // (`--all-targets` selects target KINDS, not features, so a `#[cfg(feature = "tikv")]`
     // / `#[cfg(feature = "fdb")]` body slips through). Each row is GATED on ITS OWN
@@ -1643,9 +1689,9 @@ fn run_ci_steps(
         toolchain(xtask::TIKV_TOOLCHAIN_ENV),
         toolchain(xtask::FDB_TOOLCHAIN_ENV),
     ) {
-        exec(&check)?;
+        step(&mut failures, &check);
     }
-    Ok(())
+    failures
 }
 
 /// [`run_ci_steps`] over the workspace at `root` with the REAL guards: each
@@ -1655,10 +1701,7 @@ fn run_ci_steps(
 /// and a printing `exec`. That is the only difference, so dry-running a
 /// workspace that holds a forbidden dependency exercises the exact guard
 /// dispatch the gate uses (#775).
-fn run_ci_steps_in(
-    root: &Path,
-    exec: &mut dyn FnMut(&[&str]) -> Result<(), String>,
-) -> Result<(), String> {
+fn run_ci_steps_in(root: &Path, exec: &mut dyn FnMut(&[&str]) -> Result<(), String>) -> CiFailures {
     run_ci_steps(
         &mut |name| std::env::var_os(name).is_some(),
         &mut |guard| run_ci_guard(guard, root),
@@ -1666,25 +1709,28 @@ fn run_ci_steps_in(
     )
 }
 
-/// The full CI gate (ADR-0009). Each step runs in workspace order; the first
-/// failure stops the run.
+/// The full CI gate (ADR-0009). Each step runs in workspace order, and every
+/// step runs even when an earlier one failed, so a red run lists every failing
+/// check, not just the first.
 fn run_ci() -> Result<(), String> {
+    let mut failures = CiFailures::default();
     // The prose gates first: both are sub-second, and until #598 they ran only
     // as GitHub-side jobs — the one gate class a locally-green tree kept
-    // failing on. Fail fast before the expensive clippy/build/test.
-    typos_check()?;
-    docs_check()?;
+    // failing on. They report before the expensive clippy/build/test start.
+    failures.record("typos", typos_check());
+    failures.record("docs check", docs_check());
     // Then the repo-hygiene guards (#616, #775) and the cargo steps. The guards
     // run INSIDE `run_ci_steps_in`, from the lib-side
     // `xtask::repo_guard::CI_GUARDS` list, so `cargo xtask ci-dry-run` and the
     // recording-executor tests see every guard the gate runs.
-    run_ci_steps_in(&workspace_root(), &mut |args| cargo(args))?;
-    cargo_machete_check()?;
-    cargo_deny_check()?;
-    run_conformance()?;
-    run_statics()?;
-    run_orchestrator_guard()?;
-    run_dst()?;
+    failures.extend(run_ci_steps_in(&workspace_root(), &mut |args| cargo(args)));
+    failures.record("cargo-machete", cargo_machete_check());
+    failures.record("cargo-deny", cargo_deny_check());
+    failures.record("conformance", run_conformance());
+    failures.record("statics", run_statics());
+    failures.record("orchestrator guard", run_orchestrator_guard());
+    failures.record("dst", run_dst());
+    failures.into_result()?;
     println!("\nxtask ci: all checks passed");
     Ok(())
 }
@@ -1692,8 +1738,8 @@ fn run_ci() -> Result<(), String> {
 /// `cargo xtask ci-dry-run [--workspace DIR]`: the gate's guard-and-cargo
 /// phase ([`run_ci_steps_in`]) over the workspace at DIR (default: this
 /// one). The repo-hygiene guards run for real; the cargo steps are only
-/// printed. A failing guard stops the run before the first cargo step, just
-/// as it stops `cargo xtask ci`. `xtask/tests/blackbox_dependency_guard.rs`
+/// printed. A failing guard fails the run, just as it fails `cargo xtask ci`,
+/// and the cargo steps after it are still listed. `xtask/tests/blackbox_dependency_guard.rs`
 /// dry-runs planted workspaces to show the gate itself refusing a forbidden
 /// dependency (#775).
 fn run_ci_dry_run_cmd(args: &[String]) -> Result<(), String> {
@@ -1707,7 +1753,8 @@ fn run_ci_dry_run_cmd(args: &[String]) -> Result<(), String> {
     run_ci_steps_in(&root, &mut |args| {
         println!("dry-run: would run `cargo {}`", args.join(" "));
         Ok(())
-    })?;
+    })
+    .into_result()?;
     println!("\nxtask ci-dry-run: every repo-hygiene guard passed");
     Ok(())
 }
@@ -1855,6 +1902,10 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// binary is a hard failure, so the wall is always enforced on every PR.
 fn cargo_deny_check() -> Result<(), String> {
     let invocations = xtask::dependency_wall_invocations();
+    // Both walls run even when the first is red: a default-graph failure and an
+    // all-features advisory are separate fixes, and the second must not hide
+    // behind the first.
+    let mut failures = CiFailures::default();
 
     for args in invocations {
         let args: Vec<&str> = args;
@@ -1869,7 +1920,10 @@ fn cargo_deny_check() -> Result<(), String> {
 
         match status {
             Ok(s) if s.success() => {}
-            Ok(s) => return Err(format!("`cargo {}` failed with {s}", args.join(" "))),
+            Ok(s) => failures.record(
+                &format!("cargo {}", args.join(" ")),
+                Err(format!("exited with {s}")),
+            ),
             Err(_) if is_ci() => {
                 return Err("cargo-deny is not installed but is required in CI".to_string());
             }
@@ -1883,7 +1937,7 @@ fn cargo_deny_check() -> Result<(), String> {
         }
     }
 
-    Ok(())
+    failures.into_result()
 }
 
 /// Run `cargo machete` — flag dependencies declared in a `Cargo.toml` but never
@@ -2116,6 +2170,16 @@ mod tests {
         declared: &[&str],
         failing: Option<xtask::repo_guard::CiGuard>,
     ) -> (Result<(), String>, Vec<String>) {
+        recorded_run_failing(declared, failing, &[])
+    }
+
+    // `recorded_run`, plus `failing_cargo`: the cargo subcommands (`args[0]`)
+    // whose executor returns `Err`, as a red `cargo test` does.
+    fn recorded_run_failing(
+        declared: &[&str],
+        failing: Option<xtask::repo_guard::CiGuard>,
+        failing_cargo: &[&str],
+    ) -> (Result<(), String>, Vec<String>) {
         let steps = RefCell::new(Vec::new());
         let result = run_ci_steps(
             &mut |name| declared.contains(&name),
@@ -2129,9 +2193,14 @@ mod tests {
             },
             &mut |args| {
                 steps.borrow_mut().push(format!("cargo {}", args.join(" ")));
-                Ok(())
+                if failing_cargo.contains(&args[0]) {
+                    Err(format!("`cargo {}` failed", args[0]))
+                } else {
+                    Ok(())
+                }
             },
-        );
+        )
+        .into_result();
         (result, steps.into_inner())
     }
 
@@ -2163,26 +2232,39 @@ mod tests {
         );
     }
 
-    // #775: a guard's `Err` is the gate's `Err`, and nothing runs after it — not
-    // swallowed, not deferred until after the build.
+    // #775: a guard's `Err` is the gate's `Err` — not swallowed, not deferred
+    // into a pass. The cargo steps after it still run, so a guard violation and
+    // a broken build show up in the same run instead of one round apart.
     #[test]
-    fn a_failing_guard_stops_ci_before_any_cargo_step() {
+    fn a_failing_guard_fails_ci_and_the_cargo_steps_still_run() {
         use xtask::repo_guard::CiGuard;
         let (result, steps) = recorded_run(&[], Some(CiGuard::BlackboxClosure));
         assert_eq!(
             result,
-            Err("BlackboxClosure found a violation".to_string()),
+            Err("BlackboxClosure guard: BlackboxClosure found a violation".to_string()),
             "{steps:?}"
         );
+        assert_eq!(steps, recorded_steps(&[]), "every step must still run");
+    }
+
+    // One failing step must not hide the next: a red `cargo test` still lets
+    // the feature-gated checks run, and every failure is named in the result.
+    #[test]
+    fn every_failing_step_is_reported_not_just_the_first() {
+        use xtask::repo_guard::CiGuard;
+        let declared = [xtask::TIKV_TOOLCHAIN_ENV, xtask::FDB_TOOLCHAIN_ENV];
+        let (result, steps) =
+            recorded_run_failing(&declared, Some(CiGuard::Gitlink), &["fmt", "test"]);
         assert_eq!(
             steps,
-            [
-                "guard Gitlink",
-                "guard UnsafeForbid",
-                "guard BlackboxClosure"
-            ],
-            "no step may run after a failing guard"
+            recorded_steps(&declared),
+            "every step must still run"
         );
+        let report = result.expect_err("three failures make a red run");
+        assert!(report.starts_with("3 checks failed:"), "{report}");
+        for step in ["Gitlink guard", "cargo fmt", "cargo test"] {
+            assert!(report.contains(step), "missing {step}: {report}");
+        }
     }
 
     // The feature list is matched EXACTLY (`--features <list> `, trailing space), not by
