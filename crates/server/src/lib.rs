@@ -427,31 +427,34 @@ where
         // read from its bounded `seg:` range. A generation retired mid-resolve restarts
         // against the CURRENT root (decision 7(h)) — an overwrite is not a deletion, so a
         // concurrent one serves the new generation rather than a spurious `NoSuchKey`.
+        // This read takes the OWNING entry because it hands the list on to its reader task:
+        // the inode is ours, so a flat map on a live snapshot MOVES its chunk list (and every
+        // placement vector in it) out of the record instead of deep-copying it on the
+        // primary read path (#686, restoring the #648 follow-up move of `bbdb7c5`).
         let Some(resolved) =
-            metadata::resolve_chunk_map(&self.meta, &metadata::inode_key(inode_id), &inode).await?
+            metadata::resolve_chunk_map_owned(&self.meta, &metadata::inode_key(inode_id), inode)
+                .await?
         else {
             return Ok(None);
         };
         // Frame the response from the generation the chunks actually came from: on a
-        // restart the snapshot above describes bytes this stream is not about to send.
-        let served = &resolved.record;
+        // restart the snapshot above describes bytes this stream is not about to send. The
+        // owned answer carries that generation's framing fields by value, so taking them
+        // copies no chunk.
         // Carry the committed object size out with the stream so the wire layer frames the
         // response (`Content-Length`): if a chunk read faults mid-stream (e.g. a fragment
         // reclaimed by a racing DELETE), the body ends early and the client detects the short
         // read as a truncation instead of a complete object (issue #364 carry-forward).
-        let size = served.size;
+        let size = resolved.size;
         // Carry the committed object metadata (ADR-0047) out with the stream so the wire layer
         // can surface the ETag, the stored content type, and Last-Modified. A record written
         // before this model carries `None`, degrading to the pre-metadata wire behaviour.
-        let etag = served.etag.clone();
-        let content_type = served.content_type.clone();
-        let modified = served.modified;
+        let etag = resolved.etag;
+        let content_type = resolved.content_type;
+        let modified = resolved.modified;
         let this = Arc::clone(&self);
-        // `into_owned`, not a deep copy: the resolver hands back a `Cow`, so a flat map on a
-        // live snapshot moves its chunk list (and every placement vector in it) into the
-        // reader task instead of being cloned on the primary read path (#648 follow-up
-        // `bbdb7c5`, preserved through the resolver seam).
-        let chunk_map = resolved.chunks.into_owned();
+        // Moved, not copied: the resolver already handed this list over by value.
+        let chunk_map = resolved.chunks;
         // The reader task is spawned LAZILY — on the stream's first poll, not here — so a
         // caller that resolves the object and then never reads the body (the wire layer's
         // 304/412 conditional short-circuit drops the stream unread, issue #510 review) costs

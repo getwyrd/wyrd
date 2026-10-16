@@ -572,8 +572,9 @@ pub async fn read_object(
 ///
 /// The inode **id** rides out with the record because the map is not always inline: a
 /// segmented one (proposal 0016 decision 7) resolves through
-/// [`metadata::resolve_chunk_map`], which needs the root's own key to settle a
-/// generation retired mid-resolve (decision 7(h)).
+/// [`metadata::resolve_chunk_map`] (or [`metadata::resolve_chunk_map_owned`], for a caller
+/// that hands the list on), which needs the root's own key to settle a generation retired
+/// mid-resolve (decision 7(h)).
 pub async fn committed_inode(
     meta: &impl MetadataStore,
     parent: InodeId,
