@@ -7,9 +7,9 @@
 //! 1. **the guard runs inside the gate** — `cargo xtask ci-dry-run --workspace
 //!    DIR` runs the gate's guard phase for real (the same `run_ci_steps_in`
 //!    `ci` calls, the same guard dispatch) over a planted cargo workspace and
-//!    only prints the cargo steps after it. With a forbidden dependency it
-//!    must stop at the blackbox guard before any cargo step; clean, all three
-//!    guards must pass, in order, before the first cargo step;
+//!    only prints the cargo steps after it. With a forbidden dependency the
+//!    blackbox guard must fail the run, and the cargo steps still follow;
+//!    clean, all three guards must pass, in order, before the first cargo step;
 //! 2. **the guard is flippable** — red on planted `cargo metadata` documents
 //!    (a direct normal edge, an optional off-by-default declaration, a
 //!    transitive edge) and on planted workspaces resolved by real cargo (an
@@ -226,11 +226,10 @@ fn run_in(dir: &Path, program: &str, args: &[&str]) {
 // ─── (1) the guard runs inside `cargo xtask ci` ──────────────────────────────
 
 #[test]
-fn the_gate_stops_at_the_blackbox_guard_on_a_forbidden_dependency() {
+fn the_gate_fails_on_the_blackbox_guard_for_a_forbidden_dependency() {
     // The gate's own guard phase, over a workspace whose validator depends on
     // `wyrd-core`. A guard missing from the gate, a dispatch that skips it, or
-    // an error swallowed on the way back would each let this run go on to the
-    // cargo steps and pass.
+    // an error swallowed on the way back would each let this run pass.
     let ws = Workspace::plant_locked(
         "gate-red",
         "[dependencies]\nwyrd-core = { path = \"../core\" }\n",
@@ -244,16 +243,18 @@ fn the_gate_stops_at_the_blackbox_guard_on_a_forbidden_dependency() {
         "{}",
         v.output
     );
-    // The two #616 guards ran on the same workspace and passed, so the stop is
-    // the blackbox guard's.
+    // The two #616 guards ran on the same workspace and passed, so the failure
+    // is the blackbox guard's.
     assert!(
         v.output.contains(GITLINK_PASSED) && v.output.contains(UNSAFE_PASSED),
         "{}",
         v.output
     );
+    // A failing guard does not stop the gate: the cargo steps after it still
+    // run, so one run reports every failing check.
     assert!(
-        !v.output.contains(DRY_RUN_CARGO),
-        "no cargo step may follow a failing guard:\n{}",
+        v.output.contains(DRY_RUN_CARGO),
+        "the cargo steps must still run after a failing guard:\n{}",
         v.output
     );
 }
