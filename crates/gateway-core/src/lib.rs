@@ -264,6 +264,21 @@ pub enum GatewayError {
     /// A streaming PUT's delivered bytes did not hash to the [`ContentHash::Expected`]
     /// value — rejected before the write was published.
     PayloadMismatch,
+    /// A single PUT's declared length is above the largest object one PUT can publish
+    /// (`limit` bytes, fixed by the implementer's chunk size) — refused before any of its
+    /// bytes were read or written (#671).
+    EntityTooLarge {
+        /// The object length the PUT declared.
+        declared: u64,
+        /// The largest single PUT the implementer accepts, in bytes.
+        limit: u64,
+    },
+    /// A PUT's body delivered more or fewer bytes than its declared length — refused, never
+    /// published (#671). A body is stopped as soon as it passes the declared length.
+    LengthMismatch {
+        /// The object length the PUT declared.
+        declared: u64,
+    },
 }
 
 impl std::fmt::Display for GatewayError {
@@ -274,6 +289,14 @@ impl std::fmt::Display for GatewayError {
             GatewayError::PayloadMismatch => {
                 write!(f, "payload does not match the expected content hash")
             }
+            GatewayError::EntityTooLarge { declared, limit } => write!(
+                f,
+                "object of {declared} bytes is larger than the {limit}-byte single PUT limit"
+            ),
+            GatewayError::LengthMismatch { declared } => write!(
+                f,
+                "body length does not match the declared object length of {declared} bytes"
+            ),
         }
     }
 }
@@ -297,10 +320,18 @@ pub trait ObjectGateway: Send + Sync + 'static {
     /// the committed object's **ETag** — the content digest as an opaque change-token; the
     /// wire layer quotes it as S3's `ETag` header (ADR-0047). A concurrent writer loses
     /// with [`GatewayError::Conflict`] rather than corrupting the object.
+    ///
+    /// `declared_len` is the object length the client declared up front (#671). An
+    /// implementer refuses a length above the largest object one PUT can publish with
+    /// [`GatewayError::EntityTooLarge`] **before polling `source`**, so an oversize PUT is
+    /// refused from its headers and none of its bytes are written; and it holds `source` to
+    /// `declared_len`, answering [`GatewayError::LengthMismatch`] as soon as the body passes
+    /// it, or when the body ends short of it, never publishing either.
     fn put_object_streaming<S>(
         &self,
         key: &str,
         source: S,
+        declared_len: u64,
         expected: ContentHash,
         content_type: Option<String>,
     ) -> impl Future<Output = Result<String>> + Send

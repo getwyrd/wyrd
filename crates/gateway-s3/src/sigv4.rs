@@ -95,6 +95,12 @@ pub struct StreamingContext {
     /// consumed-and-ignored deeper in the pipeline (issue #505; the same "no half-accept"
     /// invariant as `streaming_variant`).
     pub trailer: Option<TrailerDeclaration>,
+    /// `x-amz-decoded-content-length` — the object length an `aws-chunked` upload declares
+    /// (its `Content-Length` counts the framing, not the object). Read by [`verify`] for
+    /// **every** streaming variant (#671); `None` when the client sent none, which the PUT
+    /// arm refuses `411 MissingContentLength` before any body is read. The decoder
+    /// ([`super::streaming`]) holds the de-framed bytes to it while they stream.
+    pub decoded_content_length: Option<u64>,
 }
 
 /// A `-TRAILER` streaming framing's declared trailer: the ONE `x-amz-checksum-*` header
@@ -108,9 +114,6 @@ pub struct TrailerDeclaration {
     pub name: String,
     /// The checksum algorithm `name` names.
     pub algorithm: ChecksumAlgorithm,
-    /// `x-amz-decoded-content-length`, if the client sent one — the decoder checks the
-    /// number of DE-FRAMED object bytes against it once the trailer is consumed.
-    pub decoded_content_length: Option<u64>,
 }
 
 /// Why a request's signature was refused. Every variant maps to HTTP 403; the
@@ -510,6 +513,7 @@ pub fn verify(
         } else {
             None
         };
+        let decoded_content_length = parse_decoded_content_length(headers)?;
         PayloadHash::Streaming(StreamingContext {
             seed_signature: expected,
             signing_key: signing_key(&cred.secret_access_key, &authz.date, region, service),
@@ -517,6 +521,7 @@ pub fn verify(
             scope: format!("{}/{region}/{service}/aws4_request", authz.date),
             signed,
             trailer,
+            decoded_content_length,
         })
     } else {
         // Not UNSIGNED-PAYLOAD, not a hex digest, not a streaming sentinel the decoder
@@ -553,9 +558,8 @@ fn streaming_variant(sentinel: &str) -> Option<(bool, bool)> {
     }
 }
 
-/// Parse and validate a `-TRAILER` framing's declaration headers — `x-amz-trailer`
-/// (required: the ONE checksum trailer this slice supports, brief #505 scope) and the
-/// optional `x-amz-decoded-content-length`. Runs **before any body is read**, so an
+/// Parse and validate a `-TRAILER` framing's declaration header `x-amz-trailer`
+/// (required: the ONE checksum trailer this slice supports, brief #505 scope). Runs **before any body is read**, so an
 /// unverifiable declaration (a missing `x-amz-trailer`, more than one declared trailer
 /// name, an unrecognised checksum algorithm — including the out-of-scope
 /// `x-amz-checksum-crc64nvme`) is refused up front rather than admitted and only later
@@ -576,17 +580,23 @@ fn parse_trailer_declaration(headers: &HeaderMap) -> Result<TrailerDeclaration, 
     let algorithm = ChecksumAlgorithm::from_trailer_name(&name).ok_or_else(|| {
         AuthError::Malformed(format!("unsupported x-amz-trailer checksum `{name}`"))
     })?;
-    let decoded_content_length = match header(headers, "x-amz-decoded-content-length") {
-        Some(v) => Some(v.parse::<u64>().map_err(|_| {
-            AuthError::Malformed("x-amz-decoded-content-length is not a valid integer".into())
-        })?),
-        None => None,
+    Ok(TrailerDeclaration { name, algorithm })
+}
+
+/// Read an `aws-chunked` upload's `x-amz-decoded-content-length`, for every streaming variant
+/// (#671). `Ok(None)` when absent (the PUT arm answers `411`). A present value must be a run
+/// of ASCII digits that fits a `u64` — stricter than `u64::from_str`, which takes a leading
+/// `+` — and anything else is refused here, before any body is read.
+fn parse_decoded_content_length(headers: &HeaderMap) -> Result<Option<u64>, AuthError> {
+    let Some(raw) = header(headers, "x-amz-decoded-content-length") else {
+        return Ok(None);
     };
-    Ok(TrailerDeclaration {
-        name,
-        algorithm,
-        decoded_content_length,
-    })
+    let malformed =
+        || AuthError::Malformed("x-amz-decoded-content-length is not a valid integer".into());
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(malformed());
+    }
+    raw.parse::<u64>().map(Some).map_err(|_| malformed())
 }
 
 /// Whether `s` is a 64-character hex string — the shape of a literal SHA-256 payload hash.
@@ -659,20 +669,58 @@ pub fn sign_with_payload_hash(
     region: &str,
     service: &str,
 ) -> SignedHeaders {
+    sign_with_payload_hash_and_headers(
+        method,
+        uri,
+        query,
+        host,
+        amz_date,
+        payload_hash,
+        &[],
+        credentials,
+        region,
+        service,
+    )
+}
+
+/// As [`sign_with_payload_hash`], but also signing each of `extra_headers` (name, value) —
+/// the way an SDK signs the `x-amz-*` headers it sends, such as an `aws-chunked` upload's
+/// `x-amz-decoded-content-length` (#671). The caller sends those headers with the same
+/// values. Names are lower-cased and the set is sorted, as the canonical request requires.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_with_payload_hash_and_headers(
+    method: &str,
+    uri: &str,
+    query: &str,
+    host: &str,
+    amz_date: &str,
+    payload_hash: &str,
+    extra_headers: &[(&str, &str)],
+    credentials: &Credentials,
+    region: &str,
+    service: &str,
+) -> SignedHeaders {
     let date = &amz_date[..8];
-    // Sorted ascending by header name (host < x-amz-content-sha256 < x-amz-date).
-    let headers = [
+    let mut headers = vec![
         ("host".to_string(), host.trim().to_string()),
         ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
         ("x-amz-date".to_string(), amz_date.to_string()),
     ];
-    let signed_headers_str = "host;x-amz-content-sha256;x-amz-date";
+    for (name, value) in extra_headers {
+        headers.push((name.to_ascii_lowercase(), trim_all(value)));
+    }
+    headers.sort_by(|a, b| a.0.cmp(&b.0));
+    let signed_headers_str = headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
     let canonical = canonical_request(
         method,
         uri,
         &canonical_query(query),
         &headers,
-        signed_headers_str,
+        &signed_headers_str,
         payload_hash,
     );
     let signature = derive_signature(
@@ -1134,9 +1182,9 @@ mod tests {
             Some(TrailerDeclaration {
                 name: "x-amz-checksum-crc32".to_string(),
                 algorithm: ChecksumAlgorithm::Crc32,
-                decoded_content_length: None,
             })
         );
+        assert_eq!(ctx.decoded_content_length, None);
 
         let payload = verify_with_claim_and_headers(
             "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
@@ -1155,9 +1203,39 @@ mod tests {
             Some(TrailerDeclaration {
                 name: "x-amz-checksum-crc32c".to_string(),
                 algorithm: ChecksumAlgorithm::Crc32c,
-                decoded_content_length: Some(42),
             })
         );
+        assert_eq!(ctx.decoded_content_length, Some(42));
+    }
+
+    /// #671: `x-amz-decoded-content-length` is read for the plain
+    /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` form too (it was read only for `-TRAILER`), and a
+    /// value that is not a plain run of digits — a `+` sign `u64::from_str` would take,
+    /// whitespace, a value past `u64` — is refused before any body is read.
+    #[test]
+    fn verify_reads_the_decoded_length_for_every_streaming_variant() {
+        let payload = verify_with_claim_and_headers(
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+            &[("x-amz-decoded-content-length", "1265")],
+        )
+        .expect("a plain streaming upload with a decoded length authenticates");
+        let PayloadHash::Streaming(ctx) = payload else {
+            panic!("the plain streaming sentinel must classify as PayloadHash::Streaming");
+        };
+        assert_eq!(ctx.decoded_content_length, Some(1265));
+
+        for bad in ["+5", "-5", " 5", "5a", "", "18446744073709551616"] {
+            assert!(
+                matches!(
+                    verify_with_claim_and_headers(
+                        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                        &[("x-amz-decoded-content-length", bad)],
+                    ),
+                    Err(AuthError::Malformed(_))
+                ),
+                "decoded length {bad:?} must be refused"
+            );
+        }
     }
 
     /// The `-TRAILER` admission stays fail-closed on its OWN declaration (issue #505: "the

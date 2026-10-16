@@ -353,7 +353,8 @@ fn client_sign_trailer(ctx: &SeedCtx, previous_signature: &str, canonical_header
 /// Sign the SEED request for a `-TRAILER` streaming PUT, exactly as a real SDK does: the
 /// seed `Authorization` covers the sentinel (the body streams, not available whole at
 /// signing time) and the request carries the trailer-declaration headers
-/// (`x-amz-trailer`, optionally `x-amz-decoded-content-length`) — mirrors
+/// (`x-amz-trailer` and `x-amz-decoded-content-length`, which every `aws-chunked` PUT must
+/// declare since #671 — as an SDK always does) — mirrors
 /// `s3_http_wire.rs`'s `streaming_interop::streaming_seed`, extended with the trailer
 /// declaration this brief (#505) adds.
 fn streaming_seed(
@@ -362,7 +363,7 @@ fn streaming_seed(
     path: &str,
     host: &str,
     algorithm: Algo,
-    decoded_content_length: Option<u64>,
+    decoded_content_length: u64,
 ) -> (Vec<(String, String)>, SeedCtx) {
     let creds = Credentials {
         access_key_id: ACCESS_KEY.to_string(),
@@ -386,16 +387,17 @@ fn streaming_seed(
         scope: format!("{}/{REGION}/s3/aws4_request", &amz_date[..8]),
         signed,
     };
-    let mut headers = vec![
+    let headers = vec![
         ("authorization".to_string(), seed.authorization),
         ("x-amz-date".to_string(), seed.amz_date),
         ("x-amz-content-sha256".to_string(), seed.content_sha256),
         ("content-encoding".to_string(), "aws-chunked".to_string()),
         ("x-amz-trailer".to_string(), name),
+        (
+            "x-amz-decoded-content-length".to_string(),
+            decoded_content_length.to_string(),
+        ),
     ];
-    if let Some(len) = decoded_content_length {
-        headers.push(("x-amz-decoded-content-length".to_string(), len.to_string()));
-    }
     (headers, ctx)
 }
 
@@ -449,7 +451,9 @@ async fn unsigned_trailer_put_accepts_the_minimum_checksum_algorithm_set() {
         let (addr, _dir) = start_gateway().await;
         let host = addr.to_string();
         let path = "/wyrd-bucket/unsigned-trailer-object";
-        let object: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        // Several store chunks and wire frames, under the gateway's single-PUT ceiling
+        // (158 × 8 = 1,264 bytes, #671).
+        let object: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
 
         let (headers, ctx) = streaming_seed(
             "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
@@ -457,12 +461,12 @@ async fn unsigned_trailer_put_accepts_the_minimum_checksum_algorithm_set() {
             path,
             &host,
             algorithm,
-            None,
+            object.len() as u64,
         );
         let value = checksum_trailer_value(algorithm, &object);
         let framed = frame_trailer_body(
             &ctx,
-            &[&object[..1000], &object[1000..2500], &object[2500..]],
+            &[&object[..300], &object[300..700], &object[700..]],
             trailer_name(algorithm),
             &value,
         );
@@ -501,7 +505,8 @@ async fn signed_trailer_put_with_valid_chunk_and_trailer_signatures_round_trips(
     let (addr, _dir) = start_gateway().await;
     let host = addr.to_string();
     let path = "/wyrd-bucket/signed-trailer-object";
-    let object: Vec<u8> = (0..3000u32).map(|i| (i % 197) as u8).collect();
+    // Under the gateway's single-PUT ceiling (158 × 8 = 1,264 bytes, #671).
+    let object: Vec<u8> = (0..1200u32).map(|i| (i % 197) as u8).collect();
 
     let (headers, ctx) = streaming_seed(
         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
@@ -509,12 +514,12 @@ async fn signed_trailer_put_with_valid_chunk_and_trailer_signatures_round_trips(
         path,
         &host,
         Algo::Crc32,
-        Some(object.len() as u64),
+        object.len() as u64,
     );
     let value = checksum_trailer_value(Algo::Crc32, &object);
     let framed = frame_trailer_body(
         &ctx,
-        &[&object[..1500], &object[1500..]],
+        &[&object[..600], &object[600..]],
         trailer_name(Algo::Crc32),
         &value,
     );
@@ -553,7 +558,7 @@ async fn a_forged_trailer_signature_is_refused_and_stores_nothing() {
         path,
         &host,
         Algo::Crc32,
-        None,
+        object.len() as u64,
     );
     let value = checksum_trailer_value(Algo::Crc32, &object);
     let mut framed = frame_trailer_body(&ctx, &[&object], trailer_name(Algo::Crc32), &value);
@@ -599,7 +604,7 @@ async fn a_tampered_trailer_checksum_is_refused_and_stores_nothing() {
         path,
         &host,
         Algo::Crc32,
-        None,
+        object.len() as u64,
     );
     // A checksum for bytes OTHER than what is actually streamed.
     let wrong_value = checksum_trailer_value(Algo::Crc32, b"not the real object");
@@ -689,7 +694,7 @@ async fn a_non_base64_trailer_checksum_is_refused_as_bad_request() {
         path,
         &host,
         Algo::Crc32,
-        None,
+        object.len() as u64,
     );
     let framed = frame_trailer_body(
         &ctx,
@@ -745,7 +750,7 @@ async fn a_non_canonical_base64_trailer_checksum_is_refused_as_bad_request() {
         path,
         &host,
         Algo::Crc32,
-        None,
+        object.len() as u64,
     );
     let non_canonical = non_canonical_base64_crc32(&object);
     // Sanity: it differs textually from the canonical value it would decode to.
@@ -778,7 +783,7 @@ async fn an_undeclared_trailer_name_is_refused_as_bad_request() {
         path,
         &host,
         Algo::Crc32,
-        None,
+        object.len() as u64,
     );
     // Declares crc32 but the wire sends crc32c instead.
     let value = checksum_trailer_value(Algo::Crc32c, &object);
@@ -806,7 +811,7 @@ async fn garbage_after_the_trailer_block_is_refused_as_bad_request() {
         path,
         &host,
         Algo::Crc32,
-        None,
+        object.len() as u64,
     );
     let value = checksum_trailer_value(Algo::Crc32, &object);
     let mut framed = frame_trailer_body(&ctx, &[&object], trailer_name(Algo::Crc32), &value);
@@ -835,14 +840,20 @@ async fn a_decoded_content_length_mismatch_is_refused() {
         path,
         &host,
         Algo::Crc32,
-        Some(9999), // deliberately wrong
+        // Deliberately wrong, and under the single-PUT ceiling (#671) so the refusal is the
+        // mismatch's own, not EntityTooLarge.
+        object.len() as u64 + 1,
     );
     let value = checksum_trailer_value(Algo::Crc32, &object);
     let framed = frame_trailer_body(&ctx, &[&object], trailer_name(Algo::Crc32), &value);
 
-    let (status, _) = send(addr, "PUT", path, &headers, &framed).await;
+    let (status, body) = send(addr, "PUT", path, &headers, &framed).await;
     assert_eq!(
         status, 400,
         "an x-amz-decoded-content-length mismatch must be a 400 (was blanket 403 pre-#505)"
+    );
+    assert!(
+        String::from_utf8_lossy(&body).contains("<Code>InvalidRequest</Code>"),
+        "the mismatch must be refused as a malformed body, not for its size"
     );
 }
