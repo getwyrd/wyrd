@@ -453,21 +453,25 @@ hand-rolled form is how a validator invents its own false failures.
 **At quiesce**, with mutation stopped: the full `ListObjectsV2` sweep equals the model's live set
 exactly — no extra key, no missing key, correct `CommonPrefixes` rollups under `delimiter=/`.
 
-**`Last-Modified` is real wall-clock but not directly comparable across surfaces.**
-`now_millis()` reads `SystemTime::now()` (`crates/server/src/lib.rs:756`) and objects are stamped
-at `:197` and `:348`. But the value the wire returns differs by surface and is not ordered across
-a fleet:
+**`Last-Modified` is real wall-clock, agrees across surfaces to the second, and is not ordered
+across a fleet.** `now_millis()` reads `SystemTime::now()` (`crates/server/src/lib.rs:756`) and
+objects are stamped at `:197` and `:348`. The store keeps milliseconds (ADR-0047); the wire does
+not:
 
-- A listing renders `<LastModified>` through `iso8601`, keeping milliseconds; `GET`/`HEAD` render
-  the header through `http_date`, which is IMF-fixdate and second-granular. The same object
-  therefore reports two different times, up to 999 ms apart ([#767][i767]).
+- A listing renders `<LastModified>` through `iso8601` truncated to the whole second (`.000Z`),
+  and `GET`/`HEAD` render the header through `http_date`, which is IMF-fixdate and
+  second-granular. Both name the same instant for every stored value, which is what S3 itself
+  does ([#767][i767]).
 - Each gateway stamps from its own clock with no monotonicity guard at overwrite commit, so on
   the blueprinted N-gateway fleet `Last-Modified` can go **backwards** across an overwrite
   ([#768][i768]).
 
-So the oracle verifies the timestamp **per surface** — a listing time against the listing format,
-a header time against the header format — and never compares one to the other or assumes ordering.
-`sync`'s comparison (§7 workflows) inherits the same limit and is discussed there.
+So the oracle checks each timestamp against its own surface's format, **and** checks that a
+listing's `LastModified` and a `HEAD` of the same object, at the same generation, agree at
+whole-second precision. A mismatch there is a failure, not noise: it is exactly what makes a
+sync tool that caches a listing and revalidates with `HEAD` see every object as changed. What the
+oracle does not assume is ordering: two stamps of different generations are never compared for
+"later than". `sync`'s comparison (§7 workflows) inherits that limit and is discussed there.
 (madsim virtualises the read under DST, so the stamp is deterministic in simulation and real
 everywhere else.)
 
