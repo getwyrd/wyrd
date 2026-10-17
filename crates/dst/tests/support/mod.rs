@@ -514,7 +514,9 @@ pub enum FdbFidelity {
 /// aware (see the module docs).
 #[derive(Debug, Clone, Copy)]
 struct Nemesis {
-    code: i32,
+    /// The code every strike raises, or `None` for a **mixed** nemesis whose every strike draws
+    /// its code from a seed-derived coin ([`SimFdbMetadataStore::arm_mixed_commit_ambiguity`]).
+    code: Option<i32>,
     budget: u64,
 }
 
@@ -568,6 +570,9 @@ struct FdbInner {
     /// committed at a later point in time" (`crates/metadata-fdb/src/lib.rs:161-164`).
     /// Each is still subject to the resolver when it lands, so it can be rejected then.
     in_flight: Vec<WriteBatch>,
+    /// Whether an in-flight batch lands only at [`SimFdbMetadataStore::quiesce`], never at a
+    /// later store operation ([`SimFdbMetadataStore::defer_in_flight_landings`]).
+    defer_in_flight: bool,
     /// Seed-derived, so a bug-finding seed replays the *same* fault decisions (ADR-0009).
     /// Never wall-clock, never thread scheduling.
     rng: rand_chacha::ChaCha8Rng,
@@ -604,9 +609,10 @@ impl FdbInner {
     /// beaten is rejected, and "exactly one writer wins" survives the deferral.
     ///
     /// Returns immediately, drawing **no** randomness, when nothing is in flight — so a
-    /// nemesis-free run (the shared contract suite) is bit-for-bit unperturbed.
+    /// nemesis-free run (the shared contract suite) is bit-for-bit unperturbed — and, on a
+    /// store that defers in-flight landings, whenever it is not forced.
     fn settle_in_flight(&mut self, force: bool) {
-        if self.in_flight.is_empty() {
+        if self.in_flight.is_empty() || (self.defer_in_flight && !force) {
             return;
         }
         // The violating twin skips the resolver's read-conflict re-check on the *forced*
@@ -668,6 +674,7 @@ impl SimFdbMetadataStore {
                 fidelity,
                 nemesis: None,
                 in_flight: Vec::new(),
+                defer_in_flight: false,
                 rng: rand_chacha::ChaCha8Rng::seed_from_u64(
                     madsim::runtime::Handle::current().seed(),
                 ),
@@ -698,6 +705,29 @@ impl SimFdbMetadataStore {
             code == SIM_COMMIT_UNKNOWN_RESULT || code == SIM_TRANSACTION_TIMED_OUT,
             "simulated-FDB: {code} is not an undeterminable commit code (1021 or 1031)"
         );
+        self.arm(Some(code), budget);
+    }
+
+    /// Arm a **mixed** nemesis for the next `budget` commits the resolver accepts: each strike
+    /// raises [`SIM_COMMIT_UNKNOWN_RESULT`] or [`SIM_TRANSACTION_TIMED_OUT`] on a seed-derived
+    /// coin, so one writer can meet a `1031` and then a `1021` (#894). The coin is drawn only
+    /// on a strike of a mixed nemesis, so a single-code nemesis replays bit for bit as before.
+    pub fn arm_mixed_commit_ambiguity(&self, budget: u64) {
+        self.arm(None, budget);
+    }
+
+    /// Let a batch a `1031` leaves in flight land only at [`Self::quiesce`], never at a later
+    /// store operation's opportunistic settle: the latest of the instants FoundationDB allows
+    /// ("the transaction could get committed at a later point in time",
+    /// `crates/metadata-fdb/src/lib.rs:161-164`), still through the resolver. It selects that
+    /// schedule, so a scenario can reach a writer that gave up while its batch was in flight
+    /// and see the batch land afterwards (#894). Off by default; a store that never calls it
+    /// replays bit for bit as before.
+    pub fn defer_in_flight_landings(&self) {
+        self.inner.lock().unwrap().defer_in_flight = true;
+    }
+
+    fn arm(&self, code: Option<i32>, budget: u64) {
         let mut inner = self.inner.lock().unwrap();
         assert_ne!(
             inner.fidelity,
@@ -788,6 +818,11 @@ impl SimFdbMetadataStore {
         let Some(code) = strike else {
             apply(&mut inner.truth, batch);
             return Ok(CommitOutcome::Committed);
+        };
+        let code = match code {
+            Some(code) => code,
+            None if inner.coin() => SIM_COMMIT_UNKNOWN_RESULT,
+            None => SIM_TRANSACTION_TIMED_OUT,
         };
 
         inner.obs.ambiguous_commits += 1;
