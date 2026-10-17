@@ -2,10 +2,12 @@
 //! spelled in (proposal 0016,
 //! `docs/design/proposals/draft/0016-multipart-commit-protocol.md`).
 //!
-//! This is slices 1–3 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). It is
-//! deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
-//! `async fn`. After this module a reader can name every key the protocol will ever write
-//! (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
+//! This is slices 1–3 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). This
+//! file is deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
+//! `async fn`. The protocol's store round trips live beside it, in child modules, and use only
+//! what this file defines: the first is [`create`], `CreateMultipartUpload`'s admission and
+//! session creation (#894). After this file a reader can name every key the protocol will ever
+//! write (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
 //! names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
 //! derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence` singleton
 //! ([`FenceGeneration`], the restore-fence generation of `0016:723-728`), the in-flight lifecycle
@@ -90,22 +92,25 @@
 //! Structural validity is checked **at decode**, never by convention at a call site
 //! (`0016:390-414`).
 //!
-//! # Almost nothing here is written yet — and the living-architecture doc says exactly that
+//! # What writes these records — and the living-architecture doc says exactly that
 //!
-//! This module is the key **grammar** plus the record **shapes**: it makes no store call, and its
+//! This file is the key **grammar** plus the record **shapes**: it makes no store call. Its
 //! writer-side API is the post-restore fence's two teardowns ([`SessionRecord::open_teardown`],
-//! #841, and [`SessionRecord::completing_teardown`], #842) and the generation record that pass
-//! keeps ([`FenceGeneration`], #810); every other first writer is a store round trip (#656–#659).
+//! #841, and [`SessionRecord::completing_teardown`], #842), the generation record that pass
+//! keeps ([`FenceGeneration`], #810), and one creation route each for a fresh session and for
+//! the admission ledger, which [`create::create_session`] commits (#894). So Create now writes
+//! `mpuctl`, `mpu:` and `seggrp:`, with no production caller until the S3 verb is wired (#668);
+//! every other first writer is a store round trip still to land (#657–#659).
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
 //! is** (`docs/design/README.md:28`), and a persisted record *definition* is part of that
 //! system the moment it is merged — `AGENTS.md:154-158` makes updating it in the same PR a
 //! merge requirement, not a follow-up. Its metadata model
-//! (`docs/design/architecture/05-building-block-view.md:202-204`) therefore records these
-//! record **types** as landed ahead of their writers, along with the answer table and the
-//! multipart ETag and Complete fingerprint a `Completed` session stores, and defers the
-//! *protocol* — the fenced transitions, staged publication and the retirement drain — to the
+//! (`docs/design/architecture/05-building-block-view.md:206`) therefore records these
+//! record **types**, says which of them Create now writes, and lists the answer table and the
+//! multipart ETag and Complete fingerprint a `Completed` session stores; it defers the rest of
+//! the *protocol* — the fenced transitions, staged publication and the retirement drain — to the
 //! proposal, whose §1 (`0016:333-356`) stays the normative description of this key space.
 //!
 //! One type here does reach a live path: the owned entry's value is the shared
@@ -137,6 +142,8 @@ use crate::metadata::{
     self, ChunkRef, EcScheme, InodeId, SegmentGroup, SegmentNonce, MAX_ROOT_SEGMENTS,
     MAX_ROOT_VALUE_BYTES, MAX_VALUE_BYTES,
 };
+
+pub mod create;
 
 // ===========================================================================
 // 1. Errors — every structural violation is a typed error, never a value
@@ -1556,9 +1563,10 @@ const SCAN_HALF: u64 = (SCAN_CAP as u64) / 2;
 /// whose own derivations are undefined: [`Budget::u_ref`] and [`Budget::max_sessions`] are
 /// total for every value of this type, and a tuple that would make them otherwise is an error
 /// at the boundary rather than a value inside the program (ADR-0045, parse-don't-validate). A
-/// writer-side constructor is deliberately absent — the first writers are the store round
-/// trips (#656–#659), and a knob-range check over an operator's *configuration* is a
-/// different boundary, #508's and #655's (`0016:1458-1466`).
+/// writer-side constructor is deliberately absent: the first writer, [`create::create_session`],
+/// takes the profile it admits against from its caller as a decoded `Budget` and stores it
+/// whole, and a knob-range check over an operator's *configuration* is a different boundary,
+/// #508's and #655's (`0016:1458-1466`).
 ///
 /// The wire shape is **closed** (`deny_unknown_fields`) for the reason [`AdmissionRecord`]
 /// records: this tuple is part of the value CAS compares.
@@ -1684,6 +1692,24 @@ impl Budget {
         let quotient = self.w_ref / self.u_ref();
         // `quotient.min(SCAN_HALF)`, which a `const fn` cannot call.
         quotient - quotient.saturating_sub(SCAN_HALF)
+    }
+
+    /// The **contention budget** of a create admitting against this profile: how many of its
+    /// admission commits may be lost (the `mpuctl` CAS lost, a `Conflict` with nothing moved, or
+    /// an outcome the store could not report) before it refuses with
+    /// [`Backpressure::AdmissionContention`]. It is this profile's own [`Self::max_sessions`]
+    /// (#894).
+    ///
+    /// A contention refusal is therefore bounded, not ruled out: the create lost or could not
+    /// settle its commit this many times. On a store whose `Conflict` means another committed
+    /// batch wrote a precondition key (redb, FoundationDB), with no unknown outcomes, each loss
+    /// is the ledger moving. On TiKV a locking read that meets another writer's lock also answers
+    /// `Conflict` with nothing moved, so lock contention alone can spend it on a ledger with room.
+    /// Following the profile in effect rather than the shipped [`MAX_SESSIONS`] is what keeps a
+    /// deployment with a larger profile from refusing creates sooner than its own limit. The
+    /// cast is exact: `max_sessions ≤ SCAN_CAP/2` by its own clamp.
+    pub const fn admission_cas_attempts(&self) -> u32 {
+        self.max_sessions() as u32
     }
 
     /// The profile's whole rule set, in one place and applied wherever a [`Budget`] can come
@@ -1857,6 +1883,39 @@ impl AdmissionRecord {
     /// The budget tuple that establishes [`Self::max_sessions`].
     pub const fn profile(&self) -> &Budget {
         &self.profile
+    }
+
+    /// The ledger the **first** admission on a store writes (`0016:348`, `:2003-2010`): one
+    /// session counted, the limit `profile` derives, and `profile` itself, so a fresh store
+    /// adopts the first admitting gateway's derivation and every later one is checked against
+    /// it.
+    ///
+    /// One of this record's two creation routes, both [`create::create_session`]'s; the other
+    /// is [`Self::admit_one`]. Each holds the identity [`decode_admission_record`] enforces by
+    /// construction: `max_sessions` is the profile's own derivation (G8), the profile already
+    /// passed G1–G7 (it is a [`Budget`]), and every field is required, so the encoding is the
+    /// canonical spelling the decoder requires back.
+    pub(crate) const fn bootstrap(profile: Budget) -> Self {
+        Self {
+            count: 1,
+            max_sessions: profile.max_sessions(),
+            profile,
+        }
+    }
+
+    /// This ledger with one more session admitted, or `None` when it is at (or, after a lowered
+    /// profile, above) its **stored** `max_sessions`: the bound the Create batch's
+    /// `require(mpuctl == prior)` enforces (`0016:657`). The increment cannot overflow, because
+    /// `count < max_sessions ≤ SCAN_CAP/2` when it happens. `max_sessions` and `profile` are
+    /// carried unchanged, so G8 still holds.
+    pub(crate) fn admit_one(&self) -> Option<Self> {
+        if self.count >= self.max_sessions {
+            return None;
+        }
+        Some(Self {
+            count: self.count + 1,
+            ..*self
+        })
     }
 }
 
@@ -2258,8 +2317,10 @@ struct SessionRecordWire {
 ///
 /// No free constructor: a `SessionRecord` minted from loose fields could not be relied on to hold
 /// the identity [`decode_session_record`] enforces — precisely the reason [`AdmissionRecord`] and
-/// [`Budget`] omit one too. The writer-side routes transition a record that already decoded
-/// ([`Self::open_teardown`], [`Self::completing_teardown`]), changing only `epoch` and `state`.
+/// [`Budget`] omit one too. The writer-side routes are the one creation route Create uses
+/// (`SessionRecord::open`, crate-private, #894), which can only mint an `Open` session, and the
+/// transitions of a record that already decoded ([`Self::open_teardown`],
+/// [`Self::completing_teardown`]), which change only `epoch` and `state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SessionRecordWire")]
 pub struct SessionRecord {
@@ -2280,6 +2341,121 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
+    /// The session **Create** installs (`0016:350`, `:657`): `Open` at epoch 0 (the first value
+    /// of the monotone counter every fence bumps, `0016:528-560`) with no Complete fence spent
+    /// (`attempts` 0), stamped `created_at_millis` by the clock `clock_source` names (the
+    /// caller's, `0016:1957-1990`), and carrying the segment-group nonce Create reserves beside
+    /// it.
+    ///
+    /// The **one** creation route for this record ([`create::create_session`] is its only
+    /// caller). It holds the identity [`decode_session_record`] enforces: the cross-field rules
+    /// bind only `Completing`, an absent `content_type` is omitted rather than spelled `null`,
+    /// and every other field is required, so [`crate::metadata::encode`] writes exactly the
+    /// canonical spelling the decoder requires back.
+    pub(crate) fn open(
+        parent: InodeId,
+        object: String,
+        content_type: Option<String>,
+        created_at_millis: u64,
+        clock_source: String,
+        segment_nonce: SegmentNonce,
+    ) -> Self {
+        Self {
+            parent,
+            object,
+            content_type,
+            created_at_millis,
+            clock_source,
+            segment_nonce,
+            epoch: 0,
+            attempts: 0,
+            state: SessionState::Open {},
+        }
+    }
+
+    /// The most bytes this session's record can encode to in **any** state it can later reach
+    /// (`Open` again after a rolled-back Complete, `Completing`, `Aborting`, `Completed`), with
+    /// every number the decoder accepts at its widest: `epoch` and every timestamp at
+    /// `u64::MAX`, `attempts` at `u32::MAX`, the segment cursor at its format bound, the
+    /// published inode and version at `u64::MAX`, and an ETag naming [`MAX_PART_NUMBER`] parts.
+    /// Measured with the real encoder, so the JSON escapes of the object name count, and
+    /// `Completing` carries that name twice (as `object` and as `publish_target.name`).
+    ///
+    /// Create refuses a session whose widest state would cross [`MAX_VALUE_BYTES`]: admitted at
+    /// `Open`, it could reach a state the tightest backend refuses to store, so every fence of it
+    /// (Abort's, Complete's, the restore fence) would fail forever and its admission slot would
+    /// never be released.
+    pub(crate) fn widest_reachable_bytes(&self) -> usize {
+        let widest = |state: SessionState| {
+            metadata::encode(&Self {
+                epoch: u64::MAX,
+                attempts: u32::MAX,
+                state,
+                ..self.clone()
+            })
+            .len()
+        };
+        let completing = SessionState::Completing {
+            fenced_at_millis: u64::MAX,
+            segments_written: metadata::MAX_SEGMENT_INDEX + 1,
+            publish_target: PublishTarget {
+                parent: self.parent,
+                name: self.object.clone(),
+                epoch: u64::MAX,
+            },
+        };
+        // A digest is fixed-width (64 hex characters), so any value is its widest.
+        let digest = Digest::from_bytes([0xff; 32]);
+        let completed = SessionState::Completed {
+            completion: Completion {
+                inode: InodeId::MAX,
+                version: u64::MAX,
+                etag: MultipartEtag {
+                    composed: digest,
+                    parts: MAX_PART_NUMBER,
+                },
+                completed_at_millis: u64::MAX,
+                complete_fingerprint: digest,
+            },
+        };
+        [
+            SessionState::Open {},
+            SessionState::Aborting {},
+            completing,
+            completed,
+        ]
+        .into_iter()
+        .map(widest)
+        .fold(0, usize::max)
+    }
+
+    /// Whether `other` is **this session** at some point of its life, possibly a later one:
+    /// every field no transition changes is equal. Every later state change is a fenced CAS
+    /// (`0016:350`) that moves only `epoch`, `attempts` (the Complete fence, `0016:661`) and
+    /// `state`; the publish target (`parent`, `object`), `content_type`, the `created_at_millis`
+    /// stamp, its `clock_source` and the segment-group nonce stay as Create wrote them. Create
+    /// uses it to recognise its own session after a fence moved it past `Open@0` (#894), so the
+    /// destructuring below makes a new field a compile error here until it is classified.
+    pub(crate) fn same_session(&self, other: &Self) -> bool {
+        let Self {
+            parent,
+            object,
+            content_type,
+            created_at_millis,
+            clock_source,
+            segment_nonce,
+            epoch: _,
+            attempts: _,
+            state: _,
+        } = self;
+        *parent == other.parent
+            && *object == other.object
+            && *content_type == other.content_type
+            && *created_at_millis == other.created_at_millis
+            && *clock_source == other.clock_source
+            && *segment_nonce == other.segment_nonce
+    }
+
     /// The bucket inode the session targets.
     pub const fn parent(&self) -> InodeId {
         self.parent
@@ -4289,7 +4465,10 @@ pub enum Backpressure {
         /// The size of the session's slot key space.
         max_inflight_parts: u32,
     },
-    /// The create lost the serialized admission CAS this many times.
+    /// The create spent its contention budget ([`Budget::admission_cas_attempts`] of the profile
+    /// in effect): it lost or could not settle this many of its admission commits. Each loss is
+    /// the ledger moving, an outcome the store could not report, or (on TiKV) a lock another
+    /// writer held with nothing moved.
     AdmissionContention {
         /// Attempts spent.
         attempts: u32,
@@ -4325,6 +4504,18 @@ pub enum Refusal {
         /// The chunk count the request would have installed.
         chunks: u64,
         /// The ceiling it crossed.
+        limit: u64,
+    },
+    /// The session a Create asked for could not reach every later state inside the value
+    /// ceiling every backend inherits: the widest encoding its record can reach in any later
+    /// state (`Completing` carries the object name, JSON escapes included, twice; `Completed`
+    /// carries a fixed payload that is wider for a short name) is `bytes`, past `limit`. Refused
+    /// before any read or write, because a session admitted at `Open` that could not later be
+    /// fenced would hold its admission slot forever (#894).
+    SessionTooLarge {
+        /// The widest encoding the session's record could reach, in bytes.
+        bytes: u64,
+        /// The ceiling it crosses ([`MAX_VALUE_BYTES`]).
         limit: u64,
     },
     /// Designed backpressure.
@@ -4374,8 +4565,8 @@ impl Publication {
     }
 }
 
-/// What `CreateMultipartUpload` answers (#656) — named here so #656 answers in this
-/// vocabulary rather than inventing its own.
+/// What `CreateMultipartUpload` answers ([`create::create_session`], #894) — named here so the
+/// create answers in this vocabulary rather than inventing its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateOutcome {
     /// A session record and its `seggrp:` reservation are durable and the admission counter
@@ -4676,11 +4867,13 @@ pub fn answer(
 // against a number the batch that must later undo it cannot hold — never fenced, never
 // deleted, holding its admission slot forever (`docs/principles.md` §5 C-1).
 //
-// Nothing here is enforced yet — no admission path exists to enforce it on — and none of it is
-// a decode rule. A capacity is a contextual check made where work is admitted, never against a
-// stored record (ADR-0045 decision 1; `0016:390-402`), so moving a number can never make a
-// durable record unreadable. That is why `Budget`'s record rules leave these ranges out, and why
-// `knob_clamps_hold` is a separate, configuration-side check that applies those rules as well.
+// Only the create path enforces any of it yet (`create::create_session`, #894: the stored
+// session limit and the two create budgets); the rest waits for the slices that admit its work.
+// None of it is a decode rule. A capacity is a contextual check made where work is admitted,
+// never against a stored record (ADR-0045 decision 1; `0016:390-402`), so moving a number can
+// never make a durable record unreadable. That is why `Budget`'s record rules leave these ranges
+// out, and why `knob_clamps_hold` is a separate, configuration-side check that applies those
+// rules as well.
 
 /// The durability scheme the shipped chunk caps are sized for: Reed-Solomon(6,3), the
 /// deployment default (`DEFAULT_DURABILITY`, `crates/server/src/lib.rs:49`), restated because
@@ -5000,34 +5193,50 @@ pub const R_PUBLISH: u32 = 3;
 /// session's only exit.
 pub const MAX_COMPLETE_ATTEMPTS: u32 = 3;
 
-/// Upload ids a create mints before it refuses — its budget for a `require_absent(mpu:<id>)`
-/// **collision**, a 2^-128 event per mint (`0016:493-497`). Two: one re-mint makes a second
+/// Session identities a create mints before it gives up with
+/// [`create::CreateError::IdentityCollisions`]: its budget for a **collision**, an upload id
+/// whose `mpu:<id>` or a nonce whose `seggrp:<nonce>` is already in the store when the create
+/// first reads it, a 2^-128 event per mint (`0016:493-497`). Two: one re-mint makes a second
 /// collision a 2^-256 event, and more buys nothing.
 ///
 /// **Not the contention budget, and never sized like it** — see
-/// [`MAX_ADMISSION_CAS_ATTEMPTS`].
+/// [`MAX_ADMISSION_CAS_ATTEMPTS`]. A lost admission CAS never spends this budget, and a
+/// collision never spends that one.
 pub const MAX_UPLOAD_ID_ATTEMPTS: u32 = 2;
 
-/// Admission-CAS attempts a create makes before refusing with
-/// [`Backpressure::AdmissionContention`] — its budget for losing the `mpuctl` CAS to other
-/// creators (`0016:1999-2034`). Contention there is normal: every create CASes the one ledger,
-/// so `N` simultaneous creators serialize and the last needs `N` attempts.
+/// The contention budget of a create admitting against the **shipped** profile: how many of its
+/// admission commits may be lost (the `mpuctl` CAS lost to other creators, `0016:2001-2036`, a
+/// `Conflict` with nothing moved, or an outcome the store could not report) before it refuses
+/// with [`Backpressure::AdmissionContention`]. Contention there is normal: every create CASes the
+/// one ledger, so `N` simultaneous creators serialize and the last needs `N` attempts.
 ///
-/// **Derived: [`MAX_SESSIONS`].** Among creates, a lost CAS means another create was admitted,
-/// so after `MAX_SESSIONS` losses the ledger is full and the refusal is the capacity bound: a
-/// create storm on an empty ledger is never refused while the ledger has room. The defect this
-/// pair replaces was one budget shared with [`MAX_UPLOAD_ID_ATTEMPTS`] — sized for a 2^-128
-/// collision, it answered a false `503 SlowDown` on an empty store at ordinary client
-/// concurrency. (A CAS lost to a teardown's decrement is churn, and a refusal under churn is
-/// backpressure.) The cast is exact: [`MAX_SESSIONS`] is at most `SCAN_CAP/2` by its own clamp.
-pub const MAX_ADMISSION_CAS_ATTEMPTS: u32 = MAX_SESSIONS as u32;
+/// **Derived, and not fixed.** A create spends the budget of the profile **in effect**,
+/// [`Budget::admission_cas_attempts`] of its own [`Budget`] (equal to the ledger's, or the create
+/// already answered [`Refusal::ProfileSkew`]), so a deployment whose profile admits more sessions
+/// also rides out more contention ([`create::create_session`]). This constant is only that
+/// derivation at the shipped numbers, [`MAX_SESSIONS`]: the value [`KnobSet::DEPLOYED`] carries
+/// and [`knob_clamps_hold`] holds to at least the session limit.
+///
+/// A contention refusal is therefore bounded, not ruled out: the create lost or could not settle
+/// its commit as many times as the profile admits sessions. Each loss is the ledger moving, an
+/// outcome the store could not report, or (on TiKV, whose locking read answers `Conflict` when
+/// it meets another writer's lock) a lock another writer held with nothing moved. Where every
+/// loss is the ledger moving (redb, FoundationDB, no unknown outcomes), a create storm on a
+/// ledger with room fills the ledger before any create is refused for contention, and the
+/// refusal is then the capacity bound ([`Backpressure::SessionCap`]); on TiKV, lock contention
+/// alone can spend the budget on a ledger with room. (A CAS lost to a teardown's decrement is
+/// churn, and a refusal under churn is backpressure.) The defect this pair replaces was one
+/// budget shared with [`MAX_UPLOAD_ID_ATTEMPTS`]: sized for a 2^-128 collision, it answered a
+/// false `503 SlowDown` on an empty store at ordinary client concurrency.
+pub const MAX_ADMISSION_CAS_ATTEMPTS: u32 = SHIPPED_PROFILE.admission_cas_attempts();
 
 /// The least a creator waits after a lost admission CAS, in milliseconds, and the step the
 /// backoff window doubles from.
 pub const ADMISSION_BACKOFF_BASE_MILLIS: u64 = 2;
 
-/// The most a creator waits after one lost admission CAS, in milliseconds; a create that spends
-/// its whole contention budget has waited at most `MAX_ADMISSION_CAS_ATTEMPTS ×` this (2.3 s).
+/// The most a creator waits after one lost admission CAS, in milliseconds. A create that spends
+/// its whole contention budget has waited at most its budget ([`Budget::admission_cas_attempts`]
+/// of the profile in effect) times this: 2.3 s at the shipped profile's 46.
 pub const ADMISSION_BACKOFF_CAP_MILLIS: u64 = 50;
 
 const _: () = assert!(
@@ -5096,8 +5305,12 @@ pub struct KnobSet {
     /// [`MAX_COMPLETE_ATTEMPTS`].
     pub max_complete_attempts: u32,
     /// [`MAX_UPLOAD_ID_ATTEMPTS`].
+    /// [`create::create_session`] does not read this field yet: it takes the constant, and #508,
+    /// which wires configuration, reconciles the two.
     pub max_upload_id_attempts: u32,
     /// [`MAX_ADMISSION_CAS_ATTEMPTS`].
+    /// [`create::create_session`] does not read this field yet: it takes the profile's own
+    /// `max_sessions`, and #508, which wires configuration, reconciles the two.
     pub max_admission_cas_attempts: u32,
 }
 

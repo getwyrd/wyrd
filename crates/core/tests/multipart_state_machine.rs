@@ -766,6 +766,7 @@ fn exhaust_refusal(value: &Refusal) -> &'static str {
         Refusal::OperationAborted => "operation-aborted",
         Refusal::InvalidPart { .. } => "invalid-part",
         Refusal::EntityTooLarge { .. } => "entity-too-large",
+        Refusal::SessionTooLarge { .. } => "session-too-large",
         Refusal::SlowDown { .. } => "slow-down",
         Refusal::ProfileSkew { .. } => "profile-skew",
         Refusal::CompleteAttemptsExhausted => "complete-attempts-exhausted",
