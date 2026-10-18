@@ -5,8 +5,9 @@
 //! This is slices 1–3 of 3 of issue #654's own re-split (itself slice 1 of 7 of #636). This
 //! file is deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
 //! `async fn`. The protocol's store round trips live beside it, in child modules, and use only
-//! what this file defines: the first is [`create`], `CreateMultipartUpload`'s admission and
-//! session creation (#894). After this file a reader can name every key the protocol will ever
+//! what this file defines: [`create`], `CreateMultipartUpload`'s admission and session creation
+//! (#894), and [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
+//! fence's batch (#895). After this file a reader can name every key the protocol will ever
 //! write (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
 //! names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
 //! derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence` singleton
@@ -99,8 +100,10 @@
 //! #841, and [`SessionRecord::completing_teardown`], #842), the generation record that pass
 //! keeps ([`FenceGeneration`], #810), and one creation route each for a fresh session and for
 //! the admission ledger, which [`create::create_session`] commits (#894). So Create now writes
-//! `mpuctl`, `mpu:` and `seggrp:`, with no production caller until the S3 verb is wired (#668);
-//! every other first writer is a store round trip still to land (#657–#659).
+//! `mpuctl`, `mpu:` and `seggrp:`, and Abort ([`abort::abort_session`], #895) writes `mpu:` and
+//! `retire:bytes:` through the one fence batch builder the restore fence also commits
+//! ([`abort::fence_batch`]); neither has a production caller until the S3 verbs are wired
+//! (#668). Every other first writer is a store round trip still to land (#657–#659).
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -108,10 +111,11 @@
 //! system the moment it is merged — `AGENTS.md:154-158` makes updating it in the same PR a
 //! merge requirement, not a follow-up. Its metadata model
 //! (`docs/design/architecture/05-building-block-view.md:206`) therefore records these
-//! record **types**, says which of them Create now writes, and lists the answer table and the
-//! multipart ETag and Complete fingerprint a `Completed` session stores; it defers the rest of
-//! the *protocol* — the fenced transitions, staged publication and the retirement drain — to the
-//! proposal, whose §1 (`0016:333-356`) stays the normative description of this key space.
+//! record **types**, says which of them Create and Abort now write, and lists the answer table
+//! and the multipart ETag and Complete fingerprint a `Completed` session stores; it defers the
+//! rest of the *protocol* — the other fenced transitions, staged publication and the retirement
+//! drain — to the proposal, whose §1 (`0016:333-356`) stays the normative description of this
+//! key space.
 //!
 //! One type here does reach a live path: the owned entry's value is the shared
 //! [`crate::metadata::PendingEntry`], which every streaming write already puts under
@@ -143,6 +147,7 @@ use crate::metadata::{
     MAX_ROOT_VALUE_BYTES, MAX_VALUE_BYTES,
 };
 
+pub mod abort;
 pub mod create;
 
 // ===========================================================================
@@ -3900,9 +3905,10 @@ pub fn decode_retire_obligation(
 
 /// A retirement obligation **as a writer installs it**: key and payload minted by one constructor,
 /// so they cannot disagree — the writer-side mirror of [`decode_retire_obligation`]. Its only
-/// constructors are the restore fence's rows ([`SessionRecord::open_teardown`],
-/// [`SessionRecord::completing_teardown`]); a later writer's row is added as its own constructor,
-/// never as a payload handed in beside a key the caller chose.
+/// constructors are the teardown fence's rows ([`SessionRecord::open_teardown`], which the
+/// restore fence and Abort commit, and [`SessionRecord::completing_teardown`]); a later writer's
+/// row is added as its own constructor, never as a payload handed in beside a key the caller
+/// chose. That is what lets [`abort::fence_batch`] write only obligations this decoder accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireObligation {
     mode: RetireMode,
@@ -4625,8 +4631,8 @@ pub enum CompleteOutcome {
     Refused(Refusal),
 }
 
-/// What `AbortMultipartUpload` answers (#656) — the body half of the verb; the *lifecycle*
-/// half is [`AbortAnswer`], decision 3's table cell.
+/// What `AbortMultipartUpload` answers ([`abort::abort_session`], #895) — the body half of the
+/// verb; the *lifecycle* half is [`AbortAnswer`], decision 3's table cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AbortOutcome {
     /// The fence landed: the session is `Aborting` and its teardown obligation is durable.
