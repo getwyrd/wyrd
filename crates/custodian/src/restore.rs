@@ -106,6 +106,7 @@ use wyrd_core::metadata::{
     self, parse_seg_key, seg_range_prefix, ChunkMapError, InodeRecord, InodeState, SegmentGroup,
     SegmentRecord,
 };
+use wyrd_core::multipart::abort::fence_batch;
 use wyrd_core::multipart::{
     decode_fence_generation, decode_part_record, decode_retire_obligation, decode_session_record,
     parse_mpu_key, parse_part_key, part_range, retire_key, FenceGeneration, RetireMode,
@@ -501,10 +502,13 @@ impl std::error::Error for FenceGenerationFault {}
 /// after Pass 3 the pass re-lists `mpu:` in bounded pages and moves each `Open@E` session to
 /// `Aborting@E+1` in **one** commit with its `{session, all}` obligation
 /// ([`wyrd_core::multipart::SessionRecord::open_teardown`]), requiring the bytes it read and the
-/// obligation key absent (`0016:369-373`). What it cannot fence is named, classified once and
-/// never retried ([`RestoreReport::sessions_unsettled`]). A failed commit — an unknown outcome
-/// included, never read as a `Conflict` — ends the pass with that `Err` after the summary records
-/// every count as INCOMPLETE, never clean; the re-run is idempotent.
+/// obligation key absent (`0016:369-373`). That batch is built by
+/// [`wyrd_core::multipart::abort::fence_batch`], the one builder the client Abort commits too, so
+/// the two writers of the `Open → Aborting` edge cannot drift apart. What it cannot fence is
+/// named, classified once and never retried ([`RestoreReport::sessions_unsettled`]). A failed
+/// commit — an unknown outcome included, never read as a `Conflict` — ends the pass with that
+/// `Err` after the summary records every count as INCOMPLETE, never clean; the re-run is
+/// idempotent.
 ///
 /// A `Completing@E` session is fenced the same way, its commit also installing its attempt's
 /// `retire:records:{seg}` ([`SessionRecord::completing_teardown`]), that key required absent too;
@@ -1047,14 +1051,8 @@ async fn fence_session(
         .iter()
         .map(RetireObligation::key)
         .collect();
-    let mut batch = WriteBatch::new().require(key.to_vec(), read.to_vec());
-    for obligation in &keys {
-        batch = batch.require_absent(obligation.clone());
-    }
-    batch = batch.put(key.to_vec(), metadata::encode(&fence.session));
-    for (obligation, at) in fence.obligations.iter().zip(&keys) {
-        batch = batch.put(at.clone(), metadata::encode(obligation.payload()));
-    }
+    // The one teardown fence batch builder, shared with the client Abort (#895).
+    let batch = fence_batch(key, read, &fence.session, &fence.obligations);
     match meta.commit(batch).await {
         Ok(CommitOutcome::Committed) => {
             let named: Vec<String> = keys.iter().map(|at| object_name(at)).collect();
