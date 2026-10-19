@@ -65,7 +65,10 @@ pub struct WritePlan {
     /// time. Chunking cannot know the ETag (the streaming digest is only final once the
     /// body has streamed), so the composition root fills this after the data phase and
     /// before the commit; a plan left with the default (all `None`) commits no metadata,
-    /// preserving the pre-metadata wire behaviour for callers that do not set it.
+    /// preserving the pre-metadata wire behaviour for callers that do not set it — except
+    /// that an **overwrite** with no `modified` over a version that has one is refused
+    /// ([`metadata::UnstampedOverwrite`], nothing written), so the stored order of a file's
+    /// times cannot reset (#768).
     pub object_meta: ObjectMeta,
 }
 
@@ -311,6 +314,10 @@ pub async fn commit_create(
 /// fragments the custodian GC is free to reclaim. `orphaned_at_millis` **is** the commit's own
 /// logical instant, so it doubles as the `now` the lease check is evaluated against (obligation
 /// (e), issue #490); its one production caller passes `now_millis()` (`server/src/lib.rs:184`).
+///
+/// The committed `modified` is ordered after the prior's ([`metadata::overwrite_modified`],
+/// #768): a plan with no `object_meta.modified` over a prior that has one is refused with
+/// [`metadata::UnstampedOverwrite`] and nothing is written.
 pub async fn commit_overwrite(
     meta: &impl MetadataStore,
     inode_id: InodeId,

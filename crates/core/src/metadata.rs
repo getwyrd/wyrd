@@ -1584,8 +1584,31 @@ pub struct ObjectMeta {
     pub etag: Option<String>,
     /// The `Content-Type` the writing client declared, round-tripped verbatim.
     pub content_type: Option<String>,
-    /// Content-publication time in epoch milliseconds; rendered RFC-7231 IMF-fixdate
-    /// as `Last-Modified` on the wire.
+    /// The file's last-modified time (ADR-0047's content-publication time) in epoch
+    /// milliseconds; rendered RFC-7231 IMF-fixdate as `Last-Modified` on the wire.
+    ///
+    /// Across overwrites that each record a time it **strictly increases**: such an
+    /// overwrite records `max(publishing clock, prior modified + 1 ms)`
+    /// ([`overwrite_modified`], #768). There is no cap and no automatic correction: a prior
+    /// stamped by a badly wrong clock is still ordered after, because no data must be lost
+    /// to time drift and a backwards step can make a mirror that copies only newer files
+    /// skip the new content; a prior more than a day ahead logs a warning. An overwrite
+    /// with no time over a version that has one is refused ([`UnstampedOverwrite`], nothing
+    /// written); over a version with no time (a legacy record) it records none. Both gateway
+    /// PUT paths always stamp, and any new path that publishes over a prior generation (the
+    /// multipart Complete flip, #658) must stamp and call the rule. Repairs preserve it
+    /// unchanged.
+    ///
+    /// The S3 surface shows the earlier of this and the serving gateway's clock, in whole
+    /// seconds, in the `Last-Modified` header, a listing's `<LastModified>` and the
+    /// `If-Modified-Since` / `If-Unmodified-Since` checks, so it is never later than the
+    /// response's `Date` (RFC 9110 §8.8.2.1). An overwrite inside the same second as the
+    /// time it replaced can show the same one, and which gateway answers can move the shown
+    /// time by the clock skew between gateways (kept at milliseconds by #902's clock sync);
+    /// a client that must see every change compares `etag`. A stored time in the future is
+    /// shown as the serving gateway's current time, so until real time passes it mirrors
+    /// re-copy the file on each pass, and a mirror that already holds a time later than real
+    /// time skips later overwrites until then (re-sync it by ETag or with a full copy).
     pub modified: Option<u64>,
 }
 
@@ -1635,7 +1658,24 @@ pub struct InodeRecord {
     /// see `etag` — required for the CAS round trip on legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
-    /// Content-publication time (epoch millis), rendered `Last-Modified` on the wire.
+    /// The file's last-modified time (ADR-0047's content-publication time, epoch millis),
+    /// rendered `Last-Modified` on the wire. Across overwrites that each record a time it
+    /// **strictly increases**: such an overwrite records
+    /// `max(publishing clock, prior modified + 1 ms)` ([`overwrite_modified`], #768), with no
+    /// cap and no automatic correction, so a stored time is never stepped backwards (no data
+    /// lost to time drift) and a prior more than a day ahead logs a warning. An overwrite
+    /// with no time over a version that has one is refused ([`UnstampedOverwrite`], nothing
+    /// written), so the stored order cannot reset; over a legacy record with no time it
+    /// records none. Any new path that publishes over a prior generation (the multipart
+    /// Complete flip, #658) must stamp and call the rule. Repairs preserve it unchanged.
+    ///
+    /// The S3 surface shows `min(this, serving gateway's clock)` in whole seconds, in the
+    /// header, the listing and the date preconditions, so never later than the response's
+    /// `Date` (RFC 9110 §8.8.2.1); an overwrite in the same second can show the same time,
+    /// the answering gateway's clock skew (#902) can move it, and a stored time in the future
+    /// shows as the current time, with the mirror consequences [`ObjectMeta::modified`]
+    /// spells out. `etag`, not this, is the content-identity token.
+    ///
     /// `Option` + `#[serde(default)]` for stored-record compatibility.
     /// `skip_serializing_if`: see `etag` — required for the CAS round trip on legacy
     /// records.
@@ -2186,6 +2226,12 @@ pub async fn commit_chunk_map(
 ///
 /// A `Conflict` (a stale writer lost the CAS) rolls the whole batch back, so no orphan record
 /// is ever written for an overwrite that did not win.
+///
+/// The new record's `modified` is ordered after the prior's by [`overwrite_modified`] (#768):
+/// `max(meta.modified, prior.modified + 1 ms)`. An overwrite whose `meta.modified` is `None`
+/// over a prior that has a time is refused with [`UnstampedOverwrite`] — a typed error, not
+/// [`CommitOutcome::Conflict`], since no retry can stamp it — and nothing is written. That
+/// refusal is judged after the segmented-prior refusal and before the batch is built.
 pub async fn commit_chunk_map_superseding(
     store: &impl MetadataStore,
     id: InodeId,
@@ -2195,6 +2241,13 @@ pub async fn commit_chunk_map_superseding(
     orphaned_at_millis: u64,
     meta: &ObjectMeta,
 ) -> Result<CommitOutcome> {
+    let prior_chunks = prior
+        .chunk_map
+        .as_flat()
+        .ok_or(ChunkMapError::SegmentedMapUnsupported {
+            operation: "commit_chunk_map_superseding",
+        })?;
+    let modified = overwrite_modified(id, prior.modified, meta.modified)?;
     let next = InodeRecord {
         size,
         chunk_map: chunk_map.into(),
@@ -2202,22 +2255,16 @@ pub async fn commit_chunk_map_superseding(
         version: prior.version + 1,
         // A content **overwrite** is a fresh publication (ADR-0047), so it stamps the new
         // object metadata (digest / content type / publication time) rather than carrying
-        // the prior version's forward.
+        // the prior version's forward — the time ordered after the prior's (#768).
         etag: meta.etag.clone(),
         content_type: meta.content_type.clone(),
-        modified: meta.modified,
+        modified,
     };
     let key = inode_key(id);
     let mut batch = WriteBatch::new()
         .require(key.clone(), encode(prior))
         .put(key, encode(&next));
-    for chunk in prior
-        .chunk_map
-        .as_flat()
-        .ok_or(ChunkMapError::SegmentedMapUnsupported {
-            operation: "commit_chunk_map_superseding",
-        })?
-    {
+    for chunk in prior_chunks {
         for (index, dserver) in chunk.fragments() {
             let frag = FragmentId {
                 chunk: chunk.id,
@@ -2230,6 +2277,128 @@ pub async fn commit_chunk_map_superseding(
         }
     }
     store.commit(batch).await
+}
+
+/// How far a superseded generation's `modified` may lead the publishing clock before
+/// [`overwrite_modified`] logs a warning: one day. It **only triggers the log** — the
+/// committed value is the same either way (no cap, no correction, #768). A lead this large
+/// is not skew between synced hosts (#902) but a clock that was badly wrong when it stamped
+/// the prior, and the warning names both readings so an operator can find that clock.
+const MODIFIED_LEAD_WARN_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+
+/// An **overwrite** that carries no `modified` over a version that has one, refused by
+/// [`overwrite_modified`] before anything is written (#768).
+///
+/// Committing it would leave the file with no stored time, so the next stamped overwrite
+/// would have nothing to order against and the stored order would reset. Carrying the
+/// prior's time into it, or inventing one, would put a time on content its publisher never
+/// stamped, so refusing is the only answer that invents nothing. It is a typed error rather
+/// than [`CommitOutcome::Conflict`] because a conflict is the *retry* answer, and no retry
+/// stamps a publication: its publisher must. Both gateway PUT paths always stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnstampedOverwrite {
+    /// The inode of the file the refused overwrite targeted.
+    pub inode: InodeId,
+    /// The `modified` (epoch millis) of the version the overwrite would have replaced.
+    pub prior_modified: u64,
+}
+
+impl fmt::Display for UnstampedOverwrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "refused an overwrite of inode {} that carries no modified time over a version \
+             stamped at {} ms: nothing was written; a publication over a stamped version must \
+             carry its own time",
+            self.inode, self.prior_modified
+        )
+    }
+}
+
+impl std::error::Error for UnstampedOverwrite {}
+
+/// The `modified` an **overwrite** of `inode` commits (#768), from the superseded version's
+/// stamp (`prior`) and the publisher's (`published`). Across overwrites that each record a
+/// time, a file's stored `modified` **strictly increases**:
+///
+/// - both set → `max(published, prior + 1 ms)`, however far ahead `prior` is. The `+ 1`
+///   saturates, so a prior at or near `u64::MAX` (decodable, ADR-0045) commits `u64::MAX`,
+///   never a wrapped value.
+/// - `prior` unset (a legacy record, ADR-0047) → `published`, set or not.
+/// - `published` unset over a set `prior` → refused with [`UnstampedOverwrite`]; the caller
+///   writes nothing. Committing it would leave the next stamped overwrite nothing to order
+///   against, and carrying the prior's time into it or inventing one would put a time on
+///   content its publisher never stamped (the S3 gateway refuses to invent times for the
+///   same reason: sync tools compare `LastModified` to decide whether to transfer).
+///
+/// **No cap and no automatic correction.** A prior stamped by a badly wrong clock is still
+/// ordered after, because no data must be lost inadvertently to time drift: a backwards step
+/// can make a mirror that copies only newer files skip the new content. When `prior` leads
+/// `published` by more than `MODIFIED_LEAD_WARN_MILLIS` (a day) the overwrite also logs a
+/// warning naming both readings and the lead, so an operator can find the clock that was
+/// wrong. The committed value is the same; correcting a stored time is an explicit operator
+/// action, not this function's.
+///
+/// **What S3 shows.** The stored time steps in milliseconds, but the S3 surface shows the
+/// earlier of it and the serving gateway's clock, in whole seconds (`wyrd-gateway-s3`'s
+/// `shown_modified`), for the `Last-Modified` header, a listing's `<LastModified>` and the
+/// `If-Modified-Since` / `If-Unmodified-Since` checks, so never later than the response's
+/// `Date` (RFC 9110 §8.8.2.1). An overwrite inside the same second as the time it replaced
+/// can show the same one, and which gateway answers can move the shown time by the clock
+/// skew between gateways, which #902's clock sync keeps at milliseconds; a client that must
+/// see every change compares `ETag`, the content-identity token. A stored time in the future
+/// (left by a badly wrong clock) is shown as the serving gateway's current time, which moves
+/// forward with each request: until real time passes it, mirrors re-copy the file on each
+/// pass and `If-Unmodified-Since` with an earlier shown time fails. A mirror that has only
+/// been shown such times misses no change. The exception is a mirror that already holds a
+/// time later than real time, copied while a gateway showed the future stored time (a
+/// gateway without this rule, or one whose own clock was that far ahead): it sees each later
+/// overwrite at an earlier time than its copy and, if it copies only newer files, skips them
+/// until an overwrite lands after real time has passed the time it holds. No shown time can
+/// fix that without being later than `Date`, so such a mirror is re-synced by `ETag` or with
+/// a full copy.
+///
+/// **Clock.** This reads no clock. `published` is the publishing gateway's wall-clock reading
+/// (its `now_millis`, the clock that owns the publication-time lifecycle) and `prior` was
+/// written by the same kind of clock; this only orders one against the other (ADR-0009).
+/// `prior` is the version the commit supersedes: both callers CAS on its exact bytes.
+///
+/// **Who must call it.** Every path that publishes content over a prior generation: today
+/// [`commit_chunk_map_superseding`] and [`commit_chunk_map_superseding_leased`], so both
+/// gateway PUT paths. The multipart Complete flip (#658) publishes through its own committer
+/// (proposal 0016 rules out reusing the leased one), so it does not inherit this: it must
+/// stamp its publication and call this explicitly, or its overwrites of stamped files fail.
+/// Repair commits ([`commit_chunk_map`], reconstruction, backfill, rebalance) re-commit the
+/// same content and keep preserving `modified` unchanged.
+pub fn overwrite_modified(
+    inode: InodeId,
+    prior: Option<u64>,
+    published: Option<u64>,
+) -> std::result::Result<Option<u64>, UnstampedOverwrite> {
+    let Some(prior) = prior else {
+        return Ok(published);
+    };
+    let Some(published) = published else {
+        return Err(UnstampedOverwrite {
+            inode,
+            prior_modified: prior,
+        });
+    };
+    let lead = prior.saturating_sub(published);
+    if lead > MODIFIED_LEAD_WARN_MILLIS {
+        tracing::warn!(
+            target: "wyrd.metadata.modified",
+            inode,
+            prior,
+            published,
+            lead_millis = lead,
+            "an overwrite's superseded modified time is more than a day ahead of the \
+             publishing clock: the clock that stamped it was badly wrong; the overwrite is \
+             still ordered after it (no automatic correction), so the stored time stays ahead \
+             until real time passes it or an operator corrects it",
+        );
+    }
+    Ok(Some(published.max(prior.saturating_add(1))))
 }
 
 /// Like [`commit_chunk_map_superseding`], but the overwrite CAS lands only if every chunk in
@@ -2254,6 +2423,13 @@ pub async fn commit_chunk_map_superseding(
 /// [`CommitOutcome::Conflict`] whenever the lease had also lapsed — and a `Conflict` is
 /// the *retry* answer (a racing writer won; re-read and try again), so a caller obeying it
 /// would spin against a shape no retry can fix, instead of failing closed for that object.
+///
+/// **The stamp, between the two.** The new record's `modified` is ordered after the prior's
+/// by [`overwrite_modified`] (#768): `max(meta.modified, prior.modified + 1 ms)`. An
+/// overwrite whose `meta.modified` is `None` over a prior that has a time is refused with
+/// [`UnstampedOverwrite`] and nothing is written. It is judged after the shape and before
+/// the leases, for the same reason as the shape: it is a typed refusal no retry can fix, so
+/// it must not be reported as the `Conflict` a lapsed lease answers with.
 #[allow(clippy::too_many_arguments)]
 pub async fn commit_chunk_map_superseding_leased(
     store: &impl MetadataStore,
@@ -2272,6 +2448,7 @@ pub async fn commit_chunk_map_superseding_leased(
         .ok_or(ChunkMapError::SegmentedMapUnsupported {
             operation: "commit_chunk_map_superseding_leased",
         })?;
+    let modified = overwrite_modified(id, prior.modified, meta.modified)?;
     let Some(guards) = live_lease_guards(store, pending_chunks, now_millis).await? else {
         return Ok(CommitOutcome::Conflict);
     };
@@ -2281,10 +2458,11 @@ pub async fn commit_chunk_map_superseding_leased(
         state: InodeState::Committed,
         version: prior.version + 1,
         // A content **overwrite** is a fresh publication (ADR-0047): stamp the new object
-        // metadata rather than carrying the prior version's forward.
+        // metadata rather than carrying the prior version's forward — the time ordered
+        // after the prior's (#768).
         etag: meta.etag.clone(),
         content_type: meta.content_type.clone(),
-        modified: meta.modified,
+        modified,
     };
     let key = inode_key(id);
     let mut batch = WriteBatch::new()
@@ -5367,5 +5545,342 @@ mod placement_move {
         }
         // Every race ran, so no seed range can pass vacuously.
         assert!(tally.iter().all(|&count| count > 0), "{tally:?}");
+    }
+}
+
+/// The overwrite stamp rule (#768) at its home: [`overwrite_modified`]'s values, its refusal
+/// surfacing from **both** overwrite commits as the typed [`UnstampedOverwrite`] (never the
+/// retriable `Conflict`) with nothing written, the documented order of refusals, and the
+/// far-ahead warning that changes nothing it commits. The exact values through both commits
+/// and the gateway's PUT paths are pinned end to end by
+/// `crates/server/tests/last_modified_monotonic.rs`.
+#[cfg(test)]
+mod overwrite_modified_rule {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A publisher stamp a quarter into a second.
+    const T: u64 = 1_700_000_000_250;
+    /// One day in milliseconds, as a literal on purpose: the warning threshold
+    /// `MODIFIED_LEAD_WARN_MILLIS` is asserted against this and against literal leads either
+    /// side of it, never derived from the constant, so a wrong constant is caught here.
+    const DAY: u64 = 86_400_000;
+
+    /// A well-formed segmented root (two segments tiling `size`) that carries a time, so an
+    /// unstamped overwrite of it meets both refusals.
+    const SEGMENTED_STAMPED_ROOT: &[u8] = br#"{"size":12,"chunk_map":{"group":{"nonce":"0123456789abcdef0123456789abcdef","epoch":1},"segment_count":2,"segments":[{"index":0,"byte_offset":0,"byte_len":5},{"index":1,"byte_offset":5,"byte_len":7}]},"state":"Committed","version":1,"modified":1700000000250}"#;
+
+    fn store() -> wyrd_metadata_redb::RedbMetadataStore {
+        wyrd_metadata_redb::RedbMetadataStore::in_memory().expect("in-memory redb store")
+    }
+
+    /// A committed flat record with the given `modified`, stored under `inode:<id>`.
+    fn seed(
+        store: &impl MetadataStore,
+        id: InodeId,
+        modified: Option<u64>,
+    ) -> (InodeRecord, Bytes) {
+        let prior = InodeRecord {
+            size: 0,
+            chunk_map: Vec::new().into(),
+            state: InodeState::Committed,
+            version: 1,
+            etag: Some("prior".to_owned()),
+            content_type: None,
+            modified,
+        };
+        let bytes = encode(&prior);
+        assert_eq!(
+            pollster::block_on(store.commit(WriteBatch::new().put(inode_key(id), bytes.clone())))
+                .unwrap(),
+            CommitOutcome::Committed
+        );
+        (prior, bytes)
+    }
+
+    fn published(modified: Option<u64>) -> ObjectMeta {
+        ObjectMeta {
+            etag: Some("next".to_owned()),
+            content_type: None,
+            modified,
+        }
+    }
+
+    /// The typed refusal behind a boxed commit error, recovered by downcast as a caller that
+    /// must act on it would.
+    fn refusal<R: std::fmt::Debug>(result: Result<R>) -> UnstampedOverwrite {
+        let err = result.expect_err("an unstamped overwrite of a stamped version is refused");
+        *err.downcast::<UnstampedOverwrite>()
+            .expect("the refusal is the typed UnstampedOverwrite")
+    }
+
+    #[test]
+    fn the_rule_orders_an_overwrite_after_the_prior() {
+        for (prior, publisher, want) in [
+            (Some(T), Some(T), Some(T + 1)),
+            (Some(T + 500), Some(T), Some(T + 501)),
+            (Some(T - 1), Some(T), Some(T)),
+            (Some(T - 5_000), Some(T), Some(T)),
+            (None, Some(T), Some(T)),
+            (None, None, None),
+            // A lead of at most a day stays below the warning: only the logging test below
+            // reaches it (see `logged`). Leads past a day, up to `u64::MAX`, are pinned there
+            // and end to end in `crates/server/tests/last_modified_monotonic.rs`.
+            (Some(T + DAY), Some(T), Some(T + DAY + 1)),
+            (Some(u64::MAX - 1), Some(u64::MAX - 1), Some(u64::MAX)),
+        ] {
+            assert_eq!(
+                overwrite_modified(7, prior, publisher),
+                Ok(want),
+                "prior {prior:?}, publisher {publisher:?}"
+            );
+        }
+        let refused = overwrite_modified(7, Some(T + 5_000), None);
+        assert_eq!(
+            refused,
+            Err(UnstampedOverwrite {
+                inode: 7,
+                prior_modified: T + 5_000
+            })
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "refused an overwrite of inode 7 that carries no modified time over a version \
+             stamped at 1700000005250 ms: nothing was written; a publication over a stamped \
+             version must carry its own time",
+            "the refusal names the file and the stamped version it would have replaced"
+        );
+    }
+
+    #[test]
+    fn both_commits_refuse_an_unstamped_overwrite_with_a_typed_error_and_write_nothing() {
+        let store = store();
+        let (prior, bytes) = seed(&store, 2, Some(T));
+        let want = UnstampedOverwrite {
+            inode: 2,
+            prior_modified: T,
+        };
+        assert_eq!(
+            refusal(pollster::block_on(commit_chunk_map_superseding(
+                &store,
+                2,
+                &prior,
+                vec![],
+                0,
+                0,
+                &published(None),
+            ))),
+            want
+        );
+        assert_eq!(
+            refusal(pollster::block_on(commit_chunk_map_superseding_leased(
+                &store,
+                2,
+                &prior,
+                vec![],
+                0,
+                0,
+                &[],
+                0,
+                &published(None),
+            ))),
+            want
+        );
+        assert_eq!(
+            pollster::block_on(store.get(&inode_key(2)))
+                .unwrap()
+                .as_deref(),
+            Some(&bytes[..]),
+            "a refused overwrite leaves the stored record byte-for-byte unchanged"
+        );
+        assert!(
+            pollster::block_on(store.scan(ORPHAN_PREFIX))
+                .unwrap()
+                .is_empty(),
+            "a refused overwrite deadlines no fragment"
+        );
+    }
+
+    #[test]
+    fn the_segmented_refusal_outranks_the_stamp_refusal() {
+        // Both refusals apply to an unstamped overwrite of a stamped segmented root. The
+        // shape is judged first, so the caller learns the shape no overwrite of this build
+        // can replace rather than a stamp it could add and still fail on.
+        let store = store();
+        let prior: InodeRecord = decode(SEGMENTED_STAMPED_ROOT).unwrap();
+        assert_eq!(prior.modified, Some(T));
+        let shape = |result: Result<CommitOutcome>| {
+            *result
+                .expect_err("refused")
+                .downcast::<ChunkMapError>()
+                .expect("the shape refusal comes first")
+        };
+        assert_eq!(
+            shape(pollster::block_on(commit_chunk_map_superseding(
+                &store,
+                2,
+                &prior,
+                vec![],
+                12,
+                0,
+                &published(None),
+            ))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "commit_chunk_map_superseding"
+            }
+        );
+        assert_eq!(
+            shape(pollster::block_on(commit_chunk_map_superseding_leased(
+                &store,
+                2,
+                &prior,
+                vec![],
+                12,
+                0,
+                &[],
+                0,
+                &published(None),
+            ))),
+            ChunkMapError::SegmentedMapUnsupported {
+                operation: "commit_chunk_map_superseding_leased"
+            }
+        );
+    }
+
+    #[test]
+    fn the_leased_commit_judges_the_stamp_before_the_leases() {
+        // The new chunk's lease is already reaped (no `pending:` entry), which on its own
+        // answers `Ok(Conflict)`: the retry answer. An unstamped overwrite must not be told
+        // to retry — no retry stamps it — so the typed refusal is the answer here too.
+        let store = store();
+        let (prior, bytes) = seed(&store, 2, Some(T + 5_000));
+        assert_eq!(
+            refusal(pollster::block_on(commit_chunk_map_superseding_leased(
+                &store,
+                2,
+                &prior,
+                vec![],
+                0,
+                0,
+                &[9],
+                10,
+                &published(None),
+            ))),
+            UnstampedOverwrite {
+                inode: 2,
+                prior_modified: T + 5_000
+            }
+        );
+        assert_eq!(
+            pollster::block_on(store.get(&inode_key(2)))
+                .unwrap()
+                .as_deref(),
+            Some(&bytes[..])
+        );
+        // The same overwrite, stamped, still meets the lapsed lease: the order changes only
+        // which refusal an unstamped overwrite gets.
+        assert_eq!(
+            pollster::block_on(commit_chunk_map_superseding_leased(
+                &store,
+                2,
+                &prior,
+                vec![],
+                0,
+                0,
+                &[9],
+                10,
+                &published(Some(T)),
+            ))
+            .unwrap(),
+            CommitOutcome::Conflict
+        );
+    }
+
+    /// A `MakeWriter` collecting what the subscriber emits (the `crates/core/tests/
+    /// read_repair.rs` capture), so the warning is asserted from what was actually logged.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn contents(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
+        type Writer = Self;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Run `f` with a JSON capture installed as this thread's subscriber. No global default is
+    /// installed (the ADR-0035 statics gate forbids one in a scanned crate): installing the
+    /// scoped dispatcher re-registers every callsite's interest, and this module's
+    /// `a_prior_more_than_a_day_ahead_is_still_ordered_after_and_is_logged` is the only test
+    /// in this binary that reaches the warning, so no sibling can latch it off first.
+    fn logged<R>(f: impl FnOnce() -> R) -> (R, String) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = Capture::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_writer(capture.clone()),
+            ),
+        );
+        let out = {
+            let _guard = tracing::dispatcher::set_default(&dispatch);
+            f()
+        };
+        (out, capture.contents())
+    }
+
+    #[test]
+    fn a_prior_more_than_a_day_ahead_is_still_ordered_after_and_is_logged() {
+        // The threshold is one day, 86_400_000 ms, pinned with literal leads on both sides so
+        // the constant itself is under test: one millisecond past a day is logged ...
+        let (committed, log) = logged(|| overwrite_modified(3, Some(T + 86_400_001), Some(T)));
+        assert_eq!(
+            committed,
+            Ok(Some(T + 86_400_002)),
+            "the warning changes nothing: no cap, no correction"
+        );
+        assert!(
+            log.contains(r#""target":"wyrd.metadata.modified""#)
+                && log.contains(r#""level":"WARN""#)
+                && log.contains(&format!(r#""prior":{}"#, T + 86_400_001))
+                && log.contains(&format!(r#""published":{T}"#))
+                && log.contains(r#""lead_millis":86400001"#),
+            "a lead past a day names both readings and the lead: {log}"
+        );
+
+        // No heal at the top of the range either: logged, and still ordered after.
+        let (committed, log) = logged(|| overwrite_modified(3, Some(u64::MAX), Some(T)));
+        assert_eq!(committed, Ok(Some(u64::MAX)));
+        assert!(
+            log.contains(&format!(r#""lead_millis":{}"#, u64::MAX - T)),
+            "{log}"
+        );
+
+        // ... and exactly a day, or one millisecond short of it, is not.
+        for lead in [86_400_000, 86_399_999] {
+            let (committed, log) = logged(|| overwrite_modified(3, Some(T + lead), Some(T)));
+            assert_eq!(committed, Ok(Some(T + lead + 1)));
+            assert!(
+                log.is_empty(),
+                "a lead of {lead} ms (not more than a day) is not logged: {log}"
+            );
+        }
     }
 }
