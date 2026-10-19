@@ -953,6 +953,12 @@ where
         max_keys,
     );
 
+    // One clock reading for this response (#768), taken after paging so only the rows this page
+    // emits are capped at it — not every object in the bucket. Each emitted row shows its stored
+    // time capped at this reading, as HEAD and GET do, so the listing and HEAD keep agreeing
+    // (#767) while a file carries a future stored time; the listing's `Date` is rendered from the
+    // same reading below.
+    let now_secs = epoch_secs_now();
     let view = ListView {
         bucket,
         prefix: &prefix,
@@ -966,11 +972,23 @@ where
             request_token.as_deref(),
             request_start_after.as_deref(),
             &page,
+            now_secs,
         )
     } else {
-        render_list_v1(&view, request_marker.as_deref().unwrap_or(""), &page)
+        render_list_v1(
+            &view,
+            request_marker.as_deref().unwrap_or(""),
+            &page,
+            now_secs,
+        )
     };
-    list_response(xml)
+    let mut response = list_response(xml);
+    if let Some(date) = date_header(now_secs) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::DATE, date);
+    }
+    response
 }
 
 /// Decode an opaque ListObjectsV2 continuation token back to the resume key: standard base64
@@ -1050,11 +1068,18 @@ fn project_value(s: &str, encode: bool) -> String {
 /// and a stored ETag that is not a well-formed entity-tag (store corruption / out-of-band
 /// edits — `xml_escape` cannot neutralise an XML-1.0-forbidden control byte) is omitted via
 /// the SAME [`etag_header`] validation the GET path uses.
-fn render_contents(out: &mut String, obj: &ListedObject, encode: bool) {
+///
+/// `<LastModified>` is the **shown** time ([`shown_modified`], #768): the stored time capped at
+/// `now_secs`, the response's one clock reading, so a row never shows a time later than the
+/// listing's `Date`, and a stored time past year 9999 is shown as that reading, not omitted as
+/// unrenderable. The cap is applied here, per emitted row, so a listing pays for the rows it
+/// returns and not for every object in the bucket. `None` (a clock that could not be read) caps
+/// nothing: the stored time is rendered as stored.
+fn render_contents(out: &mut String, obj: &ListedObject, encode: bool, now_secs: Option<u64>) {
     out.push_str("<Contents><Key>");
     out.push_str(&project_value(&obj.key, encode));
     out.push_str("</Key>");
-    if let Some(rendered) = obj.modified.and_then(iso8601) {
+    if let Some(rendered) = shown_modified(obj.modified, now_secs).and_then(iso8601) {
         out.push_str("<LastModified>");
         out.push_str(&rendered);
         out.push_str("</LastModified>");
@@ -1096,12 +1121,14 @@ struct ListView<'a> {
 /// `encoding-type=url` (`view.encode`) the `Key`/`Prefix`/`Delimiter`/`CommonPrefixes`/
 /// `StartAfter` values are percent-encoded and an `<EncodingType>url</EncodingType>` element is
 /// emitted; the opaque `ContinuationToken`/`NextContinuationToken` are left UNTOUCHED so a
-/// returned token resumes verbatim (Delta 1).
+/// returned token resumes verbatim (Delta 1). `now_secs` is the response's one clock reading,
+/// which each emitted row's `<LastModified>` is capped at ([`render_contents`], #768).
 fn render_list_v2(
     view: &ListView<'_>,
     request_token: Option<&str>,
     start_after: Option<&str>,
     page: &ListPage<'_>,
+    now_secs: Option<u64>,
 ) -> String {
     let encode = view.encode;
     let key_count = page.contents.len() + page.common_prefixes.len();
@@ -1150,7 +1177,7 @@ fn render_list_v2(
         ));
     }
     for obj in &page.contents {
-        render_contents(&mut out, obj, encode);
+        render_contents(&mut out, obj, encode, now_secs);
     }
     render_common_prefixes(&mut out, &page.common_prefixes, encode);
     out.push_str("</ListBucketResult>");
@@ -1160,8 +1187,15 @@ fn render_list_v2(
 /// Emit a v1 ListObjects `<ListBucketResult>` — the thin compat shim (`GET /bucket`, no
 /// `list-type`). `Marker`-based rather than token-based: it echoes the request `<Marker>`
 /// and, when truncated with a delimiter, a `<NextMarker>` (the last RETURNED item — the
-/// common prefix for a rollup, `page.next_marker`) the client resends as `marker`.
-fn render_list_v1(view: &ListView<'_>, request_marker: &str, page: &ListPage<'_>) -> String {
+/// common prefix for a rollup, `page.next_marker`) the client resends as `marker`. `now_secs`
+/// is the response's one clock reading, which each emitted row's `<LastModified>` is capped at
+/// ([`render_contents`], #768).
+fn render_list_v1(
+    view: &ListView<'_>,
+    request_marker: &str,
+    page: &ListPage<'_>,
+    now_secs: Option<u64>,
+) -> String {
     let encode = view.encode;
     let key_count = page.contents.len() + page.common_prefixes.len();
     let mut out = String::with_capacity(256 + key_count * 128);
@@ -1207,7 +1241,7 @@ fn render_list_v1(view: &ListView<'_>, request_marker: &str, page: &ListPage<'_>
         }
     }
     for obj in &page.contents {
-        render_contents(&mut out, obj, encode);
+        render_contents(&mut out, obj, encode, now_secs);
     }
     render_common_prefixes(&mut out, &page.common_prefixes, encode);
     out.push_str("</ListBucketResult>");
@@ -2465,19 +2499,21 @@ where
             .get_object_range(object_key, range)
             .await
         {
-            Ok(Some(RangeRead { meta, outcome })) => {
-                if let Some(verdict) = evaluate_conditionals(
-                    &cond,
-                    meta.etag.as_deref(),
-                    meta.modified,
-                    epoch_secs_now(),
-                ) {
+            Ok(Some(RangeRead { mut meta, outcome })) => {
+                // One clock reading for this response (#768): every surface below shows the
+                // stored time capped at it, and the response's `Date` is rendered from it.
+                let now_secs = epoch_secs_now();
+                meta.modified = shown_modified(meta.modified, now_secs);
+                if let Some(verdict) =
+                    evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified, now_secs)
+                {
                     // A 304/412 short-circuits before the range is applied (§13.2); the
                     // (possibly-open) covering-chunk stream in `outcome` is dropped unread.
                     return precondition_response(
                         verdict,
                         meta.etag.as_deref(),
                         meta.modified,
+                        now_secs,
                         request_id,
                     );
                 }
@@ -2486,7 +2522,7 @@ where
                         offset,
                         len,
                         stream,
-                    } => partial_content_response(&meta, offset, len, stream),
+                    } => partial_content_response(&meta, offset, len, stream, now_secs),
                     RangeOutcome::Unsatisfiable => range_not_satisfiable(request_id, meta.size),
                 }
             }
@@ -2501,21 +2537,22 @@ where
             .get_object_streaming(object_key)
             .await
         {
-            Ok(Some(read)) => {
-                if let Some(verdict) = evaluate_conditionals(
-                    &cond,
-                    read.etag.as_deref(),
-                    read.modified,
-                    epoch_secs_now(),
-                ) {
+            Ok(Some(mut read)) => {
+                // One clock reading for this response (#768), as in the ranged arm above.
+                let now_secs = epoch_secs_now();
+                read.modified = shown_modified(read.modified, now_secs);
+                if let Some(verdict) =
+                    evaluate_conditionals(&cond, read.etag.as_deref(), read.modified, now_secs)
+                {
                     return precondition_response(
                         verdict,
                         read.etag.as_deref(),
                         read.modified,
+                        now_secs,
                         request_id,
                     );
                 }
-                full_object_response(read)
+                full_object_response(read, now_secs)
             }
             Ok(None) => no_such_key(request_id),
             Err(err) => gateway_error_response(request_id, &err),
@@ -2544,15 +2581,20 @@ where
     // metadata 200), exactly as on GET.
     let range = honoured_range(headers);
     match state.gateway.head_object(object_key).await {
-        Ok(Some(meta)) => {
+        Ok(Some(mut meta)) => {
+            // One clock reading for this response (#768): every surface below shows the stored
+            // time capped at it, and the response's `Date` is rendered from it.
+            let now_secs = epoch_secs_now();
+            meta.modified = shown_modified(meta.modified, now_secs);
             // 1. Conditionals first (same precedence and S3 semantics as GET).
             if let Some(verdict) =
-                evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified, epoch_secs_now())
+                evaluate_conditionals(&cond, meta.etag.as_deref(), meta.modified, now_secs)
             {
                 return precondition_response(
                     verdict,
                     meta.etag.as_deref(),
                     meta.modified,
+                    now_secs,
                     request_id,
                 );
             }
@@ -2561,7 +2603,9 @@ where
             //    so a ranged HEAD stays metadata-only (no chunk read for a body a HEAD never sends).
             if let Some(range) = range {
                 return match resolve_byte_range(range, meta.size) {
-                    Some((offset, len)) => head_partial_content_response(&meta, offset, len),
+                    Some((offset, len)) => {
+                        head_partial_content_response(&meta, offset, len, now_secs)
+                    }
                     None => range_not_satisfiable(request_id, meta.size),
                 };
             }
@@ -2574,6 +2618,7 @@ where
                 meta.content_type.as_deref(),
                 meta.etag.as_deref(),
                 meta.modified,
+                now_secs,
             );
             builder
                 .body(Body::empty())
@@ -2591,11 +2636,17 @@ where
 /// read so a client learns range support even from an unranged GET/HEAD (issue #510). The
 /// `Content-Length` is set by the caller (the object size on a 200, the SPAN length on a 206), so
 /// it is not touched here.
+///
+/// `modified` is the **shown** time ([`shown_modified`]), and `now_secs` the clock reading it was
+/// capped at: the response's `Date` is rendered from that same reading ([`date_header`]), so the
+/// `Last-Modified` it carries is never later than its `Date` (#768, RFC 9110 §8.8.2.1). With no
+/// readable clock (`None`) nothing was capped and no `Date` is written here.
 fn apply_object_headers(
     mut builder: axum::http::response::Builder,
     content_type: Option<&str>,
     etag: Option<&str>,
     modified: Option<u64>,
+    now_secs: Option<u64>,
 ) -> axum::http::response::Builder {
     builder = builder
         // The stored content type, or the S3 default when none was recorded (an old record, or a
@@ -2613,13 +2664,17 @@ fn apply_object_headers(
     if let Some(value) = modified.and_then(http_date) {
         builder = builder.header("last-modified", value);
     }
+    if let Some(value) = date_header(now_secs) {
+        builder = builder.header("date", value);
+    }
     builder
 }
 
 /// A full-object `200` streaming response (the hot GET path), now advertising
 /// `Accept-Ranges: bytes`. Declares the exact object length so a body truncated by a mid-stream
 /// fault is a detectable short read, not a silent "complete" 200 (issue #364 carry-forward).
-fn full_object_response(read: ObjectRead) -> Response {
+/// `read.modified` is the shown time, capped at `now_secs` ([`apply_object_headers`]).
+fn full_object_response(read: ObjectRead, now_secs: Option<u64>) -> Response {
     let ObjectRead {
         size,
         stream,
@@ -2634,6 +2689,7 @@ fn full_object_response(read: ObjectRead) -> Response {
         content_type.as_deref(),
         etag.as_deref(),
         modified,
+        now_secs,
     )
     .body(Body::from_stream(stream))
     .expect("streaming response is always valid")
@@ -2644,11 +2700,13 @@ fn full_object_response(read: ObjectRead) -> Response {
 /// {offset}-{offset+len-1}/{size}`, so the access-log body wrapper's declared==streamed
 /// accounting holds for the SPAN — a 206 that declared the full size would be logged as truncated
 /// on every ranged GET (issue #364 span invariant, brief note on `content-length`).
+/// `meta.modified` is the shown time, capped at `now_secs` ([`apply_object_headers`]).
 fn partial_content_response(
     meta: &ObjectMeta,
     offset: u64,
     len: u64,
     stream: ObjectStream,
+    now_secs: Option<u64>,
 ) -> Response {
     // A satisfiable range always has `len >= 1`, so `offset + len - 1` is the inclusive last byte.
     let last = offset + len - 1;
@@ -2663,6 +2721,7 @@ fn partial_content_response(
         meta.content_type.as_deref(),
         meta.etag.as_deref(),
         meta.modified,
+        now_secs,
     )
     .body(Body::from_stream(stream))
     .expect("streaming response is always valid")
@@ -2671,15 +2730,17 @@ fn partial_content_response(
 /// Map an [`evaluate_conditionals`] verdict to its wire response — a `304 Not Modified` carrying
 /// the object's cache validators, or a `412 Precondition Failed`. Shared by the GET (ranged and
 /// unranged) and HEAD arms so a precondition answers identically everywhere, judged against the
-/// same `etag`/`modified` the arm resolved (issue #510 carry-forward item 2).
+/// same `etag`/`modified` the arm resolved (issue #510 carry-forward item 2). `modified` is the
+/// shown time and `now_secs` the clock reading it was capped at (#768).
 fn precondition_response(
     verdict: Precondition,
     etag: Option<&str>,
     modified: Option<u64>,
+    now_secs: Option<u64>,
     request_id: RequestId,
 ) -> Response {
     match verdict {
-        Precondition::NotModified => not_modified_response(etag, modified),
+        Precondition::NotModified => not_modified_response(etag, modified, now_secs),
         Precondition::Failed => precondition_failed(request_id),
     }
 }
@@ -2687,8 +2748,14 @@ fn precondition_response(
 /// A HEAD's `206 Partial Content` for a satisfiable `Range`: the same `Content-Range` and SPAN
 /// `Content-Length` as GET's [`partial_content_response`], but body-less — a HEAD never carries a
 /// body (RFC 9110 §9.3.2). The span is resolved from the metadata size alone, so a ranged HEAD
-/// costs no chunk read (issue #510 carry-forward item 3).
-fn head_partial_content_response(meta: &ObjectMeta, offset: u64, len: u64) -> Response {
+/// costs no chunk read (issue #510 carry-forward item 3). `meta.modified` is the shown time,
+/// capped at `now_secs` ([`apply_object_headers`]).
+fn head_partial_content_response(
+    meta: &ObjectMeta,
+    offset: u64,
+    len: u64,
+    now_secs: Option<u64>,
+) -> Response {
     // A satisfiable range always has `len >= 1`, so `offset + len - 1` is the inclusive last byte.
     let last = offset + len - 1;
     apply_object_headers(
@@ -2702,6 +2769,7 @@ fn head_partial_content_response(meta: &ObjectMeta, offset: u64, len: u64) -> Re
         meta.content_type.as_deref(),
         meta.etag.as_deref(),
         meta.modified,
+        now_secs,
     )
     .body(Body::empty())
     .expect("static response is always valid")
@@ -2710,8 +2778,15 @@ fn head_partial_content_response(meta: &ObjectMeta, offset: u64, len: u64) -> Re
 /// A `304 Not Modified` for a passing `If-None-Match`/`If-Modified-Since` gate. It carries the
 /// cache validators (`ETag`, `Last-Modified`) and advertises range support, but NO body and no
 /// `Content-Type`/`Content-Length` (RFC 9110 §15.4.5). `finish_response` records a 304 as a
-/// complete body-less transfer, so it needs no declared length.
-fn not_modified_response(etag: Option<&str>, modified: Option<u64>) -> Response {
+/// complete body-less transfer, so it needs no declared length. Like the `200`/`206` renderer
+/// ([`apply_object_headers`]), `modified` is the shown time and the `Date` is rendered from the
+/// clock reading `now_secs` it was capped at, so this `Last-Modified` too is never later than
+/// its `Date` (#768).
+fn not_modified_response(
+    etag: Option<&str>,
+    modified: Option<u64>,
+    now_secs: Option<u64>,
+) -> Response {
     let mut builder = Response::builder()
         .status(StatusCode::NOT_MODIFIED)
         .header("accept-ranges", "bytes");
@@ -2720,6 +2795,9 @@ fn not_modified_response(etag: Option<&str>, modified: Option<u64>) -> Response 
     }
     if let Some(value) = modified.and_then(http_date) {
         builder = builder.header("last-modified", value);
+    }
+    if let Some(value) = date_header(now_secs) {
+        builder = builder.header("date", value);
     }
     builder
         .body(Body::empty())
@@ -2878,17 +2956,27 @@ enum Precondition {
 /// If-Unmodified-Since; If-None-Match > If-Modified-Since) but with **S3 comparison semantics**,
 /// not full RFC (S3 itself deviates): exact opaque ETag equality plus `*`; weak comparators and
 /// multi-ETag lists are out of scope (stock aws clients send a single value); date comparison
-/// truncates the stored epoch-millis to SECONDS (IMF-fixdate has second resolution). A record
+/// truncates the epoch-millis to SECONDS (IMF-fixdate has second resolution). A record
 /// with no stored ETag (`etag == None`) fails a specific `If-Match` (no current entity-tag) and a
 /// record with no stored `modified` ignores the date conditionals — degrade safely, never panic.
 /// An unparsable date header is ignored (RFC 9110). `None` ⇒ no precondition fired; serve the
 /// object.
+///
+/// `modified` is the **shown** time, not the stored one: the caller caps it at the same clock
+/// reading `now_secs` ([`shown_modified`], #768), so `If-Modified-Since` / `If-Unmodified-Since`
+/// judge the time the response shows, and a client that sends back a `Last-Modified` it was shown
+/// is compared against that same kind of value. A future date in the header is accepted, as
+/// [`parse_http_date`] always has. `now_secs` is also the RFC-850 two-digit-year pivot; a clock
+/// that could not be read (`None`, [`epoch_secs_now`]) capped nothing, and the pivot then falls
+/// back to the epoch as it did before the clock became optional (#619) — a parsing default, never
+/// a time that is shown.
 fn evaluate_conditionals(
     cond: &Conditionals<'_>,
     etag: Option<&str>,
     modified: Option<u64>,
-    now_secs: u64,
+    now_secs: Option<u64>,
 ) -> Option<Precondition> {
+    let now_secs = now_secs.unwrap_or(0);
     // 1. If-Match takes precedence over If-Unmodified-Since (only one of the two is consulted).
     if let Some(im) = cond.if_match {
         // Strong comparison (§13.1.1): a weak `W/`-tag never matches → 412.
@@ -2985,16 +3073,87 @@ fn parse_http_date(value: &str, now_secs: u64) -> Option<u64> {
 }
 
 /// The wall clock as epoch seconds — the `now` the RFC-850 two-digit-year rule is relative to
-/// ([`parse_rfc850_date`]). Kept at the wire edge so the parsers stay pure over their inputs.
-fn epoch_secs_now() -> u64 {
+/// ([`parse_rfc850_date`]), and the serving gateway's clock a response's shown modification time
+/// is capped at ([`shown_modified`]) and its `Date` is rendered from ([`date_header`], #768). A
+/// response reads it once and uses the one value for all three. Kept at the wire edge so the
+/// parsers and the cap stay pure over their inputs.
+///
+/// `None` when the clock cannot be read as a time after the epoch (a host clock before 1970).
+/// Such a reading is never shown: the cap then leaves every stored time as stored, no `Date` is
+/// written here (hyper's own, RFC 9110 §6.6.1), and the two-digit-year pivot falls back to the
+/// epoch as it did before (#619). A `0` in its place would show every object as modified in 1970.
+fn epoch_secs_now() -> Option<u64> {
     // wall-clock exempt: the RFC 9110 clock-relative two-digit-year pivot is
-    // defined against real wall time; kept at the wire edge so the parsers
-    // stay pure (#619).
+    // defined against real wall time, and RFC 9110 §8.8.2.1 caps `Last-Modified`
+    // at the origin server's own clock (the one its `Date` reports), so both are
+    // the wall clock's lifecycle; kept at the wire edge so the parsers and the
+    // cap stay pure (#619, #768).
     #[allow(clippy::disallowed_methods)]
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
+        .ok()
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+}
+
+/// The modification time the S3 surface **shows** for a stored `modified` (#768): the earlier of
+/// the stored time and the serving gateway's clock `now_secs`, in whole seconds. A response reads
+/// the clock once ([`epoch_secs_now`]) and uses that one value for the `Last-Modified` header
+/// (`200`, `206` and `304`), each listing row's `<LastModified>`, the `If-Modified-Since` /
+/// `If-Unmodified-Since` checks ([`evaluate_conditionals`]) and its own `Date`
+/// ([`date_header`]). So a shown time is never later than the `Date` it rides with: RFC 9110
+/// §8.8.2.1 says an origin server with a clock MUST NOT send a `Last-Modified` later than its
+/// `Date`, and replaces a future one with the `Date`.
+///
+/// What the store holds is not this. Across overwrites that each record a time a file's stored
+/// `modified` strictly increases — an overwrite records
+/// `max(publishing clock, prior modified + 1 ms)`, with no cap and no automatic correction, and
+/// an overwrite with no time over a version that has one is refused
+/// (`wyrd_core::metadata::overwrite_modified`). The store keeps
+/// milliseconds; S3 shows whole seconds. So an overwrite inside the same second as the time it
+/// replaced can show the **same** one, and which gateway answers can move the shown time by the
+/// clock skew between gateways, which #902's clock sync keeps at milliseconds. A client that must
+/// see every change compares `ETag`, the content-identity token.
+///
+/// A stored time in the future (left by a badly wrong clock) is shown as the serving gateway's
+/// current time, which moves forward with each request. Until real time passes the stored time,
+/// mirrors re-copy the file on each pass, and `If-Unmodified-Since` with an earlier shown time
+/// fails. A mirror that has only been shown such times misses no change. The exception: a mirror
+/// that already holds a time later than real time, copied while a gateway showed the future stored
+/// time (a gateway without this rule, or one whose own clock was that far ahead), sees each later
+/// overwrite at an earlier time than its copy; if it copies only newer files, it skips them until
+/// an overwrite lands after real time has passed the time it holds. No shown time can fix that
+/// without being later than `Date`, so re-sync such a mirror by `ETag` or with a full copy.
+///
+/// A file with no stored time still shows none (the field is omitted, as before). A stored time
+/// past year 9999 is in the future, so it is shown as the response time instead of being omitted;
+/// [`http_date`] and [`iso8601`] still return `None` past year 9999 for any direct caller. A read
+/// never rewrites the stored time.
+///
+/// `now_secs` is `None` when the clock could not be read ([`epoch_secs_now`]): then nothing is
+/// capped and the stored time is shown as stored — never as 1970.
+///
+/// The value stays in epoch milliseconds so the renderers take it unchanged:
+/// `min(stored, now_secs * 1000)` truncates to exactly `min(stored / 1000, now_secs)`, the whole
+/// second shown. Pure over its inputs; the clock is read by the caller.
+fn shown_modified(stored: Option<u64>, now_secs: Option<u64>) -> Option<u64> {
+    stored.map(|stored| now_secs.map_or(stored, |now| stored.min(now.saturating_mul(1_000))))
+}
+
+/// The `Date` header of a response that shows a modification time, rendered from the clock
+/// reading `now_secs` its shown time was capped at ([`shown_modified`], #768), so its
+/// `Last-Modified` is never later than its `Date` by construction (RFC 9110 §8.8.2.1).
+///
+/// Set here rather than left to hyper because hyper's own `Date` is a per-thread cache refreshed
+/// when the connection task is polled (`hyper::proto::h1::dispatch`'s `poll_inner` calls
+/// `update_date` before polling the handler), so it can be read before the handler's clock read;
+/// across a second boundary hyper's `Date` would then be one second earlier than a `Last-Modified`
+/// capped at the handler's clock. hyper writes no `Date` of its own when the response carries one.
+/// `None` for a clock that could not be read (nothing was capped, so there is no reading to
+/// report) or one past year 9999; both leave the `Date` to hyper (RFC 9110 §6.6.1).
+fn date_header(now_secs: Option<u64>) -> Option<HeaderValue> {
+    now_secs
+        .and_then(|now| http_date(now.saturating_mul(1_000)))
+        .and_then(|date| HeaderValue::from_str(&date).ok())
 }
 
 /// Parse a fixed-width HTTP-date numeric field that MUST be all ASCII digits, into `T`. Rust's
@@ -5137,6 +5296,8 @@ mod tests {
         // `LastModified` to decide whether to transfer, and a zero backfill makes every local
         // copy look newer, silently leaving stale content in place. The element is omitted —
         // the same degradation the absent ETag right beside it already uses.
+        // The clock is a day past the recorded time, so the cap (#768) leaves it as recorded.
+        let now_secs = Some(1_700_086_400);
         let mut out = String::new();
         render_contents(
             &mut out,
@@ -5147,6 +5308,7 @@ mod tests {
                 modified: None,
             },
             false,
+            now_secs,
         );
         assert!(
             !out.contains("<LastModified>"),
@@ -5164,6 +5326,7 @@ mod tests {
                 modified: Some(1_700_000_000_000),
             },
             false,
+            now_secs,
         );
         assert!(
             out.contains(&format!(
@@ -5171,6 +5334,55 @@ mod tests {
                 iso8601(1_700_000_000_000).expect("in-range instant renders")
             )),
             "a recorded modified time renders as ISO-8601: {out}"
+        );
+    }
+
+    /// A listing row's `<LastModified>` is the shown time (#768, RFC 9110 §8.8.2.1): a stored
+    /// time later than the response's clock reading is rendered as that reading, in whole
+    /// seconds, exactly as the `Last-Modified` header of a HEAD of the same object would be
+    /// (#767), and a stored time past year 9999 is shown rather than omitted.
+    #[test]
+    fn a_contents_row_shows_a_future_recorded_time_as_the_clock() {
+        const NOW: u64 = 1_700_000_000;
+        for stored in [
+            NOW * 1_000 + 1,
+            NOW * 1_000 + 3_600_000,
+            253_402_300_800_000,
+            u64::MAX,
+        ] {
+            let mut out = String::new();
+            render_contents(
+                &mut out,
+                &ListedObject {
+                    key: "ahead".to_string(),
+                    size: 3,
+                    etag: None,
+                    modified: Some(stored),
+                },
+                false,
+                Some(NOW),
+            );
+            assert!(
+                out.contains("<LastModified>2023-11-14T22:13:20.000Z</LastModified>"),
+                "stored {stored}: {out}"
+            );
+        }
+        // Inside the clock's own second the row shows that second: stored and clock agree.
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "now".to_string(),
+                size: 3,
+                etag: None,
+                modified: Some(NOW * 1_000 + 999),
+            },
+            false,
+            Some(NOW),
+        );
+        assert!(
+            out.contains("<LastModified>2023-11-14T22:13:20.000Z</LastModified>"),
+            "{out}"
         );
     }
 
@@ -5211,13 +5423,167 @@ mod tests {
     }
 
     #[test]
+    fn the_shown_time_is_the_earlier_of_the_stored_time_and_the_clock() {
+        // #768 / RFC 9110 §8.8.2.1. `NOW` is the serving clock in whole seconds:
+        // 2023-11-14T22:13:20Z.
+        const NOW: u64 = 1_700_000_000;
+        const NOW_IMF: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
+        // A past stored time is shown as stored, so it renders its own second.
+        assert_eq!(
+            shown_modified(Some(1_699_999_000_750), Some(NOW)),
+            Some(1_699_999_000_750)
+        );
+        // A stored time inside the clock's own second shows that same second.
+        assert_eq!(
+            shown_modified(Some(NOW * 1_000 + 250), Some(NOW)).map(|m| m / 1_000),
+            Some(NOW)
+        );
+        // A future stored time, however far ahead, is shown as the clock.
+        assert_eq!(
+            shown_modified(Some(NOW * 1_000 + 3_600_000), Some(NOW)),
+            Some(NOW * 1_000)
+        );
+        assert_eq!(shown_modified(Some(u64::MAX), Some(NOW)), Some(NOW * 1_000));
+        // No stored time: nothing to show (the field is omitted, never fabricated).
+        assert_eq!(shown_modified(None, Some(NOW)), None);
+        // The `Date` comes from the same reading, so a capped time renders exactly as it.
+        assert_eq!(
+            date_header(Some(NOW)),
+            Some(HeaderValue::from_static(NOW_IMF))
+        );
+        assert_eq!(
+            shown_modified(Some(u64::MAX), Some(NOW))
+                .and_then(http_date)
+                .as_deref(),
+            Some(NOW_IMF)
+        );
+        assert_eq!(
+            shown_modified(Some(u64::MAX), Some(NOW))
+                .and_then(iso8601)
+                .as_deref(),
+            Some("2023-11-14T22:13:20.000Z")
+        );
+        // A clock past year 9999 caps (the stored time is later still) but renders no `Date`,
+        // which is left to hyper; `http_date` declines the five-digit year as before.
+        assert_eq!(date_header(Some(253_402_300_800)), None);
+    }
+
+    /// A clock that cannot be read as a time after the epoch (`epoch_secs_now()` is `None`)
+    /// caps nothing and writes no `Date`: the stored time is shown as stored, the `Date` is
+    /// left to hyper (RFC 9110 §6.6.1), and no object is ever shown as modified in 1970 — the
+    /// value a `0` fallback for the clock would have produced on every surface.
+    #[test]
+    fn a_clock_that_cannot_be_read_caps_nothing_and_writes_no_date() {
+        const STORED: u64 = 1_700_000_000_250;
+        const STORED_IMF: &str = "Tue, 14 Nov 2023 22:13:20 GMT";
+        const NO_CLOCK: Option<u64> = None;
+
+        // The pure helpers: nothing capped (a far-future time included), no `Date`.
+        assert_eq!(shown_modified(Some(STORED), NO_CLOCK), Some(STORED));
+        assert_eq!(shown_modified(Some(u64::MAX), NO_CLOCK), Some(u64::MAX));
+        assert_eq!(shown_modified(None, NO_CLOCK), None);
+        assert_eq!(date_header(NO_CLOCK), None);
+
+        // The `200`/`206` renderer: the stored time, and no `Date` written by the handler.
+        let response = apply_object_headers(
+            Response::builder().status(StatusCode::OK),
+            None,
+            Some("0badc0de0badc0de"),
+            Some(STORED),
+            NO_CLOCK,
+        )
+        .body(Body::empty())
+        .expect("response");
+        let header = |response: &Response, name: &str| {
+            response
+                .headers()
+                .get(name)
+                .map(|v| v.to_str().expect("ascii").to_owned())
+        };
+        assert_eq!(
+            header(&response, "last-modified").as_deref(),
+            Some(STORED_IMF)
+        );
+        assert_eq!(header(&response, "date"), None);
+
+        // The `304` renderer likewise.
+        let not_modified = not_modified_response(Some("0badc0de0badc0de"), Some(STORED), NO_CLOCK);
+        assert_eq!(
+            header(&not_modified, "last-modified").as_deref(),
+            Some(STORED_IMF)
+        );
+        assert_eq!(header(&not_modified, "date"), None);
+
+        // A listing row shows the stored time; a stored time no renderer can show is omitted,
+        // as before the cap (there is no clock reading to show instead).
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "stored".to_string(),
+                size: 3,
+                etag: None,
+                modified: Some(STORED),
+            },
+            false,
+            NO_CLOCK,
+        );
+        assert!(
+            out.contains("<LastModified>2023-11-14T22:13:20.000Z</LastModified>"),
+            "{out}"
+        );
+        let mut out = String::new();
+        render_contents(
+            &mut out,
+            &ListedObject {
+                key: "far-future".to_string(),
+                size: 3,
+                etag: None,
+                modified: Some(u64::MAX),
+            },
+            false,
+            NO_CLOCK,
+        );
+        assert!(!out.contains("<LastModified>"), "{out}");
+        assert!(!out.contains("1970"), "{out}");
+
+        // The date preconditions still judge an IMF-fixdate (which needs no pivot) against the
+        // stored time: not modified since its own second, modified since the second before.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("if-modified-since", HeaderValue::from_static(STORED_IMF));
+        assert!(matches!(
+            evaluate_conditionals(
+                &Conditionals::from_headers(&headers),
+                None,
+                Some(STORED),
+                NO_CLOCK
+            ),
+            Some(Precondition::NotModified)
+        ));
+        headers.insert(
+            "if-modified-since",
+            HeaderValue::from_static("Tue, 14 Nov 2023 22:13:19 GMT"),
+        );
+        assert!(evaluate_conditionals(
+            &Conditionals::from_headers(&headers),
+            None,
+            Some(STORED),
+            NO_CLOCK
+        )
+        .is_none());
+    }
+
+    #[test]
     fn a_contents_row_omits_unpresentable_recorded_metadata() {
         // A RECORDED value can still be unpresentable; each degrades by omission so one
         // pathological record cannot poison the whole listing document (the GET path's
         // established behaviour, applied to the listing renderer).
         //
         // A `modified` past year 9999 has no valid RFC-3339 rendering (a five-digit year) —
-        // the same bound `http_date` applies to the `Last-Modified` header on GET.
+        // the same bound `http_date` applies to the `Last-Modified` header on GET. With a clock
+        // reading it is shown as that reading (#768, `a_contents_row_shows_a_future_recorded_
+        // time_as_the_clock`); handed none to cap it at, the renderer still omits it rather
+        // than emitting the malformed value.
         let mut out = String::new();
         render_contents(
             &mut out,
@@ -5228,6 +5594,7 @@ mod tests {
                 modified: Some(253_402_300_800_000),
             },
             false,
+            None,
         );
         assert!(
             !out.contains("<LastModified>"),
@@ -5247,6 +5614,7 @@ mod tests {
                 modified: None,
             },
             false,
+            None,
         );
         assert!(
             !out.contains("<ETag>"),
@@ -5264,6 +5632,7 @@ mod tests {
                 modified: None,
             },
             false,
+            None,
         );
         assert!(
             out.contains("<ETag>&quot;0badc0de0badc0de&quot;</ETag>"),
@@ -5280,6 +5649,8 @@ mod tests {
         content_type: Option<String>,
         etag: Option<String>,
         modified: Option<u64>,
+        /// What a listing of any bucket returns (the bucket exists; empty by default).
+        listed: Vec<ListedObject>,
     }
 
     impl StoredMetaGateway {
@@ -5290,11 +5661,19 @@ mod tests {
                 content_type: None,
                 etag: Some("0badc0de0badc0de".to_string()),
                 modified: Some(1_700_000_000_000),
+                listed: Vec::new(),
             }
         }
     }
 
-    impl ContainerGateway for StoredMetaGateway {}
+    impl ContainerGateway for StoredMetaGateway {
+        async fn list_container(
+            &self,
+            _container: &str,
+        ) -> wyrd_traits::Result<Option<Vec<ListedObject>>> {
+            Ok(Some(self.listed.clone()))
+        }
+    }
 
     impl MultipartGateway for StoredMetaGateway {}
 
@@ -5337,7 +5716,7 @@ mod tests {
                 size: 11, // b"object-body".len()
                 etag: self.etag.clone(),
                 content_type: self.content_type.clone(),
-                modified: Some(1_700_000_000_000),
+                modified: self.modified,
             }))
         }
 
@@ -5355,6 +5734,20 @@ mod tests {
         method: &str,
         body: &'static [u8],
     ) -> Response {
+        signed_request_through_router(gateway, method, "/bucket/key", "", &[], body).await
+    }
+
+    /// [`signed_through_router`] generalised: a signed `method` request for `path` with the
+    /// canonical `query` (signed too, as a listing's is) and the unsigned `extra` headers,
+    /// through the REAL router against `gateway`.
+    async fn signed_request_through_router(
+        gateway: Arc<StoredMetaGateway>,
+        method: &str,
+        path: &str,
+        query: &str,
+        extra: &[(&str, &str)],
+        body: &'static [u8],
+    ) -> Response {
         use tower::ServiceExt;
 
         let creds = crate::sigv4::Credentials {
@@ -5364,12 +5757,11 @@ mod tests {
         let router = S3Gateway::new(gateway, S3Config::new(vec![creds.clone()])).router();
 
         let host = "example.com";
-        let path = "/bucket/key";
         let amz_date = crate::sigv4::format_amz_date(SystemTime::now());
         let signed = crate::sigv4::sign(
             method,
             path,
-            "",
+            query,
             host,
             &amz_date,
             body,
@@ -5377,27 +5769,212 @@ mod tests {
             "us-east-1",
             "s3",
         );
+        let uri = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", host)
+            .header("authorization", signed.authorization)
+            .header("x-amz-date", signed.amz_date)
+            .header("x-amz-content-sha256", signed.content_sha256)
+            // The declared length an HTTP client always sends; a PUT without one is
+            // refused `411` (#671).
+            .header("content-length", body.len());
+        for (name, value) in extra {
+            request = request.header(*name, *value);
+        }
         router
-            .oneshot(
-                axum::http::Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header("host", host)
-                    .header("authorization", signed.authorization)
-                    .header("x-amz-date", signed.amz_date)
-                    .header("x-amz-content-sha256", signed.content_sha256)
-                    // The declared length an HTTP client always sends; a PUT without one is
-                    // refused `411` (#671).
-                    .header("content-length", body.len())
-                    .body(Body::from(body))
-                    .expect("request"),
-            )
+            .oneshot(request.body(Body::from(body)).expect("request"))
             .await
             .expect("the router answers without panicking")
     }
 
     async fn signed_get_through_router(gateway: Arc<StoredMetaGateway>) -> Response {
         signed_through_router(gateway, "GET", b"").await
+    }
+
+    /// This host's clock in whole epoch seconds, the source the handlers' one reading
+    /// (`epoch_secs_now`) comes from, so readings taken around a request bracket it.
+    fn wall_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_secs()
+    }
+
+    /// The named header of `response` as text, or a panic naming it.
+    fn header_text(response: &Response, name: &str) -> String {
+        response
+            .headers()
+            .get(name)
+            .unwrap_or_else(|| panic!("the response carries {name}"))
+            .to_str()
+            .expect("ascii")
+            .to_owned()
+    }
+
+    /// `response`'s `Last-Modified` and its own `Date` name the same whole second, which lies
+    /// between the clock readings taken just before and after the request: the stored time was
+    /// in the future, so the shown time is the serving clock (#768, RFC 9110 §8.8.2.1). Returns
+    /// that second.
+    fn assert_shown_as_the_clock(response: &Response, before: u64, after: u64) -> u64 {
+        let shown = header_text(response, "last-modified");
+        assert_eq!(
+            shown,
+            header_text(response, "date"),
+            "a future stored time is shown as the response's own Date"
+        );
+        let secs = parse_imf_fixdate(&shown)
+            .unwrap_or_else(|| panic!("a well-formed IMF-fixdate, not {shown:?}"));
+        assert!(
+            (before..=after).contains(&secs),
+            "the shown time {shown} is the serving clock, between {before} and {after}"
+        );
+        secs
+    }
+
+    /// HEAD shows a future stored time as its own `Date`, on the unranged `200` and the ranged
+    /// `206` alike, with the rest of the metadata intact (#768).
+    #[tokio::test]
+    async fn head_shows_a_future_stored_time_as_its_own_date() {
+        // A stored time no clock can be at (and past year 9999, so unrenderable as stored).
+        let gateway = Arc::new(StoredMetaGateway {
+            modified: Some(u64::MAX - 1),
+            ..StoredMetaGateway::new()
+        });
+
+        let before = wall_secs();
+        let response = signed_request_through_router(
+            Arc::clone(&gateway),
+            "HEAD",
+            "/bucket/key",
+            "",
+            &[],
+            b"",
+        )
+        .await;
+        let after = wall_secs();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_shown_as_the_clock(&response, before, after);
+        assert_eq!(header_text(&response, "etag"), "\"0badc0de0badc0de\"");
+        assert_eq!(header_text(&response, "content-length"), "11");
+
+        let before = wall_secs();
+        let response = signed_request_through_router(
+            gateway,
+            "HEAD",
+            "/bucket/key",
+            "",
+            &[("range", "bytes=0-3")],
+            b"",
+        )
+        .await;
+        let after = wall_secs();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_shown_as_the_clock(&response, before, after);
+        assert_eq!(header_text(&response, "content-range"), "bytes 0-3/11");
+        assert_eq!(header_text(&response, "content-length"), "4");
+    }
+
+    /// A `304` for a future stored time shows the serving clock as its `Last-Modified` and
+    /// writes the same reading as its own `Date` (the handler sets both, #768), on GET and HEAD
+    /// alike: `If-Modified-Since` is judged against the shown time, so an instant at or after
+    /// the clock answers `304`, not the `200` the stored time would give.
+    #[tokio::test]
+    async fn a_304_for_a_future_stored_time_shows_its_own_date_on_get_and_head() {
+        let gateway = Arc::new(StoredMetaGateway {
+            modified: Some(u64::MAX - 1),
+            ..StoredMetaGateway::new()
+        });
+        for method in ["GET", "HEAD"] {
+            let before = wall_secs();
+            // A minute past the clock: not before the shown time, so `304`.
+            let since = http_date((before + 60) * 1_000).expect("in range");
+            let response = signed_request_through_router(
+                Arc::clone(&gateway),
+                method,
+                "/bucket/key",
+                "",
+                &[("if-modified-since", since.as_str())],
+                b"",
+            )
+            .await;
+            let after = wall_secs();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "{method} If-Modified-Since {since}"
+            );
+            assert_shown_as_the_clock(&response, before, after);
+            assert_eq!(header_text(&response, "etag"), "\"0badc0de0badc0de\"");
+        }
+    }
+
+    /// A listing (v2 and the v1 shim) shows a row's future stored time as the listing's own
+    /// `Date`, and a past one exactly as stored, so the listing and a HEAD of the same object
+    /// agree while a file carries a future stored time (#768, #767).
+    #[tokio::test]
+    async fn a_listing_shows_a_future_stored_time_as_its_own_date_and_a_past_one_as_stored() {
+        let gateway = Arc::new(StoredMetaGateway {
+            listed: vec![
+                ListedObject {
+                    key: "ahead".to_string(),
+                    size: 3,
+                    etag: Some("0badc0de0badc0de".to_string()),
+                    modified: Some(u64::MAX - 1),
+                },
+                ListedObject {
+                    key: "behind".to_string(),
+                    size: 3,
+                    etag: None,
+                    modified: Some(1_700_000_000_250),
+                },
+            ],
+            ..StoredMetaGateway::new()
+        });
+        for query in ["list-type=2", ""] {
+            let before = wall_secs();
+            let response = signed_request_through_router(
+                Arc::clone(&gateway),
+                "GET",
+                "/bucket",
+                query,
+                &[],
+                b"",
+            )
+            .await;
+            let after = wall_secs();
+            assert_eq!(response.status(), StatusCode::OK, "GET /bucket?{query}");
+            let date = header_text(&response, "date");
+            let date_secs = parse_imf_fixdate(&date)
+                .unwrap_or_else(|| panic!("a well-formed Date, not {date:?}"));
+            assert!(
+                (before..=after).contains(&date_secs),
+                "GET /bucket?{query}: Date {date} between {before} and {after}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body = std::str::from_utf8(&body).expect("UTF-8 listing");
+            let shown = iso8601(date_secs * 1_000).expect("in range");
+            assert!(
+                body.contains(&format!(
+                    "<Key>ahead</Key><LastModified>{shown}</LastModified>"
+                )),
+                "GET /bucket?{query}: the future stored time is listed as the listing's own \
+                 Date {shown}: {body}"
+            );
+            assert!(
+                body.contains(
+                    "<Key>behind</Key><LastModified>2023-11-14T22:13:20.000Z</LastModified>"
+                ),
+                "GET /bucket?{query}: the past stored time is listed as stored: {body}"
+            );
+        }
     }
 
     #[test]
@@ -5645,18 +6222,20 @@ mod tests {
         );
     }
 
-    /// A stored `modified` past year 9999 must degrade to NO `Last-Modified` header — never
-    /// a malformed one.
+    /// A stored `modified` past year 9999 is shown as the response time — never as a
+    /// malformed `Last-Modified`.
     ///
     /// IMF-fixdate's year is exactly four digits, but metadata decoding accepts any `u64`
     /// (ADR-0045), so store corruption or an out-of-band edit can leave a timestamp whose
-    /// year is 10000+. Unlike the malformed etag/content-type cases, such a value IS a
-    /// valid HTTP header value — the failure is not a panic but a five-digit year on the
-    /// wire, which is not a valid IMF-fixdate (RFC 7231 §7.1.1.1) and can misparse in
-    /// caching clients. Post-hardening `http_date` declines the render and the GET omits
-    /// the header, symmetric with the etag degradation above; everything else still serves.
+    /// year is 10000+. Such a value IS a valid HTTP header value, so the failure would not be
+    /// a panic but a five-digit year on the wire, which is not a valid IMF-fixdate (RFC 7231
+    /// §7.1.1.1) and can misparse in caching clients. It is also a time in the future, so the
+    /// shown-time cap (#768, RFC 9110 §8.8.2.1) shows it as the serving clock: the GET carries
+    /// a well-formed `Last-Modified` equal to its own `Date`. (Before #768 the header was
+    /// omitted; `http_date` itself still declines the render, checked below.) Everything else
+    /// still serves.
     #[tokio::test]
-    async fn an_unrenderable_stored_modified_omits_last_modified_instead_of_malforming_it() {
+    async fn a_stored_modified_past_year_9999_is_shown_as_the_response_time() {
         // 253_402_300_800_000 ms is 10000-01-01T00:00:00Z — the first unrenderable instant.
         let gateway = Arc::new(StoredMetaGateway {
             modified: Some(253_402_300_800_000),
@@ -5669,10 +6248,25 @@ mod tests {
             StatusCode::OK,
             "an unrenderable stored modified time must still serve the object",
         );
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .unwrap_or_else(|| panic!("the GET carries {name}"))
+                .to_str()
+                .expect("ascii")
+                .to_owned()
+        };
+        let shown = header("last-modified");
+        assert_eq!(
+            shown,
+            header("date"),
+            "a year-10000+ stored modified time is shown as the response's own Date",
+        );
         assert!(
-            response.headers().get("last-modified").is_none(),
-            "a year-10000+ stored modified time degrades to no Last-Modified header, \
-             never a malformed IMF-fixdate",
+            parse_imf_fixdate(&shown).is_some(),
+            "the shown Last-Modified is a well-formed IMF-fixdate, not a five-digit year: \
+             {shown:?}",
         );
         // The rest of the metadata is intact — degrading the date drops only the date.
         assert_eq!(
