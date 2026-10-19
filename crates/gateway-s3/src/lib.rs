@@ -486,20 +486,43 @@ fn is_delete_subresource(query: &str) -> bool {
         .any(|k| k == "delete")
 }
 
+/// The longest object key S3 allows, in bytes of the key's UTF-8 encoding (AWS S3 User Guide,
+/// "Naming Amazon S3 objects"; issue #620). Measured on the DECODED key alone: never on its
+/// percent-encoded wire form, never in characters, never on the flat `bucket/key` name.
+///
+/// Enforced ONLY where an object is CREATED (object PUT), as `400 KeyTooLongError`. No read or
+/// delete path checks it — not single-object GET, HEAD or DELETE, and not an entry of a bulk
+/// **DeleteObjects** body — so an over-limit object that exists anyway (stored before this limit,
+/// or written outside the S3 surface by `wyrd put --key` or `Gateway::put_object`) stays exactly
+/// as readable and removable as it was, bounded only by the request limits that already apply
+/// ([`MAX_DELETE_BODY_BYTES`]; hyper's `414` for a request target over 65,534 bytes). A key past
+/// that `414` ceiling has bulk delete as its ONLY S3 exit, which is why bulk delete must never
+/// refuse a key for its length (#620 iteration-4 sign-off).
+const MAX_KEY_BYTES: usize = 1024;
+
 /// The buffered-byte cap for a bulk **DeleteObjects** request body (issue #509). The body is
 /// small (≤1000 keys) and SigV4-signed, so — unlike a streamed object PUT — it is buffered whole;
 /// the cap is enforced BY CONSTRUCTION as the body is read (never by trusting `Content-Length`),
 /// and an over-cap body is refused as `MalformedXML`.
 ///
 /// The bound must sit in `[~6.2 MB, 9 MiB)`. FLOOR: a legal maximum request MUST fit **as it is
-/// serialized on the wire — after XML escaping**. A 1024-byte key is legal, and one key character
-/// can occupy up to 6 body bytes once escaped (`&quot;`/`&apos;`, or a `&#xNN;` character
-/// reference), so the worst case is 1000 × 1024 × 6 ≈ 6.14 MB of key text plus the
-/// `<Object><Key></Key></Object>` envelope (≈28 KB) ≈ 6.2 MB. Sizing this floor on the RAW key
-/// bytes (~1.06 MB, the previous 2 MiB cap) fail-closed-rejected a request that satisfies both
-/// documented limits — 1000 keys, each ≤1024 bytes — merely because its keys contained `&`
-/// (PR #612 review). CEILING: the retained oversized-body test sends a 9 MiB body, so the cap MUST
-/// be < 9 MiB to refuse it. 8 MiB sits in `[6.2 MB, 9 MiB)`.
+/// serialized on the wire — after XML escaping**. S3's longest legal key is 1024 bytes
+/// ([`MAX_KEY_BYTES`]), and one key character can occupy up to 6 body bytes once escaped
+/// (`&quot;`/`&apos;`, or a `&#xNN;` character reference), so the worst case is 1000 × 1024 × 6
+/// ≈ 6.14 MB of key text plus the `<Object><Key></Key></Object>` envelope (≈28 KB) ≈ 6.2 MB.
+/// Sizing this floor on the RAW key bytes (~1.06 MB, the previous 2 MiB cap) fail-closed-rejected
+/// a request that satisfies both documented limits — 1000 keys, each ≤1024 bytes — merely because
+/// its keys contained `&` (PR #612 review). CEILING: the retained oversized-body test sends a
+/// 9 MiB body, so the cap MUST be < 9 MiB to refuse it. 8 MiB sits in `[6.2 MB, 9 MiB)`.
+///
+/// The floor is what the cap must ADMIT, not a bound the parser enforces per entry: this cap is
+/// the ONLY limit on one `<Key>`'s length (issue #620). [`parse_delete_request`] accepts any
+/// non-empty key the body can carry, so a stored key longer than [`MAX_KEY_BYTES`] — one that
+/// predates the PUT-side limit, or was written outside the S3 surface — stays deletable in bulk,
+/// including a key past hyper's 65,534-byte request-target ceiling, whose single-object DELETE
+/// answers `414` before this crate runs. A key too long for this cap (only the in-process
+/// `Gateway::put_object` can write one) has no S3 exit; that gap predates #620 and is not
+/// widened by it.
 ///
 /// A character reference may be padded with leading zeros (`&#x00000041;`) without bound, so no
 /// finite cap accommodates EVERY escaping of a legal key; such a body is still refused. The floor
@@ -1772,11 +1795,9 @@ where
     // key like `my file.txt` — sent as `/bucket/my%20file.txt` — is stored under
     // `bucket/my file.txt`, not the literal `bucket/my%20file.txt` (issue #364
     // carry-forward, real-SDK break 1). Bucket + key compose onto the M0 flat namespace.
-    let object_key = format!(
-        "{}/{}",
-        percent_decode_utf8(bucket),
-        percent_decode_utf8(key)
-    );
+    let bucket_name = percent_decode_utf8(bucket);
+    let key_name = percent_decode_utf8(key);
+    let object_key = format!("{bucket_name}/{key_name}");
 
     // Subresource / multipart query forms (?uploadId, ?partNumber, ?tagging, ?acl, …) are
     // out of scope (brief §Out-of-scope: multipart upload, ACLs, the full S3 surface).
@@ -1813,6 +1834,39 @@ where
                     StatusCode::NOT_IMPLEMENTED,
                     "NotImplemented",
                     "CopyObject (x-amz-copy-source) is not supported",
+                );
+            }
+            // Refuse an object this PUT would store under a name S3 cannot express (issue
+            // #620), before any body byte is read — the same placement as the CopyObject
+            // guard above, and BEFORE the payload-form dispatch below, so the refusal holds
+            // alike for a single-shot signed body, an `aws-chunked` stream (the stock-SDK
+            // form) and an `UNSIGNED-PAYLOAD` body. Only the CREATING path refuses: GET,
+            // HEAD, single-object DELETE and bulk DeleteObjects stay open on any key, so an
+            // over-limit object stored before this check (or written outside the S3 surface)
+            // is still removable and never stranded (see [`MAX_KEY_BYTES`]).
+            //
+            // The path is split on its first LITERAL `/` and only then decoded, and bucket +
+            // key are joined into one flat key. So `/b%2Fa/k` would store the same object as
+            // `/b/a/k` while the key measured below is only `k` — a way round the length
+            // limit. S3 bucket names cannot contain `/`, so a decoded bucket that does is
+            // refused outright.
+            if bucket_name.contains('/') {
+                return error_response(
+                    request_id,
+                    StatusCode::BAD_REQUEST,
+                    "InvalidBucketName",
+                    "the specified bucket is not valid: a bucket name cannot contain `/`",
+                );
+            }
+            // `str::len` is the UTF-8 byte length of the DECODED key — not its characters, not
+            // its percent-encoded wire form — and it counts the key alone, not `bucket/key`.
+            // `KeyTooLongError` is S3's own code for it.
+            if key_name.len() > MAX_KEY_BYTES {
+                return error_response(
+                    request_id,
+                    StatusCode::BAD_REQUEST,
+                    "KeyTooLongError",
+                    "your key is too long: an object key is at most 1024 bytes of UTF-8",
                 );
             }
             // The client's declared `Content-Type`, round-tripped verbatim on GET (ADR-0047).
@@ -4552,6 +4606,426 @@ mod tests {
         assert_eq!(op_label(&Method::POST, "/bucket/key", "delete"), "other");
         assert_eq!(op_label(&Method::POST, "/bucket", ""), "other");
         assert_eq!(op_label(&Method::POST, "/bucket", "uploads"), "other");
+    }
+
+    // --- S3's 1,024-byte object-key limit (issue #620) ------------------------------------------
+    // The wire-level red→green discriminator is `crates/server/tests/s3_key_length_limit.rs`.
+    // This pins the same PUT boundary inside this crate, where the refusal lives, and adds the
+    // one fact the wire cannot show: a refused PUT never reaches the write seam.
+
+    /// Records every key the router asks the backend to store, so a test can prove a refused
+    /// PUT reached no write. Deletes always succeed, so the same double shows that a bulk
+    /// delete naming an over-limit key is NOT refused for its length.
+    #[derive(Default)]
+    struct RecordingGateway {
+        puts: std::sync::Mutex<Vec<String>>,
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ContainerGateway for RecordingGateway {}
+
+    impl MultipartGateway for RecordingGateway {}
+
+    impl ObjectGateway for RecordingGateway {
+        async fn put_object_streaming<S>(
+            &self,
+            key: &str,
+            _source: S,
+            _declared_len: u64,
+            _expected: ContentHash,
+            _content_type: Option<String>,
+        ) -> wyrd_traits::Result<String>
+        where
+            S: futures_util::Stream<Item = wyrd_traits::Result<bytes::Bytes>>
+                + Send
+                + Unpin
+                + 'static,
+        {
+            self.puts.lock().unwrap().push(key.to_string());
+            Ok("0badc0de0badc0de".to_string())
+        }
+
+        async fn get_object_streaming(
+            self: Arc<Self>,
+            _key: &str,
+        ) -> wyrd_traits::Result<Option<ObjectRead>> {
+            Ok(None)
+        }
+
+        async fn head_object(&self, _key: &str) -> wyrd_traits::Result<Option<ObjectMeta>> {
+            Ok(None)
+        }
+
+        async fn delete_object(&self, key: &str) -> wyrd_traits::Result<bool> {
+            self.deletes.lock().unwrap().push(key.to_string());
+            Ok(true)
+        }
+    }
+
+    const KEY_LIMIT_HOST: &str = "example.com";
+    const KEY_LIMIT_SECRET: &str = "secret";
+
+    fn key_limit_credentials() -> crate::sigv4::Credentials {
+        crate::sigv4::Credentials {
+            access_key_id: "AKIA".to_string(),
+            secret_access_key: KEY_LIMIT_SECRET.to_string(),
+        }
+    }
+
+    /// Drive one request through the REAL router against `gateway`, returning its status and
+    /// body. In-process (`oneshot`), but still bounded so a stalled handler fails the test
+    /// instead of hanging it.
+    async fn drive_key_limit_request(
+        gateway: &Arc<RecordingGateway>,
+        request: axum::http::Request<Body>,
+    ) -> (StatusCode, String) {
+        use tower::ServiceExt;
+
+        let router = S3Gateway::new(
+            Arc::clone(gateway),
+            S3Config::new(vec![key_limit_credentials()]),
+        )
+        .router();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let response = router.oneshot(request).await.expect("the router answers");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain the body");
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        })
+        .await
+        .expect("the request completes within 30s")
+    }
+
+    /// One signed single-shot request (`x-amz-content-sha256` = the body's hash) through the
+    /// real router.
+    async fn signed_key_limit_request(
+        gateway: &Arc<RecordingGateway>,
+        method: &str,
+        path: &str,
+        query: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, String) {
+        let amz_date = crate::sigv4::format_amz_date(SystemTime::now());
+        let signed = crate::sigv4::sign(
+            method,
+            path,
+            query,
+            KEY_LIMIT_HOST,
+            &amz_date,
+            &body,
+            &key_limit_credentials(),
+            "us-east-1",
+            "s3",
+        );
+        let uri = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{query}")
+        };
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", KEY_LIMIT_HOST)
+            .header("authorization", signed.authorization)
+            .header("x-amz-date", signed.amz_date)
+            .header("x-amz-content-sha256", signed.content_sha256)
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .expect("request");
+        drive_key_limit_request(gateway, request).await
+    }
+
+    /// The payload forms of an object PUT other than the single-shot signed body.
+    #[derive(Clone, Copy, Debug)]
+    enum PutPayloadForm {
+        /// `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` with `content-encoding: aws-chunked` — the form
+        /// a stock SDK sends.
+        AwsChunked,
+        /// `UNSIGNED-PAYLOAD`: the body rides outside the signature.
+        Unsigned,
+    }
+
+    /// Frame `object` as one signed `aws-chunked` chunk plus the terminator, chained off the
+    /// seed with the decoder's own [`streaming::sign_chunk`].
+    fn frame_signed_chunks(ctx: &sigv4::StreamingContext, object: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut previous = ctx.seed_signature.clone();
+        for data in [object, &[][..]] {
+            let sig = streaming::sign_chunk(ctx, &previous, data);
+            out.extend_from_slice(format!("{:x};chunk-signature={sig}\r\n", data.len()).as_bytes());
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\r\n");
+            previous = sig;
+        }
+        out
+    }
+
+    /// PUT a small body to `path` in `form` through the real router.
+    async fn put_key_limit_request(
+        gateway: &Arc<RecordingGateway>,
+        path: &str,
+        form: PutPayloadForm,
+    ) -> (StatusCode, String) {
+        let object = b"body";
+        let amz_date = crate::sigv4::format_amz_date(SystemTime::now());
+        let date = &amz_date[..8];
+        let builder = axum::http::Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("host", KEY_LIMIT_HOST);
+        let (signed, body, builder) = match form {
+            PutPayloadForm::Unsigned => {
+                let signed = crate::sigv4::sign_with_payload_hash(
+                    "PUT",
+                    path,
+                    "",
+                    KEY_LIMIT_HOST,
+                    &amz_date,
+                    "UNSIGNED-PAYLOAD",
+                    &key_limit_credentials(),
+                    "us-east-1",
+                    "s3",
+                );
+                (signed, object.to_vec(), builder)
+            }
+            PutPayloadForm::AwsChunked => {
+                let decoded_len = object.len().to_string();
+                let extra = [
+                    ("content-encoding", "aws-chunked"),
+                    ("x-amz-decoded-content-length", decoded_len.as_str()),
+                ];
+                let signed = crate::sigv4::sign_with_payload_hash_and_headers(
+                    "PUT",
+                    path,
+                    "",
+                    KEY_LIMIT_HOST,
+                    &amz_date,
+                    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+                    &extra,
+                    &key_limit_credentials(),
+                    "us-east-1",
+                    "s3",
+                );
+                let (_, seed) = signed
+                    .authorization
+                    .rsplit_once("Signature=")
+                    .expect("the Authorization header ends in its signature");
+                let ctx = sigv4::StreamingContext {
+                    seed_signature: seed.to_string(),
+                    signing_key: sigv4::signing_key_for(KEY_LIMIT_SECRET, date, "us-east-1", "s3"),
+                    date_time: amz_date.clone(),
+                    scope: format!("{date}/us-east-1/s3/aws4_request"),
+                    signed: true,
+                    trailer: None,
+                    decoded_content_length: Some(object.len() as u64),
+                };
+                let framed = frame_signed_chunks(&ctx, object);
+                let builder = builder
+                    .header("content-encoding", "aws-chunked")
+                    .header("x-amz-decoded-content-length", decoded_len);
+                (signed, framed, builder)
+            }
+        };
+        let request = builder
+            .header("authorization", signed.authorization)
+            .header("x-amz-date", signed.amz_date)
+            .header("x-amz-content-sha256", signed.content_sha256)
+            .header("content-length", body.len())
+            .body(Body::from(body))
+            .expect("request");
+        drive_key_limit_request(gateway, request).await
+    }
+
+    /// An object PUT refuses, before the write seam is called: a decoded key over 1,024 UTF-8
+    /// bytes (`KeyTooLongError`), and a decoded bucket segment containing `/`
+    /// (`InvalidBucketName`). A key of exactly 1,024 bytes, in one- or two-byte characters, is
+    /// stored.
+    #[tokio::test]
+    async fn an_object_put_refuses_an_over_limit_key_before_the_write_seam() {
+        let gateway = Arc::new(RecordingGateway::default());
+
+        let at_limit = "k".repeat(MAX_KEY_BYTES);
+        let two_byte = "é".repeat(512); // 512 characters, 1,024 bytes
+        assert_eq!(two_byte.len(), MAX_KEY_BYTES);
+
+        // Keys go on the wire as a client spells them: every byte outside SigV4's unreserved set
+        // percent-encoded (a raw `é` is not a legal URI byte).
+        for key in [&at_limit, &two_byte] {
+            let path = format!("/b/{}", crate::sigv4::uri_encode(key, true));
+            let (status, body) =
+                signed_key_limit_request(&gateway, "PUT", &path, "", b"body".to_vec()).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a 1,024-byte key must be stored: {body}"
+            );
+        }
+
+        for (what, key) in [
+            ("a 1,025-byte key", "k".repeat(MAX_KEY_BYTES + 1)),
+            ("342 × `€` (1,026 bytes)", "€".repeat(342)),
+        ] {
+            let path = format!("/b/{}", crate::sigv4::uri_encode(&key, true));
+            let (status, body) =
+                signed_key_limit_request(&gateway, "PUT", &path, "", b"body".to_vec()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+            assert!(
+                body.contains("<Code>KeyTooLongError</Code>"),
+                "{what}: expected KeyTooLongError, got {body}",
+            );
+        }
+
+        // `/b%2Fa/<1,023 bytes>` would store `b/a/<1,023 bytes>`: a 1,025-byte key under `b`.
+        let path = format!("/b%2Fa/{}", "x".repeat(1023));
+        let (status, body) =
+            signed_key_limit_request(&gateway, "PUT", &path, "", b"body".to_vec()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("<Code>InvalidBucketName</Code>"),
+            "a `/` in the decoded bucket must be refused, got {body}",
+        );
+
+        assert_eq!(
+            *gateway.puts.lock().unwrap(),
+            vec![format!("b/{at_limit}"), format!("b/{two_byte}")],
+            "only the in-limit PUTs may reach the write seam",
+        );
+    }
+
+    /// The same two refusals in the payload forms the test above does not send — an
+    /// `aws-chunked` upload with signed chunks (the stock-SDK form) and an `UNSIGNED-PAYLOAD`
+    /// body — and the same seam fact: a refused PUT reaches no write. The PUT arm dispatches on
+    /// the payload form AFTER the key checks; a check that had slipped inside the signed-payload
+    /// arm passes the test above while a stock SDK stores a 1,025-byte key (the #620
+    /// iteration-6 sign-off). Per form, a 1,024-byte key reaches the seam, so the form itself is
+    /// accepted and a `400` is the key refusal, not a framing or signature failure.
+    #[tokio::test]
+    async fn an_object_put_refuses_an_over_limit_key_in_every_payload_form() {
+        let gateway = Arc::new(RecordingGateway::default());
+        let mut expected_puts = Vec::new();
+
+        for form in [PutPayloadForm::AwsChunked, PutPayloadForm::Unsigned] {
+            let at_limit = format!("{form:?}-{}", "s".repeat(MAX_KEY_BYTES));
+            let at_limit = &at_limit[..MAX_KEY_BYTES];
+            let (status, body) =
+                put_key_limit_request(&gateway, &format!("/b/{at_limit}"), form).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{form:?}: a 1,024-byte key must be stored: {body}"
+            );
+            expected_puts.push(format!("b/{at_limit}"));
+
+            let over_limit = format!("{form:?}-{}", "t".repeat(MAX_KEY_BYTES + 1));
+            let over_limit = &over_limit[..MAX_KEY_BYTES + 1];
+            let (status, body) =
+                put_key_limit_request(&gateway, &format!("/b/{over_limit}"), form).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{form:?}: {body}");
+            assert!(
+                body.contains("<Code>KeyTooLongError</Code>"),
+                "{form:?}: a 1,025-byte key must be KeyTooLongError, got {body}",
+            );
+
+            let aliased = format!("/b%2Fa/{}", "x".repeat(1023));
+            let (status, body) = put_key_limit_request(&gateway, &aliased, form).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{form:?}: {body}");
+            assert!(
+                body.contains("<Code>InvalidBucketName</Code>"),
+                "{form:?}: a `/` in the decoded bucket must be refused, got {body}",
+            );
+        }
+
+        assert_eq!(
+            *gateway.puts.lock().unwrap(),
+            expected_puts,
+            "only the in-limit PUTs may reach the write seam, in either payload form",
+        );
+    }
+
+    /// Bulk DeleteObjects has NO key-length bound: a `<Key>` longer than [`MAX_KEY_BYTES`] — far
+    /// longer, past hyper's request-target ceiling where single-object DELETE cannot reach it —
+    /// is deleted like any other, reported `<Deleted>`, and the request answers `200` with no
+    /// `<Error>` row. The body cap alone bounds an entry (the #620 iteration-4 sign-off).
+    #[tokio::test]
+    async fn a_bulk_delete_deletes_an_over_limit_key_rather_than_refusing_it() {
+        let gateway = Arc::new(RecordingGateway::default());
+
+        let over_limit = "a".repeat(MAX_KEY_BYTES + 1);
+        let euro = "€".repeat(342); // 342 characters, 1,026 bytes
+        let past_414 = "c".repeat(70_000);
+        let request = format!(
+            "<Delete><Object><Key>ok</Key></Object><Object><Key>{over_limit}</Key></Object>\
+             <Object><Key>{euro}</Key></Object><Object><Key>{past_414}</Key></Object></Delete>"
+        )
+        .into_bytes();
+        let (status, body) =
+            signed_key_limit_request(&gateway, "POST", "/b", "delete", request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for key in ["ok", &over_limit, &euro, &past_414] {
+            assert!(
+                body.contains(&format!("<Deleted><Key>{key}</Key></Deleted>")),
+                "every key must be reported deleted, missing a {}-byte one: {}",
+                key.len(),
+                &body[..body.len().min(400)],
+            );
+        }
+        assert!(
+            !body.contains("<Error>"),
+            "no key may be refused for its length: {body}"
+        );
+        assert_eq!(
+            *gateway.deletes.lock().unwrap(),
+            vec![
+                "b/ok".to_string(),
+                format!("b/{over_limit}"),
+                format!("b/{euro}"),
+                format!("b/{past_414}"),
+            ],
+            "every key must reach the delete seam, in request order",
+        );
+    }
+
+    /// The LONGEST `<Key>` bulk delete can carry — one that fills [`MAX_DELETE_BODY_BYTES`]
+    /// exactly as the sole entry of a `<Delete>` document — reaches the delete seam and is
+    /// reported `<Deleted>`. The body cap is the only bound on an entry's length, so a length
+    /// check anywhere below it goes red here (a `key.len() > 100_000` check passed the
+    /// 70,000-byte key above at the #620 iteration-5 sign-off).
+    #[tokio::test]
+    async fn a_bulk_delete_deletes_the_longest_key_the_body_cap_can_carry() {
+        let gateway = Arc::new(RecordingGateway::default());
+
+        let envelope = "<Delete><Object><Key></Key></Object></Delete>";
+        let at_cap = "d".repeat(MAX_DELETE_BODY_BYTES - envelope.len());
+        let request = format!("<Delete><Object><Key>{at_cap}</Key></Object></Delete>").into_bytes();
+        assert_eq!(
+            request.len(),
+            MAX_DELETE_BODY_BYTES,
+            "the one-key body must fill the cap exactly"
+        );
+        let (status, body) =
+            signed_key_limit_request(&gateway, "POST", "/b", "delete", request).await;
+        assert_eq!(status, StatusCode::OK, "{}", &body[..body.len().min(400)]);
+        assert!(
+            body.contains(&format!("<Deleted><Key>{at_cap}</Key></Deleted>")),
+            "the {}-byte key must be reported deleted: {}",
+            at_cap.len(),
+            &body[..body.len().min(400)],
+        );
+        assert!(
+            !body.contains("<Error>"),
+            "no key may be refused for its length: {}",
+            &body[..body.len().min(400)],
+        );
+        let deletes = gateway.deletes.lock().unwrap();
+        assert!(
+            deletes.as_slice() == [format!("b/{at_cap}")],
+            "the at-cap key must reach the delete seam as `b/<key>`; recorded {} delete(s) of \
+             {:?} bytes",
+            deletes.len(),
+            deletes.iter().map(String::len).collect::<Vec<_>>(),
+        );
     }
 
     #[test]
