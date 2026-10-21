@@ -1237,7 +1237,7 @@ fn the_shipped_artifact_wall_carries_no_off_by_default_backend_exception() {
     let deny = read("deny.toml");
     let all_features = read("deny-all-features.toml");
 
-    // The nine tikv-client advisories (#543). None may appear in the default wall.
+    // The ten tikv-client advisories (#543). None may appear in the default wall.
     for advisory in [
         "RUSTSEC-2026-0104",
         "RUSTSEC-2026-0099",
@@ -1255,6 +1255,9 @@ fn the_shipped_artifact_wall_carries_no_off_by_default_backend_exception() {
         // either ID would silently admit an affected rustls if a default dependency pulled one.
         "RUSTSEC-2026-0346",
         "RUSTSEC-2026-0349",
+        // rustls-webpki 0.101.7 via the same rustls 0.21 chain. Patched only in 0.103.16+;
+        // parked in deny.toml it would admit an affected webpki a default dependency pulled.
+        "RUSTSEC-2026-0382",
     ] {
         assert!(
             !deny.contains(advisory),

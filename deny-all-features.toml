@@ -49,7 +49,7 @@ unsound = "all"
 
 # THE tikv-client EXPOSURE BOUNDARY (#543).
 #
-# The nine tikv entries below all reach us through exactly one crate — `tikv-client` 0.4.0 —
+# The ten tikv entries below all reach us through exactly one crate — `tikv-client` 0.4.0 —
 # which is pulled in only by the OFF-by-default `tikv` feature (`crates/server/Cargo.toml`).
 # They are therefore reachable **only** under `--features tikv`: by the `tikv-conformance`
 # and Tier-1 TiKV fault legs, and by an operator who deliberately builds the TiKV backend.
@@ -102,7 +102,7 @@ ignore = [
     # shipped code. Revisit if madsim moves off it.
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3, unmaintained; test-only via madsim (wyrd-dst), never in shipped code. Mirrors the entry in deny.toml." },
 
-    # --- The tikv-client tree (#543). All nine: `--features tikv` only. ---
+    # --- The tikv-client tree (#543). All ten: `--features tikv` only. ---
 
     # HIGH (7.5). Reachable panic parsing a certificate revocation list, BEFORE the CRL's
     # signature is verified. rustls-webpki 0.101.7 <- rustls 0.21.12 <- tokio-rustls 0.24 /
@@ -165,4 +165,11 @@ ignore = [
     # key compromise, no authentication bypass). Same rustls 0.21.12 chain and the same
     # `>= 0.23.46`-only fix as RUSTSEC-2026-0346 above.
     { id = "RUSTSEC-2026-0349", reason = "rustls 0.21.12 via tonic 0.10 <- tikv-client 0.4.0; patched only in >= 0.23.46, no 0.21.x fix. Absent from the shipped graph, which contains no rustls. No fix reachable: tikv-client 0.4.0 is abandoned upstream (#543)." },
+
+    # Certificate verification may accept paths through the distrusted emSign intermediates,
+    # whose private keys are now public — only when the configured trust anchors allow such a
+    # path. rustls-webpki 0.101.7 <- rustls 0.21.12 <- tokio-rustls 0.24 / tonic 0.10 <-
+    # tikv-client 0.4.0, the same chain as RUSTSEC-2026-0104. The fix is only in `>= 0.103.16`
+    # (and 0.104.0-alpha.8); no 0.101.x release carries it.
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101.7 via rustls 0.21.12 / tonic 0.10 <- tikv-client 0.4.0; patched only in >= 0.103.16, no 0.101.x fix. Absent from the shipped graph. No fix reachable: tikv-client 0.4.0 is abandoned upstream (#543)." },
 ]
