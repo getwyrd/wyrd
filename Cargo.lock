@@ -5226,6 +5226,7 @@ dependencies = [
  "futures-util",
  "http-body 1.1.0",
  "roxmltree",
+ "sha2",
  "tempfile",
  "tokio",
  "wyrd-chunkstore-fs",
