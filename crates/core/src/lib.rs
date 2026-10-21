@@ -14,4 +14,5 @@ pub mod multipart;
 pub mod placement;
 pub mod read;
 pub mod repair;
+pub mod staged_publication;
 pub mod write;
