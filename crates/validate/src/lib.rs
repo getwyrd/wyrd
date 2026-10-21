@@ -4,9 +4,11 @@
 //!
 //! An out-of-process tool that drives a Wyrd deployment through its S3 front door the way a
 //! client does, knowing nothing about Wyrd but its address. The binary parses the argument
-//! surface, resolves credentials, echoes the resolved configuration, and exits; the library
-//! also carries the S3 client every scenario calls through ([`s3`]). No scenario drives that
-//! client yet: the capability matrix and `smoke` arrive in #743.
+//! surface, resolves credentials and the deployment's tuning, echoes the resolved
+//! configuration, and exits; the library also carries the S3 client every scenario calls
+//! through ([`s3`]), the derived object bodies it will send ([`payload`]), and the size classes
+//! it will send them at ([`sizes`]). No scenario drives the client yet: the capability matrix
+//! and `smoke` arrive in #743.
 //!
 //! Layering (proposal 0017 §2): everything decision-shaped lives here, pure and tested; the
 //! binary (`src/main.rs`) owns only the I/O — the real argv, the real environment, the real
@@ -19,15 +21,23 @@
 
 pub mod access_keys;
 pub mod args;
+pub mod payload;
 pub mod s3;
+pub mod sizes;
 
 use std::ffi::OsString;
 use std::io::Write;
 
 pub use access_keys::{resolve, CredentialError, CredentialSource, Credentials};
-pub use args::{parse, usage, ArgError, Args, FLAGS};
+pub use args::{parse, usage, ArgError, Args, FLAGS, TUNING_FLAGS};
+pub use payload::{OutOfRange, Payload, Pieces, BLOCK_BYTES, PIECE_BYTES};
 pub use s3::{
     BodyError, Deadlines, ErrorCode, ObjectBody, Phase, PutOutcome, PutSource, S3Client, S3Error,
+};
+pub use sizes::{
+    Boundary, Setting, SizeClass, Source, Tuning, TuningError, TuningFlags, CHUNK_REF_BYTES,
+    DEFAULT_CHUNK_SIZE, DEFAULT_MAX_ROOT_VALUE_BYTES, MAX_CHUNK_SIZE, MAX_ROOT_VALUE_BYTES_CAP,
+    MIN_CHUNK_SIZE,
 };
 
 /// Exit status for a run whose validation passed. No run returns it yet: no scenario drives the
@@ -43,20 +53,29 @@ pub const EXIT_USAGE: u8 = 2;
 /// every run that gets that far ends here until the S3 client and scenarios are wired.
 pub const EXIT_INCONCLUSIVE: u8 = 3;
 
-/// Everything a run needs, resolved: the ten flags plus the credential pair.
+/// Everything a run needs, resolved: the ten flags, the credential pair, and the tuning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedConfig {
     pub args: Args,
     pub credentials: Credentials,
+    /// The deployment's tuning, each value with where it came from.
+    pub tuning: Tuning,
 }
 
 impl ResolvedConfig {
-    /// The resolved-configuration block: one `--flag = value` line per flag, then the
-    /// access-key **id** and where it came from. The secret is never part of it.
+    /// The resolved-configuration block: one `--flag = value` line per required flag, one
+    /// `--flag = value (source)` line per tuning flag (`given`, `default` or `derived`), then
+    /// the access-key **id** and where it came from. The secret is never part of it.
     pub fn render(&self) -> String {
         let mut block = String::from("wyrd-validate: resolved configuration\n");
         for (flag, value) in self.args.pairs() {
             block.push_str(&format!("  --{flag} = {value}\n"));
+        }
+        for (flag, setting) in self.tuning.pairs() {
+            block.push_str(&format!(
+                "  --{flag} = {} ({})\n",
+                setting.value, setting.source
+            ));
         }
         block.push_str(&format!(
             "  access-key-id = {}\n",
@@ -70,21 +89,29 @@ impl ResolvedConfig {
     }
 }
 
-/// Parse `args` (argv without the program name) and resolve credentials over `lookup`.
-/// Argument errors are reported before credential errors.
+/// Parse `args` (argv without the program name), resolve the tuning, and resolve credentials
+/// over `lookup`. Argument errors are reported first, then tuning errors, then credential
+/// errors.
 pub fn resolve_config(
     args: &[String],
     lookup: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<ResolvedConfig, RunError> {
     let args = parse(args).map_err(RunError::Args)?;
+    let tuning = Tuning::resolve(&args.tuning).map_err(RunError::Tuning)?;
     let credentials = resolve(lookup).map_err(RunError::Credentials)?;
-    Ok(ResolvedConfig { args, credentials })
+    Ok(ResolvedConfig {
+        args,
+        credentials,
+        tuning,
+    })
 }
 
 /// Why a run was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
     Args(ArgError),
+    /// The tuning flags parsed but cannot produce a valid size table.
+    Tuning(TuningError),
     Credentials(CredentialError),
 }
 
@@ -92,6 +119,7 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Args(e) => write!(f, "{e}\n{}", usage()),
+            Self::Tuning(e) => write!(f, "{e}\n{}", usage()),
             Self::Credentials(e) => write!(f, "{e}"),
         }
     }
