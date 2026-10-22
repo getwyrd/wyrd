@@ -85,13 +85,24 @@ async-trait = "0.1"
 # New to the shipped graph (`cargo tree -p wyrd-validate -e normal`, 81 crates): the 18
 # `aws-*` crates; `http` 0.2 and `http-body` 0.4 (aws-runtime's `http-02x`); the checksum
 # stack (`crc-fast`, `crc32fast`, `md-5`, `sha1`); `lru`; `url`/`idna` with the ICU4X tables
-# (Unicode-3.0); `time`, `uuid`, `regex-lite`, `xmlparser`; and, through `default-client`
-# below, `rustls-native-certs`, `rustls-pki-types` and, on Unix, `openssl-probe`, but not
-# `rustls` itself.
+# (Unicode-3.0); `time`, `uuid`, `regex-lite`, `xmlparser`.
 aws-sdk-s3 = { version = "1.144.0", default-features = false, features = ["rt-tokio", "http-1x"] }
-# The SDK's hyper 1.x HTTP client; `default-client` is the feature that carries hyper. The
-# validator builds it without TLS (`build_http`). Floor: the version Cargo.lock resolves.
-aws-smithy-http-client = { version = "1.4.2", default-features = false, features = ["default-client"] }
+# The validator's own HTTP connector (`crates/validate/src/s3/wire.rs`, #853): one plain-HTTP
+# connection per request on hyper's own HTTP/1.1 connection API, so the client can take the
+# connection back after a response and see what the endpoint sent past its end. It replaces
+# the SDK's `aws-smithy-http-client`, whose connector exposes neither the connection nor its
+# unread bytes. The three crates are the trait it implements (`aws-smithy-runtime-api`, the
+# SDK's own runtime API) and the two the SDK's connector was itself built on, so all three
+# were already in `wyrd-validate`'s shipped graph through it. Promoted to direct dependencies,
+# with minimal features: client and HTTP/1 only, no HTTP/2, no pool, no TLS. Licences and
+# unsafe as audited with the SDK above. Leaving `aws-smithy-http-client` adds no crate to the
+# shipped graph (`cargo tree -p wyrd-validate -e normal`) and takes 13 out of it: itself,
+# `h2`, `tower` with `tower-layer` and `tower-service`, `rustls-native-certs`,
+# `rustls-pki-types`, `openssl-probe`, `base64`, `fnv`, `indexmap`, `ipnet`, and `socket2`
+# 0.5. Floors: the versions Cargo.lock resolves.
+aws-smithy-runtime-api = { version = "1.19.0", default-features = false, features = ["client", "http-1x"] }
+hyper = { version = "1.10.1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", default-features = false, features = ["tokio"] }
 # The HTTP framework hosting the gateway's S3 wire surface (issue #364,
 # m4-first-deployment-blueprint §5 "Primary integration surface"). Already in the
 # graph transitively via `tonic` (built on axum/hyper), so this promotes an existing,

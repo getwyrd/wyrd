@@ -23,15 +23,25 @@ path = "src/main.rs"
 # ADR-0003 §2 adoption audit for the AWS SDK sits by its pins in the root manifest.
 [dependencies]
 aws-sdk-s3.workspace = true
-# The SDK's hyper-backed HTTP client, built without TLS (`build_http`): plain HTTP only,
-# with TLS terminated in front of the gateway (proposal 0017 §10).
-aws-smithy-http-client.workspace = true
+# The SDK's connector trait, which the client's own HTTP connector implements
+# (`src/s3/wire.rs`).
+aws-smithy-runtime-api.workspace = true
 bytes.workspace = true
 # `Stream`, the shape of a caller's PUT source.
 futures-util.workspace = true
 # `Body`/`Frame`, to hand a caller's source to the SDK as a request body with a declared
-# length and no buffering.
+# length and no buffering, and to cap a response body the SDK buffers.
 http-body.workspace = true
+# The client's own HTTP connector (`src/s3/wire.rs`): hyper's HTTP/1.1 client connection over
+# a tokio TCP socket, one per request, taken back after the response to see what followed it.
+# Plain HTTP only, with TLS terminated in front of the gateway (proposal 0017 §10).
+hyper.workspace = true
+hyper-util.workspace = true
+# The strict reading of an S3 error document (#853): well-formedness, the whole document and
+# nothing after it but whitespace and comments, text-only fields, no DTD. The workspace's
+# shared XML parser (ADR-0003 audit with #509), in place of the SDK's reader, which accepts a
+# cut-off document.
+roxmltree.workspace = true
 # SHA-256: the counter-mode construction derived payloads are built from, and the payload
 # digest checkpoints and the oracle key on (`src/payload.rs`; proposal 0017 §2, §4).
 sha2.workspace = true
@@ -43,7 +53,6 @@ tokio.workspace = true
 # dev-dependencies unconstrained): the client is proven against a real Wyrd S3 gateway served
 # in-process on loopback, the composition `crates/server/tests/s3_http_wire.rs` uses.
 [dev-dependencies]
-roxmltree.workspace = true
 tempfile.workspace = true
 wyrd-chunkstore-fs.workspace = true
 wyrd-coordination-mem.workspace = true

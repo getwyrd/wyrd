@@ -24,6 +24,7 @@ use tokio::task::Unconstrained;
 use tokio::time::Instant;
 
 use super::error::{BodyError, Phase, S3Error};
+use super::wire::Overrun;
 
 /// The pieces of a PUT body.
 type Pieces = Pin<Box<dyn Stream<Item = Result<Bytes, BoxError>> + Send + Sync>>;
@@ -349,6 +350,18 @@ impl http_body::Body for DeclaredLengthBody {
     }
 }
 
+/// The first error of type `E` in `err`'s source chain, `err` included.
+fn source_of<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&'a E> {
+    let mut next = Some(err);
+    while let Some(err) = next {
+        if let Some(found) = err.downcast_ref::<E>() {
+            return Some(found);
+        }
+        next = err.source();
+    }
+    None
+}
+
 /// An error and its sources, joined with `": "`.
 fn error_chain(err: &(dyn Error + 'static)) -> String {
     let mut text = err.to_string();
@@ -366,13 +379,19 @@ fn error_chain(err: &(dyn Error + 'static)) -> String {
 /// Every piece is handed over as the SDK yields it. Each wait for the next piece is bounded
 /// by the body-idle deadline, and the body as a whole by the body deadline, which runs from
 /// the moment the response head was read: a peer that trickles a byte just inside every idle
-/// window cannot keep the caller pending past it. The body is trusted only up to its
-/// declared `Content-Length`: a body that fails, ends short or runs past it is a
-/// [`BodyError`], never a shorter or longer object. After the first error every later call
-/// returns that error again.
+/// window cannot keep the caller pending past it. The body ends only where its framing says
+/// it does: at its declared `Content-Length`, or at the terminal chunk of a chunked body. A
+/// body that fails, ends short of that point or runs past it is a [`BodyError`], never a
+/// shorter or longer object. After the first error every later call returns that error
+/// again.
+///
+/// No byte budget applies here: the body streams, so what the client holds of it does not
+/// grow with its size ([`super::BUFFERED_BODY_BUDGET`] caps only the bodies the SDK
+/// buffers).
 pub struct ObjectBody {
     stream: ByteStream,
-    declared: u64,
+    /// The `Content-Length`, or `None` for a chunked body.
+    declared: Option<u64>,
     received: u64,
     idle: Duration,
     /// The whole-body limit, kept for the error it expires as.
@@ -387,7 +406,12 @@ pub struct ObjectBody {
 impl ObjectBody {
     /// A body over `stream`, whose whole-body deadline starts now: call it as soon as the
     /// response head is read.
-    pub(super) fn new(stream: ByteStream, declared: u64, idle: Duration, limit: Duration) -> Self {
+    pub(super) fn new(
+        stream: ByteStream,
+        declared: Option<u64>,
+        idle: Duration,
+        limit: Duration,
+    ) -> Self {
         // Clock: tokio's runtime clock, as for the idle deadline in `read`.
         let deadline = Instant::now().checked_add(limit);
         Self {
@@ -402,13 +426,14 @@ impl ObjectBody {
         }
     }
 
-    /// The object's declared `Content-Length`.
-    pub fn content_length(&self) -> u64 {
+    /// The object's declared `Content-Length`, or `None` for a chunked body, whose length is
+    /// known only at its end.
+    pub fn content_length(&self) -> Option<u64> {
         self.declared
     }
 
-    /// The next piece, or `None` once exactly `content_length` bytes have been handed over
-    /// and the body has ended.
+    /// The next piece, or `None` once the body has ended where its framing says: exactly
+    /// `content_length` bytes, or a chunked body's terminal chunk.
     pub async fn next_piece(&mut self) -> Result<Option<Bytes>, S3Error> {
         if let Some(e) = &self.failed {
             return Err(e.clone());
@@ -439,36 +464,49 @@ impl ObjectBody {
         let next = tokio::time::timeout(wait, self.stream.next())
             .await
             .map_err(|_| expired)?;
-        // deferred: #853 — the two length checks below (a piece past the declared length, an
-        // end short of it) can fire only when the response's framing disagrees with its
-        // `Content-Length`. With a conforming response hyper reads exactly the declared
-        // length and reports a cut connection as a transport error, so only #853's
-        // non-conforming framings exercise them.
+        // The end is hyper's to find. A `Content-Length` body is read to exactly that length,
+        // a cut connection reported as a transport error; a chunked body ends only after its
+        // terminal chunk and final CRLF, a connection that closes anywhere before them
+        // reported as an unexpected EOF (`hyper` 1.10.1 `proto/h1/decode.rs:160-164` for a
+        // length, `:259-269` inside chunk framing, `:497-501` inside chunk data). At that end
+        // the connector checks that nothing followed it, and fails the body with an
+        // [`Overrun`] if anything did (`s3/wire.rs`). A response framed both ways, neither
+        // way, or in a coding other than `chunked` never gets here (`S3Client::get_object`).
+        // The two length checks below therefore guard against hyper itself: no framing a peer
+        // can send reaches them.
         match next {
             Some(Ok(piece)) => {
                 let received = self.received.saturating_add(piece.len() as u64);
-                if received > self.declared {
-                    return Err(S3Error::Body(BodyError::Length {
-                        declared: self.declared,
-                        received,
-                    }));
+                if let Some(declared) = self.declared.filter(|&d| received > d) {
+                    return Err(S3Error::Body(BodyError::Length { declared, received }));
                 }
                 self.received = received;
                 Ok(Some(piece))
             }
-            Some(Err(e)) => Err(S3Error::Body(BodyError::Transport {
-                declared: self.declared,
-                received: self.received,
-                detail: DisplayErrorContext(&e).to_string(),
+            // A read that failed, or the connector's check at the body's end (`s3/wire.rs`):
+            // hyper's body ended where the framing says, and more had arrived past it.
+            Some(Err(e)) => Err(S3Error::Body(match source_of::<Overrun>(&e) {
+                Some(overrun) => BodyError::Overrun {
+                    declared: self.declared,
+                    received: self.received,
+                    after: overrun.after,
+                },
+                None => BodyError::Transport {
+                    declared: self.declared,
+                    received: self.received,
+                    detail: DisplayErrorContext(&e).to_string(),
+                },
             })),
-            None if self.received == self.declared => {
-                self.ended = true;
-                Ok(None)
-            }
-            None => Err(S3Error::Body(BodyError::Length {
-                declared: self.declared,
-                received: self.received,
-            })),
+            None => match self.declared.filter(|&d| self.received != d) {
+                Some(declared) => Err(S3Error::Body(BodyError::Length {
+                    declared,
+                    received: self.received,
+                })),
+                None => {
+                    self.ended = true;
+                    Ok(None)
+                }
+            },
         }
     }
 
