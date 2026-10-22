@@ -1,0 +1,53 @@
+name: Issue triage
+
+# Keep the `new` label in step with the milestone (#935): an open issue with no
+# milestone carries `new`; once a milestone is set the label comes off, and it
+# comes back if the milestone is cleared while the issue is still open.
+#
+# The issue is re-read from the API instead of trusting the event payload: an
+# issue opened with a milestone fires both `opened` and `milestoned`, and the
+# runs can start in either order. Reading the current state makes every run
+# idempotent, and the per-issue concurrency group keeps two runs for the same
+# issue from interleaving.
+
+on:
+  issues:
+    types: [opened, reopened, milestoned, demilestoned]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: issue-triage-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  triage-new-label:
+    name: triage-new-label
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync the `new` label with the milestone
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const LABEL = 'new';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.issue.number;
+
+            const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number });
+            const hasLabel = issue.labels.some(l => (typeof l === 'string' ? l : l.name) === LABEL);
+            const wantLabel = issue.state === 'open' && issue.milestone === null;
+
+            if (wantLabel && !hasLabel) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [LABEL] });
+              core.info(`#${issue_number}: no milestone, added "${LABEL}".`);
+            } else if (!wantLabel && hasLabel) {
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name: LABEL });
+              } catch (e) {
+                if (e.status !== 404) throw e;   // already removed by a concurrent edit
+              }
+              core.info(`#${issue_number}: milestone "${issue.milestone?.title}", removed "${LABEL}".`);
+            } else {
+              core.info(`#${issue_number}: label already correct (milestone: ${issue.milestone?.title ?? 'none'}).`);
+            }
