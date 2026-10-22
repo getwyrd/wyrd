@@ -400,7 +400,7 @@ fn client_direct(gateway: &GatewayFixture) -> S3Client {
 
 /// Read `body` to its end, checking every byte against the payload function.
 async fn expect_payload(body: &mut ObjectBody, len: u64) {
-    assert_eq!(body.content_length(), len, "declared Content-Length");
+    assert_eq!(body.content_length(), Some(len), "declared Content-Length");
     let mut offset = 0u64;
     loop {
         let piece = timeout(STALL, body.next_piece())
@@ -1096,7 +1096,7 @@ async fn get_hands_over_pieces_within_the_window() {
         .await
         .unwrap_or_else(|_| panic!("{}", stalled(0)))
         .expect("GET");
-    assert_eq!(body.content_length(), len);
+    assert_eq!(body.content_length(), Some(len));
     let mut offset = 0u64;
     loop {
         let piece = timeout(STALL, body.next_piece())
@@ -1228,7 +1228,7 @@ async fn get_cut_mid_body_is_the_body_error_never_a_shorter_object() {
     let relay = Relay::start(gateway.addr, Downstream::CutAfter { body: cut_at }).await;
     let client = client(relay.addr);
     let mut body = get(&client, "cut").await.expect("GET head");
-    assert_eq!(body.content_length(), len);
+    assert_eq!(body.content_length(), Some(len));
     let mut handed = 0u64;
     let err = loop {
         match timeout(STALL, body.next_piece()).await.expect("bounded") {
@@ -1241,7 +1241,7 @@ async fn get_cut_mid_body_is_the_body_error_never_a_shorter_object() {
         S3Error::Body(BodyError::Transport {
             declared, received, ..
         }) => {
-            assert_eq!(declared, len, "declared length");
+            assert_eq!(declared, Some(len), "declared length");
             assert_eq!(received, handed, "the error counts what was handed over");
             assert_eq!(handed, cut_at, "everything before the cut was handed over");
         }

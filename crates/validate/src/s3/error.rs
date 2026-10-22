@@ -23,14 +23,18 @@ pub enum S3Error {
         /// The `x-amz-request-id` response header, read from that header itself.
         request_id: Option<String>,
     },
-    /// A response arrived but cannot be read as S3: a success body the SDK could not
-    /// deserialize, or an error response that is not an S3 `<Error>` document.
+    /// A response arrived but cannot be read as S3: a success the SDK could not deserialize,
+    /// an error response whose body is not one whole S3 `<Error>` document, a response whose
+    /// framing cannot mark where its body ends, bytes after the end its framing marks, a PUT
+    /// or DELETE success that carries a body, or a body the client buffers that runs past
+    /// [`super::BUFFERED_BODY_BUDGET`].
     Unreadable {
         /// The response's HTTP status.
         status: u16,
         /// The `x-amz-request-id` response header, when present.
         request_id: Option<String>,
-        /// What the SDK reported, with its source chain.
+        /// What went wrong: the SDK's report with its source chain, or the client's own
+        /// reading of the response.
         detail: String,
     },
     /// No response: the connection could not be made, or was lost before a response head
@@ -108,18 +112,37 @@ pub enum BodyError {
         /// The answer's `x-amz-request-id` header.
         request_id: Option<String>,
     },
-    /// GET: reading the body failed after `received` of its `declared` bytes (a cut
-    /// connection, a framing error).
+    /// GET: reading the body failed after `received` bytes (a cut connection, a framing
+    /// error such as chunked framing that ends before its terminal chunk). `declared` is the
+    /// `Content-Length`, or `None` for a chunked body, which declares none.
     Transport {
-        declared: u64,
+        declared: Option<u64>,
         received: u64,
         detail: String,
     },
     /// GET: the body ended short of, or ran past, its declared `Content-Length`.
     Length { declared: u64, received: u64 },
-    /// GET: the response declared no `Content-Length`, so a cut connection could not be told
-    /// apart from the end of the object.
+    /// GET: the body reached the end its framing marks after `received` bytes, but the
+    /// endpoint had sent at least `after` more bytes past that end: a body longer than its
+    /// `Content-Length`, or bytes after a chunked body's terminal chunk and trailer section.
+    /// `declared` is the `Content-Length`, or `None` for a chunked body.
+    Overrun {
+        declared: Option<u64>,
+        received: u64,
+        after: u64,
+    },
+    /// GET: the response declared neither a `Content-Length` nor chunked framing, so a cut
+    /// connection could not be told apart from the end of the object.
     LengthUndeclared,
+    /// GET: the response's framing cannot mark where the object ends, so its body is not read:
+    /// a `Transfer-Encoding` together with a `Content-Length` (RFC 9112 §6.2 forbids sending
+    /// both), a `Transfer-Encoding` other than exactly `chunked`, a `Content-Length` that is
+    /// not one decimal length, or a `204` that frames a body. The two header values as sent,
+    /// joined when repeated.
+    Framing {
+        transfer_encoding: Option<String>,
+        content_length: Option<String>,
+    },
 }
 
 impl fmt::Display for S3Error {
@@ -210,21 +233,55 @@ impl fmt::Display for BodyError {
                 write_request_id(f, request_id.as_deref())
             }
             Self::Transport {
-                declared,
+                declared: Some(declared),
                 received,
                 detail,
             } => write!(
                 f,
                 "reading the body failed after {received} of {declared} bytes: {detail}"
             ),
+            Self::Transport {
+                declared: None,
+                received,
+                detail,
+            } => write!(
+                f,
+                "reading the chunked body failed after {received} bytes: {detail}"
+            ),
             Self::Length { declared, received } => write!(
                 f,
                 "the body carried {received} bytes against a declared Content-Length of \
                  {declared}"
             ),
+            Self::Overrun {
+                declared,
+                received,
+                after,
+            } => {
+                write!(
+                    f,
+                    "the body ended where its framing says, after {received} bytes"
+                )?;
+                if let Some(declared) = declared {
+                    write!(f, " of a declared Content-Length of {declared}")?;
+                }
+                write!(
+                    f,
+                    ", but the endpoint sent at least {after} more bytes after that end"
+                )
+            }
             Self::LengthUndeclared => write!(
                 f,
-                "the response declared no Content-Length, so its end cannot be told from a cut"
+                "the response declared neither a Content-Length nor chunked framing, so its end \
+                 cannot be told from a cut"
+            ),
+            Self::Framing {
+                transfer_encoding,
+                content_length,
+            } => write!(
+                f,
+                "the response's framing cannot mark where the object ends: Transfer-Encoding \
+                 {transfer_encoding:?}, Content-Length {content_length:?}"
             ),
         }
     }

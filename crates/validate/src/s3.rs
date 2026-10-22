@@ -1,25 +1,44 @@
 //! The S3 client every validator scenario calls through (proposal 0017 §6-7).
 //!
 //! It is `aws-sdk-s3` pointed at an arbitrary `--endpoint`: path-style addressing, static
-//! SigV4 credentials, a plain-HTTP connector (TLS is terminated in front of the gateway,
-//! proposal 0017 §10), and retries and stalled-stream protection **off**, so every request
-//! the validator reports on is exactly one request on the wire. On top of the SDK it adds
-//! four things:
+//! SigV4 credentials, and retries and stalled-stream protection **off**, so every request the
+//! validator reports on is exactly one request on the wire. On top of the SDK it adds seven
+//! things:
 //!
+//! * a plain-HTTP connector of its own (TLS is terminated in front of the gateway, proposal
+//!   0017 §10), with one connection per request, which counts what the endpoint sent after
+//!   each response's end: anything at all fails the response (`s3/wire.rs`);
 //! * a typed error, [`S3Error`], whose every fact is the server's or the client's own
 //!   measurement — in particular the request id is read from the `x-amz-request-id` header
 //!   itself, because the SDK's generic accessor prefers `x-amzn-requestid` when both are
 //!   present;
+//! * a strict reading of every response: one that is not a whole, well-formed, correctly
+//!   framed S3 response is never reported as one — not as a clean S3 error, not as a
+//!   success, not as a shorter object. An error body is read by the client itself, not the
+//!   SDK: empty is "no body", an `<Error>` without a `<Code>`, or with an empty one, is "no
+//!   code in body", and anything but one whole `<Error>` document whose `<Code>` and
+//!   `<Message>` hold only text is [`S3Error::Unreadable`]. Framing that cannot mark where a
+//!   body ends is refused: both `Transfer-Encoding` and `Content-Length`, a transfer coding
+//!   other than exactly `chunked`, a `204` that frames a body, a `Transfer-Encoding` on a
+//!   `304` to a PUT or a DELETE, or neither header on a GET object. So are bytes after the
+//!   end the framing marks, a PUT or DELETE success that carries a body, and a success the
+//!   SDK cannot read, with the SDK's diagnostic kept;
+//! * a byte budget, [`BUFFERED_BODY_BUDGET`] (64 KiB), on every body the SDK buffers — every
+//!   error response and every PUT or DELETE response — counted as the body arrives, so a body
+//!   with no declared length is cut off at the budget rather than read whole;
 //! * bounded waits ([`Deadlines`]): connect, operation, body-idle, and whole body, each
 //!   expiring as a typed timeout naming its phase;
 //! * bodies that stream both ways ([`PutSource`], [`ObjectBody`]), so what the client holds
-//!   of an object is bounded independently of the object's size;
+//!   of an object is bounded independently of the object's size. A GET object is outside the
+//!   budget: it streams, whether it is framed by a `Content-Length` or chunked;
 //! * PUTs that end with their call ([`S3Client::put_object`]): a receipt only when the source
 //!   had ended before the answer, and neither the source nor the connection left behind when
 //!   the call returns.
 
 mod body;
 mod error;
+mod response;
+mod wire;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -33,14 +52,17 @@ use aws_sdk_s3::config::{
     ConfigBag, Credentials as SdkCredentials, Intercept, Region, RuntimeComponents,
     StalledStreamProtectionConfig,
 };
-use aws_sdk_s3::error::{BoxError, DisplayErrorContext, ProvideErrorMetadata, SdkError};
+use aws_sdk_s3::error::{BoxError, DisplayErrorContext, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use futures_util::future::{self, Either};
 
 pub use body::{ObjectBody, PutSource};
 pub use error::{BodyError, ErrorCode, Phase, S3Error};
+pub use response::BUFFERED_BODY_BUDGET;
 
 use body::Upload;
+use response::{error_document, Framing, ResponseGuard};
+use wire::WireClient;
 
 use crate::ResolvedConfig;
 
@@ -49,8 +71,8 @@ use crate::ResolvedConfig;
 const REQUEST_ID_HEADER: &str = "x-amz-request-id";
 
 /// The bound on every wait for the endpoint. All four run on tokio's runtime clock: the
-/// SDK's connect and operation timeouts sleep on its default tokio sleep, and the body-idle
-/// and whole-body deadlines are a `tokio::time::timeout`. A PUT's two deadlines sleep on the
+/// SDK's operation timeout sleeps on its default tokio sleep, and the connect, body-idle and
+/// whole-body deadlines are a `tokio::time::timeout`. A PUT's two deadlines sleep on the
 /// timer of the PUT's own runtime ([`S3Client::put_object`]), which reads the same monotonic
 /// clock, so every deadline of one request still has one source. The SDK also reads the wall
 /// clock, to date SigV4 signatures; that stamp belongs to the server's freshness check, not to any
@@ -94,10 +116,9 @@ pub struct PutOutcome {
 /// An S3 client for the bucket and endpoint of one resolved configuration.
 #[derive(Debug, Clone)]
 pub struct S3Client {
+    /// The SDK client, on the client's own connector: no connection is kept for reuse
+    /// (`s3/wire.rs`), and a PUT's is closed when the PUT returns ([`S3Client::put_object`]).
     sdk: aws_sdk_s3::Client,
-    /// The same configuration without an idle-connection pool, for PUTs: a PUT's connection
-    /// is closed when the PUT returns ([`S3Client::put_object`]), so none is kept for reuse.
-    uploads: aws_sdk_s3::Client,
     bucket: String,
     deadlines: Deadlines,
 }
@@ -127,7 +148,7 @@ impl S3Client {
             None,
             "wyrd-validate",
         );
-        let sdk_config = aws_sdk_s3::Config::builder()
+        let sdk = aws_sdk_s3::Config::builder()
             .behavior_version_latest()
             .region(Region::new(config.args.region.clone()))
             .endpoint_url(config.args.endpoint.as_str())
@@ -135,21 +156,11 @@ impl S3Client {
             .force_path_style(true)
             .retry_config(RetryConfig::disabled())
             .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
-            .timeout_config(timeouts);
-        let sdk = sdk_config
-            .clone()
-            .http_client(aws_smithy_http_client::Builder::new().build_http())
-            .build();
-        let uploads = sdk_config
-            .http_client(
-                aws_smithy_http_client::Builder::new()
-                    .pool_max_idle_per_host(0)
-                    .build_http(),
-            )
+            .timeout_config(timeouts)
+            .http_client(WireClient)
             .build();
         Self {
             sdk: aws_sdk_s3::Client::from_conf(sdk),
-            uploads: aws_sdk_s3::Client::from_conf(uploads),
             bucket: config.args.bucket.clone(),
             deadlines,
         }
@@ -162,10 +173,11 @@ impl S3Client {
     /// head arrived: it had given its whole declared length and then reported its end. For
     /// the client the response arrives at the moment hyper reads it off the socket and hands
     /// it over. A success that arrives sooner is [`BodyError::AcknowledgedEarly`], carrying
-    /// the answer's request id. Having given the whole declared length is not enough: until
-    /// the source reports its end, the SDK has not written the body's final chunk and
-    /// checksum trailer and may still be holding the last bytes back, and the source may
-    /// still run past its declared length. From the moment hyper hands the response over the
+    /// the answer's request id, whether or not its body is then read whole. Having given the
+    /// whole declared length is not enough: until the source reports its end, the SDK has not
+    /// written the body's final chunk and checksum trailer and may still be holding the last
+    /// bytes back, and the source may still run past its declared length. From the moment
+    /// hyper hands the response over the
     /// source is not polled again, so whatever it would have done after that moment (reported
     /// its end, given another piece, failed, run past its declared length) counts for nothing.
     /// A source that runs past its declared length before the response arrives is still
@@ -178,8 +190,9 @@ impl S3Client {
     /// answered, or the server read them and threw them away. And it cannot see an answer
     /// that has reached its own kernel's receive buffer but that hyper has not read yet: a
     /// source that ends inside that window turns an answer the server sent early into a
-    /// receipt. Closing the window needs the socket, which the SDK's connector does not
-    /// expose.
+    /// receipt. Closing the window would need the connector to read the socket ahead of
+    /// hyper, which it does not: it looks at the socket only once a response has ended
+    /// (`s3/wire.rs`).
     ///
     /// Nothing detects a false receipt of either kind today: no scenario drives this client
     /// yet. Once scenarios do, the read-back check of proposal 0017's oracle will catch one
@@ -196,19 +209,20 @@ impl S3Client {
     /// If the future is dropped instead, both are released promptly after. The request runs
     /// on a current-thread runtime of its own, on a thread of its own, and that runtime is
     /// shut down before the outcome is handed back. Shutting it down drops every task on it,
-    /// hyper's connection task among them, and with that task its socket and the request
-    /// body. Nothing else can release a connection blocked mid-write: it waits only for its
-    /// socket to drain, never polls the body again, and the SDK's connector exposes neither
-    /// the socket nor the task.
+    /// the connection's task among them, and with that task its socket and the request body.
+    /// A connection blocked mid-write waits only for its socket to drain and never polls the
+    /// body again. The connector also ends its task when the response is read to its end or
+    /// dropped (`s3/wire.rs`), but only the runtime's shutdown covers every path.
     ///
-    /// **The cost, per PUT.** One thread for its length, and a fresh TCP connection that the
-    /// client closes: no connection is reused across PUTs, and each one leaves a client
-    /// socket in `TIME_WAIT`. That caps sustained PUTs between one client address and one
-    /// gateway address at about the number of ephemeral ports divided by the `TIME_WAIT`
-    /// time: about 470 a second with Linux's defaults (28,232 ports, 60 s). Past that,
-    /// `connect` fails and the PUT is [`S3Error::NoResponse`], which proposal 0017's taxonomy
-    /// would count against the server as `availability`. The cap is a default of the host,
-    /// not a hard ceiling. It holds per pair of client address and gateway address, shared by
+    /// **The cost, per PUT.** One thread for its length, and, as for every request the
+    /// client makes (`s3/wire.rs`), a fresh TCP connection that the client closes: no
+    /// connection is reused, and each one leaves a client socket in `TIME_WAIT`. That caps
+    /// sustained requests (PUT, GET and DELETE requests together) between one client address
+    /// and one gateway address at about the number of ephemeral ports divided by the
+    /// `TIME_WAIT` time: about 470 a second with Linux's defaults (28,232 ports, 60 s). Past
+    /// that, `connect` fails and the request is [`S3Error::NoResponse`], which proposal 0017's
+    /// taxonomy would count against the server as `availability`. The cap is a default of the
+    /// host, not a hard ceiling. It holds per pair of client address and gateway address, shared by
     /// every worker on that client, and an operator raises it with more client or gateway
     /// addresses, a wider `net.ipv4.ip_local_port_range`, or `net.ipv4.tcp_tw_reuse = 1`
     /// (Linux's default, `2`, reuses ports on loopback only).
@@ -221,7 +235,7 @@ impl S3Client {
         })?;
         let (body, upload) = source.into_body();
         let request = self
-            .uploads
+            .sdk
             .put_object()
             .bucket(&self.bucket)
             .key(key)
@@ -229,10 +243,22 @@ impl S3Client {
             .body(ByteStream::from_body_1_x(body))
             .customize()
             .interceptor(ResponseArrival(Arc::clone(&upload)))
+            .interceptor(ResponseGuard::buffered())
             .send();
         let sent = on_own_runtime(upload.request_first(request)).await?;
         // The source has been dropped and the connection closed by here.
-        if sent.is_ok() {
+        //
+        // Whether an answer came early is settled by its head: a success head that arrived
+        // before the source had ended is the early acknowledgement, whether its body is then
+        // read whole or refused while being read (a PUT success carries no body, so any is
+        // refused), since that body came after the head. A head the SDK cannot read is no
+        // success head, and stays `Unreadable` with the SDK's diagnostic.
+        let success_head = match &sent {
+            Ok(_) => true,
+            Err(SdkError::ResponseError(context)) => context.raw().status().is_success(),
+            Err(_) => false,
+        };
+        if success_head {
             if let Some(early) = upload.acknowledged_early() {
                 return Err(S3Error::Body(early));
             }
@@ -253,19 +279,39 @@ impl S3Client {
     /// GET `key`. The returned body is read piece by piece with
     /// [`ObjectBody::next_piece`]; nothing is read ahead of the caller.
     pub async fn get_object(&self, key: &str) -> Result<ObjectBody, S3Error> {
+        let (guard, framing) = ResponseGuard::streaming_success();
         let output = self
             .sdk
             .get_object()
             .bucket(&self.bucket)
             .key(key)
+            .customize()
+            .interceptor(guard)
             .send()
             .await
             .map_err(|e| self.classify(e))?;
-        // deferred: #853 — close-delimited and chunked GET framing. Without a declared
-        // length a cut connection is indistinguishable from the end of the object, so such a
-        // body is refused rather than trusted.
-        let Some(declared) = output.content_length().and_then(|n| u64::try_from(n).ok()) else {
-            return Err(S3Error::Body(BodyError::LengthUndeclared));
+        // The guard records the framing of every success it lets through, and the SDK
+        // returns an output only for a success it has let through.
+        let framing = framing
+            .get()
+            .cloned()
+            .expect("the response guard records the framing of every GET success");
+        let declared = match framing {
+            Framing::Length(n) => Some(n),
+            // Chunked framing marks its own end, so the body is accepted without a length.
+            Framing::Chunked => None,
+            // Without either a cut connection is indistinguishable from the end of the
+            // object, so the body is refused rather than trusted.
+            Framing::Undeclared => return Err(S3Error::Body(BodyError::LengthUndeclared)),
+            Framing::Untrusted {
+                transfer_encoding,
+                content_length,
+            } => {
+                return Err(S3Error::Body(BodyError::Framing {
+                    transfer_encoding,
+                    content_length,
+                }))
+            }
         };
         Ok(ObjectBody::new(
             output.body,
@@ -281,6 +327,8 @@ impl S3Client {
             .delete_object()
             .bucket(&self.bucket)
             .key(key)
+            .customize()
+            .interceptor(ResponseGuard::buffered())
             .send()
             .await
             .map(|_| ())
@@ -290,7 +338,7 @@ impl S3Client {
     /// Map an SDK failure onto the one [`S3Error`] variant for where it happened.
     fn classify<E>(&self, err: SdkError<E, HttpResponse>) -> S3Error
     where
-        E: ProvideErrorMetadata + std::error::Error + 'static,
+        E: std::error::Error + 'static,
     {
         let detail = DisplayErrorContext(&err).to_string();
         match &err {
@@ -310,27 +358,34 @@ impl S3Client {
                 let raw = context.raw();
                 let status = raw.status().as_u16();
                 let request_id = request_id(raw);
-                // deferred: #853 — non-conforming error responses. The SDK reads the error
-                // body whole, with no byte budget. An empty error body is classified below
-                // (`NoBody`) but exercised only there. An `<Error>` document that names no
-                // `<Code>` is not yet told apart from a body that is not an `<Error>` document
-                // at all; both are reported as unreadable until then.
-                match (raw.body().bytes(), context.err().code()) {
-                    // Checked before the SDK's code: it fills in `NotFound` for a bodiless
-                    // 404, which the server never sent.
-                    (Some([]), _) => S3Error::Service {
+                // A success status here is one the SDK could not read, a header that fails its
+                // grammar for one: an error only in the SDK's account, which is kept whole.
+                if raw.status().is_success() {
+                    return S3Error::Unreadable {
                         status,
-                        code: ErrorCode::NoBody,
-                        message: None,
+                        request_id,
+                        detail,
+                    };
+                }
+                // The body is read here, never through the SDK's error metadata: the SDK
+                // makes up `NotFound` for a bodiless 404 and reads a cut-off or trailed
+                // document as a clean one. The response guard has capped it at the budget.
+                match raw.body().bytes().map(error_document) {
+                    Some(Ok((code, message))) => S3Error::Service {
+                        status,
+                        code,
+                        message,
                         request_id,
                     },
-                    (_, Some(code)) => S3Error::Service {
+                    Some(Err(reading)) => S3Error::Unreadable {
                         status,
-                        code: ErrorCode::Code(code.to_owned()),
-                        message: context.err().message().map(str::to_owned),
                         request_id,
+                        detail: reading,
                     },
-                    (_, None) => S3Error::Unreadable {
+                    // The SDK reads every error body before it deserializes one
+                    // (`aws-smithy-runtime` 1.16.0 `client/orchestrator.rs:526-536`), so this
+                    // is not expected; reported as what it would be, a body nobody read.
+                    None => S3Error::Unreadable {
                         status,
                         request_id,
                         detail,
@@ -338,10 +393,9 @@ impl S3Client {
                 }
             }
             // Everything else is classified by whether a response arrived: a dispatch failure
-            // has none; a response the SDK could not deserialize (`ResponseError`) has one.
-            // `SdkError` is non-exhaustive, so a future variant lands here too.
-            // deferred: #853 — a conforming server sends no unreadable response, so only
-            // #853's non-conforming responses reach the `Unreadable` side of this arm.
+            // has none; a response that was refused or could not be read (`ResponseError`:
+            // the response guard's framing and budget refusals, a body that failed mid-read)
+            // has one. `SdkError` is non-exhaustive, so a future variant lands here too.
             _ => match err.raw_response() {
                 Some(raw) => S3Error::Unreadable {
                     status: raw.status().as_u16(),
@@ -360,8 +414,8 @@ fn request_id(raw: &HttpResponse) -> Option<String> {
 }
 
 /// Run `request` on a current-thread runtime of its own, on a thread of its own, and shut
-/// that runtime down before handing back the outcome. hyper spawns each connection's task
-/// onto the runtime it is called from (the SDK's connector hands it tokio's executor), so the
+/// that runtime down before handing back the outcome. The client's connector spawns each
+/// connection's task onto the runtime it is called from (`tokio::spawn`, `s3/wire.rs`), so the
 /// task lands on this runtime, and shutting it down drops the task, its socket and whatever
 /// request body it holds, on this thread, before the outcome is sent.
 ///
