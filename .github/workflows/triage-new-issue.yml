@@ -2,7 +2,11 @@ name: Issue triage
 
 # Keep the `new` label in step with the milestone (#935): an open issue with no
 # milestone carries `new`; once a milestone is set the label comes off, and it
-# comes back if the milestone is cleared while the issue is still open.
+# comes back if the milestone is cleared while the issue is still open. Closing
+# an issue takes the label off.
+#
+# Issues opened with `GITHUB_TOKEN` (report-nightly-failure.yml) do not trigger
+# this workflow, so that reporter applies `new` itself.
 #
 # The issue is re-read from the API instead of trusting the event payload: an
 # issue opened with a milestone fires both `opened` and `milestoned`, and the
@@ -12,7 +16,7 @@ name: Issue triage
 
 on:
   issues:
-    types: [opened, reopened, milestoned, demilestoned]
+    types: [opened, reopened, closed, milestoned, demilestoned]
 
 permissions:
   issues: write
@@ -27,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Sync the `new` label with the milestone
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const LABEL = 'new';

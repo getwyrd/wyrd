@@ -127,5 +127,6 @@ jobs:
             --title "$title" \
             --label nightly-failure \
             --label bug \
+            --label new \
             --body-file "$body_file"
           echo "Opened a new issue for '$title'."
