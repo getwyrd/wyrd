@@ -77,7 +77,7 @@ The labels are `priority:P0` to `priority:P3`, the same names as in Stemma, so a
 
 A bot that triages does this on each new issue:
 
-1. Set type (`bug`, `enhancement`, `documentation` or `research`) unless one is already set, plus severity, reach, area and priority.
+1. Set type (`bug`, `enhancement`, `documentation` or `research`) unless one is already set, plus severity, reach, area and priority. The issue templates set `bug` or `enhancement`, so most issues arrive typed; the bot keeps that label, and says in its comment when the issue reads as a different type.
 2. Post one comment with a line of reasoning per label, so the maintainer can check the call quickly and correct it by changing a label.
 3. Assign from a fixed owner table by area, unless someone is already assigned.
 4. Leave the milestone empty. The `new` label therefore stays until the maintainer sets one.

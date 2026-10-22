@@ -281,7 +281,11 @@ def build_plan(issue: Issue, verdict: dict, config: dict, *, model: str, usage: 
 
     have_type = [t for t in TYPES if t in issue.labels]
     if have_type:
-        rows.append(_row(have_type[0], "Kept the type the issue already had."))
+        # The label wins, but a disagreement is worth a line: templates set the type.
+        why = "Kept the type the issue already had."
+        if verdict["type"] != have_type[0]:
+            why += f" It reads more like {verdict['type']}: {reasons['type']}"
+        rows.append(_row(have_type[0], why))
     else:
         plan.add_labels.append(verdict["type"])
         rows.append(_row(verdict["type"], reasons["type"]))

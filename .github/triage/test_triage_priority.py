@@ -216,6 +216,10 @@ class BuildPlan(unittest.TestCase):
         p = plan(i=issue(labels={"enhancement"}, assignees=["someone"]))
         self.assertNotIn("bug", p.add_labels)
         self.assertIsNone(p.assignee)
+        self.assertIn("It reads more like bug", p.comment)
+
+    def test_no_type_note_when_the_label_agrees(self) -> None:
+        self.assertNotIn("reads more like", plan(i=issue(labels={"bug"})).comment)
 
     def test_unsure_sets_needs_triage_and_no_priority(self) -> None:
         p = plan(unsure=True, missing="Which backend the cluster runs.")
