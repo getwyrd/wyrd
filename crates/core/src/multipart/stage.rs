@@ -856,7 +856,10 @@ enum Late {
 /// `None`, `work` has been dropped: never awaited further, never restarted. An answer is taken
 /// as it comes: the one `work` has ready when the timer fires too. A timer that fired early is
 /// waited out again for what is left. An answer seen with the clock at or past `deadline` —
-/// however the race fell, and whichever branch saw it — is judged by `late`.
+/// however the race fell, and whichever branch saw it — is judged by `late`. That includes an
+/// answer `work` has ready when a wait that ended early finds the deadline already passed: once
+/// `work` has run, it is polled one last time, so a write that finished in time is not abandoned
+/// for being looked at late. `work` never polled is not started past its deadline.
 async fn bounded<F: Future>(
     runtime: &impl StageRuntime,
     work: F,
@@ -864,11 +867,16 @@ async fn bounded<F: Future>(
     late: Late,
 ) -> Option<F::Output> {
     let mut work = pin!(work);
+    let mut started = false;
     loop {
         let now = runtime.now_millis();
         if now >= deadline {
-            return None;
+            return match late {
+                Late::Taken if started => work.as_mut().now_or_never(),
+                Late::Taken | Late::Refused => None,
+            };
         }
+        started = true;
         let output = match select(work.as_mut(), pin!(runtime.wait(deadline - now))).await {
             Either::Left((output, _)) => output,
             Either::Right(((), _)) => match work.as_mut().now_or_never() {
@@ -1672,5 +1680,76 @@ impl<'r> Stager<'r> {
         self.footprint.record = intent.record.clone();
         self.footprint.owned.push(intent.owned.clone());
         intent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A clock that reads `times` in order, then stays on the last; its timer always fires at
+    /// once, which [`StageRuntime::wait`] allows ("waking early is allowed").
+    struct Scripted {
+        times: Vec<u64>,
+        reads: Cell<usize>,
+    }
+
+    impl StageRuntime for Scripted {
+        fn now_millis(&self) -> u64 {
+            let i = self.reads.get();
+            self.reads.set(i + 1);
+            self.times[i.min(self.times.len() - 1)]
+        }
+
+        fn next_chunk_id(&mut self) -> ChunkId {
+            unreachable!("bounded takes no chunk ids")
+        }
+
+        fn wait(&self, _millis: u64) -> impl Future<Output = ()> + Send {
+            std::future::ready(())
+        }
+    }
+
+    /// Work that answers `7` on its `ready_on`-th poll and counts its polls.
+    fn work(polls: &Cell<u32>, ready_on: u32) -> impl Future<Output = u32> + '_ {
+        poll_fn(move |_| {
+            polls.set(polls.get() + 1);
+            if polls.get() >= ready_on {
+                Poll::Ready(7)
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+
+    /// The timer ends a wait early with the work pending; by the next look the clock has reached
+    /// the deadline and the work has its answer. A taken answer is kept, a refused one is not.
+    #[test]
+    fn an_answer_ready_when_an_early_wait_finds_the_deadline_passed_is_judged_by_late() {
+        for (late, expected) in [(Late::Taken, Some(7)), (Late::Refused, None)] {
+            let runtime = Scripted {
+                times: vec![99, 100],
+                reads: Cell::new(0),
+            };
+            let polls = Cell::new(0);
+            let output = bounded(&runtime, work(&polls, 3), 100, late)
+                .now_or_never()
+                .expect("nothing in bounded waits on this runtime");
+            assert_eq!(output, expected, "{late:?}");
+        }
+    }
+
+    /// Work whose deadline has passed before it ever ran is not started.
+    #[test]
+    fn work_never_polled_is_not_started_past_its_deadline() {
+        let runtime = Scripted {
+            times: vec![100],
+            reads: Cell::new(0),
+        };
+        let polls = Cell::new(0);
+        let output = bounded(&runtime, work(&polls, 1), 100, Late::Taken).now_or_never();
+        assert_eq!(output, Some(None));
+        assert_eq!(polls.get(), 0, "the work was never polled");
     }
 }
