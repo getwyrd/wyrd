@@ -18,8 +18,11 @@ name: mutants
 # below, so cargo-mutants never builds them.
 #
 # Two jobs, by trigger:
-#   * mutants-pr   — per-PR, `--in-diff`, single runner. Fast (<90s); only tests
-#     mutants overlapping the PR's changed lines.
+#   * mutants-pr   — per-PR, `--in-diff`, single runner, two mutants at a time
+#     (`--jobs 2`). Only tests mutants overlapping the PR's changed lines: a minute
+#     or two for a small PR, but each mutant rebuilds and runs the whole wyrd-core
+#     suite (~10s, ~35s if it hangs to the timeout), so a PR that adds a large file
+#     (~150 mutants) needs ~10 min even in parallel.
 #   * mutants-full — nightly / manual, full sweep over the correctness crates.
 #     SHARDED with `--shard i/N` across a job matrix so the run finishes well within
 #     budget as the workspace grows: cargo-mutants partitions its mutant list
@@ -58,7 +61,9 @@ jobs:
   mutants-pr:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A cancelled job shows as a failed check (`continue-on-error` only covers a
+    # failing step), so leave room for large PRs: ~150 mutants took ~20 min serially.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
@@ -92,7 +97,7 @@ jobs:
             --setenv=HOME="$HOME" --setenv=PATH="$PATH" \
             --setenv=CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             --setenv=RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            "$(command -v cargo)" mutants --in-diff pr.diff --no-shuffle \
+            "$(command -v cargo)" mutants --in-diff pr.diff --no-shuffle --jobs 2 \
             --package wyrd-chunk-format \
             --package wyrd-core \
             --package wyrd-traits \
