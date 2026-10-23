@@ -5212,11 +5212,14 @@ name = "wyrd-validate"
 version = "0.0.0"
 dependencies = [
  "aws-sdk-s3",
- "aws-smithy-http-client",
+ "aws-smithy-runtime-api",
  "bytes",
  "futures-util",
  "http-body 1.1.0",
+ "hyper 1.10.1",
+ "hyper-util",
  "roxmltree",
+ "sha2",
  "tempfile",
  "tokio",
  "wyrd-chunkstore-fs",

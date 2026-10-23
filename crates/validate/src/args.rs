@@ -1,4 +1,4 @@
-//! The ten-flag argument surface, parsed strictly.
+//! The argument surface, parsed strictly: ten required flags and three optional tuning flags.
 //!
 //! Hand-rolled in the shape of `wyrd`'s `ParsedArgs` (`crates/server/src/cli.rs:2533-2570`)
 //! so the two binaries read as one product — same `--flag value` pairs, same "needs a value"
@@ -7,15 +7,27 @@
 //! the bucket to `"--typo"`, and it accepts any flag name, known or not. Here every token is
 //! either resolved into [`Args`] or refused by name: an unknown flag, a flag-shaped token in a
 //! value slot, an empty value, a repeated flag, a stray positional, and a missing flag are all
-//! errors. None of them is ever absorbed or defaulted.
+//! errors. None of them is ever absorbed.
+//!
+//! Two kinds of flag, kept apart. The ten in [`FLAGS`] are **required** and never defaulted:
+//! a defaulted `--duration` or `--run-id` is a value the operator did not choose. The three in
+//! [`TUNING_FLAGS`] describe the deployment's tuning (proposal 0017 §4) and are **optional**:
+//! each absent one takes a default that mirrors today's server value, or is derived from the
+//! others ([`crate::sizes::Tuning::resolve`]). That is honest only because the resolved
+//! configuration echo prints every tuning value with where it came from — `(given)`,
+//! `(default)` or `(derived)` — so a default is recorded, never silent. A tuning value is a
+//! positive decimal integer: digits only (no sign, no unit), not zero, and within `u64`.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
-/// Every flag `wyrd-validate` accepts, in the order the resolved configuration echoes them.
-/// All ten are required: this slice has no defaults, because a defaulted `--duration` or
+use crate::sizes::TuningFlags;
+
+/// Every required flag `wyrd-validate` accepts, in the order the resolved configuration echoes
+/// them. All ten are required, with no defaults, because a defaulted `--duration` or
 /// `--run-id` is exactly the value an operator did not choose — and proposal 0017 judges a
-/// run against its `--duration` (§8) and scopes every delete to its `--run-id` (§5, §15).
+/// run against its `--duration` (§8) and scopes every delete to its `--run-id` (§5, §15). The
+/// optional tuning flags are [`TUNING_FLAGS`].
 pub const FLAGS: [&str; 10] = [
     "endpoint",
     "region",
@@ -29,12 +41,23 @@ pub const FLAGS: [&str; 10] = [
     "driver-placement",
 ];
 
-/// The parsed argument surface: one value per flag in [`FLAGS`], each exactly as given.
+/// The optional tuning flags, each a positive integer byte count, in the order the resolved
+/// configuration echoes them (after [`FLAGS`]). Absent, each is defaulted or derived and the
+/// echo says which (see the module docs).
+pub const TUNING_FLAGS: [&str; 3] = [
+    "chunk-size",
+    "max-root-value-bytes",
+    "segment-threshold-bytes",
+];
+
+/// The parsed argument surface: one value per flag in [`FLAGS`], each exactly as given, and
+/// the tuning flags in [`TUNING_FLAGS`] that were given.
 ///
 /// Values are kept as the operator typed them, and none is empty. Typing them (a duration
 /// grammar, a worker count, the scenario and placement vocabularies of proposal 0017 §8/§10)
 /// belongs to the slices that consume them; this slice's contract is that none is dropped or
-/// invented.
+/// invented. The tuning flags are the exception: they are typed here, as byte counts, because
+/// the size classes are computed from them ([`crate::sizes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
     pub endpoint: String,
@@ -47,6 +70,8 @@ pub struct Args {
     pub out: String,
     pub run_id: String,
     pub driver_placement: String,
+    /// The tuning flags as given; an absent one is `None`, resolved later.
+    pub tuning: TuningFlags,
 }
 
 impl Args {
@@ -73,7 +98,7 @@ pub enum ArgError {
     /// A token that is not `--`-prefixed where a flag was expected. `wyrd-validate` takes no
     /// positional arguments.
     Unexpected(String),
-    /// A `--`-prefixed token that is not one of [`FLAGS`].
+    /// A `--`-prefixed token that is not one of [`FLAGS`] or [`TUNING_FLAGS`].
     UnknownFlag(String),
     /// A flag was the last token, with nothing after it.
     NeedsValue(&'static str),
@@ -87,6 +112,13 @@ pub enum ArgError {
     Repeated(&'static str),
     /// Required flags that were never given, in [`FLAGS`] order.
     Missing(Vec<&'static str>),
+    /// A tuning flag whose value is not a decimal integer: anything but ASCII digits,
+    /// including a sign, a unit suffix or whitespace.
+    NotAnInteger { flag: &'static str, value: String },
+    /// A tuning flag given 0. No deployment has a zero chunk size, budget or threshold.
+    Zero(&'static str),
+    /// A tuning flag whose value does not fit in 64 bits.
+    TooLarge { flag: &'static str, value: String },
 }
 
 impl fmt::Display for ArgError {
@@ -112,6 +144,14 @@ impl fmt::Display for ArgError {
                 let names: Vec<String> = flags.iter().map(|flag| format!("`--{flag}`")).collect();
                 write!(f, "missing required flag(s): {}", names.join(", "))
             }
+            Self::NotAnInteger { flag, value } => write!(
+                f,
+                "flag `--{flag}` needs a positive integer byte count, not `{value}`"
+            ),
+            Self::Zero(flag) => write!(f, "flag `--{flag}` must be a positive integer, not 0"),
+            Self::TooLarge { flag, value } => {
+                write!(f, "flag `--{flag}` value `{value}` does not fit in 64 bits")
+            }
         }
     }
 }
@@ -121,6 +161,7 @@ impl std::error::Error for ArgError {}
 /// Parse the arguments after the program name. Strict: see the module docs.
 pub fn parse(args: &[String]) -> Result<Args, ArgError> {
     let mut given: BTreeMap<&'static str, String> = BTreeMap::new();
+    let mut byte_counts: BTreeMap<&'static str, u64> = BTreeMap::new();
     let mut i = 0;
     while i < args.len() {
         let token = &args[i];
@@ -129,6 +170,7 @@ pub fn parse(args: &[String]) -> Result<Args, ArgError> {
             .ok_or_else(|| ArgError::Unexpected(token.clone()))?;
         let flag = FLAGS
             .iter()
+            .chain(TUNING_FLAGS.iter())
             .copied()
             .find(|known| *known == name)
             .ok_or_else(|| ArgError::UnknownFlag(token.clone()))?;
@@ -142,11 +184,26 @@ pub fn parse(args: &[String]) -> Result<Args, ArgError> {
         if value.is_empty() {
             return Err(ArgError::EmptyValue(flag));
         }
+        let count = if TUNING_FLAGS.contains(&flag) {
+            Some(byte_count(flag, value)?)
+        } else {
+            None
+        };
         if given.insert(flag, value.clone()).is_some() {
             return Err(ArgError::Repeated(flag));
         }
+        if let Some(count) = count {
+            byte_counts.insert(flag, count);
+        }
         i += 2;
     }
+
+    // Each tuning value was parsed as it was read; an absent one stays `None`.
+    let tuning = TuningFlags {
+        chunk_size: byte_counts.get("chunk-size").copied(),
+        max_root_value_bytes: byte_counts.get("max-root-value-bytes").copied(),
+        segment_threshold_bytes: byte_counts.get("segment-threshold-bytes").copied(),
+    };
 
     // A flag that was never given is recorded as missing, and the placeholder it leaves in
     // the struct is discarded with the whole `Args` below — it can never reach a caller.
@@ -168,6 +225,7 @@ pub fn parse(args: &[String]) -> Result<Args, ArgError> {
         out: take("out"),
         run_id: take("run-id"),
         driver_placement: take("driver-placement"),
+        tuning,
     };
     if !missing.is_empty() {
         return Err(ArgError::Missing(missing));
@@ -175,11 +233,40 @@ pub fn parse(args: &[String]) -> Result<Args, ArgError> {
     Ok(parsed)
 }
 
-/// The one-line usage summary appended to every argument error.
+/// A tuning flag's value as a byte count: ASCII digits only (so no `+`, which
+/// `u64::from_str` would accept), not zero, within `u64`.
+fn byte_count(flag: &'static str, value: &str) -> Result<u64, ArgError> {
+    if !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ArgError::NotAnInteger {
+            flag,
+            value: value.to_string(),
+        });
+    }
+    // Digits only and non-empty, so the one way left to fail is overflow.
+    match value.parse::<u64>() {
+        Ok(0) => Err(ArgError::Zero(flag)),
+        Ok(count) => Ok(count),
+        Err(_) => Err(ArgError::TooLarge {
+            flag,
+            value: value.to_string(),
+        }),
+    }
+}
+
+/// The usage summary appended to every argument error: the required flags on one line, then
+/// the optional tuning flags on the next.
 pub fn usage() -> String {
     let flags: Vec<String> = FLAGS
         .iter()
         .map(|flag| format!("--{flag} <{}>", flag.to_uppercase().replace('-', "_")))
         .collect();
-    format!("usage: wyrd-validate {}", flags.join(" "))
+    let tuning: Vec<String> = TUNING_FLAGS
+        .iter()
+        .map(|flag| format!("[--{flag} <BYTES>]"))
+        .collect();
+    format!(
+        "usage: wyrd-validate {}\n       optional tuning: {}",
+        flags.join(" "),
+        tuning.join(" ")
+    )
 }
