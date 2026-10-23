@@ -85,6 +85,34 @@ pub fn parse_orphan_key(key: &[u8]) -> Option<(DServerId, FragmentId)> {
     Some((dserver, FragmentId { chunk, index }))
 }
 
+/// Key prefix for the **desired-state** ledger: one record per D server an operator has asked
+/// to drain or decommission (proposal 0005 §"Declarative management hook"). The custodian
+/// writes and reads it (`crates/custodian/src/desired_state.rs`); the multipart staging writer
+/// reads it too, because every batch that installs an owned `sidx:` entry carries
+/// `require_absent` on the key of each server in the placement it records (the drain fence,
+/// proposal 0016 `0016:353`, `:659`).
+///
+/// Defined here, beside [`orphan_key`], for the reason that key is: two crates must spell one
+/// key, and core cannot depend on the custodian (ADR-0010). A fence that `require_absent`s a
+/// key the drain writer spells differently fences nothing.
+pub const DESIRED_DSERVER_PREFIX: &[u8] = b"desired:dserver:";
+
+/// Key for one D server's desired-state record: `desired:dserver:<id>`. The bytes are the ones
+/// the custodian has always written, so records already in a store keep their meaning.
+pub fn desired_dserver_key(dserver: DServerId) -> Vec<u8> {
+    format!("desired:dserver:{dserver}").into_bytes()
+}
+
+/// Parse a [`desired_dserver_key`] back into its D-server id, or `None` if `key` is not one.
+/// The inverse the custodian's drain listing and the staging writer's drain read share.
+pub fn parse_desired_dserver_key(key: &[u8]) -> Option<DServerId> {
+    std::str::from_utf8(key)
+        .ok()?
+        .strip_prefix("desired:dserver:")?
+        .parse()
+        .ok()
+}
+
 /// The longest unreference-event identity an [`OrphanMark`] may carry, in bytes.
 ///
 /// Every identity proposal 0016 enumerates is short ASCII (`0016:1174-1187`): a `retire:`

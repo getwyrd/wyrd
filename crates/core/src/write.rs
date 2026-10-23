@@ -134,8 +134,10 @@ pub fn encode_ec_fragment(chunk: ChunkId, index: u16, k: u8, m: u8, shard: &[u8]
     Bytes::from(encode(&header, shard))
 }
 
-/// Encode one chunk's `piece` into its fragments under `scheme`.
-fn encode_chunk(
+/// Encode one chunk's `piece` into its fragments under `scheme`. Crate-visible so multipart
+/// staging (`multipart::stage`) encodes a part's chunks exactly as this path encodes an
+/// object's.
+pub(crate) fn encode_chunk(
     scheme: EcScheme,
     id: ChunkId,
     piece: &[u8],

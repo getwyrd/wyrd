@@ -1,0 +1,4216 @@
+//! Issue #932 (the first of #926's two slices of #657) — `UploadPart`'s **staging half**,
+//! `wyrd_core::multipart::stage::{stage_part, reserve_slot}`, driven over a real store
+//! (`RedbMetadataStore::in_memory()`), a placement-aware chunk-store fake (the shape of `Fleet`
+//! in `domain_placement.rs`) that enforces the write deadline as the trait requires, a store
+//! wrapper that logs every batch and can act on any of them, and a runtime whose clock and timer
+//! the test moves by hand (proposal 0016 decision 5, `0016:1676-1847`; the *Part slot reserve*
+//! and *Part intent* rows, `0016:658-659`). Every session here is made by Create (#894).
+//!
+//! * **(A)** staging, and the order that makes it safe; the hand-off's chunk references.
+//! * **(A′)** the write deadline: exact, enforced at the fake's publication point, waited for no
+//!   longer than itself; an unverified or abandoned write never counted either way, and classed
+//!   `Indeterminate` however the timing fell or whichever write answered first; an `Ok` counted
+//!   even when it is first seen as the deadline's timer fires.
+//! * **(A″)** the body-idle bound: per read, on the test's clock and timer; empty pieces are not
+//!   progress, and a piece or end seen past the bound is late.
+//! * **(B)** the drain fence: a drain recorded just before an intent commits re-plans (B1); a
+//!   drain recorded before staging is planned around (B2); four of twelve domains draining (B3).
+//! * **(C)** slots: the cap, `stage_part`'s answer to a full range, a session leaving `Open`
+//!   under the reserve, an adopted ambiguous reserve, the same-index rule, a held reserve that
+//!   lands after its attempt refused, one that lands just before the session moves, and a store
+//!   read or commit that fails while a reserve is in doubt.
+//! * **(D)** leases: written forward, checked by every intent round at its own reading, never
+//!   revived.
+//! * **(E)** unknown intent outcomes, settled by a re-read, including a held intent that lands
+//!   between two of the reads, and a store read or commit that fails while an intent is in doubt;
+//!   **(E′)** the intent's own session fence against a real Abort.
+//! * **(F)** every loop ends after exactly its stated number of commits.
+//! * **(G)** the per-part chunk bound. **(H)** a request that cannot be honoured, refused alike
+//!   by `stage_part` and `reserve_slot`.
+//!
+//! The wrappers keep their state in struct fields, never in a `static` (ADR-0035). 657.1b
+//! (#933) appends its renewal legs here and reuses this harness.
+
+#![forbid(unsafe_code)]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::future::Future;
+use std::io::Write as _;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::stream::{self, Stream};
+use sha2::{Digest as _, Sha256};
+use tokio::sync::Semaphore;
+use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, SegmentNonce};
+use wyrd_core::multipart::abort::abort_session;
+use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
+use wyrd_core::multipart::stage::{
+    reserve_slot, stage_part, InDoubt, StageError, StageOutcome, StageRequest, StageRuntime,
+    StagedAttempt, Stop, INTENT_ROUNDS, RESERVE_AMBIGUOUS_ROUNDS,
+};
+use wyrd_core::multipart::{
+    decode_owned_entry, decode_session_record, decode_slot_record, mpu_key, parse_sidx_key,
+    parse_slot_key, sidx_key, sidx_range, slot_key, slot_range, AbortOutcome, AttemptId,
+    Backpressure, Budget, CreateOutcome, Digest, OwnedEntry, PartNumber, Refusal, ReserveOutcome,
+    SessionState, SlotIndex, SlotRecord, UploadId, MAX_INFLIGHT_PARTS, MAX_SLOT_INDEX, PART_PREFIX,
+    PSUM_PREFIX, SIDX_PREFIX, SLOT_PREFIX,
+};
+use wyrd_core::placement::{select_distinct_domains, SelectorError, Topology};
+use wyrd_core::read::read_chunk_verified;
+use wyrd_metadata_redb::RedbMetadataStore;
+use wyrd_testkit::{Clock, ManualClock};
+use wyrd_traits::{
+    classify, write_deadline_outcome, BoxError, ChunkId, ChunkStore, CommitOutcome,
+    CommitUnknownResult, DServerId, ErrorClass, FragmentId, Health, MetadataStore,
+    PlacementChunkStore, Result as StoreResult, ScanPage, TransientFault, WriteBatch,
+    WriteDeadlineExpired, WriteEffect,
+};
+
+// ─────────────────────────────── fixtures ───────────────────────────────
+
+const BUCKET: &str = "photos";
+/// The root inode every Alpha object dirent lives under, as `<bucket>/<key>` (ADR-0046).
+const ROOT: InodeId = 0;
+const MARKER: &[u8] = br#"{"name":"photos","created_at_millis":1}"#;
+/// No leg may hang the suite: a leg runs in milliseconds, so one still running after this has
+/// hung (the repo's 30 s watchdog, `chunkstore-grpc/tests/write_deadline.rs`).
+const LEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long past [`LEG_TIMEOUT`] the watchdog thread waits for a leg that never yields, which no
+/// async timeout can interrupt, before it ends the test process.
+const WATCHDOG_GRACE: Duration = Duration::from_secs(5);
+/// How long a driver waits for the staging future to reach a point it is waiting for.
+const WAIT_FOR: Duration = Duration::from_secs(10);
+/// More commits than any staging may make. A loop past it never stops committing.
+const RUNAWAY_COMMITS: usize = 400;
+/// The test clock's first reading.
+const T0: u64 = 1_000_000;
+/// The lease TTL every request here asks for.
+const TTL: u64 = 10_000;
+/// `W_write`.
+const W: u64 = 3_000;
+/// The body-idle bound every request here asks for: far longer than any leg moves the clock
+/// while a read is pending, except the legs that test it.
+const IDLE: u64 = 100 * TTL;
+/// The body-idle bound the (A″) legs ask for: inside the lease, so a leg that runs the clock to
+/// the bound stops on the bound, never on a lapsed lease.
+const BOUND: u64 = 5_000;
+const _: () = assert!(BOUND < TTL);
+/// Bytes per chunk.
+const CHUNK: usize = 64;
+/// Six fragments per chunk.
+const RS42: EcScheme = EcScheme::ReedSolomon { k: 4, m: 2 };
+const FRAGMENTS: u16 = 6;
+/// Twelve D servers, each its own failure domain.
+const SERVERS: u64 = 12;
+const PART: u32 = 7;
+
+/// Run `leg` under [`LEG_TIMEOUT`]. A leg stuck in a loop that never yields cannot be timed out
+/// from its own task, so a watchdog thread ends the whole test process (exit 101) if the leg has
+/// neither finished nor panicked [`WATCHDOG_GRACE`] after the timeout.
+async fn within<T>(leg: impl Future<Output = T>) -> T {
+    let (disarm, armed) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // A finished or panicking leg drops `disarm`, which ends the wait early.
+        if armed.recv_timeout(LEG_TIMEOUT + WATCHDOG_GRACE) == Err(RecvTimeoutError::Timeout) {
+            // Straight to stderr: the test harness captures `eprintln!` from this thread, and
+            // the process ends before that capture is printed.
+            let _ = writeln!(
+                std::io::stderr(),
+                "a leg ran past {LEG_TIMEOUT:?} without yielding; ending the test process"
+            );
+            std::process::exit(101);
+        }
+    });
+    let output = tokio::time::timeout(LEG_TIMEOUT, leg)
+        .await
+        .expect("the leg settled in time");
+    drop(disarm);
+    output
+}
+
+/// Wait until `ready` holds, letting the staging future run in between; panics after
+/// [`WAIT_FOR`]. A schedule whose point never comes fails here, not at the leg timeout.
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let start = tokio::time::Instant::now();
+    while !ready() {
+        assert!(start.elapsed() < WAIT_FOR, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// A profile admitting 8 sessions. Create stores it; staging never reads it.
+fn profile() -> Budget {
+    let json = r#"{"w_ref":16,"max_part_chunks":1,"max_parts_per_session":1,"max_inflight_parts":1,"max_staged_chunks":1}"#;
+    metadata::decode(json.as_bytes()).expect("a legal profile")
+}
+
+fn identity(n: u128) -> (UploadId, SegmentNonce) {
+    (
+        UploadId::new(format!("{n:032x}")).unwrap(),
+        SegmentNonce::new(format!("{:032x}", n ^ 0x5a5a_5a5a)).unwrap(),
+    )
+}
+
+fn attempt(n: u128) -> AttemptId {
+    AttemptId::new(format!("{:032x}", 0xa77e_0000_u128 + n)).unwrap()
+}
+
+fn part() -> PartNumber {
+    PartNumber::new(PART).unwrap()
+}
+
+/// The runtime Create needs: one fixed identity, no jitter, no wait.
+struct Fixed(Option<(UploadId, SegmentNonce)>);
+
+impl CreateRuntime for Fixed {
+    fn mint(&mut self) -> (UploadId, SegmentNonce) {
+        self.0.take().expect("one identity per create")
+    }
+
+    fn jitter(&mut self) -> u64 {
+        0
+    }
+
+    fn wait(&mut self, _millis: u64) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
+/// Twelve servers `0..12` in domains `d00..d11`, equally loaded: the selector takes domains in
+/// label order, so an RS(4,2) chunk lands on servers `0..6`.
+fn topology() -> Topology {
+    let mut topology = Topology::default();
+    for id in 0..SERVERS {
+        topology.register(id, format!("d{id:02}"));
+    }
+    topology
+}
+
+/// [`topology`], with every server loaded but `preferred`: the selector's first pick.
+fn topology_preferring(preferred: DServerId) -> Topology {
+    let mut topology = topology();
+    for id in 0..SERVERS {
+        topology.set_utilization(id, if id == preferred { 0 } else { 10 });
+    }
+    topology
+}
+
+/// The request every leg starts from.
+fn request<'a>(
+    topology: &'a Topology,
+    upload: &'a UploadId,
+    attempt: &'a AttemptId,
+) -> StageRequest<'a> {
+    StageRequest {
+        upload_id: upload,
+        part_number: part(),
+        attempt_id: attempt,
+        max_inflight_parts: MAX_INFLIGHT_PARTS,
+        lease_ttl_millis: TTL,
+        chunk_size: CHUNK,
+        scheme: RS42,
+        topology,
+        write_window_millis: W,
+        max_part_chunks: 1_000,
+        body_idle_millis: IDLE,
+    }
+}
+
+/// `len` deterministic body bytes.
+fn body_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 31 + 7) as u8).collect()
+}
+
+/// `body` cut into pieces of `sizes`, which must cover it exactly.
+fn pieces(body: &[u8], sizes: &[usize]) -> Vec<Bytes> {
+    assert_eq!(
+        sizes.iter().sum::<usize>(),
+        body.len(),
+        "the pieces cover the body"
+    );
+    let mut at = 0;
+    sizes
+        .iter()
+        .map(|size| {
+            let piece = Bytes::copy_from_slice(&body[at..at + size]);
+            at += size;
+            piece
+        })
+        .collect()
+}
+
+fn sha256(bytes: &[u8]) -> Digest {
+    Digest::from_bytes(Sha256::digest(bytes).into())
+}
+
+type Body = Pin<Box<dyn Stream<Item = StoreResult<Bytes>> + Send>>;
+
+fn stream_of(pieces: Vec<Bytes>) -> Body {
+    Box::pin(stream::iter(pieces.into_iter().map(Ok)))
+}
+
+/// A body the test feeds piece by piece, each logged as read ([`Event::Read`]) the moment the
+/// body yields it. It ends when the sender is dropped.
+fn channel(log: &Log) -> (tokio::sync::mpsc::UnboundedSender<Bytes>, Body) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let log = log.clone();
+    let body = stream::unfold((rx, 0usize), move |(mut rx, index)| {
+        let log = log.clone();
+        async move {
+            let piece = rx.recv().await?;
+            log.push(Event::Read { index });
+            Some((Ok(piece), (rx, index + 1)))
+        }
+    });
+    (tx, Box::pin(body))
+}
+
+/// Run `staging`, then set `ended`: a driver can tell that staging returned while something it
+/// sent is still held.
+async fn flagging<T>(ended: Arc<AtomicBool>, staging: impl Future<Output = T>) -> T {
+    let output = staging.await;
+    ended.store(true, Ordering::SeqCst);
+    output
+}
+
+fn unknown(may_still_commit: bool) -> BoxError {
+    Box::new(CommitUnknownResult {
+        backend: "scripted",
+        code: None,
+        detail: "scripted unknown outcome".into(),
+        may_still_commit,
+    })
+}
+
+/// The fault a scripted read answers with: a transient one, as a network blip would be, so a
+/// leg can show the class of an in-doubt error is still the commit's, not the read's.
+fn read_fault(key: &[u8]) -> BoxError {
+    Box::new(TransientFault::new(format!(
+        "scripted read fault on {}",
+        String::from_utf8_lossy(key)
+    )))
+}
+
+// ─────────────────────────────── the log ───────────────────────────────
+
+/// Which batch of staging a commit is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    /// `require_absent(slot:..)`.
+    Reserve,
+    /// `require_absent(sidx:..)`.
+    Intent,
+    Other,
+}
+
+fn kind_of(batch: &WriteBatch) -> Kind {
+    let absent = |prefix: &[u8]| {
+        batch
+            .preconditions
+            .iter()
+            .any(|p| p.expected.is_none() && p.key.starts_with(prefix))
+    };
+    if absent(SIDX_PREFIX) {
+        Kind::Intent
+    } else if absent(SLOT_PREFIX) {
+        Kind::Reserve
+    } else {
+        Kind::Other
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answer {
+    Committed,
+    Conflict,
+    Unknown { may_still_commit: bool },
+    Failed,
+}
+
+fn answer_of(result: &StoreResult<CommitOutcome>) -> Answer {
+    match result {
+        Ok(CommitOutcome::Committed) => Answer::Committed,
+        Ok(CommitOutcome::Conflict) => Answer::Conflict,
+        Err(fault) => match fault.downcast_ref::<CommitUnknownResult>() {
+            Some(unknown) => Answer::Unknown {
+                may_still_commit: unknown.may_still_commit,
+            },
+            None => Answer::Failed,
+        },
+    }
+}
+
+/// Where the chunk-store fake holds a put until the test releases it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldAt {
+    /// On arrival, before the publication-point check: the put has not begun publishing.
+    Arrival,
+    /// Inside the publishing step: past the check, before the bytes are stored.
+    Publishing,
+    /// After the store answered, before the answer reaches the caller: a reply in transit.
+    Answer,
+}
+
+#[derive(Debug, Clone)]
+enum Event {
+    /// A batch through the wrapper: what it was, the clock when it arrived, and the answer.
+    Commit {
+        kind: Kind,
+        batch: WriteBatch,
+        clock: u64,
+        answer: Answer,
+    },
+    /// A channel body yielded its `index`-th piece (0-based).
+    Read { index: usize },
+    /// A fragment put the chunk store was asked for, logged on arrival, before any hold.
+    Put {
+        dserver: DServerId,
+        id: FragmentId,
+        deadline: Option<u64>,
+        clock: u64,
+    },
+    /// A put reached the hold point the test set for it, and waits there.
+    Held { id: FragmentId, at: HoldAt },
+    /// The fake refused a put at its publication point: the deadline had passed.
+    Refused { id: FragmentId },
+    /// The fake stored a fragment: it is readable from now on.
+    Stored { id: FragmentId },
+    /// The fake stored a fragment but its clock had reached the deadline once the publishing
+    /// step returned: it answered `WriteEffect::Unknown`.
+    Unverified { id: FragmentId },
+    /// The fake answered a put `Ok`: published strictly before its deadline.
+    Acked { id: FragmentId },
+    /// The fake answered a put with the fault scripted for it ([`Fleet::fail`]), storing nothing.
+    Faulted { id: FragmentId },
+    /// The wrapper answered a read of `key` (a `get`'s key, or a `scan`'s prefix) with a fault.
+    ReadFault { key: Vec<u8> },
+}
+
+/// One ordered log shared by the store wrapper, the chunk-store fake and the bodies.
+#[derive(Debug, Clone, Default)]
+struct Log(Arc<Mutex<Vec<Event>>>);
+
+struct Commit {
+    batch: WriteBatch,
+    clock: u64,
+    answer: Answer,
+}
+
+struct Put {
+    dserver: DServerId,
+    id: FragmentId,
+    deadline: Option<u64>,
+    clock: u64,
+}
+
+impl Log {
+    fn push(&self, event: Event) {
+        self.0.lock().unwrap().push(event);
+    }
+
+    fn events(&self) -> Vec<Event> {
+        self.0.lock().unwrap().clone()
+    }
+
+    fn has(&self, wanted: impl Fn(&Event) -> bool) -> bool {
+        self.events().iter().any(wanted)
+    }
+
+    fn commits(&self, of: Kind) -> Vec<Commit> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Commit {
+                    kind,
+                    batch,
+                    clock,
+                    answer,
+                } if kind == of => Some(Commit {
+                    batch,
+                    clock,
+                    answer,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn puts(&self) -> Vec<Put> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Put {
+                    dserver,
+                    id,
+                    deadline,
+                    clock,
+                } => Some(Put {
+                    dserver,
+                    id,
+                    deadline,
+                    clock,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn put_count(&self, id: FragmentId) -> usize {
+        self.puts().iter().filter(|put| put.id == id).count()
+    }
+
+    /// Whether some body has yielded its `index`-th piece.
+    fn read(&self, index: usize) -> bool {
+        self.has(|e| matches!(e, Event::Read { index: i } if *i == index))
+    }
+
+    /// The intent commits for `chunk`.
+    fn intents_of(&self, chunk: ChunkId) -> Vec<Commit> {
+        self.commits(Kind::Intent)
+            .into_iter()
+            .filter(|commit| intent_chunk(&commit.batch) == chunk)
+            .collect()
+    }
+}
+
+/// The owned entry an intent batch puts: its key and value.
+fn intent_put(batch: &WriteBatch) -> (Vec<u8>, Bytes) {
+    batch
+        .puts
+        .iter()
+        .find(|(key, _)| key.starts_with(SIDX_PREFIX))
+        .cloned()
+        .expect("an intent puts its owned entry")
+}
+
+fn intent_chunk(batch: &WriteBatch) -> ChunkId {
+    parse_sidx_key(&intent_put(batch).0).unwrap().2
+}
+
+fn intent_entry(batch: &WriteBatch) -> OwnedEntry {
+    let (key, value) = intent_put(batch);
+    decode_owned_entry(&key, &value).unwrap().2
+}
+
+/// The slot value a batch requires.
+fn slot_required(batch: &WriteBatch) -> Bytes {
+    batch
+        .preconditions
+        .iter()
+        .find(|p| p.key.starts_with(SLOT_PREFIX))
+        .and_then(|p| p.expected.clone())
+        .expect("the batch requires its slot's bytes")
+}
+
+/// Every value a batch puts under `slot:` or `sidx:` is one its decoder accepts back unchanged.
+fn assert_values_decode(batch: &WriteBatch) {
+    for (key, value) in &batch.puts {
+        if key.starts_with(SLOT_PREFIX) {
+            let record =
+                decode_slot_record(value).expect("every slot value staging writes decodes");
+            assert_eq!(
+                metadata::encode(&record),
+                *value,
+                "a slot value re-encodes byte for byte"
+            );
+        } else if key.starts_with(SIDX_PREFIX) {
+            decode_owned_entry(key, value).expect("every owned entry decodes against its key");
+        }
+    }
+}
+
+// ──────────────────────── the scripted store wrapper ────────────────────────
+
+/// A batch to commit on the inner store, built from the batch under test.
+type Hook = Arc<dyn Fn(&WriteBatch) -> WriteBatch + Send + Sync>;
+
+/// Something the wrapper does on the inner store beside a commit under test.
+#[derive(Clone)]
+enum Side {
+    /// Commit `hook(batch)`, which must land.
+    Batch(Hook),
+    /// Run a real Abort (#895) of the session, which must fence it.
+    Abort(UploadId),
+}
+
+/// What the wrapper does with one commit of a [`Kind`].
+#[derive(Clone)]
+enum Act {
+    /// Delegate unchanged.
+    Pass,
+    /// Answer `Conflict` without applying anything, as TiKV does when a locking read meets
+    /// another writer's lock.
+    Conflict,
+    /// As `Conflict`, and advance the clock by the given milliseconds before answering: a round
+    /// lost slowly.
+    ConflictThenAdvance(u64),
+    /// Apply the batch or not, then answer `CommitUnknownResult { may_still_commit }`.
+    Unknown {
+        applied: bool,
+        may_still_commit: bool,
+    },
+    /// Keep the batch unapplied, advance the clock by `advance`, and answer
+    /// `CommitUnknownResult { may_still_commit: true }`. It lands when the test releases it.
+    Hold { advance: u64 },
+    /// As `Hold { advance: 0 }`, after doing `side` on the inner store.
+    HoldThen(Side),
+    /// Do `side` on the inner store first, then delegate.
+    First(Side),
+    /// Delegate, then advance the clock: a dispatch delayed after the commit returned.
+    PassThenAdvance(u64),
+    /// Apply the oldest held batch, then delegate.
+    ReleaseHeldFirst,
+    /// Answer a plain store fault without applying anything: a definite failure of this batch,
+    /// not an unknown outcome.
+    Fail,
+}
+
+/// What the wrapper does right after a read returns, before handing its answer back: the
+/// interleaving "between this read and the next one".
+#[derive(Clone)]
+enum Then {
+    /// Advance the clock.
+    Advance(u64),
+    /// Apply the oldest held batch, which must land.
+    ReleaseHeld,
+    /// Commit this batch on the inner store, which must land.
+    Commit(WriteBatch),
+    /// Run a real Abort of the session, which must fence it.
+    Abort(UploadId),
+    /// Answer this read with a store fault instead of what it found ([`read_fault`]), after
+    /// any action listed before it.
+    Fault,
+}
+
+/// Fire `then` after the read of `key` (a `get`'s key, or a `scan`'s prefix) that follows `skip`
+/// earlier reads of it. Hooks on one key fire in the order they were added, each counting its
+/// `skip` from the read after the previous one fired.
+struct ReadHook {
+    key: Vec<u8>,
+    skip: usize,
+    then: Vec<Then>,
+}
+
+#[derive(Default)]
+struct ScriptState {
+    plans: HashMap<Kind, (VecDeque<Act>, Option<Act>)>,
+    held: VecDeque<WriteBatch>,
+    made: usize,
+    reads: Vec<ReadHook>,
+}
+
+struct Scripted {
+    inner: RedbMetadataStore,
+    clock: ManualClock,
+    log: Log,
+    state: Mutex<ScriptState>,
+}
+
+async fn fence(inner: &RedbMetadataStore, upload: &UploadId) {
+    let fenced = abort_session(inner, upload).await.expect("the abort ran");
+    assert_eq!(fenced, AbortOutcome::Fenced, "the abort fenced the session");
+}
+
+impl Scripted {
+    /// `kind`'s commits follow `plan`, then `then` (`Pass` when unset).
+    fn script(&self, kind: Kind, plan: Vec<Act>, then: Option<Act>) {
+        self.state
+            .lock()
+            .unwrap()
+            .plans
+            .insert(kind, (plan.into(), then));
+    }
+
+    /// Apply the oldest held batch now; what it met.
+    async fn release_held(&self) -> CommitOutcome {
+        let held = self
+            .state
+            .lock()
+            .unwrap()
+            .held
+            .pop_front()
+            .expect("a batch is held");
+        self.inner.commit(held).await.unwrap()
+    }
+
+    fn hold(&self, batch: WriteBatch) {
+        self.state.lock().unwrap().held.push_back(batch);
+    }
+
+    async fn side(&self, side: &Side, batch: &WriteBatch) {
+        match side {
+            Side::Batch(hook) => {
+                assert_eq!(
+                    self.inner.commit(hook(batch)).await.unwrap(),
+                    CommitOutcome::Committed
+                );
+            }
+            Side::Abort(upload) => fence(&self.inner, upload).await,
+        }
+    }
+
+    /// After the read of `key` that follows `skip` earlier ones, do `then`.
+    fn after_read(&self, key: &[u8], skip: usize, then: Vec<Then>) {
+        self.state.lock().unwrap().reads.push(ReadHook {
+            key: key.to_vec(),
+            skip,
+            then,
+        });
+    }
+
+    /// A read of `key` has returned: fire the hook it is due for, if any. Whether the read is
+    /// to answer a fault instead of what it found.
+    async fn on_read(&self, key: &[u8]) -> bool {
+        let due = {
+            let mut state = self.state.lock().unwrap();
+            match state.reads.iter().position(|hook| hook.key == key) {
+                Some(at) if state.reads[at].skip > 0 => {
+                    state.reads[at].skip -= 1;
+                    Vec::new()
+                }
+                Some(at) => state.reads.remove(at).then,
+                None => Vec::new(),
+            }
+        };
+        let mut fault = false;
+        for then in due {
+            match then {
+                Then::Fault => {
+                    self.log.push(Event::ReadFault { key: key.to_vec() });
+                    fault = true;
+                }
+                Then::Advance(millis) => self.clock.advance(millis),
+                Then::ReleaseHeld => {
+                    assert_eq!(self.release_held().await, CommitOutcome::Committed);
+                }
+                Then::Commit(batch) => {
+                    assert_eq!(
+                        self.inner.commit(batch).await.unwrap(),
+                        CommitOutcome::Committed
+                    );
+                }
+                Then::Abort(upload) => fence(&self.inner, &upload).await,
+            }
+        }
+        fault
+    }
+}
+
+#[async_trait]
+impl MetadataStore for Scripted {
+    async fn get(&self, key: &[u8]) -> StoreResult<Option<Bytes>> {
+        let found = self.inner.get(key).await;
+        if self.on_read(key).await {
+            return Err(read_fault(key));
+        }
+        found
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> StoreResult<Vec<(Vec<u8>, Bytes)>> {
+        let found = self.inner.scan(prefix).await;
+        if self.on_read(prefix).await {
+            return Err(read_fault(prefix));
+        }
+        found
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> StoreResult<ScanPage> {
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> StoreResult<CommitOutcome> {
+        let kind = kind_of(&batch);
+        assert_values_decode(&batch);
+        let clock = self.clock.now_millis();
+        let act = {
+            let mut state = self.state.lock().unwrap();
+            state.made += 1;
+            assert!(
+                state.made <= RUNAWAY_COMMITS,
+                "staging never stopped committing ({} commits)",
+                state.made
+            );
+            match state.plans.get_mut(&kind) {
+                Some((plan, then)) => plan.pop_front().or_else(|| then.clone()),
+                None => None,
+            }
+            .unwrap_or(Act::Pass)
+        };
+        let result = match act {
+            Act::Pass => self.inner.commit(batch.clone()).await,
+            Act::Conflict => {
+                // A real store yields here; so must this one, or no timeout could fire.
+                tokio::task::yield_now().await;
+                Ok(CommitOutcome::Conflict)
+            }
+            Act::ConflictThenAdvance(advance) => {
+                tokio::task::yield_now().await;
+                self.clock.advance(advance);
+                Ok(CommitOutcome::Conflict)
+            }
+            Act::Unknown {
+                applied,
+                may_still_commit,
+            } => {
+                if applied {
+                    let landed = self.inner.commit(batch.clone()).await?;
+                    assert_eq!(landed, CommitOutcome::Committed, "the scripted batch lands");
+                }
+                Err(unknown(may_still_commit))
+            }
+            Act::Hold { advance } => {
+                self.hold(batch.clone());
+                self.clock.advance(advance);
+                Err(unknown(true))
+            }
+            Act::HoldThen(side) => {
+                self.hold(batch.clone());
+                self.side(&side, &batch).await;
+                Err(unknown(true))
+            }
+            Act::First(side) => {
+                self.side(&side, &batch).await;
+                self.inner.commit(batch.clone()).await
+            }
+            Act::PassThenAdvance(advance) => {
+                let result = self.inner.commit(batch.clone()).await;
+                self.clock.advance(advance);
+                result
+            }
+            Act::ReleaseHeldFirst => {
+                assert_eq!(self.release_held().await, CommitOutcome::Committed);
+                self.inner.commit(batch.clone()).await
+            }
+            Act::Fail => {
+                tokio::task::yield_now().await;
+                Err("scripted commit fault: the batch was not applied".into())
+            }
+        };
+        self.log.push(Event::Commit {
+            kind,
+            batch,
+            clock,
+            answer: answer_of(&result),
+        });
+        result
+    }
+}
+
+// ──────────────────────── the chunk-store fake ────────────────────────
+
+/// In-process D servers addressed by stable id (`domain_placement.rs`'s `Fleet`), logging every
+/// put with its deadline, enforcing that deadline as `ChunkStore::put_fragment` requires, and
+/// able to hold a put at any of three points until the test releases it, or to fail one.
+///
+/// A put runs in its own task, as it would on a remote D server: a caller that stops waiting
+/// drops only its wait, and the D server goes on with the put. Its deadline is judged twice, as
+/// the trait defines (`crates/traits/src/lib.rs`, `ChunkStore::put_fragment`):
+///
+/// 1. at the **publication point**, the instant before the fragment is stored, with
+///    [`WriteDeadlineExpired::if_elapsed`]: a late put is refused and nothing of it is stored;
+/// 2. right after the publishing step returns, with
+///    [`WriteDeadlineExpired::if_publication_unverified`]: a put whose step straddled the
+///    deadline stays stored and is answered [`WriteEffect::Unknown`].
+#[derive(Clone)]
+struct Fleet(Arc<FleetState>);
+
+struct FleetState {
+    servers: Mutex<BTreeMap<DServerId, HashMap<FragmentId, Bytes>>>,
+    clock: ManualClock,
+    log: Log,
+    holds: Mutex<Vec<(FragmentId, HoldAt, Arc<Semaphore>)>>,
+    /// Puts answered with a fault once past their arrival hold, storing nothing.
+    failing: Mutex<HashMap<FragmentId, Failure>>,
+}
+
+/// How a put the fake fails is answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// A [`TransientFault`]: the D server unreachable.
+    Transient,
+    /// A plain error no seam type names, which `classify` reads `Terminal`.
+    Plain,
+}
+
+impl Fleet {
+    fn new(clock: &ManualClock, log: &Log) -> Self {
+        Self(Arc::new(FleetState {
+            servers: Mutex::new((0..SERVERS).map(|id| (id, HashMap::new())).collect()),
+            clock: clock.clone(),
+            log: log.clone(),
+            holds: Mutex::new(Vec::new()),
+            failing: Mutex::new(HashMap::new()),
+        }))
+    }
+
+    /// Hold the put of `id` at `at` until a permit is added to the returned gate.
+    fn hold(&self, id: FragmentId, at: HoldAt) -> Arc<Semaphore> {
+        let gate = Arc::new(Semaphore::new(0));
+        self.0
+            .holds
+            .lock()
+            .unwrap()
+            .push((id, at, Arc::clone(&gate)));
+        gate
+    }
+
+    /// Answer the put of `id` with `failure` once it is past its arrival hold, if any.
+    fn fail(&self, id: FragmentId, failure: Failure) {
+        self.0.failing.lock().unwrap().insert(id, failure);
+    }
+
+    /// The server that stores fragment `id`, if any.
+    fn stored_on(&self, id: FragmentId) -> Option<DServerId> {
+        self.0
+            .servers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, held)| held.contains_key(&id))
+            .map(|(server, _)| *server)
+    }
+
+    /// Whether every put of `held`'s chunk but `held` itself has been answered: `Ok`, or the
+    /// transient fault scripted for it.
+    fn answered_the_rest(&self, held: FragmentId) -> bool {
+        let events = self.0.log.events();
+        (0..FRAGMENTS)
+            .filter(|index| *index != held.index)
+            .all(|index| {
+                let id = FragmentId {
+                    chunk: held.chunk,
+                    index,
+                };
+                events.iter().any(|e| {
+                    matches!(e, Event::Acked { id: answered } | Event::Faulted { id: answered }
+                        if *answered == id)
+                })
+            })
+    }
+
+    /// Whether the put of `id` is waiting at `at`, and every other put of its chunk is answered,
+    /// so a clock the test moves now reaches that one put only.
+    fn holds_only(&self, id: FragmentId, at: HoldAt) -> bool {
+        self.held(id, at) && self.answered_the_rest(id)
+    }
+
+    fn held(&self, id: FragmentId, at: HoldAt) -> bool {
+        self.0
+            .log
+            .has(|e| matches!(e, Event::Held { id: i, at: a } if *i == id && *a == at))
+    }
+}
+
+impl FleetState {
+    async fn gate(&self, id: FragmentId, at: HoldAt) {
+        let gate = self
+            .holds
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(held, point, _)| *held == id && *point == at)
+            .map(|(_, _, gate)| Arc::clone(gate));
+        if let Some(gate) = gate {
+            self.log.push(Event::Held { id, at });
+            gate.acquire().await.expect("the gate stays open").forget();
+        }
+    }
+
+    async fn apply(
+        &self,
+        dserver: DServerId,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> StoreResult<()> {
+        self.gate(id, HoldAt::Arrival).await;
+        let failure = self.failing.lock().unwrap().get(&id).copied();
+        if let Some(failure) = failure {
+            self.log.push(Event::Faulted { id });
+            return Err(match failure {
+                Failure::Transient => Box::new(TransientFault::new(format!(
+                    "scripted: the D server holding fragment {id:?} is unreachable"
+                ))),
+                Failure::Plain => format!("scripted: fragment {id:?}'s disk failed").into(),
+            });
+        }
+        // The publication point.
+        if let Some(deadline) = deadline_millis {
+            let now = self.clock.now_millis();
+            if let Some(refused) = WriteDeadlineExpired::if_elapsed(id, deadline, now) {
+                self.log.push(Event::Refused { id });
+                return Err(Box::new(refused));
+            }
+        }
+        // The publishing step.
+        self.gate(id, HoldAt::Publishing).await;
+        self.servers
+            .lock()
+            .unwrap()
+            .get_mut(&dserver)
+            .ok_or_else(|| format!("Fleet: unknown D server {dserver}"))?
+            .insert(id, fragment);
+        self.log.push(Event::Stored { id });
+        if let Some(deadline) = deadline_millis {
+            let now = self.clock.now_millis();
+            if let Some(unverified) =
+                WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                self.log.push(Event::Unverified { id });
+                return Err(Box::new(unverified));
+            }
+        }
+        self.log.push(Event::Acked { id });
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ChunkStore for Fleet {
+    async fn put_fragment(
+        &self,
+        _id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> StoreResult<()> {
+        Err("Fleet: a staged write must address a D server (use put_fragment_at)".into())
+    }
+
+    async fn get_fragment(&self, _id: FragmentId) -> StoreResult<Option<Bytes>> {
+        Ok(None)
+    }
+
+    async fn list_fragments(&self) -> StoreResult<Vec<FragmentId>> {
+        Ok(self
+            .0
+            .servers
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|held| held.keys().copied().collect::<Vec<_>>())
+            .collect())
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> StoreResult<()> {
+        for held in self.0.servers.lock().unwrap().values_mut() {
+            held.remove(&id);
+        }
+        Ok(())
+    }
+
+    async fn health(&self) -> StoreResult<Health> {
+        Ok(Health::Healthy)
+    }
+}
+
+#[async_trait]
+impl PlacementChunkStore for Fleet {
+    async fn get_fragment_at(
+        &self,
+        dserver: DServerId,
+        id: FragmentId,
+    ) -> StoreResult<Option<Bytes>> {
+        Ok(self
+            .0
+            .servers
+            .lock()
+            .unwrap()
+            .get(&dserver)
+            .and_then(|held| held.get(&id).cloned()))
+    }
+
+    async fn put_fragment_at(
+        &self,
+        dserver: DServerId,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> StoreResult<()> {
+        let state = Arc::clone(&self.0);
+        state.log.push(Event::Put {
+            dserver,
+            id,
+            deadline: deadline_millis,
+            clock: state.clock.now_millis(),
+        });
+        let task = Arc::clone(&state);
+        let put =
+            tokio::spawn(async move { task.apply(dserver, id, fragment, deadline_millis).await });
+        let answer = put.await.expect("the put task ran to an answer");
+        // The reply in transit: the store has answered, the caller has not heard yet.
+        state.gate(id, HoldAt::Answer).await;
+        answer
+    }
+}
+
+// ─────────────────────────────── the runtime ───────────────────────────────
+
+/// What the test's timer does in the instant a wait fires, before staging sees it fire.
+type OnFire = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// The staging runtime: the manual clock, chunk ids `1, 2, 3, …`, and a timer the test fires by
+/// hand ([`Runtime::timer`]'s permits). Every wait staging asks for is logged with its length
+/// ([`Runtime::waits`]), though only a permit ends it. The first wait to fire after the test
+/// sets [`Runtime::on_fire`] runs it, inside its own firing: so a test can make something
+/// happen exactly as the timer fires, with no poll of staging in between.
+struct Runtime {
+    clock: ManualClock,
+    next_chunk: ChunkId,
+    timer: Arc<Semaphore>,
+    waits: Arc<Mutex<Vec<u64>>>,
+    on_fire: OnFire,
+}
+
+impl StageRuntime for Runtime {
+    fn now_millis(&self) -> u64 {
+        self.clock.now_millis()
+    }
+
+    fn next_chunk_id(&mut self) -> ChunkId {
+        self.next_chunk += 1;
+        self.next_chunk
+    }
+
+    fn wait(&self, millis: u64) -> impl Future<Output = ()> + Send {
+        self.waits.lock().unwrap().push(millis);
+        let timer = Arc::clone(&self.timer);
+        let on_fire = Arc::clone(&self.on_fire);
+        async move {
+            timer
+                .acquire()
+                .await
+                .expect("the timer stays open")
+                .forget();
+            let fired = on_fire.lock().unwrap().take();
+            if let Some(fired) = fired {
+                fired();
+            }
+        }
+    }
+}
+
+// ─────────────────────────────── the rig ───────────────────────────────
+
+struct Rig {
+    clock: ManualClock,
+    log: Log,
+    store: Scripted,
+    fleet: Fleet,
+    runtime: Runtime,
+    topology: Topology,
+    upload: UploadId,
+    /// The session bytes Create stored: `Open@0`.
+    session: Bytes,
+    attempt: AttemptId,
+}
+
+impl Rig {
+    async fn new() -> Self {
+        let clock = ManualClock::new(T0);
+        let log = Log::default();
+        let inner = RedbMetadataStore::in_memory().unwrap();
+        inner
+            .commit(WriteBatch::new().put(metadata::bucket_key(BUCKET), MARKER))
+            .await
+            .unwrap();
+        let object = format!("{BUCKET}/object");
+        let create = CreateRequest {
+            bucket: BUCKET,
+            parent: ROOT,
+            object: &object,
+            content_type: None,
+            created_at_millis: T0,
+            clock_source: "wall",
+        };
+        let outcome = create_session(&inner, &profile(), &create, &mut Fixed(Some(identity(1))))
+            .await
+            .expect("the create ran");
+        let CreateOutcome::Created { upload_id } = outcome else {
+            panic!("expected Created, got {outcome:?}");
+        };
+        let session = inner.get(&mpu_key(&upload_id)).await.unwrap().unwrap();
+        Self {
+            store: Scripted {
+                inner,
+                clock: clock.clone(),
+                log: log.clone(),
+                state: Mutex::new(ScriptState::default()),
+            },
+            fleet: Fleet::new(&clock, &log),
+            runtime: Runtime {
+                clock: clock.clone(),
+                next_chunk: 0,
+                timer: Arc::new(Semaphore::new(0)),
+                waits: Arc::new(Mutex::new(Vec::new())),
+                on_fire: Arc::new(Mutex::new(None)),
+            },
+            topology: topology(),
+            upload: upload_id,
+            session,
+            attempt: attempt(0),
+            clock,
+            log,
+        }
+    }
+
+    /// Stage `body` under `request`, with nothing running beside it.
+    async fn stage(
+        &mut self,
+        request: impl FnOnce(&mut StageRequest<'_>),
+        body: Body,
+    ) -> Result<StageOutcome, StageError> {
+        let mut req = self::request(&self.topology, &self.upload, &self.attempt);
+        request(&mut req);
+        stage_part(&self.store, &self.fleet, &mut self.runtime, &req, body).await
+    }
+
+    fn waits(&self) -> Vec<u64> {
+        self.runtime.waits.lock().unwrap().clone()
+    }
+
+    /// The session's state as the store holds it.
+    async fn state(&self) -> SessionState {
+        let bytes = self
+            .store
+            .inner
+            .get(&mpu_key(&self.upload))
+            .await
+            .unwrap()
+            .expect("the session is stored");
+        decode_session_record(&bytes).unwrap().state().clone()
+    }
+}
+
+fn staged(outcome: Result<StageOutcome, StageError>) -> Box<StagedAttempt> {
+    match outcome {
+        Ok(StageOutcome::Staged(attempt)) => attempt,
+        other => panic!("expected Staged, got {other:?}"),
+    }
+}
+
+/// The cause of a staging that stopped with nothing in doubt.
+fn stopped(outcome: Result<StageOutcome, StageError>) -> Stop {
+    match outcome {
+        Err(StageError::Stopped { cause, .. }) => cause,
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+}
+
+/// The doubt a reserve or a staging ended in, once it is shown to read `Indeterminate`.
+fn in_doubt<T: std::fmt::Debug>(outcome: Result<T, StageError>) -> Box<InDoubt> {
+    match outcome {
+        Err(err @ StageError::InDoubt(_)) => {
+            assert_eq!(classify(&err), ErrorClass::Indeterminate, "{err}");
+            let StageError::InDoubt(doubt) = err else {
+                unreachable!()
+            };
+            doubt
+        }
+        other => panic!("expected InDoubt, got {other:?}"),
+    }
+}
+
+/// Every slot of `upload`, by index.
+async fn slots(store: &impl MetadataStore, upload: &UploadId) -> Vec<(SlotIndex, SlotRecord)> {
+    let mut found: Vec<_> = store
+        .scan(&slot_range(upload))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| {
+            let (owner, index) = parse_slot_key(&key).unwrap();
+            assert_eq!(&owner, upload);
+            (index, decode_slot_record(&value).unwrap())
+        })
+        .collect();
+    found.sort_by_key(|(index, _)| *index);
+    found
+}
+
+/// The slots `attempt` holds.
+async fn slots_of(store: &impl MetadataStore, upload: &UploadId, attempt: &AttemptId) -> usize {
+    slots(store, upload)
+        .await
+        .iter()
+        .filter(|(_, slot)| slot.attempt_id() == attempt)
+        .count()
+}
+
+/// Every owned entry of `upload`, by chunk id.
+async fn owned(store: &impl MetadataStore, upload: &UploadId) -> BTreeMap<ChunkId, OwnedEntry> {
+    store
+        .scan(&sidx_range(upload))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(key, value)| {
+            let (part_number, chunk, entry) = decode_owned_entry(&key, &value).unwrap();
+            assert_eq!(part_number, part());
+            (chunk, entry)
+        })
+        .collect()
+}
+
+async fn count(store: &impl MetadataStore, prefix: &[u8]) -> usize {
+    store.scan(prefix).await.unwrap().len()
+}
+
+async fn snapshot(store: &impl MetadataStore) -> Vec<(Vec<u8>, Bytes)> {
+    let mut all = store.scan(b"").await.unwrap();
+    all.sort();
+    all
+}
+
+/// **(A)** Every chunk's intent batches all precede the first put of that chunk's fragments
+/// (`0016:1788`: assert the order, not just the end state).
+fn assert_intents_precede_puts(log: &Log) {
+    let events = log.events();
+    let mut chunks = BTreeSet::new();
+    for event in &events {
+        if let Event::Put { id, .. } = event {
+            chunks.insert(id.chunk);
+        }
+    }
+    for chunk in chunks {
+        let first_put = events
+            .iter()
+            .position(|e| matches!(e, Event::Put { id, .. } if id.chunk == chunk))
+            .unwrap();
+        let intents: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(e, Event::Commit { kind: Kind::Intent, batch, .. }
+                    if intent_chunk(batch) == chunk)
+            })
+            .map(|(at, _)| at)
+            .collect();
+        assert!(!intents.is_empty(), "chunk {chunk} has an intent");
+        assert!(
+            intents.iter().all(|at| *at < first_put),
+            "chunk {chunk}: every intent commit precedes its first fragment put"
+        );
+    }
+}
+
+/// Every fragment the fleet was asked to write, and every fragment it stores, is named, now, by
+/// a durable owned entry whose placement puts that fragment on the server it went to.
+async fn assert_fragments_evidenced(rig: &Rig) {
+    let entries = owned(&rig.store.inner, &rig.upload).await;
+    let named = |id: FragmentId, dserver: DServerId| {
+        let entry = entries
+            .get(&id.chunk)
+            .unwrap_or_else(|| panic!("fragment {id:?} has no durable owned entry"));
+        assert_eq!(
+            entry.staged().placement()[usize::from(id.index)],
+            dserver,
+            "fragment {id:?} is where its entry says"
+        );
+    };
+    for put in rig.log.puts() {
+        named(put.id, put.dserver);
+    }
+    for (dserver, held) in rig.fleet.0.servers.lock().unwrap().iter() {
+        for id in held.keys() {
+            named(*id, *dserver);
+        }
+    }
+}
+
+/// Nothing staged names `server`: no owned entry, no fragment put, no hand-off chunk.
+async fn assert_nothing_names(rig: &Rig, attempt: &StagedAttempt, server: DServerId) {
+    for (chunk, entry) in owned(&rig.store.inner, &rig.upload).await {
+        assert!(
+            !entry.staged().placement().contains(&server),
+            "chunk {chunk}'s entry names draining server {server}"
+        );
+    }
+    assert!(
+        rig.log.puts().iter().all(|put| put.dserver != server),
+        "no fragment is written to draining server {server}"
+    );
+    assert!(
+        attempt
+            .chunks()
+            .iter()
+            .all(|c| !c.placement.contains(&server)),
+        "no hand-off chunk names draining server {server}"
+    );
+}
+
+/// `open`'s session at `Open@epoch`, in the codec's canonical spelling.
+fn open_at(open: &Bytes, epoch: u64) -> Bytes {
+    let record = decode_session_record(open).unwrap();
+    let json = |text: &str| String::from_utf8(metadata::encode(&text).to_vec()).unwrap();
+    let bytes = format!(
+        "{{\"parent\":{},\"object\":{},\"created_at_millis\":{},\"clock_source\":{},\
+         \"segment_nonce\":\"{}\",\"epoch\":{epoch},\"attempts\":0,\"state\":{{\"kind\":\"Open\"}}}}",
+        record.parent(),
+        json(record.object()),
+        record.created_at_millis(),
+        json(record.clock_source()),
+        record.segment_nonce(),
+    );
+    let decoded = decode_session_record(bytes.as_bytes()).expect("a canonical session");
+    assert!(matches!(decoded.state(), SessionState::Open {}));
+    assert_eq!(metadata::encode(&decoded), bytes.as_bytes());
+    Bytes::from(bytes)
+}
+
+/// A side action that moves `upload`'s session to `to` (a Complete fence and its release).
+fn move_session(upload: &UploadId, to: Bytes) -> Side {
+    let key = mpu_key(upload);
+    Side::Batch(Arc::new(move |_| {
+        WriteBatch::new().put(key.clone(), to.clone())
+    }))
+}
+
+/// A canonical slot value for attempt `n` of part `part_number`, as residue or a live part would
+/// leave it.
+fn other_slot(n: u128, part_number: u32) -> Bytes {
+    let bytes = format!(
+        "{{\"part_number\":{part_number},\"attempt_id\":\"{}\",\"reserved_at_millis\":{T0},\
+         \"lease_expiry_millis\":{}}}",
+        attempt(n),
+        T0 + TTL
+    );
+    let decoded = decode_slot_record(bytes.as_bytes()).expect("a canonical slot");
+    assert_eq!(metadata::encode(&decoded), bytes.as_bytes());
+    Bytes::from(bytes)
+}
+
+// ═══════════════════════ (A) staging and its order ═══════════════════════
+
+/// **(A)** A body of three full chunks and a short fourth, fed as uneven pieces (10 bytes, then
+/// 100 spanning the first boundary, then 37, then 65 spanning the third; no boundary aligned to
+/// the chunk size), stages exactly four chunks. Read back through the fragments they equal the
+/// body; the length and digest are the body's. Mid-stage the store holds an owned entry and no
+/// `pending:` entry. After: one slot (this attempt's), one owned entry per chunk at the
+/// placement its fragments went to, nothing under `part:` or `psum:`; every intent precedes its
+/// chunk's first fragment put; the hand-off carries one complete `ChunkRef` per chunk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stages_uneven_pieces_in_order_and_hands_off_complete_chunk_refs() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let body = body_bytes(3 * CHUNK + 20);
+        let body_pieces = pieces(&body, &[10, 100, 37, 65]);
+        let first = FragmentId { chunk: 1, index: 0 };
+        let gate = rig.fleet.hold(first, HoldAt::Arrival);
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let staging = stage_part(
+            &rig.store,
+            &rig.fleet,
+            &mut rig.runtime,
+            &req,
+            stream_of(body_pieces),
+        );
+        let (fleet, inner) = (rig.fleet.clone(), &rig.store.inner);
+        let driver = async {
+            until("chunk 1's first fragment put", || {
+                fleet.held(first, HoldAt::Arrival)
+            })
+            .await;
+            assert!(
+                !inner.scan(SIDX_PREFIX).await.unwrap().is_empty(),
+                "while staging, scan(\"sidx:\") is non-empty"
+            );
+            assert!(
+                inner.scan(b"pending:").await.unwrap().is_empty(),
+                "while staging, scan(\"pending:\") is empty"
+            );
+            gate.add_permits(1);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let attempt = staged(outcome);
+        let inner = &rig.store.inner;
+
+        assert_eq!(attempt.chunks().len(), body.len().div_ceil(CHUNK));
+        let mut read_back = Vec::new();
+        for chunk in attempt.chunks() {
+            read_back
+                .extend_from_slice(&read_chunk_verified(inner, &rig.fleet, chunk).await.unwrap());
+        }
+        assert_eq!(
+            read_back, body,
+            "the chunks read back through their fragments are the body"
+        );
+        assert_eq!(attempt.len(), body.len() as u64);
+        assert_eq!(
+            *attempt.digest(),
+            sha256(&body),
+            "the digest is the body's SHA-256"
+        );
+
+        let held = slots(inner, &rig.upload).await;
+        assert_eq!(held.len(), 1, "one slot");
+        assert_eq!(held[0].1.attempt_id(), &rig.attempt);
+        assert_eq!(held[0].1.part_number(), part());
+        let entries = owned(inner, &rig.upload).await;
+        assert_eq!(
+            entries.len(),
+            attempt.chunks().len(),
+            "one owned entry per chunk"
+        );
+        for (chunk, entry) in &entries {
+            let written: BTreeMap<u16, DServerId> = rig
+                .log
+                .puts()
+                .iter()
+                .filter(|put| put.id.chunk == *chunk)
+                .map(|put| (put.id.index, put.dserver))
+                .collect();
+            assert_eq!(written.len(), usize::from(FRAGMENTS));
+            for (index, dserver) in written {
+                assert_eq!(entry.staged().placement()[usize::from(index)], dserver);
+            }
+        }
+        assert_eq!(count(inner, PART_PREFIX).await, 0, "nothing under part:");
+        assert_eq!(count(inner, PSUM_PREFIX).await, 0, "nothing under psum:");
+        assert!(inner.scan(b"pending:").await.unwrap().is_empty());
+        assert_intents_precede_puts(&rig.log);
+        assert_fragments_evidenced(&rig).await;
+
+        // The hand-off: complete chunk references, in chunk order.
+        let chunks = attempt.chunks();
+        assert_eq!(chunks.iter().map(|c| c.len).sum::<u64>(), body.len() as u64);
+        let (last, full) = chunks.split_last().unwrap();
+        assert!(
+            full.iter().all(|c| c.len == CHUNK as u64),
+            "every chunk but the last is full"
+        );
+        assert_eq!(last.len, 20, "the last chunk carries the short remainder");
+        assert_eq!(attempt.owned().len(), chunks.len());
+        for (chunk, held) in chunks.iter().zip(attempt.owned()) {
+            let (_, id, entry) = decode_owned_entry(held.key(), held.bytes()).unwrap();
+            assert_eq!(&entry, held.entry());
+            assert_eq!(chunk.id, id, "the ChunkRef's id is its owned entry's chunk");
+            assert_eq!(chunk.scheme, entry.staged().scheme());
+            assert_eq!(chunk.placement, entry.staged().placement());
+            assert_eq!(
+                entries[&id], entry,
+                "the hand-off's entry is the stored one"
+            );
+            assert_eq!(
+                inner.get(held.key()).await.unwrap().as_ref(),
+                Some(held.bytes())
+            );
+        }
+        let ids: Vec<ChunkId> = chunks.iter().map(|c| c.id).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "chunk order");
+        assert_eq!(attempt.part_number(), part());
+        assert_eq!(attempt.attempt_id(), &rig.attempt);
+        assert_eq!(attempt.upload_id(), &rig.upload);
+        assert_eq!(attempt.session_bytes(), &rig.session);
+        assert_eq!(attempt.slot_index(), held[0].0);
+        assert_eq!(
+            attempt.slot_key(),
+            slot_key(&rig.upload, held[0].0).as_slice()
+        );
+        assert_eq!(attempt.slot(), &held[0].1);
+        assert_eq!(
+            inner.get(attempt.slot_key()).await.unwrap().as_ref(),
+            Some(attempt.slot_bytes())
+        );
+        assert!(!attempt.chunk_bound_exceeded());
+        assert!(!attempt.is_empty());
+    })
+    .await;
+}
+
+/// **(A)** An empty body stages no chunk: the attempt holds its slot and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_an_empty_body_stages_no_chunk() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let attempt = staged(rig.stage(|_| {}, stream_of(Vec::new())).await);
+        assert!(attempt.is_empty());
+        assert!(attempt.chunks().is_empty());
+        assert!(attempt.owned().is_empty());
+        assert_eq!(*attempt.digest(), sha256(&[]));
+        assert_eq!(slots(&rig.store.inner, &rig.upload).await.len(), 1);
+        assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+        assert!(rig.log.commits(Kind::Intent).is_empty());
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+// ═══════════════════════ (A′) the write deadline ═══════════════════════
+
+/// **(A′)** Every staged fragment put carries `t_auth + W`, where `t_auth` is the clock reading
+/// when its chunk's intent was committed. The wrapper advances the clock right after each intent
+/// commit returns, so the puts are dispatched later — and the deadline is still `t_auth + W`:
+/// never `t_dispatch + W`, never `None`, never unbounded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_every_fragment_deadline_is_t_auth_plus_w() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store
+            .script(Kind::Intent, vec![], Some(Act::PassThenAdvance(777)));
+        let body = body_bytes(3 * CHUNK);
+        staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK])))
+                .await,
+        );
+        let intents = rig.log.commits(Kind::Intent);
+        assert_eq!(intents.len(), 3);
+        let puts = rig.log.puts();
+        assert_eq!(puts.len(), 3 * usize::from(FRAGMENTS));
+        for intent in intents {
+            assert_eq!(intent.answer, Answer::Committed);
+            let chunk = intent_chunk(&intent.batch);
+            let t_auth = intent.clock;
+            for put in puts.iter().filter(|put| put.id.chunk == chunk) {
+                assert_eq!(put.clock, t_auth + 777, "the dispatch was delayed");
+                assert_eq!(put.deadline, Some(t_auth + W), "deadline = t_auth + W");
+                assert_ne!(put.deadline, Some(put.clock + W), "never t_dispatch + W");
+                assert_ne!(put.deadline, None);
+                assert_ne!(put.deadline, Some(u64::MAX));
+            }
+        }
+    })
+    .await;
+}
+
+/// The effect-unknown stop a staging ended with: its chunk, its deadline, the writes it
+/// abandoned and the store's reports.
+fn effect_unknown(cause: &Stop) -> (ChunkId, u64, &[WriteDeadlineExpired], &[BoxError]) {
+    match cause {
+        Stop::WriteEffectUnknown {
+            chunk,
+            deadline_millis,
+            abandoned,
+            reports,
+        } => (*chunk, *deadline_millis, abandoned, reports),
+        other => panic!("expected WriteEffectUnknown, got {other:?}"),
+    }
+}
+
+/// Staging's account of the one write it abandoned: `held`, its effect unknown, in staging's own
+/// words, never dressed up as the store's.
+fn assert_abandoned_only(abandoned: &[WriteDeadlineExpired], held: FragmentId) {
+    assert_eq!(abandoned.len(), 1, "one write abandoned");
+    assert_eq!(abandoned[0].id, held);
+    assert_eq!(abandoned[0].effect, WriteEffect::Unknown);
+    assert_eq!(abandoned[0].error_class(), ErrorClass::Indeterminate);
+    assert!(
+        abandoned[0].detail.contains("the writer, not the store"),
+        "{}",
+        abandoned[0].detail
+    );
+}
+
+/// Hold chunk 1's first fragment put at `at`, stage two chunks, and let `driver` move the clock
+/// and the timer. Returns the outcome and whether staging had ended when the driver finished.
+async fn stage_with_held_put<D, F>(
+    rig: &mut Rig,
+    at: HoldAt,
+    driver: D,
+) -> (Result<StageOutcome, StageError>, Arc<Semaphore>)
+where
+    D: FnOnce(Fleet, ManualClock, Arc<Semaphore>, Arc<Semaphore>, Arc<AtomicBool>) -> F,
+    F: Future<Output = ()>,
+{
+    let held = FragmentId { chunk: 1, index: 0 };
+    let gate = rig.fleet.hold(held, at);
+    let body = body_bytes(2 * CHUNK);
+    let ended = Arc::new(AtomicBool::new(false));
+    let driver = driver(
+        rig.fleet.clone(),
+        rig.clock.clone(),
+        Arc::clone(&rig.runtime.timer),
+        Arc::clone(&gate),
+        Arc::clone(&ended),
+    );
+    let req = request(&rig.topology, &rig.upload, &rig.attempt);
+    let staging = flagging(
+        ended,
+        stage_part(
+            &rig.store,
+            &rig.fleet,
+            &mut rig.runtime,
+            &req,
+            stream_of(pieces(&body, &[2 * CHUNK])),
+        ),
+    );
+    let (outcome, ()) = tokio::join!(staging, driver);
+    (outcome, gate)
+}
+
+/// **(A′)** The wait for a chunk's fragment writes is bounded by their deadline, fail-closed
+/// (`0016:1555-1557`): a put the fake holds once the clock has reached `t_auth + W` is abandoned
+/// at the deadline, without waiting for it, and staging stops with a typed error naming the chunk
+/// and the deadline — an effect it cannot know, never "nothing landed". The put is not re-sent
+/// and no later chunk is started. A staging that awaited the writes without their deadline would
+/// still be waiting; this leg fails waiting for it to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_a_write_pending_past_its_deadline_is_abandoned() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let held = FragmentId { chunk: 1, index: 0 };
+        let (outcome, gate) = stage_with_held_put(
+            &mut rig,
+            HoldAt::Arrival,
+            |fleet, clock, timer, _, ended| async move {
+                until("chunk 1's held put", || {
+                    fleet.holds_only(held, HoldAt::Arrival)
+                })
+                .await;
+                clock.advance(W);
+                timer.add_permits(1);
+                until("staging to stop at the deadline", || {
+                    ended.load(Ordering::SeqCst)
+                })
+                .await;
+            },
+        )
+        .await;
+        assert_eq!(rig.clock.now_millis(), T0 + W, "it stopped at the deadline");
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "the held put was never released"
+        );
+        let err = outcome.expect_err("staging stopped");
+        let text = err.to_string();
+        assert!(text.contains("is unknown"), "{text}");
+        assert_eq!(
+            classify(&err),
+            ErrorClass::Indeterminate,
+            "an abandoned write's effect is unknown, and its class says so"
+        );
+        let cause = stopped(Err(err));
+        let (chunk, deadline, abandoned, reports) = effect_unknown(&cause);
+        assert_eq!((chunk, deadline), (1, T0 + W));
+        assert_abandoned_only(abandoned, held);
+        assert!(reports.is_empty(), "the other five answered Ok");
+        assert_eq!(
+            rig.log.put_count(held),
+            1,
+            "the abandoned put is not re-sent"
+        );
+        assert_eq!(
+            rig.log.commits(Kind::Intent).len(),
+            1,
+            "no later chunk was started"
+        );
+        // The body read waited on the timer, then the writes waited for exactly their window.
+        assert_eq!(rig.waits(), vec![IDLE, W]);
+        assert_fragments_evidenced(&rig).await;
+        assert_eq!(owned(&rig.store.inner, &rig.upload).await.len(), 1);
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            1
+        );
+    })
+    .await;
+}
+
+/// **(A′)** A held put released after its deadline is refused and **not published** (v3
+/// sign-off). The fake holds a put on arrival, the clock passes its deadline, staging stops, and
+/// only then is the put released. The fake's publication-point check refuses it with
+/// `WriteEffect::NotApplied`, and no fragment of that put is readable afterwards. A fake without
+/// that check would store it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_a_held_put_released_after_expiry_is_refused_and_not_published() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let held = FragmentId { chunk: 1, index: 0 };
+        let (outcome, gate) = stage_with_held_put(
+            &mut rig,
+            HoldAt::Arrival,
+            |fleet, clock, timer, _, ended| async move {
+                until("chunk 1's held put", || {
+                    fleet.holds_only(held, HoldAt::Arrival)
+                })
+                .await;
+                clock.advance(W + 1);
+                timer.add_permits(1);
+                until("staging to stop", || ended.load(Ordering::SeqCst)).await;
+            },
+        )
+        .await;
+        let cause = stopped(outcome);
+        assert_abandoned_only(effect_unknown(&cause).2, held);
+        gate.add_permits(1);
+        let log = rig.log.clone();
+        until("the fake to answer the late put", || {
+            log.has(|e| matches!(e, Event::Refused { id } | Event::Stored { id } if *id == held))
+        })
+        .await;
+        assert_eq!(
+            rig.fleet.stored_on(held),
+            None,
+            "nothing of it was published"
+        );
+        assert!(
+            log.has(|e| matches!(e, Event::Refused { id } if *id == held)),
+            "the fake refused it at its publication point"
+        );
+        let dserver = rig
+            .log
+            .puts()
+            .iter()
+            .find(|p| p.id == held)
+            .unwrap()
+            .dserver;
+        assert_eq!(
+            rig.fleet.get_fragment_at(dserver, held).await.unwrap(),
+            None,
+            "no fragment of that put is readable"
+        );
+        assert!(!log.has(|e| matches!(e, Event::Stored { id } if *id == held)));
+    })
+    .await;
+}
+
+/// **(A′)** A put the store refuses as too late *before* staging stops waiting is reported as
+/// what it is: nothing of it landed. The fake holds a put on arrival; the clock passes the
+/// deadline and the put is released before the timer fires, so the fake refuses it
+/// (`WriteEffect::NotApplied`) and every write of the chunk has answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_a_put_refused_as_late_is_reported_as_nothing_landed() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let held = FragmentId { chunk: 1, index: 0 };
+        let (outcome, _) = stage_with_held_put(
+            &mut rig,
+            HoldAt::Arrival,
+            |fleet, clock, _, gate, _| async move {
+                until("chunk 1's held put", || {
+                    fleet.holds_only(held, HoldAt::Arrival)
+                })
+                .await;
+                clock.advance(W);
+                gate.add_permits(1);
+            },
+        )
+        .await;
+        let err = outcome.expect_err("staging stopped");
+        assert_eq!(classify(&err), ErrorClass::Terminal);
+        assert!(err.to_string().contains("nothing of them landed"), "{err}");
+        let cause = stopped(Err(err));
+        assert!(
+            matches!(
+                cause,
+                Stop::WriteDeadlineElapsed { chunk: 1, deadline_millis, refused: 1 }
+                    if deadline_millis == T0 + W
+            ),
+            "{cause:?}"
+        );
+        assert_eq!(rig.fleet.stored_on(held), None);
+        assert_eq!(rig.waits(), vec![IDLE, W], "the timer never fired");
+    })
+    .await;
+}
+
+/// **(A′)** A deadline that has passed before the writes are dispatched sends none of them: the
+/// intent commit is slow enough that the clock reaches `t_auth + W` before it returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_a_deadline_passed_before_dispatch_sends_nothing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store
+            .script(Kind::Intent, vec![Act::PassThenAdvance(W)], None);
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(
+                cause,
+                Stop::WriteDeadlineElapsed { chunk: 1, deadline_millis, refused: 0 }
+                    if deadline_millis == T0 + W
+            ),
+            "{cause:?}"
+        );
+        assert!(rig.log.puts().is_empty(), "no fragment write was sent");
+        assert_eq!(owned(&rig.store.inner, &rig.upload).await.len(), 1);
+    })
+    .await;
+}
+
+/// **(A′)** A publication that straddles the deadline (added 2026-10-22). The fake passes its
+/// publication-point check inside the window, then holds **inside** its publishing step while
+/// the clock passes the deadline (`crates/traits/src/lib.rs`, `WriteEffect::Unknown`).
+///
+/// * Run 1: the test lets the fake finish; the fragment is stored and the fake answers
+///   `WriteEffect::Unknown` (`WriteDeadlineExpired::if_publication_unverified`).
+/// * Run 2: the timer fires while the fake is still inside the step; staging abandons the put and
+///   returns, and only then does the fake finish and publish.
+///
+/// In both: a typed error saying the write's effect is unknown — never success, never the clean
+/// "nothing landed" refusal — and classed `Indeterminate` in both, since the bytes are in the same
+/// state whichever way the timing fell (review finding: run 2 read `Terminal`); no staged
+/// attempt; the fragment that did land is on a position the chunk's durable owned entry names;
+/// the owned entry and the slot are still there, residue for the reaper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_a_publication_straddling_the_deadline_is_never_counted() {
+    for run in [1, 2] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let held = FragmentId { chunk: 1, index: 0 };
+            let (outcome, gate) = stage_with_held_put(
+                &mut rig,
+                HoldAt::Publishing,
+                |fleet, clock, timer, gate, ended| async move {
+                    until("chunk 1's put inside its publishing step", || {
+                        fleet.holds_only(held, HoldAt::Publishing)
+                    })
+                    .await;
+                    clock.advance(W);
+                    if run == 1 {
+                        gate.add_permits(1);
+                    } else {
+                        timer.add_permits(1);
+                        until("staging to stop at the deadline", || {
+                            ended.load(Ordering::SeqCst)
+                        })
+                        .await;
+                    }
+                },
+            )
+            .await;
+            let err = match outcome {
+                Err(err @ StageError::Stopped { .. }) => err,
+                other => panic!("run {run}: expected Stopped, got {other:?}"),
+            };
+            assert!(err.to_string().contains("is unknown"), "run {run}: {err}");
+            assert_eq!(
+                classify(&err),
+                ErrorClass::Indeterminate,
+                "run {run}: the class follows the bytes, not the timing"
+            );
+            let cause = stopped(Err(err));
+            let (chunk, deadline, abandoned, reports) = effect_unknown(&cause);
+            assert_eq!((chunk, deadline), (1, T0 + W), "run {run}");
+            if run == 1 {
+                assert!(abandoned.is_empty());
+                assert_eq!(reports.len(), 1);
+                let report = write_deadline_outcome(reports[0].as_ref()).expect("the store's");
+                assert_eq!(report.effect, WriteEffect::Unknown);
+                assert_eq!(report.id, held);
+                assert!(rig
+                    .log
+                    .has(|e| matches!(e, Event::Unverified { id } if *id == held)));
+            } else {
+                assert_abandoned_only(abandoned, held);
+                assert!(reports.is_empty());
+                assert_eq!(gate.available_permits(), 0, "still inside its step");
+                gate.add_permits(1);
+                let log = rig.log.clone();
+                until("the fake to finish publishing", || {
+                    log.has(|e| matches!(e, Event::Stored { id } if *id == held))
+                })
+                .await;
+            }
+            let landed = rig.fleet.stored_on(held).expect("the fragment landed");
+            let entries = owned(&rig.store.inner, &rig.upload).await;
+            assert_eq!(
+                entries[&1].staged().placement()[0],
+                landed,
+                "run {run}: it landed on a position the durable owned entry names"
+            );
+            assert_fragments_evidenced(&rig).await;
+            assert_eq!(entries.len(), 1, "run {run}: the owned entry stays");
+            assert_eq!(
+                slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+                1,
+                "run {run}: the slot stays"
+            );
+            assert_eq!(rig.log.commits(Kind::Intent).len(), 1, "no later chunk");
+        })
+        .await;
+    }
+}
+
+/// **(A′)** The class of a write stop does not depend on which write answered first (review
+/// finding): the most indeterminate account decides, `Transient` only if every one is. In both
+/// runs chunk 1's second fragment write is answered with a transient fault, first.
+///
+/// * Run 1: the first write is held inside its publishing step across the deadline and answered
+///   `WriteEffect::Unknown`, later. The stop is classed `Indeterminate`, so a caller is never
+///   told to retry a write that may have landed.
+/// * Run 2: the first write is held on arrival and then failed with a plain fault, later. The
+///   stop is classed `Terminal`: one write said retrying cannot help, and a transient fault that
+///   answered earlier does not outrank it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_a_write_stop_is_classed_by_its_most_indeterminate_answer() {
+    for unknown_later in [true, false] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let held = FragmentId { chunk: 1, index: 0 };
+            let failing = FragmentId { chunk: 1, index: 1 };
+            rig.fleet.fail(failing, Failure::Transient);
+            let at = if unknown_later {
+                HoldAt::Publishing
+            } else {
+                rig.fleet.fail(held, Failure::Plain);
+                HoldAt::Arrival
+            };
+            let (outcome, _) =
+                stage_with_held_put(&mut rig, at, |fleet, clock, _, gate, _| async move {
+                    until("chunk 1's held put, the rest answered", || {
+                        fleet.holds_only(held, at)
+                    })
+                    .await;
+                    if unknown_later {
+                        clock.advance(W);
+                    }
+                    gate.add_permits(1);
+                })
+                .await;
+            let err = match outcome {
+                Err(err @ StageError::Stopped { .. }) => err,
+                other => panic!("expected Stopped, got {other:?}"),
+            };
+            let class = if unknown_later {
+                ErrorClass::Indeterminate
+            } else {
+                ErrorClass::Terminal
+            };
+            assert_eq!(classify(&err), class, "{err}");
+            let said = if unknown_later {
+                "NOT acknowledged"
+            } else {
+                "disk failed"
+            };
+            assert!(err.to_string().contains(said), "{err}");
+            let cause = stopped(Err(err));
+            let (chunk, _, abandoned, reports) = effect_unknown(&cause);
+            assert_eq!(chunk, 1);
+            assert!(abandoned.is_empty(), "every write answered");
+            assert_eq!(reports.len(), 2);
+            assert_eq!(
+                classify(reports[0].as_ref()),
+                ErrorClass::Transient,
+                "the transient fault answered first"
+            );
+            match write_deadline_outcome(reports[1].as_ref()) {
+                Some(verdict) => {
+                    assert!(unknown_later);
+                    assert_eq!((verdict.id, verdict.effect), (held, WriteEffect::Unknown));
+                }
+                None => {
+                    assert!(!unknown_later);
+                    assert_eq!(classify(reports[1].as_ref()), ErrorClass::Terminal);
+                }
+            }
+            assert_eq!(rig.fleet.stored_on(failing), None);
+            assert_fragments_evidenced(&rig).await;
+        })
+        .await;
+    }
+}
+
+/// **(A′)** An `Ok` the store gave in time is counted written even when staging first sees it in
+/// the instant its deadline's timer fires: `Ok` means published strictly before the deadline,
+/// whenever it is seen. The fake publishes chunk 1's first fragment in time and answers `Ok`, but
+/// holds the reply in transit; the clock reaches the deadline, and the timer's own firing releases
+/// the reply, so the wait sees the timer fire with the answer ready behind it. The part stages. A
+/// wait that dropped an answer ready when its timer fired would abandon a write that landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prime_an_ok_ready_as_the_deadline_timer_fires_is_counted_written() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let held = FragmentId { chunk: 1, index: 0 };
+        let on_fire = Arc::clone(&rig.runtime.on_fire);
+        let fired = Arc::clone(&on_fire);
+        let (outcome, _) = stage_with_held_put(
+            &mut rig,
+            HoldAt::Answer,
+            |fleet, clock, timer, gate, _| async move {
+                until("chunk 1's Ok in transit, the rest answered", || {
+                    fleet.holds_only(held, HoldAt::Answer)
+                })
+                .await;
+                clock.advance(W);
+                *on_fire.lock().unwrap() = Some(Box::new(move || gate.add_permits(1)));
+                timer.add_permits(1);
+            },
+        )
+        .await;
+        let attempt = staged(outcome);
+        assert!(fired.lock().unwrap().is_none(), "the timer fired");
+        assert!(rig
+            .log
+            .has(|e| matches!(e, Event::Acked { id } if *id == held)));
+        assert_eq!(attempt.chunks().len(), 2);
+        assert_eq!(
+            rig.clock.now_millis(),
+            T0 + W,
+            "chunk 1's deadline had come"
+        );
+        assert_eq!(
+            rig.waits()[..2],
+            [IDLE, W],
+            "chunk 1's writes waited for their window"
+        );
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+// ═══════════════════════ (A″) the body-idle bound ═══════════════════════
+
+/// **(A″)** A body read left unanswered for the bound stops staging, on the test's clock and
+/// timer, and nothing is written after it. The body sends 10 bytes and then nothing. A timer that
+/// fires a millisecond early is waited out for what is left; at the bound, staging stops with
+/// `BodyIdle`. The slot stays for the reaper. A staging that awaited the body without the bound
+/// would still be waiting; this leg fails waiting for it to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_double_prime_a_stalled_body_read_stops_at_its_idle_bound() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body) = channel(&rig.log);
+        tx.send(Bytes::from(body_bytes(10))).unwrap();
+        let (clock, timer, waits) = (
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+        req.body_idle_millis = BOUND;
+        let ended = Arc::new(AtomicBool::new(false));
+        let staging = flagging(
+            Arc::clone(&ended),
+            stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body),
+        );
+        let armed = |n: usize| {
+            let waits = Arc::clone(&waits);
+            move || waits.lock().unwrap().len() == n
+        };
+        let driver = async move {
+            until("the second read to wait", armed(2)).await;
+            clock.advance(BOUND - 1);
+            timer.add_permits(1);
+            until("the early wake to wait out the rest", armed(3)).await;
+            clock.advance(1);
+            timer.add_permits(1);
+            until("staging to give up the stalled body", || {
+                ended.load(Ordering::SeqCst)
+            })
+            .await;
+            // The body never ended: the client is still connected, sending nothing.
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let err = outcome.expect_err("staging stopped");
+        assert!(
+            err.to_string()
+                .contains(&format!("the part body sent nothing for {BOUND} ms")),
+            "{err}"
+        );
+        let cause = stopped(Err(err));
+        assert!(
+            matches!(cause, Stop::BodyIdle { idle_millis } if idle_millis == BOUND),
+            "{cause:?}"
+        );
+        assert_eq!(rig.clock.now_millis(), T0 + BOUND);
+        assert_eq!(rig.waits(), vec![BOUND, BOUND, 1]);
+        assert!(
+            rig.log.commits(Kind::Intent).is_empty(),
+            "nothing written after it"
+        );
+        assert!(rig.log.puts().is_empty());
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            1,
+            "the slot stays for the reaper"
+        );
+    })
+    .await;
+}
+
+/// **(A″)** A body answer seen at or past the read's idle deadline is late, a piece or the
+/// body's end alike (review finding). The body sends 10 bytes, so a partial chunk is buffered,
+/// and the next read is left pending; the clock reaches the bound (the lease still live), and
+/// only then does the body answer — it ends, or it sends a late piece and then ends — while the
+/// timer fires too. Staging stops with `BodyIdle` at the bound and writes nothing: the buffered
+/// bytes are never staged. A wait that took whatever answer it saw, without judging the clock,
+/// would stage them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_double_prime_a_body_answer_seen_past_its_idle_deadline_is_late() {
+    for late_piece in [false, true] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let (tx, body) = channel(&rig.log);
+            tx.send(Bytes::from(body_bytes(10))).unwrap();
+            let (clock, timer, waits) = (
+                rig.clock.clone(),
+                Arc::clone(&rig.runtime.timer),
+                Arc::clone(&rig.runtime.waits),
+            );
+            let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+            req.body_idle_millis = BOUND;
+            let ended = Arc::new(AtomicBool::new(false));
+            let staging = flagging(
+                Arc::clone(&ended),
+                stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body),
+            );
+            let driver = async move {
+                until("the second read to wait", || {
+                    waits.lock().unwrap().len() == 2
+                })
+                .await;
+                clock.advance(BOUND);
+                if late_piece {
+                    tx.send(Bytes::from(body_bytes(20))).unwrap();
+                }
+                // The body ends: a staging that took the late piece still has an end to stage on.
+                drop(tx);
+                timer.add_permits(1);
+                until("staging to stop", || ended.load(Ordering::SeqCst)).await;
+            };
+            let (outcome, ()) = tokio::join!(staging, driver);
+            let cause = stopped(outcome);
+            assert!(
+                matches!(cause, Stop::BodyIdle { idle_millis } if idle_millis == BOUND),
+                "late piece {late_piece}: {cause:?}"
+            );
+            assert_eq!(rig.clock.now_millis(), T0 + BOUND);
+            assert!(
+                rig.log.commits(Kind::Intent).is_empty(),
+                "late piece {late_piece}: the buffered bytes were never staged"
+            );
+            assert!(rig.log.puts().is_empty());
+            assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+            assert_eq!(
+                slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+                1,
+                "the slot stays for the reaper"
+            );
+        })
+        .await;
+    }
+}
+
+/// **(A″)** The bound is per read, not per body: a body that sends a piece inside every window is
+/// never cut off. With a bound `B`, the second piece comes at `T0 + B - 1` and the end at
+/// `T0 + 2B - 2`, the timer firing just before each; the part stages. A bound measured from the
+/// start of the body would stop it at the second wake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_double_prime_the_idle_bound_is_per_read_not_per_body() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body_stream) = channel(&rig.log);
+        let body = body_bytes(20);
+        tx.send(Bytes::copy_from_slice(&body[..10])).unwrap();
+        let (log, clock, timer, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+        req.body_idle_millis = BOUND;
+        let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream);
+        let piece = Bytes::copy_from_slice(&body[10..]);
+        let armed = |n: usize| {
+            let waits = Arc::clone(&waits);
+            move || waits.lock().unwrap().len() == n
+        };
+        let driver = async move {
+            until("the second read to wait", armed(2)).await;
+            clock.advance(BOUND - 1);
+            timer.add_permits(1);
+            until("the wake to wait again", armed(3)).await;
+            tx.send(piece).unwrap();
+            until("the second piece read", || log.read(1)).await;
+            until("the third read to wait", armed(4)).await;
+            clock.advance(BOUND - 1);
+            timer.add_permits(1);
+            until("the wake to wait again", armed(5)).await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let attempt = staged(outcome);
+        assert_eq!(attempt.len(), 20);
+        assert_eq!(*attempt.digest(), sha256(&body));
+        assert_eq!(
+            rig.clock.now_millis(),
+            T0 + 2 * (BOUND - 1),
+            "the body took longer than one bound"
+        );
+        assert_eq!(rig.waits()[..5], [BOUND, BOUND, 1, BOUND, 1]);
+    })
+    .await;
+}
+
+/// **(A″)** Empty pieces do not count as progress (v3 sign-off). A body that sends only empty
+/// pieces, each just inside the bound after the last, is stopped at the bound measured from the
+/// last **non-empty** piece, or from the start of the body if there was none. HTTP/2 permits empty
+/// `DATA` frames, so a production body can do this. A staging whose empty piece re-armed the
+/// deadline would wait past the bound; this leg fails waiting for it to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_double_prime_empty_pieces_do_not_count_as_progress() {
+    // The first non-empty piece's offset from T0, if any.
+    for first in [None, Some(500)] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let (tx, body) = channel(&rig.log);
+            let (log, clock, timer, waits) = (
+                rig.log.clone(),
+                rig.clock.clone(),
+                Arc::clone(&rig.runtime.timer),
+                Arc::clone(&rig.runtime.waits),
+            );
+            let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+            req.body_idle_millis = BOUND;
+            let ended = Arc::new(AtomicBool::new(false));
+            let staging = flagging(
+                Arc::clone(&ended),
+                stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body),
+            );
+            let driver = async move {
+                let armed = |n: usize| {
+                    let waits = Arc::clone(&waits);
+                    move || waits.lock().unwrap().len() == n
+                };
+                until("the first read to wait", armed(1)).await;
+                let mut read = 0;
+                if let Some(offset) = first {
+                    clock.advance(offset);
+                    tx.send(Bytes::from(body_bytes(10))).unwrap();
+                    until("the non-empty piece read", || log.read(0)).await;
+                    read = 1;
+                    until("the next read to wait", armed(2)).await;
+                }
+                for _ in 0..3 {
+                    clock.advance(BOUND - 1);
+                    tx.send(Bytes::new()).unwrap();
+                    until("the empty piece read", || log.read(read)).await;
+                    read += 1;
+                    clock.advance(1);
+                    // `add_permits` hands the permit straight to a queued wait, so the permit
+                    // count says nothing about whether staging has run: watch for it to stop, or
+                    // to ask for another wait.
+                    let asked = waits.lock().unwrap().len();
+                    timer.add_permits(1);
+                    let stopped = || ended.load(Ordering::SeqCst);
+                    let waits = Arc::clone(&waits);
+                    until("staging to stop, or to wait again", || {
+                        stopped() || waits.lock().unwrap().len() > asked
+                    })
+                    .await;
+                    if stopped() {
+                        break;
+                    }
+                }
+                drop(tx);
+            };
+            let (outcome, ()) = tokio::join!(staging, driver);
+            let cause = stopped(outcome);
+            assert!(
+                matches!(cause, Stop::BodyIdle { idle_millis } if idle_millis == BOUND),
+                "{first:?}: {cause:?}"
+            );
+            let from = T0 + first.unwrap_or(0);
+            assert_eq!(
+                rig.clock.now_millis(),
+                from + BOUND,
+                "{first:?}: stopped at the bound from the last non-empty piece"
+            );
+            assert!(rig.log.commits(Kind::Intent).is_empty());
+            assert!(rig.log.puts().is_empty());
+        })
+        .await;
+    }
+}
+
+/// **(A″)** A body that always has an empty piece ready never keeps staging from its timer: the
+/// read yields after each one, and staging stops at the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_double_prime_an_endless_run_of_empty_pieces_stops_at_the_bound() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let body: Body = Box::pin(stream::repeat_with(|| Ok(Bytes::new())));
+        let (clock, timer, waits) = (
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+        req.body_idle_millis = BOUND;
+        let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body);
+        let driver = async move {
+            until("the read to wait", || waits.lock().unwrap().len() == 1).await;
+            clock.advance(BOUND);
+            timer.add_permits(1);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let cause = stopped(outcome);
+        assert!(matches!(cause, Stop::BodyIdle { .. }), "{cause:?}");
+        assert_eq!(rig.waits(), vec![BOUND]);
+    })
+    .await;
+}
+
+// ═══════════════════════ (B) the drain fence ═══════════════════════
+
+/// The first server the owned entry an intent batch puts is placed on.
+fn first_server(batch: &WriteBatch) -> DServerId {
+    intent_entry(batch).staged().placement()[0]
+}
+
+/// **B1.** The wrapper records `desired:dserver:<S>`, for a server `S` the plan selected, just
+/// before the first intent commits. That intent fails on its own drain fence and re-plans;
+/// staging completes, and no owned entry, fragment or hand-off chunk names `S`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b1_a_drain_recorded_just_before_the_intent_commits_makes_it_replan() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let drained = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&drained);
+        let drain: Hook = Arc::new(move |batch| {
+            let server = first_server(batch);
+            *seen.lock().unwrap() = Some(server);
+            WriteBatch::new().put(metadata::desired_dserver_key(server), b"draining".to_vec())
+        });
+        rig.store
+            .script(Kind::Intent, vec![Act::First(Side::Batch(drain))], None);
+        let body = body_bytes(3 * CHUNK);
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK])))
+                .await,
+        );
+        let server = drained.lock().unwrap().expect("the hook ran");
+
+        let intents = rig.log.commits(Kind::Intent);
+        assert_eq!(
+            intents[0].answer,
+            Answer::Conflict,
+            "the drain fence failed the intent"
+        );
+        assert_eq!(first_server(&intents[0].batch), server);
+        // The fence is one `require_absent` per server the entry names, in the custodian's bytes.
+        let fenced: BTreeSet<Vec<u8>> = intents[0]
+            .batch
+            .preconditions
+            .iter()
+            .filter(|p| p.expected.is_none() && p.key.starts_with(b"desired:dserver:"))
+            .map(|p| p.key.clone())
+            .collect();
+        let named: BTreeSet<Vec<u8>> = intent_entry(&intents[0].batch)
+            .staged()
+            .placement()
+            .iter()
+            .map(|s| format!("desired:dserver:{s}").into_bytes())
+            .collect();
+        assert_eq!(fenced, named);
+        assert_eq!(intents[1].answer, Answer::Committed, "the re-plan landed");
+        assert_nothing_names(&rig, &attempt, server).await;
+        assert_eq!(attempt.chunks().len(), 3);
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+/// **B2.** `desired:dserver:<S>` is recorded before staging and `S` is the selector's first
+/// pick (lowest utilization) on the full topology. Staging completes, nothing names `S`, and no
+/// intent conflicts: the plan left `S` out, rather than learning of it from the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b2_a_drain_recorded_before_staging_is_planned_around() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let preferred = 9;
+        rig.topology = topology_preferring(preferred);
+        assert_eq!(
+            select_distinct_domains(&rig.topology, FRAGMENTS).unwrap()[0],
+            preferred,
+            "the fixture binds: S is the full topology's first pick"
+        );
+        let drain = WriteBatch::new().put(
+            metadata::desired_dserver_key(preferred),
+            b"draining".to_vec(),
+        );
+        rig.store.inner.commit(drain).await.unwrap();
+        let body = body_bytes(3 * CHUNK);
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK])))
+                .await,
+        );
+        assert_nothing_names(&rig, &attempt, preferred).await;
+        assert!(
+            rig.log
+                .commits(Kind::Intent)
+                .iter()
+                .all(|c| c.answer == Answer::Committed),
+            "no intent conflicted"
+        );
+        assert_eq!(rig.log.commits(Kind::Intent).len(), 3);
+    })
+    .await;
+}
+
+/// **B3.** Four of twelve single-server domains draining and RS(4,2), which fits in the other
+/// eight: the part stages, and nothing names a draining server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b3_four_of_twelve_draining_still_stages() {
+    within(async {
+        let mut rig = Rig::new().await;
+        for server in 0..4 {
+            let drain =
+                WriteBatch::new().put(metadata::desired_dserver_key(server), b"draining".to_vec());
+            rig.store.inner.commit(drain).await.unwrap();
+        }
+        let body = body_bytes(2 * CHUNK + 5);
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[2 * CHUNK + 5])))
+                .await,
+        );
+        for server in 0..4 {
+            assert_nothing_names(&rig, &attempt, server).await;
+        }
+        assert_eq!(attempt.chunks().len(), 3);
+    })
+    .await;
+}
+
+/// **B3.** Too few non-draining domains for the scheme (RS(6,3) needs nine, eight remain): a
+/// typed placement error, never `NoSuchUpload` for an `Open` session, and nothing written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b3_too_few_domains_is_a_typed_placement_error_writing_nothing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        for server in 0..4 {
+            let drain =
+                WriteBatch::new().put(metadata::desired_dserver_key(server), b"draining".to_vec());
+            rig.store.inner.commit(drain).await.unwrap();
+        }
+        let before = snapshot(&rig.store.inner).await;
+        let rs63 = EcScheme::ReedSolomon { k: 6, m: 3 };
+        let outcome = rig
+            .stage(
+                |r| r.scheme = rs63,
+                stream_of(vec![Bytes::from(body_bytes(CHUNK))]),
+            )
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(
+                cause,
+                Stop::Placement(SelectorError::InsufficientDomains { have: 8, need: 9 })
+            ),
+            "{cause:?}"
+        );
+        assert_eq!(snapshot(&rig.store.inner).await, before, "nothing written");
+        assert!(rig.log.events().is_empty(), "no commit, no put");
+        assert!(matches!(rig.state().await, SessionState::Open {}));
+    })
+    .await;
+}
+
+/// **B3.** Drains recorded after the slot is reserved, leaving too few domains: the intent's own
+/// plan refuses with the same typed placement error, not `NoSuchUpload`, and no owned entry is
+/// written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b3_drains_after_the_reserve_leave_a_typed_placement_error() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let drains: Hook = Arc::new(|_| {
+            (0..7).fold(WriteBatch::new(), |batch, server| {
+                batch.put(metadata::desired_dserver_key(server), b"draining".to_vec())
+            })
+        });
+        rig.store
+            .script(Kind::Reserve, vec![Act::First(Side::Batch(drains))], None);
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(
+                cause,
+                Stop::Placement(SelectorError::InsufficientDomains { have: 5, need: 6 })
+            ),
+            "{cause:?}"
+        );
+        assert!(
+            rig.log.commits(Kind::Intent).is_empty(),
+            "no intent was sent"
+        );
+        assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+/// **(B)** The drain key keeps the custodian's exact bytes, `desired:dserver:<id>`.
+#[test]
+fn b_the_drain_key_keeps_its_bytes() {
+    assert_eq!(
+        metadata::desired_dserver_key(42),
+        b"desired:dserver:42".to_vec()
+    );
+    assert_eq!(metadata::DESIRED_DSERVER_PREFIX, b"desired:dserver:");
+    assert_eq!(
+        metadata::parse_desired_dserver_key(b"desired:dserver:42"),
+        Some(42)
+    );
+    assert_eq!(
+        metadata::parse_desired_dserver_key(b"desired:dserver:x"),
+        None
+    );
+    assert_eq!(metadata::parse_desired_dserver_key(b"orphan:42"), None);
+}
+
+// ═══════════════════════ (C) slots ═══════════════════════
+
+/// A request for `attempt` on the rig's session.
+fn reserve_request<'a>(rig: &'a Rig, attempt: &'a AttemptId) -> StageRequest<'a> {
+    request(&rig.topology, &rig.upload, attempt)
+}
+
+fn inflight_full() -> Refusal {
+    Refusal::SlowDown {
+        pressure: Backpressure::InflightParts {
+            max_inflight_parts: MAX_INFLIGHT_PARTS,
+        },
+    }
+}
+
+/// Reserve every slot index of the rig's session for attempts `1..=MAX_INFLIGHT_PARTS`.
+async fn fill_every_slot(rig: &Rig) {
+    for n in 1..=u128::from(MAX_INFLIGHT_PARTS) {
+        let id = attempt(n);
+        let outcome = reserve_slot(&rig.store, &reserve_request(rig, &id), T0)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ReserveOutcome::Reserved { .. }));
+    }
+}
+
+/// **(C)** `MAX_INFLIGHT_PARTS` reserves succeed on one session, at indices `0..16`; the next is
+/// `SlowDown { InflightParts }`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_the_cap_is_the_key_space() {
+    within(async {
+        let rig = Rig::new().await;
+        for n in 0..u128::from(MAX_INFLIGHT_PARTS) {
+            let id = attempt(n);
+            let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &id), T0)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                ReserveOutcome::Reserved {
+                    index: SlotIndex::new(n as u32).unwrap(),
+                    attempt_id: id
+                }
+            );
+        }
+        let id = attempt(99);
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &id), T0)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReserveOutcome::Refused(inflight_full()));
+        assert_eq!(
+            slots(&rig.store.inner, &rig.upload).await.len(),
+            MAX_INFLIGHT_PARTS as usize
+        );
+    })
+    .await;
+}
+
+/// **(C)** The same answer from `stage_part` (v3 sign-off): with every slot index held, staging
+/// answers `Refused(SlowDown { InflightParts })`, never `Refused(NoSuchUpload)`, and writes
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_stage_part_with_every_slot_held_answers_slow_down() {
+    within(async {
+        let mut rig = Rig::new().await;
+        fill_every_slot(&rig).await;
+        let before = snapshot(&rig.store.inner).await;
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        match outcome {
+            Ok(StageOutcome::Refused(refusal)) => assert_eq!(refusal, inflight_full()),
+            other => panic!("expected Refused(SlowDown), got {other:?}"),
+        }
+        assert_eq!(snapshot(&rig.store.inner).await, before, "nothing written");
+        assert!(rig.log.commits(Kind::Intent).is_empty());
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+/// **(C)** A reserve against a session that is not `Open` — fenced by Abort, or absent — answers
+/// `NoSuchUpload` and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_non_open_session_is_no_such_upload_writing_nothing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        fence(&rig.store.inner, &rig.upload).await;
+        let before = snapshot(&rig.store.inner).await;
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReserveOutcome::Refused(Refusal::NoSuchUpload));
+        let staging = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(10))]))
+            .await;
+        assert!(
+            matches!(staging, Ok(StageOutcome::Refused(Refusal::NoSuchUpload))),
+            "{staging:?}"
+        );
+        let (absent, _) = identity(77);
+        let mut req = reserve_request(&rig, &rig.attempt);
+        req.upload_id = &absent;
+        let outcome = reserve_slot(&rig.store, &req, T0).await.unwrap();
+        assert_eq!(outcome, ReserveOutcome::Refused(Refusal::NoSuchUpload));
+        assert_eq!(snapshot(&rig.store.inner).await, before, "nothing written");
+        assert!(rig.log.events().is_empty(), "no commit");
+    })
+    .await;
+}
+
+/// **(C)** A session that leaves `Open` between the reserve's session read and its commit (an
+/// Abort in between) answers `NoSuchUpload`, not `SlowDown`, from `reserve_slot` and from
+/// `stage_part`. The reserve's one commit conflicts and no slot of the attempt exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_session_leaving_open_under_the_reserve_is_no_such_upload() {
+    for through_stage_part in [false, true] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let abort = Act::First(Side::Abort(rig.upload.clone()));
+            rig.store.script(Kind::Reserve, vec![abort], None);
+            let refusal = if through_stage_part {
+                match rig
+                    .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+                    .await
+                {
+                    Ok(StageOutcome::Refused(refusal)) => refusal,
+                    other => panic!("expected Refused, got {other:?}"),
+                }
+            } else {
+                match reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+                    .await
+                    .unwrap()
+                {
+                    ReserveOutcome::Refused(refusal) => refusal,
+                    other => panic!("expected Refused, got {other:?}"),
+                }
+            };
+            assert_eq!(
+                refusal,
+                Refusal::NoSuchUpload,
+                "stage_part {through_stage_part}"
+            );
+            let reserves = rig.log.commits(Kind::Reserve);
+            assert_eq!(reserves.len(), 1);
+            assert_eq!(reserves[0].answer, Answer::Conflict);
+            assert_eq!(
+                slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+                0
+            );
+            assert!(rig.log.commits(Kind::Intent).is_empty());
+        })
+        .await;
+    }
+}
+
+/// **(C)** The same move on the pinned path, after an ambiguous outcome: the reserve's batch is
+/// held (`may_still_commit: true`), and right after its slot read an Abort fences the session.
+/// Whether the held batch stays out or lands just before the Abort, the reserve answers
+/// `NoSuchUpload`, never `SlowDown`; a slot the held batch installed is residue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_the_pinned_reserve_answers_no_such_upload_once_the_session_left_open() {
+    for lands in [false, true] {
+        within(async {
+            let rig = Rig::new().await;
+            rig.store
+                .script(Kind::Reserve, vec![Act::Hold { advance: 0 }], None);
+            let index0 = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+            let mut then = Vec::new();
+            if lands {
+                then.push(Then::ReleaseHeld);
+            }
+            then.push(Then::Abort(rig.upload.clone()));
+            rig.store.after_read(&index0, 0, then);
+            let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                ReserveOutcome::Refused(Refusal::NoSuchUpload),
+                "lands {lands}"
+            );
+            assert_eq!(rig.log.commits(Kind::Reserve).len(), 1, "no second probe");
+            assert_eq!(
+                slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+                usize::from(lands),
+                "lands {lands}"
+            );
+        })
+        .await;
+    }
+}
+
+/// **(C)** A reserve whose batch lands but answers `CommitUnknownResult` — either
+/// `may_still_commit` — adopts its own slot on re-read, with one commit. With a second live
+/// attempt beside it and no residue, the held slots equal the live attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_landed_unknown_reserve_adopts_its_own_slot() {
+    for may_still_commit in [false, true] {
+        within(async {
+            let rig = Rig::new().await;
+            rig.store.script(
+                Kind::Reserve,
+                vec![Act::Unknown {
+                    applied: true,
+                    may_still_commit,
+                }],
+                None,
+            );
+            let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                ReserveOutcome::Reserved {
+                    index: SlotIndex::new(0).unwrap(),
+                    attempt_id: rig.attempt.clone()
+                },
+                "may_still_commit {may_still_commit}"
+            );
+            assert_eq!(
+                rig.log.commits(Kind::Reserve).len(),
+                1,
+                "adopted, not re-reserved"
+            );
+            let other = attempt(5);
+            let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &other), T0)
+                .await
+                .unwrap();
+            assert!(matches!(outcome, ReserveOutcome::Reserved { .. }));
+            assert_eq!(
+                slots(&rig.store.inner, &rig.upload).await.len(),
+                2,
+                "two live attempts"
+            );
+            assert_eq!(
+                slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+                1
+            );
+        })
+        .await;
+    }
+}
+
+/// **(C) The same-index rule.** Attempt X holds index 0. This reserve takes index 1 and its batch
+/// is held (`may_still_commit: true`, absent on re-read); X releases index 0 before the retry.
+/// The retry goes to index **1** again with the same attempt id, and once the held batch is
+/// released this attempt holds exactly one slot. A reserve that took the lowest free index after
+/// the ambiguous outcome would take 0 here and end with two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_an_ambiguous_reserve_retries_the_same_index() {
+    within(async {
+        let rig = Rig::new().await;
+        let x = attempt(1);
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &x), T0)
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ReserveOutcome::Reserved { index, .. } if index.get() == 0));
+        let key = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        let x_slot = rig.store.inner.get(&key).await.unwrap().unwrap();
+        let release: Hook = Arc::new(move |_| {
+            WriteBatch::new()
+                .require(key.clone(), x_slot.clone())
+                .delete(key.clone())
+        });
+        rig.store.script(
+            Kind::Reserve,
+            vec![Act::HoldThen(Side::Batch(release))],
+            None,
+        );
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReserveOutcome::Reserved {
+                index: SlotIndex::new(1).unwrap(),
+                attempt_id: rig.attempt.clone()
+            },
+            "the retry pinned index 1, though index 0 was free"
+        );
+        assert_eq!(
+            rig.log.commits(Kind::Reserve).len(),
+            3,
+            "X's, the held one, the retry"
+        );
+        assert_eq!(rig.store.release_held().await, CommitOutcome::Conflict);
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            1,
+            "exactly one slot of this attempt"
+        );
+    })
+    .await;
+}
+
+/// **(C)** After [`RESERVE_AMBIGUOUS_ROUNDS`] ambiguous rounds the reserve refuses `SlowDown`,
+/// after exactly that many commits. Then the held batch lands after the refusal, with
+/// `MAX_INFLIGHT_PARTS − 1` other slots held: exactly one slot of the refused attempt exists, no
+/// live attempt owns it, and it counts toward the cap — the next reserve is refused too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_held_reserve_landing_after_its_refusal_is_one_counted_slot() {
+    within(async {
+        let rig = Rig::new().await;
+        let x = attempt(1);
+        reserve_slot(&rig.store, &reserve_request(&rig, &x), T0)
+            .await
+            .unwrap();
+        let mut plan = vec![Act::Hold { advance: 0 }];
+        plan.extend((1..RESERVE_AMBIGUOUS_ROUNDS).map(|_| Act::Unknown {
+            applied: false,
+            may_still_commit: true,
+        }));
+        rig.store.script(Kind::Reserve, plan, None);
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReserveOutcome::Refused(inflight_full()),
+            "refused after its ambiguous rounds"
+        );
+        let ours: Vec<_> = rig.log.commits(Kind::Reserve).into_iter().skip(1).collect();
+        assert_eq!(
+            ours.len(),
+            RESERVE_AMBIGUOUS_ROUNDS as usize,
+            "exactly the bound"
+        );
+        let pinned = slot_key(&rig.upload, SlotIndex::new(1).unwrap());
+        assert!(
+            ours.iter()
+                .all(|c| c.batch.puts.iter().all(|(key, _)| *key == pinned)),
+            "every round went to the one index"
+        );
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            0
+        );
+
+        // Fill every other index, then the held batch lands.
+        for index in 2..MAX_INFLIGHT_PARTS {
+            let key = slot_key(&rig.upload, SlotIndex::new(index).unwrap());
+            let put = WriteBatch::new().put(key, other_slot(u128::from(index), PART + 1));
+            rig.store.inner.commit(put).await.unwrap();
+        }
+        assert_eq!(
+            slots(&rig.store.inner, &rig.upload).await.len(),
+            MAX_INFLIGHT_PARTS as usize - 1
+        );
+        assert_eq!(rig.store.release_held().await, CommitOutcome::Committed);
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            1,
+            "exactly one slot of the refused attempt, never two"
+        );
+        assert_eq!(
+            slots(&rig.store.inner, &rig.upload).await.len(),
+            MAX_INFLIGHT_PARTS as usize
+        );
+        let next = attempt(50);
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &next), T0)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ReserveOutcome::Refused(inflight_full()),
+            "the residue counts toward the cap"
+        );
+    })
+    .await;
+}
+
+/// **(C)** A reserve whose held index is then taken by another attempt refuses rather than
+/// probing elsewhere: a second slot for this attempt could land once that attempt released it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_held_index_taken_by_another_refuses() {
+    within(async {
+        let rig = Rig::new().await;
+        let key = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        // Another attempt at the same part: only the attempt id tells it from this one's slot.
+        let squat: Hook =
+            Arc::new(move |_| WriteBatch::new().put(key.clone(), other_slot(9, PART)));
+        rig.store
+            .script(Kind::Reserve, vec![Act::HoldThen(Side::Batch(squat))], None);
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReserveOutcome::Refused(inflight_full()));
+        assert_eq!(
+            rig.log.commits(Kind::Reserve).len(),
+            1,
+            "no probe of another index"
+        );
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            0
+        );
+    })
+    .await;
+}
+
+/// **(C)** A session moved to a later `Open` epoch under the reserve (a Complete fence and its
+/// release): the reserve is answered from the new state and reserves under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_session_moved_to_a_later_open_epoch_is_reserved_under() {
+    within(async {
+        let rig = Rig::new().await;
+        let later = open_at(&rig.session, 2);
+        let side = move_session(&rig.upload, later.clone());
+        rig.store
+            .script(Kind::Reserve, vec![Act::First(side)], None);
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ReserveOutcome::Reserved { .. }),
+            "{outcome:?}"
+        );
+        let reserves = rig.log.commits(Kind::Reserve);
+        assert_eq!(reserves.len(), 2);
+        assert_eq!(reserves[0].answer, Answer::Conflict);
+        let session = mpu_key(&rig.upload);
+        assert!(reserves[1]
+            .batch
+            .preconditions
+            .iter()
+            .any(|p| p.key == session && p.expected.as_ref() == Some(&later)));
+    })
+    .await;
+}
+
+/// **(C)** A pinned index is not dropped on a newer session epoch alone (iteration-1 finding). A
+/// held reserve at index 0 lands **after** its slot read found the index empty and **before** the
+/// session moves to a later `Open` epoch, so the session read that follows finds the session
+/// moved. The reserve reads the index once more before letting it go, finds its own slot, and
+/// keeps it under the new session: one reserve commit, one slot of this attempt, and the intent
+/// fenced on the new session bytes lands first time. A reserve that unpinned on seeing the
+/// session move would probe index 1 and hold two slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_held_reserve_landing_before_the_session_moves_keeps_its_one_slot() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let later = open_at(&rig.session, 2);
+        rig.store
+            .script(Kind::Reserve, vec![Act::Hold { advance: 0 }], None);
+        let index0 = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        let move_session = WriteBatch::new().put(mpu_key(&rig.upload), later.clone());
+        rig.store.after_read(
+            &index0,
+            0,
+            vec![Then::ReleaseHeld, Then::Commit(move_session)],
+        );
+        let body = body_bytes(CHUNK);
+        let attempt = staged(rig.stage(|_| {}, stream_of(vec![Bytes::from(body)])).await);
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            1,
+            "exactly one slot of this attempt"
+        );
+        assert_eq!(
+            attempt.slot_index().get(),
+            0,
+            "the index its held batch took"
+        );
+        assert_eq!(rig.log.commits(Kind::Reserve).len(), 1, "no second probe");
+        assert_eq!(attempt.session_bytes(), &later, "fenced on the new session");
+        let intents = rig.log.commits(Kind::Intent);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].answer, Answer::Committed);
+    })
+    .await;
+}
+
+/// **(C)** The index a held reserve may still install is found holding bytes that are not a
+/// slot record: a typed record error (ADR-0045) that keeps the held batch's doubt, never read as
+/// "another attempt's slot", never adopted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_an_undecodable_slot_at_the_reserved_index_is_a_typed_error() {
+    within(async {
+        let rig = Rig::new().await;
+        let key = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        let garbage: Hook =
+            Arc::new(move |_| WriteBatch::new().put(key.clone(), b"not a slot".to_vec()));
+        rig.store.script(
+            Kind::Reserve,
+            vec![Act::HoldThen(Side::Batch(garbage))],
+            None,
+        );
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0).await;
+        let Err(StageError::InDoubt(doubt)) = outcome else {
+            panic!("expected InDoubt, got {outcome:?}");
+        };
+        assert!(doubt.may_still_commit, "the held batch's doubt is kept");
+        assert!(matches!(doubt.cause, Stop::Record(_)), "{:?}", doubt.cause);
+        assert_eq!(rig.log.commits(Kind::Reserve).len(), 1);
+    })
+    .await;
+}
+
+/// One schedule of a read-fault leg: what the commits of one kind do, which read fails (its key
+/// and how many earlier reads of that key pass), how many commits of that kind are made, and
+/// what the held batch meets when the test releases it afterwards.
+struct FaultSchedule {
+    name: &'static str,
+    plan: Vec<Act>,
+    fails: Option<(Vec<u8>, usize)>,
+    commits: usize,
+    released: CommitOutcome,
+}
+
+/// Check the end state of a read-fault schedule: the doubt is the held batch's, the scripted read
+/// fault fired, and the held batch, released afterwards, meets what the schedule says — landing
+/// shows the doubt was real.
+fn assert_fault_doubt(schedule: &FaultSchedule, doubt: &InDoubt, log: &Log) {
+    let name = schedule.name;
+    assert!(doubt.may_still_commit, "{name}: the held batch's doubt");
+    assert!(
+        doubt.outcome.may_still_commit,
+        "{name}: the report kept is the held batch's, not a later out-of-flight one"
+    );
+    assert!(
+        matches!(doubt.cause, Stop::Store(_)),
+        "{name}: {:?}",
+        doubt.cause
+    );
+    if let Some((key, _)) = &schedule.fails {
+        assert!(
+            log.has(|e| matches!(e, Event::ReadFault { key: k } if k == key)),
+            "{name}: the scripted read fault fired"
+        );
+    }
+}
+
+/// **(C)** A store read (or commit) that fails while a reserve batch is in doubt keeps the doubt
+/// (review finding): the reserve answers `InDoubt`, classed `Indeterminate`, carrying the held
+/// batch's `may_still_commit: true` — never a plain stop that says nothing is in doubt, though
+/// the fault itself is transient. Each schedule holds the reserve's first batch at index 0, then
+/// fails a different step: the slot read after a same-index retry answered an out-of-flight
+/// unknown (both doubts are live, and the held one must win); the session read after the held
+/// round's slot read; the second read of the pinned index after the session moved; the retry's
+/// own commit. Releasing the held batch afterwards lands it (or, after the session moved,
+/// conflicts), so the doubt was real.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_reserve_read_that_fails_while_a_batch_is_in_doubt_keeps_the_doubt() {
+    for at in 0..4 {
+        within(async {
+            let rig = Rig::new().await;
+            let index0 = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+            let session = mpu_key(&rig.upload);
+            let held = Act::Hold { advance: 0 };
+            let out_of_flight = Act::Unknown {
+                applied: false,
+                may_still_commit: false,
+            };
+            let moved = move_session(&rig.upload, open_at(&rig.session, 2));
+            let schedule = [
+                FaultSchedule {
+                    name: "the retry's slot read, after an out-of-flight unknown",
+                    plan: vec![held.clone(), out_of_flight],
+                    fails: Some((index0.clone(), 1)),
+                    commits: 2,
+                    released: CommitOutcome::Committed,
+                },
+                FaultSchedule {
+                    name: "the session read after the held round's slot read",
+                    plan: vec![held.clone()],
+                    fails: Some((session, 1)),
+                    commits: 1,
+                    released: CommitOutcome::Committed,
+                },
+                FaultSchedule {
+                    name: "the pinned index's second read, after the session moved",
+                    plan: vec![Act::HoldThen(moved)],
+                    fails: Some((index0, 1)),
+                    commits: 1,
+                    released: CommitOutcome::Conflict,
+                },
+                FaultSchedule {
+                    name: "the same-index retry's commit",
+                    plan: vec![held, Act::Fail],
+                    fails: None,
+                    commits: 2,
+                    released: CommitOutcome::Committed,
+                },
+            ]
+            .into_iter()
+            .nth(at)
+            .unwrap();
+            rig.store.script(Kind::Reserve, schedule.plan.clone(), None);
+            if let Some((key, skip)) = &schedule.fails {
+                rig.store.after_read(key, *skip, vec![Then::Fault]);
+            }
+            let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0).await;
+            let doubt = in_doubt(outcome);
+            assert_fault_doubt(&schedule, &doubt, &rig.log);
+            let name = schedule.name;
+            assert_eq!(
+                rig.log.commits(Kind::Reserve).len(),
+                schedule.commits,
+                "{name}"
+            );
+            assert_eq!(
+                slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+                0,
+                "{name}: nothing landed yet"
+            );
+            assert_eq!(rig.store.release_held().await, schedule.released, "{name}");
+            assert_eq!(
+                slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+                usize::from(schedule.released == CommitOutcome::Committed),
+                "{name}: one slot at most"
+            );
+        })
+        .await;
+    }
+}
+
+// ═══════════════════════ (D) leases ═══════════════════════
+
+/// The lease a batch puts on `key`.
+fn lease_put(batch: &WriteBatch, key: &[u8]) -> u64 {
+    let (_, value) = batch
+        .puts
+        .iter()
+        .find(|(k, _)| k == key)
+        .expect("the batch puts the key");
+    if key.starts_with(SLOT_PREFIX) {
+        decode_slot_record(value).unwrap().lease_expiry_millis()
+    } else {
+        decode_owned_entry(key, value)
+            .unwrap()
+            .2
+            .lease_expiry_millis()
+    }
+}
+
+/// **(D)** The reserve writes the slot lease at `now + TTL`. Each intent writes its owned entry's
+/// lease and rewrites the slot with its lease moved forward, in the same batch, both at its own
+/// reading plus a TTL — or a millisecond past the slot lease it replaces, when two intents share
+/// a reading. No lease staging writes is earlier than the slot lease it replaces.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d_the_reserve_and_every_intent_write_their_leases_forward() {
+    within(async {
+        let mut rig = Rig::new().await;
+        // Chunks 1 and 2 are registered at T0, chunk 3 at T0 + 100.
+        rig.store.script(
+            Kind::Intent,
+            vec![Act::Pass, Act::PassThenAdvance(100)],
+            None,
+        );
+        let body = body_bytes(3 * CHUNK);
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK])))
+                .await,
+        );
+        let reserve = &rig.log.commits(Kind::Reserve)[0];
+        let slot = attempt.slot_key().to_vec();
+        assert_eq!(lease_put(&reserve.batch, &slot), T0 + TTL, "now + TTL");
+        let intents = rig.log.commits(Kind::Intent);
+        let expected = [T0 + TTL + 1, T0 + TTL + 2, T0 + 100 + TTL];
+        let mut replaced = T0 + TTL;
+        for (intent, lease) in intents.iter().zip(expected) {
+            assert_eq!(intent.answer, Answer::Committed);
+            let entry = intent_put(&intent.batch).0;
+            assert_eq!(
+                decode_slot_record(&slot_required(&intent.batch))
+                    .unwrap()
+                    .lease_expiry_millis(),
+                replaced,
+                "the slot lease it replaces"
+            );
+            assert_eq!(
+                lease_put(&intent.batch, &slot),
+                lease,
+                "the slot's new lease"
+            );
+            assert_eq!(lease_put(&intent.batch, &entry), lease, "the owned lease");
+            assert!(lease > replaced, "never earlier than the lease it replaces");
+            assert!(
+                lease >= intent.clock + TTL,
+                "at least a TTL past its reading"
+            );
+            replaced = lease;
+        }
+        assert_eq!(attempt.slot().lease_expiry_millis(), T0 + 100 + TTL);
+        let leases: Vec<u64> = attempt
+            .owned()
+            .iter()
+            .map(|held| held.entry().lease_expiry_millis())
+            .collect();
+        assert_eq!(leases, expected);
+    })
+    .await;
+}
+
+/// The cause of a staging that stopped on a lapsed lease: the key, its expiry, the reading.
+fn lapsed(cause: &Stop) -> (Vec<u8>, u64, u64) {
+    match cause {
+        Stop::LeaseLapsed {
+            key,
+            lease_expiry_millis,
+            now_millis,
+        } => (key.clone().into_bytes(), *lease_expiry_millis, *now_millis),
+        other => panic!("expected LeaseLapsed, got {other:?}"),
+    }
+}
+
+/// **(D)** The slot's lease lapses while the first intent reads the drain records. The intent
+/// checks every lease at its own reading, taken after that read, and refuses: no intent is sent,
+/// so the lapsed slot lease is never moved forward, and no fragment is written. An intent that
+/// stamped a fresh lease without the check would revive the slot and stage the part.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d_an_intent_refuses_a_slot_lease_that_lapsed_during_its_drain_read() {
+    within(async {
+        let mut rig = Rig::new().await;
+        // The first drain read is staging's pre-check; the second is the first intent's.
+        rig.store.after_read(
+            metadata::DESIRED_DSERVER_PREFIX,
+            1,
+            vec![Then::Advance(TTL)],
+        );
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let err = outcome.expect_err("staging stopped");
+        let text = err.to_string();
+        let reserved = rig.log.commits(Kind::Reserve).remove(0).batch.puts[0].clone();
+        let slot = String::from_utf8(reserved.0.clone()).unwrap();
+        for part in [
+            rig.upload.as_str(),
+            slot.as_str(),
+            "is not revived",
+            "no batch of this part attempt is in doubt",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text:?}");
+        }
+        let cause = stopped(Err(err));
+        assert_eq!(lapsed(&cause), (reserved.0.clone(), T0 + TTL, T0 + TTL));
+        assert!(
+            rig.log.commits(Kind::Intent).is_empty(),
+            "no intent was sent"
+        );
+        assert!(rig.log.puts().is_empty());
+        assert_eq!(
+            rig.store.inner.get(&reserved.0).await.unwrap(),
+            Some(reserved.1),
+            "the slot is exactly as reserved"
+        );
+    })
+    .await;
+}
+
+/// **(D)** Chunk 1's owned lease lapses while chunk 3's intent reads the drain records; the slot's
+/// lease, moved forward by chunk 2's intent, has not. Chunk 3's intent checks chunk 1's lease too
+/// and refuses before it is sent. An intent that checked only the slot's lease would land chunk 3
+/// beside a dead entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d_an_intent_refuses_an_owned_lease_that_lapsed_during_its_drain_read() {
+    within(async {
+        let mut rig = Rig::new().await;
+        // Chunk 1 at T0 (leases T0 + TTL + 1), chunk 2 at T0 + 1000.
+        rig.store
+            .script(Kind::Intent, vec![], Some(Act::PassThenAdvance(1_000)));
+        // Pre-check, chunk 1's intent, chunk 2's, then chunk 3's: the clock reaches chunk 1's
+        // lease during that last read.
+        rig.store.after_read(
+            metadata::DESIRED_DSERVER_PREFIX,
+            3,
+            vec![Then::Advance(TTL + 1 - 2_000)],
+        );
+        let body = body_bytes(3 * CHUNK);
+        let outcome = rig
+            .stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK])))
+            .await;
+        let cause = stopped(outcome);
+        let chunk1 = sidx_key(&rig.upload, part(), 1);
+        assert_eq!(lapsed(&cause), (chunk1, T0 + TTL + 1, T0 + TTL + 1));
+        assert!(
+            rig.log.intents_of(3).is_empty(),
+            "chunk 3's intent was never sent"
+        );
+        assert!(rig.log.puts().iter().all(|put| put.id.chunk != 3));
+        assert_eq!(
+            owned(&rig.store.inner, &rig.upload).await[&1].lease_expiry_millis(),
+            T0 + TTL + 1,
+            "chunk 1's lease was not revived"
+        );
+    })
+    .await;
+}
+
+/// **(D)** An intent round is lost — answered `Conflict` unapplied, or held — slowly enough that
+/// the slot's lease lapses before the retry. The retry checks the leases at its own fresh reading
+/// and refuses before it is sent: one intent commit. Lost to a conflict, nothing is in doubt; held,
+/// the error keeps the held batch's `may_still_commit` doubt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d_an_intent_retry_refuses_a_lease_that_lapsed_between_rounds() {
+    for held in [false, true] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let lost = if held {
+                Act::Hold { advance: TTL }
+            } else {
+                Act::ConflictThenAdvance(TTL)
+            };
+            rig.store.script(Kind::Intent, vec![lost], None);
+            let outcome = rig
+                .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+                .await;
+            let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+            let cause = match (held, outcome) {
+                (false, outcome) => stopped(outcome),
+                (true, Err(StageError::InDoubt(doubt))) => {
+                    assert!(doubt.may_still_commit, "the held batch's doubt is kept");
+                    doubt.cause
+                }
+                (true, other) => panic!("expected InDoubt, got {other:?}"),
+            };
+            assert_eq!(lapsed(&cause), (slot, T0 + TTL, T0 + TTL), "held {held}");
+            assert_eq!(rig.log.commits(Kind::Intent).len(), 1, "no retry was sent");
+            assert!(rig.log.puts().is_empty());
+        })
+        .await;
+    }
+}
+
+// ═══════════════════════ (E) unknown outcomes ═══════════════════════
+
+/// **(E)** An intent whose batch lands but answers `CommitUnknownResult` (either
+/// `may_still_commit`) is recognised by re-reading the owned entry's exact bytes: one commit, no
+/// second entry for the chunk, and its fragments go to the placement that landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_a_landed_unknown_intent_is_adopted_from_its_exact_bytes() {
+    for may_still_commit in [false, true] {
+        within(async {
+            let mut rig = Rig::new().await;
+            rig.store.script(
+                Kind::Intent,
+                vec![Act::Unknown {
+                    applied: true,
+                    may_still_commit,
+                }],
+                None,
+            );
+            let body = body_bytes(3 * CHUNK);
+            let attempt = staged(
+                rig.stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK])))
+                    .await,
+            );
+            assert_eq!(rig.log.intents_of(1).len(), 1, "adopted, not re-sent");
+            let entries = owned(&rig.store.inner, &rig.upload).await;
+            assert_eq!(entries.len(), 3, "one owned entry per chunk");
+            let landed = intent_entry(&rig.log.intents_of(1)[0].batch);
+            assert_eq!(entries[&1], landed);
+            assert_eq!(attempt.chunks()[0].placement, landed.staged().placement());
+            assert_fragments_evidenced(&rig).await;
+        })
+        .await;
+    }
+}
+
+/// **(E)** An intent answered `CommitUnknownResult { may_still_commit: false }` and not applied is
+/// retried; staging ends with exactly one owned entry per chunk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_an_out_of_flight_unknown_intent_that_did_not_land_is_retried() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(
+            Kind::Intent,
+            vec![Act::Unknown {
+                applied: false,
+                may_still_commit: false,
+            }],
+            None,
+        );
+        let body = body_bytes(3 * CHUNK);
+        staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK])))
+                .await,
+        );
+        assert_eq!(rig.log.intents_of(1).len(), 2, "retried once");
+        assert_eq!(owned(&rig.store.inner, &rig.upload).await.len(), 3);
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+/// **(E) (i)** An intent is held (`may_still_commit: true`) and the clock moves on; the held
+/// batch is released just before the attempt's next batch, which therefore conflicts. The
+/// re-read finds the held batch's exact entry: it is adopted — its placement, and its own
+/// `t_auth` for the deadline — and no fragment was written before that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_i_a_held_intent_released_before_the_next_batch_is_adopted() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(
+            Kind::Intent,
+            vec![Act::Hold { advance: 500 }, Act::ReleaseHeldFirst],
+            None,
+        );
+        let body = body_bytes(2 * CHUNK);
+        staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[2 * CHUNK])))
+                .await,
+        );
+        let intents = rig.log.intents_of(1);
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[1].answer, Answer::Conflict);
+        let held = intent_put(&intents[0].batch);
+        assert_eq!(
+            rig.store.inner.get(&held.0).await.unwrap(),
+            Some(held.1),
+            "the held batch's entry is the durable one"
+        );
+        for put in rig.log.puts().iter().filter(|p| p.id.chunk == 1) {
+            assert_eq!(
+                put.deadline,
+                Some(intents[0].clock + W),
+                "the held batch's t_auth"
+            );
+        }
+        assert_intents_precede_puts(&rig.log);
+        assert_fragments_evidenced(&rig).await;
+        assert_eq!(owned(&rig.store.inner, &rig.upload).await.len(), 2);
+    })
+    .await;
+}
+
+/// **(E) (ii)** Chunk 2's intent is held, and every later batch is answered `Conflict` unapplied
+/// until the rounds run out: no fragment of chunk 2 is written on the strength of an absent read,
+/// and staging returns an in-doubt error that keeps `may_still_commit`. The held batch then lands,
+/// and every fragment written is named by a durable owned entry with its placement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_ii_a_held_intent_that_never_settles_ends_in_doubt() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(
+            Kind::Intent,
+            vec![Act::Pass, Act::Hold { advance: 0 }],
+            Some(Act::Conflict),
+        );
+        let body = body_bytes(3 * CHUNK);
+        let outcome = rig.stage(|_| {}, stream_of(pieces(&body, &[3 * CHUNK]))).await;
+        let err = match outcome {
+            Err(err @ StageError::InDoubt(_)) => err,
+            other => panic!("expected InDoubt, got {other:?}"),
+        };
+        assert_eq!(classify(&err), ErrorClass::Indeterminate, "{err}");
+        let text = err.to_string();
+        let spent = format!("chunk 2's intent spent all {INTENT_ROUNDS} rounds");
+        for part in [
+            rig.upload.as_str(),
+            "is in doubt",
+            "may still be applied",
+            spent.as_str(),
+        ] {
+            assert!(text.contains(part), "{part:?} in {text:?}");
+        }
+        let StageError::InDoubt(doubt) = err else {
+            unreachable!()
+        };
+        assert!(doubt.may_still_commit, "the doubt is kept");
+        assert!(
+            matches!(doubt.cause, Stop::IntentRoundsSpent { chunk: 2, rounds } if rounds == INTENT_ROUNDS),
+            "{:?}",
+            doubt.cause
+        );
+        assert_eq!(rig.log.intents_of(2).len(), INTENT_ROUNDS as usize);
+        // Every later batch required the slot at the bytes the held batch required, so at most one
+        // of them could land.
+        let required: BTreeSet<Bytes> = rig
+            .log
+            .intents_of(2)
+            .iter()
+            .map(|intent| slot_required(&intent.batch))
+            .collect();
+        assert_eq!(required.len(), 1, "one required slot value across every round");
+        assert!(
+            rig.log.puts().iter().all(|p| p.id.chunk != 2),
+            "no fragment of chunk 2 was written"
+        );
+        assert_eq!(rig.store.release_held().await, CommitOutcome::Committed);
+        assert_fragments_evidenced(&rig).await;
+        assert_eq!(owned(&rig.store.inner, &rig.upload).await.len(), 2);
+    })
+    .await;
+}
+
+/// **(E)** An intent answered `CommitUnknownResult { may_still_commit: false }`, not applied, and
+/// then answered `Conflict` until its rounds run out: the read after the unknown outcome settled
+/// it (the batch is out of flight and its entry absent), so the error says nothing is in doubt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_an_out_of_flight_unknown_a_read_settled_is_not_reported_in_doubt() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(
+            Kind::Intent,
+            vec![Act::Unknown {
+                applied: false,
+                may_still_commit: false,
+            }],
+            Some(Act::Conflict),
+        );
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(cause, Stop::IntentRoundsSpent { chunk: 1, rounds } if rounds == INTENT_ROUNDS),
+            "{cause:?}"
+        );
+        assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+    })
+    .await;
+}
+
+/// **(E)** An intent held (`may_still_commit: true`) while the session moves on to a later `Open`
+/// epoch: the held batch required the old session bytes, so it can never land, and once the
+/// rounds run out the error says nothing is in doubt. Released afterwards, the held batch indeed
+/// conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_a_held_intent_whose_session_moved_on_is_no_longer_in_doubt() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let later = open_at(&rig.session, 2);
+        let side = move_session(&rig.upload, later);
+        rig.store
+            .script(Kind::Intent, vec![Act::HoldThen(side)], Some(Act::Conflict));
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(cause, Stop::IntentRoundsSpent { chunk: 1, rounds } if rounds == INTENT_ROUNDS),
+            "{cause:?}"
+        );
+        assert_eq!(rig.store.release_held().await, CommitOutcome::Conflict);
+        assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+/// **(E)** A session moved to a later `Open` epoch under an intent: the intent is answered from
+/// the new state and lands under it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_an_intent_under_a_session_moved_to_a_later_open_epoch_lands_under_it() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let later = open_at(&rig.session, 2);
+        let side = move_session(&rig.upload, later.clone());
+        rig.store.script(Kind::Intent, vec![Act::First(side)], None);
+        let body = body_bytes(2 * CHUNK);
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[2 * CHUNK])))
+                .await,
+        );
+        assert_eq!(attempt.session_bytes(), &later);
+        let intents = rig.log.intents_of(1);
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].answer, Answer::Conflict);
+        assert_eq!(intents[1].answer, Answer::Committed);
+    })
+    .await;
+}
+
+/// **(E)** A fresh chunk's `sidx:` key already holding bytes no batch of this attempt put is a
+/// typed error, never adopted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_a_chunk_id_already_taken_is_a_typed_error() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let key = sidx_key(&rig.upload, part(), 1);
+        rig.store
+            .inner
+            .commit(WriteBatch::new().put(key.clone(), b"someone else".to_vec()))
+            .await
+            .unwrap();
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(&cause, Stop::ChunkIdTaken { key: named } if named.as_bytes() == key.as_slice()),
+            "{cause:?}"
+        );
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+/// **(E)** The slot is deleted from under a live attempt (the session unchanged) just before its
+/// first intent commits: the intent conflicts and staging stops with a typed error naming the
+/// slot, writing no owned entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_a_slot_lost_under_an_unchanged_session_is_a_typed_error() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        let named = slot.clone();
+        let delete: Hook = Arc::new(move |_| WriteBatch::new().delete(slot.clone()));
+        rig.store
+            .script(Kind::Intent, vec![Act::First(Side::Batch(delete))], None);
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(&cause, Stop::SlotLost { key } if key.as_bytes() == named.as_slice()),
+            "{cause:?}"
+        );
+        assert_eq!(rig.log.commits(Kind::Intent).len(), 1);
+        assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+/// **(E)** Chunk 1's intent is held, and lands **after** its entry read found nothing and
+/// **before** its slot read (iteration-1 finding). The slot then holds the value only that batch
+/// puts, so the intent reads its entry again and adopts the batch: no retry, no `SlotLost`, its
+/// fragments go to the placement that landed under its own `t_auth`, and chunk 2's intent requires
+/// the slot that batch put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_a_held_intent_landing_between_its_entry_and_slot_reads_is_adopted() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store
+            .script(Kind::Intent, vec![Act::Hold { advance: 0 }], None);
+        let entry = sidx_key(&rig.upload, part(), 1);
+        rig.store.after_read(&entry, 0, vec![Then::ReleaseHeld]);
+        let body = body_bytes(2 * CHUNK);
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(pieces(&body, &[2 * CHUNK])))
+                .await,
+        );
+        let intents = rig.log.intents_of(1);
+        assert_eq!(intents.len(), 1, "adopted, not re-sent");
+        let held = intent_put(&intents[0].batch);
+        assert_eq!(rig.store.inner.get(&held.0).await.unwrap(), Some(held.1));
+        assert_eq!(
+            attempt.chunks()[0].placement,
+            intent_entry(&intents[0].batch).staged().placement()
+        );
+        for put in rig.log.puts().iter().filter(|p| p.id.chunk == 1) {
+            assert_eq!(
+                put.deadline,
+                Some(intents[0].clock + W),
+                "the held batch's t_auth"
+            );
+        }
+        let held_slot = intents[0]
+            .batch
+            .puts
+            .iter()
+            .find(|(key, _)| key.starts_with(SLOT_PREFIX))
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            slot_required(&rig.log.intents_of(2)[0].batch),
+            held_slot,
+            "chunk 2 is fenced on the slot the adopted batch put"
+        );
+        assert_intents_precede_puts(&rig.log);
+        assert_fragments_evidenced(&rig).await;
+        assert_eq!(owned(&rig.store.inner, &rig.upload).await.len(), 2);
+    })
+    .await;
+}
+
+/// **(E)** Chunk 1's intent loses its first rounds and its **last** round is held. That batch
+/// lands after its slot read and just before the session moves to a later `Open` epoch, so the
+/// session read finds the session moved. The intent reads its entry again before letting the
+/// doubt go, adopts the batch that landed, and writes the chunk under the new session — never
+/// "rounds spent, nothing in doubt" for a chunk whose entry is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_a_held_intent_landing_before_the_session_moves_is_adopted() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let later = open_at(&rig.session, 2);
+        let mut plan = vec![Act::Conflict; INTENT_ROUNDS as usize - 1];
+        plan.push(Act::Hold { advance: 0 });
+        rig.store.script(Kind::Intent, plan, None);
+        let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        let move_session = WriteBatch::new().put(mpu_key(&rig.upload), later.clone());
+        // Each lost round reads the slot once; fire after the last round's slot read.
+        rig.store.after_read(
+            &slot,
+            INTENT_ROUNDS as usize - 1,
+            vec![Then::ReleaseHeld, Then::Commit(move_session)],
+        );
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+                .await,
+        );
+        let intents = rig.log.intents_of(1);
+        assert_eq!(
+            intents.len(),
+            INTENT_ROUNDS as usize,
+            "no round past the bound"
+        );
+        let landed = intent_put(&intents[INTENT_ROUNDS as usize - 1].batch);
+        assert_eq!(
+            rig.store.inner.get(&landed.0).await.unwrap(),
+            Some(landed.1)
+        );
+        assert_eq!(attempt.session_bytes(), &later, "fenced on the new session");
+        assert_eq!(attempt.chunks().len(), 1);
+        assert_intents_precede_puts(&rig.log);
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+/// **(E)** As in `e_a_held_intent_landing_between_its_entry_and_slot_reads_is_adopted`, but chunk
+/// 1's entry is deleted right after its held intent lands, before the intent reads it again. The
+/// slot proves the batch landed and the entry is gone: a typed error naming the entry, nothing in
+/// doubt, and no fragment of the chunk written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_an_entry_removed_after_its_intent_landed_is_a_typed_error() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store
+            .script(Kind::Intent, vec![Act::Hold { advance: 0 }], None);
+        let entry = sidx_key(&rig.upload, part(), 1);
+        let remove = WriteBatch::new().delete(entry.clone());
+        rig.store
+            .after_read(&entry, 0, vec![Then::ReleaseHeld, Then::Commit(remove)]);
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let err = match outcome {
+            Err(err @ StageError::Stopped { .. }) => err,
+            other => panic!("expected Stopped, got {other:?}"),
+        };
+        let text = err.to_string();
+        let named = String::from_utf8(entry.clone()).unwrap();
+        for part in [
+            named.as_str(),
+            "removed or rewritten after its intent landed",
+            "no batch of this part attempt is in doubt",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text:?}");
+        }
+        let cause = stopped(Err(err));
+        assert!(
+            matches!(&cause, Stop::EntryLost { key } if key.as_bytes() == entry.as_slice()),
+            "{cause:?}"
+        );
+        assert_eq!(rig.log.commits(Kind::Intent).len(), 1);
+        assert!(
+            rig.log.puts().is_empty(),
+            "no fragment without a durable entry"
+        );
+    })
+    .await;
+}
+
+/// **(E)** A store read (or commit) that fails while an intent batch is in doubt keeps the doubt
+/// (review finding): staging answers `InDoubt`, classed `Indeterminate`, carrying the held batch's
+/// `may_still_commit: true`, and writes no fragment of the chunk. Each schedule holds chunk 1's
+/// first intent, then fails a different step. The first is the finding's own: the retry answers
+/// `CommitUnknownResult { may_still_commit: false }` unapplied and the entry read after it fails,
+/// so both doubts are live and the held one must win. Then: the held round's slot read; its
+/// session read; the next round's drain read; the entry's second read after the session moved;
+/// the retry's own commit. Releasing the held batch afterwards lands it (or, after the session
+/// moved, conflicts), so the doubt was real.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_an_intent_read_that_fails_while_a_batch_is_in_doubt_keeps_the_doubt() {
+    for at in 0..6 {
+        within(async {
+            let mut rig = Rig::new().await;
+            let entry = sidx_key(&rig.upload, part(), 1);
+            let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+            let session = mpu_key(&rig.upload);
+            let drains = metadata::DESIRED_DSERVER_PREFIX.to_vec();
+            let held = Act::Hold { advance: 0 };
+            let out_of_flight = Act::Unknown {
+                applied: false,
+                may_still_commit: false,
+            };
+            let moved = move_session(&rig.upload, open_at(&rig.session, 2));
+            let schedule = [
+                FaultSchedule {
+                    name: "the retry's entry read, after an out-of-flight unknown",
+                    plan: vec![held.clone(), out_of_flight],
+                    fails: Some((entry.clone(), 1)),
+                    commits: 2,
+                    released: CommitOutcome::Committed,
+                },
+                FaultSchedule {
+                    name: "the held round's slot read",
+                    plan: vec![held.clone()],
+                    fails: Some((slot, 0)),
+                    commits: 1,
+                    released: CommitOutcome::Committed,
+                },
+                FaultSchedule {
+                    // The first session read is staging's own, before the reserve.
+                    name: "the held round's session read",
+                    plan: vec![held.clone()],
+                    fails: Some((session, 1)),
+                    commits: 1,
+                    released: CommitOutcome::Committed,
+                },
+                FaultSchedule {
+                    // Staging's pre-check, the held round's, then the next round's.
+                    name: "the next round's drain read",
+                    plan: vec![held.clone()],
+                    fails: Some((drains, 2)),
+                    commits: 1,
+                    released: CommitOutcome::Committed,
+                },
+                FaultSchedule {
+                    name: "the entry's second read, after the session moved",
+                    plan: vec![Act::HoldThen(moved)],
+                    fails: Some((entry.clone(), 1)),
+                    commits: 1,
+                    released: CommitOutcome::Conflict,
+                },
+                FaultSchedule {
+                    name: "the retry's commit",
+                    plan: vec![held, Act::Fail],
+                    fails: None,
+                    commits: 2,
+                    released: CommitOutcome::Committed,
+                },
+            ]
+            .into_iter()
+            .nth(at)
+            .unwrap();
+            rig.store.script(Kind::Intent, schedule.plan.clone(), None);
+            if let Some((key, skip)) = &schedule.fails {
+                rig.store.after_read(key, *skip, vec![Then::Fault]);
+            }
+            let outcome = rig
+                .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+                .await;
+            let doubt = in_doubt(outcome);
+            assert_fault_doubt(&schedule, &doubt, &rig.log);
+            let name = schedule.name;
+            assert_eq!(rig.log.intents_of(1).len(), schedule.commits, "{name}");
+            assert!(rig.log.puts().is_empty(), "{name}: no fragment written");
+            assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+            assert_eq!(rig.store.release_held().await, schedule.released, "{name}");
+            assert_eq!(
+                rig.store.inner.get(&entry).await.unwrap().is_some(),
+                schedule.released == CommitOutcome::Committed,
+                "{name}: the held batch's entry"
+            );
+            assert_fragments_evidenced(&rig).await;
+        })
+        .await;
+    }
+}
+
+// ═══════════════════════ (E′) the intent's own session fence ═══════════════════════
+
+/// **E′1.** The reserve succeeds; the wrapper runs a real Abort (#895) immediately before chunk
+/// `n`'s intent commits, for `n` 1 and 3. The Abort rewrites only the session and its obligation
+/// (`crates/core/src/multipart/abort.rs`), so the intent's slot precondition still holds and only
+/// its own `require(mpu == Open@E)` can stop it. The intent conflicts, staging answers
+/// `NoSuchUpload`, and no owned entry or fragment of chunk `n` exists; earlier chunks' entries
+/// stay, as residue for the reaper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_prime_1_an_abort_just_before_an_intent_commits_stops_it() {
+    for chunk in [1u128, 3] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let mut plan = vec![Act::Pass; chunk as usize - 1];
+            plan.push(Act::First(Side::Abort(rig.upload.clone())));
+            rig.store.script(Kind::Intent, plan, None);
+            let body = body_bytes(4 * CHUNK);
+            let outcome = rig
+                .stage(|_| {}, stream_of(pieces(&body, &[4 * CHUNK])))
+                .await;
+            assert!(
+                matches!(outcome, Ok(StageOutcome::Refused(Refusal::NoSuchUpload))),
+                "chunk {chunk}: {outcome:?}"
+            );
+            assert!(matches!(rig.state().await, SessionState::Aborting {}));
+            let intents = rig.log.intents_of(chunk);
+            assert_eq!(intents.len(), 1, "chunk {chunk}: one intent, no retry");
+            assert_eq!(intents[0].answer, Answer::Conflict);
+            let entries = owned(&rig.store.inner, &rig.upload).await;
+            assert!(
+                !entries.contains_key(&chunk),
+                "chunk {chunk}: no owned entry"
+            );
+            assert_eq!(
+                entries.keys().copied().collect::<Vec<_>>(),
+                (1..chunk).collect::<Vec<_>>(),
+                "earlier chunks' entries stay"
+            );
+            assert!(
+                rig.log.puts().iter().all(|p| p.id.chunk != chunk),
+                "chunk {chunk}: no fragment"
+            );
+            assert!((0..FRAGMENTS)
+                .all(|index| rig.fleet.stored_on(FragmentId { chunk, index }).is_none()));
+            assert_fragments_evidenced(&rig).await;
+        })
+        .await;
+    }
+}
+
+/// **E′2.** An intent held (`may_still_commit: true`) and not applied; the wrapper then runs a
+/// real Abort. Staging re-reads, finds the session no longer `Open`, and stops with
+/// `NoSuchUpload`: that batch required the `Open` bytes, so it can no longer land and nothing is
+/// in doubt. Released to the inner store afterwards, the held batch conflicts, and no owned entry
+/// for the chunk exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_prime_2_a_held_intent_then_an_abort_stops_with_nothing_in_doubt() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let abort = Act::HoldThen(Side::Abort(rig.upload.clone()));
+        rig.store.script(Kind::Intent, vec![abort], None);
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        assert!(
+            matches!(outcome, Ok(StageOutcome::Refused(Refusal::NoSuchUpload))),
+            "{outcome:?}"
+        );
+        assert_eq!(rig.log.commits(Kind::Intent).len(), 1);
+        assert_eq!(rig.store.release_held().await, CommitOutcome::Conflict);
+        assert!(owned(&rig.store.inner, &rig.upload).await.is_empty());
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+// ═══════════════════════ (F) every loop is bounded ═══════════════════════
+
+/// **(F)** Every reserve answered `Conflict` unapplied: the reserve probes each index once —
+/// exactly `MAX_INFLIGHT_PARTS` commits — and refuses `SlowDown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_the_reserve_probe_is_bounded() {
+    within(async {
+        let rig = Rig::new().await;
+        rig.store.script(Kind::Reserve, vec![], Some(Act::Conflict));
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReserveOutcome::Refused(inflight_full()));
+        let reserves = rig.log.commits(Kind::Reserve);
+        assert_eq!(reserves.len(), MAX_INFLIGHT_PARTS as usize);
+        let probed: BTreeSet<Vec<u8>> =
+            reserves.iter().map(|c| c.batch.puts[0].0.clone()).collect();
+        assert_eq!(
+            probed.len(),
+            MAX_INFLIGHT_PARTS as usize,
+            "each probe a different index"
+        );
+    })
+    .await;
+}
+
+/// **(F)** A session that moves to a later `Open` epoch under every reserve commit: the probe
+/// count alone bounds the loop, at exactly `MAX_INFLIGHT_PARTS` commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_the_reserve_probe_is_bounded_while_the_session_keeps_moving() {
+    within(async {
+        let rig = Rig::new().await;
+        let epoch = Arc::new(AtomicU64::new(0));
+        let (open, key) = (rig.session.clone(), mpu_key(&rig.upload));
+        let moving: Hook = Arc::new(move |_| {
+            let next = epoch.fetch_add(2, Ordering::SeqCst) + 2;
+            WriteBatch::new().put(key.clone(), open_at(&open, next))
+        });
+        rig.store
+            .script(Kind::Reserve, vec![], Some(Act::First(Side::Batch(moving))));
+        let outcome = reserve_slot(&rig.store, &reserve_request(&rig, &rig.attempt), T0)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ReserveOutcome::Refused(inflight_full()));
+        assert_eq!(
+            rig.log.commits(Kind::Reserve).len(),
+            MAX_INFLIGHT_PARTS as usize
+        );
+    })
+    .await;
+}
+
+/// **(F)** Every intent answered `Conflict` unapplied: exactly [`INTENT_ROUNDS`] commits, then a
+/// typed error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_the_intent_loop_is_bounded() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(Kind::Intent, vec![], Some(Act::Conflict));
+        let outcome = rig
+            .stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await;
+        let cause = stopped(outcome);
+        assert!(
+            matches!(cause, Stop::IntentRoundsSpent { chunk: 1, rounds } if rounds == INTENT_ROUNDS),
+            "{cause:?}"
+        );
+        assert_eq!(rig.log.commits(Kind::Intent).len(), INTENT_ROUNDS as usize);
+        assert!(rig.log.puts().is_empty());
+    })
+    .await;
+}
+
+// ═══════════════════════ (G) the per-part chunk bound ═══════════════════════
+
+/// **(G)** A body longer than the per-part bound (3 here, a parameter) never registers more than
+/// 3 owned entries. Staging stops and reports the overrun, handing the staged attempt back
+/// intact for the commit to refuse and compensate: its chunks, entries, length and digest cover
+/// exactly the staged bytes. A body of exactly 3 chunks is not an overrun.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g_the_per_part_chunk_bound_stops_staging_and_reports_it() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let body = body_bytes(5 * CHUNK);
+        let outcome = rig
+            .stage(
+                |r| r.max_part_chunks = 3,
+                stream_of(pieces(&body, &[CHUNK + 1, 4 * CHUNK - 1])),
+            )
+            .await;
+        let attempt = staged(outcome);
+        assert!(attempt.chunk_bound_exceeded(), "the overrun is reported");
+        assert_eq!(attempt.chunks().len(), 3);
+        assert_eq!(attempt.owned().len(), 3);
+        assert_eq!(
+            owned(&rig.store.inner, &rig.upload).await.len(),
+            3,
+            "never more than 3"
+        );
+        assert_eq!(attempt.len(), 3 * CHUNK as u64);
+        assert_eq!(*attempt.digest(), sha256(&body[..3 * CHUNK]));
+        assert_eq!(rig.log.commits(Kind::Intent).len(), 3);
+        assert_fragments_evidenced(&rig).await;
+
+        let mut rig = Rig::new().await;
+        let body = body_bytes(3 * CHUNK);
+        let attempt = staged(
+            rig.stage(
+                |r| r.max_part_chunks = 3,
+                stream_of(pieces(&body, &[3 * CHUNK])),
+            )
+            .await,
+        );
+        assert!(
+            !attempt.chunk_bound_exceeded(),
+            "exactly the bound is not an overrun"
+        );
+        assert_eq!(attempt.chunks().len(), 3);
+        assert_eq!(*attempt.digest(), sha256(&body));
+    })
+    .await;
+}
+
+// ═══════════════════════ (H) request validation ═══════════════════════
+
+/// **(H)** A zero chunk size, a lease TTL below 2, a zero write window, a zero body-idle bound,
+/// or a slot key space that is empty or wider than the `slot:` grammar is refused with a typed
+/// error before anything is read or written — by `stage_part` and by `reserve_slot` alike, which
+/// share one check (review finding: `reserve_slot` committed a slot leased one millisecond past
+/// its stamp, and answered `SlowDown` forever for an empty key space). A TTL of 2 and a key space
+/// exactly as wide as the grammar are valid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h_an_invalid_request_writes_nothing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let before = snapshot(&rig.store.inner).await;
+        let invalid: [fn(&mut StageRequest<'_>); 7] = [
+            |r| r.chunk_size = 0,
+            |r| r.lease_ttl_millis = 0,
+            |r| r.lease_ttl_millis = 1,
+            |r| r.write_window_millis = 0,
+            |r| r.body_idle_millis = 0,
+            |r| r.max_inflight_parts = 0,
+            |r| r.max_inflight_parts = MAX_SLOT_INDEX + 2,
+        ];
+        for edit in invalid {
+            let outcome = rig
+                .stage(edit, stream_of(vec![Bytes::from_static(b"x")]))
+                .await;
+            let cause = stopped(outcome);
+            assert!(matches!(cause, Stop::InvalidRequest { .. }), "{cause:?}");
+
+            let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+            edit(&mut req);
+            match reserve_slot(&rig.store, &req, T0).await {
+                Err(StageError::Stopped {
+                    cause: Stop::InvalidRequest { .. },
+                    ..
+                }) => {}
+                other => panic!("reserve_slot: expected InvalidRequest, got {other:?}"),
+            }
+        }
+        assert_eq!(snapshot(&rig.store.inner).await, before, "nothing written");
+        assert!(rig.log.events().is_empty(), "no commit, no put");
+        let staged_two = rig
+            .stage(|r| r.lease_ttl_millis = 2, stream_of(Vec::new()))
+            .await;
+        assert!(
+            matches!(staged_two, Ok(StageOutcome::Staged(_))),
+            "a TTL of 2 is valid"
+        );
+        let other = attempt(3);
+        let mut req = request(&rig.topology, &rig.upload, &other);
+        req.lease_ttl_millis = 2;
+        req.max_inflight_parts = MAX_SLOT_INDEX + 1;
+        let outcome = reserve_slot(&rig.store, &req, T0).await.unwrap();
+        assert!(
+            matches!(outcome, ReserveOutcome::Reserved { .. }),
+            "a TTL of 2 and the grammar's whole key space are valid: {outcome:?}"
+        );
+    })
+    .await;
+}
+
+/// The rig's chunk references point at real fragments: a check that the fake stores what it is
+/// given at the server it is given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_fleet_fake_resolves_fragments_by_placement() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let body = body_bytes(CHUNK);
+        let attempt = staged(
+            rig.stage(|_| {}, stream_of(vec![Bytes::from(body.clone())]))
+                .await,
+        );
+        let chunk: &ChunkRef = &attempt.chunks()[0];
+        let moved = ChunkRef {
+            placement: chunk.placement.iter().map(|s| (s + 1) % SERVERS).collect(),
+            ..chunk.clone()
+        };
+        assert!(
+            read_chunk_verified(&rig.store.inner, &rig.fleet, &moved)
+                .await
+                .is_err(),
+            "a wrong placement finds nothing"
+        );
+        assert_eq!(
+            read_chunk_verified(&rig.store.inner, &rig.fleet, chunk)
+                .await
+                .unwrap(),
+            body
+        );
+    })
+    .await;
+}
