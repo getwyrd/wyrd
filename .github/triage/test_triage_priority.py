@@ -5,6 +5,7 @@ Run: python -I -m unittest discover -s .github/triage
 
 from __future__ import annotations
 
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -179,17 +180,71 @@ class Skip(unittest.TestCase):
             "is a pull request": issue(is_pr=True),
             "is closed": issue(state="closed"),
             "was opened by a bot": issue(author_is_bot=True),
-            "was already triaged": issue(triaged_before=True),
+            "was already triaged": issue(triage_count=1),
         }
         for why, i in cases.items():
             with self.subTest(why=why):
                 self.assertEqual(tp.skip_reason(i), why)
 
-    def test_needs_triage_is_retried(self) -> None:
-        self.assertIsNone(tp.skip_reason(issue(triaged_before=True, labels={"needs-triage"})))
+    def test_needs_triage_is_retried_on_an_edit(self) -> None:
+        self.assertIsNone(tp.skip_reason(issue(triage_count=1, labels={"needs-triage"}), retry=True))
+
+    def test_backfill_and_reopen_never_retry(self) -> None:
+        # A back-fill batch used to pick a needs-triage issue up again and comment again.
+        self.assertEqual(tp.skip_reason(issue(triage_count=1, labels={"needs-triage"})),
+                         "was already triaged")
+
+    def test_edit_does_not_retry_a_placed_issue(self) -> None:
+        self.assertEqual(tp.skip_reason(issue(triage_count=1), retry=True), "was already triaged")
+
+    def test_retries_are_capped(self) -> None:
+        i = issue(triage_count=tp.MAX_RETRIES + 1, labels={"needs-triage"})
+        self.assertEqual(tp.skip_reason(i, retry=True), "was retried too often")
+        i = issue(triage_count=tp.MAX_RETRIES, labels={"needs-triage"})
+        self.assertIsNone(tp.skip_reason(i, retry=True))
+
+    def test_only_the_workflow_comments_count(self) -> None:
+        bot, person = {"login": tp.BOT_LOGIN}, {"login": "someone"}
+        comments = [{"body": tp.MARKER + " x", "user": bot},
+                    {"body": "copied: " + tp.MARKER, "user": person},
+                    {"body": "no marker", "user": bot},
+                    {"body": None, "user": None}]
+        self.assertEqual(tp.triage_comments(comments), 1)
 
     def test_fresh_issue_is_triaged(self) -> None:
         self.assertIsNone(tp.skip_reason(issue()))
+
+
+class Backfill(unittest.TestCase):
+    """The back-fill limit counts only issues that will be triaged (Codex P1 on #944)."""
+
+    def test_already_triaged_issues_do_not_fill_the_batch(self) -> None:
+        listed = [{"number": n, "labels": []} for n in range(1, 8)]
+        listed.append({"number": 8, "labels": [{"name": "priority:P2"}]})
+        # 1-3 already had their one pass and stay at needs-triage; 4-7 are fresh.
+        seen = {n: issue(number=n, triage_count=1, labels={"needs-triage"}) for n in (1, 2, 3)}
+        old_gh, old_fetch = tp.gh, tp.fetch_issue
+        tp.gh = lambda *args, **kw: json.dumps(listed)
+        tp.fetch_issue = lambda repo, n: seen.get(n) or issue(number=n)
+        try:
+            self.assertEqual(tp.open_untriaged("o/r", 2), [4, 5])
+            self.assertEqual(tp.open_untriaged("o/r", 20), [4, 5, 6, 7])
+        finally:
+            tp.gh, tp.fetch_issue = old_gh, old_fetch
+
+
+class ClearsNeedsTriage(unittest.TestCase):
+    def test_a_placed_priority_clears_needs_triage(self) -> None:
+        p = plan(i=issue(labels={"needs-triage"}))
+        self.assertEqual(p.remove_labels, ["needs-triage"])
+        self.assertTrue(any(l.startswith("priority:") for l in p.add_labels))
+
+    def test_still_unsure_keeps_it(self) -> None:
+        p = plan(i=issue(labels={"needs-triage"}), unsure=True, missing="Which version ran.")
+        self.assertEqual(p.remove_labels, [])
+
+    def test_nothing_removed_on_a_fresh_issue(self) -> None:
+        self.assertEqual(plan().remove_labels, [])
 
 
 class BuildPlan(unittest.TestCase):
