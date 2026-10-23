@@ -1,0 +1,45 @@
+{
+  "_comment": "Labels for issue triage (ADR-0048). The triage workflow creates any that are missing; it never edits or deletes an existing label. Descriptions stay within GitHub's 100-character limit. Owners map an area to the GitHub login assigned when an issue has no assignee; \"*\" is the fallback.",
+  "severity": {
+    "sev:critical": {"color": "B60205", "description": "Acknowledged write lost, torn write visible, chunk unrecoverable, data or key leak, auth bypass"},
+    "sev:major": {"color": "D93F0B", "description": "Safety check off or bypassable, crash, silent repair failure, spec divergence (ADR-0048)"},
+    "sev:minor": {"color": "FBCA04", "description": "Wrong behaviour with a workaround, regression, or misleading telemetry (ADR-0048)"},
+    "sev:trivial": {"color": "C2E0C6", "description": "Cosmetic, wording, docs, or a test-only gap (ADR-0048)"}
+  },
+  "reach": {
+    "reach:common": {"color": "5319E7", "description": "Normal operation with a default or documented configuration triggers it (ADR-0048)"},
+    "reach:edge": {"color": "8A63D2", "description": "Needs an unusual configuration, workload, fault combination or timing (ADR-0048)"},
+    "reach:adversarial": {"color": "C5B7E8", "description": "Only when someone sets it up: hostile client or tenant, crafted input, compromised node"}
+  },
+  "area": {
+    "area:metadata": {"color": "BFDADC", "description": "Metadata store, the commit point, and its backends (architecture 5.1)"},
+    "area:client": {"color": "BFDADC", "description": "Client: erasure coding, commit, reconstruct on read (architecture 5.1)"},
+    "area:dserver": {"color": "BFDADC", "description": "D servers and the ChunkStore seam (architecture 5.1)"},
+    "area:custodian": {"color": "BFDADC", "description": "Custodian: GC, scrub, reconstruct, rebalance (architecture 5.1)"},
+    "area:replication": {"color": "BFDADC", "description": "Cross-zone replication worker (architecture 5.1)"},
+    "area:coordination": {"color": "BFDADC", "description": "Coordination: discovery, leases, leader election, fencing (L5)"},
+    "area:gateway": {"color": "BFDADC", "description": "Access layer and the S3 gateway (L1)"},
+    "area:chunk-format": {"color": "BFDADC", "description": "On-disk chunk format and its spec"},
+    "area:proto": {"color": "BFDADC", "description": "Wire contracts (protobuf)"},
+    "area:security": {"color": "BFDADC", "description": "Identity, mTLS, CA, KMS and access control (architecture 14)"},
+    "area:telemetry": {"color": "BFDADC", "description": "Telemetry and observability (ADR-0012)"},
+    "area:testkit": {"color": "BFDADC", "description": "Simulation testing and the conformance suites (ADR-0009)"},
+    "area:validate": {"color": "BFDADC", "description": "Blackbox validation binary (proposal 0017)"},
+    "area:server": {"color": "BFDADC", "description": "Composition and the wyrd binary"},
+    "area:deploy": {"color": "BFDADC", "description": "Deployment, packaging and release"},
+    "area:docs": {"color": "BFDADC", "description": "Documentation and design records"},
+    "area:ci": {"color": "BFDADC", "description": "CI, workflows and repository tooling"}
+  },
+  "priority": {
+    "priority:P0": {"color": "B60205", "description": "Drop other work, fix now, block the release (ADR-0048)"},
+    "priority:P1": {"color": "D93F0B", "description": "Current milestone (ADR-0048)"},
+    "priority:P2": {"color": "FBCA04", "description": "Next milestone, or whenever it fits (ADR-0048)"},
+    "priority:P3": {"color": "C2E0C6", "description": "Backlog (ADR-0048)"}
+  },
+  "other": {
+    "needs-triage": {"color": "EDEDED", "description": "Severity or reach could not be placed; see the triage comment (ADR-0048)"}
+  },
+  "owners": {
+    "*": "eduralph"
+  }
+}

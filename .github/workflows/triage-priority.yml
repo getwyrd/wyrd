@@ -1,0 +1,153 @@
+name: Issue priority
+
+# Automated triage under ADR-0048 (rules in sections 1-4, this workflow in 5). When an issue has
+# no `priority:*` label, .github/triage/triage_priority.py asks Claude once to classify
+# it and then sets type, severity, reach, area and priority labels, an assignee and one
+# comment. It never sets the milestone, so the `new` label and the start of PDCA work stay
+# the maintainer's decision.
+#
+# Cost is bounded by design: one request per issue, capped input, low effort, and no
+# second pass on an edit unless the issue was left at `needs-triage`. Anyone can open an
+# issue on this public repository, so the backstop is the spending limit on the Claude
+# workspace the service account acts in, not anything in this file.
+#
+# Issue text is untrusted. It never reaches a shell here (no `${{ github.event.issue.* }}`
+# in a run step); the script reads it from the API and passes it to the model as data.
+# The model gets no token and no tools; the script validates its JSON before writing.
+#
+# No API key is stored. The job asks GitHub for a short-lived OIDC identity token and the
+# SDK exchanges it for a Claude API token (Workload Identity Federation, ADR-0048). The
+# federation rule only accepts runs on refs/heads/main of this repository, which covers
+# issue events and manual runs from main but not pull requests or other branches.
+
+on:
+  issues:
+    types: [opened, reopened, edited]
+  pull_request:
+    paths:
+      - ".github/triage/**"
+      - ".github/workflows/triage-priority.yml"
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue number to triage (empty = every open issue without a priority)"
+        required: false
+      limit:
+        description: "Most issues to triage when no number is given"
+        required: false
+        default: "20"
+      dry_run:
+        description: "Classify and print the plan, write nothing"
+        type: boolean
+        default: false
+      check:
+        description: "Only test the Claude API sign-in with one tiny request"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: triage tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Unit tests (offline, no SDK needed)
+        run: python -I -m unittest discover -s .github/triage -v
+
+  triage:
+    name: triage
+    if: github.event_name != 'pull_request' && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      id-token: write
+    concurrency:
+      group: issue-priority-${{ github.event.issue.number || inputs.issue || 'backfill' }}
+      cancel-in-progress: false
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install the pinned, hash-checked SDK (ADR-0048 section 5)
+        run: python -m pip install --quiet --require-hashes --no-deps -r .github/triage/requirements.txt
+      - name: Fetch a GitHub identity token for the Claude API
+        id: oidc
+        env:
+          RULE: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RULE:-}" ]; then
+            echo "::warning::ANTHROPIC_FEDERATION_RULE_ID is not set; skipping automated triage."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" \
+            | jq -r .value > "$RUNNER_TEMP/gha-jwt"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - name: Check the Claude API connection
+        if: steps.oidc.outputs.enabled == 'true' && inputs.check
+        env:
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_IDENTITY_TOKEN_FILE: ${{ runner.temp }}/gha-jwt
+        run: |
+          set -euo pipefail
+          [ -n "${ANTHROPIC_WORKSPACE_ID:-}" ] || unset ANTHROPIC_WORKSPACE_ID
+          python -I - <<'EOF'
+          import sys
+          sys.path.insert(0, ".github/triage")
+          import anthropic
+          from triage_priority import MODEL
+
+          message = anthropic.Anthropic().messages.create(
+              model=MODEL, max_tokens=16,
+              messages=[{"role": "user", "content": "Reply with the word ok."}],
+          )
+          text = next((b.text for b in message.content if b.type == "text"), "")
+          print(f"Connected: {message.model} replied {text!r} "
+                f"({message.usage.input_tokens} in, {message.usage.output_tokens} out)")
+          EOF
+      - name: Triage
+        if: steps.oidc.outputs.enabled == 'true' && !inputs.check
+        env:
+          # Identifiers, not secrets; kept as repository variables.
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          ANTHROPIC_IDENTITY_TOKEN_FILE: ${{ runner.temp }}/gha-jwt
+          GH_TOKEN: ${{ github.token }}
+          EVENT_ISSUE: ${{ github.event.issue.number }}
+          EVENT_ACTION: ${{ github.event.action }}
+          INPUT_ISSUE: ${{ inputs.issue }}
+          INPUT_LIMIT: ${{ inputs.limit }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # An empty workspace variable would be sent as an empty ID; drop it instead.
+          [ -n "${ANTHROPIC_WORKSPACE_ID:-}" ] || unset ANTHROPIC_WORKSPACE_ID
+          args=()
+          if [ -n "${EVENT_ISSUE:-}" ]; then
+            args+=(--issue "$EVENT_ISSUE")
+            # Only an edit may retry an issue left at needs-triage (the author added information).
+            if [ "${EVENT_ACTION:-}" = "edited" ]; then args+=(--retry); fi
+          elif [ -n "${INPUT_ISSUE:-}" ]; then
+            args+=(--issue "$INPUT_ISSUE")
+          else
+            args+=(--all --limit "${INPUT_LIMIT:-20}")
+          fi
+          if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
+          python -I .github/triage/triage_priority.py "${args[@]}"
