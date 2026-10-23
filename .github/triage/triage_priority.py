@@ -41,6 +41,10 @@ MAX_TITLE = 300
 MAX_BODY = 6000
 MAX_REASON = 200
 MARKER = "<!-- wyrd-triage -->"
+# Only the workflow's own comments count as triage comments; anyone can type the marker.
+BOT_LOGIN = "github-actions[bot]"
+# An issue left at needs-triage is triaged again only when it is edited, at most this often.
+MAX_RETRIES = 2
 
 TYPES = ("bug", "enhancement", "documentation", "research")
 SEVERITIES = ("critical", "major", "minor", "trivial")
@@ -229,17 +233,20 @@ class Issue:
     state: str = "open"
     is_pr: bool = False
     author_is_bot: bool = False
-    triaged_before: bool = False
+    triage_count: int = 0  # the workflow's own triage comments on the issue
 
 
 @dataclass
 class Plan:
     add_labels: list[str] = field(default_factory=list)
+    remove_labels: list[str] = field(default_factory=list)
     assignee: str | None = None
     comment: str = ""
 
 
-def skip_reason(issue: Issue) -> str | None:
+def skip_reason(issue: Issue, retry: bool = False) -> str | None:
+    """Why ``issue`` is not triaged, or None. ``retry`` is True only for an edit to the
+    issue: the one event that may bring the information a needs-triage issue lacked."""
     if issue.is_pr:
         return "is a pull request"
     if issue.state != "open":
@@ -248,10 +255,14 @@ def skip_reason(issue: Issue) -> str | None:
         return "was opened by a bot"
     if any(label.startswith("priority:") for label in issue.labels):
         return "already has a priority"
-    # One automated pass per issue, so editing an issue does not re-spend tokens; an
-    # issue left at needs-triage is triaged again when its author adds information.
-    if issue.triaged_before and "needs-triage" not in issue.labels:
-        return "was already triaged"
+    # One automated pass per issue. A back-fill or a reopen never triages an issue again,
+    # so it cannot re-spend tokens or post the same comment twice; only an edit retries
+    # one left at needs-triage, and at most MAX_RETRIES times.
+    if issue.triage_count:
+        if not retry or "needs-triage" not in issue.labels:
+            return "was already triaged"
+        if issue.triage_count > MAX_RETRIES:
+            return "was retried too often"
     return None
 
 
@@ -304,6 +315,8 @@ def build_plan(issue: Issue, verdict: dict, config: dict, *, model: str, usage: 
     else:
         prio, base, applied = compute_priority(verdict["severity"], verdict["reach"],
                                                verdict["flags"], issue.labels)
+        if "needs-triage" in issue.labels:
+            plan.remove_labels.append("needs-triage")
         plan.add_labels += [f"sev:{verdict['severity']}", f"reach:{verdict['reach']}",
                             f"priority:P{prio}"]
         rows.append(_row(f"sev:{verdict['severity']}", reasons["severity"]))
@@ -408,6 +421,12 @@ def gh(*args: str, input: str | None = None) -> str:
         raise
 
 
+def triage_comments(comments: list[dict]) -> int:
+    """How many of ``comments`` are the workflow's own triage comments."""
+    return sum(1 for c in comments
+               if MARKER in (c.get("body") or "") and (c.get("user") or {}).get("login") == BOT_LOGIN)
+
+
 def fetch_issue(repo: str, number: int) -> Issue:
     data = json.loads(gh("api", f"repos/{repo}/issues/{number}"))
     comments = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repo}/issues/{number}/comments"))
@@ -421,7 +440,7 @@ def fetch_issue(repo: str, number: int) -> Issue:
         state=data.get("state", "open"),
         is_pr="pull_request" in data,
         author_is_bot=(data.get("user") or {}).get("type") == "Bot",
-        triaged_before=any(MARKER in (c.get("body") or "") for c in flat),
+        triage_count=triage_comments(flat),
     )
 
 
@@ -444,14 +463,16 @@ def ensure_labels(repo: str, config: dict) -> None:
                 print(f"created label {name}")
 
 
-def apply(repo: str, issue: Issue, plan: Plan) -> None:
+def apply(repo: str, issue: Issue, plan: Plan, retry: bool = False) -> None:
     # Re-read the labels: a human may have set a priority while the model was running.
     fresh = fetch_issue(repo, issue.number)
-    if skip_reason(fresh):
-        print(f"#{issue.number}: skipped at apply time ({skip_reason(fresh)})")
+    if (why := skip_reason(fresh, retry=retry)):
+        print(f"#{issue.number}: skipped at apply time ({why})")
         return
     if plan.add_labels:
         gh("issue", "edit", str(issue.number), "-R", repo, "--add-label", ",".join(plan.add_labels))
+    if plan.remove_labels:
+        gh("issue", "edit", str(issue.number), "-R", repo, "--remove-label", ",".join(plan.remove_labels))
     if plan.assignee:
         try:
             gh("issue", "edit", str(issue.number), "-R", repo, "--add-assignee", plan.assignee)
@@ -468,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
     target.add_argument("--all", action="store_true", help="open issues without a priority")
     ap.add_argument("--limit", type=int, default=20, help="cap for --all")
     ap.add_argument("--dry-run", action="store_true", help="print the plan, write nothing")
+    ap.add_argument("--retry", action="store_true",
+                    help="the issue was edited: retry it if it is at needs-triage")
     ap.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     args = ap.parse_args(argv)
     if not args.repo:
@@ -488,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
     failed = 0
     for number in numbers:
         issue = fetch_issue(args.repo, number)
-        if (why := skip_reason(issue)):
+        if (why := skip_reason(issue, retry=args.retry)):
             print(f"#{number}: skipped ({why})")
             continue
         try:
@@ -513,7 +536,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.dry_run:
             print(plan.comment)
         else:
-            apply(args.repo, issue, plan)
+            apply(args.repo, issue, plan, retry=args.retry)
     return 1 if failed else 0
 
 

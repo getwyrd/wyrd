@@ -131,6 +131,7 @@ jobs:
           ANTHROPIC_IDENTITY_TOKEN_FILE: ${{ runner.temp }}/gha-jwt
           GH_TOKEN: ${{ github.token }}
           EVENT_ISSUE: ${{ github.event.issue.number }}
+          EVENT_ACTION: ${{ github.event.action }}
           INPUT_ISSUE: ${{ inputs.issue }}
           INPUT_LIMIT: ${{ inputs.limit }}
           INPUT_DRY_RUN: ${{ inputs.dry_run }}
@@ -141,6 +142,8 @@ jobs:
           args=()
           if [ -n "${EVENT_ISSUE:-}" ]; then
             args+=(--issue "$EVENT_ISSUE")
+            # Only an edit may retry an issue left at needs-triage (the author added information).
+            if [ "${EVENT_ACTION:-}" = "edited" ]; then args+=(--retry); fi
           elif [ -n "${INPUT_ISSUE:-}" ]; then
             args+=(--issue "$INPUT_ISSUE")
           else
