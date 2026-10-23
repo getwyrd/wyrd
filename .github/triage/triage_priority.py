@@ -445,11 +445,20 @@ def fetch_issue(repo: str, number: int) -> Issue:
 
 
 def open_untriaged(repo: str, limit: int) -> list[int]:
+    """Up to ``limit`` open issues a back-fill should triage, oldest first. The limit is
+    applied after skipping, so issues that stay without a priority after their one
+    automated pass (needs-triage, or a type with no priority) never fill a batch."""
     data = json.loads(gh("issue", "list", "-R", repo, "--state", "open", "--limit", "500",
                          "--json", "number,labels"))
-    numbers = [i["number"] for i in data
-               if not any(l["name"].startswith("priority:") for l in i["labels"])]
-    return sorted(numbers)[:limit]
+    candidates = sorted(i["number"] for i in data
+                        if not any(l["name"].startswith("priority:") for l in i["labels"]))
+    numbers = []
+    for number in candidates:
+        if len(numbers) == limit:
+            break
+        if skip_reason(fetch_issue(repo, number)) is None:
+            numbers.append(number)
+    return numbers
 
 
 def ensure_labels(repo: str, config: dict) -> None:
