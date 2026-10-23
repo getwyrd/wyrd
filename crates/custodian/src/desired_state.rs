@@ -25,27 +25,18 @@
 
 use std::collections::BTreeMap;
 
+use wyrd_core::metadata::{parse_desired_dserver_key, DESIRED_DSERVER_PREFIX};
 use wyrd_traits::{ChunkId, DServerId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::{object_name, referenced_fragments, staged_fragments};
 
-/// Key prefix for the **desired-state** ledger — a D server the operator has marked
-/// draining / decommissioning. Mirrors the `pending:` / `orphan:` / `repair:` ledger
-/// pattern (architecture §5); the value records which lifecycle was requested.
-const DESIRED_PREFIX: &[u8] = b"desired:dserver:";
-
-/// Key for one D server's desired-state record: `desired:dserver:<id>`.
-pub fn desired_key(dserver: DServerId) -> Vec<u8> {
-    format!("desired:dserver:{dserver}").into_bytes()
-}
-
-fn parse_desired_key(key: &[u8]) -> Option<DServerId> {
-    std::str::from_utf8(key)
-        .ok()?
-        .strip_prefix("desired:dserver:")?
-        .parse()
-        .ok()
-}
+/// Key for one D server's desired-state record: `desired:dserver:<id>`. The key lives in core
+/// (`wyrd_core::metadata::desired_dserver_key`), because the multipart staging writer must
+/// spell it too: every batch that installs an owned `sidx:` entry `require_absent`s it for each
+/// server in its placement. Re-exported here under the name the custodian has always used. The
+/// ledger mirrors the `pending:` / `orphan:` / `repair:` pattern (architecture §5); the value
+/// records which lifecycle was requested.
+pub use wyrd_core::metadata::desired_dserver_key as desired_key;
 
 /// The operator-requested lifecycle of a D server (`0005:349`). Both are evacuation
 /// targets for the rebalance loop — fragments are moved **off** the server; the
@@ -172,8 +163,8 @@ pub async fn draining_servers(
     meta: &dyn MetadataStore,
 ) -> Result<BTreeMap<DServerId, DServerLifecycle>> {
     let mut map = BTreeMap::new();
-    for (key, value) in meta.scan(DESIRED_PREFIX).await? {
-        if let Some(id) = parse_desired_key(&key) {
+    for (key, value) in meta.scan(DESIRED_DSERVER_PREFIX).await? {
+        if let Some(id) = parse_desired_dserver_key(&key) {
             if let Some(lifecycle) = std::str::from_utf8(&value)
                 .ok()
                 .and_then(DServerLifecycle::parse)
@@ -223,11 +214,11 @@ pub async fn draining_servers(
 /// server in the placement it installs ([`desired_key`]), so an intent either commits
 /// before the drain record — and is then in the staged class this query reads — or fails
 /// its precondition and re-plans against `Topology::excluding(draining)`. There is no
-/// third outcome, so no fragment lands on a server after it was reported `Satisfied`. No
-/// production writer of `sidx:` entries exists yet (`crates/core/src/multipart.rs`, "Nothing
-/// here is written yet"); the fence lands with the first one — `deferred: #657` — and the
-/// seeded interleaving that exercises it, `deferred: #665`. Until then a `Satisfied` answer
-/// is exact for every byte the store holds, and silent about none.
+/// third outcome, so no fragment lands on a server after it was reported `Satisfied`. The
+/// `sidx:` writer, `wyrd_core::multipart::stage` (#932), carries that fence on every intent
+/// batch, reading the drain records under the same key ([`desired_key`], one spelling in
+/// core); it has no production caller until the S3 verb is wired (#669). The seeded
+/// interleaving that races an intent against a drain request is `deferred: #665`.
 ///
 /// Every non-satisfied answer says **why**, because "not yet" and "not ever, until you repair
 /// X" are different operator instructions: still-held ([`ReconciliationStatus::Pending`]),
@@ -242,10 +233,10 @@ pub async fn reconciliation_status(
     meta: &dyn MetadataStore,
     dserver: DServerId,
 ) -> Result<ReconciliationStatus> {
-    // The drain record this query reads is the key the `sidx:` intent writer must
-    // `require_absent` per selected server (`0016:837-857`), so an intent that lands after the
-    // readings below cannot name `dserver`. That precondition is the writer's, with the writer
-    // — deferred: #657 (fence), #665 (seeded interleaving).
+    // The drain record this query reads is the key the `sidx:` intent writer
+    // (`wyrd_core::multipart::stage`, #932) `require_absent`s per selected server
+    // (`0016:837-857`), so an intent that lands after the readings below cannot name `dserver`.
+    // The seeded interleaving of the two — deferred: #665.
     if meta.get(&desired_key(dserver)).await?.is_none() {
         return Ok(ReconciliationStatus::NotRequested);
     }
