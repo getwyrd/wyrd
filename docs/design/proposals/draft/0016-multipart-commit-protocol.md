@@ -1711,12 +1711,12 @@ Three properties are strictly better here, and the third is what the iteration-7
   a permanent `503` with no crash to blame. So on an ambiguous outcome the reserver **retries the
   same index with the same `attempt_id`**, never a different one: the two batches are mutually
   exclusive through `require_absent(slot:<id>:<k>)`, so at most one lands and both would carry the
-  same `attempt_id`, making either outcome the same observable slot. It probes onward only once it
-  reads that index carrying *another* attempt's id (its own reserve definitively lost), and refuses
-  `503` after a bounded number of ambiguous retries — leaving any slot the ambiguous batch may yet
-  install as ordinary residue the reaper reclaims with the session (F11a). Blindly probing a fresh
-  index after an unknown outcome would leak the landed one for the session's whole life — the
-  same accounting hazard the release side avoids with `require(slot == prior)`.
+  same `attempt_id`, making either outcome the same observable slot. Nor does another attempt's id
+  there prove a loss (it may release the index, and the batch then land), so it never probes onward:
+  it refuses `503` on reading one, or after a bounded number of ambiguous retries — leaving any slot
+  the batch may yet install as residue the reaper reclaims with the session (F11a). Blindly probing
+  a fresh index after an unknown outcome would leak the landed one for the session's whole life —
+  the same accounting hazard the release side avoids with `require(slot == prior)`.
 - **The request quiesces its own renewal before committing the part (normative; iteration-11
   finding 3).** Once every liveness batch rewrites the slot (above), this request's *own* renewal
   loop becomes a writer of the very key its part commit preconditions on

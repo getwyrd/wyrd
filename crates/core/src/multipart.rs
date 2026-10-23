@@ -6,21 +6,22 @@
 //! file is deliberately **pure**: no [`wyrd_traits::MetadataStore`] call, no `WriteBatch`, no
 //! `async fn`. The protocol's store round trips live beside it, in child modules, and use only
 //! what this file defines: [`create`], `CreateMultipartUpload`'s admission and session creation
-//! (#894), and [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
-//! fence's batch (#895). After this file a reader can name every key the protocol will ever
-//! write (`0016` §1, `:333-527`), parse it back, **and decode the record values that key space
-//! names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and the two
-//! derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence` singleton
-//! ([`FenceGeneration`], the restore-fence generation of `0016:723-728`), the in-flight lifecycle
-//! records ([`SessionRecord`], [`SlotRecord`], [`PartRecord`], [`PartSummary`]), and the two
-//! whose identity lives partly in their **key**: the retirement obligation ([`RetirePayload`])
-//! and the owned staging entry ([`OwnedEntry`] — `sidx:`'s [`crate::metadata::PendingEntry`]
-//! with its two ownership fields, its planned placement a [`StagedPlacement`]). It also
-//! **answers** the protocol's verbs, in one typed vocabulary every later slice uses (issue
-//! #693): decision 3's verb × state table as total pure functions ([`answer`], `0016:894-1037`),
-//! the object's identity ([`multipart_etag`] — the composition ADR-0047 deferred,
-//! `0016:3064-3070`), and the request identity a `Completed` tombstone answers a retry on
-//! ([`complete_fingerprint`], `0016:898-908`).
+//! (#894), [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
+//! fence's batch (#895), and [`stage`], `UploadPart`'s staging half: the slot reserve and the
+//! owned intent per chunk (#932). After this file a reader can name every key the protocol
+//! will ever write (`0016` §1, `:333-527`), parse it back, **and decode the record values that
+//! key space names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and
+//! the two derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence`
+//! singleton ([`FenceGeneration`], the restore-fence generation of `0016:723-728`), the
+//! in-flight lifecycle records ([`SessionRecord`], [`SlotRecord`], [`PartRecord`],
+//! [`PartSummary`]), and the two whose identity lives partly in their **key**: the retirement
+//! obligation ([`RetirePayload`]) and the owned staging entry ([`OwnedEntry`] — `sidx:`'s
+//! [`crate::metadata::PendingEntry`] with its two ownership fields, its planned placement a
+//! [`StagedPlacement`]). It also **answers** the protocol's verbs, in one typed vocabulary every
+//! later slice uses (issue #693): decision 3's verb × state table as total pure functions
+//! ([`answer`], `0016:894-1037`), the object's identity ([`multipart_etag`] — the composition
+//! ADR-0047 deferred, `0016:3064-3070`), and the request identity a `Completed` tombstone
+//! answers a retry on ([`complete_fingerprint`], `0016:898-908`).
 //!
 //! It also carries the protocol's **numbers** (issue #655, slice 2 of 7 of #636; section 14):
 //! every knob `0016`'s table settles a range for, valued as a named constant with its
@@ -67,7 +68,7 @@
 //!
 //! Every prefix here is disjoint from every other and from the pre-existing `inode:` /
 //! `dirent:` / `pending:` / `bucket:` / `orphan:` (`metadata.rs:30-70`), `seg:` / `seggrp:`
-//! (`metadata.rs:293-300`) and `desired:dserver:` (`custodian/src/desired_state.rs:33`),
+//! (`metadata.rs:293-300`) and `desired:dserver:` ([`crate::metadata::DESIRED_DSERVER_PREFIX`]),
 //! and none is a prefix of another, so no `scan` returns a neighbour's records
 //! (`0016:333-356`; ADR-0046 decision 1, disjoint first-class records under a disjoint
 //! prefix — never an encoding smuggled into an existing namespace).
@@ -103,7 +104,9 @@
 //! `mpuctl`, `mpu:` and `seggrp:`, and Abort ([`abort::abort_session`], #895) writes `mpu:` and
 //! `retire:bytes:` through the one fence batch builder the restore fence also commits
 //! ([`abort::fence_batch`]); neither has a production caller until the S3 verbs are wired
-//! (#668). Every other first writer is a store round trip still to land (#657–#659).
+//! (#668). Staging ([`stage::stage_part`], #932) writes `slot:` and `sidx:`, and has no
+//! production caller until the S3 `UploadPart` verb is wired (#669). Every other first writer
+//! is a store round trip still to land: the part commit (#927), then #658–#659.
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -149,6 +152,7 @@ use crate::metadata::{
 
 pub mod abort;
 pub mod create;
+pub mod stage;
 
 // ===========================================================================
 // 1. Errors — every structural violation is a typed error, never a value
@@ -1043,14 +1047,13 @@ impl Digest {
         Self(bytes)
     }
 
-    /// The SHA-256 of everything `feed` writes into the hasher — the **one** place this
-    /// module names the algorithm (ADR-0047's basis), shared by [`multipart_etag`] and
-    /// [`complete_fingerprint`]. The hasher is fed piece by piece, so a composition over a
+    /// The SHA-256 of everything `feed` writes into the hasher, shared by [`multipart_etag`]
+    /// and [`complete_fingerprint`]. The hasher is fed piece by piece, so a composition over a
     /// long part list is never first copied into one buffer.
     fn sha256(feed: impl FnOnce(&mut Sha256)) -> Self {
-        let mut hasher = Sha256::new();
-        feed(&mut hasher);
-        Self(hasher.finalize().into())
+        let mut hasher = DigestHasher::new();
+        feed(&mut hasher.0);
+        hasher.finish()
     }
 
     /// The validating parser: exactly 64 lowercase-hex characters. Rejects uppercase hex
@@ -1080,6 +1083,28 @@ impl Digest {
     /// The canonical lowercase-hex rendering.
     pub fn to_hex(&self) -> String {
         hex_lower(&self.0)
+    }
+}
+
+/// A [`Digest`] being computed over bytes that arrive in pieces, across awaits: a part body
+/// hashed as it streams in ([`stage`], #932). The **one** place this module names the
+/// algorithm (ADR-0047's basis); `Digest::sha256` goes through it too.
+pub(crate) struct DigestHasher(Sha256);
+
+impl DigestHasher {
+    /// A digest of nothing yet.
+    pub(crate) fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    /// Feed the next piece.
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// The digest of every piece fed, in order.
+    pub(crate) fn finish(self) -> Digest {
+        Digest(self.0.finalize().into())
     }
 }
 
@@ -2713,7 +2738,12 @@ struct SlotRecordWire {
 /// Every field is required and the wire shape is closed, so decode→encode is byte-identical —
 /// see [`SessionRecord`]'s "Serialization identity" for why that matters to a whole-record CAS.
 ///
-/// No writer-side constructor — see [`SessionRecord`]'s doc for why.
+/// No free constructor, for the reason [`SessionRecord`] has none. The writer-side routes are
+/// crate-private, in the shape of `SessionRecord::open`: `SlotRecord::reserve` mints the value
+/// a reservation puts, and `SlotRecord::with_lease` the one an intent puts over it. Both refuse
+/// exactly what [`decode_slot_record`] refuses (a lease that is not after the reservation
+/// stamp), so every slot value staging writes is one decode accepts back unchanged ([`stage`],
+/// #932).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SlotRecordWire")]
 pub struct SlotRecord {
@@ -2724,6 +2754,38 @@ pub struct SlotRecord {
 }
 
 impl SlotRecord {
+    /// The slot a reservation installs (`0016:349`, `:658`): this attempt's id and part number,
+    /// stamped `reserved_at_millis`, leased to `lease_expiry_millis`. Refuses a lease that is not
+    /// strictly after the stamp ([`RecordError::SlotLeaseAlreadyLapsed`]), the one rule
+    /// [`decode_slot_record`] adds to the wire shape, so the value it returns encodes to bytes
+    /// that decode back to it.
+    pub(crate) fn reserve(
+        part_number: PartNumber,
+        attempt_id: AttemptId,
+        reserved_at_millis: u64,
+        lease_expiry_millis: u64,
+    ) -> Result<Self, RecordError> {
+        Self::try_from(SlotRecordWire {
+            part_number,
+            attempt_id,
+            reserved_at_millis,
+            lease_expiry_millis,
+        })
+    }
+
+    /// This slot with its lease moved to `lease_expiry_millis` and every other field kept: the
+    /// value the intent that rewrites the slot beside a new owned entry puts (`0016:659`). The
+    /// reservation stamp is kept because the reaper reads it as a fixed progress instant
+    /// (`0016:1831-1832`). Same refusal as [`Self::reserve`].
+    pub(crate) fn with_lease(&self, lease_expiry_millis: u64) -> Result<Self, RecordError> {
+        Self::reserve(
+            self.part_number,
+            self.attempt_id.clone(),
+            self.reserved_at_millis,
+            lease_expiry_millis,
+        )
+    }
+
     /// The part number this slot was reserved for.
     pub const fn part_number(&self) -> PartNumber {
         self.part_number
