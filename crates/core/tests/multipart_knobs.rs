@@ -57,6 +57,12 @@ const PART_COMMIT_FIXED_OPS: u32 = 8;
 /// `:675`): the session precondition, two obligation `require_absent`s, three puts.
 const FENCE_FIXED_OPS: u32 = 6;
 
+/// The same count for a renewal besides its two per owned entry (`0016:349`, `:659`, #933): the
+/// session's and the slot's preconditions and the slot's put; each owned entry adds its
+/// precondition and its put. Counted here from the batch's shape, not imported; the staging legs
+/// (`multipart_upload_part_stage.rs`, `renewals`) count the same on every renewal batch sent.
+const RENEWAL_FIXED_OPS: u32 = 3;
+
 /// The shipped set.
 const D: KnobSet = KnobSet::DEPLOYED;
 
@@ -179,7 +185,7 @@ fn leg1_the_shipped_set_passes_every_clamp() {
 /// names the first it checks, and that is the one asserted.
 #[test]
 fn leg2_each_clamp_passes_its_bound_and_names_itself_one_step_past_it() {
-    let (seg, part_ops) = (seg_put_bytes(), MAX_PART_CHUNKS + PART_COMMIT_FIXED_OPS);
+    let seg = seg_put_bytes();
     // `B_ops` at the whole five seconds — the ceiling the shipped value halves (leg 3).
     let (fence_edge, ops_top) = (MAX_BATCH_OPS - FENCE_FIXED_OPS, 2 * MAX_BATCH_OPS);
     // `B_bytes` at its floor and `B_ops` at its ceiling, so the idle fence's byte clamp binds
@@ -191,13 +197,33 @@ fn leg2_each_clamp_passes_its_bound_and_names_itself_one_step_past_it() {
     let at_scan_half = derived(with(TINY, |k| k.w_ref = 2 * (SCAN_HALF + 1)));
     let (past, past_cas) = (SCAN_HALF + 1, u32::try_from(SCAN_HALF + 1).unwrap());
     let fleet_at_half = derived(with(TINY, |k| k.w_ref = 2_000));
+    // A part commit spends `N + 8` operations and a renewal `2N + 3`, so the renewal is the
+    // tighter clamp from six chunks a part (#933): at the shipped 158, a `B_ops` that fails the
+    // part commit (166) fails the renewal (319) first. The part commit's own bound is put where it
+    // binds — `TINY`, one chunk a part, where it spends 9 and a renewal 5 — and the renewal's on
+    // the shipped set.
+    let tiny = derived(TINY);
+    let tiny_part_ops = TINY.max_part_chunks + PART_COMMIT_FIXED_OPS;
+    let renewal_ops = RENEWAL_FIXED_OPS + 2 * MAX_PART_CHUNKS;
+    // The adversary's set (v3 sign-off): unreplicated chunks, whose smaller ref lets a part grow
+    // past the shipped cap with every other clamp passing, to the first size whose renewal is one
+    // operation past `B_ops`; re-derived, or it would break `SessionsOverFootprint` instead.
+    let unreplicated = |chunks: u32| {
+        derived(with(D, |k| {
+            k.scheme = EcScheme::None;
+            k.max_part_chunks = chunks;
+        }))
+    };
+    assert_eq!(RENEWAL_FIXED_OPS + 2 * 249, MAX_BATCH_OPS + 1);
     verdicts! {
         // On each bound. `D` holds four: every chunk cap at capacity, staging at the publishable
         // ceiling, `B_bytes` at `E_tx/2`, the contention budget at `MAX_SESSIONS`.
         D => Ok(());
         with(D, |k| k.batch_bytes = seg) => Ok(());
         with(D, |k| k.batch_ops = ops_top) => Ok(());
-        with(D, |k| k.batch_ops = part_ops) => Ok(());
+        with(tiny, |k| k.batch_ops = tiny_part_ops) => Ok(());
+        with(D, |k| k.batch_ops = renewal_ops) => Ok(());
+        unreplicated(248) => Ok(());
         inflight(D, fence_edge) => Ok(());
         inflight(floor, pins) => Ok(());
         with(D, |k| k.w_ref = MAX_SESSIONS * U_REF) => Ok(());
@@ -238,9 +264,14 @@ fn leg2_each_clamp_passes_its_bound_and_names_itself_one_step_past_it() {
         with(D, |k| k.batch_bytes = E_TX_BYTES / 2 + 1) => Err(C::BatchBytesAboveHalfEnvelope);
         with(D, |k| k.batch_bytes = seg - 1) => Err(C::BatchBytesBelowSegmentPut);
         with(D, |k| k.batch_ops = ops_top + 1) => Err(C::BatchOpsAboveDeadline);
-        // The part commit one operation over `B_ops`, and `MAX_PART_CHUNKS > B_ops` (`0016:1466`).
-        with(D, |k| k.batch_ops = part_ops - 1) => Err(C::PartCommitOverOps);
-        with(D, |k| k.batch_ops = MAX_PART_CHUNKS - 1) => Err(C::PartCommitOverOps);
+        // The part commit one operation over `B_ops`, and `MAX_PART_CHUNKS > B_ops` (`0016:1466`),
+        // where the part commit binds.
+        with(tiny, |k| k.batch_ops = tiny_part_ops - 1) => Err(C::PartCommitOverOps);
+        with(tiny, |k| k.batch_ops = TINY.max_part_chunks - 1) => Err(C::PartCommitOverOps);
+        // A renewal of a whole part one operation over `B_ops`: at the shipped part size, and at
+        // the adversary's (`3 + 2 × 249 = 501`).
+        with(D, |k| k.batch_ops = renewal_ops - 1) => Err(C::RenewalOverOps);
+        unreplicated(249) => Err(C::RenewalOverOps);
         // The whole-range fence one pin over the mutation-byte budget, one operation over
         // `B_ops`, and `MAX_INFLIGHT_PARTS > B_ops` (`0016:1471`).
         inflight(floor, pins + 1) => Err(C::SlotRangeOverBytes);

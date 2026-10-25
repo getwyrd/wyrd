@@ -2774,8 +2774,9 @@ impl SlotRecord {
     }
 
     /// This slot with its lease moved to `lease_expiry_millis` and every other field kept: the
-    /// value the intent that rewrites the slot beside a new owned entry puts (`0016:659`). The
-    /// reservation stamp is kept because the reaper reads it as a fixed progress instant
+    /// value the intent that rewrites the slot beside a new owned entry puts (`0016:659`), and
+    /// the one a renewal puts beside every owned entry it renews (`0016:349`). The reservation
+    /// stamp is kept because the reaper reads it as a fixed progress instant
     /// (`0016:1831-1832`). Same refusal as [`Self::reserve`].
     pub(crate) fn with_lease(&self, lease_expiry_millis: u64) -> Result<Self, RecordError> {
         Self::reserve(
@@ -5030,7 +5031,9 @@ pub const MAX_SEG_CHUNKS: u32 = VALUE_CHUNK_CAPACITY;
 /// `sidx:` entries besides its fixed operations (`0016:659`), and it must fit [`MAX_BATCH_OPS`].
 /// Past that, a *valid* part's commit and its compensation — the same shape (`0016:672`) —
 /// would both time out on every attempt, leaving the slot and the staged residue with no path
-/// that ever clears them (`0016:1466`).
+/// that ever clears them (`0016:1466`). So must a renewal of that many owned leases, which moves
+/// them with the slot's in one batch: `3 + 2 × MAX_PART_CHUNKS` operations, the tighter of the
+/// two from six chunks up.
 pub const MAX_PART_CHUNKS: u32 = VALUE_CHUNK_CAPACITY;
 
 /// The largest part `UploadPart` accepts at `chunk_size` bytes per chunk:
@@ -5173,6 +5176,20 @@ pub const MAX_BATCH_OPS: u32 = (DEADLINE_OPS / 2) as u32;
 /// put, the slot delete and the re-upload `retire:bytes:` put. The live-session compensation
 /// (`0016:672`) is the same shape with fewer, so the commit is the batch the clamp must fit.
 const PART_COMMIT_FIXED_OPS: u64 = 8;
+
+/// The operations a renewal spends besides its two per owned entry (`0016:349`, `:659`): the
+/// session's and the slot's preconditions and the slot's put. Each owned entry adds its own
+/// precondition and its put.
+const RENEWAL_FIXED_OPS: u64 = 3;
+
+/// The operations one renewal of an attempt holding `owned` entries carries: [`stage`]'s renewal
+/// batch, which moves the slot's lease and every owned lease together and so cannot be split
+/// (`0016:349`, `:659`). [`knob_clamps_hold`] holds it to `B_ops` at `MAX_PART_CHUNKS`, and
+/// staging refuses a request whose chunk bound would pass [`MAX_BATCH_OPS`], since a batch past
+/// it would time out on every attempt and its leases could never be renewed.
+pub(crate) const fn renewal_batch_ops(owned: u32) -> u64 {
+    RENEWAL_FIXED_OPS + 2 * owned as u64
+}
 
 /// The operations the reaper's idle fence spends besides its one pin per slot index
 /// (`0016:664`, `:675`): the session precondition, two obligation `require_absent`s, and three
@@ -5445,6 +5462,11 @@ pub enum KnobClamp {
     /// A part commit — `MAX_PART_CHUNKS` owned-entry deletes plus its fixed operations — exceeds
     /// `B_ops` (`0016:1466`): an unsplittable batch that would time out on every attempt.
     PartCommitOverOps,
+    /// A renewal of a part holding `MAX_PART_CHUNKS` owned entries — `3 + 2 × MAX_PART_CHUNKS`
+    /// operations, since it moves the slot's lease with every owned lease (`0016:349`, `:659`) —
+    /// exceeds `B_ops`: an unsplittable batch that would time out on every attempt, leaving a part
+    /// whose leases can never be renewed.
+    RenewalOverOps,
     /// The idle fence's pins over the whole slot range exceed `B_bytes` (`0016:1471`).
     SlotRangeOverBytes,
     /// The idle fence — one pin per slot index plus its fixed operations — exceeds `B_ops`
@@ -5514,6 +5536,10 @@ pub fn knob_clamps_hold(set: &KnobSet) -> Result<(), KnobClamp> {
     ensure(ops <= DEADLINE_OPS, BatchOpsAboveDeadline)?;
     let part_commit = u64::from(set.max_part_chunks) + PART_COMMIT_FIXED_OPS;
     ensure(part_commit <= ops, PartCommitOverOps)?;
+    ensure(
+        renewal_batch_ops(set.max_part_chunks) <= ops,
+        RenewalOverOps,
+    )?;
     let inflight = u64::from(set.max_inflight_parts);
     ensure(inflight * SLOT_PIN_BYTES <= bytes, SlotRangeOverBytes)?;
     ensure(inflight + FENCE_FIXED_OPS <= ops, SlotRangeOverOps)?;
