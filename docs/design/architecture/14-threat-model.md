@@ -112,6 +112,7 @@ Each defended attack maps to the decision that owns it.
 | Write-path DoS / resource exhaustion | admission control: quota + rate + failure-domain room, all fail-closed | section 8.9, ADR-0022 |
 | Treating coordination (etcd, L5) as a database | architectural rule: nothing data-proportional in L5; sized in kilobytes | section 11 (risks), ADR-0006 |
 | Supply-chain compromise | permissive-only dependency criteria; `cargo-deny` advisory + license wall; `cargo-machete`; DCO | ADR-0008 |
+| Prompt injection through issue text into the triage bot (mislabel, abusive comment, spend) | the model gets no tools and no token; its answer is validated against the label sets and the priority computed by code; reasons that echo the issue, a single identifier-like token included, are withheld and markup neutralised; the job holds `contents: read`, `issues: write` and `id-token: write` only, and calls just the label, assignee and comment endpoints (the wider `issues: write` reach, editing or closing issues, needs a compromise of the job's hash-pinned code or dependencies); the Claude API token is federated, short-lived and accepted only from `main`; a workspace spending limit caps cost | ADR-0048 |
 | Multi-language client divergence (corrupt / non-atomic data) | spec-first on-disk format + conformance vectors; a Rust core with FFI is the reserved alternative to reimplementation | ADR-0002, section 8.6, 8.7 |
 | Backup that cannot restore (recursive dependency) | backups must not depend on the system they back up; the recursion bottoms out in independent storage | section 8.2 |
 
@@ -166,6 +167,9 @@ section 13; "DST" is Tier 0, the correctness authority.
 - **Single-provider operator trust** — operators are trusted within the provider (no
   cross-operator verify-everything, ADR-0005); insider risk is bounded by the append-only
   audit log and envelope encryption (the operator cannot read a tenant's directory).
+- **Issue text sent to the model provider** — the triage bot sends each issue's title and
+  description to Anthropic's API. The text is already public; a secret a reporter pasted is
+  the residual exposure, and the bot asks for it to be rotated (ADR-0048).
 
 ## 14.9 Gaps and their disposition
 

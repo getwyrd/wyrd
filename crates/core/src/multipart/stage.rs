@@ -1937,7 +1937,10 @@ impl<'r> Stager<'r> {
     /// taken as it comes: the one `work` has ready when the timer fires too, and one it gives
     /// while a renewal commits. A timer that fired early is waited out again for what is left. An
     /// answer seen with the clock at or past `deadline` — however the race fell, and whichever
-    /// branch saw it — is judged by `late`.
+    /// branch saw it — is judged by `late`. Each look at `work` comes after the clock reading it
+    /// is judged against, so an answer it has by a reading at or past `deadline` is judged too,
+    /// not abandoned for being looked at late, whether a renewal is running or not. `work` never
+    /// polled is not started past its deadline.
     ///
     /// A due renewal is raced against `work` and `deadline`, never awaited first. Once `work` has
     /// answered, the deadline no longer constrains the renewal, which is awaited to its end. A
@@ -1959,22 +1962,24 @@ impl<'r> Stager<'r> {
             Late::Taken => Some(output),
             Late::Refused => (runtime.now_millis() < deadline).then_some(output),
         };
+        // Whether `work` has been polled. Until it has, it is not started past its deadline.
         let mut started = false;
         loop {
+            let now = runtime.now_millis();
             if started {
-                // Whatever woke this loop, `work` may have answered meanwhile, and an answer it
-                // has is never lost to the deadline.
+                // Whatever woke this loop, `work` may have answered meanwhile. It is looked at
+                // after the clock is read, so an answer it has by that reading is never lost to
+                // the deadline.
                 if let Some(output) = work.as_mut().now_or_never() {
                     return judge(output).map_or(Raced::Expired(None), Raced::Answered);
                 }
             }
-            let now = runtime.now_millis();
             if now >= deadline {
                 return Raced::Expired(None);
             }
-            started = true;
             if now < self.renew_at {
                 let wake = self.renew_at.min(deadline) - now;
+                started = true;
                 if let Either::Left((output, _)) =
                     select(work.as_mut(), pin!(runtime.wait(wake))).await
                 {
@@ -1996,9 +2001,23 @@ impl<'r> Stager<'r> {
                     }
                     let now = runtime.now_millis();
                     if now >= deadline {
-                        break None;
+                        // As in the outer loop: once `work` has been polled, an answer it has by
+                        // this reading is judged, and a kept one disarms the deadline.
+                        let ready = if started {
+                            work.as_mut().now_or_never()
+                        } else {
+                            None
+                        };
+                        match ready.and_then(&judge) {
+                            Some(output) => {
+                                answered = Some(output);
+                                continue;
+                            }
+                            None => break None,
+                        }
                     }
                     let mut timer = pin!(runtime.wait(deadline - now));
+                    started = true;
                     // `work` first, so an answer it has is never lost to the renewal or the
                     // deadline; the timer last.
                     let woke = poll_fn(|cx| {
@@ -2391,5 +2410,204 @@ impl<'r> Stager<'r> {
         self.footprint.record = intent.record.clone();
         self.footprint.owned.push(intent.owned.clone());
         intent
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    use async_trait::async_trait;
+    use wyrd_traits::ScanPage;
+
+    const DEADLINE: u64 = 100;
+
+    /// What a scripted runtime and store share: whether the timer has fired, and whether the
+    /// clock has been read at or past [`DEADLINE`].
+    #[derive(Default)]
+    struct Script {
+        fired: AtomicBool,
+        late_seen: AtomicBool,
+    }
+
+    /// A clock that reads `early` until the timer has fired, then `late`; its timer fires at its
+    /// first poll, which [`StageRuntime::wait`] allows ("waking early is allowed").
+    struct Scripted<'s> {
+        script: &'s Script,
+        early: u64,
+        late: u64,
+    }
+
+    impl StageClock for Scripted<'_> {
+        fn now_millis(&self) -> u64 {
+            let now = if self.script.fired.load(Ordering::SeqCst) {
+                self.late
+            } else {
+                self.early
+            };
+            if now >= DEADLINE {
+                self.script.late_seen.store(true, Ordering::SeqCst);
+            }
+            now
+        }
+    }
+
+    impl StageRuntime for Scripted<'_> {
+        fn next_chunk_id(&mut self) -> ChunkId {
+            unreachable!("renewing takes no chunk ids")
+        }
+
+        fn wait(&self, _millis: u64) -> impl Future<Output = ()> + Send {
+            let fired = &self.script.fired;
+            poll_fn(move |_| {
+                fired.store(true, Ordering::SeqCst);
+                Poll::Ready(())
+            })
+        }
+    }
+
+    /// A store whose renewal commit is pending until the timer has fired, then lands.
+    struct Store<'s>(&'s Script);
+
+    #[async_trait]
+    impl MetadataStore for Store<'_> {
+        async fn get(&self, _key: &[u8]) -> wyrd_traits::Result<Option<Bytes>> {
+            unreachable!("a renewal that lands reads nothing")
+        }
+
+        async fn scan(&self, _prefix: &[u8]) -> wyrd_traits::Result<Vec<(Vec<u8>, Bytes)>> {
+            unreachable!("a renewal scans nothing")
+        }
+
+        async fn scan_page(
+            &self,
+            _prefix: &[u8],
+            _after: Option<&[u8]>,
+            _limit: usize,
+        ) -> wyrd_traits::Result<ScanPage> {
+            unreachable!("a renewal scans nothing")
+        }
+
+        async fn commit(&self, _batch: WriteBatch) -> wyrd_traits::Result<CommitOutcome> {
+            poll_fn(|_| {
+                if self.0.fired.load(Ordering::SeqCst) {
+                    Poll::Ready(Ok(CommitOutcome::Committed))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        }
+    }
+
+    /// Work that answers `7` once the clock has been read at or past the deadline: a write that
+    /// landed by that reading. It counts its polls.
+    fn work<'a>(script: &'a Script, polls: &'a AtomicU32) -> impl Future<Output = u32> + 'a {
+        poll_fn(move |_| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            if script.late_seen.load(Ordering::SeqCst) {
+                Poll::Ready(7)
+            } else {
+                Poll::Pending
+            }
+        })
+    }
+
+    /// Run [`Stager::renewing`] on `runtime` for [`work`], with a renewal due from `renew_at`.
+    fn race(runtime: &Scripted<'_>, polls: &AtomicU32, renew_at: u64, late: Late) -> Raced<u32> {
+        let upload = UploadId::new(format!("{:032x}", 1)).unwrap();
+        let attempt = AttemptId::new(format!("{:032x}", 2)).unwrap();
+        let part = PartNumber::new(1).unwrap();
+        let topology = Topology::default();
+        let request = StageRequest {
+            upload_id: &upload,
+            part_number: part,
+            attempt_id: &attempt,
+            max_inflight_parts: 1,
+            lease_ttl_millis: 10_000,
+            chunk_size: 1,
+            scheme: EcScheme::ReedSolomon { k: 1, m: 1 },
+            topology: &topology,
+            write_window_millis: 1,
+            max_part_chunks: 1,
+            body_idle_millis: 1,
+        };
+        let reservation = Reservation {
+            session: Bytes::new(),
+            index: SlotIndex::new(0).unwrap(),
+            slot: Bytes::new(),
+            record: SlotRecord::reserve(part, attempt.clone(), 0, 10_000).unwrap(),
+        };
+        let mut stager = Stager::new(&request, reservation);
+        stager.renew_at = renew_at;
+        let store = Store(runtime.script);
+        stager
+            .renewing(&store, runtime, work(runtime.script, polls), DEADLINE, late)
+            .now_or_never()
+            .expect("nothing in renewing waits on this runtime")
+    }
+
+    /// `raced`, for a failure message.
+    fn outcome(raced: &Raced<u32>) -> String {
+        match raced {
+            Raced::Answered(output) => format!("answered {output}"),
+            Raced::Expired(None) => "expired".into(),
+            Raced::Expired(Some(_)) => "expired with a renewal abandoned".into(),
+            Raced::Halted(_) => "halted".into(),
+        }
+    }
+
+    /// The timer ends a wait early with the work pending; by the next look the clock has reached
+    /// the deadline and the work has its answer. A taken answer is kept, a refused one is not.
+    #[test]
+    fn an_answer_ready_when_an_early_wait_finds_the_deadline_passed_is_judged_by_late() {
+        for late in [Late::Taken, Late::Refused] {
+            let script = Script::default();
+            let runtime = Scripted {
+                script: &script,
+                early: 99,
+                late: DEADLINE,
+            };
+            let raced = race(&runtime, &AtomicU32::new(0), u64::MAX, late);
+            match (late, raced) {
+                (Late::Taken, Raced::Answered(7)) | (Late::Refused, Raced::Expired(None)) => {}
+                (late, raced) => panic!("{late:?}: {}", outcome(&raced)),
+            }
+        }
+    }
+
+    /// As above, with a renewal committing when the deadline is found passed. A taken answer is
+    /// kept and the renewal runs to its end; a refused one leaves the renewal abandoned.
+    #[test]
+    fn an_answer_ready_when_the_deadline_passes_during_a_renewal_is_judged_by_late() {
+        for late in [Late::Taken, Late::Refused] {
+            let script = Script::default();
+            let runtime = Scripted {
+                script: &script,
+                early: 99,
+                late: DEADLINE,
+            };
+            let raced = race(&runtime, &AtomicU32::new(0), 0, late);
+            match (late, raced) {
+                (Late::Taken, Raced::Answered(7)) | (Late::Refused, Raced::Expired(Some(_))) => {}
+                (late, raced) => panic!("{late:?}: {}", outcome(&raced)),
+            }
+        }
+    }
+
+    /// Work whose deadline has passed before it ever ran is not started.
+    #[test]
+    fn work_never_polled_is_not_started_past_its_deadline() {
+        let script = Script::default();
+        let runtime = Scripted {
+            script: &script,
+            early: DEADLINE,
+            late: DEADLINE,
+        };
+        let polls = AtomicU32::new(0);
+        let raced = race(&runtime, &polls, u64::MAX, Late::Taken);
+        assert!(matches!(raced, Raced::Expired(None)));
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "the work was never polled");
     }
 }

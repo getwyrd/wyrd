@@ -34,3 +34,7 @@ target
 /docs/.obsidian/workspace-mobile.json
 /docs/.obsidian/cache
 /docs/.obsidian/plugins/
+
+# Python bytecode (the triage scripts under .github/triage)
+__pycache__/
+*.pyc
