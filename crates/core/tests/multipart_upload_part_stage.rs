@@ -28,8 +28,23 @@
 //! * **(G)** the per-part chunk bound. **(H)** a request that cannot be honoured, refused alike
 //!   by `stage_part` and `reserve_slot`.
 //!
-//! The wrappers keep their state in struct fields, never in a `static` (ADR-0035). 657.1b
-//! (#933) appends its renewal legs here and reuses this harness.
+//! 657.1b (#933) appends its renewal legs, over the same harness:
+//!
+//! * **(R1)** every renewal batch rewrites the slot with every owned lease, each required at its
+//!   prior bytes under the session fence, in exactly the operations the clamp counts.
+//! * **(R2)** renewal runs for the whole request: before the first chunk, while a body read is
+//!   withheld (D-i), while a fragment write is held (D-ii), at exactly half a TTL, before an intent
+//!   and never during one; and a renewal that crosses expiry defeats a stand-in reaper fence.
+//! * **(R3)** renewal never holds staging past an armed deadline, and a write answered in time is
+//!   taken however long the renewal beside it takes; the body-idle bound still holds.
+//! * **(R4)** a lapsed lease is refused, never revived, by every round at its own reading; and a
+//!   renewal that stops staging beside a chunk's writes leaves their effect unknown, a refusal
+//!   included, unless every write had answered.
+//! * **(R5)** unknown renewal outcomes are settled by a re-read. **(R6)** the renewal loop is
+//!   bounded. **(R7)** the commit's quiesce renewal, `StagedAttempt::renew`, and its cover.
+//!   **(R8)** a chunk bound whose renewal would pass `MAX_BATCH_OPS` is refused.
+//!
+//! The wrappers keep their state in struct fields, never in a `static` (ADR-0035).
 
 #![forbid(unsafe_code)]
 
@@ -51,15 +66,16 @@ use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, SegmentNonce};
 use wyrd_core::multipart::abort::abort_session;
 use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
 use wyrd_core::multipart::stage::{
-    reserve_slot, stage_part, InDoubt, StageError, StageOutcome, StageRequest, StageRuntime,
-    StagedAttempt, Stop, INTENT_ROUNDS, RESERVE_AMBIGUOUS_ROUNDS,
+    reserve_slot, stage_part, InDoubt, RenewOutcome, StageClock, StageError, StageOutcome,
+    StageRequest, StageRuntime, StagedAttempt, Stop, ABANDONED_COMMIT, INTENT_ROUNDS,
+    RENEWAL_ROUNDS, RESERVE_AMBIGUOUS_ROUNDS,
 };
 use wyrd_core::multipart::{
     decode_owned_entry, decode_session_record, decode_slot_record, mpu_key, parse_sidx_key,
     parse_slot_key, sidx_key, sidx_range, slot_key, slot_range, AbortOutcome, AttemptId,
     Backpressure, Budget, CreateOutcome, Digest, OwnedEntry, PartNumber, Refusal, ReserveOutcome,
-    SessionState, SlotIndex, SlotRecord, UploadId, MAX_INFLIGHT_PARTS, MAX_SLOT_INDEX, PART_PREFIX,
-    PSUM_PREFIX, SIDX_PREFIX, SLOT_PREFIX,
+    SessionState, SlotIndex, SlotRecord, UploadId, MAX_BATCH_OPS, MAX_INFLIGHT_PARTS,
+    MAX_PART_CHUNKS, MAX_SLOT_INDEX, PART_PREFIX, PSUM_PREFIX, SIDX_PREFIX, SLOT_PREFIX,
 };
 use wyrd_core::placement::{select_distinct_domains, SelectorError, Topology};
 use wyrd_core::read::read_chunk_verified;
@@ -217,7 +233,9 @@ fn request<'a>(
         scheme: RS42,
         topology,
         write_window_millis: W,
-        max_part_chunks: 1_000,
+        // The shipped bound: a wider one would make a renewal batch past `MAX_BATCH_OPS`, which
+        // staging refuses (R8).
+        max_part_chunks: MAX_PART_CHUNKS,
         body_idle_millis: IDLE,
     }
 }
@@ -306,6 +324,10 @@ enum Kind {
     Reserve,
     /// `require_absent(sidx:..)`.
     Intent,
+    /// No `require_absent`, and a put of the slot or an owned entry: a renewal, which moves the
+    /// slot's lease with every owned one. Told apart by what it puts, not by whether it puts the
+    /// slot, so a renewal that left the slot out is still one.
+    Renewal,
     Other,
 }
 
@@ -320,6 +342,12 @@ fn kind_of(batch: &WriteBatch) -> Kind {
         Kind::Intent
     } else if absent(SLOT_PREFIX) {
         Kind::Reserve
+    } else if batch
+        .puts
+        .iter()
+        .any(|(key, _)| key.starts_with(SLOT_PREFIX) || key.starts_with(SIDX_PREFIX))
+    {
+        Kind::Renewal
     } else {
         Kind::Other
     }
@@ -390,6 +418,13 @@ enum Event {
     Faulted { id: FragmentId },
     /// The wrapper answered a read of `key` (a `get`'s key, or a `scan`'s prefix) with a fault.
     ReadFault { key: Vec<u8> },
+    /// A commit of `kind` reached its [`Act::Gated`] gate, and waits there.
+    Gated { kind: Kind },
+    /// A read reached its [`Then::Gate`], and waits there.
+    ReadGated,
+    /// The answer to the put of `id` reached its caller, past any transit hold: pushed while
+    /// staging polls that put, so once a driver sees it, staging has taken the answer.
+    Delivered { id: FragmentId },
 }
 
 /// One ordered log shared by the store wrapper, the chunk-store fake and the bodies.
@@ -476,6 +511,40 @@ impl Log {
             .into_iter()
             .filter(|commit| intent_chunk(&commit.batch) == chunk)
             .collect()
+    }
+
+    /// The commits of `of` the store answered `Committed`.
+    fn landed(&self, of: Kind) -> usize {
+        self.commits(of)
+            .iter()
+            .filter(|commit| commit.answer == Answer::Committed)
+            .count()
+    }
+
+    /// The commits of `of` that have reached an [`Act::Gated`] gate.
+    fn gated(&self, of: Kind) -> usize {
+        self.events()
+            .iter()
+            .filter(|event| matches!(event, Event::Gated { kind } if *kind == of))
+            .count()
+    }
+
+    /// The reads that have reached a [`Then::Gate`].
+    fn reads_gated(&self) -> usize {
+        self.events()
+            .iter()
+            .filter(|event| matches!(event, Event::ReadGated))
+            .count()
+    }
+
+    /// Whether the fake has answered the put of `id` `Ok`.
+    fn acked(&self, id: FragmentId) -> bool {
+        self.has(|e| matches!(e, Event::Acked { id: answered } if *answered == id))
+    }
+
+    /// Whether the answer to the put of `id` has reached staging ([`Event::Delivered`]).
+    fn delivered(&self, id: FragmentId) -> bool {
+        self.has(|e| matches!(e, Event::Delivered { id: answered } if *answered == id))
     }
 }
 
@@ -569,6 +638,11 @@ enum Act {
     /// Answer a plain store fault without applying anything: a definite failure of this batch,
     /// not an unknown outcome.
     Fail,
+    /// A slow commit: log [`Event::Gated`] on arrival, wait for a permit on the gate, then do the
+    /// boxed act (never itself `Gated`). A commit its caller stops waiting for at the gate is kept
+    /// unapplied in the held queue, as a store may still apply a commit its client gave up on: the
+    /// test lands it with [`Scripted::release_held`].
+    Gated(Arc<Semaphore>, Box<Act>),
 }
 
 /// What the wrapper does right after a read returns, before handing its answer back: the
@@ -586,6 +660,24 @@ enum Then {
     /// Answer this read with a store fault instead of what it found ([`read_fault`]), after
     /// any action listed before it.
     Fault,
+    /// A slow read: log [`Event::ReadGated`], then wait for a permit on the gate before the
+    /// answer is handed back.
+    Gate(Arc<Semaphore>),
+}
+
+/// A gated commit's batch while it waits at its gate: dropped there, by a caller that stopped
+/// waiting, it goes to the held queue unapplied.
+struct HeldIfDropped<'a> {
+    state: &'a Mutex<ScriptState>,
+    batch: Option<WriteBatch>,
+}
+
+impl Drop for HeldIfDropped<'_> {
+    fn drop(&mut self) {
+        if let Some(batch) = self.batch.take() {
+            self.state.lock().unwrap().held.push_back(batch);
+        }
+    }
 }
 
 /// Fire `then` after the read of `key` (a `get`'s key, or a `scan`'s prefix) that follows `skip`
@@ -643,6 +735,11 @@ impl Scripted {
         self.state.lock().unwrap().held.push_back(batch);
     }
 
+    /// How many batches are held unapplied.
+    fn held_count(&self) -> usize {
+        self.state.lock().unwrap().held.len()
+    }
+
     async fn side(&self, side: &Side, batch: &WriteBatch) {
         match side {
             Side::Batch(hook) => {
@@ -696,6 +793,10 @@ impl Scripted {
                     );
                 }
                 Then::Abort(upload) => fence(&self.inner, &upload).await,
+                Then::Gate(gate) => {
+                    self.log.push(Event::ReadGated);
+                    gate.acquire().await.expect("the gate stays open").forget();
+                }
             }
         }
         fault
@@ -747,6 +848,20 @@ impl MetadataStore for Scripted {
             }
             .unwrap_or(Act::Pass)
         };
+        let act = match act {
+            Act::Gated(gate, then) => {
+                self.log.push(Event::Gated { kind });
+                let mut waiting = HeldIfDropped {
+                    state: &self.state,
+                    batch: Some(batch.clone()),
+                };
+                gate.acquire().await.expect("the gate stays open").forget();
+                // Past the gate: the act below decides what the batch comes to.
+                waiting.batch = None;
+                *then
+            }
+            act => act,
+        };
         let result = match act {
             Act::Pass => self.inner.commit(batch.clone()).await,
             Act::Conflict => {
@@ -796,6 +911,7 @@ impl MetadataStore for Scripted {
                 tokio::task::yield_now().await;
                 Err("scripted commit fault: the batch was not applied".into())
             }
+            Act::Gated(..) => panic!("a gated act's own act is never gated"),
         };
         self.log.push(Event::Commit {
             kind,
@@ -1050,6 +1166,7 @@ impl PlacementChunkStore for Fleet {
         let answer = put.await.expect("the put task ran to an answer");
         // The reply in transit: the store has answered, the caller has not heard yet.
         state.gate(id, HoldAt::Answer).await;
+        state.log.push(Event::Delivered { id });
         answer
     }
 }
@@ -1072,11 +1189,13 @@ struct Runtime {
     on_fire: OnFire,
 }
 
-impl StageRuntime for Runtime {
+impl StageClock for Runtime {
     fn now_millis(&self) -> u64 {
         self.clock.now_millis()
     }
+}
 
+impl StageRuntime for Runtime {
     fn next_chunk_id(&mut self) -> ChunkId {
         self.next_chunk += 1;
         self.next_chunk
@@ -1592,7 +1711,17 @@ fn effect_unknown(cause: &Stop) -> (ChunkId, u64, &[WriteDeadlineExpired], &[Box
             deadline_millis,
             abandoned,
             reports,
+            ..
         } => (*chunk, *deadline_millis, abandoned, reports),
+        other => panic!("expected WriteEffectUnknown, got {other:?}"),
+    }
+}
+
+/// What stopped the renewal that stopped staging beside the writes an effect-unknown stop
+/// accounts for; `None` when staging waited for them to their end or their deadline (657.1b).
+fn stopped_by_renewal(cause: &Stop) -> Option<&Stop> {
+    match cause {
+        Stop::WriteEffectUnknown { renewal, .. } => renewal.as_deref(),
         other => panic!("expected WriteEffectUnknown, got {other:?}"),
     }
 }
@@ -1705,8 +1834,10 @@ async fn a_prime_a_write_pending_past_its_deadline_is_abandoned() {
             1,
             "no later chunk was started"
         );
-        // The body read waited on the timer, then the writes waited for exactly their window.
-        assert_eq!(rig.waits(), vec![IDLE, W]);
+        // The body read waited on the timer, then the writes waited for exactly their window. The
+        // read's wait runs to the renewal instant, half a TTL on, which comes before its idle bound
+        // (#933).
+        assert_eq!(rig.waits(), vec![HALF, W]);
         assert_fragments_evidenced(&rig).await;
         assert_eq!(owned(&rig.store.inner, &rig.upload).await.len(), 1);
         assert_eq!(
@@ -1810,7 +1941,8 @@ async fn a_prime_a_put_refused_as_late_is_reported_as_nothing_landed() {
             "{cause:?}"
         );
         assert_eq!(rig.fleet.stored_on(held), None);
-        assert_eq!(rig.waits(), vec![IDLE, W], "the timer never fired");
+        // The read's wait runs to the renewal instant, before its idle bound (#933).
+        assert_eq!(rig.waits(), vec![HALF, W], "the timer never fired");
     })
     .await;
 }
@@ -2052,9 +2184,10 @@ async fn a_prime_an_ok_ready_as_the_deadline_timer_fires_is_counted_written() {
             T0 + W,
             "chunk 1's deadline had come"
         );
+        // The read's wait runs to the renewal instant, before its idle bound (#933).
         assert_eq!(
             rig.waits()[..2],
-            [IDLE, W],
+            [HALF, W],
             "chunk 1's writes waited for their window"
         );
         assert_fragments_evidenced(&rig).await;
@@ -2215,6 +2348,10 @@ async fn a_double_prime_the_idle_bound_is_per_read_not_per_body() {
         );
         let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
         req.body_idle_millis = BOUND;
+        // A lease long enough that no renewal falls due inside the leg, so its waits are the idle
+        // bound's alone (#933; the bound beside renewals is R3's
+        // `r3_the_body_idle_bound_holds_while_renewals_keep_the_leases`).
+        req.lease_ttl_millis = 4 * TTL;
         let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream);
         let piece = Bytes::copy_from_slice(&body[10..]);
         let armed = |n: usize| {
@@ -4210,6 +4347,2118 @@ async fn the_fleet_fake_resolves_fragments_by_placement() {
                 .await
                 .unwrap(),
             body
+        );
+    })
+    .await;
+}
+
+// ═══════════════════════ 657.1b (#933): renewal ═══════════════════════
+
+/// Half the lease TTL: renewal falls due this long after the last renewal, or the reservation.
+const HALF: u64 = TTL / 2;
+/// A write window wider than half a TTL, so the renewal due at `T0 + HALF` falls inside the
+/// window of writes authorized at `T0`.
+const WINDOW: u64 = HALF + 1_000;
+/// The cover the quiesce legs ask for: the 5,000 ms transaction envelope the part commit (#927)
+/// passes (`crates/core/src/multipart.rs`, `E_TX_MILLIS`).
+const COVER: u64 = 5_000;
+const _: () = assert!(WINDOW < TTL && COVER < TTL);
+
+/// A body whose `i`-th piece advances the clock by its `u64` the moment it is read, logged as read
+/// ([`Event::Read`]): a client that sends slowly, with no timer fired.
+fn ticking(clock: &ManualClock, log: &Log, pieces: Vec<(u64, Bytes)>) -> Body {
+    let (clock, log) = (clock.clone(), log.clone());
+    let pieces: VecDeque<(u64, Bytes)> = pieces.into();
+    Box::pin(stream::unfold(
+        (pieces, 0usize),
+        move |(mut pieces, index)| {
+            let (clock, log) = (clock.clone(), log.clone());
+            async move {
+                let (advance, piece) = pieces.pop_front()?;
+                clock.advance(advance);
+                log.push(Event::Read { index });
+                Some((Ok(piece), (pieces, index + 1)))
+            }
+        },
+    ))
+}
+
+/// The body most renewal legs stage: two chunks, the second piece read at `T0 + HALF + 1`, so a
+/// renewal falls due as the third read begins.
+fn renewal_body(clock: &ManualClock, log: &Log) -> Body {
+    let body = body_bytes(2 * CHUNK);
+    let sized = pieces(&body, &[10, 10, 2 * CHUNK - 20]);
+    ticking(
+        clock,
+        log,
+        [0, HALF + 1, 0].into_iter().zip(sized).collect(),
+    )
+}
+
+/// The slot value a batch puts.
+fn slot_value_put(batch: &WriteBatch) -> Bytes {
+    batch
+        .puts
+        .iter()
+        .find(|(key, _)| key.starts_with(SLOT_PREFIX))
+        .map(|(_, value)| value.clone())
+        .expect("the batch puts the slot")
+}
+
+/// The slot record a batch puts.
+fn slot_put(batch: &WriteBatch) -> SlotRecord {
+    decode_slot_record(&slot_value_put(batch)).unwrap()
+}
+
+/// Staging's `n`-th wait has been asked for.
+fn waits_asked(waits: &Arc<Mutex<Vec<u64>>>, n: usize) -> impl FnMut() -> bool {
+    let waits = Arc::clone(waits);
+    move || waits.lock().unwrap().len() >= n
+}
+
+/// **(R1)** The renewal commits in the log, each checked to be one (`0016:349`, `:659`): it
+/// requires the session (the `Open@E` fence) and requires nothing absent; it rewrites exactly the
+/// records it requires but the session — the attempt's slot, always, and every owned entry beside
+/// it; every lease it puts is one instant, strictly later than the slot lease it replaces; and it
+/// carries `3 + 2N` operations for `N` owned entries, the count the clamp holds to `B_ops` (R8).
+fn renewals(rig: &Rig) -> Vec<Commit> {
+    let session = mpu_key(&rig.upload);
+    let renewals = rig.log.commits(Kind::Renewal);
+    for renewal in &renewals {
+        let batch = &renewal.batch;
+        assert!(
+            batch.preconditions.iter().all(|p| p.expected.is_some()),
+            "a renewal requires nothing absent"
+        );
+        assert!(batch.deletes.is_empty(), "a renewal deletes nothing");
+        let mut required: BTreeSet<&[u8]> = batch
+            .preconditions
+            .iter()
+            .map(|p| p.key.as_slice())
+            .collect();
+        assert!(required.remove(session.as_slice()), "the session fence");
+        let put: BTreeSet<&[u8]> = batch.puts.iter().map(|(key, _)| key.as_slice()).collect();
+        assert_eq!(
+            required, put,
+            "a renewal rewrites exactly the slot and the owned entries it requires"
+        );
+        assert_eq!(
+            put.iter()
+                .filter(|key| key.starts_with(SLOT_PREFIX))
+                .count(),
+            1,
+            "every renewal rewrites the attempt's slot"
+        );
+        let owned = put
+            .iter()
+            .filter(|key| key.starts_with(SIDX_PREFIX))
+            .count();
+        let ops = batch.preconditions.len() + batch.puts.len() + batch.deletes.len();
+        assert_eq!(ops, 3 + 2 * owned, "3 + 2N operations");
+        let replaced = decode_slot_record(&slot_required(batch))
+            .unwrap()
+            .lease_expiry_millis();
+        let leases: BTreeSet<u64> = put.iter().map(|key| lease_put(batch, key)).collect();
+        assert_eq!(leases.len(), 1, "one instant for every lease it moves");
+        assert!(
+            leases.iter().all(|lease| *lease > replaced),
+            "strictly later than the slot lease it replaces"
+        );
+    }
+    renewals
+}
+
+/// What a reaper reading the store at `now` finds: every lease of `upload`'s slots and owned
+/// entries still live (`0016:1824-1837`).
+async fn assert_live(store: &impl MetadataStore, upload: &UploadId, now: u64) {
+    for (index, slot) in slots(store, upload).await {
+        assert!(
+            slot.lease_expiry_millis() > now,
+            "slot {} lapsed at {} (now {now})",
+            index.get(),
+            slot.lease_expiry_millis()
+        );
+    }
+    for (chunk, entry) in owned(store, upload).await {
+        assert!(
+            entry.lease_expiry_millis() > now,
+            "chunk {chunk}'s owned lease lapsed at {} (now {now})",
+            entry.lease_expiry_millis()
+        );
+    }
+}
+
+/// The index of the `n`-th (0-based) commit of `of` in the log's events.
+fn commit_at(events: &[Event], of: Kind, n: usize) -> usize {
+    events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, Event::Commit { kind, .. } if *kind == of))
+        .map(|(at, _)| at)
+        .nth(n)
+        .unwrap_or_else(|| panic!("a {of:?} commit #{n}"))
+}
+
+/// `open`'s session fenced to `Aborting@1`, the session put a reaper's idle fence makes
+/// (`0016:664`).
+fn aborting(open: &Bytes) -> Bytes {
+    let text = String::from_utf8(open_at(open, 1).to_vec())
+        .unwrap()
+        .replace(r#"{"kind":"Open"}"#, r#"{"kind":"Aborting"}"#);
+    let decoded = decode_session_record(text.as_bytes()).expect("a canonical session");
+    assert!(matches!(decoded.state(), SessionState::Aborting {}));
+    assert_eq!(metadata::encode(&decoded), text.as_bytes());
+    Bytes::from(text)
+}
+
+// ─────────────── (R1) the renewal batch ───────────────
+
+/// **(R1)** The renewal batch (`0016:349`, `:659`). Chunks 1 and 2 are staged at `T0`; the next
+/// piece arrives at `T0 + HALF + 1`, past the renewal instant, and one renewal runs before chunk
+/// 3's intent. It requires the session at its `Open@E` bytes, the slot at the bytes chunk 2's
+/// intent put and each owned entry at the bytes its intent put; it rewrites exactly those, every
+/// lease moved to its reading plus a TTL, later than the slot lease it replaces, the placements
+/// untouched; it carries 7 operations (`3 + 2 × 2`); and chunk 3's intent is fenced on the slot it
+/// put. A renewal that left out the slot or an owned entry fails here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r1_a_renewal_rewrites_the_slot_with_every_owned_lease() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let body = body_bytes(2 * CHUNK + 10);
+        let sized = pieces(&body, &[2 * CHUNK, 10]);
+        let body_stream = ticking(
+            &rig.clock,
+            &rig.log,
+            [0, HALF + 1].into_iter().zip(sized).collect(),
+        );
+        let attempt = staged(rig.stage(|_| {}, body_stream).await);
+        let renewals = renewals(&rig);
+        assert_eq!(renewals.len(), 1);
+        let renewal = &renewals[0];
+        assert_eq!(renewal.answer, Answer::Committed);
+        assert_eq!(renewal.clock, T0 + HALF + 1);
+        let intents = rig.log.commits(Kind::Intent);
+        assert_eq!(intents.len(), 3);
+        // What the store held when the renewal was sent.
+        let mut prior: BTreeMap<Vec<u8>, Bytes> = BTreeMap::new();
+        prior.insert(mpu_key(&rig.upload), rig.session.clone());
+        prior.insert(
+            attempt.slot_key().to_vec(),
+            slot_value_put(&intents[1].batch),
+        );
+        for intent in &intents[..2] {
+            let (key, value) = intent_put(&intent.batch);
+            prior.insert(key, value);
+        }
+        let required: BTreeMap<Vec<u8>, Bytes> = renewal
+            .batch
+            .preconditions
+            .iter()
+            .map(|p| (p.key.clone(), p.expected.clone().unwrap()))
+            .collect();
+        assert_eq!(required, prior, "every record required at its prior bytes");
+        assert_eq!(
+            renewal.batch.preconditions.len() + renewal.batch.puts.len(),
+            3 + 2 * 2
+        );
+        let lease = T0 + HALF + 1 + TTL;
+        for (key, _) in &renewal.batch.puts {
+            assert_eq!(
+                lease_put(&renewal.batch, key),
+                lease,
+                "the reading plus a TTL"
+            );
+        }
+        for intent in &intents[..2] {
+            let (key, _) = intent_put(&intent.batch);
+            let before = intent_entry(&intent.batch);
+            let (_, value) = renewal.batch.puts.iter().find(|(k, _)| *k == key).unwrap();
+            let after = decode_owned_entry(&key, value).unwrap().2;
+            assert_eq!(after.owner(), before.owner());
+            assert_eq!(after.staged(), before.staged(), "only the lease moved");
+        }
+        assert_eq!(
+            slot_required(&intents[2].batch),
+            slot_value_put(&renewal.batch),
+            "chunk 3's intent is fenced on the renewed slot"
+        );
+        let leases: Vec<u64> = attempt
+            .owned()
+            .iter()
+            .map(|held| held.entry().lease_expiry_millis())
+            .collect();
+        assert_eq!(leases[..2], [lease, lease]);
+        assert_eq!(*attempt.digest(), sha256(&body));
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+// ─────────────── (R2) renewal runs for the whole request ───────────────
+
+/// **(R2) Before the first chunk.** The body arrives in four small pieces, the clock moving past
+/// half a TTL before each of the last three, with no timer fired, so the first chunk boundary
+/// falls well after the reserved slot lease (`T0 + TTL`) would have lapsed. A renewal runs as each
+/// next read begins and before the intent: the first before the third piece is read, the slot lease
+/// moved forward before the first intent, which is fenced on the last renewal's slot. At every
+/// instant the clock reaches, a reaper reading the store finds every lease live. A writer that
+/// renewed only at chunk boundaries finds the slot lapsed at the first one (`0016:1824-1837`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_renewal_runs_while_the_body_arrives_before_the_first_chunk() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body_stream) = channel(&rig.log);
+        let body = body_bytes(CHUNK);
+        let sized = pieces(&body, &[10, 10, 10, CHUNK - 30]);
+        // The fixture binds: the first chunk boundary falls after the reserved lease expired.
+        const { assert!(3 * (HALF + 1) > TTL) };
+        tx.send(sized[0].clone()).unwrap();
+        let (log, clock, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let (inner, upload) = (&rig.store.inner, rig.upload.clone());
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream);
+        let driver = async move {
+            until("the second read to wait", waits_asked(&waits, 2)).await;
+            for (n, piece) in sized[1..].iter().enumerate() {
+                clock.advance(HALF + 1);
+                assert_live(inner, &upload, clock.now_millis()).await;
+                tx.send(piece.clone()).unwrap();
+                until("the piece read", || log.read(n + 1)).await;
+                until("a renewal after it", || log.landed(Kind::Renewal) == n + 1).await;
+            }
+            until("the first intent", || log.landed(Kind::Intent) == 1).await;
+            assert_live(inner, &upload, clock.now_millis()).await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let attempt = staged(outcome);
+        assert_eq!(attempt.len(), CHUNK as u64);
+        assert_eq!(*attempt.digest(), sha256(&body));
+        let renewals = renewals(&rig);
+        assert_eq!(renewals.len(), 3);
+        for (n, renewal) in renewals.iter().enumerate() {
+            let reading = T0 + (n as u64 + 1) * (HALF + 1);
+            assert_eq!(renewal.answer, Answer::Committed);
+            assert_eq!(renewal.clock, reading);
+            assert_eq!(
+                slot_put(&renewal.batch).lease_expiry_millis(),
+                reading + TTL,
+                "the slot lease moved forward from the renewal's own reading"
+            );
+        }
+        let events = rig.log.events();
+        let third_read = events
+            .iter()
+            .position(|e| matches!(e, Event::Read { index: 2 }))
+            .unwrap();
+        assert!(
+            commit_at(&events, Kind::Renewal, 0) < third_read,
+            "renewed while the body was still arriving"
+        );
+        assert!(
+            commit_at(&events, Kind::Renewal, 2) < commit_at(&events, Kind::Intent, 0),
+            "renewed before the first intent"
+        );
+        assert_eq!(
+            slot_required(&rig.log.commits(Kind::Intent)[0].batch),
+            slot_value_put(&renewals[2].batch)
+        );
+    })
+    .await;
+}
+
+/// **(R2) D-i, the body withheld.** After the slot is reserved and the first piece read, the test
+/// withholds the next piece, moves the clock past half a TTL and fires the timer: a renewal
+/// rewriting the slot commits **while the read is still pending**. Then the piece is delivered and
+/// staging finishes normally, each piece read exactly once. A staging that renewed only between
+/// delivered pieces would still be waiting here for the renewal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_d_i_a_renewal_commits_while_a_body_read_is_pending() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body_stream) = channel(&rig.log);
+        let body = body_bytes(2 * CHUNK);
+        tx.send(Bytes::copy_from_slice(&body[..10])).unwrap();
+        let (log, clock, timer, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let (inner, upload) = (&rig.store.inner, rig.upload.clone());
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream);
+        let rest = Bytes::copy_from_slice(&body[10..]);
+        let driver = async move {
+            until("the second read to wait", waits_asked(&waits, 2)).await;
+            clock.advance(HALF + 1);
+            assert_live(inner, &upload, clock.now_millis()).await;
+            timer.add_permits(1);
+            until("a renewal while the read is pending", || {
+                log.landed(Kind::Renewal) == 1
+            })
+            .await;
+            assert!(!log.read(1), "the piece is still withheld");
+            assert!(log.commits(Kind::Intent).is_empty());
+            assert_live(inner, &upload, clock.now_millis()).await;
+            tx.send(rest).unwrap();
+            until("the withheld piece read", || log.read(1)).await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let attempt = staged(outcome);
+        assert_eq!(attempt.len(), 2 * CHUNK as u64);
+        assert_eq!(*attempt.digest(), sha256(&body), "no piece dropped");
+        for index in [0, 1] {
+            let reads = rig
+                .log
+                .events()
+                .iter()
+                .filter(|e| matches!(e, Event::Read { index: i } if *i == index))
+                .count();
+            assert_eq!(reads, 1, "piece {index} read once");
+        }
+        let renewals = renewals(&rig);
+        assert_eq!(renewals.len(), 1);
+        assert_eq!(renewals[0].clock, T0 + HALF + 1);
+        assert_eq!(
+            slot_put(&renewals[0].batch).lease_expiry_millis(),
+            T0 + HALF + 1 + TTL
+        );
+        let events = rig.log.events();
+        let withheld = events
+            .iter()
+            .position(|e| matches!(e, Event::Read { index: 1 }))
+            .unwrap();
+        assert!(commit_at(&events, Kind::Renewal, 0) < withheld);
+    })
+    .await;
+}
+
+/// **(R2) D-ii, a fragment write held.** Chunk 1 is staged at `T0`; chunk 2's bytes arrive at
+/// `T0 + 4,000`, so its writes' deadline (`T0 + 7,000`) falls after the renewal instant. The fake
+/// holds one put of chunk 2, once chunk 1's and chunk 2's owned entries are durable. The test moves
+/// the clock past the renewal instant and fires the timer: a renewal rewriting the slot and chunk
+/// 1's and chunk 2's owned leases commits **while the put is still pending**. Then the put is
+/// released, inside its deadline, staging finishes normally, and that put was sent once. A staging
+/// that did not race the timer against a pending write would wait for the put here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_d_ii_a_renewal_commits_while_a_fragment_write_is_pending() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let held = FragmentId { chunk: 2, index: 0 };
+        let gate = rig.fleet.hold(held, HoldAt::Arrival);
+        let (tx, body_stream) = channel(&rig.log);
+        let body = body_bytes(2 * CHUNK);
+        tx.send(Bytes::copy_from_slice(&body[..CHUNK])).unwrap();
+        let (log, clock, timer, waits, fleet) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+            rig.fleet.clone(),
+        );
+        let (inner, upload) = (&rig.store.inner, rig.upload.clone());
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream);
+        let second = Bytes::copy_from_slice(&body[CHUNK..]);
+        let driver = async move {
+            // The first read, chunk 1's writes, and the read for chunk 2's bytes.
+            until("the read after chunk 1 to wait", waits_asked(&waits, 3)).await;
+            clock.advance(4_000);
+            tx.send(second).unwrap();
+            until("chunk 2's held put, the rest answered", || {
+                fleet.holds_only(held, HoldAt::Arrival)
+            })
+            .await;
+            clock.advance(1_001);
+            assert_live(inner, &upload, clock.now_millis()).await;
+            timer.add_permits(1);
+            until("a renewal while the put is pending", || {
+                log.landed(Kind::Renewal) == 1
+            })
+            .await;
+            assert!(!log.acked(held), "the put is still pending");
+            assert!(fleet.held(held, HoldAt::Arrival));
+            assert_live(inner, &upload, clock.now_millis()).await;
+            gate.add_permits(1);
+            until("the released put answered", || log.acked(held)).await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let attempt = staged(outcome);
+        assert_eq!(attempt.chunks().len(), 2);
+        assert_eq!(rig.log.put_count(held), 1, "the held put was not re-sent");
+        let renewals = renewals(&rig);
+        assert_eq!(renewals.len(), 1);
+        let renewal = &renewals[0];
+        assert_eq!(renewal.clock, T0 + 5_001);
+        for chunk in [1, 2] {
+            assert_eq!(
+                lease_put(&renewal.batch, &sidx_key(&rig.upload, part(), chunk)),
+                T0 + 5_001 + TTL,
+                "the renewal moves chunk {chunk}'s owned lease"
+            );
+        }
+        let events = rig.log.events();
+        let answered = events
+            .iter()
+            .position(|e| matches!(e, Event::Acked { id } if *id == held))
+            .unwrap();
+        assert!(commit_at(&events, Kind::Renewal, 0) < answered);
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+/// **(R2)** A renewal falls due at exactly half a TTL after the last one, and not a millisecond
+/// earlier. With a body read pending, the timer fires a millisecond early: staging only waits out
+/// the rest, renewing nothing. At `T0 + HALF` it fires again and a renewal commits at that reading,
+/// the read's idle deadline armed beside it; the next wait for the renewal instant is half a TTL
+/// long, and at `T0 + TTL` the next renewal commits at that reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_a_renewal_falls_due_at_exactly_half_a_ttl_after_the_last() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body_stream) = channel(&rig.log);
+        let body = body_bytes(CHUNK);
+        tx.send(Bytes::copy_from_slice(&body[..10])).unwrap();
+        let (log, clock, timer, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream);
+        let rest = Bytes::copy_from_slice(&body[10..]);
+        let asked = Arc::clone(&waits);
+        let driver = async move {
+            until("the second read to wait", waits_asked(&waits, 2)).await;
+            clock.advance(HALF - 1);
+            timer.add_permits(1);
+            until(
+                "the early wake to wait out the rest",
+                waits_asked(&waits, 3),
+            )
+            .await;
+            assert_eq!(log.commits(Kind::Renewal).len(), 0, "not due yet");
+            clock.advance(1);
+            timer.add_permits(1);
+            until("a renewal at the due instant", || {
+                log.landed(Kind::Renewal) == 1
+            })
+            .await;
+            // The idle deadline's timer beside the renewal, then the wait for the next instant.
+            until("the next wait", waits_asked(&waits, 5)).await;
+            clock.advance(HALF);
+            timer.add_permits(1);
+            until("the next renewal", || log.landed(Kind::Renewal) == 2).await;
+            tx.send(rest).unwrap();
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        staged(outcome);
+        assert_eq!(asked.lock().unwrap()[1..5], [HALF, 1, IDLE - HALF, HALF]);
+        let renewals = renewals(&rig);
+        assert_eq!(renewals.len(), 2);
+        for (renewal, reading) in renewals.iter().zip([T0 + HALF, T0 + TTL]) {
+            assert_eq!(renewal.clock, reading);
+            assert_eq!(
+                slot_put(&renewal.batch).lease_expiry_millis(),
+                reading + TTL
+            );
+        }
+    })
+    .await;
+}
+
+/// **(R2)** A renewal due as an intent starts is sent before that intent. The body's only piece,
+/// one whole chunk, arrives at exactly `T0 + HALF`, as renewal falls due, with no timer fired: the
+/// renewal is the very next commit, at that reading, and the intent is fenced on the slot it put —
+/// never deferred until the chunk's writes are pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_a_renewal_due_as_an_intent_starts_is_sent_before_it() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let piece = Bytes::from(body_bytes(CHUNK));
+        let body_stream = ticking(&rig.clock, &rig.log, vec![(HALF, piece)]);
+        staged(rig.stage(|_| {}, body_stream).await);
+        let events = rig.log.events();
+        let renewal = commit_at(&events, Kind::Renewal, 0);
+        let intent = commit_at(&events, Kind::Intent, 0);
+        assert!(renewal < intent, "renewed before the intent");
+        assert!(
+            events[renewal + 1..intent]
+                .iter()
+                .all(|e| !matches!(e, Event::Commit { .. })),
+            "the intent is the next commit"
+        );
+        let renewals = renewals(&rig);
+        assert_eq!(renewals[0].clock, T0 + HALF);
+        assert_eq!(
+            slot_put(&renewals[0].batch).lease_expiry_millis(),
+            T0 + HALF + TTL
+        );
+        assert_eq!(
+            slot_required(&rig.log.commits(Kind::Intent)[0].batch),
+            slot_value_put(&renewals[0].batch)
+        );
+    })
+    .await;
+}
+
+/// **(R2)** Never while the attempt's own intent batch is in flight. Chunk 1's intent is held
+/// (`may_still_commit: true`) while the clock passes the renewal instant; its next round releases
+/// the held batch first, conflicts, and adopts it from the entry's bytes. No renewal is sent
+/// between those two intent commits: the first is sent once the intent has settled, beside the
+/// chunk's writes, fenced on the slot the adopted intent put and renewing its entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_no_renewal_is_sent_while_an_intent_is_in_flight() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(
+            Kind::Intent,
+            vec![Act::Hold { advance: HALF + 1 }, Act::ReleaseHeldFirst],
+            None,
+        );
+        // Wide enough that the held intent's own `t_auth` still authorizes the writes.
+        let attempt = staged(
+            rig.stage(
+                |r| r.write_window_millis = 2 * TTL,
+                stream_of(vec![Bytes::from(body_bytes(CHUNK))]),
+            )
+            .await,
+        );
+        let events = rig.log.events();
+        let (first, second) = (
+            commit_at(&events, Kind::Intent, 0),
+            commit_at(&events, Kind::Intent, 1),
+        );
+        let renewal = commit_at(&events, Kind::Renewal, 0);
+        assert!(
+            second < renewal,
+            "no renewal between the intent's rounds: {first}, {second}, {renewal}"
+        );
+        let intents = rig.log.intents_of(1);
+        assert_eq!(intents[1].answer, Answer::Conflict);
+        let renewals = renewals(&rig);
+        assert_eq!(
+            slot_required(&renewals[0].batch),
+            slot_value_put(&intents[0].batch),
+            "fenced on the slot the adopted intent put"
+        );
+        let (entry, value) = intent_put(&intents[0].batch);
+        assert!(renewals[0]
+            .batch
+            .preconditions
+            .iter()
+            .any(|p| p.key == entry && p.expected.as_ref() == Some(&value)));
+        assert_eq!(attempt.chunks().len(), 1);
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+/// **(R2) A renewal that crosses expiry** (`0016:1843-1874`). Chunk 1 is staged at `T0`, so the
+/// slot's lease is `T0 + TTL + 1`. With the next read pending, the renewal falls due at
+/// `T0 + HALF + 1`: it checks every lease live and sends, and the wrapper holds its commit. The
+/// clock moves past the slot's previous expiry; no write deadline or idle bound passes. Standing
+/// in for the reaper, the test reads the slot's bytes `S_old` and finds the lease lapsed. It
+/// releases the renewal, which lands — the store checks bytes, not expiry — and commits a stand-in
+/// idle fence, `require(mpu == Open@E)` + `require(slot == S_old)` + the session at `Aborting`: it
+/// conflicts, because the renewal rewrote the slot. The session stays `Open`, and staging goes on
+/// under the new leases and finishes normally. A renewal batch without the slot rewrite lets the
+/// fence commit; a renewal refused once its commit returned late stops staging; either fails here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r2_a_renewal_that_crosses_expiry_defeats_the_reapers_fence() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let gate = Arc::new(Semaphore::new(0));
+        rig.store.script(
+            Kind::Renewal,
+            vec![Act::Gated(Arc::clone(&gate), Box::new(Act::Pass))],
+            None,
+        );
+        let (tx, body_stream) = channel(&rig.log);
+        let body = body_bytes(2 * CHUNK);
+        tx.send(Bytes::copy_from_slice(&body[..CHUNK])).unwrap();
+        let (log, clock, timer, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let (inner, session) = (&rig.store.inner, rig.session.clone());
+        let (slot, session_key) = (
+            slot_key(&rig.upload, SlotIndex::new(0).unwrap()),
+            mpu_key(&rig.upload),
+        );
+        let s_old = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&s_old);
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let staging = stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream);
+        let second = Bytes::copy_from_slice(&body[CHUNK..]);
+        let driver = async move {
+            until("the read after chunk 1 to wait", waits_asked(&waits, 3)).await;
+            clock.advance(HALF + 1);
+            timer.add_permits(1);
+            until("the renewal at its gate", || log.gated(Kind::Renewal) == 1).await;
+            clock.set(T0 + TTL + 2);
+            // The reaper's read: the slot's bytes, and a lease lapsed at its clock.
+            let old = inner.get(&slot).await.unwrap().expect("the slot");
+            let lease = decode_slot_record(&old).unwrap().lease_expiry_millis();
+            assert_eq!(lease, T0 + TTL + 1);
+            assert!(lease <= clock.now_millis(), "the reaper reads it lapsed");
+            *seen.lock().unwrap() = Some(old.clone());
+            gate.add_permits(1);
+            until("the renewal to land", || log.landed(Kind::Renewal) >= 1).await;
+            let fence = WriteBatch::new()
+                .require(session_key.clone(), session.clone())
+                .require(slot.clone(), old)
+                .put(session_key.clone(), aborting(&session));
+            assert_eq!(
+                inner.commit(fence).await.unwrap(),
+                CommitOutcome::Conflict,
+                "the fence pinned on S_old cannot land over the renewed request"
+            );
+            tx.send(second).unwrap();
+            until("chunk 2's intent", || log.landed(Kind::Intent) == 2).await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let attempt = staged(outcome);
+        assert_eq!(attempt.chunks().len(), 2);
+        assert!(
+            matches!(rig.state().await, SessionState::Open {}),
+            "the session is still Open"
+        );
+        let renewals = renewals(&rig);
+        let first = &renewals[0];
+        assert_eq!(first.answer, Answer::Committed);
+        assert_eq!(first.clock, T0 + HALF + 1);
+        let old = s_old.lock().unwrap().clone().unwrap();
+        assert_eq!(slot_required(&first.batch), old, "it was sent over S_old");
+        assert_eq!(
+            slot_put(&first.batch).lease_expiry_millis(),
+            T0 + HALF + 1 + TTL
+        );
+        assert_live(&rig.store.inner, &rig.upload, rig.clock.now_millis()).await;
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+// ─────────────── (R3) renewal never holds staging past a deadline ───────────────
+
+/// **(R3) The reviewers' schedule** (v2 sign-off). Chunk 1's writes carry `T0 + WINDOW`, past the
+/// renewal instant. The fake holds one of them, and the renewal that falls due at `T0 + HALF` is
+/// sent and held at the wrapper's gate. The test moves the clock to the write deadline and fires
+/// the timer: staging ends there, before the renewal is released, with an in-doubt error that keeps
+/// the renewal's `may_still_commit` doubt — staging's own report ([`ABANDONED_COMMIT`]) — and a cause
+/// naming the abandoned write. Released afterwards, the renewal lands: the doubt was real. A
+/// staging that awaited the renewal before watching the deadline would still be waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_the_write_deadline_cuts_off_a_renewal_still_committing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let held = FragmentId { chunk: 1, index: 0 };
+        let put = rig.fleet.hold(held, HoldAt::Arrival);
+        let renewal_gate = Arc::new(Semaphore::new(0));
+        rig.store.script(
+            Kind::Renewal,
+            vec![Act::Gated(Arc::clone(&renewal_gate), Box::new(Act::Pass))],
+            None,
+        );
+        let body = body_bytes(2 * CHUNK);
+        let (log, clock, timer, fleet) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            rig.fleet.clone(),
+        );
+        let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+        req.write_window_millis = WINDOW;
+        let ended = Arc::new(AtomicBool::new(false));
+        let staging = flagging(
+            Arc::clone(&ended),
+            stage_part(
+                &rig.store,
+                &rig.fleet,
+                &mut rig.runtime,
+                &req,
+                stream_of(pieces(&body, &[2 * CHUNK])),
+            ),
+        );
+        let driver = async move {
+            until("chunk 1's held put", || {
+                fleet.holds_only(held, HoldAt::Arrival)
+            })
+            .await;
+            clock.advance(HALF);
+            timer.add_permits(1);
+            until("the renewal at its gate", || log.gated(Kind::Renewal) == 1).await;
+            clock.advance(WINDOW - HALF);
+            timer.add_permits(1);
+            until(
+                "staging to end at the deadline, its renewal still held",
+                || ended.load(Ordering::SeqCst),
+            )
+            .await;
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        assert_eq!(
+            rig.clock.now_millis(),
+            T0 + WINDOW,
+            "it ended at the deadline"
+        );
+        let err = outcome.expect_err("staging stopped");
+        assert!(err.to_string().contains("may still be applied"), "{err}");
+        let doubt = in_doubt::<StageOutcome>(Err(err));
+        assert!(
+            doubt.may_still_commit,
+            "the abandoned renewal may still land"
+        );
+        assert!(doubt.outcome.may_still_commit);
+        assert_eq!(
+            doubt.outcome.backend, ABANDONED_COMMIT,
+            "staging's own report"
+        );
+        let (chunk, deadline, abandoned, reports) = effect_unknown(&doubt.cause);
+        assert_eq!((chunk, deadline), (1, T0 + WINDOW));
+        assert_abandoned_only(abandoned, held);
+        assert!(reports.is_empty());
+        assert!(
+            stopped_by_renewal(&doubt.cause).is_none(),
+            "the deadline stopped staging, not the renewal"
+        );
+        assert_eq!(rig.log.gated(Kind::Renewal), 1, "one renewal was sent");
+        assert!(
+            rig.log.commits(Kind::Renewal).is_empty(),
+            "and never answered"
+        );
+        assert_eq!(renewal_gate.available_permits(), 0);
+        assert_eq!(
+            put.available_permits(),
+            0,
+            "the held put was never released"
+        );
+        assert_eq!(rig.log.put_count(held), 1, "the held write was not re-sent");
+        assert_eq!(rig.log.commits(Kind::Intent).len(), 1);
+        let reserved = rig.log.commits(Kind::Reserve)[0].batch.puts[0].0.clone();
+        let before = rig.store.inner.get(&reserved).await.unwrap();
+        assert_eq!(rig.store.release_held().await, CommitOutcome::Committed);
+        assert_ne!(
+            rig.store.inner.get(&reserved).await.unwrap(),
+            before,
+            "the abandoned renewal could still land, and did"
+        );
+    })
+    .await;
+}
+
+/// **(R3) The adversary's schedule, and a write published in time** (v3 sign-off). As in the
+/// reviewers' schedule, chunk 1's put is held and the renewal's commit waits at its gate. Now the
+/// test lets the fake publish the put while the renewal waits, and waits until the fake has stored
+/// it and answered `Ok` — at a clock reading before the deadline, which the fake enforces at its
+/// publication point — and its reply, held in transit, is collected by staging while the renewal
+/// still waits. Once staging has taken the reply, the test moves the clock past the deadline and
+/// fires the timer, which no wait is armed for any more, and then releases the renewal. The write
+/// was answered in time and is taken: the part stages, the put sent once, the renewal held at the
+/// gate landed. A staging that awaited the renewal before polling the writes never collects the
+/// reply while the renewal waits; one that still judged the deadline once the writes had answered
+/// abandons the renewal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_a_write_answered_while_a_renewal_commits_is_taken() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let held = FragmentId { chunk: 1, index: 0 };
+        let arrival = rig.fleet.hold(held, HoldAt::Arrival);
+        let reply = rig.fleet.hold(held, HoldAt::Answer);
+        let renewal_gate = Arc::new(Semaphore::new(0));
+        rig.store.script(
+            Kind::Renewal,
+            vec![Act::Gated(Arc::clone(&renewal_gate), Box::new(Act::Pass))],
+            None,
+        );
+        let body = body_bytes(2 * CHUNK);
+        let (log, clock, timer, fleet) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            rig.fleet.clone(),
+        );
+        let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+        req.write_window_millis = WINDOW;
+        let staging = stage_part(
+            &rig.store,
+            &rig.fleet,
+            &mut rig.runtime,
+            &req,
+            stream_of(pieces(&body, &[2 * CHUNK])),
+        );
+        let driver = async move {
+            until("chunk 1's held put", || {
+                fleet.holds_only(held, HoldAt::Arrival)
+            })
+            .await;
+            clock.advance(HALF);
+            timer.add_permits(1);
+            until("the renewal at its gate", || log.gated(Kind::Renewal) == 1).await;
+            arrival.add_permits(1);
+            // The fake publishes and answers `Ok`, and staging, polling the writes beside the
+            // renewal, collects the reply up to its transit hold.
+            until("the put published, its reply collected", || {
+                fleet.held(held, HoldAt::Answer)
+            })
+            .await;
+            assert!(log.acked(held), "the fake stored it and answered Ok");
+            assert!(
+                clock.now_millis() < T0 + WINDOW,
+                "published before its deadline"
+            );
+            assert!(!log.has(|e| matches!(e, Event::Refused { id } if *id == held)));
+            assert!(
+                log.commits(Kind::Renewal).is_empty(),
+                "the renewal still waits"
+            );
+            reply.add_permits(1);
+            until(
+                "staging to take the reply, the renewal still waiting",
+                || log.delivered(held),
+            )
+            .await;
+            clock.set(T0 + WINDOW + 1);
+            timer.add_permits(1);
+            assert_eq!(
+                timer.available_permits(),
+                1,
+                "nothing waits on the answered write's deadline any more"
+            );
+            renewal_gate.add_permits(1);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let attempt = staged(outcome);
+        assert_eq!(attempt.chunks().len(), 2);
+        assert_eq!(
+            rig.log.put_count(held),
+            1,
+            "the answered put was not re-sent"
+        );
+        let renewals = renewals(&rig);
+        assert_eq!(renewals[0].answer, Answer::Committed);
+        assert_eq!(renewals[0].clock, T0 + HALF, "the renewal held at the gate");
+        assert_eq!(rig.store.held_count(), 0, "it was not abandoned");
+        assert_fragments_evidenced(&rig).await;
+    })
+    .await;
+}
+
+/// **(R3) The put answers in time, then the renewal outlives the put's deadline** (added
+/// 2026-10-22). The fake holds chunk 1's last pending put and the wrapper holds the renewal's
+/// commit. The fake publishes the put and answers `Ok` before its deadline — the test waits until it
+/// has stored the fragment, and until staging has taken the answer — and only then does the test
+/// move the clock past that deadline and fire the timer, the renewal still held: no wait is armed
+/// for that deadline any more. Then the wrapper releases the renewal: run 1 as `Committed`, run 2
+/// as `CommitUnknownResult { may_still_commit: false }`, applied, which the renewal settles from
+/// its slot's bytes (R5). Staging succeeds, not in doubt, the held renewal's leases adopted —
+/// chunk 2's intent is fenced on the slot it put — and the put not re-sent. A write deadline that
+/// still constrained the renewal once its writes had answered would abandon it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_a_renewal_outliving_an_answered_writes_deadline_is_awaited() {
+    for unknown in [false, true] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let held = FragmentId { chunk: 1, index: 0 };
+            let put = rig.fleet.hold(held, HoldAt::Arrival);
+            let renewal_gate = Arc::new(Semaphore::new(0));
+            let released = if unknown {
+                Act::Unknown {
+                    applied: true,
+                    may_still_commit: false,
+                }
+            } else {
+                Act::Pass
+            };
+            rig.store.script(
+                Kind::Renewal,
+                vec![Act::Gated(Arc::clone(&renewal_gate), Box::new(released))],
+                None,
+            );
+            let body = body_bytes(2 * CHUNK);
+            let (log, clock, timer, fleet) = (
+                rig.log.clone(),
+                rig.clock.clone(),
+                Arc::clone(&rig.runtime.timer),
+                rig.fleet.clone(),
+            );
+            let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+            req.write_window_millis = WINDOW;
+            let staging = stage_part(
+                &rig.store,
+                &rig.fleet,
+                &mut rig.runtime,
+                &req,
+                stream_of(pieces(&body, &[2 * CHUNK])),
+            );
+            let driver = async move {
+                until("chunk 1's last pending put", || {
+                    fleet.holds_only(held, HoldAt::Arrival)
+                })
+                .await;
+                clock.advance(HALF);
+                timer.add_permits(1);
+                until("the renewal at its gate", || log.gated(Kind::Renewal) == 1).await;
+                put.add_permits(1);
+                until("the fake to store the put and answer Ok", || {
+                    log.acked(held)
+                })
+                .await;
+                assert!(clock.now_millis() < T0 + WINDOW, "answered in time");
+                until("staging to take the answer, the renewal still held", || {
+                    log.delivered(held)
+                })
+                .await;
+                clock.set(T0 + WINDOW + 1);
+                timer.add_permits(1);
+                assert_eq!(
+                    timer.available_permits(),
+                    1,
+                    "nothing waits on the answered write's deadline any more"
+                );
+                renewal_gate.add_permits(1);
+            };
+            let (outcome, ()) = tokio::join!(staging, driver);
+            let attempt = staged(outcome);
+            assert_eq!(attempt.chunks().len(), 2, "unknown {unknown}");
+            assert_eq!(rig.log.put_count(held), 1, "the put was not re-sent");
+            let renewals = renewals(&rig);
+            assert_eq!(renewals.len(), 1, "settled by the re-read, not re-sent");
+            assert_eq!(renewals[0].clock, T0 + HALF, "the renewal held at the gate");
+            assert_eq!(rig.store.held_count(), 0, "it was not abandoned");
+            let answer = if unknown {
+                Answer::Unknown {
+                    may_still_commit: false,
+                }
+            } else {
+                Answer::Committed
+            };
+            assert_eq!(renewals[0].answer, answer);
+            assert_eq!(
+                slot_required(&rig.log.intents_of(2)[0].batch),
+                slot_value_put(&renewals[0].batch),
+                "the renewal's leases adopted"
+            );
+            assert_fragments_evidenced(&rig).await;
+        })
+        .await;
+    }
+}
+
+/// **(R3)** A renewal cut off by the deadline between two of its own commits keeps exactly the
+/// doubt of the commit still in flight, no more and no less. Chunk 1's put is held, the renewal's
+/// first round is lost, and the write deadline passes while the renewal is
+///
+/// * reading its slot after a `Conflict`: nothing is in doubt;
+/// * reading its slot after `CommitUnknownResult { may_still_commit: false }`, unapplied: the
+///   store's own report, unsettled, which can no longer land;
+/// * reading its slot after a held round (`may_still_commit: true`): the store's own report;
+/// * awaiting its second commit, after a `Conflict`: staging's own report, which may still land.
+///
+/// The cause is the write's in every run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_a_renewal_cut_off_between_its_commits_keeps_exactly_its_doubt() {
+    for run in 0..4 {
+        within(async {
+            let mut rig = Rig::new().await;
+            let held = FragmentId { chunk: 1, index: 0 };
+            let _put = rig.fleet.hold(held, HoldAt::Arrival);
+            let gate = Arc::new(Semaphore::new(0));
+            let first = match run {
+                0 | 3 => Act::Conflict,
+                1 => Act::Unknown {
+                    applied: false,
+                    may_still_commit: false,
+                },
+                _ => Act::Hold { advance: 0 },
+            };
+            let mut plan = vec![first];
+            if run == 3 {
+                plan.push(Act::Gated(Arc::clone(&gate), Box::new(Act::Pass)));
+            } else {
+                // No slot read precedes the renewal's in a clean run.
+                let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+                rig.store
+                    .after_read(&slot, 0, vec![Then::Gate(Arc::clone(&gate))]);
+            }
+            rig.store.script(Kind::Renewal, plan, None);
+            let body = body_bytes(2 * CHUNK);
+            let (log, clock, timer, fleet) = (
+                rig.log.clone(),
+                rig.clock.clone(),
+                Arc::clone(&rig.runtime.timer),
+                rig.fleet.clone(),
+            );
+            let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+            req.write_window_millis = WINDOW;
+            let ended = Arc::new(AtomicBool::new(false));
+            let staging = flagging(
+                Arc::clone(&ended),
+                stage_part(
+                    &rig.store,
+                    &rig.fleet,
+                    &mut rig.runtime,
+                    &req,
+                    stream_of(pieces(&body, &[2 * CHUNK])),
+                ),
+            );
+            let driver = async move {
+                until("chunk 1's held put", || {
+                    fleet.holds_only(held, HoldAt::Arrival)
+                })
+                .await;
+                clock.advance(HALF);
+                timer.add_permits(1);
+                until("the renewal between its commits", || {
+                    log.reads_gated() == 1 || log.gated(Kind::Renewal) == 1
+                })
+                .await;
+                clock.advance(WINDOW - HALF);
+                timer.add_permits(1);
+                until("staging to end at the deadline", || {
+                    ended.load(Ordering::SeqCst)
+                })
+                .await;
+            };
+            let (outcome, ()) = tokio::join!(staging, driver);
+            assert_eq!(gate.available_permits(), 0, "run {run}: never let through");
+            let cause = match (run, outcome) {
+                (0, outcome) => stopped(outcome),
+                (_, outcome) => {
+                    let doubt = in_doubt(outcome);
+                    let (may_still_commit, backend) = match run {
+                        1 => (false, "scripted"),
+                        2 => (true, "scripted"),
+                        _ => (true, ABANDONED_COMMIT),
+                    };
+                    assert_eq!(doubt.may_still_commit, may_still_commit, "run {run}");
+                    assert_eq!(doubt.outcome.backend, backend, "run {run}");
+                    doubt.cause
+                }
+            };
+            let (chunk, deadline, abandoned, _) = effect_unknown(&cause);
+            assert_eq!((chunk, deadline), (1, T0 + WINDOW), "run {run}");
+            assert_abandoned_only(abandoned, held);
+            assert!(stopped_by_renewal(&cause).is_none(), "run {run}");
+            assert_eq!(
+                rig.log.commits(Kind::Renewal).len(),
+                1,
+                "run {run}: one answered"
+            );
+        })
+        .await;
+    }
+}
+
+/// **(R3) The body-idle bound still holds under renewal.** The body-idle bound is two TTLs; after
+/// its first piece the body sends nothing but one empty piece. Renewals at `T0 + HALF`, `+ TTL` and
+/// `+ 3 × HALF` keep every lease live while the read is pending, and the empty piece does not move
+/// the bound: at `T0 + 2 × TTL` staging stops with `BodyIdle`, sending no renewal at that instant
+/// and writing nothing more. A renewal that deferred the idle bound would keep a silent client's
+/// slot for ever; this leg fails waiting for staging to stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r3_the_body_idle_bound_holds_while_renewals_keep_the_leases() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body_stream) = channel(&rig.log);
+        tx.send(Bytes::from(body_bytes(10))).unwrap();
+        let (log, clock, timer, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let (inner, upload) = (&rig.store.inner, rig.upload.clone());
+        let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+        req.body_idle_millis = 2 * TTL;
+        let ended = Arc::new(AtomicBool::new(false));
+        let staging = flagging(
+            Arc::clone(&ended),
+            stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream),
+        );
+        let driver = async move {
+            until("the second read to wait", waits_asked(&waits, 2)).await;
+            for n in 1..=3 {
+                if n == 3 {
+                    // An empty piece halfway through: read, and not progress.
+                    clock.advance(2_000);
+                    tx.send(Bytes::new()).unwrap();
+                    until("the empty piece read", || log.read(1)).await;
+                    clock.advance(HALF - 2_000);
+                } else {
+                    clock.advance(HALF);
+                }
+                assert_live(inner, &upload, clock.now_millis()).await;
+                timer.add_permits(1);
+                until("a renewal while the read is pending", || {
+                    log.landed(Kind::Renewal) == n
+                })
+                .await;
+                until("the next wait", waits_asked(&waits, 2 + n)).await;
+            }
+            clock.advance(HALF);
+            timer.add_permits(1);
+            until("staging to give up the silent body", || {
+                ended.load(Ordering::SeqCst)
+            })
+            .await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let cause = stopped(outcome);
+        assert!(
+            matches!(cause, Stop::BodyIdle { idle_millis } if idle_millis == 2 * TTL),
+            "{cause:?}"
+        );
+        assert_eq!(rig.clock.now_millis(), T0 + 2 * TTL, "stopped at the bound");
+        let renewals = renewals(&rig);
+        assert_eq!(renewals.len(), 3, "none at the bound itself");
+        assert!(rig.log.commits(Kind::Intent).is_empty(), "nothing staged");
+        assert!(rig.log.puts().is_empty());
+        assert_eq!(
+            slots_of(&rig.store.inner, &rig.upload, &rig.attempt).await,
+            1,
+            "the slot stays for the reaper"
+        );
+    })
+    .await;
+}
+
+// ─────────────── (R4) a lapsed lease is refused, never revived ───────────────
+
+/// **(R4)** The slot's lease lapsed before the next renewal: with a body read pending, the clock
+/// moves past it and the timer fires. The renewal refuses, writes nothing, and staging stops with a
+/// typed error naming the slot and the rule; the slot is exactly as reserved. A renewal that moved
+/// the lapsed lease forward would stage the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_a_renewal_refuses_a_lapsed_slot_lease() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body_stream) = channel(&rig.log);
+        tx.send(Bytes::from(body_bytes(10))).unwrap();
+        let (log, clock, timer, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let ended = Arc::new(AtomicBool::new(false));
+        let staging = flagging(
+            Arc::clone(&ended),
+            stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream),
+        );
+        let driver = async move {
+            until("the second read to wait", waits_asked(&waits, 2)).await;
+            clock.advance(TTL + 1);
+            timer.add_permits(1);
+            // End the body either way, so a staging that went on stages it and fails the leg.
+            until("staging to stop, or to renew", || {
+                ended.load(Ordering::SeqCst) || !log.commits(Kind::Renewal).is_empty()
+            })
+            .await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let reserved = rig.log.commits(Kind::Reserve).remove(0).batch.puts[0].clone();
+        let err = outcome.expect_err("staging stopped");
+        let text = err.to_string();
+        let slot = String::from_utf8(reserved.0.clone()).unwrap();
+        for part in [
+            rig.upload.as_str(),
+            slot.as_str(),
+            "is not revived",
+            "no batch of this part attempt is in doubt",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text:?}");
+        }
+        let cause = stopped(Err(err));
+        assert_eq!(lapsed(&cause), (reserved.0.clone(), T0 + TTL, T0 + TTL + 1));
+        assert!(rig.log.commits(Kind::Renewal).is_empty(), "nothing written");
+        assert_eq!(
+            rig.store.inner.get(&reserved.0).await.unwrap(),
+            Some(reserved.1),
+            "the slot is exactly as reserved"
+        );
+    })
+    .await;
+}
+
+/// **(R4)** An owned entry's lease lapsed, the slot's has not, before the next renewal. Chunk 1 is
+/// registered at `T0` and chunk 2 at `T0 + 1,000`, so the slot's lease outlives chunk 1's. With the
+/// next read pending the clock reaches chunk 1's lease and the timer fires: the renewal refuses,
+/// naming that entry, and writes nothing; chunk 1's lease is not revived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_a_renewal_refuses_a_lapsed_owned_lease() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let (tx, body_stream) = channel(&rig.log);
+        let body = body_bytes(2 * CHUNK);
+        tx.send(Bytes::copy_from_slice(&body[..CHUNK])).unwrap();
+        let (log, clock, timer, waits) = (
+            rig.log.clone(),
+            rig.clock.clone(),
+            Arc::clone(&rig.runtime.timer),
+            Arc::clone(&rig.runtime.waits),
+        );
+        let req = request(&rig.topology, &rig.upload, &rig.attempt);
+        let ended = Arc::new(AtomicBool::new(false));
+        let staging = flagging(
+            Arc::clone(&ended),
+            stage_part(&rig.store, &rig.fleet, &mut rig.runtime, &req, body_stream),
+        );
+        let second = Bytes::copy_from_slice(&body[CHUNK..]);
+        let driver = async move {
+            until("the read after chunk 1 to wait", waits_asked(&waits, 3)).await;
+            clock.advance(1_000);
+            tx.send(second).unwrap();
+            // Chunk 2's writes, then the next read.
+            until("the read after chunk 2 to wait", waits_asked(&waits, 5)).await;
+            clock.set(T0 + TTL + 1);
+            timer.add_permits(1);
+            until("staging to stop, or to renew", || {
+                ended.load(Ordering::SeqCst) || !log.commits(Kind::Renewal).is_empty()
+            })
+            .await;
+            drop(tx);
+        };
+        let (outcome, ()) = tokio::join!(staging, driver);
+        let cause = stopped(outcome);
+        let chunk1 = sidx_key(&rig.upload, part(), 1);
+        assert_eq!(lapsed(&cause), (chunk1, T0 + TTL + 1, T0 + TTL + 1));
+        assert!(rig.log.commits(Kind::Renewal).is_empty(), "nothing written");
+        let entries = owned(&rig.store.inner, &rig.upload).await;
+        assert_eq!(
+            entries[&1].lease_expiry_millis(),
+            T0 + TTL + 1,
+            "chunk 1's lease was not revived"
+        );
+        assert_eq!(entries[&2].lease_expiry_millis(), T0 + 1_000 + TTL);
+    })
+    .await;
+}
+
+/// **(R4)** Every renewal round re-reads the clock and re-checks every lease before it sends
+/// (iteration-1 finding). The renewal's first round is lost — answered `Conflict` unapplied, or
+/// held — slowly enough that the slot's lease lapses before the retry. The retry checks at its own
+/// fresh reading and refuses: one renewal commit, the slot not revived. Held, the error keeps the
+/// held round's `may_still_commit` doubt, and releasing that round lands it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_a_renewal_retry_refuses_a_lease_that_lapsed_between_rounds() {
+    for held in [false, true] {
+        within(async {
+            let mut rig = Rig::new().await;
+            // Renewal falls due at T0 + HALF + 1; the lost round moves the clock past T0 + TTL.
+            let lost = if held {
+                Act::Hold { advance: HALF }
+            } else {
+                Act::ConflictThenAdvance(HALF)
+            };
+            rig.store.script(Kind::Renewal, vec![lost], None);
+            let body_stream = renewal_body(&rig.clock, &rig.log);
+            let outcome = rig.stage(|_| {}, body_stream).await;
+            let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+            let cause = match (held, outcome) {
+                (false, outcome) => stopped(outcome),
+                (true, outcome) => {
+                    let doubt = in_doubt(outcome);
+                    assert!(doubt.may_still_commit, "the held round's doubt is kept");
+                    doubt.cause
+                }
+            };
+            assert_eq!(
+                lapsed(&cause),
+                (slot.clone(), T0 + TTL, T0 + TTL + 1),
+                "held {held}"
+            );
+            let renewals = rig.log.commits(Kind::Renewal);
+            assert_eq!(renewals.len(), 1, "no retry was sent");
+            assert_eq!(renewals[0].clock, T0 + HALF + 1);
+            assert!(rig.log.commits(Kind::Intent).is_empty());
+            let reserved = rig.log.commits(Kind::Reserve).remove(0).batch.puts[0].clone();
+            assert_eq!(
+                rig.store.inner.get(&slot).await.unwrap(),
+                Some(reserved.1),
+                "the slot was not revived"
+            );
+            if held {
+                assert_eq!(rig.store.release_held().await, CommitOutcome::Committed);
+            }
+        })
+        .await;
+    }
+}
+
+/// **(R4)** A renewal after the session left `Open` (a real Abort fenced it) refuses and
+/// resurrects nothing: its batch conflicts on the session fence, nothing is written, the session
+/// stays `Aborting`, and staging answers `NoSuchUpload`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_a_renewal_after_the_session_left_open_resurrects_nothing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let abort = Act::First(Side::Abort(rig.upload.clone()));
+        rig.store.script(Kind::Renewal, vec![abort], None);
+        let body_stream = renewal_body(&rig.clock, &rig.log);
+        let outcome = rig.stage(|_| {}, body_stream).await;
+        assert!(
+            matches!(outcome, Ok(StageOutcome::Refused(Refusal::NoSuchUpload))),
+            "{outcome:?}"
+        );
+        let answers: Vec<Answer> = rig
+            .log
+            .commits(Kind::Renewal)
+            .iter()
+            .map(|c| c.answer)
+            .collect();
+        assert_eq!(
+            answers,
+            vec![Answer::Conflict],
+            "one renewal, and it wrote nothing"
+        );
+        assert!(matches!(rig.state().await, SessionState::Aborting {}));
+        let reserved = rig.log.commits(Kind::Reserve).remove(0).batch.puts[0].clone();
+        assert_eq!(
+            rig.store.inner.get(&reserved.0).await.unwrap(),
+            Some(reserved.1)
+        );
+        assert!(rig.log.commits(Kind::Intent).is_empty());
+    })
+    .await;
+}
+
+/// **(R4)** The slot is deleted from under a live attempt, the session unchanged, just before a
+/// renewal commits: the renewal conflicts and staging stops with a typed error naming the slot,
+/// nothing in doubt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_a_slot_lost_under_a_renewal_is_a_typed_error() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        let named = slot.clone();
+        let delete: Hook = Arc::new(move |_| WriteBatch::new().delete(slot.clone()));
+        rig.store
+            .script(Kind::Renewal, vec![Act::First(Side::Batch(delete))], None);
+        let body_stream = renewal_body(&rig.clock, &rig.log);
+        let cause = stopped(rig.stage(|_| {}, body_stream).await);
+        assert!(
+            matches!(&cause, Stop::SlotLost { key } if key.as_bytes() == named.as_slice()),
+            "{cause:?}"
+        );
+        assert_eq!(rig.log.commits(Kind::Renewal).len(), 1);
+        assert!(rig.log.commits(Kind::Intent).is_empty());
+    })
+    .await;
+}
+
+/// How a renewal running beside chunk 1's writes stops staging, in the legs below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenewalStop {
+    /// The wrapper answers its commit with a plain store fault, applying nothing.
+    Fails,
+    /// The clock is moved past the slot's lease before the renewal's first round.
+    Lapsed,
+    /// A real Abort fences the session just before the renewal commits.
+    Refused,
+    /// Its first round is held unapplied (it may still land) while the clock moves past the
+    /// slot's lease, and its retry refuses the lapsed lease.
+    HeldThenLapsed,
+}
+
+/// The cause staging reports for chunk 1's writes when a renewal beside them stopped it: the
+/// writes' account, never the renewal's own stop, whatever the renewal came to.
+fn assert_stopped_by(cause: &Stop, how: RenewalStop, slot: &[u8]) {
+    let renewal = stopped_by_renewal(cause).expect("a renewal stopped staging");
+    match how {
+        RenewalStop::Fails => {
+            assert!(matches!(renewal, Stop::Store(_)), "{how:?}: {renewal:?}");
+        }
+        RenewalStop::Lapsed | RenewalStop::HeldThenLapsed => {
+            assert_eq!(
+                lapsed(renewal),
+                (slot.to_vec(), T0 + TTL + 1, T0 + TTL + 1),
+                "{how:?}"
+            );
+        }
+        RenewalStop::Refused => assert!(
+            matches!(
+                renewal,
+                Stop::SessionLeftOpen {
+                    refusal: Refusal::NoSuchUpload
+                }
+            ),
+            "{how:?}: {renewal:?}"
+        ),
+    }
+}
+
+/// **(R4) A renewal that stops staging beside a pending write** (iteration-1 finding). Chunk 1's
+/// put is held at its arrival, and its deadline (`T0 + TTL + 1,000`) is still ahead when the
+/// renewal falls due and stops staging: it fails, it refuses a lapsed lease, it finds the session
+/// gone from `Open` (a real Abort), or its first round is held and its retry refuses a lapsed
+/// lease. Staging stops at once, before the put's deadline, and the stop is the write's account:
+/// `WriteEffectUnknown`, classed `Indeterminate`, the held put abandoned in staging's own words,
+/// and the renewal's cause carried in it. The held round keeps its `may_still_commit` doubt.
+/// Staging never answers a determinate error here, nor `Refused(NoSuchUpload)`. Released after
+/// staging returned, the put is published, so the doubt was real. A staging that let the
+/// renewal's own error or refusal through, dropping the write unaccounted, fails every run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_a_renewal_stopping_beside_a_pending_write_leaves_its_effect_unknown() {
+    for how in [
+        RenewalStop::Fails,
+        RenewalStop::Lapsed,
+        RenewalStop::Refused,
+        RenewalStop::HeldThenLapsed,
+    ] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let held = FragmentId { chunk: 1, index: 0 };
+            let put = rig.fleet.hold(held, HoldAt::Arrival);
+            let plan = match how {
+                RenewalStop::Fails => vec![Act::Fail],
+                RenewalStop::Lapsed => Vec::new(),
+                RenewalStop::Refused => vec![Act::First(Side::Abort(rig.upload.clone()))],
+                // The renewal falls due at `T0 + HALF`; the held round leaves the clock at
+                // `T0 + TTL + 1`, past the slot lease chunk 1's intent wrote.
+                RenewalStop::HeldThenLapsed => vec![Act::Hold { advance: HALF + 1 }],
+            };
+            rig.store.script(Kind::Renewal, plan, None);
+            let body = body_bytes(2 * CHUNK);
+            let (log, clock, timer, fleet) = (
+                rig.log.clone(),
+                rig.clock.clone(),
+                Arc::clone(&rig.runtime.timer),
+                rig.fleet.clone(),
+            );
+            let deadline = T0 + TTL + 1_000;
+            let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+            req.write_window_millis = TTL + 1_000;
+            let ended = Arc::new(AtomicBool::new(false));
+            let staging = flagging(
+                Arc::clone(&ended),
+                stage_part(
+                    &rig.store,
+                    &rig.fleet,
+                    &mut rig.runtime,
+                    &req,
+                    stream_of(pieces(&body, &[2 * CHUNK])),
+                ),
+            );
+            let driver = async move {
+                until("chunk 1's held put", || {
+                    fleet.holds_only(held, HoldAt::Arrival)
+                })
+                .await;
+                if how == RenewalStop::Lapsed {
+                    clock.set(T0 + TTL + 1);
+                } else {
+                    clock.advance(HALF);
+                }
+                timer.add_permits(1);
+                until("staging to stop, the put still held", || {
+                    ended.load(Ordering::SeqCst)
+                })
+                .await;
+                assert!(!log.acked(held), "{how:?}: the put is still pending");
+                assert!(
+                    clock.now_millis() < deadline,
+                    "{how:?}: stopped before the put's deadline"
+                );
+                put.add_permits(1);
+                until("the abandoned put to publish", || {
+                    log.has(|e| matches!(e, Event::Stored { id } if *id == held))
+                })
+                .await;
+            };
+            let (outcome, ()) = tokio::join!(staging, driver);
+            let err = outcome.expect_err("never a refusal, never staged");
+            assert_eq!(classify(&err), ErrorClass::Indeterminate, "{how:?}: {err}");
+            let text = err.to_string();
+            assert!(
+                text.contains("a renewal beside them stopped staging"),
+                "{how:?}: {text}"
+            );
+            let cause = if how == RenewalStop::HeldThenLapsed {
+                let doubt = in_doubt::<StageOutcome>(Err(err));
+                assert!(doubt.may_still_commit, "the held round's doubt is kept");
+                assert_eq!(doubt.outcome.backend, "scripted");
+                doubt.cause
+            } else {
+                stopped(Err(err))
+            };
+            let (chunk, deadline_millis, abandoned, reports) = effect_unknown(&cause);
+            assert_eq!((chunk, deadline_millis), (1, deadline), "{how:?}");
+            assert_abandoned_only(abandoned, held);
+            assert!(
+                abandoned[0]
+                    .detail
+                    .contains("a renewal of the attempt's leases stopped staging"),
+                "{}",
+                abandoned[0].detail
+            );
+            assert!(reports.is_empty(), "{how:?}");
+            let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+            assert_stopped_by(&cause, how, &slot);
+            assert_eq!(rig.log.put_count(held), 1, "{how:?}: never re-sent");
+            assert_eq!(
+                rig.log.commits(Kind::Intent).len(),
+                1,
+                "{how:?}: nothing staged after it"
+            );
+            if how == RenewalStop::Refused {
+                assert!(matches!(rig.state().await, SessionState::Aborting {}));
+            }
+        })
+        .await;
+    }
+}
+
+/// **(R4) A renewal that stops staging after the writes answered** (iteration-1 finding). Chunk
+/// 1's put is held inside its publishing step, and the renewal due at `T0 + HALF` waits at the
+/// wrapper's gate. The put then answers while the renewal waits: `Ok`, or `WriteEffect::Unknown`,
+/// the clock moved to the put's deadline first so its publication straddles it. Staging takes
+/// the answer. Then the renewal is let through and fails (a plain store fault) or finds the
+/// session gone (a real Abort). An `Unknown` answer already taken is kept: the stop is
+/// `WriteEffectUnknown` carrying that report, nothing abandoned, the renewal's cause in it,
+/// classed `Indeterminate`. With every write answered `Ok`, nothing is unsettled and the renewal's
+/// own answer stands: its store fault, `Terminal`, or `Refused(NoSuchUpload)`. A staging that
+/// dropped the taken report when the renewal failed answers those two runs determinately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r4_a_renewal_stopping_after_the_writes_answered_keeps_their_account() {
+    for (answers_unknown, how) in [
+        (true, RenewalStop::Fails),
+        (true, RenewalStop::Refused),
+        (false, RenewalStop::Fails),
+        (false, RenewalStop::Refused),
+    ] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let held = FragmentId { chunk: 1, index: 0 };
+            let publishing = rig.fleet.hold(held, HoldAt::Publishing);
+            let renewal_gate = Arc::new(Semaphore::new(0));
+            let then = match how {
+                RenewalStop::Refused => Act::First(Side::Abort(rig.upload.clone())),
+                _ => Act::Fail,
+            };
+            rig.store.script(
+                Kind::Renewal,
+                vec![Act::Gated(Arc::clone(&renewal_gate), Box::new(then))],
+                None,
+            );
+            let body = body_bytes(2 * CHUNK);
+            let (log, clock, timer, fleet) = (
+                rig.log.clone(),
+                rig.clock.clone(),
+                Arc::clone(&rig.runtime.timer),
+                rig.fleet.clone(),
+            );
+            let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+            req.write_window_millis = WINDOW;
+            let staging = stage_part(
+                &rig.store,
+                &rig.fleet,
+                &mut rig.runtime,
+                &req,
+                stream_of(pieces(&body, &[2 * CHUNK])),
+            );
+            let driver = async move {
+                until("chunk 1's put inside its publishing step", || {
+                    fleet.holds_only(held, HoldAt::Publishing)
+                })
+                .await;
+                clock.advance(HALF);
+                timer.add_permits(1);
+                until("the renewal at its gate", || log.gated(Kind::Renewal) == 1).await;
+                if answers_unknown {
+                    clock.set(T0 + WINDOW);
+                }
+                publishing.add_permits(1);
+                until(
+                    "staging to take the put's answer, the renewal still held",
+                    || log.delivered(held),
+                )
+                .await;
+                assert_eq!(
+                    log.has(|e| matches!(e, Event::Unverified { id } if *id == held)),
+                    answers_unknown
+                );
+                assert!(log.commits(Kind::Renewal).is_empty(), "the renewal waits");
+                renewal_gate.add_permits(1);
+            };
+            let (outcome, ()) = tokio::join!(staging, driver);
+            let run = format!("unknown {answers_unknown}, {how:?}");
+            assert_eq!(rig.log.put_count(held), 1, "{run}: never re-sent");
+            assert_eq!(rig.log.commits(Kind::Renewal).len(), 1, "{run}");
+            if !answers_unknown {
+                match how {
+                    RenewalStop::Refused => assert!(
+                        matches!(outcome, Ok(StageOutcome::Refused(Refusal::NoSuchUpload))),
+                        "{run}: {outcome:?}"
+                    ),
+                    _ => {
+                        let err = outcome.expect_err("the renewal's fault");
+                        assert_eq!(classify(&err), ErrorClass::Terminal, "{run}: {err}");
+                        assert!(matches!(stopped(Err(err)), Stop::Store(_)), "{run}");
+                    }
+                }
+                return;
+            }
+            let err = outcome.expect_err("never a refusal, never staged");
+            assert_eq!(classify(&err), ErrorClass::Indeterminate, "{run}: {err}");
+            let cause = stopped(Err(err));
+            let (chunk, deadline, abandoned, reports) = effect_unknown(&cause);
+            assert_eq!((chunk, deadline), (1, T0 + WINDOW), "{run}");
+            assert!(abandoned.is_empty(), "{run}: every write had answered");
+            assert_eq!(reports.len(), 1, "{run}");
+            let report = write_deadline_outcome(reports[0].as_ref()).expect("the store's report");
+            assert_eq!((report.id, report.effect), (held, WriteEffect::Unknown));
+            let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+            assert_stopped_by(&cause, how, &slot);
+        })
+        .await;
+    }
+}
+
+// ─────────────── (R5) unknown renewal outcomes ───────────────
+
+/// **(R5)** A renewal answered `CommitUnknownResult` is settled by re-reading its own slot's exact
+/// bytes: one that landed is adopted (one commit, and the next batch requires its slot), and one
+/// that did not land, with `may_still_commit: false`, is sent again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_an_unknown_renewal_is_settled_by_its_own_slot_bytes() {
+    for (applied, may_still_commit, commits) in
+        [(true, false, 1), (true, true, 1), (false, false, 2)]
+    {
+        within(async {
+            let mut rig = Rig::new().await;
+            rig.store.script(
+                Kind::Renewal,
+                vec![Act::Unknown {
+                    applied,
+                    may_still_commit,
+                }],
+                None,
+            );
+            let body_stream = renewal_body(&rig.clock, &rig.log);
+            staged(rig.stage(|_| {}, body_stream).await);
+            let renewals = renewals(&rig);
+            let case = format!("applied {applied}, may {may_still_commit}");
+            assert_eq!(renewals.len(), commits, "{case}");
+            let landed = renewals.last().unwrap();
+            let intent = &rig.log.commits(Kind::Intent)[0];
+            assert_eq!(
+                slot_required(&intent.batch),
+                slot_value_put(&landed.batch),
+                "{case}: the next batch requires the renewed slot"
+            );
+            assert_eq!(intent.answer, Answer::Committed);
+        })
+        .await;
+    }
+}
+
+/// **(R5)** A held renewal that lands before the session is seen to move is adopted. The
+/// renewal's first rounds conflict and its last is held; that round lands after its slot read and
+/// just before the session moves to a later `Open` epoch. The renewal reads its slot again before
+/// letting the doubt go, adopts that round, and staging goes on under the new session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_a_held_renewal_landing_before_the_session_moves_is_adopted() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let later = open_at(&rig.session, 2);
+        let mut plan = vec![Act::Conflict; RENEWAL_ROUNDS as usize - 1];
+        plan.push(Act::Hold { advance: 0 });
+        rig.store.script(Kind::Renewal, plan, None);
+        let slot = slot_key(&rig.upload, SlotIndex::new(0).unwrap());
+        let move_session = WriteBatch::new().put(mpu_key(&rig.upload), later.clone());
+        // Each lost round reads the slot once; fire after the last round's slot read.
+        rig.store.after_read(
+            &slot,
+            RENEWAL_ROUNDS as usize - 1,
+            vec![Then::ReleaseHeld, Then::Commit(move_session)],
+        );
+        let body_stream = renewal_body(&rig.clock, &rig.log);
+        let attempt = staged(rig.stage(|_| {}, body_stream).await);
+        let renewals = renewals(&rig);
+        assert_eq!(
+            renewals.len(),
+            RENEWAL_ROUNDS as usize,
+            "no round past the bound"
+        );
+        let landed = &renewals[RENEWAL_ROUNDS as usize - 1];
+        let intent = &rig.log.commits(Kind::Intent)[0];
+        assert_eq!(intent.answer, Answer::Committed);
+        assert_eq!(
+            slot_required(&intent.batch),
+            slot_value_put(&landed.batch),
+            "the next batch requires the adopted round's slot"
+        );
+        assert_eq!(attempt.session_bytes(), &later, "fenced on the new session");
+    })
+    .await;
+}
+
+/// **(R5)** A held renewal that never settles ends in doubt. The renewal's first round is held
+/// (`may_still_commit: true`) and every later one is answered `Conflict` unapplied until the rounds
+/// run out: an in-doubt error carrying `may_still_commit`, every round fenced on the same slot
+/// bytes, so at most one can land; released afterwards, the held round lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r5_a_held_renewal_that_never_settles_ends_in_doubt() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(
+            Kind::Renewal,
+            vec![Act::Hold { advance: 0 }],
+            Some(Act::Conflict),
+        );
+        let body_stream = renewal_body(&rig.clock, &rig.log);
+        let doubt = in_doubt(rig.stage(|_| {}, body_stream).await);
+        assert!(doubt.may_still_commit, "the doubt is kept");
+        assert_eq!(doubt.outcome.backend, "scripted");
+        assert!(
+            matches!(doubt.cause, Stop::RenewalRoundsSpent { rounds } if rounds == RENEWAL_ROUNDS),
+            "{:?}",
+            doubt.cause
+        );
+        let renewals = rig.log.commits(Kind::Renewal);
+        assert_eq!(renewals.len(), RENEWAL_ROUNDS as usize);
+        let required: BTreeSet<Bytes> = renewals
+            .iter()
+            .map(|renewal| slot_required(&renewal.batch))
+            .collect();
+        assert_eq!(
+            required.len(),
+            1,
+            "one required slot value across every round"
+        );
+        assert!(rig.log.commits(Kind::Intent).is_empty());
+        assert_eq!(rig.store.release_held().await, CommitOutcome::Committed);
+    })
+    .await;
+}
+
+// ─────────────── (R6) the renewal loop is bounded ───────────────
+
+/// **(R6)** Every renewal answered `Conflict` unapplied: exactly [`RENEWAL_ROUNDS`] commits, then
+/// a typed error with nothing in doubt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r6_the_renewal_loop_is_bounded() {
+    within(async {
+        let mut rig = Rig::new().await;
+        rig.store.script(Kind::Renewal, vec![], Some(Act::Conflict));
+        let body_stream = renewal_body(&rig.clock, &rig.log);
+        let cause = stopped(rig.stage(|_| {}, body_stream).await);
+        assert!(
+            matches!(cause, Stop::RenewalRoundsSpent { rounds } if rounds == RENEWAL_ROUNDS),
+            "{cause:?}"
+        );
+        assert_eq!(
+            rig.log.commits(Kind::Renewal).len(),
+            RENEWAL_ROUNDS as usize
+        );
+        assert!(rig.log.commits(Kind::Intent).is_empty());
+    })
+    .await;
+}
+
+// ─────────────── (R7) the quiesce renewal ───────────────
+
+/// The cause of a quiesce renewal that stopped with nothing in doubt.
+fn renew_stopped(outcome: Result<RenewOutcome, StageError>) -> Stop {
+    match outcome {
+        Err(StageError::Stopped { cause, .. }) => cause,
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+}
+
+/// Stage one chunk at `T0`: the slot and its owned entry leased to `T0 + TTL + 1`.
+async fn staged_one_chunk(rig: &mut Rig) -> Box<StagedAttempt> {
+    let attempt = staged(
+        rig.stage(|_| {}, stream_of(vec![Bytes::from(body_bytes(CHUNK))]))
+            .await,
+    );
+    assert_eq!(attempt.slot().lease_expiry_millis(), T0 + TTL + 1);
+    attempt
+}
+
+/// Every lease of `attempt` is `lease`, and the store holds exactly its slot and entries.
+async fn assert_attempt_leases(rig: &Rig, attempt: &StagedAttempt, lease: u64) {
+    assert_eq!(attempt.slot().lease_expiry_millis(), lease);
+    let inner = &rig.store.inner;
+    assert_eq!(
+        inner.get(attempt.slot_key()).await.unwrap().as_ref(),
+        Some(attempt.slot_bytes())
+    );
+    for held in attempt.owned() {
+        assert_eq!(held.entry().lease_expiry_millis(), lease);
+        assert_eq!(
+            inner.get(held.key()).await.unwrap().as_ref(),
+            Some(held.bytes())
+        );
+    }
+}
+
+/// **(R7)** The quiesce renewal ([`StagedAttempt::renew`]) takes the caller's clock and reads it
+/// every round. Its first round is lost while the clock moves on 1,000 ms; the retry stamps the
+/// leases from its own reading, `T0 + 1,000 + TTL`, and its cover is judged at a reading after
+/// that commit returned. A renewal handed one fixed reading would stamp `T0 + TTL + 2`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_the_quiesce_renewal_reads_the_callers_clock_every_round() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let mut attempt = staged_one_chunk(&mut rig).await;
+        rig.store
+            .script(Kind::Renewal, vec![Act::ConflictThenAdvance(1_000)], None);
+        let outcome = attempt
+            .renew(&rig.store, &rig.runtime, COVER)
+            .await
+            .unwrap();
+        let lease = T0 + 1_000 + TTL;
+        assert_eq!(
+            outcome,
+            RenewOutcome::Covered {
+                checked_at_millis: T0 + 1_000,
+                lease_expiry_millis: lease
+            }
+        );
+        let renewals = renewals(&rig);
+        assert_eq!(renewals.len(), 2);
+        assert_eq!(
+            (renewals[0].clock, renewals[1].clock),
+            (T0, T0 + 1_000),
+            "a reading per round"
+        );
+        assert_attempt_leases(&rig, &attempt, lease).await;
+    })
+    .await;
+}
+
+/// **(R7)** The quiesce renewal refuses a lapsed lease rather than reviving it: its first round is
+/// lost while the clock passes every lease; the retry, at its own reading, refuses with a typed
+/// error, nothing more sent and nothing revived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_the_quiesce_renewal_refuses_a_lapsed_lease() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let mut attempt = staged_one_chunk(&mut rig).await;
+        let unchanged = snapshot(&rig.store.inner).await;
+        rig.store
+            .script(Kind::Renewal, vec![Act::ConflictThenAdvance(2 * TTL)], None);
+        let cause = renew_stopped(attempt.renew(&rig.store, &rig.runtime, COVER).await);
+        let (key, lease, now) = lapsed(&cause);
+        assert_eq!(key, attempt.slot_key());
+        assert_eq!(lease, T0 + TTL + 1);
+        assert_eq!(now, T0 + 2 * TTL);
+        assert_eq!(rig.log.commits(Kind::Renewal).len(), 1, "no retry was sent");
+        assert_eq!(
+            snapshot(&rig.store.inner).await,
+            unchanged,
+            "nothing revived"
+        );
+    })
+    .await;
+}
+
+/// **(R7)** The quiesce renewal never moves a lease backwards, and refuses once the session has
+/// left `Open`. With the caller's clock read behind the leases, the lease moves one millisecond on,
+/// never back; after an Abort it answers `NoSuchUpload` and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_the_quiesce_renewal_never_moves_a_lease_backwards_or_past_a_fence() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let mut attempt = staged_one_chunk(&mut rig).await;
+        let before = attempt.slot().lease_expiry_millis();
+        rig.clock.set(T0 - HALF);
+        let outcome = attempt
+            .renew(&rig.store, &rig.runtime, COVER)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            RenewOutcome::Covered {
+                checked_at_millis: T0 - HALF,
+                lease_expiry_millis: before + 1
+            },
+            "one millisecond on, never back"
+        );
+        assert_attempt_leases(&rig, &attempt, before + 1).await;
+
+        fence(&rig.store.inner, &rig.upload).await;
+        let unchanged = snapshot(&rig.store.inner).await;
+        rig.clock.set(T0 + 1);
+        let outcome = attempt
+            .renew(&rig.store, &rig.runtime, COVER)
+            .await
+            .unwrap();
+        assert_eq!(outcome, RenewOutcome::Refused(Refusal::NoSuchUpload));
+        assert_eq!(
+            snapshot(&rig.store.inner).await,
+            unchanged,
+            "nothing resurrected"
+        );
+        assert_eq!(rig.log.commits(Kind::Renewal).len(), 2);
+    })
+    .await;
+}
+
+/// **(R7) Coverage at hand-off** (added 2026-10-22; `0016:1726-1728`). The quiesce renewal
+/// succeeds only when, at a clock reading taken after its last commit returned, every lease it
+/// wrote expires at least `COVER` later.
+///
+/// * (i) Its first commit returns `TTL − COVER + 1` late: that lease covers one millisecond too
+///   little at the reading after it, so `renew` runs another round, whose commit is prompt, and
+///   answers with a reading and an expiry at least `COVER` apart.
+/// * (ii) Every commit returns that late: a typed error after exactly [`RENEWAL_ROUNDS`] commits,
+///   the leases moved forward and no lease lapsed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_the_quiesce_renewal_covers_its_hand_off_or_refuses() {
+    for every in [false, true] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let mut attempt = staged_one_chunk(&mut rig).await;
+            // Past the staged leases, so each round's lease is its own reading plus a TTL.
+            rig.clock.set(T0 + 100);
+            let late = Act::PassThenAdvance(TTL - COVER + 1);
+            let (plan, then) = if every {
+                (vec![], Some(late))
+            } else {
+                (vec![late], None)
+            };
+            rig.store.script(Kind::Renewal, plan, then);
+            let outcome = attempt.renew(&rig.store, &rig.runtime, COVER).await;
+            let renewals = renewals(&rig);
+            assert!(renewals.iter().all(|r| r.answer == Answer::Committed));
+            let first = slot_put(&renewals[0].batch).lease_expiry_millis();
+            assert_eq!(first, T0 + 100 + TTL);
+            assert_eq!(
+                first - (T0 + 100 + TTL - COVER + 1),
+                COVER - 1,
+                "the first round covers one millisecond too little"
+            );
+            if !every {
+                assert_eq!(renewals.len(), 2, "it renewed again");
+                let checked = T0 + 100 + TTL - COVER + 1;
+                let lease = checked + TTL;
+                assert_eq!(
+                    outcome.unwrap(),
+                    RenewOutcome::Covered {
+                        checked_at_millis: checked,
+                        lease_expiry_millis: lease
+                    }
+                );
+                assert!(lease - checked >= COVER);
+                assert_eq!(renewals[1].clock, checked, "read after the late commit");
+                assert_attempt_leases(&rig, &attempt, lease).await;
+            } else {
+                assert_eq!(renewals.len(), RENEWAL_ROUNDS as usize, "exactly the bound");
+                let cause = renew_stopped(outcome);
+                let now = rig.clock.now_millis();
+                assert!(
+                    matches!(cause, Stop::CoverShort {
+                        rounds, cover_millis, lease_expiry_millis, checked_at_millis
+                    } if rounds == RENEWAL_ROUNDS
+                        && cover_millis == COVER
+                        && checked_at_millis == now
+                        && lease_expiry_millis == now + COVER - 1),
+                    "{cause:?}"
+                );
+                assert_live(&rig.store.inner, &rig.upload, now).await;
+            }
+        })
+        .await;
+    }
+}
+
+/// **(R7)** A cover not below the lease TTL is a typed input error, with nothing read or written:
+/// no lease could cover it. One millisecond below the TTL is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r7_a_cover_not_below_the_ttl_is_refused_writing_nothing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let mut attempt = staged_one_chunk(&mut rig).await;
+        assert_eq!(attempt.lease_ttl_millis(), TTL);
+        let unchanged = snapshot(&rig.store.inner).await;
+        let events = rig.log.events().len();
+        for cover in [TTL, TTL + 1] {
+            let cause = renew_stopped(attempt.renew(&rig.store, &rig.runtime, cover).await);
+            assert!(matches!(cause, Stop::InvalidRequest { .. }), "{cause:?}");
+        }
+        assert_eq!(
+            snapshot(&rig.store.inner).await,
+            unchanged,
+            "nothing written"
+        );
+        assert_eq!(rig.log.events().len(), events, "no commit sent");
+        let outcome = attempt.renew(&rig.store, &rig.runtime, TTL - 1).await;
+        assert!(
+            matches!(outcome, Ok(RenewOutcome::Covered { .. })),
+            "{outcome:?}"
+        );
+    })
+    .await;
+}
+
+// ─────────────── (R8) every renewal batch fits `B_ops` ───────────────
+
+/// **(R8)** Staging refuses, before reading or writing anything, a request whose chunk bound would
+/// build a renewal batch past `MAX_BATCH_OPS`. A renewal of `N` owned entries carries `3 + 2N`
+/// operations (counted on a real batch by `renewals`), so the widest bound that fits is
+/// `(MAX_BATCH_OPS − 3) / 2`: one more is refused by `stage_part` and `reserve_slot` alike, and the
+/// bound itself stages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r8_a_chunk_bound_past_a_renewal_batch_is_refused() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let fits = (MAX_BATCH_OPS - 3) / 2;
+        assert!(3 + 2 * fits <= MAX_BATCH_OPS && 3 + 2 * (fits + 1) > MAX_BATCH_OPS);
+        let before = snapshot(&rig.store.inner).await;
+        let past = move |r: &mut StageRequest<'_>| r.max_part_chunks = fits + 1;
+        let cause = stopped(
+            rig.stage(past, stream_of(vec![Bytes::from_static(b"x")]))
+                .await,
+        );
+        assert!(
+            matches!(cause, Stop::InvalidRequest { reason } if reason.contains("MAX_BATCH_OPS")),
+            "{cause:?}"
+        );
+        let mut req = request(&rig.topology, &rig.upload, &rig.attempt);
+        past(&mut req);
+        assert!(
+            matches!(
+                reserve_slot(&rig.store, &req, T0).await,
+                Err(StageError::Stopped {
+                    cause: Stop::InvalidRequest { .. },
+                    ..
+                })
+            ),
+            "reserve_slot refuses it too"
+        );
+        assert_eq!(snapshot(&rig.store.inner).await, before, "nothing written");
+        assert!(rig.log.events().is_empty(), "no commit, no put");
+        let attempt = staged(
+            rig.stage(
+                move |r| r.max_part_chunks = fits,
+                stream_of(vec![Bytes::from(body_bytes(CHUNK))]),
+            )
+            .await,
+        );
+        assert_eq!(
+            attempt.chunks().len(),
+            1,
+            "the widest bound that fits stages"
         );
     })
     .await;
