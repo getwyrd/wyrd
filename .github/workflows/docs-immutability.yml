@@ -246,13 +246,14 @@ jobs:
           # the stable spec's conformance surface.
           # Three dots: diff against the merge base, so a document added to the base branch
           # after the PR branch was cut is not read as deleted by the PR.
+          # T, a type change (a document replaced by a symlink, say), is checked like M.
           violations=""
           while IFS=$'\t' read -r change base_path target_path; do
             check_path "$change" "$base_path"
             if [[ "$change" == R* ]]; then
               check_path "$change" "$target_path"
             fi
-          done < <(git diff -M --name-status --diff-filter=AMDR "$BASE_SHA...$HEAD_SHA" -- \
+          done < <(git diff -M --name-status --diff-filter=AMDRT "$BASE_SHA...$HEAD_SHA" -- \
             'docs/design/adr/[0-9]*.md' \
             'docs/design/proposals/draft/[0-9]*.md' \
             'docs/design/proposals/accepted/[0-9]*.md' \

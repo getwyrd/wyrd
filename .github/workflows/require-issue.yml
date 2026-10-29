@@ -9,12 +9,13 @@ name: PR hygiene
 #      "Fixes #123", "Resolves #123") or an issue linked via the PR's Development
 #      sidebar. GitHub links a closing keyword only when the PR targets the default
 #      branch, so for any other base the keyword is checked like a reference below;
-#   2. a non-closing reference in the description ("Refs #123", "Ref: #123",
+#   2. a non-closing reference in the title or description ("Refs #123", "Ref: #123",
 #      "Refs #123, #124", "Refs owner/repo#123"), for a PR that delivers part of an
 #      issue and must not close it. Each referenced number is looked up and counts
 #      only if it is an issue (not a PR) the workflow token can read. References
 #      inside fenced code blocks or HTML comments are ignored.
-# Editing the PR body re-runs the check.
+# Editing the PR title or body re-runs the check. Linking an issue through the sidebar does
+# not trigger a run: re-run the failed job afterwards.
 #
 # Dependabot's dependency-bump PRs pass without an issue: they are traceable through the
 # changelog and the dependency audit. They pass rather than skip, because a skipped
@@ -50,6 +51,7 @@ jobs:
               query($owner: String!, $repo: String!, $number: Int!) {
                 repository(owner: $owner, name: $repo) {
                   pullRequest(number: $number) {
+                    title
                     body
                     closingIssuesReferences(first: 1) { totalCount }
                   }
@@ -63,9 +65,9 @@ jobs:
               return;
             }
 
-            // No closing link: look for `Refs #N` references in the body, and for closing
+            // No closing link: look for `Refs #N` references in the title and body, and for closing
             // keywords, which GitHub links only when the PR targets the default branch.
-            const text = (pr.body || '')
+            const text = `${pr.title || ''}\n${pr.body || ''}`
               .replace(/<!--[\s\S]*?-->/g, '')
               .replace(/^\s*(```|~~~)[\s\S]*?^\s*\1/gm, '');
             const REF = '(?:([\\w.-]+)\\/([\\w.-]+))?#(\\d+)';
@@ -108,5 +110,6 @@ jobs:
               'This PR is not linked to an issue. Add a closing reference to the ' +
               'PR description (e.g. "Closes #123"), a non-closing one for partial ' +
               'work (e.g. "Refs #123"), or link an issue via the Development ' +
-              'sidebar, then the check re-runs automatically.'
+              'sidebar. Editing the title or description re-runs this check; after ' +
+              'linking through the sidebar, re-run the failed job.'
             );
