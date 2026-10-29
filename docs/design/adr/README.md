@@ -1,6 +1,8 @@
 ---
 created: 13.06.2026 11:57
 type: index
+# Supersession is recorded in this index only; the old ADR stays as it is.
+supersession: index-only
 tags:
   - adr
 ---

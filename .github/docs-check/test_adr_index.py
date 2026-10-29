@@ -26,8 +26,9 @@ def adr(num: str, title: str, status: str, extra: str = "") -> str:
             "# Not the title\n")
 
 
-def index(*rows: str, extra: str = "") -> str:
-    return ("---\ntype: index\n---\n# Architecture Decision Records\n\n## Index\n\n"
+def index(*rows: str, extra: str = "", supersession: str = "") -> str:
+    setting = f"supersession: {supersession}\n" if supersession else ""
+    return (f"---\ntype: index\n{setting}---\n# Architecture Decision Records\n\n## Index\n\n"
             "| # | Title | Status |\n|---|-------|--------|\n" + "".join(r + "\n" for r in rows)
             + extra)
 
@@ -49,8 +50,15 @@ CANDIDATES = ("\n## ADR candidates\n\n| Candidate | Source | Why |\n|---|---|---
               "| Something | [proposal 1](../proposals/draft/0001-x.md) | Proposed |\n")
 
 
-def with_index(files: dict[str, str], rows: list[str], extra: str = CANDIDATES) -> dict[str, str]:
-    return {**files, f"{ADR}/README.md": index(*rows, extra=extra)}
+def with_index(files: dict[str, str], rows: list[str], extra: str = CANDIDATES,
+               supersession: str = "") -> dict[str, str]:
+    return {**files, f"{ADR}/README.md": index(*rows, extra=extra, supersession=supersession)}
+
+
+# 0001 superseded by 0002 in the index only; the file stays Accepted.
+INDEX_ONLY_ROWS = [GOOD_ROWS[0].replace("| Accepted |", "| Superseded by [0002](0002-license.md) |"),
+                   GOOD_ROWS[1].replace("Proposed", "Accepted")] + GOOD_ROWS[2:]
+INDEX_ONLY = {**GOOD, f"{ADR}/0002-license.md": adr("0002", "License", "Accepted", "supersedes: 0001\n")}
 
 
 def replace_row(num: str, row: str) -> list[str]:
@@ -108,15 +116,23 @@ MUST_FAIL = {
     "superseded-by differs from the index": (
         with_index({**GOOD, f"{ADR}/0003-old-way.md": adr("0003", "Old way", "Superseded", "superseded-by: 0002\n")}, GOOD_ROWS),
         "the successors in `superseded-by:` or the status differ from the index"),
+    "index names a successor that does not exist": (
+        with_index(GOOD, replace_row("0003", "| [0003](0003-old-way.md) | Old way | Superseded by 0004 and 0042 |")),
+        "names successor 0042, which does not exist"),
     "index-only supersession by a Proposed ADR": (
         with_index({**GOOD, f"{ADR}/0002-license.md": adr("0002", "License", "Proposed", "supersedes: 0001\n")},
-                   replace_row("0001", "| [0001](0001-record-decisions.md) | Record decisions | Superseded by [0002](0002-license.md) |")),
-        "Accepted ADR 0001 is shown Superseded, but no successor the row names is Accepted yet"),
+                   replace_row("0001", "| [0001](0001-record-decisions.md) | Record decisions | Superseded by [0002](0002-license.md) |"),
+                   supersession="index-only"),
+        "Accepted ADR 0001 is shown Superseded, but no successor the row names has been accepted"),
     "index-only supersession the successor does not name back": (
         with_index({**GOOD, f"{ADR}/0002-license.md": adr("0002", "License", "Accepted")},
                    replace_row("0001", "| [0001](0001-record-decisions.md) | Record decisions | Superseded by [0002](0002-license.md) |")
-                   [:1] + [GOOD_ROWS[1].replace("Proposed", "Accepted")] + GOOD_ROWS[2:]),
+                   [:1] + [GOOD_ROWS[1].replace("Proposed", "Accepted")] + GOOD_ROWS[2:],
+                   supersession="index-only"),
         "0002-license.md: `supersedes:` does not name 0001"),
+    "index-only supersession where the repo stamps the old file": (
+        with_index(INDEX_ONLY, INDEX_ONLY_ROWS),
+        "status `Superseded by 0002` differs from the file's `Accepted`"),
     "Proposed file shown Superseded in the index": (
         with_index(GOOD, replace_row("0002", "| [0002](0002-license.md) | License | Superseded by [0004](0004-new-way.md) |")),
         "status `Superseded by 0004` differs from the file's `Proposed`"),
@@ -149,10 +165,16 @@ MUST_PASS = {
         replace_row("0003", "| [0003](0003-old-way.md) | Old way | Superseded by [0002](0002-license.md), [0004](0004-new-way.md) |")),
     "a Notes column after Status": {**GOOD, f"{ADR}/README.md": index(
         *[r + " a note |" for r in GOOD_ROWS]).replace("| # | Title | Status |", "| # | Title | Status | Notes |")},
-    "supersession recorded in the index, the old file untouched (ADR-0001)": with_index(
-        {**GOOD, f"{ADR}/0002-license.md": adr("0002", "License", "Accepted", "supersedes: 0001\n")},
-        [GOOD_ROWS[0].replace("| Accepted |", "| Superseded by [0002](0002-license.md) |"),
-         GOOD_ROWS[1].replace("Proposed", "Accepted")] + GOOD_ROWS[2:]),
+    "supersession recorded in the index, the old file untouched (index-only)": with_index(
+        INDEX_ONLY, INDEX_ONLY_ROWS, supersession="index-only"),
+    "index-only: the successor was superseded in turn": with_index(
+        {**INDEX_ONLY,
+         f"{ADR}/0002-license.md": adr("0002", "License", "Superseded",
+                                       "supersedes: 0001\nsuperseded-by: 0005\n"),
+         f"{ADR}/0005-newer.md": adr("0005", "Newer", "Accepted", "supersedes: 0002\n")},
+        [INDEX_ONLY_ROWS[0], "| [0002](0002-license.md) | License | Superseded by [0005](0005-newer.md) |"]
+        + INDEX_ONLY_ROWS[2:] + ["| [0005](0005-newer.md) | Newer | Accepted |"],
+        supersession="index-only"),
     "a Proposed ADR may name what it would supersede": with_index(
         {**GOOD, f"{ADR}/0002-license.md": adr("0002", "License", "Proposed", "supersedes: 0001\n")},
         GOOD_ROWS),
