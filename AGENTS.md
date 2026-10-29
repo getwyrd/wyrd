@@ -85,6 +85,18 @@ run the checks that match the surface you changed.
   changes, run the same lint/render commands as `docs-check`; deployment itself
   happens only after merge to `main` or manual dispatch.
 
+## Workflows
+
+- Pin every action to a full commit hash with its release as a comment
+  (`uses: actions/checkout@<40-char sha> # v7.0.1`), never to a tag or branch. Pick a
+  release at least two weeks old; Dependabot keeps pins current.
+- Give every `actions/checkout` `persist-credentials: false`, and each job only the
+  `permissions:` it needs.
+- A job that branch protection requires is listed in `.github/required-checks.txt`. When
+  you rename, add or drop one, change the file in the same PR and tell the maintainer to
+  re-apply the settings after the merge; it needs admin rights.
+- Scorecard reports unpinned actions and broad token permissions in the Security tab.
+
 ## Design documents — pick the right class, change it the right way
 
 - **Pick the class by intent** (`docs/design/README.md` is the map):

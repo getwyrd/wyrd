@@ -1,0 +1,8 @@
+# The status checks main requires, one per line. Each is a job name in
+# .github/workflows/. scripts/repo-settings.py (eduralph/project-template) reads this file
+# from main to check and apply the branch protection.
+docs-check
+require-issue
+docs-immutability
+gate
+dco

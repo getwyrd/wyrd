@@ -76,13 +76,15 @@ jobs:
       # version/revision/sha256 read from the jar's own metadata (Design §3/§6).
       WYRD_ELLE_CLI_JAR: /opt/elle-cli/elle-cli-0.1.9-standalone.jar
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # ubuntu-latest ships Docker with the compose plugin; confirm the daemon is reachable
       # (the same step tier1-jepsen.yml and fdb-conformance.yml use).
@@ -105,7 +107,7 @@ jobs:
 
       # elle-cli is a Clojure/JVM tool (ADR-0041's whole reason this checker stays off-Check).
       - name: Install the JVM (elle-cli is Clojure/JVM)
-        uses: actions/setup-java@v6.1.0
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: "17"
@@ -154,7 +156,7 @@ jobs:
       # against.
       - name: Upload the checked-run artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: elle-register-verdict-run
           path: target/consistency-run/
