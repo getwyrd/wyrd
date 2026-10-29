@@ -38,6 +38,9 @@ jobs:
 
       - name: cargo xtask advisories --latest
         id: check
+        # Explicit bash adds `-o pipefail`; the default `bash -e` would take tee's exit
+        # status, mark a failed audit a success, and never open the issue below.
+        shell: bash
         run: cargo xtask advisories --latest 2>&1 | tee advisories.log
 
       - name: Open or update the advisory issue

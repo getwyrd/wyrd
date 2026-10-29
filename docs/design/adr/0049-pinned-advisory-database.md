@@ -44,6 +44,6 @@ A `gitsubmodule` entry in `.github/dependabot.yml` opens a pull request every da
 - A newly published advisory no longer stops unrelated work. It shows up in one place, the pin update, plus the daily issue.
 - An advisory reaches the PR gate up to a day later than before, and only once the pin update merges. Dependabot's security updates are unaffected: they open as soon as an advisory names a crate Wyrd uses.
 - The gate's result depends only on the commit under review, so re-running an old pull request gives the same answer.
-- In offline mode cargo-deny refuses a database older than 90 days (`maximum-db-staleness`). If the pin updates are left unmerged that long, the gate fails until one merges, which is the intended pressure.
+- `cargo xtask ci` refuses a pin whose commit is more than 90 days old. If the pin updates are left unmerged that long, the gate fails until one merges, which is the intended pressure. xtask checks the commit's date itself: cargo-deny's `maximum-db-staleness` dates the database by its last fetch, and a fresh CI runner fetches the pin every time, so that check alone would never fire.
 - `git clone --recursive` or `git submodule update --init` downloads the advisory database into `.github/advisory-db`. Nothing in the build needs it there.
 - `xtask/tests/advisory_db.rs` holds the pieces in place: the gitlink and its `.gitmodules` entry, `db-path` in both configs, `--offline` on every wall invocation, and the `--latest` runs in `release.yml` and `advisories.yml`.

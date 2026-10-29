@@ -2030,6 +2030,19 @@ fn prepare_pinned_advisory_db() -> Result<(), String> {
         git_stdout(&db, &["fetch", "--quiet", "--depth", "1", "origin", &pin])?;
         git_stdout(&db, &["checkout", "--quiet", "--detach", &pin])?;
     }
+    let committed = git_stdout(&db, &["log", "-1", "--format=%ct", "HEAD"])?;
+    let committed: u64 = committed
+        .trim()
+        .parse()
+        .map_err(|e| format!("bad commit time {committed:?} for the advisory pin: {e}"))?;
+    // The pin's age is measured against the wall clock: a build tool, not a lifecycle with a
+    // testkit Clock seam, and the age rule itself is tested through `check_advisory_pin_age`.
+    #[allow(clippy::disallowed_methods)]
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock is before 1970: {e}"))?
+        .as_secs();
+    xtask::check_advisory_pin_age(committed, now)?;
     println!("advisory database pinned at {pin} (ADR-0049)");
     cargo(&["fetch", "--locked"])
 }

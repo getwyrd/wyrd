@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use xtask::{
-    advisory_invocations, dependency_wall_invocations, offline, parse_gitlink, ADVISORY_DB_PATH,
-    ADVISORY_DB_SUBMODULE,
+    advisory_invocations, check_advisory_pin_age, dependency_wall_invocations, offline,
+    parse_gitlink, ADVISORY_DB_PATH, ADVISORY_DB_SUBMODULE, MAX_ADVISORY_PIN_AGE_DAYS,
 };
 
 /// The workspace root (`<root>/xtask` is this crate's manifest dir).
@@ -141,6 +141,10 @@ fn release_and_the_daily_run_audit_the_newest_database() {
     let daily = read(".github/workflows/advisories.yml");
     assert!(daily.contains("run: cargo xtask advisories --latest"));
     assert!(
+        daily.contains("        shell: bash\n        run: cargo xtask advisories --latest"),
+        "the daily audit pipes into tee, so it needs bash's pipefail to fail at all"
+    );
+    assert!(
         daily.contains("schedule:"),
         "advisories.yml must run on a schedule"
     );
@@ -149,5 +153,20 @@ fn release_and_the_daily_run_audit_the_newest_database() {
     assert!(
         dependabot.contains("package-ecosystem: gitsubmodule"),
         "Dependabot must move the advisory-db pin"
+    );
+}
+
+#[test]
+fn the_pin_age_is_the_commit_date_not_the_fetch_time() {
+    // cargo-deny's `maximum-db-staleness` dates the database by FETCH_HEAD, which a fresh
+    // runner sets to now, so xtask checks the pinned commit's own date.
+    const DAY: u64 = 86_400;
+    let now = 1_800_000_000;
+    let limit = MAX_ADVISORY_PIN_AGE_DAYS * DAY;
+    assert!(check_advisory_pin_age(now - limit, now).is_ok());
+    assert!(check_advisory_pin_age(now - limit - DAY, now).is_err());
+    assert!(
+        check_advisory_pin_age(now + DAY, now).is_ok(),
+        "clock skew is not staleness"
     );
 }

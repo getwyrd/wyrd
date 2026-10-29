@@ -236,3 +236,23 @@ pub fn offline(invocation: &[&'static str]) -> Vec<&'static str> {
     args.insert(at, "--offline");
     args
 }
+
+/// The oldest the pinned advisory database may be, in days (ADR-0049). cargo-deny's own
+/// `maximum-db-staleness` cannot enforce it: it dates the database by the last fetch
+/// (`FETCH_HEAD`), and xtask fetches the pinned commit on every fresh runner.
+pub const MAX_ADVISORY_PIN_AGE_DAYS: u64 = 90;
+
+/// Refuse a pinned advisory database whose commit is older than
+/// [`MAX_ADVISORY_PIN_AGE_DAYS`]. Both times are Unix seconds: `commit_time` is the pinned
+/// commit's committer date, `now` the current time. A commit dated in the future passes.
+pub fn check_advisory_pin_age(commit_time: u64, now: u64) -> Result<(), String> {
+    let age_days = now.saturating_sub(commit_time) / 86_400;
+    if age_days > MAX_ADVISORY_PIN_AGE_DAYS {
+        return Err(format!(
+            "the advisory database pinned at {ADVISORY_DB_SUBMODULE} is {age_days} days old \
+             (limit {MAX_ADVISORY_PIN_AGE_DAYS}); merge Dependabot's PR that moves the pin \
+             (ADR-0049)"
+        ));
+    }
+    Ok(())
+}
