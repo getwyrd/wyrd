@@ -108,6 +108,9 @@ MUST_FAIL = {
     "superseded-by differs from the index": (
         with_index({**GOOD, f"{ADR}/0003-old-way.md": adr("0003", "Old way", "Superseded", "superseded-by: 0002\n")}, GOOD_ROWS),
         "the successors in `superseded-by:` or the status differ from the index"),
+    "index names a successor that does not exist": (
+        with_index(GOOD, replace_row("0003", "| [0003](0003-old-way.md) | Old way | Superseded by 0004 and 0042 |")),
+        "names successor 0042, which does not exist"),
     "index-only supersession by a Proposed ADR": (
         with_index({**GOOD, f"{ADR}/0002-license.md": adr("0002", "License", "Proposed", "supersedes: 0001\n")},
                    replace_row("0001", "| [0001](0001-record-decisions.md) | Record decisions | Superseded by [0002](0002-license.md) |")),

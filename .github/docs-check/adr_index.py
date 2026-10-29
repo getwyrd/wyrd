@@ -17,14 +17,15 @@ It reads the tracked files under docs/design/adr/ and reports, as `file: message
 - in the table under `## Index`: an ADR missing or listed twice, a row for a file that
   doesn't exist, or a status that differs from the file (titles may differ: an index
   often carries a longer summary than the heading). One difference is the rule, not an
-  error: an Accepted ADR that a later one replaces keeps its file untouched and is shown
-  `Superseded by NNNN` in the index only (ADR-0001, "Immutability");
-- an ADR the index shows Superseded whose row doesn't name an existing successor, whose
-  successor's `supersedes:` doesn't name it back, or whose `superseded-by:` (or the
-  successors its status names) differs from the index; and an Accepted file shown
+  error: where the ADR process freezes Accepted files (as wyrd's does), an Accepted ADR
+  that a later one replaces keeps its file untouched and is shown `Superseded by NNNN` in
+  the index only;
+- an ADR the index shows Superseded whose row names no successor or one that doesn't
+  exist, whose successor's `supersedes:` doesn't name it back, or whose `superseded-by:`
+  (or the successors its status names) differs from the index; and an Accepted file shown
   Superseded with no Accepted successor, since only an accepted replacement supersedes it;
 - an Accepted ADR whose `supersedes:` names an ADR the index doesn't show Superseded
-  (ADR-0001 records both sides in the same pull request).
+  (the supersession records both sides in the same pull request).
 
 Other sections of the index (ADR candidates, "Why not ...?") are not read.
 
@@ -175,7 +176,7 @@ def check(root: str, tracked: list[str]) -> list[str]:
     if not adrs:
         return problems
     if INDEX not in tracked:
-        return problems + [f"{INDEX}: missing; every ADR is listed there (ADR-0001)"]
+        return problems + [f"{INDEX}: missing; every ADR is listed there"]
     with open(posixpath.join(root, INDEX), encoding="utf-8") as fh:
         rows = index_rows(fh.read())
 
@@ -203,19 +204,22 @@ def check(root: str, tracked: list[str]) -> list[str]:
                 f"{where}: status `{status_cell}` differs from the file's `{adr['status']}`"
             )
         if adr["status"] == "Superseded" or shown == "Superseded":
-            successors = {n for n in numbers(" ".join(words[1:])) if n in by_num}
-            if not successors:
+            named = numbers(" ".join(words[1:]))
+            if not named:
                 problems.append(f"{where}: superseded ADR {adr['num']:04d} must name its "
                                 "successor (`Superseded by NNNN`)")
-            elif index_only and not any(adrs[by_num[n]]["status"] == "Accepted"
-                                        for n in successors):
+            for n in sorted(named - by_num.keys()):
+                problems.append(f"{where}: names successor {n:04d}, which does not exist")
+            successors = named & by_num.keys()
+            if index_only and successors and not any(adrs[by_num[n]]["status"] == "Accepted"
+                                                     for n in successors):
                 problems.append(f"{where}: Accepted ADR {adr['num']:04d} is shown Superseded, "
                                 "but no successor the row names is Accepted yet")
-            for n in successors:
+            for n in sorted(successors):
                 if adr["num"] not in adrs[by_num[n]]["supersedes"]:
                     problems.append(f"{adrs[by_num[n]]['path']}: `supersedes:` does not name "
                                     f"{adr['num']:04d}, which the index says it replaces")
-            if adr["superseded_by"] and successors and adr["superseded_by"] != successors:
+            if adr["superseded_by"] and named and adr["superseded_by"] != named:
                 problems.append(f"{adr['path']}: the successors in `superseded-by:` or the status "
                                 "differ from the index")
 
@@ -230,7 +234,7 @@ def check(root: str, tracked: list[str]) -> list[str]:
                 elif shown_as.get(posixpath.basename(old["path"]), old["status"]) != "Superseded":
                     problems.append(f"{old['path']}: still {old['status']}, but Accepted "
                                     f"ADR {adr['num']:04d} supersedes it; show it "
-                                    f"`Superseded by {adr['num']:04d}` in the index (ADR-0001)")
+                                    f"`Superseded by {adr['num']:04d}` in the index")
     return problems
 
 
