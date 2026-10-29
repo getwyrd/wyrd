@@ -1,6 +1,6 @@
 # Dependencies of triage_priority.py. Compile with:
 #   pip-compile --generate-hashes --strip-extras --no-emit-index-url requirements.in
-# Every pin is at least two weeks old when chosen (ADR-0048 section 5): the newest anthropic 1.x
+# Every pin is at least 7 days old when chosen (ADR-0048 section 5): the newest anthropic 1.x
 # release before 2026-10-08, with its transitive dependencies held to the same cut-off.
 anthropic==1.12.0
 httpx2==2.13.1
