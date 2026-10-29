@@ -280,6 +280,9 @@ class Plan:
     remove_labels: list[str] = field(default_factory=list)
     assignee: str | None = None
     comment: str = ""
+    # The workflow's triage comments on the issue when it was classified. Apply skips the
+    # plan once that count has changed: a rerun already applied it, or another run did.
+    triage_count: int = 0
 
 
 def skip_reason(issue: Issue, retry: bool = False) -> str | None:
@@ -425,6 +428,7 @@ def check_plan(entry: dict, config: dict) -> Plan:
         assignee = entry["assignee"]
         remove = entry["remove_labels"]
         comment = entry["comment"]
+        triage_count = entry.get("triage_count", 0)
     except (KeyError, TypeError) as e:
         raise InvalidPlan(f"missing field: {e}") from e
     if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -447,8 +451,10 @@ def check_plan(entry: dict, config: dict) -> Plan:
         raise InvalidPlan(f"assignee {assignee!r} is not in the owner table")
     if not isinstance(comment, str) or not comment.startswith(MARKER) or len(comment) > MAX_COMMENT:
         raise InvalidPlan("comment is not the bot's own")
+    if not isinstance(triage_count, int) or isinstance(triage_count, bool) or triage_count < 0:
+        raise InvalidPlan(f"triage count {triage_count!r}")
     return Plan(number=number, add_labels=list(labels), remove_labels=list(remove),
-                assignee=assignee, comment=comment)
+                assignee=assignee, comment=comment, triage_count=triage_count)
 
 
 def write_plans(path: Path, plans: list[Plan]) -> None:
@@ -572,6 +578,12 @@ def apply_plan(repo: str, plan: Plan) -> None:
     # Re-read the issue: a human may have set a priority since the classify job read it.
     # The classify job already decided whether a retry was due, so allow it here.
     fresh = fetch_issue(repo, plan.number)
+    # A triage comment added since classification means this plan was already applied (a
+    # rerun of the apply job) or another run triaged the issue first. Applying it again
+    # would repeat the comment and spend one of the issue's retries.
+    if fresh.triage_count != plan.triage_count:
+        print(f"#{plan.number}: skipped at apply time (triaged since it was classified)")
+        return
     if (why := skip_reason(fresh, retry=True)):
         print(f"#{plan.number}: skipped at apply time ({why})")
         return
@@ -640,7 +652,12 @@ def run_classify(args) -> int:
         print(f"#{number}: {', '.join(plan.add_labels)}; assignee {plan.assignee}; {result.usage}")
         if args.dry_run:
             print(plan.comment)
+        plan.triage_count = issue.triage_count
         plans.append(plan)
+        # Write after every issue: a later failure (a GitHub error fetching the next one)
+        # must not discard the plans already made.
+        if args.out and not args.dry_run:
+            write_plans(Path(args.out), plans)
     # Whatever was classified is handed on, even when a later issue failed.
     if args.out and not args.dry_run:
         write_plans(Path(args.out), plans)

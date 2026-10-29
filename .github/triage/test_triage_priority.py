@@ -5,8 +5,11 @@ Run: python -I -m unittest discover -s .github/triage
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
+import subprocess
+import types
 import sys
 import tempfile
 import unittest
@@ -465,3 +468,75 @@ class LoadPrompt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanHandoff(unittest.TestCase):
+    """A plan survives a later failure and is never applied twice (Codex P2s on the
+    two-job triage)."""
+
+    def setUp(self) -> None:
+        self.saved = {n: getattr(tp, n) for n in ("gh", "fetch_issue", "open_untriaged",
+                                                   "classify_issue", "load_config",
+                                                   "load_prompt", "ensure_labels")}
+        self.addCleanup(lambda: [setattr(tp, n, f) for n, f in self.saved.items()])
+        self.calls: list[tuple] = []
+        tp.gh = lambda *args, **kw: self.calls.append(args) or ""
+
+    def test_a_replayed_plan_is_skipped(self) -> None:
+        p = plan()  # classified with no triage comment on the issue
+        tp.fetch_issue = lambda repo, n: issue(triage_count=1, labels={"needs-triage"})
+        tp.apply_plan("o/r", p)
+        self.assertEqual(self.calls, [])
+
+    def test_an_unchanged_issue_is_applied(self) -> None:
+        tp.fetch_issue = lambda repo, n: issue()
+        tp.apply_plan("o/r", plan())
+        self.assertIn("comment", [c[1] for c in self.calls])
+
+    def test_a_retry_after_an_edit_is_applied(self) -> None:
+        p = tp.unclassified_plan(issue(), "x", model="m", usage="u")
+        p.triage_count = 1
+        tp.fetch_issue = lambda repo, n: issue(triage_count=1, labels={"needs-triage"})
+        tp.apply_plan("o/r", p)
+        self.assertIn("comment", [c[1] for c in self.calls])
+
+    def test_the_count_round_trips_and_is_checked(self) -> None:
+        from dataclasses import asdict
+        p = plan()
+        p.triage_count = 2
+        self.assertEqual(tp.check_plan(asdict(p), CONFIG).triage_count, 2)
+        e = asdict(p)
+        del e["triage_count"]
+        self.assertEqual(tp.check_plan(e, CONFIG).triage_count, 0)
+        for bad in (-1, True, "1"):
+            with self.subTest(bad=bad), self.assertRaises(tp.InvalidPlan):
+                tp.check_plan({**asdict(p), "triage_count": bad}, CONFIG)
+
+    def test_a_later_failure_keeps_the_plans_already_made(self) -> None:
+        sdk = types.ModuleType("anthropic")
+        sdk.Anthropic = lambda **kw: None
+        sdk.RateLimitError = sdk.APIStatusError = sdk.APIConnectionError = type(
+            "SDKError", (Exception,), {})
+        sys.modules["anthropic"] = sdk
+        self.addCleanup(sys.modules.pop, "anthropic", None)
+        config = json.loads(json.dumps(CONFIG))
+        for spec in config["area"].values():
+            spec["description"] = "An area."
+        tp.load_config = lambda *a, **kw: config
+        tp.load_prompt = lambda *a, **kw: "rules"
+        tp.open_untriaged = lambda repo, limit: [1, 2]
+
+        def fetch(repo, n):
+            if n == 2:
+                raise subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502")
+            return issue(number=n)
+        tp.fetch_issue = fetch
+        tp.classify_issue = lambda *a: (
+            tp.Result(tp.validate(verdict(), tp.area_names(config)), None, "m", "u"), False)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "plan.json"
+            args = argparse.Namespace(repo="o/r", all=True, issue=None, limit=20, retry=False,
+                                      dry_run=False, out=str(out))
+            with self.assertRaises(subprocess.CalledProcessError):
+                tp.run_classify(args)
+            self.assertEqual([p.number for p in tp.read_plans(out, CONFIG)], [1])
