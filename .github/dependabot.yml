@@ -3,12 +3,16 @@
 # advisory lands as a surprise CI failure; scheduled update PRs surface it as a
 # tracked change instead. Two ecosystems: the Cargo workspace and the GitHub
 # Actions pinned in `.github/workflows/`.
+# Each entry waits 7 days after a release before proposing it (cooldown), so brand-new
+# releases get a week to show problems. Security updates ignore the cooldown.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
@@ -46,6 +50,8 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     commit-message:
       prefix: "ci"
