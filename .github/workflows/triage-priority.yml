@@ -1,10 +1,16 @@
 name: Issue priority
 
-# Automated triage under ADR-0048 (rules in sections 1-4, this workflow in 5). When an issue has
-# no `priority:*` label, .github/triage/triage_priority.py asks Claude once to classify
-# it and then sets type, severity, reach, area and priority labels, an assignee and one
-# comment. It never sets the milestone, so the `new` label and the start of PDCA work stay
-# the maintainer's decision.
+# Automated triage under ADR-0048 (rules in sections 1-4, this workflow in 5). When an
+# issue has no `priority:*` label, .github/triage/triage_priority.py asks Claude once to
+# classify it, then sets type, severity, reach, area and priority labels, an assignee and
+# one comment. It never sets the milestone: that starts PDCA work and stays the
+# maintainer's decision (the `new` label stays until then, see triage-new-issue.yml).
+#
+# Two jobs, because GitHub scopes the token's permissions per job, not per step, and
+# ADR-0048 section 4 limits what the bot may hold. `classify` runs the model with a
+# read-only token and writes the plan as an artifact; it cannot write to GitHub. `apply`
+# has `issues: write`, runs no model and installs no SDK, and checks every label in the
+# plan against labels.json before writing.
 #
 # Cost is bounded by design: one request per issue, capped input, low effort, and no
 # second pass on an edit unless the issue was left at `needs-triage`. Anyone can open an
@@ -13,12 +19,12 @@ name: Issue priority
 #
 # Issue text is untrusted. It never reaches a shell here (no `${{ github.event.issue.* }}`
 # in a run step); the script reads it from the API and passes it to the model as data.
-# The model gets no token and no tools; the script validates its JSON before writing.
 #
-# No API key is stored. The job asks GitHub for a short-lived OIDC identity token and the
-# SDK exchanges it for a Claude API token (Workload Identity Federation, ADR-0048). The
-# federation rule only accepts runs on refs/heads/main of this repository, which covers
-# issue events and manual runs from main but not pull requests or other branches.
+# No API key is stored. The classify job asks GitHub for a short-lived OIDC identity token
+# and the SDK exchanges it for a Claude API token (Workload Identity Federation,
+# ADR-0048 section 5). The federation rule only accepts runs on refs/heads/main of this
+# repository, which covers issue events and manual runs from main but not pull requests
+# or other branches.
 
 on:
   issues:
@@ -48,6 +54,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: issue-priority-${{ github.event.issue.number || inputs.issue || github.event.pull_request.number || 'backfill' }}
+  cancel-in-progress: false
+
 jobs:
   test:
     name: triage tests
@@ -63,18 +73,18 @@ jobs:
       - name: Unit tests (offline, no SDK needed)
         run: python -I -m unittest discover -s .github/triage -v
 
-  triage:
-    name: triage
+  classify:
+    name: classify
     if: github.event_name != 'pull_request' && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # Read-only: this job runs the model, so it must not hold a token that can write.
     permissions:
       contents: read
-      issues: write
+      issues: read
       id-token: write
-    concurrency:
-      group: issue-priority-${{ github.event.issue.number || inputs.issue || 'backfill' }}
-      cancel-in-progress: false
     timeout-minutes: 15
+    outputs:
+      plan: ${{ steps.triage.outputs.plan }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -82,8 +92,6 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - name: Install the pinned, hash-checked SDK (ADR-0048 section 5)
-        run: python -m pip install --quiet --require-hashes --no-deps -r .github/triage/requirements.txt
       - name: Fetch a GitHub identity token for the Claude API
         id: oidc
         env:
@@ -99,6 +107,9 @@ jobs:
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://api.anthropic.com" \
             | jq -r .value > "$RUNNER_TEMP/gha-jwt"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned, hash-checked SDK (ADR-0048 section 5)
+        if: steps.oidc.outputs.enabled == 'true'
+        run: python -m pip install --quiet --require-hashes --no-deps -r .github/triage/requirements.txt
       - name: Check the Claude API connection
         if: steps.oidc.outputs.enabled == 'true' && inputs.check
         env:
@@ -124,7 +135,8 @@ jobs:
           print(f"Connected: {message.model} replied {text!r} "
                 f"({message.usage.input_tokens} in, {message.usage.output_tokens} out)")
           EOF
-      - name: Triage
+      - name: Classify
+        id: triage
         if: steps.oidc.outputs.enabled == 'true' && !inputs.check
         env:
           # Identifiers, not secrets; kept as repository variables.
@@ -153,5 +165,48 @@ jobs:
           else
             args+=(--all --limit "${INPUT_LIMIT:-20}")
           fi
-          if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
-          python -I .github/triage/triage_priority.py "${args[@]}"
+          if [ "${INPUT_DRY_RUN:-false}" = "true" ]; then
+            python -I .github/triage/triage_priority.py classify "${args[@]}" --dry-run
+            exit 0
+          fi
+          # Hand on what was classified even when a later issue failed; fail the job after.
+          status=0
+          python -I .github/triage/triage_priority.py classify "${args[@]}" \
+            --out "$RUNNER_TEMP/plan.json" || status=$?
+          if [ -s "$RUNNER_TEMP/plan.json" ] && [ "$(jq length "$RUNNER_TEMP/plan.json")" -gt 0 ]; then
+            echo "plan=true" >> "$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+      - name: Hand the plan to the apply job
+        if: always() && steps.triage.outputs.plan == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: triage-plan
+          path: ${{ runner.temp }}/plan.json
+          retention-days: 7
+
+  apply:
+    name: apply
+    needs: classify
+    if: always() && needs.classify.outputs.plan == 'true'
+    runs-on: ubuntu-latest
+    # Writes to issues; runs no model and installs no SDK.
+    permissions:
+      contents: read
+      issues: write
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: triage-plan
+          path: ${{ runner.temp }}/triage-plan
+      - name: Check the plan and apply it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python -I .github/triage/triage_priority.py apply --plan "$RUNNER_TEMP/triage-plan/plan.json"

@@ -5,8 +5,10 @@ Run: python -I -m unittest discover -s .github/triage
 
 from __future__ import annotations
 
+import ast
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,7 +23,7 @@ NO_FLAGS = {f: False for f in tp.FLAGS}
 def verdict(**over) -> dict:
     v = {
         "type": "bug", "severity": "major", "reach": "common", "areas": ["gateway"],
-        "flags": dict(NO_FLAGS), "unsure": False, "missing": "",
+        "flags": dict(NO_FLAGS), "review_priority": "none", "unsure": False, "missing": "",
         "secret_in_issue": False, "vulnerability_report": False,
         "reasons": {"type": "The gateway answers a supported request wrongly.",
                     "severity": "A supported S3 operation fails with no workaround.",
@@ -46,6 +48,10 @@ def plan(i: tp.Issue | None = None, **v) -> tp.Plan:
                          model=tp.MODEL, usage="1 in, 1 out", truncated=False)
 
 
+def prio(severity, reach, flags=None, review="none", labels=()):
+    return tp.compute_priority(severity, reach, flags or NO_FLAGS, review, set(labels))
+
+
 class Table(unittest.TestCase):
     def test_matches_adr_0048(self) -> None:
         expected = {
@@ -56,24 +62,59 @@ class Table(unittest.TestCase):
         }
         for (sev, reach), p in expected.items():
             with self.subTest(sev=sev, reach=reach):
-                self.assertEqual(tp.compute_priority(sev, reach, NO_FLAGS, set())[0], p)
+                self.assertEqual(prio(sev, reach)[0], p)
 
     def test_security_lifts_adversarial_major_to_p1(self) -> None:
-        prio, base, applied = tp.compute_priority(
-            "major", "adversarial", dict(NO_FLAGS, security=True), set())
-        self.assertEqual((prio, base), (1, 2))
-        self.assertIn("security", applied[0])
+        p, base, notes = prio("major", "adversarial", dict(NO_FLAGS, security=True))
+        self.assertEqual((p, base), (1, 2))
+        self.assertIn("security", notes[0])
 
     def test_durability_lifts_edge_minor_to_p1(self) -> None:
-        flags = dict(NO_FLAGS, durability_or_consistency=True)
-        self.assertEqual(tp.compute_priority("minor", "edge", flags, set())[0], 1)
+        p, base, notes = prio("minor", "edge", dict(NO_FLAGS, durability_or_consistency=True))
+        self.assertEqual((p, base), (1, 3))
+        self.assertIn("durability or consistency", notes[0])
 
-    def test_release_gating_label_is_a_floor(self) -> None:
-        self.assertEqual(tp.compute_priority("trivial", "common", NO_FLAGS, {"release-gating"})[0], 1)
+    def test_release_gating_label_is_at_least_p1(self) -> None:
+        p, base, notes = prio("trivial", "common", labels={"release-gating"})
+        self.assertEqual((p, base), (1, 3))
+        self.assertIn("release-gating", notes[0])
+
+    def test_only_the_adr_0048_overrides_exist(self) -> None:
+        # ADR-0048 section 3: security, durability or consistency, and the release-gating
+        # label, all at least P1. No other flag or label moves a priority.
+        self.assertEqual(set(tp.FLAGS), {"security", "durability_or_consistency"})
+        self.assertEqual({k: f for k, (f, _) in tp.FLOORS.items()},
+                         {"security": 1, "durability_or_consistency": 1})
+        self.assertEqual({k: f for k, (f, _) in tp.LABEL_FLOORS.items()}, {"release-gating": 1})
+        self.assertEqual(prio("minor", "edge", labels={"accessibility", "new"})[0], 3)
+
+    def test_threat_model_catalog_examples(self) -> None:
+        # ADR-0048 section 6.
+        sec, dur = dict(NO_FLAGS, security=True), dict(NO_FLAGS, durability_or_consistency=True)
+        cases = [("critical", "edge", dur, 1), ("critical", "adversarial", sec, 1),
+                 ("critical", "common", NO_FLAGS, 0), ("major", "common", NO_FLAGS, 1),
+                 ("minor", "common", NO_FLAGS, 2)]
+        for sev, reach, flags, want in cases:
+            with self.subTest(sev=sev, reach=reach, flags=flags):
+                self.assertEqual(prio(sev, reach, flags)[0], want)
+
+    def test_review_priority_is_kept(self) -> None:
+        # A minor/edge deferred review finding: P3 by the table, P2 from the review.
+        p, base, notes = prio("minor", "edge", review="P2")
+        self.assertEqual((p, base), (2, 3))
+        self.assertIn("deferred review", notes[0])
+
+    def test_review_priority_can_lower_the_table(self) -> None:
+        self.assertEqual(prio("major", "common", review="P2")[0], 2)
+
+    def test_floors_apply_after_the_review_priority(self) -> None:
+        p, _, notes = prio("major", "adversarial", dict(NO_FLAGS, security=True), review="P2")
+        self.assertEqual(p, 1)
+        self.assertEqual(len(notes), 1)  # the review agrees with the table; only the floor
 
     def test_floor_never_lowers(self) -> None:
-        prio, _, applied = tp.compute_priority("critical", "common", dict(NO_FLAGS, security=True), set())
-        self.assertEqual((prio, applied), (0, []))
+        p, _, notes = prio("critical", "common", dict(NO_FLAGS, security=True))
+        self.assertEqual((p, notes), (0, []))
 
     def test_every_flag_has_a_floor(self) -> None:
         self.assertLessEqual(set(tp.FLAGS), set(tp.FLOORS))
@@ -82,12 +123,12 @@ class Table(unittest.TestCase):
 class Validate(unittest.TestCase):
     def test_rejects_unknown_values(self) -> None:
         for bad in ({"severity": "blocker"}, {"reach": "rare"}, {"type": "chore"},
-                    {"areas": ["kernel"]}):
+                    {"areas": ["kernel"]}, {"review_priority": "P4"}):
             with self.subTest(bad=bad), self.assertRaises(tp.InvalidVerdict):
                 tp.validate(verdict(**bad), AREAS)
 
     def test_rejects_missing_fields(self) -> None:
-        for field in ("flags", "secret_in_issue", "vulnerability_report"):
+        for field in ("flags", "review_priority", "secret_in_issue", "vulnerability_report"):
             v = verdict()
             del v[field]
             with self.subTest(field=field), self.assertRaises(tp.InvalidVerdict):
@@ -96,6 +137,9 @@ class Validate(unittest.TestCase):
     def test_at_most_two_areas(self) -> None:
         got = tp.validate(verdict(areas=["gateway", "metadata", "client"]), AREAS)["areas"]
         self.assertEqual(got, ["gateway", "metadata"])
+
+    def test_no_area_is_allowed(self) -> None:
+        self.assertEqual(tp.validate(verdict(areas=[]), AREAS)["areas"], [])
 
     def test_schema_enums_match_config(self) -> None:
         schema = tp.verdict_schema(AREAS)
@@ -211,6 +255,11 @@ class Skip(unittest.TestCase):
                     {"body": None, "user": None}]
         self.assertEqual(tp.triage_comments(comments), 1)
 
+    def test_marker_is_unchanged(self) -> None:
+        # Issues triaged before the two-job split carry this marker; a new one would let
+        # them be triaged a second time.
+        self.assertEqual(tp.MARKER, "<!-- wyrd-triage -->")
+
     def test_fresh_issue_is_triaged(self) -> None:
         self.assertIsNone(tp.skip_reason(issue()))
 
@@ -250,6 +299,7 @@ class ClearsNeedsTriage(unittest.TestCase):
 class BuildPlan(unittest.TestCase):
     def test_labels_and_priority(self) -> None:
         p = plan()
+        self.assertEqual(p.number, 7)
         self.assertEqual(p.add_labels, ["bug", "area:gateway", "sev:major", "reach:common", "priority:P1"])
         self.assertEqual(p.assignee, "eduralph")
         self.assertTrue(p.comment.startswith(tp.MARKER))
@@ -261,20 +311,31 @@ class BuildPlan(unittest.TestCase):
                 with self.subTest(label=name):
                     self.assertLessEqual(len(spec["description"]), 100)
 
-    def test_every_label_it_adds_exists_in_config(self) -> None:
-        known = {n for g in ("severity", "reach", "area", "priority", "other") for n in CONFIG[g]}
-        known |= set(tp.TYPES)
-        p = plan(i=issue(), flags=dict(NO_FLAGS, security=True), areas=["security", "gateway"])
-        self.assertLessEqual(set(p.add_labels), known)
+    def test_every_label_it_adds_is_allowed(self) -> None:
+        p = plan(flags=dict(NO_FLAGS, security=True), areas=["security", "gateway"])
+        self.assertLessEqual(set(p.add_labels), tp.allowed_labels(CONFIG))
 
     def test_keeps_existing_type_and_assignee(self) -> None:
-        p = plan(i=issue(labels={"enhancement"}, assignees=["someone"]))
-        self.assertNotIn("bug", p.add_labels)
+        p = plan(i=issue(labels={"bug"}, assignees=["someone"]), type="enhancement")
+        self.assertNotIn("enhancement", p.add_labels)
         self.assertIsNone(p.assignee)
-        self.assertIn("It reads more like bug", p.comment)
+        self.assertIn("It reads more like enhancement", p.comment)
 
     def test_no_type_note_when_the_label_agrees(self) -> None:
         self.assertNotIn("reads more like", plan(i=issue(labels={"bug"})).comment)
+
+    def test_every_type_gets_a_priority(self) -> None:
+        # ADR-0048 sets a priority for every type, not only for bugs.
+        for kind in tp.TYPES:
+            with self.subTest(kind=kind):
+                p = plan(type=kind, severity="minor", reach="common")
+                self.assertIn(kind, p.add_labels)
+                self.assertIn("priority:P2", p.add_labels)
+                self.assertNotIn("no priority", p.comment)
+
+    def test_existing_non_bug_label_still_gets_a_priority(self) -> None:
+        p = plan(i=issue(labels={"documentation"}))
+        self.assertIn("priority:P1", p.add_labels)
 
     def test_unsure_sets_needs_triage_and_no_priority(self) -> None:
         p = plan(unsure=True, missing="Which backend the cluster runs.")
@@ -286,7 +347,15 @@ class BuildPlan(unittest.TestCase):
         self.assertIn("priority:P1", p.add_labels)
         p = plan(severity="major", reach="adversarial", flags=dict(NO_FLAGS, security=True))
         self.assertIn("priority:P1", p.add_labels)
-        self.assertIn("Raised by: security bug", p.comment)
+        self.assertIn("Then: security bug (at least P1)", p.comment)
+        p = plan(i=issue(labels={"release-gating"}), severity="minor", reach="edge")
+        self.assertIn("priority:P1", p.add_labels)
+        self.assertIn("`release-gating` label (at least P1)", p.comment)
+
+    def test_review_priority_is_explained(self) -> None:
+        p = plan(severity="minor", reach="edge", review_priority="P2")
+        self.assertIn("priority:P2", p.add_labels)
+        self.assertIn("kept the deferred review's P2", p.comment)
 
     def test_never_touches_the_milestone(self) -> None:
         self.assertFalse(hasattr(plan(), "milestone"))
@@ -299,8 +368,99 @@ class BuildPlan(unittest.TestCase):
 
     def test_unclassified_plan(self) -> None:
         p = tp.unclassified_plan(issue(), "the model declined to classify it", model="m", usage="u")
-        self.assertEqual(p.add_labels, ["needs-triage"])
+        self.assertEqual((p.number, p.add_labels), (7, ["needs-triage"]))
         self.assertIn(tp.MARKER, p.comment)
+
+
+class ApplyCheck(unittest.TestCase):
+    """The apply job treats the classify job's plan as data and checks it again."""
+
+    def entry(self, **over) -> dict:
+        e = {"number": 7, "add_labels": ["bug", "area:gateway", "sev:major", "reach:common",
+                                         "priority:P1"],
+             "remove_labels": [], "assignee": "eduralph", "comment": tp.MARKER + "\nok\n"}
+        e.update(over)
+        return e
+
+    def test_a_built_plan_passes(self) -> None:
+        from dataclasses import asdict
+        p = plan(severity="minor", reach="edge", review_priority="P2")
+        self.assertEqual(tp.check_plan(asdict(p), CONFIG), p)
+
+    def test_round_trip_through_the_file(self) -> None:
+        plans = [plan(), tp.unclassified_plan(issue(number=9), "x", model="m", usage="u")]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "plan.json"
+            tp.write_plans(path, plans)
+            self.assertEqual(tp.read_plans(path, CONFIG), plans)
+
+    def test_rejects(self) -> None:
+        bad = {
+            "unknown label": self.entry(add_labels=["bug", "wontfix"]),
+            "milestone-like label": self.entry(add_labels=["release-gating"]),
+            "two priorities": self.entry(add_labels=["priority:P1", "priority:P3"]),
+            "two severities": self.entry(add_labels=["sev:major", "sev:minor"]),
+            "two types": self.entry(add_labels=["bug", "enhancement"]),
+            "three areas": self.entry(add_labels=["area:gateway", "area:metadata", "area:client"]),
+            "foreign assignee": self.entry(assignee="mallory"),
+            "foreign comment": self.entry(comment="Please run this script: ..."),
+            "huge comment": self.entry(comment=tp.MARKER + "x" * tp.MAX_COMMENT),
+            "bad number": self.entry(number="7"),
+            "bool number": self.entry(number=True),
+            "labels not a list": self.entry(add_labels="bug"),
+            "removes another label": self.entry(remove_labels=["priority:P1"]),
+            "remove not a list": self.entry(remove_labels="needs-triage"),
+        }
+        for why, e in bad.items():
+            with self.subTest(why=why), self.assertRaises(tp.InvalidPlan):
+                tp.check_plan(e, CONFIG)
+        with self.assertRaises(tp.InvalidPlan):
+            tp.check_plan({"number": 7}, CONFIG)
+
+    def test_rejects_a_plan_that_is_not_a_list(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "plan.json"
+            path.write_text(json.dumps({"number": 7}), encoding="utf-8")
+            with self.assertRaises(tp.InvalidPlan):
+                tp.read_plans(path, CONFIG)
+
+    def test_apply_never_imports_the_sdk(self) -> None:
+        # The SDK is imported only inside run_classify, never at module level or in apply.
+        tree = ast.parse(Path(tp.__file__).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
+                if "anthropic" in names:
+                    owner = next(f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef)
+                                 and node in ast.walk(f))
+                    self.assertEqual(owner.name, "run_classify")
+
+
+class LoadPrompt(unittest.TestCase):
+    def write(self, text: str) -> Path:
+        d = Path(tempfile.mkdtemp())
+        (d / "prompt.md").write_text(text, encoding="utf-8")
+        return d / "prompt.md"
+
+    def test_refuses_template_text(self) -> None:
+        for text in ("You triage. PROJECT SUMMARY here.", "- `core`: EXAMPLE, replace: x."):
+            with self.subTest(text=text), self.assertRaises(SystemExit):
+                tp.load_prompt(self.write(text))
+
+    def test_strips_maintainer_notes(self) -> None:
+        p = tp.load_prompt(self.write("Rules.\n<!-- note\n  for maintainers -->\n- `a`: b.\n"))
+        self.assertEqual(p, "Rules.\n- `a`: b.\n")
+
+    def test_the_real_prompt_loads_unchanged(self) -> None:
+        path = Path(tp.__file__).resolve().parent / "prompt.md"
+        self.assertEqual(tp.load_prompt(path), path.read_text(encoding="utf-8"))
+
+    def test_the_real_prompt_names_every_field_the_schema_needs(self) -> None:
+        text = tp.load_prompt()
+        for name in (*tp.FLAGS, "review_priority", "unsure", "missing", "secret_in_issue",
+                     "vulnerability_report", *AREAS):
+            with self.subTest(name=name):
+                self.assertIn(f"`{name}`", text)
 
 
 if __name__ == "__main__":
