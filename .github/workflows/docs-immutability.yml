@@ -222,6 +222,11 @@ jobs:
             local status status_lc
 
             [ -n "$path" ] || return 0
+            # Identical (content and mode) in the current base and the PR head: this PR does not
+            # change it. A three-dot diff still lists such a path, e.g. a supersession stamp
+            # that a squash-merged parent PR already landed on the base.
+            [ "$(git ls-tree "$BASE_SHA" -- "$path")" != "$(git ls-tree "$HEAD_SHA" -- "$path")" ] \
+              || return 0
             status=$(document_status "$path") || return 0
             status_lc=$(normalized_status "$status")
 
@@ -244,13 +249,23 @@ jobs:
           # both a delete at the old path and an add at the new path, because a
           # move from a draft-governed tree into a stable-governed tree grows
           # the stable spec's conformance surface.
+          # Three dots: diff against the merge base, so a document added to the base branch
+          # after the PR branch was cut is not read as deleted by the PR.
+          # T, a type change (a document replaced by a symlink, say), is checked like M.
+          # -z: NUL-separated records, so a path with non-ASCII characters, tabs or quotes
+          # arrives as it is instead of quoted, and still matches the patterns above.
           violations=""
-          while IFS=$'\t' read -r change base_path target_path; do
+          while IFS= read -r -d '' change; do
+            IFS= read -r -d '' base_path || break
+            target_path=""
+            if [[ "$change" == R* ]]; then
+              IFS= read -r -d '' target_path || break
+            fi
             check_path "$change" "$base_path"
             if [[ "$change" == R* ]]; then
               check_path "$change" "$target_path"
             fi
-          done < <(git diff -M --name-status --diff-filter=AMDR "$BASE_SHA" "$HEAD_SHA" -- \
+          done < <(git diff -z -M --name-status --diff-filter=AMDRT "$BASE_SHA...$HEAD_SHA" -- \
             'docs/design/adr/[0-9]*.md' \
             'docs/design/proposals/draft/[0-9]*.md' \
             'docs/design/proposals/accepted/[0-9]*.md' \
