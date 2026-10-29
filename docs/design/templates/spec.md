@@ -1,7 +1,9 @@
 ---
 created: <DD.MM.YYYY HH:MM>
 type: spec
-status: draft   # draft | stable | superseded | withdrawn
+# status: draft | stable | superseded | withdrawn.
+# Keep comments off the status line: the immutability check reads the whole value.
+status: draft
 version: v<N>
 stability: unstable   # unstable | stable
 tracking-issue:

@@ -10,6 +10,10 @@ name: docs-check
 # No paths filter: the check always runs and reports a status, which is required
 # for it to serve as a required status check (a path-filtered workflow would
 # never report on PRs that don't touch docs/, blocking their merge).
+#
+# It also runs the two checkers in .github/docs-check/ (shared with eduralph/project-template):
+# docs_links.py (every relative link points at a tracked file) and adr_index.py
+# (docs/design/adr/README.md matches the ADRs' frontmatter).
 
 on:
   pull_request:
@@ -24,6 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Full history: the checks below read their checker from the PR's base commit.
+          fetch-depth: 0
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -37,3 +43,37 @@ jobs:
 
       - name: Render site (fails on any dangling internal link)
         run: python3 docs/publishing/tools/render_site.py --check --out ./build
+
+      # The checkers' own tests, so a change to one is tested before it gates anything.
+      - name: Test the checkers
+        run: python3 -I -m unittest discover -s .github/docs-check -v
+      # Each step runs the BASE commit's copy of its checker, so a PR cannot switch off
+      # its own check by editing it. Only the PR that first adds a checker runs its own
+      # copy. `-I` (isolated mode) keeps the checkout off sys.path, so a PR cannot plant
+      # a module such as `re.py` that the checker would import instead of the stdlib.
+      - name: Relative links resolve
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          CHECKER: .github/docs-check/docs_links.py
+        run: |
+          set -euo pipefail
+          if git cat-file -e "$BASE:$CHECKER" 2>/dev/null; then
+            echo "Running $CHECKER from the base commit $BASE"
+            git show "$BASE:$CHECKER" | python3 -I -
+          else
+            echo "$CHECKER is not on the base; running the PR's copy"
+            python3 -I "$CHECKER"
+          fi
+      - name: ADR index matches the ADRs
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          CHECKER: .github/docs-check/adr_index.py
+        run: |
+          set -euo pipefail
+          if git cat-file -e "$BASE:$CHECKER" 2>/dev/null; then
+            echo "Running $CHECKER from the base commit $BASE"
+            git show "$BASE:$CHECKER" | python3 -I -
+          else
+            echo "$CHECKER is not on the base; running the PR's copy"
+            python3 -I "$CHECKER"
+          fi

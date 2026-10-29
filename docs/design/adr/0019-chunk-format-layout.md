@@ -1,7 +1,13 @@
+---
+created: 18.06.2026 18:57
+type: adr
+status: Accepted
+tags:
+  - adr
+  - storage
+  - format
+---
 # 0019. Chunk/fragment on-disk format layout
-
-Date: design phase
-Status: Accepted
 
 ## Context
 

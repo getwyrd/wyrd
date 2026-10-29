@@ -1,7 +1,9 @@
 ---
 created: <DD.MM.YYYY HH:MM>
 type: proposal
-status: draft   # draft | accepted | implemented | withdrawn
+# status: draft | accepted | implemented | withdrawn.
+# Keep comments off the status line: the immutability check reads the whole value.
+status: draft
 author:
 tracking-issue:
 tags:
