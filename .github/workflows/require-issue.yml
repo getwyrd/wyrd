@@ -1,63 +1,110 @@
-name: require-issue
+name: PR hygiene
 
-# Workflow governance: every pull request must reference a real issue, for
-# traceability. The PR title or body must mention an issue (e.g. "Closes #12",
-# "Refs #12", "#12", or an issue URL), and that number must resolve to an actual
-# issue -- not a pull request -- in this repository. Dependabot dependency-bump
-# PRs are exempt (they reference no tracker item but are traceable via the
-# changelog / cargo-deny advisory wall, ADR-0003 §2): the check passes for them.
+# Enforce that every PR is tied to an issue. A required status check on `main`; with
+# branch protection's `enforce_admins` the PR+issue process binds everyone, admins
+# included.
 #
-# No paths filter: the check always runs and reports a status, so it can serve
-# as a required status check. It re-runs when the PR is edited, so adding the
-# reference after opening clears the check.
+# A PR satisfies the check when it is tied to an issue in either of two ways:
+#   1. a linked/closing issue: a closing keyword in the description ("Closes #123",
+#      "Fixes #123", "Resolves #123") or an issue linked via the PR's Development
+#      sidebar;
+#   2. a non-closing reference in the description ("Refs #123", "Ref: #123",
+#      "Refs #123, #124", "Refs owner/repo#123"), for a PR that delivers part of an
+#      issue and must not close it. Each referenced number is looked up and counts
+#      only if it is an issue (not a PR) the workflow token can read. References
+#      inside fenced code blocks or HTML comments are ignored.
+# Editing the PR body re-runs the check.
+#
+# Dependabot's dependency-bump PRs pass without an issue: they are traceable through the
+# changelog and the dependency audit. They pass rather than skip, because a skipped
+# required check stays pending and would block the merge.
+
+# The job keeps the name `require-issue`, which branch protection requires.
 
 on:
   pull_request:
-    types: [opened, edited, reopened, synchronize]
+    types: [opened, edited, reopened, synchronize, ready_for_review]
 
 permissions:
   contents: read
+  pull-requests: read
   issues: read
 
 jobs:
   require-issue:
+    name: require-issue
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      PR_TITLE: ${{ github.event.pull_request.title }}
-      PR_BODY: ${{ github.event.pull_request.body }}
-      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
     steps:
-      - name: Require a real linked issue
-        run: |
-          set -uo pipefail
-          # Dependabot opens dependency-bump PRs that reference no issue; they are
-          # traceable through the changelog / cargo-deny advisory wall (ADR-0003 §2),
-          # not a tracker item. Exempt them by PASSING — not skipping the job: a
-          # skipped required check stays "pending" and would wedge the merge (the same
-          # reason ci.yml uses an always-runs `gate` job rather than a paths filter).
-          if [ "$PR_AUTHOR" = "dependabot[bot]" ]; then
-            echo "OK: dependency PR by $PR_AUTHOR — exempt from require-issue."
-            exit 0
-          fi
-          text="$PR_TITLE
-          $PR_BODY"
-          # Collect candidate numbers from "#N" and ".../issues/N" forms.
-          nums=$(printf '%s\n' "$text" | grep -oiE '(#|issues/)[0-9]+' | grep -oE '[0-9]+' | sort -un)
-          if [ -z "$nums" ]; then
-            echo "::error::This PR must reference an issue (e.g. 'Closes #12') in its title or body. None found."
-            exit 1
-          fi
-          for n in $nums; do
-            # The issues endpoint returns a .pull_request object only for PRs;
-            # absence of it (and a successful fetch) means it is a real issue.
-            kind=$(gh api "repos/$REPO/issues/$n" --jq 'if .pull_request then "pr" else "issue" end' 2>/dev/null) || kind="missing"
-            case "$kind" in
-              issue) echo "OK: references issue #$n"; exit 0 ;;
-              pr)    echo "note: #$n is a pull request, not an issue" ;;
-              *)     echo "note: #$n does not exist" ;;
-            esac
-          done
-          echo "::error::No referenced number resolves to a real issue. Open an issue and reference it (e.g. 'Closes #N')."
-          exit 1
+      - name: Verify the PR links an issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const number = context.payload.pull_request.number;
+            if (context.payload.pull_request.user.login === 'dependabot[bot]') {
+              core.info('Dependency PR by dependabot — exempt.');
+              return;
+            }
+            const query = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    body
+                    closingIssuesReferences(first: 1) { totalCount }
+                  }
+                }
+              }`;
+            const res = await github.graphql(query, { owner, repo, number });
+            const pr = res.repository.pullRequest;
+            const linked = pr.closingIssuesReferences.totalCount;
+            if (linked > 0) {
+              core.info(`PR is linked to ${linked} issue(s) — OK.`);
+              return;
+            }
+
+            // No closing link: look for `Refs #N` references in the body.
+            const text = (pr.body || '')
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .replace(/^\s*(```|~~~)[\s\S]*?^\s*\1/gm, '');
+            const REF = '(?:([\\w.-]+)\\/([\\w.-]+))?#(\\d+)';
+            const keyword = new RegExp(
+              `\\brefs?\\b:?\\s*(${REF}(?:\\s*(?:,|and)\\s*${REF})*)`, 'gi');
+            const refs = [];
+            for (const m of text.matchAll(keyword)) {
+              for (const r of m[1].matchAll(new RegExp(REF, 'g'))) {
+                refs.push({ owner: r[1] || owner, repo: r[2] || repo, number: Number(r[3]) });
+              }
+            }
+
+            const kind = `
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issueOrPullRequest(number: $number) { __typename }
+                }
+              }`;
+            const issues = [];
+            for (const r of refs) {
+              const name = `${r.owner}/${r.repo}#${r.number}`;
+              try {
+                const k = await github.graphql(kind, r);
+                const t = k.repository && k.repository.issueOrPullRequest &&
+                          k.repository.issueOrPullRequest.__typename;
+                if (t === 'Issue') {
+                  issues.push(name);
+                } else {
+                  core.info(`${name} is ${t ? 'a pull request' : 'not found'} — not counted.`);
+                }
+              } catch (e) {
+                core.info(`${name} could not be read (${e.message}) — not counted.`);
+              }
+            }
+            if (issues.length > 0) {
+              core.info(`PR references ${issues.join(', ')} (non-closing) — OK.`);
+              return;
+            }
+            core.setFailed(
+              'This PR is not linked to an issue. Add a closing reference to the ' +
+              'PR description (e.g. "Closes #123"), a non-closing one for partial ' +
+              'work (e.g. "Refs #123"), or link an issue via the Development ' +
+              'sidebar, then the check re-runs automatically.'
+            );
