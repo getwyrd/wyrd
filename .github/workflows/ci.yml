@@ -89,7 +89,9 @@ jobs:
     env:
       CI: "true"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Installs the toolchain pinned by rust-toolchain.toml (with rustfmt and
       # clippy) on first use.
@@ -97,14 +99,14 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Prebuilt binaries, so the license/advisory wall, the unused-dependency
       # check, and the spell check cost seconds, not a from-source compile.
       # `cargo xtask ci` shells out to all three (hard-failing in CI if any is
       # missing — see xtask).
       - name: Install cargo-deny + cargo-machete + typos
-        uses: taiki-e/install-action@v2.87.30
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-deny,cargo-machete,typos-cli
 
@@ -173,7 +175,9 @@ jobs:
       # is why a laptop / PDCA worktree never compiles the pre-1.0 tikv-client tree.
       WYRD_TIKV_TOOLCHAIN: "1"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
@@ -191,7 +195,7 @@ jobs:
             cmake protobuf-compiler libssl-dev pkg-config
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: tikv
 
@@ -218,9 +222,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install typos
-        uses: taiki-e/install-action@v2.87.30
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: typos-cli
       - name: Spell-check (source + docs)
