@@ -7,7 +7,8 @@ name: PR hygiene
 # A PR satisfies the check when it is tied to an issue in either of two ways:
 #   1. a linked/closing issue: a closing keyword in the description ("Closes #123",
 #      "Fixes #123", "Resolves #123") or an issue linked via the PR's Development
-#      sidebar;
+#      sidebar. GitHub links a closing keyword only when the PR targets the default
+#      branch, so for any other base the keyword is checked like a reference below;
 #   2. a non-closing reference in the description ("Refs #123", "Ref: #123",
 #      "Refs #123, #124", "Refs owner/repo#123"), for a PR that delivers part of an
 #      issue and must not close it. Each referenced number is looked up and counts
@@ -62,13 +63,14 @@ jobs:
               return;
             }
 
-            // No closing link: look for `Refs #N` references in the body.
+            // No closing link: look for `Refs #N` references in the body, and for closing
+            // keywords, which GitHub links only when the PR targets the default branch.
             const text = (pr.body || '')
               .replace(/<!--[\s\S]*?-->/g, '')
               .replace(/^\s*(```|~~~)[\s\S]*?^\s*\1/gm, '');
             const REF = '(?:([\\w.-]+)\\/([\\w.-]+))?#(\\d+)';
             const keyword = new RegExp(
-              `\\brefs?\\b:?\\s*(${REF}(?:\\s*(?:,|and)\\s*${REF})*)`, 'gi');
+              `\\b(?:refs?|close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b:?\\s*(${REF}(?:\\s*(?:,|and)\\s*${REF})*)`, 'gi');
             const refs = [];
             for (const m of text.matchAll(keyword)) {
               for (const r of m[1].matchAll(new RegExp(REF, 'g'))) {
