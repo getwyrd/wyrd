@@ -1,0 +1,5 @@
+[submodule "advisory-db"]
+	path = .github/advisory-db
+	url = https://github.com/RustSec/advisory-db
+	branch = main
+	shallow = true

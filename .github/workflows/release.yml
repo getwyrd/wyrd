@@ -26,7 +26,33 @@ on:
 permissions: {}
 
 jobs:
+  # A release is checked against the NEWEST RustSec advisory database, not the commit
+  # the PR gate pins (ADR-0049): nothing ships with a known advisory just because the
+  # Dependabot PR moving the pin has not merged yet.
+  advisories:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny
+
+      - name: cargo xtask advisories --latest
+        run: cargo xtask advisories --latest
+
   release:
+    needs: advisories
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the GitHub Release and upload assets

@@ -148,6 +148,10 @@ fn main() -> ExitCode {
         Some("metadata-tier1") => faults::run_metadata_tier1(),
         Some("metadata-tier2") => faults::run_metadata_tier2(),
         Some("bench") => run_bench(),
+        Some("advisories") => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            run_advisories(&rest)
+        }
         Some(other) => {
             eprintln!("xtask: unknown task `{other}`");
             print_usage();
@@ -171,7 +175,7 @@ fn main() -> ExitCode {
 fn print_usage() {
     eprintln!(
         "usage: cargo xtask \
-         <ci|ci-dry-run|blackbox-guard|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|consistency-run|etcd-conformance|deploy-small-multi-node|dist|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench>"
+         <ci|ci-dry-run|blackbox-guard|conformance|gen-vectors|dst|statics|integration|tikv-conformance|fdb-conformance|fdb-doctor|fdb-metadata-tier1|metadata-nemesis|consistency-run|etcd-conformance|deploy-small-multi-node|dist|disk-faults|jepsen|kill-reconstruct|metadata-tier1|metadata-tier2|bench|advisories>"
     );
 }
 
@@ -1911,6 +1915,11 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// auditing the optional trees needs none of their native toolchains (no `libfdb_c`, no
 /// cmake/protoc).
 ///
+/// The advisories come from the database commit the `.github/advisory-db` submodule pins
+/// (ADR-0049), and every invocation runs `--offline` against it: a newly published advisory
+/// reaches the wall only through the PR that moves the pin, so it cannot turn every open PR
+/// red at once.
+///
 /// If cargo-deny is not installed locally, warn and skip; in CI (where `CI` is set) a missing
 /// binary is a hard failure, so the wall is always enforced on every PR.
 fn cargo_deny_check() -> CiFailures {
@@ -1920,8 +1929,15 @@ fn cargo_deny_check() -> CiFailures {
     // behind the first.
     let mut failures = CiFailures::default();
 
+    if Command::new("cargo-deny").arg("--version").output().is_ok() {
+        if let Err(e) = prepare_pinned_advisory_db() {
+            failures.record("advisory database pin (ADR-0049)", Err(e));
+            return failures;
+        }
+    }
+
     for args in invocations {
-        let args: Vec<&str> = args;
+        let args: Vec<&str> = xtask::offline(&args);
         let mut printed = vec!["cargo"];
         printed.extend_from_slice(&args);
         print_step(&printed);
@@ -1955,6 +1971,112 @@ fn cargo_deny_check() -> CiFailures {
     }
 
     failures
+}
+
+/// `cargo xtask advisories [--latest]`: the advisory part of the dependency wall alone
+/// (ADR-0049). Without a flag it audits the pinned database, exactly as `cargo xtask ci`
+/// does. `--latest` audits the newest database instead: `release.yml` runs it before
+/// building, so nothing ships with a known advisory the pin does not carry yet, and the
+/// daily `advisories.yml` run on `main` uses it to open an issue for one.
+fn run_advisories(args: &[String]) -> Result<(), String> {
+    let latest = match args {
+        [] => false,
+        [flag] if flag == "--latest" => true,
+        _ => return Err("usage: cargo xtask advisories [--latest]".to_string()),
+    };
+    if !latest {
+        prepare_pinned_advisory_db()?;
+    }
+    let mut failures = CiFailures::default();
+    for invocation in xtask::advisory_invocations() {
+        let args = if latest {
+            invocation
+        } else {
+            xtask::offline(&invocation)
+        };
+        failures.record(&format!("cargo {}", args.join(" ")), cargo(&args));
+    }
+    failures.into_result()
+}
+
+/// Move cargo-deny's advisory database (in [`xtask::ADVISORY_DB_PATH`]) to the commit the
+/// `.github/advisory-db` submodule pins, fetching only that commit. cargo-deny names the
+/// clone after a hash of its URL, so the first run lets `cargo deny fetch db` create it and
+/// later runs find it by its `advisory-db-` prefix.
+///
+/// Then `cargo fetch --locked`: the walls run `--offline`, which stops cargo-deny's own
+/// crate download too, and the `--all-features` wall reads the manifests of the fdb/tikv
+/// trees, which the default build never downloads.
+fn prepare_pinned_advisory_db() -> Result<(), String> {
+    let root = workspace_root();
+    let pin = xtask::parse_gitlink(&git_stdout(
+        &root,
+        &["ls-files", "-s", "--", xtask::ADVISORY_DB_SUBMODULE],
+    )?)?;
+    let db = match advisory_db_dir(&root) {
+        Some(db) => db,
+        None => {
+            cargo(&["deny", "fetch", "db"])?;
+            advisory_db_dir(&root).ok_or_else(|| {
+                format!(
+                    "`cargo deny fetch db` left no advisory-db-* clone in {}",
+                    xtask::ADVISORY_DB_PATH
+                )
+            })?
+        }
+    };
+    if git_stdout(&db, &["rev-parse", "HEAD"])?.trim() != pin {
+        print_step(&["git", "fetch", "--depth", "1", "origin", &pin]);
+        git_stdout(&db, &["fetch", "--quiet", "--depth", "1", "origin", &pin])?;
+        git_stdout(&db, &["checkout", "--quiet", "--detach", &pin])?;
+    }
+    let committed = git_stdout(&db, &["log", "-1", "--format=%ct", "HEAD"])?;
+    let committed: u64 = committed
+        .trim()
+        .parse()
+        .map_err(|e| format!("bad commit time {committed:?} for the advisory pin: {e}"))?;
+    // The pin's age is measured against the wall clock: a build tool, not a lifecycle with a
+    // testkit Clock seam, and the age rule itself is tested through `check_advisory_pin_age`.
+    #[allow(clippy::disallowed_methods)]
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("system clock is before 1970: {e}"))?
+        .as_secs();
+    xtask::check_advisory_pin_age(committed, now)?;
+    println!("advisory database pinned at {pin} (ADR-0049)");
+    cargo(&["fetch", "--locked"])
+}
+
+/// The advisory-db clone cargo-deny keeps under [`xtask::ADVISORY_DB_PATH`], if any.
+fn advisory_db_dir(root: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(root.join(xtask::ADVISORY_DB_PATH))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("advisory-db-"))
+        })
+}
+
+/// Run `git` in DIR and return its stdout; a non-zero exit is an error carrying stderr.
+fn git_stdout(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git {}` failed with {}:\n{}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Run `cargo machete` — flag dependencies declared in a `Cargo.toml` but never

@@ -46,6 +46,17 @@ updates:
           - "opentelemetry-*"
           - "tracing-opentelemetry"
 
+  # The pinned RustSec advisory database (ADR-0049): the `.github/advisory-db`
+  # submodule records the commit the PR gate audits against. Daily, so a new advisory
+  # reaches the gate within a day, as this one PR, red and naming the crate if it hits
+  # Wyrd. No cooldown: the database has no releases to let settle.
+  - package-ecosystem: gitsubmodule
+    directory: "/"
+    schedule:
+      interval: daily
+    commit-message:
+      prefix: "deps"
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

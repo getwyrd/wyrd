@@ -39,6 +39,11 @@
 # So: advisories here, licences there, one allowlist, no duplication.
 
 [advisories]
+# The database is pinned (ADR-0049): `cargo xtask ci` moves this clone to the commit the
+# `.github/advisory-db` submodule records and runs `--offline`, so a new advisory reaches the
+# wall only through the PR that moves the pin. Our own directory, not the shared
+# $CARGO_HOME/advisory-dbs, so pinning never rewinds another project's copy.
+db-path = "target/advisory-dbs"
 version = 2
 yanked = "deny"
 # Must match `deny.toml`. cargo-deny's default unsound scope is `workspace` — only our own

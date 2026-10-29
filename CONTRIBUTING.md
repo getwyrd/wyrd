@@ -51,7 +51,9 @@ cargo xtask ci
 This is the same gate that runs in CI, including the prose gates (`typos` and
 the docs lint/render check); external tools it needs (`typos`,
 `cargo-machete`, `cargo-deny`, the docs renderer deps) are warn-and-skip when
-not installed locally, so install them for full parity.
+not installed locally, so install them for full parity. The advisory check
+reads the RustSec database at the commit `.github/advisory-db` pins (ADR-0049);
+`cargo xtask advisories --latest` checks against the newest one.
 
 Optional Tier-2 integration tests:
 

@@ -1,0 +1,76 @@
+name: advisories
+
+# The daily check of `main` against the NEWEST RustSec advisory database (ADR-0049).
+# The PR gate audits the database commit the `.github/advisory-db` submodule pins, so
+# a new advisory reaches it only through Dependabot's PR that moves the pin. That PR
+# goes red when the advisory hits Wyrd, and nothing else announces it: this run opens
+# an issue, or comments on the open one when it finds an advisory the issue does not
+# name yet, so a red pin bump cannot sit unnoticed.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # open or comment on the advisory issue
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny
+
+      - name: cargo xtask advisories --latest
+        id: check
+        # Explicit bash adds `-o pipefail`; the default `bash -e` would take tee's exit
+        # status, mark a failed audit a success, and never open the issue below.
+        shell: bash
+        run: cargo xtask advisories --latest 2>&1 | tee advisories.log
+
+      - name: Open or update the advisory issue
+        if: failure() && steps.check.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="RustSec advisory affects main"
+          ids=$(grep -o 'RUSTSEC-[0-9]\{4\}-[0-9]\{4\}' advisories.log | sort -u || true)
+          list=$(printf '%s\n' "$ids" | sed '/^$/d; s/^/- /')
+          text="\`cargo xtask advisories --latest\` failed on \`main\` ($RUN_URL).
+
+          ${list:-No advisory ID in the log; read the run.}
+
+          Fix it in Dependabot's PR that moves \`.github/advisory-db\` (ADR-0049): bump the crate, or record a justified exception in \`deny.toml\` / \`deny-all-features.toml\`."
+          issue=$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" \
+            --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -1)
+          if [ -z "$issue" ]; then
+            gh issue create -R "$REPO" --title "$title" --body "$text"
+            exit 0
+          fi
+          seen=$(gh issue view "$issue" -R "$REPO" --comments --json body,comments \
+            --jq '[.body] + [.comments[].body] | join("\n")')
+          new=""
+          for id in $ids; do
+            case "$seen" in *"$id"*) ;; *) new="$new $id" ;; esac
+          done
+          if [ -n "$new" ] || [ -z "$ids" ]; then
+            gh issue comment "$issue" -R "$REPO" --body "$text"
+          fi
