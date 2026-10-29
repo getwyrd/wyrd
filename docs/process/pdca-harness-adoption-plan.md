@@ -56,7 +56,7 @@ Wyrd implements three of PDCA's four beats natively, often more rigorously than 
 |-----------|----------------------------|
 | **Plan** | `specs/` (RFC-2119 + conformance vectors), ADRs (immutable), proposals (draft → accepted → implemented) |
 | **Do** | DST-constrained implementation against `testkit` abstractions (ADR-0009) |
-| **Check** | `cargo xtask ci` — fmt, clippy `-D warnings`, build, test, cargo-deny, conformance — run identically on laptop and CI; plus `require-issue`, `dco`, `adr-immutability` |
+| **Check** | `cargo xtask ci` — fmt, clippy `-D warnings`, build, test, cargo-deny, conformance — run identically on laptop and CI; plus `require-issue`, `dco`, `docs-immutability` |
 | **Act** | native home proposed in `docs/process/act-log.md` (ADR-0023); the pilot adds richer tooling (`../wyrd-pdca/process/act-log.md` + `pdca act-index`/`act-log`) — complementary, per ADR-0023's own framing |
 
 The integration work is therefore **not** "install a process Wyrd lacks." It is "make PDCA neutral enough to wrap the process Wyrd already has, and fill the one gap (Act)."
@@ -78,7 +78,7 @@ These are the changes that let the harness sit over an opinionated host like Wyr
    The template assumes Plan ≈ a single brief/spec. Wyrd's Plan is a *set* of artifacts (ADR / proposal / spec) with distinct change processes. Neutrality means PDCA's Plan step accepts **"the host's existing planning process" as the artifact** — a reference to the relevant ADR/proposal/issue — rather than imposing its own document format.
 
 5. **Compose with the host's CI gates instead of replacing them.**
-   The harness must accommodate Wyrd's `require-issue`, `dco`, and `adr-immutability` checks as the issue/PR-governance layer, mapping PDCA's "init from brief" onto a GitHub issue that already satisfies `require-issue`. PDCA's agent-merge-guard hooks should *supplement* these, not duplicate them.
+   The harness must accommodate Wyrd's `require-issue`, `dco`, and `docs-immutability` checks as the issue/PR-governance layer, mapping PDCA's "init from brief" onto a GitHub issue that already satisfies `require-issue`. PDCA's agent-merge-guard hooks should *supplement* these, not duplicate them.
 
 ## Workstream B — Wyrd-side concretizations (INTEGRATION.md fill-ins)
 

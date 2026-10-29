@@ -10,6 +10,38 @@ tags:
 
 Numbered, immutable records of significant decisions and *why* they were made. An ADR is never edited after acceptance; it is superseded by a later ADR that references it. Format follows the lightweight Nygard template (see ADR-0001).
 
+## How an ADR is made
+
+The rules are in ADR-0001 (lifecycle), ADR-0037 (proposals and specs), ADR-0038
+(supersession) and
+[GOVERNANCE.md](../../governance/GOVERNANCE.md) (who accepts). In order:
+
+1. **Open an issue** that states the question. Every pull request needs one, and the
+   discussion before there is a draft belongs there.
+2. **Take the next number.** One more than the highest number in the index and in any open
+   pull request that adds an ADR. Numbers are never reused, not even for an ADR that was
+   dropped.
+3. **Write it from the template.** Copy `../templates/adr.md` to
+   `NNNN-short-title.md`, keep `status: Proposed` with nothing after it on that line, and
+   write Context, Decision and Consequences. Mark anything still undecided **[OPEN]**.
+4. **Add it to the index** below, with status `Proposed`, in the same pull request.
+5. **Open the pull request** with `Refs #N` for the issue. Discussion happens there; a
+   Proposed ADR may be edited freely, before and after it merges.
+6. **Accept it.** When the architecture board (GOVERNANCE.md) agrees and no **[OPEN]**
+   items are left, change `status:` to `Accepted` and the index row to match, then merge.
+   This edit is the act of acceptance; only a maintainer makes it, never an agent. From
+   here the file is frozen (`docs-immutability`).
+7. **Change it later only by superseding it** (ADR-0038): a new ADR with
+   `supersedes: NNNN`, and the old index row changed to `Superseded by NNNN`, in one pull
+   request. The old file stays byte-for-byte untouched.
+
+ADR-0001 has no Rejected status: if the board does not agree, close the pull request
+without merging it.
+
+`docs-check` keeps this index honest: every ADR is listed once, its status here matches its
+frontmatter, and both sides of every supersession agree. Run
+`python3 -I .github/docs-check/adr_index.py` before pushing.
+
 ## Index
 
 | # | Title | Status |
