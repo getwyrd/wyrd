@@ -86,8 +86,16 @@ jobs:
                   issueOrPullRequest(number: $number) { __typename }
                 }
               }`;
+            // Each distinct reference once, at most MAX_LOOKUPS of them, stopping at the first
+            // real issue: a body repeating `#1` cannot spend the token's GraphQL quota.
+            const MAX_LOOKUPS = 10;
+            const seen = new Set();
+            const unique = refs.filter((r) => {
+              const key = `${r.owner}/${r.repo}#${r.number}`.toLowerCase();
+              return !seen.has(key) && seen.add(key);
+            }).slice(0, MAX_LOOKUPS);
             const issues = [];
-            for (const r of refs) {
+            for (const r of unique) {
               const name = `${r.owner}/${r.repo}#${r.number}`;
               try {
                 const k = await github.graphql(kind, r);
@@ -95,6 +103,7 @@ jobs:
                           k.repository.issueOrPullRequest.__typename;
                 if (t === 'Issue') {
                   issues.push(name);
+                  break;
                 } else {
                   core.info(`${name} is ${t ? 'a pull request' : 'not found'} — not counted.`);
                 }
