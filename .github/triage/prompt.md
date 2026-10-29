@@ -55,6 +55,10 @@ Set each flag to true only when the issue text supports it:
 - `security`: the issue is about an attack on Wyrd, a security check, or data or keys reaching someone they should not.
 - `durability_or_consistency`: the issue is about losing an acknowledged write, a torn or stale write becoming visible, or a chunk that cannot be recovered.
 
+## Deferred review findings
+
+Some issues record a code review finding that was deferred out of a pull request. The body then names the review's priority, for example "Codex review of #154 (P2, deferred on purpose there)" or a P1 or P2 badge. Set `review_priority` to that priority (`P0` to `P3`). Set it to `none` when the issue states no review priority, or when the issue shows that the pull request changed the impact.
+
 ## When you cannot tell
 
 If the text does not let you place severity or reach, set `unsure` to true and say in `missing` what information would settle it. Never pick a lower severity or reach to be safe; leaving it open is the safe choice.
