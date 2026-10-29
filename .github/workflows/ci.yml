@@ -120,7 +120,8 @@ jobs:
       # the artifact we ship — and, via deny-all-features.toml, the off-by-default
       # `fdb`/`tikv` trees, which the default graph cannot see at all (#543). Kept in
       # xtask rather than as a YAML step so this stays the complete local equivalent
-      # of the gate (ADR-0009).
+      # of the gate (ADR-0009). The advisories come from the database commit the
+      # `.github/advisory-db` submodule pins, read --offline (ADR-0049).
       - name: cargo xtask ci
         run: cargo xtask ci
 

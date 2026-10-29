@@ -181,3 +181,58 @@ pub fn dependency_wall_invocations() -> Vec<Vec<&'static str>> {
         ],
     ]
 }
+
+/// The submodule that pins the RustSec advisory database (ADR-0049). Only its gitlink
+/// matters — the commit the wall audits against — so nothing needs to check it out: the
+/// database itself lives in [`ADVISORY_DB_PATH`].
+pub const ADVISORY_DB_SUBMODULE: &str = ".github/advisory-db";
+
+/// Where cargo-deny keeps its advisory database — the `db-path` both `deny.toml` and
+/// `deny-all-features.toml` set. A directory of our own, so moving it to the pinned commit
+/// never touches the shared copy in `$CARGO_HOME/advisory-dbs` other projects use.
+pub const ADVISORY_DB_PATH: &str = "target/advisory-dbs";
+
+/// The commit a gitlink records, from `git ls-files -s <path>` output
+/// (`160000 <sha> 0\t<path>`). Anything else — no entry, a regular file, a malformed line —
+/// is an error: the wall must never fall back to an unpinned database without saying so.
+pub fn parse_gitlink(ls_files: &str) -> Result<String, String> {
+    let line = ls_files.lines().next().unwrap_or("");
+    let mut fields = line.split_whitespace();
+    match (fields.next(), fields.next()) {
+        (Some("160000"), Some(sha))
+            if sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            Ok(sha.to_string())
+        }
+        _ => Err(format!(
+            "{ADVISORY_DB_SUBMODULE} is not a submodule gitlink in the index (got {line:?})"
+        )),
+    }
+}
+
+/// The advisory part of the wall alone — what `cargo xtask advisories` runs. The same two
+/// graphs and configs as [`dependency_wall_invocations`]: the default graph from `deny.toml`,
+/// and the off-by-default trees from `deny-all-features.toml` with its quarantined ignores.
+pub fn advisory_invocations() -> Vec<Vec<&'static str>> {
+    vec![
+        vec!["deny", "check", "advisories"],
+        vec![
+            "deny",
+            "--all-features",
+            "--config",
+            "deny-all-features.toml",
+            "check",
+            "advisories",
+        ],
+    ]
+}
+
+/// `invocation` with cargo-deny's `--offline` flag, so it audits the database already on
+/// disk (the pinned commit) instead of fetching the newest. The flag is global and must
+/// come before the subcommand: `cargo deny --offline check …`.
+pub fn offline(invocation: &[&'static str]) -> Vec<&'static str> {
+    let mut args = invocation.to_vec();
+    let at = args.iter().position(|a| *a == "deny").map_or(0, |i| i + 1);
+    args.insert(at, "--offline");
+    args
+}

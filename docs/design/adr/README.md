@@ -60,6 +60,7 @@ Numbered, immutable records of significant decisions and *why* they were made. A
 | [0046](0046-bucket-model-real-namespace.md) | Bucket model: real bucket records in the `MetadataStore` behind a protocol-neutral container seam; synthesized prefixes rejected (decides #502; shapes #507, #511) | Accepted |
 | [0047](0047-object-metadata-model.md) | Object metadata model: `ETag` (opaque SHA-256 change-token), `Content-Type`, and `Last-Modified` as flat optional fields on `InodeRecord`, committed atomically with the chunk map and preserved across repair (decides #503; foundation for #504, #506, multipart) | Accepted |
 | [0048](0048-issue-priority-and-automated-triage.md) | Issue priority and automated triage: severity × reach set P0–P3 with security and durability overrides; a GitHub Action applies it with one Claude API call per issue, authenticated by Workload Identity Federation | Proposed |
+| [0049](0049-pinned-advisory-database.md) | Pinned advisory database: the PR gate audits a RustSec database commit recorded as the `.github/advisory-db` submodule, Dependabot moves it daily, and release and a daily run on `main` audit the newest one (#986) | Proposed |
 
 ## Why not ... ?
 

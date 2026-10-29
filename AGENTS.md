@@ -127,7 +127,9 @@ run the checks that match the surface you changed.
   replace it. Don't run real external services inside the simulator; promote any
   real-world finding back into a seeded DST regression.
 - **Dependency doctrine** (ADR-0003): linked crates must pass the `deny.toml`
-  license wall (permissive only; AGPL/BSL/SSPL denied). Deployed *services* are
+  license wall (permissive only; AGPL/BSL/SSPL denied) and the advisory check,
+  which reads the RustSec database at the commit `.github/advisory-db` pins
+  (ADR-0049). Deployed *services* are
   judged by control-resilience (forkable, self-hostable, foundation-governed) —
   e.g. OpenBao, not BSL-licensed Vault.
 

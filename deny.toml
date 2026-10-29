@@ -2,7 +2,9 @@
 # allowlist that denies adopter-infecting copyleft (AGPL) and source-available
 # "paywall" licenses (BSL/SSPL), plus the RUSTSEC advisory database. A
 # contribution that pulls in a disqualified license or a vulnerable crate fails
-# `cargo deny check` in CI.
+# `cargo deny check` in CI. The advisory database is the commit the
+# `.github/advisory-db` submodule pins (ADR-0049), so a newly published advisory
+# reaches the gate through Dependabot's PR that moves the pin, not every PR at once.
 #
 # AUDIT POLICY — what this file can and cannot see (ADR-0042, issues #439, #543).
 # `cargo deny` / `cargo audit` traverse the **Rust dependency graph** recorded in
@@ -57,6 +59,11 @@
 # library; it is a property of the tooling, not of this dependency.
 
 [advisories]
+# The database is pinned (ADR-0049): `cargo xtask ci` moves this clone to the commit the
+# `.github/advisory-db` submodule records and runs `--offline`, so a new advisory reaches the
+# wall only through the PR that moves the pin. Our own directory, not the shared
+# $CARGO_HOME/advisory-dbs, so pinning never rewinds another project's copy.
+db-path = "target/advisory-dbs"
 # Fail on any RUSTSEC advisory for a crate in the dependency graph.
 version = 2
 yanked = "deny"
