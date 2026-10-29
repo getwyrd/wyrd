@@ -19,7 +19,7 @@ The rules are in ADR-0001 (lifecycle), ADR-0037 (proposals and specs), ADR-0038
 2. **Take the next number.** One more than the highest number in the index and in any open
    pull request that adds an ADR. Numbers are never reused, not even for an ADR that was
    dropped.
-3. **Write it from the template.** Copy [`../templates/adr.md`](../templates/adr.md) to
+3. **Write it from the template.** Copy `../templates/adr.md` to
    `NNNN-short-title.md`, keep `status: Proposed` with nothing after it on that line, and
    write Context, Decision and Consequences. Mark anything still undecided **[OPEN]**.
 4. **Add it to the index** below, with status `Proposed`, in the same pull request.
