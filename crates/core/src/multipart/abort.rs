@@ -47,14 +47,18 @@ use crate::metadata;
 
 /// How many fence commits one [`abort_session`] makes at most: [`MAX_COMPLETE_ATTEMPTS`] `+ 1`.
 ///
-/// A session goes back to `Open` only when a Complete fence is released, and it spends at most
-/// [`MAX_COMPLETE_ATTEMPTS`] Complete fences, so a session that keeps moving to a later `Open@E'`
-/// under the Abort can cost it at most that many rounds. The one more is the round that fences.
-/// A round is also spent by a conflict no re-read explains (on TiKV, a lock another writer held,
-/// with nothing moved) and by a commit whose outcome the store could not report; those share
-/// the same budget. It is sized from the shipped value of that knob, and it bounds the work one
-/// Abort does, not its correctness: an Abort that spends it ends with an error that says whether
-/// a fence of it may still land, never with a wrong answer.
+/// A session goes back to `Open` only when a Complete fence is released, and it can spend at
+/// most [`MAX_COMPLETE_ATTEMPTS`] charged Complete fences, so that many rounds cover a session
+/// moved to a later `Open@E'` by each of them. The one more is the round that fences. A Complete
+/// that fenced and was then rejected, or stopped by a store fault, behind its fence gives its
+/// attempt back when it releases that fence (#1007), so such Completes can move the session under
+/// the Abort more often than that; each such move spends a round too. A list already invalid
+/// before the fence commits nothing and moves nothing. A round is also spent by a conflict no
+/// re-read explains (on TiKV, a lock another writer held, with nothing moved) and by a commit whose
+/// outcome the store could not report; those share the same budget. It is sized from the shipped
+/// value of that knob, and it bounds the work one Abort does, not its correctness: an Abort that
+/// spends it ends with an error that says whether a fence of it may still land, never with a wrong
+/// answer.
 pub const ABORT_ROUNDS: u32 = MAX_COMPLETE_ATTEMPTS + 1;
 
 /// **The teardown fence's batch** (`0016:665`), the one builder of it: given the session's
