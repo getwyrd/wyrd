@@ -5226,6 +5226,7 @@ dependencies = [
  "wyrd-gateway-s3",
  "wyrd-metadata-redb",
  "wyrd-server",
+ "wyrd-traits",
 ]
 
 [[package]]

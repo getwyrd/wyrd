@@ -60,6 +60,9 @@ wyrd-core.workspace = true
 wyrd-gateway-s3.workspace = true
 wyrd-metadata-redb.workspace = true
 wyrd-server = { path = "../server" }
+# The bucket marker a listing needs (ADR-0046 decision 1), seeded on the store before it goes
+# into the gateway, as `crates/server/tests/s3_list_objects.rs` seeds it.
+wyrd-traits.workspace = true
 
 # Inherit the workspace lint policy (single source of truth).
 [lints]
