@@ -17,8 +17,8 @@
 //!    vocabulary has no arm for: `NamedParts` refuses an empty list.
 //! 2. [`the_real_gateway_meets_the_s3_crates_gateway_bound`] — a helper bounded on
 //!    `ObjectGateway + ContainerGateway + MultipartGateway` accepts the real `Gateway` and
-//!    composes `S3Gateway::new` over it; the served router still answers every multipart form
-//!    `501`.
+//!    composes `S3Gateway::new` over it; the served router still answers every well-formed
+//!    multipart form `501`.
 //! 3. [`every_multipart_form_still_answers_501_without_entering_the_seam`] — over the
 //!    in-process listener, a sentinel gateway counts every call into its seams. Each multipart
 //!    form answers `501 NotImplemented` naming its subresource, and afterwards the multipart
@@ -74,8 +74,8 @@ const REGION: &str = "us-east-1";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The six S3 multipart wire forms, as `(method, path, query, the subresource the 501 names)`.
-/// The named subresource is the FIRST denylisted query key, which is what the S3 crate's guard
-/// reports (`crates/gateway-s3/src/lib.rs`, `unsupported_subresource`).
+/// The named subresource is the query key that selects the operation, which is what the S3
+/// crate's classifier reports (`crates/gateway-s3/src/lib.rs`, `MultipartOp::selector`).
 const MULTIPART_FORMS: [(&str, &str, &str, &str); 6] = [
     // CreateMultipartUpload
     ("POST", "/b/k", "uploads", "uploads"),
