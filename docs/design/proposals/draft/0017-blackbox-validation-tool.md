@@ -193,6 +193,10 @@ asserted — not just the success path.
 - `required` — must succeed, and its result must satisfy the oracle.
 - `unsupported(#NNN)` — must fail, **with the declared status and S3 error code**. Not a 500,
   not a hang, and emphatically not a success.
+- `supported, not checked (#NNN)` — the server is expected to accept it and the tool cannot
+  check it yet; `#NNN` is the issue that adds the check. The verdict lists the row as not
+  covered, with its issue, and never counts an answer to it as a pass; a 5xx to it is still
+  `protocol` (§7). A run can be `PASS` without exercising it.
 
 An `unsupported` operation that succeeds is a failure of class `unexpected-support`, and it is
 fatal. That is [#504][i504] generalised: the day an unimplemented operation starts half-working
@@ -256,9 +260,12 @@ reading as broken.
 
 **The matrix must be keyed to the server version.** Expectations change as slices land, so a
 tool validating an older release would otherwise fail on rows naming issues fixed after that
-build. The gateway advertises no version today — no `Server:` header, nothing on the wire — so
-this needs the version header of [#736][i736] (*Dependencies*). Until it lands, `--server-version` is an
-operator-supplied parameter, with the honest weakness that a parameter can be silently wrong.
+build. Since #886 every response carries `Server: wyrd/<version>`
+(`crates/gateway-s3/src/lib.rs:1694-1699`), the version header of [#736][i736]
+(*Dependencies*): the version is read from the wire and `--server-version` is an override, with
+the honest weakness that an override can be silently wrong. A version the server does not know
+(`wyrd/unknown`, or a build identity ending `+git.unknown[.dirty]`) is never read as release
+`0.0.0`: it selects no profile.
 
 **Profiles are versioned and retained — rows are never flipped in place.** An earlier revision
 said "when #508 lands, the change is flipping six rows", which contradicts the version-keying
@@ -273,6 +280,24 @@ version-keying mean anything rather than being a flag the tool accepts and ignor
 
 Each profile is a reviewed constant with citations, and the retained ones are how a validator
 shipped in an operator tarball stays useful against the release that operator actually runs.
+
+**Until the first `0.1.0` release, the `pre-0.1` profile describes `main` and is edited in
+place when a feature lands.** No release exists for a retained profile to protect, and every
+untagged build reports `0.0.0+git.<sha>`, so a second pre-release profile could never be
+selected. Retention starts at the first `0.1.0` release, not at the first tag: a release
+candidate (`0.1.0-rc.1`) is below `0.1.0` and still selects `pre-0.1`. A feature that lands
+before the tool can check it moves its rows to `supported, not checked (#NNN)`, naming the
+issue that adds the check (for multipart: the `cp` upload leg, #750). The profiles live in
+`crates/validate/src/matrix.rs` (#937).
+
+The cost, stated plainly: a tag before `0.1.0` (such as `v0.1.0-rc.1`) gets no retained
+profile, so a newer tool run against that release candidate after a later edit can fail on a
+row the candidate predates. Its correct `501` on a multipart row that has since moved to
+`supported, not checked` is a 5xx that row does not declare, so `protocol`. Freezing a profile
+at the rc tag would not remove that false failure, only move it: a build past a tag reports
+`0.1.0-rc.1+git.<n>.<sha>` (`crates/server/src/version/derivation.rs:55`) and selects what the
+tag selects, so `main` past the candidate would hit `unexpected-support` on the frozen rows
+instead.
 
 ### 4. Size classes
 
@@ -489,8 +514,8 @@ instantly when a byte comes back wrong.
 | `integrity` | bytes, digest, or size differ | **fatal** — stop, preserve state and the object |
 | `oracle` | model and server disagree (deleted key readable, stale generation, listing mismatch) | **fatal** |
 | `unexpected-support` | an `unsupported` operation succeeded | **fatal** |
-| `protocol` | wrong status, error code, or XML shape | **fatal**, in every scenario |
-| `availability` | transport failure, connection reset, 5xx | **budgeted** — counted, rate-limited, fails only above a declared threshold |
+| `protocol` | wrong status (a 5xx included), header, error code, or XML shape | **fatal**, in every scenario |
+| `availability` | a failure that leaves no answer to judge: transport failure, connection reset, a timeout before the response head, a body cut off after it (unless what arrived before the cut is already wrong, which is `integrity` or `protocol`) | **budgeted** — counted, rate-limited, fails only above a declared threshold |
 
 **`protocol` is fatal everywhere.** An earlier revision budgeted it in long scenarios, which is
 incoherent: a wrong status or malformed XML is a *correctness* violation, not transient
@@ -498,6 +523,11 @@ unavailability. Under a budget, a rare malformed response during a week-long run
 threshold and the run could still report `PASS` — while the verdict claims to cover correctness
 and while `smoke` treats the identical response as fatal. Only transport-shaped failures are
 budgeted. Rarity is not a defence for a wrong answer.
+
+A 5xx is an answer, and an answer other than the defined one is an implementation error, fatal
+like any wrong status; only the transport-shaped failures above, which leave no answer to judge,
+are budgeted. And a fatal fact outranks an unproved exercise: a cut, a lost follow-up or an ask
+that cannot test its row never hides a wrong status, header or byte that already arrived.
 
 **Every operation is bounded, and unbounded waits are not an availability class at all.** A peer
 that accepts a request or body stream and then stops producing data cannot be *classified* by the
@@ -855,12 +885,12 @@ Three product changes the tool's coverage wants. None blocks a first slice — d
 today's values and the verdict records what was used — but each makes it accurate against a real
 deployment rather than against the tree.
 
-**The gateway advertises no version.** No `Server:` header, nothing on the wire
-(`crates/gateway-s3/src/lib.rs`). A shipped tool cannot discover what it is validating, so the
-capability matrix cannot key its expectations to a release. `Server: wyrd/<version>`, sourced
-from the same `normalize_describe` over `git describe` that `cargo xtask dist` already uses
-(`xtask/src/dist.rs:119,356`) rather than the `version = "0.0.0"` placeholder. Interim:
-`--server-version`. Tracked as [#736][i736] (0.1 Alpha — a gateway change, not tooling).
+**The gateway advertises its version — landed.** [#736][i736] landed through #886: every
+response carries `Server: wyrd/<version>` (`crates/gateway-s3/src/lib.rs:1694-1699`), the
+build identity from the same `normalize_describe` over `git describe` that `cargo xtask dist`
+uses (`crates/server/src/version/derivation.rs:41`). So a shipped tool reads what it is
+validating from the wire, the matrix keys its expectations to that release (§3), and
+`--server-version` is an override rather than the interim source.
 
 **The `s3` role does not expose `--chunk-size`.** The seam exists —
 `Gateway::with_chunk_size` (`crates/server/src/lib.rs:145`, doc-commented "mainly so tests can
