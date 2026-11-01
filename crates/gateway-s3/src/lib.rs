@@ -315,9 +315,12 @@ fn op_label(method: &Method, path: &str, query: &str) -> &'static str {
         // by method alone filed every bulk delete under `other` — pooled with unsupported methods
         // — so the `delete` RED series was blind to the one path that removes up to 1000 objects
         // per request, and its latency and failures never reached a delete dashboard or alert
-        // (PR #612 review). The predicate mirrors the route's own interception exactly (see
-        // `dispatch`), so this label can never name a request the bulk handler did not take.
-        Method::POST if bucket_scoped_path(path).is_some() && is_delete_subresource(query) => {
+        // (PR #612 review). The predicate is the route's own interception (see `dispatch`), on the
+        // same decoded keys, so this label can never name a request the bulk handler did not take.
+        Method::POST
+            if bucket_scoped_path(path).is_some()
+                && is_delete_subresource(&DecodedQuery::decode(query)) =>
+        {
             "delete"
         }
         _ => "other",
@@ -400,17 +403,17 @@ fn emit_request_red(
     });
 }
 
-/// The S3 subresource / multipart query keys this object-only floor does not implement.
-/// A request carrying any of them is refused (501) rather than falling through to a plain
-/// object PUT/GET/DELETE (or, on the bucket route, a listing), which would mishandle it —
-/// destructively for `PUT ?partNumber` (UploadPart) and `DELETE ?tagging`, and silently for
-/// `GET /bucket?acl` (would read a listing document). Benign params a normal SDK adds to
-/// ordinary requests (e.g. `x-id=PutObject`) are not listed, so they still pass; this is a
-/// denylist of unsupported operations, not a ban on all query strings.
+/// The S3 subresource query keys this object-only floor does not implement. A request
+/// carrying any of them is refused (501) rather than falling through to a plain object
+/// PUT/GET/DELETE (or, on the bucket route, a listing), which would mishandle it —
+/// destructively for `DELETE ?tagging`, and silently for `GET /bucket?acl` (would read a
+/// listing document). Benign params a normal SDK adds to ordinary requests (e.g.
+/// `x-id=PutObject`) are not listed, so they still pass; this is a denylist of unsupported
+/// operations, not a ban on all query strings.
+///
+/// Keys are matched **percent-decoded**, on every route ([`DecodedQuery`]), so no spelling
+/// slips past. The three [`MULTIPART_KEYS`] are routed, not listed.
 const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
-    "uploads",
-    "uploadId",
-    "partNumber",
     "tagging",
     "acl",
     "versions",
@@ -452,38 +455,244 @@ const UNSUPPORTED_SUBRESOURCES: &[&str] = &[
     "metadataTable",
 ];
 
-/// The first [`UNSUPPORTED_SUBRESOURCES`] query key present in `query`, matching **raw**
-/// (un-decoded) keys. Used on the OBJECT path (PUT/GET/DELETE), where a missed subresource
-/// falls through to the plain verb rather than to a listing — so this is a raw match, not the
-/// percent-decoding one the bucket route needs ([`unsupported_subresource_decoded`]).
+/// The three query keys that select an S3 multipart operation ([`MultipartOp`]). Routed by
+/// [`classify_query`], never by the denylist; bulk delete refuses them by name
+/// ([`foreign_subresource_on_delete`]).
+const MULTIPART_KEYS: [&str; 3] = ["uploads", "uploadId", "partNumber"];
+
+/// A request's query string with every parameter's key and value percent-decoded **exactly
+/// once**: `dispatch` builds it after SigV4, and every route chooses by it (issue #667); a
+/// listing's own parameters are still matched raw ([`query_param`]).
 ///
-/// The residual (adversary, not pressed): a client that percent-encodes a subresource key
-/// (`?part%4Eumber`) dodges this raw match and the request executes as a plain object verb.
-/// It is not a listing-disclosure like the bucket route's gap — only a fully-credentialed
-/// client that deliberately encodes the key can reach it, and such a client can issue the
-/// plain verb directly anyway, so a raw match is adequate HERE (unlike the bucket route).
-/// Returns the first offending key found.
-fn unsupported_subresource(query: &str) -> Option<&str> {
-    query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
-        .find(|k| UNSUPPORTED_SUBRESOURCES.contains(k))
+/// Once, because that is what SigV4 does: [`sigv4::canonical_query`] decodes each key and value
+/// once and re-encodes it, so the parameter the client signed is the once-decoded one. Routing
+/// on the RAW key let `PUT /b/k?part%4Eumber=1`, which signs as `partNumber`, miss the object
+/// route's denylist and overwrite the object as a plain PUT (issue #491). Decoding twice would
+/// be wrong the other way: `?part%254Eumber` signs as the literal key `part%4Eumber`, which is
+/// not `partNumber`. A key with no `=` has the empty value, as in the canonical query.
+struct DecodedQuery {
+    params: Vec<(String, String)>,
 }
 
-/// True if `query` names the **`delete`** subresource (`?delete`, `?delete=`, `?delete&x=1`) —
-/// the marker of a bulk **DeleteObjects** POST (issue #509). A **bare-key** match, mirroring
-/// [`unsupported_subresource`]'s split (:387-393): `?delete` has no `=`, so [`query_param`]
-/// (:453), which requires `k=v`, would return `None` and miss it. Used on the bucket route to
-/// intercept `POST /bucket?delete` BEFORE the subresource denylist (which lists `"delete"`, :344)
-/// would refuse it — while `"delete"` stays on the OBJECT-path denylist so `DELETE /b/k?delete`
-/// remains `501`.
-fn is_delete_subresource(query: &str) -> bool {
-    query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
-        .any(|k| k == "delete")
+impl DecodedQuery {
+    fn decode(raw: &str) -> Self {
+        let params = raw
+            .split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| {
+                let (key, value) = p.split_once('=').unwrap_or((p, ""));
+                (percent_decode_utf8(key), percent_decode_utf8(value))
+            })
+            .collect();
+        Self { params }
+    }
+
+    /// Every key, in query order.
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.params.iter().map(|(key, _)| key.as_str())
+    }
+
+    /// The first [`UNSUPPORTED_SUBRESOURCES`] key present, if any.
+    fn unsupported_subresource(&self) -> Option<&str> {
+        self.keys()
+            .find(|key| UNSUPPORTED_SUBRESOURCES.contains(key))
+    }
+}
+
+/// Which kind of path a request names, as far as [`classify_query`] needs to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryTarget {
+    /// `/{bucket}` or `/{bucket}/` ([`bucket_scoped_path`]).
+    Bucket,
+    /// `/{bucket}/{key}` ([`split_bucket_key`]).
+    Object,
+}
+
+/// A well-formed S3 multipart request: the operation and its parsed arguments. The upload id is
+/// the decoded value as sent: checking it is the verb's (the seam answers an id that does not
+/// parse `NoSuchUpload`, see `MultipartGateway`), so an unknown or malformed id routes here
+/// too. The part number has passed [`parse_part_number`]; its range is the seam's to check.
+#[derive(Debug, PartialEq, Eq)]
+enum MultipartOp {
+    /// `POST /{bucket}/{key}?uploads`.
+    Create,
+    /// `PUT /{bucket}/{key}?partNumber=N&uploadId=U`.
+    UploadPart { upload_id: String, part_number: u32 },
+    /// `POST /{bucket}/{key}?uploadId=U`.
+    Complete { upload_id: String },
+    /// `DELETE /{bucket}/{key}?uploadId=U`.
+    Abort { upload_id: String },
+    /// `GET /{bucket}/{key}?uploadId=U`.
+    ListParts { upload_id: String },
+    /// `GET /{bucket}?uploads`.
+    ListUploads,
+}
+
+impl MultipartOp {
+    /// The S3 operation's name.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Create => "CreateMultipartUpload",
+            Self::UploadPart { .. } => "UploadPart",
+            Self::Complete { .. } => "CompleteMultipartUpload",
+            Self::Abort { .. } => "AbortMultipartUpload",
+            Self::ListParts { .. } => "ListParts",
+            Self::ListUploads => "ListMultipartUploads",
+        }
+    }
+
+    /// The query key that selects the operation, which its `501` names (as the denylist's
+    /// refusal named it before these keys left the list).
+    fn selector(&self) -> &'static str {
+        match self {
+            Self::Create | Self::ListUploads => "uploads",
+            Self::UploadPart { .. } => "partNumber",
+            Self::Complete { .. } | Self::Abort { .. } | Self::ListParts { .. } => "uploadId",
+        }
+    }
+}
+
+/// Where a request's query sends it, when not to the target's plain verb: the classification
+/// [`classify_query`] makes for the bucket and object routes (issue #667).
+#[derive(Debug, PartialEq, Eq)]
+enum QueryRoute {
+    /// A denylisted subresource ([`UNSUPPORTED_SUBRESOURCES`]), decoded: `501`, naming it.
+    /// Checked first, so it wins over any multipart key beside it.
+    Unsupported(String),
+    /// A multipart key in a shape no S3 operation takes: a key missing or extra, a key
+    /// repeated, a `partNumber` that is not canonical digits, or a method and path no
+    /// multipart operation uses. `400 InvalidArgument`, carrying why.
+    IllFormed(String),
+    /// `GET` / `HEAD /{bucket}/{key}?partNumber=N`: GetObject / HeadObject of one part of an
+    /// object. A valid S3 form that is not a multipart operation and is not implemented here:
+    /// `501`, never `400`.
+    PartRead,
+    /// A well-formed multipart operation.
+    Multipart(MultipartOp),
+}
+
+/// `partNumber` parsed as S3 numbers parts: canonical decimal digits that fit a `u32`. Strict
+/// per the grammar rule (AGENTS.md, *Grammar strictness*): at least one ASCII digit, no sign
+/// (`u32::from_str` alone accepts `+1`), no leading zero (`01`; a lone `0` is canonical), no
+/// whitespace, no fraction. The RANGE (S3's `1..=10000`) is not checked here: the seam's
+/// `upload_part` contract checks it first (`MultipartGateway`), so `0` parses here and is
+/// refused there.
+fn parse_part_number(value: &str) -> Option<u32> {
+    let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    let leading_zero = value.len() > 1 && value.starts_with('0');
+    if !digits || leading_zero {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// Classify `query` for `method` on `target`: the one place a denylisted or multipart key picks
+/// a route, so every spelling of such a key reaches the same arm (issue #667). `None` is the
+/// target's plain verb: the object PUT/GET/HEAD/DELETE table, or the bucket listing.
+///
+/// In order:
+/// 1. A denylisted subresource, in any spelling, wins: [`QueryRoute::Unsupported`].
+/// 2. No multipart key: `None`.
+/// 3. A multipart key that appears twice is refused, never first-wins: two `uploadId`s name
+///    two uploads, and two `partNumber`s two parts.
+/// 4. `partNumber` must parse ([`parse_part_number`]).
+/// 5. The keys present must be exactly the set one operation takes, on that operation's
+///    method and path. Anything else is [`QueryRoute::IllFormed`], so no multipart key can
+///    reach a plain verb or a listing.
+fn classify_query(
+    method: &Method,
+    target: QueryTarget,
+    query: &DecodedQuery,
+) -> Option<QueryRoute> {
+    if let Some(sub) = query.unsupported_subresource() {
+        return Some(QueryRoute::Unsupported(sub.to_string()));
+    }
+    // Each multipart key's value, in `MULTIPART_KEYS` order, filled in one pass.
+    let mut found = [None; MULTIPART_KEYS.len()];
+    for (key, value) in &query.params {
+        let Some(slot) = MULTIPART_KEYS.iter().position(|multipart| multipart == key) else {
+            continue;
+        };
+        if found[slot].replace(value.as_str()).is_some() {
+            return Some(QueryRoute::IllFormed(format!(
+                "the `{key}` query parameter appears more than once; it may appear at most once"
+            )));
+        }
+    }
+    if found.iter().all(Option::is_none) {
+        return None;
+    }
+    let [uploads, upload_id, part_number] = found;
+    let part_number =
+        match part_number.map(parse_part_number) {
+            None => None,
+            Some(Some(number)) => Some(number),
+            Some(None) => return Some(QueryRoute::IllFormed(
+                "`partNumber` must be a part number in decimal digits, with no sign, no leading \
+                 zero and no whitespace"
+                    .to_string(),
+            )),
+        };
+    let route = match (target, method, uploads.is_some(), upload_id, part_number) {
+        (QueryTarget::Object, &Method::POST, true, None, None) => {
+            QueryRoute::Multipart(MultipartOp::Create)
+        }
+        (QueryTarget::Object, &Method::PUT, false, Some(upload_id), Some(part_number)) => {
+            QueryRoute::Multipart(MultipartOp::UploadPart {
+                upload_id: upload_id.to_string(),
+                part_number,
+            })
+        }
+        (QueryTarget::Object, &Method::POST, false, Some(upload_id), None) => {
+            QueryRoute::Multipart(MultipartOp::Complete {
+                upload_id: upload_id.to_string(),
+            })
+        }
+        (QueryTarget::Object, &Method::DELETE, false, Some(upload_id), None) => {
+            QueryRoute::Multipart(MultipartOp::Abort {
+                upload_id: upload_id.to_string(),
+            })
+        }
+        (QueryTarget::Object, &Method::GET, false, Some(upload_id), None) => {
+            QueryRoute::Multipart(MultipartOp::ListParts {
+                upload_id: upload_id.to_string(),
+            })
+        }
+        (QueryTarget::Object, &Method::GET | &Method::HEAD, false, None, Some(_)) => {
+            QueryRoute::PartRead
+        }
+        (QueryTarget::Bucket, &Method::GET, true, None, None) => {
+            QueryRoute::Multipart(MultipartOp::ListUploads)
+        }
+        _ => {
+            let keys = MULTIPART_KEYS
+                .iter()
+                .zip(found)
+                .filter(|(_, value)| value.is_some())
+                .map(|(key, _)| format!("`{key}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let path = match target {
+                QueryTarget::Bucket => "a bucket",
+                QueryTarget::Object => "an object",
+            };
+            QueryRoute::IllFormed(format!(
+                "the multipart query parameters {keys} are not a valid {method} request on {path}"
+            ))
+        }
+    };
+    Some(route)
+}
+
+/// True if `query` names the **`delete`** subresource (`?delete`, `?delete=`, `?delete&x=1`,
+/// `?d%65lete`) — the marker of a bulk **DeleteObjects** POST (issue #509). A **bare-key** match
+/// on the DECODED key, so every spelling that signs as `delete` reaches the bulk route (issue
+/// #667): [`query_param`], which requires `k=v`, would miss a valueless `?delete`. Used on the
+/// bucket route to intercept `POST /bucket?delete` BEFORE the subresource denylist (which lists
+/// `"delete"`) would refuse it — while `"delete"` stays on the OBJECT-path denylist so
+/// `DELETE /b/k?delete` remains `501`.
+fn is_delete_subresource(query: &DecodedQuery) -> bool {
+    query.keys().any(|key| key == "delete")
 }
 
 /// The longest object key S3 allows, in bytes of the key's UTF-8 encoding (AWS S3 User Guide,
@@ -547,23 +756,8 @@ const _: () = assert!(
      stay under the 9 MiB oversized-body test's body",
 );
 
-/// Like [`unsupported_subresource`] but matches against **percent-decoded** query keys, so a
-/// bucket subresource cannot slip past the listing route by percent-encoding its name
-/// (`GET /bucket?%61cl`, `GET /bucket?upload%73`). The bucket route routes anything not on the
-/// denylist to a listing, so an encoded `?acl` that dodged a raw match would be answered with
-/// a listing document — precisely the "bucket subresource op silently answered with a listing"
-/// the routing decision forbids (issue #507 adversarial finding). Returns the decoded key.
-fn unsupported_subresource_decoded(query: &str) -> Option<String> {
-    query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
-        .map(percent_decode_utf8)
-        .find(|k| UNSUPPORTED_SUBRESOURCES.contains(&k.as_str()))
-}
-
-/// The denylisted subresource a bulk-delete query carries BESIDES its own `delete` marker, if any
-/// — percent-decoded, exactly like [`unsupported_subresource_decoded`].
+/// The subresource a bulk-delete query carries BESIDES its own `delete` marker, if any: a
+/// denylisted key or a multipart one, read off the [`DecodedQuery`] so no spelling slips past.
 ///
 /// The bulk-delete route is intercepted BEFORE the denylist, so that `?delete` — which is itself on
 /// the denylist — is not refused by it. That early return also skipped the denylist for every
@@ -573,15 +767,15 @@ fn unsupported_subresource_decoded(query: &str) -> Option<String> {
 /// object. That is the exact data-loss shape a `<VersionId>` in the BODY is refused for, reached by
 /// the query spelling instead (PR #612 review).
 ///
-/// Only the `delete` marker is exempt; every other denylisted key still refuses. Benign query
-/// params are untouched, so this narrows nothing a client legitimately sends.
-fn foreign_subresource_on_delete(query: &str) -> Option<String> {
-    query
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|p| p.split_once('=').map(|(k, _)| k).unwrap_or(p))
-        .map(percent_decode_utf8)
-        .find(|k| k != "delete" && UNSUPPORTED_SUBRESOURCES.contains(&k.as_str()))
+/// Only the `delete` marker is exempt; every other denylisted key still refuses, and so does each
+/// of the [`MULTIPART_KEYS`]. Those left the denylist for [`classify_query`], which this route
+/// never reaches, so they are refused here by name: `POST /bucket?delete&uploadId=U` must not run
+/// a bulk delete the client did not ask for (issue #667). Benign query params are untouched, so
+/// this narrows nothing a client legitimately sends.
+fn foreign_subresource_on_delete(query: &DecodedQuery) -> Option<&str> {
+    query.keys().find(|key| {
+        *key != "delete" && (UNSUPPORTED_SUBRESOURCES.contains(key) || MULTIPART_KEYS.contains(key))
+    })
 }
 
 /// Split a request path `/{bucket}/{key}` into `(bucket, key)`. `key` may itself contain
@@ -1749,6 +1943,13 @@ where
         }
     };
 
+    // The query, percent-decoded ONCE, as SigV4 just canonicalised it. Route CHOICE reads it: bulk
+    // delete, the bucket listing and the object verbs all classify these keys, so every spelling
+    // of the bulk-delete marker, a denylisted key or a multipart key routes as its plain spelling
+    // does (issue #667). A listing's own parameters do not read it: `list_objects` still matches
+    // them raw ([`query_param`]), so `?list%2Dtype=3` is ignored where `?list-type=3` is refused.
+    let decoded = DecodedQuery::decode(&query);
+
     // Bucket-scoped dispatch, split off BEFORE the object-path guard (issue #507, ADR-0046
     // routing decision). A path naming a bucket but no object (`/{bucket}` or `/{bucket}/`)
     // is a bucket-level request, not the malformed object path the guard below rejects —
@@ -1757,19 +1958,20 @@ where
     // verbs); the split routes bucket-scoped GET to the listing handler and leaves every
     // other bucket-scoped method on today's 400 (#511 / 509 extend the split later).
     if let Some(bucket) = bucket_scoped_path(&path) {
+        let bucket_name = percent_decode_utf8(bucket);
         // Bulk DeleteObjects (issue #509): `POST /bucket?delete` carries an XML `<Delete>` body
-        // of keys and answers a `<DeleteResult>`. It is intercepted HERE, BEFORE the subresource
-        // denylist below — which lists `"delete"` (:344) and would otherwise `501` it — so the
-        // bulk handler runs. `"delete"` stays on the OBJECT-path denylist (:1513) so
-        // `DELETE /b/k?delete` is still `501`. `?delete` is detected with a bare-key match
+        // of keys and answers a `<DeleteResult>`. It is intercepted HERE, BEFORE the query
+        // classifier below — whose denylist lists `"delete"` and would otherwise `501` it — so
+        // the bulk handler runs. `"delete"` stays on the denylist, so `DELETE /b/k?delete` is
+        // still `501`. `?delete` is detected with a bare-key match on the decoded query
         // ([`is_delete_subresource`]); `query_param` would miss a valueless `?delete`.
-        if method == Method::POST && is_delete_subresource(&query) {
-            // This interception runs BEFORE the denylist below, so the denylist has to be applied
-            // to every OTHER key here — otherwise the bulk-delete marker is a skeleton key that
-            // walks any denylisted subresource past the fence and into a destructive handler
-            // (`?delete&versionId=v` deleting the CURRENT object). Refuse exactly as the denylist
-            // would have.
-            if let Some(sub) = foreign_subresource_on_delete(&query) {
+        if method == Method::POST && is_delete_subresource(&decoded) {
+            // This interception runs BEFORE the classifier below, so the denylisted and the
+            // multipart keys have to be refused for every OTHER key here — otherwise the
+            // bulk-delete marker is a skeleton key that walks any of them past the fence and into
+            // a destructive handler (`?delete&versionId=v` deleting the CURRENT object). Refuse
+            // exactly as the denylist would have.
+            if let Some(sub) = foreign_subresource_on_delete(&decoded) {
                 return error_response(
                     request_id,
                     StatusCode::NOT_IMPLEMENTED,
@@ -1777,35 +1979,22 @@ where
                     &format!("the `{sub}` S3 subresource/operation is not supported"),
                 );
             }
-            return delete_objects(
-                &state,
-                request_id,
-                &percent_decode_utf8(bucket),
-                payload,
-                body,
-            )
-            .await;
+            return delete_objects(&state, request_id, &bucket_name, payload, body).await;
         }
-        // The bucket path MUST still consult the subresource denylist first: only a listing
-        // form (`?list-type=2`, the v1 bare / `marker` / `prefix` / `delimiter` / `max-keys`
-        // forms, and benign params) routes to listing. `GET /bucket?acl` / `?policy` /
-        // `?versions` / `?location` / `?uploads` etc. stay `501 NotImplemented` so a bucket
-        // subresource op is never silently answered with a listing document (which would let
-        // `aws s3api get-bucket-acl` read a listing, and would destroy 508's
-        // ListMultipartUploads red). The keys are DECODED before matching so a percent-encoded
-        // subresource (`?%61cl`, `?upload%73`) cannot dodge the fence (issue #507 adversary).
-        if let Some(sub) = unsupported_subresource_decoded(&query) {
-            return error_response(
-                request_id,
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                &format!("the `{sub}` S3 subresource/operation is not supported"),
-            );
+        // The bucket path MUST still classify its query first: only a listing form
+        // (`?list-type=2`, the v1 bare / `marker` / `prefix` / `delimiter` / `max-keys` forms,
+        // and benign params) routes to listing. `GET /bucket?acl` / `?policy` / `?versions` /
+        // `?location` etc. stay `501 NotImplemented` so a bucket subresource op is never
+        // silently answered with a listing document (which would let `aws s3api
+        // get-bucket-acl` read a listing). `?uploads` is ListMultipartUploads, and
+        // `?uploadId` / `?partNumber` are refused `400`: no multipart key reaches the listing.
+        // The keys are DECODED before matching so a percent-encoded subresource (`?%61cl`,
+        // `?upload%73`) cannot dodge the fence (issue #507 adversary).
+        if let Some(route) = classify_query(&method, QueryTarget::Bucket, &decoded) {
+            return query_route_response(request_id, &bucket_name, route);
         }
         return match method {
-            Method::GET => {
-                list_objects(&state, request_id, &percent_decode_utf8(bucket), &query).await
-            }
+            Method::GET => list_objects(&state, request_id, &bucket_name, &query).await,
             // Other bucket-scoped methods keep today's behaviour (bucket ops are #511/509).
             _ => error_response(
                 request_id,
@@ -1833,19 +2022,14 @@ where
     let key_name = percent_decode_utf8(key);
     let object_key = format!("{bucket_name}/{key_name}");
 
-    // Subresource / multipart query forms (?uploadId, ?partNumber, ?tagging, ?acl, …) are
-    // out of scope (brief §Out-of-scope: multipart upload, ACLs, the full S3 surface).
-    // Dispatch below is by method only — the query is used solely for SigV4 — so without
-    // this guard a `PUT /b/k?partNumber=1&uploadId=…` (UploadPart) would silently OVERWRITE
-    // the whole object and a `DELETE /b/k?tagging` would DELETE the object itself, both
-    // returning 2xx. Refuse a form we do not implement rather than mishandle it.
-    if let Some(sub) = unsupported_subresource(&query) {
-        return error_response(
-            request_id,
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            &format!("the `{sub}` S3 subresource/operation is not supported"),
-        );
+    // Subresource and multipart query forms (?tagging, ?acl, ?uploadId, ?partNumber, …) never
+    // reach the method table below, which dispatches by method alone: without this a
+    // `PUT /b/k?partNumber=1&uploadId=…` (UploadPart) would silently OVERWRITE the whole object
+    // and a `DELETE /b/k?uploadId=…` (AbortMultipartUpload) or `DELETE /b/k?tagging` would
+    // DELETE the object itself, all answering 2xx. The classifier reads the DECODED query, so
+    // an encoded spelling (`?part%4Eumber=1`) is refused like the plain one (issue #667).
+    if let Some(route) = classify_query(&method, QueryTarget::Object, &decoded) {
+        return query_route_response(request_id, &bucket_name, route);
     }
 
     match method {
@@ -1855,7 +2039,7 @@ where
             // destination key — but a copy request's payload IS the copy-source reference,
             // so its body is empty; falling through here would silently overwrite the
             // destination with zero bytes and answer 200 (data loss). Refuse it before any
-            // body byte is read, mirroring the subresource guard above (:548-561) and its
+            // body byte is read, mirroring the query classifier above and its
             // rationale — a form this floor does not implement is refused, never silently
             // mishandled. The header need not be part of the client's SigV4 signed-header
             // set for this guard to apply, so it is read directly off the request headers.
@@ -1883,14 +2067,9 @@ where
             // key are joined into one flat key. So `/b%2Fa/k` would store the same object as
             // `/b/a/k` while the key measured below is only `k` — a way round the length
             // limit. S3 bucket names cannot contain `/`, so a decoded bucket that does is
-            // refused outright.
+            // refused outright (every multipart route refuses it the same way).
             if bucket_name.contains('/') {
-                return error_response(
-                    request_id,
-                    StatusCode::BAD_REQUEST,
-                    "InvalidBucketName",
-                    "the specified bucket is not valid: a bucket name cannot contain `/`",
-                );
+                return invalid_bucket_name(request_id);
             }
             // `str::len` is the UTF-8 byte length of the DECODED key — not its characters, not
             // its percent-encoded wire form — and it counts the key alone, not `bucket/key`.
@@ -2035,6 +2214,80 @@ where
             "only object PUT, GET, HEAD, and DELETE are supported",
         ),
     }
+}
+
+/// Answer a request whose query [`classify_query`] routed away from its target's plain verb —
+/// the one place each such answer lives, on the bucket route and the object route alike.
+///
+/// Every multipart shape, well-formed or not, first refuses a bucket name that decoded to
+/// contain `/`. The path is split on its first LITERAL `/` and only then decoded, so `/b%2Fa/k`
+/// names the same flat object as `/b/a/k`; S3 bucket names cannot contain `/`, so the alias is
+/// refused here, before any session read, target match or core call, with the answer the object
+/// PUT arm gives it.
+fn query_route_response(request_id: RequestId, bucket: &str, route: QueryRoute) -> Response {
+    match route {
+        QueryRoute::Unsupported(sub) => error_response(
+            request_id,
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            &format!("the `{sub}` S3 subresource/operation is not supported"),
+        ),
+        QueryRoute::PartRead => error_response(
+            request_id,
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "the `partNumber` S3 subresource selects one part of an object, and GetObject / \
+             HeadObject by part number are not implemented",
+        ),
+        QueryRoute::IllFormed(_) | QueryRoute::Multipart(_) if bucket.contains('/') => {
+            invalid_bucket_name(request_id)
+        }
+        QueryRoute::IllFormed(why) => {
+            error_response(request_id, StatusCode::BAD_REQUEST, "InvalidArgument", &why)
+        }
+        QueryRoute::Multipart(op) => multipart_response(request_id, op),
+    }
+}
+
+/// The arm of each multipart operation: one per operation, each answering `501` until its verb
+/// lands. #668–#670 each replace their own operation's arm, passing in what that verb reads. The
+/// plain PUT arm's `x-amz-copy-source` refusal is not on this route, so the UploadPart arm must
+/// refuse that header itself, or an UploadPartCopy would store its empty body as a part.
+fn multipart_response(request_id: RequestId, op: MultipartOp) -> Response {
+    match &op {
+        MultipartOp::Create => multipart_not_implemented(request_id, &op),
+        MultipartOp::UploadPart { .. } => multipart_not_implemented(request_id, &op),
+        MultipartOp::Complete { .. } => multipart_not_implemented(request_id, &op),
+        MultipartOp::Abort { .. } => multipart_not_implemented(request_id, &op),
+        MultipartOp::ListParts { .. } => multipart_not_implemented(request_id, &op),
+        MultipartOp::ListUploads => multipart_not_implemented(request_id, &op),
+    }
+}
+
+/// The `501` of a multipart operation this gateway does not serve yet, naming the operation and
+/// the query key that selected it.
+fn multipart_not_implemented(request_id: RequestId, op: &MultipartOp) -> Response {
+    error_response(
+        request_id,
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        &format!(
+            "the `{}` S3 subresource selects {}, which is not implemented",
+            op.selector(),
+            op.name()
+        ),
+    )
+}
+
+/// `400 InvalidBucketName` for a bucket name that decoded to contain `/`, which no S3 bucket
+/// name can: the answer of the object PUT arm and of every multipart route.
+fn invalid_bucket_name(request_id: RequestId) -> Response {
+    error_response(
+        request_id,
+        StatusCode::BAD_REQUEST,
+        "InvalidBucketName",
+        "the specified bucket is not valid: a bucket name cannot contain `/`",
+    )
 }
 
 /// A single-shot PUT body's declared length (#671): its `Content-Length`. `Ok(None)` when it
@@ -4754,6 +5007,8 @@ mod tests {
         // The bulk-delete route: a bucket-scoped POST carrying a bare `?delete`.
         assert_eq!(op_label(&Method::POST, "/bucket", "delete"), "delete");
         assert_eq!(op_label(&Method::POST, "/bucket/", "delete"), "delete");
+        // The marker in any spelling that signs as `delete` takes the same route (issue #667).
+        assert_eq!(op_label(&Method::POST, "/bucket", "d%65lete"), "delete");
         // Ordinary methods keep their method-derived label.
         assert_eq!(op_label(&Method::GET, "/bucket/key", ""), "get");
         assert_eq!(op_label(&Method::DELETE, "/bucket/key", ""), "delete");
@@ -4765,6 +5020,9 @@ mod tests {
         assert_eq!(op_label(&Method::POST, "/bucket/key", "delete"), "other");
         assert_eq!(op_label(&Method::POST, "/bucket", ""), "other");
         assert_eq!(op_label(&Method::POST, "/bucket", "uploads"), "other");
+        // Decoded once, as SigV4 does: `d%2565lete` signs as the literal key `d%65lete`.
+        assert_eq!(op_label(&Method::POST, "/bucket", "d%2565lete"), "other");
+        assert_eq!(op_label(&Method::POST, "/bucket/key", "d%65lete"), "other");
     }
 
     // --- S3's 1,024-byte object-key limit (issue #620) ------------------------------------------
@@ -5205,22 +5463,341 @@ mod tests {
         assert_eq!(bucket_scoped_path("///"), None);
     }
 
+    // --- the query classifier (issue #667) -------------------------------------------------
+    // The wire-level red→green discriminator is `crates/server/tests/s3_multipart_routing.rs`.
+    // These pin the classification itself, shape by shape.
+
+    /// What [`classify_query`] makes of `query` for `method` on `target`.
+    fn route(method: Method, target: QueryTarget, query: &str) -> Option<QueryRoute> {
+        classify_query(&method, target, &DecodedQuery::decode(query))
+    }
+
+    fn unsupported(key: &str) -> Option<QueryRoute> {
+        Some(QueryRoute::Unsupported(key.to_string()))
+    }
+
+    fn multipart(op: MultipartOp) -> Option<QueryRoute> {
+        Some(QueryRoute::Multipart(op))
+    }
+
     #[test]
-    fn unsupported_subresource_flags_multipart_and_subresource_forms() {
-        // Destructive if mishandled: UploadPart would overwrite the whole object,
-        // ?tagging DELETE would delete the object. These must be refused (501).
+    fn classify_query_refuses_denylisted_subresources_in_any_spelling() {
+        use QueryTarget::{Bucket, Object};
+        // Destructive if mishandled: a `DELETE ?tagging` would delete the object itself.
         assert_eq!(
-            unsupported_subresource("partNumber=1&uploadId=abc"),
+            route(Method::DELETE, Object, "tagging"),
+            unsupported("tagging")
+        );
+        assert_eq!(route(Method::GET, Object, "acl"), unsupported("acl"));
+        assert_eq!(
+            route(Method::GET, Object, "versionId=3"),
+            unsupported("versionId")
+        );
+        // Matched decoded, on the object route as on the bucket route.
+        assert_eq!(
+            route(Method::PUT, Object, "t%61gging=1"),
+            unsupported("tagging")
+        );
+        assert_eq!(route(Method::GET, Bucket, "%61cl"), unsupported("acl"));
+        // A denylisted key wins over a multipart shape beside it.
+        assert_eq!(
+            route(Method::PUT, Object, "partNumber=1&uploadId=U&t%61gging=1"),
+            unsupported("tagging")
+        );
+        assert_eq!(
+            route(Method::GET, Bucket, "uploads&%61cl"),
+            unsupported("acl")
+        );
+        // Ordinary requests take the plain verb: no query, the benign `x-id` a real SDK adds,
+        // a listing.
+        assert_eq!(route(Method::PUT, Object, ""), None);
+        assert_eq!(route(Method::PUT, Object, "x-id=PutObject"), None);
+        assert_eq!(route(Method::GET, Object, "x-id=GetObject"), None);
+        assert_eq!(route(Method::GET, Bucket, "list-type=2&prefix=a"), None);
+    }
+
+    #[test]
+    fn classify_query_routes_each_well_formed_multipart_shape_to_its_operation() {
+        use QueryTarget::{Bucket, Object};
+        let id = |s: &str| s.to_string();
+        assert_eq!(
+            route(Method::POST, Object, "uploads"),
+            multipart(MultipartOp::Create)
+        );
+        assert_eq!(
+            route(Method::PUT, Object, "partNumber=1&uploadId=U"),
+            multipart(MultipartOp::UploadPart {
+                upload_id: id("U"),
+                part_number: 1
+            })
+        );
+        assert_eq!(
+            route(Method::POST, Object, "uploadId=U"),
+            multipart(MultipartOp::Complete { upload_id: id("U") })
+        );
+        assert_eq!(
+            route(Method::DELETE, Object, "uploadId=U"),
+            multipart(MultipartOp::Abort { upload_id: id("U") })
+        );
+        assert_eq!(
+            route(Method::GET, Object, "uploadId=U"),
+            multipart(MultipartOp::ListParts { upload_id: id("U") })
+        );
+        assert_eq!(
+            route(Method::GET, Bucket, "uploads"),
+            multipart(MultipartOp::ListUploads)
+        );
+        // A benign parameter beside the shape (ListParts' own `max-parts`) leaves it as it is.
+        assert_eq!(
+            route(Method::GET, Object, "max-parts=10&uploadId=U"),
+            multipart(MultipartOp::ListParts { upload_id: id("U") })
+        );
+        // Decoded once, keys and values alike, as SigV4 canonicalises them ...
+        assert_eq!(
+            route(Method::POST, Object, "upload%73"),
+            multipart(MultipartOp::Create)
+        );
+        assert_eq!(
+            route(Method::DELETE, Object, "upload%49d=a%2Fb"),
+            multipart(MultipartOp::Abort {
+                upload_id: id("a/b")
+            })
+        );
+        assert_eq!(
+            route(Method::PUT, Object, "part%4Eumber=7&uploadId=U"),
+            multipart(MultipartOp::UploadPart {
+                upload_id: id("U"),
+                part_number: 7
+            })
+        );
+        // ... and only once: `%254E` decodes to the literal `%4E`, which names no multipart key.
+        assert_eq!(route(Method::PUT, Object, "part%254Eumber=1"), None);
+        // The upload id is the verb's to check: an unknown or malformed one still routes.
+        assert_eq!(
+            route(Method::DELETE, Object, "uploadId=zz"),
+            multipart(MultipartOp::Abort {
+                upload_id: id("zz")
+            })
+        );
+        // The part-number RANGE is the seam's: canonical `0` and `10001` route.
+        for (query, part_number) in [
+            ("partNumber=0&uploadId=U", 0),
+            ("partNumber=10001&uploadId=U", 10_001),
+        ] {
+            assert_eq!(
+                route(Method::PUT, Object, query),
+                multipart(MultipartOp::UploadPart {
+                    upload_id: id("U"),
+                    part_number
+                }),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_query_keeps_part_ranged_reads_off_the_multipart_routes() {
+        // GetObject / HeadObject by part number: valid S3, not multipart, not implemented.
+        assert_eq!(
+            route(Method::GET, QueryTarget::Object, "partNumber=1"),
+            Some(QueryRoute::PartRead)
+        );
+        assert_eq!(
+            route(Method::HEAD, QueryTarget::Object, "part%4Eumber=1"),
+            Some(QueryRoute::PartRead)
+        );
+    }
+
+    #[test]
+    fn classify_query_refuses_every_ill_formed_multipart_shape() {
+        use QueryTarget::{Bucket, Object};
+        for (method, target, query) in [
+            // A key missing, or one too many, for the method.
+            (&Method::PUT, Object, "partNumber=1"),
+            (&Method::PUT, Object, "uploadId=U"),
+            (&Method::PUT, Object, "uploads"),
+            (&Method::PUT, Object, "uploads&partNumber=1&uploadId=U"),
+            (&Method::POST, Object, "uploads&uploadId=U"),
+            (&Method::POST, Object, "partNumber=1&uploadId=U"),
+            (&Method::DELETE, Object, "partNumber=1"),
+            (&Method::DELETE, Object, "uploads"),
+            (&Method::DELETE, Object, "uploadId=U&partNumber=1"),
+            (&Method::GET, Object, "uploads"),
+            (&Method::GET, Object, "partNumber=1&uploadId=U"),
+            (&Method::HEAD, Object, "uploadId=U"),
+            (&Method::PATCH, Object, "uploadId=U"),
+            // Bucket-scoped: only `GET ?uploads` is a multipart operation.
+            (&Method::GET, Bucket, "uploadId=U"),
+            (&Method::GET, Bucket, "partNumber=1"),
+            (&Method::GET, Bucket, "uploads&uploadId=U"),
+            (&Method::POST, Bucket, "uploads"),
+            (&Method::PUT, Bucket, "uploadId=U"),
+            (&Method::DELETE, Bucket, "uploadId=U"),
+            // A key repeated is refused, never first-wins — whatever its spelling.
+            (&Method::DELETE, Object, "uploadId=U&uploadId=V"),
+            (&Method::DELETE, Object, "uploadId=U&upload%49d=U"),
+            (&Method::PUT, Object, "partNumber=1&partNumber=2&uploadId=U"),
+            (&Method::POST, Object, "uploads&uploads"),
+            // A part number that is not canonical decimal digits, on any method.
+            (&Method::PUT, Object, "partNumber=abc&uploadId=U"),
+            (&Method::PUT, Object, "partNumber=+1&uploadId=U"),
+            (&Method::PUT, Object, "partNumber=%2B1&uploadId=U"),
+            (&Method::PUT, Object, "partNumber=01&uploadId=U"),
+            (&Method::PUT, Object, "partNumber=&uploadId=U"),
+            (&Method::PUT, Object, "partNumber&uploadId=U"),
+            (&Method::PUT, Object, "partNumber=1.0&uploadId=U"),
+            (&Method::PUT, Object, "partNumber=%201&uploadId=U"),
+            (&Method::PUT, Object, "partNumber=4294967296&uploadId=U"),
+            (&Method::GET, Object, "partNumber=abc"),
+        ] {
+            let got = classify_query(method, target, &DecodedQuery::decode(query));
+            assert!(
+                matches!(got, Some(QueryRoute::IllFormed(_))),
+                "{method} {target:?} ?{query}: expected IllFormed, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_part_number_takes_canonical_digits_only() {
+        assert_eq!(parse_part_number("1"), Some(1));
+        assert_eq!(parse_part_number("10000"), Some(10_000));
+        assert_eq!(parse_part_number("0"), Some(0));
+        assert_eq!(parse_part_number("4294967295"), Some(u32::MAX));
+        for bad in [
+            "",
+            "+1",
+            "-1",
+            "01",
+            "00",
+            " 1",
+            "1 ",
+            "1.0",
+            "abc",
+            "1e3",
+            "4294967296",
+        ] {
+            assert_eq!(parse_part_number(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn bulk_delete_refuses_multipart_and_denylisted_keys_but_not_its_marker() {
+        let foreign = |query: &str| {
+            foreign_subresource_on_delete(&DecodedQuery::decode(query)).map(str::to_string)
+        };
+        assert_eq!(foreign("delete"), None);
+        assert_eq!(foreign("delete="), None);
+        assert_eq!(foreign("delete&x-id=DeleteObjects"), None);
+        assert_eq!(foreign("delete&versionId=v").as_deref(), Some("versionId"));
+        assert_eq!(foreign("delete&uploads").as_deref(), Some("uploads"));
+        assert_eq!(foreign("delete&uploadId=U").as_deref(), Some("uploadId"));
+        assert_eq!(
+            foreign("delete&part%4Eumber=1").as_deref(),
             Some("partNumber")
         );
-        assert_eq!(unsupported_subresource("uploads"), Some("uploads"));
-        assert_eq!(unsupported_subresource("tagging"), Some("tagging"));
-        assert_eq!(unsupported_subresource("acl"), Some("acl"));
-        assert_eq!(unsupported_subresource("versionId=3"), Some("versionId"));
-        // Ordinary object requests pass: empty query, and the benign x-id a real SDK adds.
-        assert_eq!(unsupported_subresource(""), None);
-        assert_eq!(unsupported_subresource("x-id=PutObject"), None);
-        assert_eq!(unsupported_subresource("x-id=GetObject"), None);
+    }
+
+    /// The query routes through the REAL router, SigV4 included, against a backend that records
+    /// writes (the full table runs over the wire in `s3_multipart_routing.rs`). A row is `(method,
+    /// path, query, status, S3 code, text its message carries)`; none reaches a PUT or a DELETE.
+    #[tokio::test]
+    async fn the_router_answers_each_query_route_and_reaches_no_write() {
+        const NOT_IMPL: &str = "NotImplemented";
+        const BAD_ARG: &str = "InvalidArgument";
+        const BAD_BUCKET: &str = "InvalidBucketName";
+        #[rustfmt::skip]
+        const TABLE: &[(&str, &str, &str, u16, &str, &str)] = &[
+            // An operation's `501` names its selector and the operation.
+            ("POST", "/b/k", "uploads", 501, NOT_IMPL, "`uploads`"),
+            ("POST", "/b/k", "uploads", 501, NOT_IMPL, "CreateMultipartUpload"),
+            ("DELETE", "/b/k", "upload%49d=U", 501, NOT_IMPL, "AbortMultipartUpload"),
+            ("GET", "/b", "uploads", 501, NOT_IMPL, "ListMultipartUploads"),
+            // A part-ranged read, a denylisted key beside a multipart shape, an ill-formed shape.
+            ("GET", "/b/k", "partNumber=1", 501, NOT_IMPL, "by part number"),
+            ("PUT", "/b/k", "partNumber=1&uploadId=U&t%61gging=1", 501, NOT_IMPL, "`tagging`"),
+            ("PUT", "/b/k", "part%4Eumber=1", 400, BAD_ARG, "`partNumber`"),
+            ("GET", "/b", "uploadId=U&partNumber=1", 400, BAD_ARG, "`uploadId`, `partNumber`"),
+            ("DELETE", "/b/k", "uploadId=U&upload%49d=V", 400, BAD_ARG, "more than once"),
+            ("PUT", "/b/k", "partNumber=%2B1&uploadId=U", 400, BAD_ARG, "decimal digits"),
+            // The alias is refused ahead of a well-formed and an ill-formed shape, on both routes.
+            // A part-ranged read and a denylisted key are not multipart routes.
+            ("POST", "/b%2Fa/k", "uploads", 400, BAD_BUCKET, "cannot contain"),
+            ("PUT", "/b%2Fa/k", "partNumber=1", 400, BAD_BUCKET, "cannot contain"),
+            ("GET", "/b%2Fa", "uploads", 400, BAD_BUCKET, "cannot contain"),
+            ("GET", "/b%2Fa/k", "partNumber=1", 501, NOT_IMPL, "by part number"),
+            ("PUT", "/b%2Fa/k", "tagging", 501, NOT_IMPL, "`tagging`"),
+            // Bulk delete fires only on a POST carrying the marker: a GET with it meets the
+            // denylist, a POST without it keeps the bucket route's `400`, and with it a multipart
+            // key beside it is refused.
+            ("GET", "/b", "delete", 501, NOT_IMPL, "`delete`"),
+            ("POST", "/b", "", 400, "InvalidRequest", "bucket-scoped"),
+            ("POST", "/b", "delete&part%4Eumber=1", 501, NOT_IMPL, "`partNumber`"),
+            // The same with the marker encoded, and a double-encoded marker that signs as another
+            // key. On an object path the marker stays a denylisted key.
+            ("GET", "/b", "d%65lete", 501, NOT_IMPL, "`delete`"),
+            ("POST", "/b", "d%65lete&part%4Eumber=1", 501, NOT_IMPL, "`partNumber`"),
+            ("POST", "/b", "d%2565lete", 400, "InvalidRequest", "bucket-scoped"),
+            ("POST", "/b/k", "d%65lete", 501, NOT_IMPL, "`delete`"),
+        ];
+        let gateway = Arc::new(RecordingGateway::default());
+        for (method, path, query, status, code, text) in TABLE {
+            let (got, body) =
+                signed_key_limit_request(&gateway, method, path, query, Vec::new()).await;
+            assert_eq!(got.as_u16(), *status, "{method} {path}?{query}: {body}");
+            assert!(
+                body.contains(&format!("<Code>{code}</Code>")) && body.contains(text),
+                "{method} {path}?{query}: expected {code} with {text:?}, got {body}"
+            );
+            assert!(
+                gateway.puts.lock().unwrap().is_empty()
+                    && gateway.deletes.lock().unwrap().is_empty(),
+                "{method} {path}?{query} reached a write"
+            );
+        }
+    }
+
+    /// The other side of that table: forms that are not multipart still reach the plain verb, a
+    /// key that decodes to a multipart key only on a SECOND decode among them.
+    #[tokio::test]
+    async fn the_router_keeps_the_plain_verbs_for_every_non_multipart_query() {
+        let gateway = Arc::new(RecordingGateway::default());
+        for query in ["", "x-id=PutObject", "part%254Eumber=1"] {
+            let (status, body) =
+                signed_key_limit_request(&gateway, "PUT", "/b/k", query, b"x".to_vec()).await;
+            assert_eq!(status, StatusCode::OK, "PUT ?{query}: {body}");
+        }
+        assert_eq!(gateway.puts.lock().unwrap().len(), 3);
+        let (status, body) =
+            signed_key_limit_request(&gateway, "DELETE", "/b/k", "x-id=DeleteObject", Vec::new())
+                .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(gateway.deletes.lock().unwrap().as_slice(), ["b/k"]);
+        // The bulk-delete route itself: a POST with the marker and a `<Delete>` body.
+        let (status, body) = signed_key_limit_request(
+            &gateway,
+            "POST",
+            "/b",
+            "delete",
+            b"<Delete><Object><Key>k2</Key></Object></Delete>".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(gateway.deletes.lock().unwrap().as_slice(), ["b/k", "b/k2"]);
+        // And with the marker encoded: it signs as `delete`, so it takes the same route.
+        let (status, body) = signed_key_limit_request(
+            &gateway,
+            "POST",
+            "/b",
+            "d%65lete",
+            b"<Delete><Object><Key>k3</Key></Object></Delete>".to_vec(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            gateway.deletes.lock().unwrap().as_slice(),
+            ["b/k", "b/k2", "b/k3"]
+        );
     }
 
     #[test]
