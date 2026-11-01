@@ -7,8 +7,10 @@
 //! `async fn`. The protocol's store round trips live beside it, in child modules, and use only
 //! what this file defines: [`create`], `CreateMultipartUpload`'s admission and session creation
 //! (#894), [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
-//! fence's batch (#895), and [`stage`], `UploadPart`'s staging half: the slot reserve and the
-//! owned intent per chunk (#932). After this file a reader can name every key the protocol
+//! fence's batch (#895), [`complete`], the fence phase of `CompleteMultipartUpload`: the fence,
+//! the validation against the frozen part set, and the release of a rejected request's fence
+//! (#1007), and [`stage`], `UploadPart`'s staging half: the slot reserve and the owned intent
+//! per chunk (#932). After this file a reader can name every key the protocol
 //! will ever write (`0016` §1, `:333-527`), parse it back, **and decode the record values that
 //! key space names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and
 //! the two derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence`
@@ -105,8 +107,11 @@
 //! `retire:bytes:` through the one fence batch builder the restore fence also commits
 //! ([`abort::fence_batch`]); neither has a production caller until the S3 verbs are wired
 //! (#668). Staging ([`stage::stage_part`], #932) writes `slot:` and `sidx:`, and has no
-//! production caller until the S3 `UploadPart` verb is wired (#669). Every other first writer
-//! is a store round trip still to land: the part commit (#927), then #658–#659.
+//! production caller until the S3 `UploadPart` verb is wired (#669). The Complete fence
+//! ([`complete::fence_complete`], #1007) writes `mpu:` only: the fence and, for a rejected
+//! request, its release; it publishes nothing and has no production caller until the S3 verb
+//! is wired (#670). Every other first writer is a store round trip still to land: the part
+//! commit (#927), publication (#1008–#1011), then #659.
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -151,6 +156,7 @@ use crate::metadata::{
 };
 
 pub mod abort;
+pub mod complete;
 pub mod create;
 pub mod stage;
 
@@ -2349,8 +2355,10 @@ struct SessionRecordWire {
 /// the identity [`decode_session_record`] enforces — precisely the reason [`AdmissionRecord`] and
 /// [`Budget`] omit one too. The writer-side routes are the one creation route Create uses
 /// (`SessionRecord::open`, crate-private, #894), which can only mint an `Open` session, and the
-/// transitions of a record that already decoded ([`Self::open_teardown`],
-/// [`Self::completing_teardown`]), which change only `epoch` and `state`.
+/// transitions of a record that already decoded: the teardowns ([`Self::open_teardown`],
+/// [`Self::completing_teardown`]), which change only `epoch` and `state`, and the Complete fence
+/// and its release (`SessionRecord::complete_fence` and `SessionRecord::fence_released`,
+/// crate-private, #1007), which also move `attempts`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SessionRecordWire")]
 pub struct SessionRecord {
@@ -2600,6 +2608,59 @@ impl SessionRecord {
             },
             bytes: RetireObligation::session_teardown(upload_id, self.epoch),
             records: RetireObligation::attempt_segments(upload_id, group),
+        })
+    }
+
+    /// The **Complete fence of an `Open@E` session** (`0016:661`): this session at
+    /// `Completing@E+1`, stamped `fenced_at_millis`, with no segment written yet, its publish
+    /// target its own `parent` and `object` at the new epoch, and one more Complete fence spent
+    /// (`attempts + 1`). The `W_completing` rollback is measured from that stamp (`0016:1005-1009`),
+    /// so it must be a reading of the clock this session's [`clock_source`](Self::clock_source)
+    /// names; [`complete::fence_complete`] checks that before it builds one.
+    ///
+    /// It holds the identity [`decode_session_record`] enforces: the publish target agrees with
+    /// the session's own target and epoch, and the cursor starts at 0. `None` unless the session
+    /// is `Open` below `u64::MAX`, or when `attempts` is at `u32::MAX`. The cap
+    /// [`MAX_COMPLETE_ATTEMPTS`] is not checked here: it is a knob, enforced where a fence is
+    /// admitted (see [`Self::attempts`]).
+    pub(crate) fn complete_fence(&self, fenced_at_millis: u64) -> Option<Self> {
+        if !matches!(self.state, SessionState::Open {}) {
+            return None;
+        }
+        let epoch = self.epoch.checked_add(1)?;
+        Some(Self {
+            epoch,
+            attempts: self.attempts.checked_add(1)?,
+            state: SessionState::Completing {
+                fenced_at_millis,
+                segments_written: 0,
+                publish_target: PublishTarget {
+                    parent: self.parent,
+                    name: self.object.clone(),
+                    epoch,
+                },
+            },
+            ..self.clone()
+        })
+    }
+
+    /// The **release of a Complete fence** (`0016:664`): this `Completing@E` session back at
+    /// `Open@E+1`, with its fence stamps dropped and `attempts` set to the value given. For a
+    /// fence that wrote no segment that value is the one read before the fence: such a fence
+    /// minted no `seg:` epoch, which is all the cap bounds (`0016:661`), so a rejected request
+    /// spends nothing (#1007). The charging rule for a fence that did write segments is #1009's.
+    ///
+    /// The segment-group nonce stays, for the next attempt (`0016:538-552`). `None` unless the
+    /// session is `Completing` below `u64::MAX`.
+    pub(crate) fn fence_released(&self, attempts: u32) -> Option<Self> {
+        if !matches!(self.state, SessionState::Completing { .. }) {
+            return None;
+        }
+        Some(Self {
+            epoch: self.epoch.checked_add(1)?,
+            attempts,
+            state: SessionState::Open {},
+            ..self.clone()
         })
     }
 }
