@@ -192,6 +192,35 @@ pub const ADVISORY_DB_SUBMODULE: &str = ".github/advisory-db";
 /// never touches the shared copy in `$CARGO_HOME/advisory-dbs` other projects use.
 pub const ADVISORY_DB_PATH: &str = "target/advisory-dbs";
 
+/// Where the pinned commit is fetched from — the URL `.gitmodules` declares for
+/// [`ADVISORY_DB_SUBMODULE`]. Named, never `origin` (#1035): a clone folder that is not its
+/// own repository makes git walk up to the Wyrd checkout, whose `origin` lacks the commit.
+pub const ADVISORY_DB_URL: &str = "https://github.com/RustSec/advisory-db";
+
+/// Whether `dir` is the top of its own git repository, so a `git` command run there acts on
+/// that clone and not on a repository above it (#1035). A restored CI cache can bring the
+/// clone folder back without its `.git`; such a folder must be cloned again, not reused.
+pub fn is_own_git_repo(dir: &std::path::Path) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let top = String::from_utf8_lossy(&output.stdout);
+    match (
+        std::fs::canonicalize(top.trim()),
+        std::fs::canonicalize(dir),
+    ) {
+        (Ok(top), Ok(dir)) => top == dir,
+        _ => false,
+    }
+}
+
 /// The commit a gitlink records, from `git ls-files -s <path>` output
 /// (`160000 <sha> 0\t<path>`). Anything else — no entry, a regular file, a malformed line —
 /// is an error: the wall must never fall back to an unpinned database without saying so.
