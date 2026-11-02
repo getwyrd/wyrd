@@ -2,7 +2,7 @@
 //!
 //! It is `aws-sdk-s3` pointed at an arbitrary `--endpoint`: path-style addressing, static
 //! SigV4 credentials, and retries and stalled-stream protection **off**, so every request the
-//! validator reports on is exactly one request on the wire. On top of the SDK it adds seven
+//! validator reports on is exactly one request on the wire. On top of the SDK it adds eight
 //! things:
 //!
 //! * a plain-HTTP connector of its own (TLS is terminated in front of the gateway, proposal
@@ -24,8 +24,10 @@
 //!   end the framing marks, a PUT or DELETE success that carries a body, and a success the
 //!   SDK cannot read, with the SDK's diagnostic kept;
 //! * a byte budget, [`BUFFERED_BODY_BUDGET`] (64 KiB), on every body the SDK buffers — every
-//!   error response and every PUT or DELETE response — counted as the body arrives, so a body
-//!   with no declared length is cut off at the budget rather than read whole;
+//!   error response and every PUT or DELETE response — and on every body the client reads
+//!   whole itself (an [`Answer`]'s: a HEAD's, a listing page's, a ranged or conditional GET's
+//!   that is not a 2xx), counted as the body arrives, so a body with no declared length is cut
+//!   off at the budget rather than read whole;
 //! * bounded waits ([`Deadlines`]): connect, operation, body-idle, and whole body, each
 //!   expiring as a typed timeout naming its phase;
 //! * bodies that stream both ways ([`PutSource`], [`ObjectBody`]), so what the client holds
@@ -33,11 +35,25 @@
 //!   budget: it streams, whether it is framed by a `Content-Length` or chunked;
 //! * PUTs that end with their call ([`S3Client::put_object`]): a receipt only when the source
 //!   had ended before the answer, and neither the source nor the connection left behind when
-//!   the call returns.
+//!   the call returns;
+//! * answers kept whole for the verbs `smoke` sends beyond those three that only read
+//!   (`s3/verbs.rs`, #938): HEAD, a ranged and a conditional GET, and `ListObjectsV2` and
+//!   `ListObjects` followed across pages. Each reports the head as the server sent it, every
+//!   header field line included, and reads the body itself, under the budget and the body
+//!   deadlines, so a body that fails after a 2xx head is reported beside that 2xx, never in
+//!   its place ([`Answer`], `s3/answer.rs`), and a listing page whose 2xx carries an S3
+//!   `<Error>` document in place of the listing is reported with that document's code and
+//!   message beside the 2xx. Listing pages are read by the same strict rules as an error
+//!   document (`s3/document.rs`). A request that fails before the SDK calls the connector (an
+//!   endpoint the SDK's endpoint rules refuse, for one) is [`S3Error::RequestNotBuilt`], since
+//!   it was never sent.
 
+mod answer;
 mod body;
+mod document;
 mod error;
 mod response;
+mod verbs;
 mod wire;
 
 use std::future::Future;
@@ -56,7 +72,9 @@ use aws_sdk_s3::error::{BoxError, DisplayErrorContext, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use futures_util::future::{self, Either};
 
+pub use answer::{Answer, BodyFailure, Fetched, Head, NoResult, Outcome};
 pub use body::{ObjectBody, PutSource};
+pub use document::{ListEntry, Listing, ListingError, MAX_LISTING_PAGES};
 pub use error::{BodyError, ErrorCode, Phase, S3Error};
 pub use response::BUFFERED_BODY_BUDGET;
 
@@ -85,13 +103,14 @@ pub struct Deadlines {
     /// covers the upload, so the default is sized for a large object rather than a small
     /// one.
     pub operation: Duration,
-    /// The wait for each next piece of a GET body.
+    /// The wait for each next piece of a body the client reads itself: a GET object's, and the
+    /// body of every [`Answer`] (`s3/answer.rs`).
     pub body_idle: Duration,
-    /// A whole GET body, from the moment its response head is read to its end. The operation
-    /// deadline ends with the response head, and the idle deadline restarts at every piece,
-    /// so without this a peer that trickles a byte inside every idle window could hold a
-    /// worker for as long as its declared length lasts. The default matches `operation`:
-    /// the same object read back gets the budget its upload had.
+    /// A whole body the client reads itself, from the moment its response head is read to its
+    /// end. The operation deadline ends with the response head, and the idle deadline restarts
+    /// at every piece, so without this a peer that trickles a byte inside every idle window
+    /// could hold a worker for as long as its declared length lasts. The default matches
+    /// `operation`: the same object read back gets the budget its upload had.
     pub body: Duration,
 }
 
@@ -217,7 +236,7 @@ impl S3Client {
     /// **The cost, per PUT.** One thread for its length, and, as for every request the
     /// client makes (`s3/wire.rs`), a fresh TCP connection that the client closes: no
     /// connection is reused, and each one leaves a client socket in `TIME_WAIT`. That caps
-    /// sustained requests (PUT, GET and DELETE requests together) between one client address
+    /// sustained requests (of every verb, together) between one client address
     /// and one gateway address at about the number of ephemeral ports divided by the
     /// `TIME_WAIT` time: about 470 a second with Linux's defaults (28,232 ports, 60 s). Past
     /// that, `connect` fails and the request is [`S3Error::NoResponse`], which proposal 0017's
@@ -296,23 +315,7 @@ impl S3Client {
             .get()
             .cloned()
             .expect("the response guard records the framing of every GET success");
-        let declared = match framing {
-            Framing::Length(n) => Some(n),
-            // Chunked framing marks its own end, so the body is accepted without a length.
-            Framing::Chunked => None,
-            // Without either a cut connection is indistinguishable from the end of the
-            // object, so the body is refused rather than trusted.
-            Framing::Undeclared => return Err(S3Error::Body(BodyError::LengthUndeclared)),
-            Framing::Untrusted {
-                transfer_encoding,
-                content_length,
-            } => {
-                return Err(S3Error::Body(BodyError::Framing {
-                    transfer_encoding,
-                    content_length,
-                }))
-            }
-        };
+        let declared = object_length(framing).map_err(S3Error::Body)?;
         Ok(ObjectBody::new(
             output.body,
             declared,
@@ -405,6 +408,27 @@ impl S3Client {
                 None => S3Error::NoResponse { detail },
             },
         }
+    }
+}
+
+/// The length a GET success's `framing` declares for the object it streams: its
+/// `Content-Length`, or `None` for chunked framing, which marks its own end; or why the body
+/// cannot be read as the object.
+fn object_length(framing: Framing) -> Result<Option<u64>, BodyError> {
+    match framing {
+        Framing::Length(n) => Ok(Some(n)),
+        // Chunked framing marks its own end, so the body is accepted without a length.
+        Framing::Chunked => Ok(None),
+        // Without either a cut connection is indistinguishable from the end of the object, so
+        // the body is refused rather than trusted.
+        Framing::Undeclared => Err(BodyError::LengthUndeclared),
+        Framing::Untrusted {
+            transfer_encoding,
+            content_length,
+        } => Err(BodyError::Framing {
+            transfer_encoding,
+            content_length,
+        }),
     }
 }
 

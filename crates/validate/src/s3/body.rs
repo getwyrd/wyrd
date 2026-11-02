@@ -351,7 +351,7 @@ impl http_body::Body for DeclaredLengthBody {
 }
 
 /// The first error of type `E` in `err`'s source chain, `err` included.
-fn source_of<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&'a E> {
+pub(super) fn source_of<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&'a E> {
     let mut next = Some(err);
     while let Some(err) = next {
         if let Some(found) = err.downcast_ref::<E>() {
@@ -363,7 +363,7 @@ fn source_of<'a, E: Error + 'static>(err: &'a (dyn Error + 'static)) -> Option<&
 }
 
 /// An error and its sources, joined with `": "`.
-fn error_chain(err: &(dyn Error + 'static)) -> String {
+pub(super) fn error_chain(err: &(dyn Error + 'static)) -> String {
     let mut text = err.to_string();
     let mut source = err.source();
     while let Some(e) = source {

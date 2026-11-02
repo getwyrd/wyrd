@@ -15,7 +15,12 @@
 //! * for a GET success, which streams, records the framing for the caller to enforce piece by
 //!   piece ([`super::ObjectBody`]), and leaves the body uncapped.
 //!
-//! The buffered body of an error response is then read by [`error_document`], strictly.
+//! The buffered body of an error response is then read by [`error_document`], strictly, by the
+//! rules [`whole_document`] holds every document the client reads to.
+//!
+//! The verbs that report an answer whole (`super::answer`) take the body from the SDK at the
+//! same hook instead, and read it themselves; [`Framing`] and [`whole_document`] are shared
+//! with them.
 
 use std::fmt;
 use std::pin::Pin;
@@ -35,9 +40,11 @@ use super::error::ErrorCode;
 /// The most bytes of a response body the client buffers: 64 KiB.
 ///
 /// It applies to every body the SDK reads whole (every error response, and every PUT or
-/// DELETE response) and to no successful GET body, which streams. A PUT or DELETE success
-/// has no body at all, so one that sends a byte is refused at that byte, well inside the
-/// budget. S3 error documents are small: a few hundred bytes, except
+/// DELETE response), to every body the client reads whole itself (the body of an
+/// [`super::Answer`]: a HEAD's, a listing page's, and a ranged or conditional GET's that is not
+/// a 2xx), and to no successful GET body, which streams. A PUT
+/// or DELETE success has no body at all, so one that sends a byte is refused at that byte,
+/// well inside the budget. S3 error documents are small: a few hundred bytes, except
 /// `SignatureDoesNotMatch`, which echoes the canonical request twice (as text, and as hex
 /// bytes at three characters a byte) and the string to sign. For this client's requests that
 /// is at most about 20 KiB, even with a 1024-byte key whose every byte is percent-encoded,
@@ -351,54 +358,37 @@ impl http_body::Body for Budgeted {
 ///
 /// An empty body is [`ErrorCode::NoBody`]. Otherwise the body must be one well-formed XML
 /// document (UTF-8, every element closed, no DTD, elements nested at most
-/// [`MAX_ERROR_DOCUMENT_DEPTH`] deep) whose root element is `<Error>`, with nothing but the
+/// [`MAX_DOCUMENT_DEPTH`] deep) whose root element is `<Error>`, with nothing but the
 /// XML declaration, whitespace and comments before it and nothing but whitespace and
-/// comments after it. `<Code>` and `<Message>` are the root's child elements of those names,
-/// each at most once, each holding text only (character references and CDATA sections are
-/// text; an element, a comment or a processing instruction is not); a document without a
-/// `<Code>`, or whose `<Code>` holds only whitespace, is [`ErrorCode::MissingInXml`]. The
-/// SDK's own reading is not used: it accepts a document that is cut off or followed by junk,
-/// reads a field up to the first markup inside it, and makes up `NotFound` for a bodiless 404
-/// (`aws-sdk-s3` 1.152.0 `protocol_serde.rs:25-30`).
+/// comments after it ([`whole_document`]). `<Code>` and `<Message>` are the root's child
+/// elements of those names, each at most once, each holding text only (character references
+/// and CDATA sections are text; an element, a comment or a processing instruction is not); a
+/// document without a `<Code>`, or whose `<Code>` holds only whitespace, is
+/// [`ErrorCode::MissingInXml`]. The SDK's own reading is not used: it accepts a document that
+/// is cut off or followed by junk, reads a field up to the first markup inside it, and makes
+/// up `NotFound` for a bodiless 404 (`aws-sdk-s3` 1.152.0 `protocol_serde.rs:25-30`).
 pub(super) fn error_document(body: &[u8]) -> Result<(ErrorCode, Option<String>), String> {
     if body.is_empty() {
         return Ok((ErrorCode::NoBody, None));
     }
-    let text = std::str::from_utf8(body)
-        .map_err(|e| format!("the error response body is not UTF-8: {e}"))?;
-    // Before the parser, which recurses once per level of nesting with no limit of its own
-    // (`roxmltree` 0.21.1 `tokenizer.rs`, `parse_element` and `parse_content`): a body nested
-    // a few thousand levels deep, well inside the budget, would overflow the stack, an abort
-    // no caller can catch.
-    if nests_deeper_than(body, MAX_ERROR_DOCUMENT_DEPTH) {
-        return Err(format!(
-            "the error response body nests elements more than {MAX_ERROR_DOCUMENT_DEPTH} \
-             deep, and an S3 error document is two deep"
-        ));
-    }
-    let document = roxmltree::Document::parse(text)
-        .map_err(|e| format!("the error response body is not a well-formed XML document: {e}"))?;
-    let root = document.root_element();
-    if root.tag_name().name() != "Error" {
-        return Err(format!(
-            "the error response body is an XML document whose root is <{}>, not <Error>",
-            root.tag_name().name()
-        ));
-    }
-    // Outside the root the parser refuses text and elements and keeps no whitespace (the XML
-    // declaration is not a node either), so what can sit there is comments and processing
-    // instructions. A processing instruction is well-formed XML, but no part of an S3 error
-    // document, before the root or after it.
-    if document
-        .root()
-        .children()
-        .any(|node| node != root && !node.is_comment())
-    {
-        return Err(
+    let document = whole_document(body, "Error").map_err(|fault| match fault {
+        NotADocument::NotUtf8(e) => format!("the error response body is not UTF-8: {e}"),
+        NotADocument::TooDeep => format!(
+            "the error response body nests elements more than {MAX_DOCUMENT_DEPTH} deep, and \
+             an S3 error document is two deep"
+        ),
+        NotADocument::Malformed(e) => {
+            format!("the error response body is not a well-formed XML document: {e}")
+        }
+        NotADocument::Root(name) => format!(
+            "the error response body is an XML document whose root is <{name}>, not <Error>"
+        ),
+        NotADocument::Around => {
             "the <Error> document has something other than whitespace or comments around it"
-                .to_string(),
-        );
-    }
+                .to_string()
+        }
+    })?;
+    let root = document.root_element();
     let mut code = None;
     let mut message = None;
     for child in root.children().filter(roxmltree::Node::is_element) {
@@ -408,38 +398,114 @@ pub(super) fn error_document(body: &[u8]) -> Result<(ErrorCode, Option<String>),
             "Message" => &mut message,
             _ => continue,
         };
-        let text = child
-            .children()
-            .map(|node| {
-                node.is_text()
-                    .then(|| node.text())
-                    .flatten()
-                    .ok_or_else(|| {
-                        format!("the <{name}> of the <Error> document holds markup, not only text")
-                    })
-            })
-            .collect::<Result<String, String>>()?;
+        let text = text_only(child).ok_or_else(|| {
+            format!("the <{name}> of the <Error> document holds markup, not only text")
+        })?;
         if slot.replace(text).is_some() {
             return Err(format!("the <Error> document has more than one <{name}>"));
         }
     }
-    // An empty `<Code>` names no code, any more than an absent one does. XML's whitespace
-    // (`S`, XML 1.0 §2.3) is the only kind trimmed: a code is never read as anything else.
-    let code = code
-        .filter(|code| {
-            !code
-                .trim_matches(['\x20', '\x09', '\x0D', '\x0A'])
-                .is_empty()
-        })
-        .map_or(ErrorCode::MissingInXml, ErrorCode::Code);
-    Ok((code, message))
+    Ok((named_code(code), message))
 }
 
-/// The deepest element nesting [`error_document`] parses, the root being level one. An S3
-/// error document is two levels deep (`<Error>` and its fields); this leaves room for an
-/// extension element nested inside a field, and keeps the parser's recursion to a few
-/// kilobytes of stack per level.
-const MAX_ERROR_DOCUMENT_DEPTH: usize = 16;
+/// A `<Code>` as read: an absent one, or one that is empty, names no code. XML's whitespace
+/// (`S`, XML 1.0 §2.3) is the only kind trimmed: a code is never read as anything else.
+pub(super) fn named_code(code: Option<String>) -> ErrorCode {
+    code.filter(|code| {
+        !code
+            .trim_matches(['\x20', '\x09', '\x0D', '\x0A'])
+            .is_empty()
+    })
+    .map_or(ErrorCode::MissingInXml, ErrorCode::Code)
+}
+
+/// Why a body is not one whole XML document under the root it should have.
+#[derive(Debug)]
+pub(super) enum NotADocument {
+    /// The body is not UTF-8.
+    NotUtf8(std::str::Utf8Error),
+    /// An element is nested more than [`MAX_DOCUMENT_DEPTH`] deep.
+    TooDeep,
+    /// The body is not well-formed XML (a DTD included, which the parser refuses).
+    Malformed(roxmltree::Error),
+    /// The document's root element has this name instead.
+    Root(String),
+    /// Something other than whitespace and comments sits before or after the root.
+    Around,
+}
+
+impl NotADocument {
+    /// The fault in words, for a body described as `what` that should be one `<root>`
+    /// document.
+    pub(super) fn describe(&self, what: &str, root: &str) -> String {
+        match self {
+            Self::NotUtf8(e) => format!("{what} is not UTF-8: {e}"),
+            Self::TooDeep => {
+                format!("{what} nests elements more than {MAX_DOCUMENT_DEPTH} deep")
+            }
+            Self::Malformed(e) => format!("{what} is not a well-formed XML document: {e}"),
+            Self::Root(name) => {
+                format!("{what} is an XML document whose root is <{name}>, not <{root}>")
+            }
+            Self::Around => format!(
+                "the <{root}> document has something other than whitespace or comments around it"
+            ),
+        }
+    }
+}
+
+/// `body` read strictly as one whole XML document whose root element is `<root>`: UTF-8,
+/// every element closed, no DTD, elements nested at most [`MAX_DOCUMENT_DEPTH`] deep, and
+/// nothing but the XML declaration, whitespace and comments before the root and nothing but
+/// whitespace and comments after it. The one reading every document the client reads itself
+/// goes through: the error document here, and a listing page (`super::document`).
+pub(super) fn whole_document<'a>(
+    body: &'a [u8],
+    root: &str,
+) -> Result<roxmltree::Document<'a>, NotADocument> {
+    let text = std::str::from_utf8(body).map_err(NotADocument::NotUtf8)?;
+    // Before the parser, which recurses once per level of nesting with no limit of its own
+    // (`roxmltree` 0.21.1 `tokenizer.rs`, `parse_element` and `parse_content`): a body nested
+    // a few thousand levels deep, well inside the budget, would overflow the stack, an abort
+    // no caller can catch.
+    if nests_deeper_than(body, MAX_DOCUMENT_DEPTH) {
+        return Err(NotADocument::TooDeep);
+    }
+    let document = roxmltree::Document::parse(text).map_err(NotADocument::Malformed)?;
+    let found = document.root_element();
+    if found.tag_name().name() != root {
+        return Err(NotADocument::Root(found.tag_name().name().to_string()));
+    }
+    // Outside the root the parser refuses text and elements and keeps no whitespace (the XML
+    // declaration is not a node either), so what can sit there is comments and processing
+    // instructions. A processing instruction is well-formed XML, but no part of an S3
+    // document, before the root or after it.
+    if document
+        .root()
+        .children()
+        .any(|node| node != found && !node.is_comment())
+    {
+        return Err(NotADocument::Around);
+    }
+    Ok(document)
+}
+
+/// The text `element` holds, when it holds text only: character references and CDATA
+/// sections are text; an element, a comment or a processing instruction is not. An empty
+/// element holds the empty text.
+pub(super) fn text_only(element: roxmltree::Node<'_, '_>) -> Option<String> {
+    element
+        .children()
+        .map(|node| node.is_text().then(|| node.text()).flatten())
+        .collect()
+}
+
+/// The deepest element nesting [`whole_document`] parses, the root being level one. An S3
+/// error document is two levels deep (`<Error>` and its fields), a listing three
+/// (`<Contents>` and its fields); this leaves room for an extension
+/// element nested inside a field, and keeps the parser's recursion to a few kilobytes of stack
+/// per level.
+const MAX_DOCUMENT_DEPTH: usize = 16;
 
 /// Whether `xml` has an element more than `limit` levels deep (the root is level one) before
 /// anything the parser would stop at. Never less deep than the parser goes: comments, CDATA

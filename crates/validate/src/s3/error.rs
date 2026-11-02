@@ -83,9 +83,10 @@ pub enum Phase {
     /// The whole request up to a deserialized response head: for a PUT, that includes the
     /// upload.
     Operation,
-    /// Waiting for the next piece of a GET body.
+    /// Waiting for the next piece of a body the client reads itself: a GET object's, or an
+    /// answer's (`super::Answer`).
     BodyIdle,
-    /// Reading a whole GET body, from its response head to its end.
+    /// Reading a whole body the client reads itself, from its response head to its end.
     Body,
 }
 
