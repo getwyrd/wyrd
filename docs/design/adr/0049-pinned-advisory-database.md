@@ -24,7 +24,7 @@ The advisory check itself must stay. A pull request that adds or changes a depen
 
 The commit of the RustSec advisory database (<https://github.com/RustSec/advisory-db>) that the wall audits against is recorded in the repository as the gitlink of the `.github/advisory-db` submodule. Only the gitlink is used; nothing needs to check the submodule out.
 
-Both deny configs set `db-path = "target/advisory-dbs"`. Before the wall runs, `cargo xtask ci` moves cargo-deny's clone there to the pinned commit (fetching only that commit), downloads the crates in `Cargo.lock` with `cargo fetch --locked`, and runs every wall invocation with `--offline`. A pull request now fails the advisory check only when the dependencies it brings, or the pin it moves, carry an advisory. CI and a laptop audit the same database.
+Both deny configs set `db-path = "target/advisory-dbs"`. Before the wall runs, `cargo xtask ci` moves cargo-deny's clone there to the pinned commit (fetching only that commit), downloads the crates in `Cargo.lock` with `cargo fetch --locked`, and runs every wall invocation with `--offline`. It fetches the pin from the RustSec URL, never the clone's `origin`, and clones again when the folder is not its own git repository, as a restored CI cache can leave it (#1035). A pull request now fails the advisory check only when the dependencies it brings, or the pin it moves, carry an advisory. CI and a laptop audit the same database.
 
 `cargo xtask advisories` runs the advisory part of the wall alone, against the pin.
 
