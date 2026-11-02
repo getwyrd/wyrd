@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use xtask::{
-    advisory_invocations, check_advisory_pin_age, dependency_wall_invocations, offline,
-    parse_gitlink, ADVISORY_DB_PATH, ADVISORY_DB_SUBMODULE, MAX_ADVISORY_PIN_AGE_DAYS,
+    advisory_invocations, check_advisory_pin_age, dependency_wall_invocations, is_own_git_repo,
+    offline, parse_gitlink, ADVISORY_DB_PATH, ADVISORY_DB_SUBMODULE, ADVISORY_DB_URL,
+    MAX_ADVISORY_PIN_AGE_DAYS,
 };
 
 /// The workspace root (`<root>/xtask` is this crate's manifest dir).
@@ -72,7 +73,11 @@ fn the_index_pins_the_rustsec_database_as_a_declared_submodule() {
         "--get",
         "submodule.advisory-db.url",
     ]);
-    assert_eq!(url.trim(), "https://github.com/RustSec/advisory-db");
+    assert_eq!(
+        url.trim(),
+        ADVISORY_DB_URL,
+        "xtask fetches the pin from this URL, so it must be the submodule's (#1035)"
+    );
     let path = git(&[
         "config",
         "-f",
@@ -169,4 +174,39 @@ fn the_pin_age_is_the_commit_date_not_the_fetch_time() {
         check_advisory_pin_age(now + DAY, now).is_ok(),
         "clock skew is not staleness"
     );
+}
+
+/// A fresh folder under this test's scratch directory, which lies inside the Wyrd checkout
+/// (`target/tmp`) — where cargo-deny's clone lives too.
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create scratch folder");
+    dir
+}
+
+#[test]
+fn a_clone_folder_without_its_own_git_is_not_reused() {
+    // #1035: a restored CI cache brought `target/advisory-dbs/advisory-db-*` back without
+    // its `.git`. git walked up to the Wyrd checkout, and the pin fetch asked getwyrd/wyrd
+    // for a RustSec commit ("not our ref"), failing every PR.
+    let restored = scratch("advisory-db-without-git");
+    assert!(
+        !is_own_git_repo(&restored),
+        "a folder inside the Wyrd checkout with no .git of its own must be cloned again"
+    );
+    assert!(!is_own_git_repo(&restored.join("missing")));
+}
+
+#[test]
+fn a_real_clone_folder_is_reused() {
+    let clone = scratch("advisory-db-with-git");
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&clone)
+        .status()
+        .expect("spawn git");
+    assert!(status.success());
+    assert!(is_own_git_repo(&clone));
+    assert!(is_own_git_repo(&workspace_root()));
 }
