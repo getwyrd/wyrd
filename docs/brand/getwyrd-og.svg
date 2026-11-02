@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Wyrd — distributed file storage with atomic writes">
+  <rect width="1200" height="630" fill="#211e1a"/>
+  <!-- faint woven lines -->
+  <g stroke="#f7f4ee" stroke-opacity="0.06" stroke-width="1">
+    <line x1="0" y1="110" x2="1200" y2="110"/><line x1="0" y1="520" x2="1200" y2="520"/>
+    <line x1="96" y1="0" x2="96" y2="630"/><line x1="1104" y1="0" x2="1104" y2="630"/>
+  </g>
+  <!-- mark -->
+  <g transform="translate(96,135) scale(7.5)">
+    <polygon points="24,3 45,24 24,45 3,24" fill="none" stroke="#f7f4ee" stroke-width="2.4" stroke-linejoin="round"/>
+    <polygon points="24,14 34,24 24,34 14,24" fill="#a2453f"/>
+  </g>
+  <!-- wordmark -->
+  <text x="500" y="268" font-family="Bitstream Charter, Charter, Georgia, serif" font-size="150" font-weight="normal" fill="#f7f4ee" letter-spacing="-3">wyrd</text>
+  <text x="504" y="340" font-family="Bitstream Charter, Charter, Georgia, serif" font-size="40" font-style="italic" fill="#e7e0d3">What is written, stays written.</text>
+  <text x="504" y="420" font-family="DejaVu Sans, Liberation Sans, sans-serif" font-size="26" fill="#b7afa2">Distributed file storage with atomic writes</text>
+  <text x="504" y="458" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="22" fill="#8a8378">Rust · Apache-2.0 · open source</text>
+  <text x="1104" y="580" text-anchor="end" font-family="DejaVu Sans Mono, Liberation Mono, monospace" font-size="24" fill="#a2453f">getwyrd.dev</text>
+</svg>
