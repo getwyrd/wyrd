@@ -21,6 +21,7 @@
 
 pub mod access_keys;
 pub mod args;
+pub mod matrix;
 pub mod payload;
 pub mod s3;
 pub mod sizes;
