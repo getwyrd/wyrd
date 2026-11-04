@@ -2014,8 +2014,14 @@ fn prepare_pinned_advisory_db() -> Result<(), String> {
         &["ls-files", "-s", "--", xtask::ADVISORY_DB_SUBMODULE],
     )?)?;
     let db = match advisory_db_dir(&root) {
-        Some(db) => db,
-        None => {
+        Some(db) if xtask::is_own_git_repo(&db) => db,
+        stale => {
+            // A folder without its own `.git` (a restored CI cache, #1035) would send every
+            // git command below to the Wyrd checkout; clone again instead of reusing it.
+            if let Some(stale) = stale {
+                std::fs::remove_dir_all(&stale)
+                    .map_err(|e| format!("remove {}: {e}", stale.display()))?;
+            }
             cargo(&["deny", "fetch", "db"])?;
             advisory_db_dir(&root).ok_or_else(|| {
                 format!(
@@ -2026,8 +2032,18 @@ fn prepare_pinned_advisory_db() -> Result<(), String> {
         }
     };
     if git_stdout(&db, &["rev-parse", "HEAD"])?.trim() != pin {
-        print_step(&["git", "fetch", "--depth", "1", "origin", &pin]);
-        git_stdout(&db, &["fetch", "--quiet", "--depth", "1", "origin", &pin])?;
+        print_step(&["git", "fetch", "--depth", "1", xtask::ADVISORY_DB_URL, &pin]);
+        git_stdout(
+            &db,
+            &[
+                "fetch",
+                "--quiet",
+                "--depth",
+                "1",
+                xtask::ADVISORY_DB_URL,
+                &pin,
+            ],
+        )?;
         git_stdout(&db, &["checkout", "--quiet", "--detach", &pin])?;
     }
     let committed = git_stdout(&db, &["log", "-1", "--format=%ct", "HEAD"])?;
