@@ -17,9 +17,10 @@
 //! and a cut never hides a wrong status or byte that already arrived. A run with any row
 //! unproved, or none proved, is INCONCLUSIVE, never PASS.
 //!
-//! The `required` rows' own evidence (object bytes, headers, documents, follow-ups) is the
-//! second slice of #937. Until it lands a `required` row is judged by the facts every row
-//! shares and is otherwise unsettled: reported unproved, never passed.
+//! A `required` row reads a closed table of facts: the defined status, the headers the table
+//! names, the body or document, and the follow-up `HEAD`s of a delete. An exercise whose recorded
+//! ask cannot test its row never passes, and is still judged by every check that does not depend
+//! on the ask.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -851,8 +852,8 @@ struct Evidence {
     body: Vec<Finding>,
     /// Each follow-up request's own answer, in their order.
     follow_ups: Vec<Finding>,
-    /// What leaves the row unproved whatever arrived: a row the tool does not check, or one
-    /// whose checks are not built yet.
+    /// What leaves the row unproved whatever arrived: a row the tool does not check, or an
+    /// exercise that carries no check of its own.
     open: Vec<Finding>,
 }
 
@@ -914,15 +915,15 @@ pub fn classify(row: &Row, exercise: &Exercise) -> RowResult {
         Expected::SupportedNotChecked { issue } => {
             evidence.open.push(Finding::NotChecked(issue));
         }
-        Expected::Required => required(&mut evidence),
+        Expected::Required => required(exercise, response, &mut evidence),
     }
     evidence.settle()
 }
 
-/// The facts every exercise that got a head is held to, whatever its row and whatever it asked:
+/// The fact every exercise that got a head is held to, whatever its row and whatever it asked:
 /// a 5xx is an answer, and not the defined one, so it is `protocol` unless the row declares
-/// that very status (0017 §7). (The other, a 404 to a typed read of a written key being
-/// `oracle`, reads the `required` rows' exercises and lands with their checks.)
+/// that very status (0017 §7). (Its pair, a 404 to a typed read of a written key being
+/// `oracle`, reads the `required` rows' exercises: see [`required`].)
 fn shared_facts(row: &Row, response: &Response, evidence: &mut Evidence) {
     let got = response.status;
     let declared = matches!(row.expected, Expected::Unsupported { status, .. } if status == got);
@@ -995,13 +996,454 @@ fn refusal(status: u16, code: DeclaredCode, response: &Response, evidence: &mut 
     }
 }
 
-/// A `required` row's own evidence: what its exercise asked, its headers, its object bytes or
-/// document, and its follow-ups. Those checks are the second slice of #937; until it lands a
-/// `required` row is judged by the shared facts alone and is otherwise unsettled, never passed.
-fn required(evidence: &mut Evidence) {
-    evidence.open.push(Finding::Unproved(
-        "required-row checks not yet defined".to_string(),
-    ));
+/// A `required` row's own evidence, by what its exercise asked and recorded. The table is closed:
+/// a row reads these facts and no others.
+///
+/// | Row | Status | Headers, in this order | Body |
+/// |---|---|---|---|
+/// | `PutObject` | 200 | `ETag` strong; `Content-Length` absent or 0 | none, after the request body ended |
+/// | `GetObject` whole | 200 | `Content-Length` absent or the size | the object's bytes |
+/// | ranged | 206 | `Content-Range` exact; `Content-Length` absent or the span | the span's bytes |
+/// | conditional, matching | 304 | none | none |
+/// | conditional, non-matching | 200 | as whole `GetObject` | the object's bytes |
+/// | `HeadObject` | 200 | `Content-Length` = size; `ETag` = the PUT's | none |
+/// | `DeleteObject` | 204 | `Content-Length` absent or 0 | none, then the follow-up `HEAD`s |
+/// | `DeleteObjects` | 200 | none | a `<DeleteResult>`, then the follow-up `HEAD`s |
+/// | follow-up `HEAD` of a requested key | 404 | none | none |
+/// | `ListObjectsV2`, v1 | 200 | none | the listing, every page together |
+///
+/// No check returns early and none is skipped for a cut or an unfit ask, except that a ranged GET
+/// outside its object and a `DeleteObjects` of no keys read nothing of their own answer past the
+/// two facts every exercise is held to: what they asked says nothing about what the rest should
+/// be. A check after a wrong status cannot change the result (the status comes first in message
+/// order), so those checks do not look at the status themselves.
+fn required(exercise: &Exercise, response: &Response, evidence: &mut Evidence) {
+    if is_typed_read(exercise) && response.status == 404 {
+        evidence.status.push(Finding::Fatal(
+            FailureClass::Oracle,
+            "answered 404 to a read of a key the run wrote".to_string(),
+        ));
+    }
+    match exercise {
+        Exercise::PutObject {
+            request_body_ended, ..
+        } => {
+            // A success before that is not a receipt (`BodyError::AcknowledgedEarly`); a refusal
+            // may rightly come early, and a wrong status is judged below.
+            if response.is_success() && !request_body_ended {
+                let got = response.status;
+                evidence.request.push(Finding::protocol(format!(
+                    "answered {got} before the request body had ended"
+                )));
+            }
+            defined_status(response, 200, evidence);
+            strong_etag(response, evidence);
+            declares_no_body(response, evidence);
+            no_body(response, &mut evidence.body);
+        }
+        Exercise::GetObject { object, .. } => {
+            defined_status(response, 200, evidence);
+            object_bytes(response, object, evidence);
+        }
+        Exercise::GetObjectRanged {
+            object,
+            first,
+            last,
+            ..
+        } => {
+            let size = object.len() as u64;
+            if first > last || *last >= size {
+                evidence.request.push(Finding::Unproved(format!(
+                    "asked bytes={first}-{last} of an object of {size} bytes"
+                )));
+                return;
+            }
+            defined_status(response, 206, evidence);
+            content_range(response, (*first, *last, size), evidence);
+            // In range by the guard above, so the slice cannot panic.
+            object_bytes(
+                response,
+                &object[*first as usize..=*last as usize],
+                evidence,
+            );
+        }
+        Exercise::GetObjectIfNoneMatchHit {
+            sent, etag, object, ..
+        } => {
+            let fit = is_strong_etag(sent) && sent == etag;
+            conditional(fit, 304, sent, etag, object, response, evidence);
+        }
+        Exercise::GetObjectIfNoneMatchMiss {
+            sent, etag, object, ..
+        } => {
+            let fit = is_strong_etag(sent) && sent != etag;
+            conditional(fit, 200, sent, etag, object, response, evidence);
+        }
+        Exercise::HeadObject { size, etag, .. } => {
+            defined_status(response, 200, evidence);
+            head_matches_the_object(response, *size, etag, evidence);
+            no_body(response, &mut evidence.body);
+        }
+        Exercise::DeleteObject {
+            key, follow_ups, ..
+        } => {
+            defined_status(response, 204, evidence);
+            declares_no_body(response, evidence);
+            no_body(response, &mut evidence.body);
+            judge_follow_ups(std::slice::from_ref(key), follow_ups, evidence);
+        }
+        Exercise::DeleteObjects {
+            keys, follow_ups, ..
+        } => {
+            if keys.is_empty() {
+                evidence.request.push(Finding::Unproved(
+                    "a DeleteObjects of no keys tests nothing".to_string(),
+                ));
+            } else {
+                let mut requested = keys.clone();
+                requested.sort();
+                let named_twice = requested.windows(2).any(|pair| pair[0] == pair[1]);
+                if named_twice {
+                    evidence.request.push(Finding::Unproved(format!(
+                        "the delete names a key twice: {requested:?}"
+                    )));
+                }
+                defined_status(response, 200, evidence);
+                delete_result(
+                    response,
+                    (!named_twice).then_some(requested.as_slice()),
+                    &mut evidence.body,
+                );
+            }
+            // Asked of no keys, every follow-up is of a key the delete did not request.
+            judge_follow_ups(keys, follow_ups, evidence);
+        }
+        Exercise::ListObjectsV2 { expected, .. } | Exercise::ListObjects { expected, .. } => {
+            if expected.is_empty() {
+                evidence.request.push(Finding::Unproved(
+                    "a listing of a prefix with nothing written proves nothing".to_string(),
+                ));
+            }
+            defined_status(response, 200, evidence);
+            listing(response, expected, &mut evidence.body);
+        }
+        Exercise::Other { operation, .. } => evidence.open.push(Finding::Unproved(format!(
+            "this exercise of {operation:?} carries no check of a required row"
+        ))),
+    }
+}
+
+/// A `GetObject` form's or `HeadObject`'s own request, of a key the run wrote. A delete's
+/// follow-up `HEAD` is not one: there a 404 is the defined answer.
+fn is_typed_read(exercise: &Exercise) -> bool {
+    matches!(
+        exercise,
+        Exercise::GetObject { .. }
+            | Exercise::GetObjectRanged { .. }
+            | Exercise::GetObjectIfNoneMatchHit { .. }
+            | Exercise::GetObjectIfNoneMatchMiss { .. }
+            | Exercise::HeadObject { .. }
+    )
+}
+
+fn defined_status(response: &Response, defined: u16, evidence: &mut Evidence) {
+    let got = response.status;
+    if got != defined {
+        evidence.status.push(Finding::protocol(format!(
+            "answered {got}; the row defines {defined}"
+        )));
+    }
+}
+
+/// The `If-None-Match` forms. An unfit ask (`fit` false) cannot tell which answer is the defined
+/// one, so 200 and 304 are both acceptable and the row stays unproved. Either way a 200 carries
+/// the object and a 304 carries nothing; any other status is already fatal.
+fn conditional(
+    fit: bool,
+    defined: u16,
+    sent: &str,
+    etag: &str,
+    object: &[u8],
+    response: &Response,
+    evidence: &mut Evidence,
+) {
+    if fit {
+        defined_status(response, defined, evidence);
+    } else {
+        evidence.request.push(Finding::Unproved(format!(
+            "sent If-None-Match: {sent}, which cannot test this row of an object tagged {etag}"
+        )));
+        let got = response.status;
+        if !matches!(got, 200 | 304) {
+            evidence.status.push(Finding::protocol(format!(
+                "answered {got}; a conditional GET answers 200 or 304"
+            )));
+        }
+    }
+    match response.status {
+        200 => object_bytes(response, object, evidence),
+        304 => no_body(response, &mut evidence.body),
+        _ => {}
+    }
+}
+
+fn strong_etag(response: &Response, evidence: &mut Evidence) {
+    match response.etag.as_deref() {
+        Some(etag) if is_strong_etag(etag) => {}
+        Some(etag) => evidence.headers.push(Finding::protocol(format!(
+            "ETag {etag:?} is not a strong entity-tag"
+        ))),
+        None => evidence
+            .headers
+            .push(Finding::protocol("answered with no ETag".to_string())),
+    }
+}
+
+/// A non-zero declared length declares a body the answer must not have, whatever arrived after.
+fn declares_no_body(response: &Response, evidence: &mut Evidence) {
+    if let Some(declared) = response.content_length.filter(|&declared| declared != 0) {
+        let got = response.status;
+        evidence.headers.push(Finding::protocol(format!(
+            "answered {got} declaring Content-Length {declared}; it carries no body"
+        )));
+    }
+}
+
+fn content_range(response: &Response, want: (u64, u64, u64), evidence: &mut Evidence) {
+    let (first, last, size) = want;
+    match response.content_range.as_deref() {
+        Some(value) if parse_content_range(value) == Some(want) => {}
+        Some(value) => evidence.headers.push(Finding::protocol(format!(
+            "Content-Range {value:?}; expected \"bytes {first}-{last}/{size}\""
+        ))),
+        None => evidence.headers.push(Finding::protocol(
+            "answered with no Content-Range".to_string(),
+        )),
+    }
+}
+
+/// What `HeadObject` reports is the server's account of the object: both are `oracle`, and an
+/// absent header counts as different.
+fn head_matches_the_object(response: &Response, size: u64, etag: &str, evidence: &mut Evidence) {
+    let (length, tag) = (response.content_length, response.etag.as_deref());
+    if length != Some(size) {
+        evidence.headers.push(Finding::Fatal(
+            FailureClass::Oracle,
+            format!("Content-Length {length:?}; the object holds {size} bytes"),
+        ));
+    }
+    if tag != Some(etag) {
+        evidence.headers.push(Finding::Fatal(
+            FailureClass::Oracle,
+            format!("ETag {tag:?}; the PUT answered {etag:?}"),
+        ));
+    }
+}
+
+/// An answer that carries object bytes, `want` being those it must carry: the declared length,
+/// then the bytes. A wrong byte is `integrity` whether or not a cut followed it; a correct prefix
+/// or a count that still fits proves nothing either way.
+fn object_bytes(response: &Response, want: &[u8], evidence: &mut Evidence) {
+    let size = want.len() as u64;
+    if let Some(declared) = response.content_length.filter(|&declared| declared != size) {
+        evidence.headers.push(Finding::Fatal(
+            FailureClass::Integrity,
+            format!("Content-Length {declared}; expected {size} bytes"),
+        ));
+    }
+    let body = &mut evidence.body;
+    let differ = |got: &[u8], before: &str| {
+        let n = got.len();
+        let at = got
+            .iter()
+            .zip(want)
+            .position(|(a, b)| a != b)
+            .unwrap_or(got.len().min(want.len()));
+        Finding::Fatal(
+            FailureClass::Integrity,
+            format!("{n} bytes{before} differ from the expected {size} at offset {at}"),
+        )
+    };
+    match &response.body {
+        Body::Empty if want.is_empty() => {}
+        Body::Empty => body.push(differ(&[], "")),
+        Body::Bytes(got) if got == want => {}
+        Body::Bytes(got) => body.push(differ(got, "")),
+        Body::Cut {
+            arrived: Arrived::Bytes(got),
+            why,
+        } if want.starts_with(got) => body.push(Finding::Unproved(format!(
+            "cut off after {} correct bytes of {size}: {why}",
+            got.len()
+        ))),
+        Body::Cut {
+            arrived: Arrived::Bytes(got),
+            ..
+        } => body.push(differ(got, " before the cut")),
+        Body::Cut {
+            arrived: Arrived::Count(count),
+            why,
+        } if *count <= size => body.push(Finding::Unproved(format!(
+            "cut off after {count} bytes of {size}: {why}"
+        ))),
+        Body::Cut {
+            arrived: Arrived::Count(count),
+            ..
+        } => body.push(Finding::Fatal(
+            FailureClass::Integrity,
+            format!("{count} bytes before the cut; expected {size}"),
+        )),
+        Body::Unreadable { why } => {
+            body.push(Finding::protocol(format!("not object bytes: {why}")))
+        }
+        Body::Listing(_) | Body::DeleteResult(_) => body.push(Finding::protocol(
+            "a document where object bytes were expected".to_string(),
+        )),
+    }
+}
+
+/// An answer that carries no body: any byte, before a cut or not, or any document is `protocol`;
+/// a cut after no byte leaves the end of the answer unseen.
+fn no_body(response: &Response, stage: &mut Vec<Finding>) {
+    let got = response.status;
+    match &response.body {
+        Body::Empty => {}
+        Body::Bytes(bytes) if bytes.is_empty() => {}
+        Body::Bytes(bytes) => stage.push(Finding::protocol(format!(
+            "answered {got} with a body of {} bytes",
+            bytes.len()
+        ))),
+        Body::Cut { arrived, why } => match arrived.count() {
+            0 => stage.push(Finding::Unproved(format!(
+                "{got} cut off after the head: {why}"
+            ))),
+            n => stage.push(Finding::protocol(format!(
+                "answered {got} with a body of {n} bytes"
+            ))),
+        },
+        Body::Unreadable { .. } | Body::Listing(_) | Body::DeleteResult(_) => {
+            stage.push(Finding::protocol(format!("answered {got} with a body")))
+        }
+    }
+}
+
+/// Where a document was called for and did not arrive: cut off, it could not be read; whole, it
+/// is the wrong shape.
+fn not_the_document(name: &str, body: &Body, stage: &mut Vec<Finding>) {
+    stage.push(match body {
+        Body::Cut { why, .. } => Finding::Unproved(format!("the {name} was cut off: {why}")),
+        Body::Unreadable { why } => Finding::protocol(format!("the body is not a {name}: {why}")),
+        _ => Finding::protocol(format!("the body is not a {name}")),
+    });
+}
+
+/// The keys and sizes listed are exactly those written: one missing, extra, listed twice or of
+/// another size is a disagreement with the model.
+fn listing(response: &Response, expected: &[Listed], stage: &mut Vec<Finding>) {
+    let Body::Listing(listed) = &response.body else {
+        return not_the_document("listing", &response.body, stage);
+    };
+    let (mut got, mut want) = (listed.clone(), expected.to_vec());
+    got.sort();
+    want.sort();
+    if got != want {
+        stage.push(Finding::Fatal(
+            FailureClass::Oracle,
+            format!("listed {got:?}; wrote {want:?}"),
+        ));
+    }
+}
+
+/// No `<Error>` row (the gateway answers 200 even when keys failed,
+/// `crates/gateway-s3/src/lib.rs:2396-2397`, `:2548`), and `<Deleted>` naming each key of `exact`
+/// (sorted) once and nothing else. `exact` is `None` when the ask named a key twice, so no
+/// document could match it.
+fn delete_result(response: &Response, exact: Option<&[String]>, stage: &mut Vec<Finding>) {
+    let Body::DeleteResult(result) = &response.body else {
+        return not_the_document("<DeleteResult>", &response.body, stage);
+    };
+    if !result.errors.is_empty() {
+        let rows: Vec<String> = result
+            .errors
+            .iter()
+            .map(|failure| format!("{} ({})", failure.key, failure.code))
+            .collect();
+        stage.push(Finding::protocol(format!(
+            "<Error> rows in the <DeleteResult>: {}",
+            rows.join(", ")
+        )));
+    }
+    if let Some(requested) = exact {
+        let mut deleted = result.deleted.clone();
+        deleted.sort();
+        if deleted != requested {
+            stage.push(Finding::protocol(format!(
+                "<Deleted> names {deleted:?}; the delete requested {requested:?}"
+            )));
+        }
+    }
+}
+
+/// Every follow-up is judged, in order, against the key it asked about, and everything it found
+/// stays on the record: a follow-up of a requested key that did not prove the key gone says why
+/// itself, whatever another follow-up of that key answered, so a clean 404 settles nothing but
+/// its own probe. That leaves one way for a requested key to go unproved: nothing asked about it.
+fn judge_follow_ups(
+    requested: &[String],
+    follow_ups: &[(String, Answer)],
+    evidence: &mut Evidence,
+) {
+    for (key, answer) in follow_ups {
+        let findings = follow_up(requested.contains(key), key, answer);
+        evidence.follow_ups.extend(findings);
+    }
+    let probed = |key: &&String| follow_ups.iter().any(|(asked, _)| asked == *key);
+    for key in requested.iter().filter(|key| !probed(key)) {
+        evidence.follow_ups.push(Finding::Unproved(format!(
+            "no follow-up HEAD proved {key:?} gone"
+        )));
+    }
+}
+
+/// One follow-up `HEAD`, status then body. Of a requested key: 404 is the defined answer, a 2xx
+/// is `oracle`, anything else `protocol`. (The `oracle` holds "after an acknowledged delete": an
+/// unacknowledged one is already fatal on its own, earlier, status.) Of any other key: the delete
+/// names only its own keys and that key may well exist, so only the checks that do not depend on
+/// the key run, and it can never prove anything.
+fn follow_up(requested: bool, key: &str, answer: &Answer) -> Vec<Finding> {
+    let response = match answer {
+        Answer::Response(response) => response,
+        Answer::NoAnswer { why } => {
+            return vec![Finding::Unproved(format!(
+                "the follow-up HEAD of {key:?} got no answer: {why}"
+            ))];
+        }
+    };
+    let got = response.status;
+    let mut findings = Vec::new();
+    if requested {
+        if response.is_success() {
+            findings.push(Finding::Fatal(
+                FailureClass::Oracle,
+                format!("{key:?} answered {got} to a HEAD after its delete"),
+            ));
+        } else if got != 404 {
+            findings.push(Finding::protocol(format!(
+                "the follow-up HEAD of {key:?} answered {got}; the row defines 404"
+            )));
+        }
+    } else if (500..=599).contains(&got) {
+        findings.push(Finding::protocol(format!(
+            "the follow-up HEAD of {key:?} answered {got}, a 5xx"
+        )));
+    }
+    no_body(response, &mut findings);
+    if !requested {
+        findings.push(Finding::Unproved(format!(
+            "a follow-up HEAD of {key:?}, which the delete did not request"
+        )));
+    }
+    findings
 }
 
 /// A strong entity-tag (RFC 9110 §8.8.3): `"` etagc* `"`, etagc = `%x21 / %x23-7E / obs-text`.
@@ -1013,6 +1455,27 @@ pub fn is_strong_etag(value: &str) -> bool {
         && bytes[1..bytes.len() - 1]
             .iter()
             .all(|&b| b == 0x21 || (0x23..=0x7E).contains(&b) || b >= 0x80)
+}
+
+/// `bytes first-last/size` (RFC 9110 §14.4): the unit case-insensitive (§14.1), each number one
+/// or more ASCII digits (no `+` sign, which `u64::from_str` takes) that fits a `u64`.
+fn parse_content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let (unit, rest) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, size) = rest.split_once('/')?;
+    let (first, last) = range.split_once('-')?;
+    // `parse` refuses an empty string and a number too big for a `u64`; the digit check refuses
+    // the `+` it would take.
+    let digits = |s: &str| {
+        if s.bytes().all(|b| b.is_ascii_digit()) {
+            s.parse::<u64>().ok()
+        } else {
+            None
+        }
+    };
+    Some((digits(first)?, digits(last)?, digits(size)?))
 }
 
 // --- The run verdict ------------------------------------------------------------------------
