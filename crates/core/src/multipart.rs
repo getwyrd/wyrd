@@ -9,8 +9,9 @@
 //! (#894), [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
 //! fence's batch (#895), [`complete`], the fence phase of `CompleteMultipartUpload`: the fence,
 //! the validation against the frozen part set, and the release of a rejected request's fence
-//! (#1007), and [`stage`], `UploadPart`'s staging half: the slot reserve and the owned intent
-//! per chunk (#932). After this file a reader can name every key the protocol
+//! (#1007), [`stage`], `UploadPart`'s staging half: the slot reserve and the owned intent
+//! per chunk (#932), and [`commit`], `UploadPart`'s commit half: the part commit and its
+//! live-session compensation (#1027). After this file a reader can name every key the protocol
 //! will ever write (`0016` §1, `:333-527`), parse it back, **and decode the record values that
 //! key space names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and
 //! the two derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence`
@@ -101,17 +102,22 @@
 //! This file is the key **grammar** plus the record **shapes**: it makes no store call. Its
 //! writer-side API is the post-restore fence's two teardowns ([`SessionRecord::open_teardown`],
 //! #841, and [`SessionRecord::completing_teardown`], #842), the generation record that pass
-//! keeps ([`FenceGeneration`], #810), and one creation route each for a fresh session and for
-//! the admission ledger, which [`create::create_session`] commits (#894). So Create now writes
+//! keeps ([`FenceGeneration`], #810), one creation route each for a fresh session and for
+//! the admission ledger, which [`create::create_session`] commits (#894), and the part
+//! commit's part record, the summary derived from it, and its per-part `{chunks}` obligation,
+//! which [`commit::commit_part`] commits (#1027). So Create now writes
 //! `mpuctl`, `mpu:` and `seggrp:`, and Abort ([`abort::abort_session`], #895) writes `mpu:` and
 //! `retire:bytes:` through the one fence batch builder the restore fence also commits
 //! ([`abort::fence_batch`]); neither has a production caller until the S3 verbs are wired
-//! (#668). Staging ([`stage::stage_part`], #932) writes `slot:` and `sidx:`, and has no
-//! production caller until the S3 `UploadPart` verb is wired (#669). The Complete fence
+//! (#668). Staging ([`stage::stage_part`], #932) writes `slot:` and `sidx:`, and the part
+//! commit ([`commit::commit_part`], #1027) writes `part:`, `psum:` and a per-part
+//! `retire:bytes:` `{chunks}` obligation, releasing the slot and deleting the owned entries in
+//! the same batch; neither has a production caller until the S3 `UploadPart` verb is wired
+//! (#669). The Complete fence
 //! ([`complete::fence_complete`], #1007) writes `mpu:` only: the fence and, for a rejected
 //! request, its release; it publishes nothing and has no production caller until the S3 verb
-//! is wired (#670). Every other first writer is a store round trip still to land: the part
-//! commit (#927), publication (#1008–#1011), then #659.
+//! is wired (#670). Every other first writer is a store round trip still to land: publication
+//! (#1008–#1011), then #659.
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -156,6 +162,7 @@ use crate::metadata::{
 };
 
 pub mod abort;
+pub mod commit;
 pub mod complete;
 pub mod create;
 pub mod stage;
@@ -369,6 +376,16 @@ pub enum RecordError {
     PartLengthOverflow {
         /// How many chunks the absurd list carries.
         chunks: usize,
+    },
+    /// A session record whose bytes differ from the ones a batch of the attempt required, at the
+    /// same or a lower epoch. Every fence and every rollback bumps the epoch
+    /// ([`SessionRecord::epoch`], `0016:364`, `:704-708`), so no legal history wrote it: this is
+    /// damage, and no batch is sent under it.
+    SessionEpochNotRisen {
+        /// The epoch the stored record carries.
+        found: u64,
+        /// The epoch of the bytes the attempt required.
+        required: u64,
     },
     /// A part-number set run whose bounds are reversed, `lo > hi` (`0016:382-388`). A reversed
     /// run names no part at all, and its endpoints are a second spelling of the empty set.
@@ -705,6 +722,11 @@ impl fmt::Display for RecordError {
             Self::PartLengthOverflow { chunks } => {
                 write!(f, "summing {chunks} chunks' logical lengths overflows u64")
             }
+            Self::SessionEpochNotRisen { found, required } => write!(
+                f,
+                "a session record at epoch {found} differs from the bytes required at epoch \
+                 {required}: only a higher epoch can replace them"
+            ),
             Self::PartNumberRunReversed { lo, hi } => {
                 write!(f, "part-number run [{lo}, {hi}] is reversed")
             }
@@ -3048,7 +3070,11 @@ struct PartRecordWire {
 /// unknown field, both of which re-encode differently from the bytes they were read from — the
 /// identity a whole-record CAS turns on, one level in.
 ///
-/// No writer-side constructor — see [`SessionRecord`]'s doc for why.
+/// No free constructor, for the reason [`SessionRecord`] has none. The one writer-side route is
+/// crate-private, in the shape of `SessionRecord::open`: `PartRecord::commit` mints the value the
+/// part commit puts ([`commit`], #1027), applying the rules [`decode_part_record`] applies, and
+/// `PartRecord::summary` derives the `psum:` value from it, so the pair the commit writes cannot
+/// disagree (`0016:352`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PartRecordWire")]
 pub struct PartRecord {
@@ -3060,6 +3086,45 @@ pub struct PartRecord {
 }
 
 impl PartRecord {
+    /// The part the part commit installs (`0016:351`, `:660`): the attempt's ordered chunk list and
+    /// its digest, stamped `committed_at_millis` by the clock that owns the attempt's lease
+    /// lifecycle, under the session epoch the commit requires. `len` is derived, never passed, so
+    /// it is the checked sum leg 1k requires. Refuses what [`decode_part_record`] refuses (a chunk
+    /// whose scheme the coder does not support, a length past `u64`), so the value it returns
+    /// encodes to bytes that decode back to it.
+    pub(crate) fn commit(
+        chunks: Vec<ChunkRef>,
+        digest: Digest,
+        committed_at_millis: u64,
+        session_epoch: u64,
+    ) -> Result<Self, RecordError> {
+        for chunk in &chunks {
+            checked_chunk_scheme(chunk)?;
+        }
+        let len = checked_chunk_len(&chunks)?;
+        Ok(Self {
+            chunks,
+            len,
+            digest,
+            committed_at_millis,
+            session_epoch,
+        })
+    }
+
+    /// The `psum:` summary of this part: every field but the chunk list, which it counts
+    /// (`0016:352`). Derived here, never assembled beside the record, so the pair the commit
+    /// writes in one batch always agrees. The commit refuses a part past
+    /// [`MAX_PART_CHUNKS`] before it mints one, so the count fits; a record that somehow did not
+    /// would summarize as `u32::MAX`, which can only over-count the cumulative ceiling.
+    pub(crate) fn summary(&self) -> PartSummary {
+        PartSummary {
+            chunks: u32::try_from(self.chunks.len()).unwrap_or(u32::MAX),
+            len: self.len,
+            digest: self.digest,
+            committed_at_millis: self.committed_at_millis,
+        }
+    }
+
     /// This part's ordered chunks, each already validated structurally (leg 1i).
     pub fn chunks(&self) -> &[ChunkRef] {
         &self.chunks
@@ -3739,7 +3804,8 @@ struct RetirePayloadWire {
 /// There is no free constructor either: a value built without decode's rules is one a writer
 /// could make durable without them. The one writer-side route, [`RetireObligation`], mints a
 /// payload **with the key it goes under**, for the restore fence's two rows (`{session, all}` and
-/// a `Completing` attempt's `{seg}`); the store round trips (#656–#659) add their rows there.
+/// a `Completing` attempt's `{seg}`) and the part commit's per-part `{chunks}` row ([`commit`],
+/// #1027); the later store round trips (#658–#659) add their rows there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetirePayload {
     /// Omitted when absent rather than spelled `false` (`AGENTS.md:170-172`), so the accepted
@@ -4028,11 +4094,13 @@ pub fn decode_retire_obligation(
 }
 
 /// A retirement obligation **as a writer installs it**: key and payload minted by one constructor,
-/// so they cannot disagree — the writer-side mirror of [`decode_retire_obligation`]. Its only
+/// so they cannot disagree — the writer-side mirror of [`decode_retire_obligation`]. Its
 /// constructors are the teardown fence's rows ([`SessionRecord::open_teardown`], which the
-/// restore fence and Abort commit, and [`SessionRecord::completing_teardown`]); a later writer's
-/// row is added as its own constructor, never as a payload handed in beside a key the caller
-/// chose. That is what lets [`abort::fence_batch`] write only obligations this decoder accepts.
+/// restore fence and Abort commit, and [`SessionRecord::completing_teardown`]) and the part
+/// commit's per-part `{chunks}` row (`RetireObligation::part_chunks`, [`commit`]); a later
+/// writer's row is added as its own constructor, never as a payload handed in beside a key the
+/// caller chose. That is what lets [`abort::fence_batch`] and the part commit write only
+/// obligations this decoder accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireObligation {
     mode: RetireMode,
@@ -4079,6 +4147,45 @@ impl RetireObligation {
                 seg: Some(group),
             },
         }
+    }
+
+    /// `retire:bytes:s:<upload-id>:<epoch>:<part-number>:<attempt-id>` owing `{chunks}`
+    /// (`0016:358-373`, `:660`, `:673`): the chunks one part attempt's batch leaves with no naming
+    /// record, the prior part's a re-upload replaces or the attempt's own that its compensation
+    /// releases. `epoch` is the session epoch that batch requires. Refuses what
+    /// [`decode_retire_obligation`] refuses, an empty list included
+    /// ([`RecordError::RetireObligationOwesNothing`]), so a caller with nothing to retire installs
+    /// no obligation at all.
+    pub(crate) fn part_chunks(
+        upload_id: &UploadId,
+        epoch: u64,
+        part_number: PartNumber,
+        attempt_id: &AttemptId,
+        chunks: &[ChunkRef],
+    ) -> Result<Self, RecordError> {
+        if chunks.is_empty() {
+            return Err(RecordError::RetireObligationOwesNothing {
+                component: "chunks",
+            });
+        }
+        for chunk in chunks {
+            checked_chunk_scheme(chunk)?;
+        }
+        Ok(Self {
+            mode: RetireMode::Bytes,
+            token: RetireToken::Session {
+                upload_id: upload_id.clone(),
+                epoch,
+                part: Some((part_number, attempt_id.clone())),
+            },
+            payload: RetirePayload {
+                session: false,
+                parts: None,
+                chunks: chunks.to_vec(),
+                generation: None,
+                seg: None,
+            },
+        })
     }
 
     /// The key it is installed under ([`retire_key`]).

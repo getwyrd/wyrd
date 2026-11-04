@@ -360,7 +360,11 @@ pub trait StageRuntime: StageClock {
 /// What [`stage_part`] answers.
 #[derive(Debug)]
 pub enum StageOutcome {
-    /// The body is staged: every chunk is registered and its fragments are written.
+    /// The body is staged, or as much of it as the per-part bound allows: every chunk the attempt
+    /// holds is registered and its fragments are written. A body longer than `max_part_chunks`
+    /// chunks is answered here too, holding only a prefix ([`StagedAttempt::chunk_bound_exceeded`]),
+    /// whose [`StagedAttempt::len`] and [`StagedAttempt::digest`] describe only that prefix. The
+    /// part commit, the one route to a part record, refuses such an attempt and compensates it.
     Staged(Box<StagedAttempt>),
     /// A typed refusal: the session is not `Open` ([`Refusal::NoSuchUpload`]), or every slot
     /// index is taken ([`Backpressure::InflightParts`]). A refusal after the reservation leaves
