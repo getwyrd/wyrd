@@ -64,7 +64,7 @@ use tokio::time::Instant;
 
 use super::body::{error_chain, source_of, ObjectBody};
 use super::error::{BodyError, ErrorCode, Phase, S3Error};
-use super::response::{error_document, Framing, BUFFERED_BODY_BUDGET};
+use super::response::{error_document, whole_document, Framing, BUFFERED_BODY_BUDGET};
 use super::wire::Overrun;
 use super::REQUEST_ID_HEADER;
 
@@ -145,9 +145,12 @@ pub struct Answer {
 /// What an answer's body turned out to be, read against its status.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// A 2xx read whole. The body as sent: a HEAD's is empty, since the connector reports any
-    /// byte after a HEAD's head as [`BodyFailure::Overrun`]. A listing page's 2xx is read into
-    /// its [`super::Listing`] and a GET's streams ([`Fetched`]), so neither is one of these.
+    /// A 2xx whose body is the one the operation's success carries: none at all, or one whole
+    /// document under the root S3 gives that success. The body as sent: a HEAD's is empty, since
+    /// the connector reports any byte after a HEAD's head as [`BodyFailure::Overrun`]. A listing
+    /// page's 2xx is read into its [`super::Listing`], a delete result's into its
+    /// [`super::DeleteResult`], and a GET's streams ([`Fetched`]), so none of those is one of
+    /// these.
     Success { body: Bytes },
     /// An S3 error, read by the rules every error response is: its `<Code>` and `<Message>`.
     /// Either a status other than 2xx whose body is empty ([`ErrorCode::NoBody`]) or one whole
@@ -161,9 +164,10 @@ pub enum Outcome {
         message: Option<String>,
     },
     /// The body was read whole and is not what its status calls for: for a 2xx, neither the
-    /// document the operation's success carries (a document cut short, followed by junk, or
-    /// under another root; no body at all) nor an `<Error>` document; for any other status, not
-    /// an S3 error document. The body as sent, and why.
+    /// body the operation's success carries (a body where that success has none; a document cut
+    /// short, followed by junk, or under another root; no body where a document is due) nor an
+    /// `<Error>` document; for any other status, not an S3 error document. The body as sent, and
+    /// why.
     Unreadable { body: Bytes, detail: String },
     /// The body could not be read whole.
     BodyFailed(BodyFailure),
@@ -303,7 +307,8 @@ impl fmt::Debug for Fetched {
     }
 }
 
-/// Why a verb that reads a document from its answer (a listing page) has no result.
+/// Why a verb that reads a document from its answer (a listing page, a delete result) has no
+/// result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoResult {
     /// No answer arrived: the request was not built, no response head arrived, or a deadline
@@ -325,6 +330,30 @@ impl fmt::Display for NoResult {
 }
 
 impl std::error::Error for NoResult {}
+
+/// What the body of a 2xx must be to be the operation's success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SuccessBody {
+    /// None at all: a HEAD's, and the success of an operation S3 answers with headers only.
+    Empty,
+    /// One whole document under this root.
+    Document(&'static str),
+}
+
+impl SuccessBody {
+    fn read(self, body: &Bytes) -> Result<(), String> {
+        match self {
+            Self::Empty if body.is_empty() => Ok(()),
+            Self::Empty => Err(format!(
+                "the success carries a {}-byte body, and this operation's S3 success has none",
+                body.len()
+            )),
+            Self::Document(root) => whole_document(body, root)
+                .map(drop)
+                .map_err(|fault| fault.describe("the success body", root)),
+        }
+    }
+}
 
 /// `body`, read against `head`'s status: for a 2xx, what `success` reads from it; otherwise,
 /// and when `success` refuses it or the body failed, the [`Outcome`] that stands in its place.
@@ -349,9 +378,11 @@ pub(super) fn settle<T>(
     })
 }
 
-/// The answer of `head` and `body`, whose 2xx is a success with the body as sent.
-pub(super) fn answer(head: Head, body: Result<Bytes, BodyFailure>) -> Answer {
-    let outcome = match settle(&head, body, |body| Ok::<_, String>(body.clone())) {
+/// The answer of `head` and `body`, a 2xx read as `success` describes.
+pub(super) fn answer(head: Head, body: Result<Bytes, BodyFailure>, success: SuccessBody) -> Answer {
+    let outcome = match settle(&head, body, |body| {
+        success.read(body).map(|()| body.clone())
+    }) {
         Ok(body) => Outcome::Success { body },
         Err(outcome) => outcome,
     };
@@ -628,9 +659,10 @@ mod tests {
         assert_eq!(capture.name(), "wyrd-validate answer capture");
     }
 
-    /// `crates/validate/tests/s3_client_smoke_verbs.rs` drives every case an endpoint can make
-    /// of these verbs, all of which are GETs or HEADs. This is the one it cannot: a `304` to any
-    /// other request, whose `Transfer-Encoding` RFC 9112 §6.1 does not allow.
+    /// `crates/validate/tests/s3_client_smoke_verbs.rs` drives this through every probe, which is
+    /// what a `304` to a request other than a GET or a HEAD comes from. This pins the reading
+    /// itself, where the coding is one [`Framing::of`] does not trust for any request: RFC 9112
+    /// §6.1 allows it on a `304` to a GET and on no other `304`.
     #[test]
     fn a_304_to_anything_but_a_get_or_a_head_keeps_its_refusal() {
         let untrusted = || Framing::Untrusted {

@@ -1,19 +1,22 @@
-//! Issue #955 (the first part of #938, 743.2): the S3 client verbs `smoke` sends beyond PUT,
-//! GET and DELETE of one object that only read — HEAD, a ranged and a conditional GET,
-//! `ListObjectsV2` and `ListObjects` — each reporting what the server sent: status, every
+//! Issues #955 and #956 (the two parts of #938, 743.2): the S3 client verbs `smoke` sends beyond
+//! PUT, GET and DELETE of one object — HEAD, a ranged and a conditional GET, `ListObjectsV2` and
+//! `ListObjects` (#955), bulk `DeleteObjects` and one probe of each operation the capability
+//! matrix may declare unsupported (#956) — each reporting what the server sent: status, every
 //! header field line, S3 code and message, body.
 //!
-//! The production [`S3Client`] runs against two kinds of endpoint, both on loopback:
+//! The production [`S3Client`] runs against three kinds of endpoint, all on loopback:
 //!
 //! * a **real Wyrd S3 gateway** served in-process (redb + `MemCoordination` + a local
 //!   `FsChunkStore`, the composition `s3_client_roundtrip.rs` uses), with the bucket's marker
 //!   seeded on the store first so listings answer (ADR-0046 decision 1), or not seeded, for a
 //!   bucket with no record;
+//! * a **relay** in front of that gateway, which records every request's head and body and
+//!   counts connections, where a case must show what reached the gateway;
 //! * a **scripted endpoint** that reads one whole request and answers with exact bytes, for
 //!   the answers no conforming gateway sends (the pattern of
 //!   `s3_client_nonconforming_responses.rs`).
 //!
-//! The legs, as the brief names them:
+//! #955's legs, as its brief names them:
 //!
 //! * **(A)** against the gateway: HEAD of a written key is `200` with its size and `ETag`, of
 //!   a missing key `404` with no body; a ranged GET is `206` with the `Content-Range` as sent
@@ -49,23 +52,76 @@
 //! `NoResponse`; a GET's answer that carries an `x-amz-checksum-*` header is read as sent, and
 //! its request asks for no checksum; a HEAD answered with a body keeps its `200` beside the
 //! overrun; framing that cannot mark a body's end is refused beside the status, and a GET's 2xx
-//! streams only under framing that marks the object's end. (E) is the three existing client
-//! tests, run unmodified beside this one.
+//! streams only under framing that marks the object's end.
 //!
-//! RED before #955: none of these verbs exist, so the file does not compile.
+//! #956's legs, as its brief names them:
+//!
+//! * **(A)** against the gateway: `DeleteObjects` of four keys reports each under `<Deleted>`
+//!   and no `<Error>`, and the keys are then gone. 1,000 keys of 32 bytes fit the budget; 1,000
+//!   of 40 are refused beside the `200`, after the gateway has deleted them. With a store fault
+//!   behind some of the keys, the gateway's own `<Error>` rows: 1,000 keys of 32 bytes fit with
+//!   41 of them and are refused beside the `200` with 42. A key holding a carriage return is
+//!   deleted, and its row comes back with a line feed in the carriage return's place (the
+//!   gateway writes the key raw, and XML reads a raw carriage return as a line feed), so the
+//!   requested key has no row and the row names no requested key: reported, not judged.
+//! * **(B)** every probe reaches the gateway through the relay, on an IP-address and on a
+//!   host-name (`localhost`) endpoint, as exactly one request of its own form (method, path, the
+//!   operation parameters it alone carries, with their values, `CopyObject`'s
+//!   `x-amz-copy-source`, and its body with the framing off: `CompleteMultipartUpload`'s names
+//!   its one part, every other probe's is empty), and comes back with the gateway's status and
+//!   S3 code. `CreateBucket` and `DeleteBucket` naming buckets S3's naming rules forbid reach it
+//!   as one request with the name as given, one path segment percent-encoded where a byte is not
+//!   unreserved, addressed to the endpoint and signed for `s3` in the configured region, on both
+//!   endpoints. That includes the names the SDK's own endpoint rules would not send so: S3
+//!   Express suffixes (one a host label could carry, one it could not), an S3 on Outposts
+//!   access-point alias, and names starting `arn:`; and `.` and `..`, each sent as that segment.
+//!   Against the scripted endpoint: an endpoint's path comes before the bucket, with or without
+//!   its trailing slash; the region is signed as given. A request that fails before the connector is called (an empty,
+//!   all-white-space or overlong name; an endpoint with a query or a scheme other than
+//!   `http`/`https`) is `RequestNotBuilt`. One that reached the connector and got no answer is
+//!   classified as the older verbs classify it: closed unanswered, reset, a refused connection
+//!   and an `https` endpoint are `NoResponse`, the connect deadline `Timeout { Connect }`, the
+//!   operation deadline `Timeout { Operation }`. A probe's key and upload id too long for a URI
+//!   are `RequestNotBuilt` and send nothing, where the SDK would panic; just inside that limit
+//!   they go on to the SDK.
+//! * **(C)** a probe or a bulk delete answered `200` whose body then stalls past the body-idle
+//!   deadline, trickles past the whole-body deadline, is cut mid-body, or is not the operation's
+//!   success body, is reported with the `200` and the body's failure beside it; a `200` whose
+//!   body is an S3 `<Error>` document is reported with its code and message beside the `200`.
+//! * **(D)** a `<DeleteResult>` refused by the rules a listing page is, and one of exactly the
+//!   budget read; a row that names no `<Key>` or an empty one, or gives a field twice or with
+//!   markup, is refused, and so is anything the root holds beside its rows but white space and
+//!   comments, a processing instruction included. A document probe's `200` whose body is one
+//!   byte past the budget, with a `Content-Length` or chunked, is refused beside the `200`, and
+//!   one of exactly the budget is its success.
+//! * **(F)** a mixed `<DeleteResult>` (two `<Deleted>`, one `<Error>`) comes back row by row,
+//!   the error row's key, code and message as sent, in document order. One that is empty, names
+//!   only some of the requested keys, or names a key not requested comes back as a result that
+//!   reports which keys have no row and which rows name no requested key, and judges neither;
+//!   a row's key is read with XML's line endings (a raw carriage return as a line feed, `&#13;`
+//!   as the carriage return) before it is compared.
+//! * **(G)** a `200` (`204` where S3 answers so) carrying the operation's whole success document
+//!   or, where the success has none, no body, is a success, once the request the endpoint read
+//!   is shown to be the probe's own form; a `304` that frames a chunked body is refused only for
+//!   a probe that is not a GET or a HEAD, and for a bulk delete, a POST.
+//!
+//! (E) of both briefs is the three existing client tests, run unmodified beside this one.
+//!
+//! RED before #955 and #956: none of these verbs exist, so the file does not compile.
 
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use wyrd_chunkstore_fs::FsChunkStore;
@@ -76,8 +132,8 @@ use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_server::Gateway;
 use wyrd_traits::{MetadataStore, WriteBatch};
 use wyrd_validate::s3::{
-    Answer, BodyError, BodyFailure, Fetched, ListEntry, Listing, ListingError, NoResult, Outcome,
-    S3Error, BUFFERED_BODY_BUDGET, MAX_LISTING_PAGES,
+    Answer, BodyError, BodyFailure, DeleteResult, DeleteRow, Fetched, KeyError, ListEntry, Listing,
+    ListingError, NoResult, Outcome, Probe, S3Error, BUFFERED_BODY_BUDGET, MAX_LISTING_PAGES,
 };
 use wyrd_validate::{
     resolve_config, Deadlines, ErrorCode, ObjectBody, Phase, PutSource, ResolvedConfig, S3Client,
@@ -92,6 +148,50 @@ const BUCKET: &str = "validate";
 const GATEWAY_CHUNK: usize = 1024;
 /// The length of the object the HEAD and GET cases write: five chunks.
 const OBJECT_LEN: usize = 5000;
+
+/// A bucket name S3's naming rules forbid (it ends in `-`).
+const FORBIDDEN_BUCKET: &str = "wyrd-validate-probe-";
+/// More names those rules forbid, each with the path segment it reaches the endpoint as:
+/// upper case and an underscore, too short, an IP address, adjacent dots, a leading hyphen,
+/// a space (percent-encoded); and the names the SDK's own endpoint rules would not send as
+/// one path segment on the endpoint, which this client sends as every other:
+///
+/// * the S3 Express directory-bucket and access-point suffixes, `--x-s3` and `--xa-s3`, one
+///   name a host label could carry and one it could not: the rules sign them for the
+///   `s3express` service, send them virtual-host style on an endpoint that is a host name,
+///   whatever path-style is set to, and refuse the one no host label can carry;
+/// * an S3 on Outposts access-point alias, which the rules resolve to an `amazonaws.com`
+///   https URL, whatever the endpoint;
+/// * names that start with `arn:`, a well-formed ARN and one that is not, which the rules
+///   read as an ARN and refuse, path-style, before anything is sent;
+/// * the dot segments `.` and `..`, sent as they are: what they mean is the server's to decide.
+const MORE_FORBIDDEN_BUCKETS: [(&str, &str); 17] = [
+    ("Wyrd_Validate_Probe", "Wyrd_Validate_Probe"),
+    ("ab", "ab"),
+    ("192.168.5.4", "192.168.5.4"),
+    ("wyrd..validate", "wyrd..validate"),
+    ("-wyrd-validate", "-wyrd-validate"),
+    ("wyrd validate", "wyrd%20validate"),
+    // One segment, encoded once: a `/` cannot start another, and a `%` is no escape of its own.
+    ("wyrd/validate", "wyrd%2Fvalidate"),
+    ("wyrd%41validate", "wyrd%2541validate"),
+    // Bytes, not characters: `é` is two.
+    ("wyrd-é-validate", "wyrd-%C3%A9-validate"),
+    ("wyrd-validate--x-s3", "wyrd-validate--x-s3"),
+    ("Wyrd_Validate--x-s3", "Wyrd_Validate--x-s3"),
+    ("wyrd-validate--xa-s3", "wyrd-validate--xa-s3"),
+    (OUTPOSTS_ALIAS, OUTPOSTS_ALIAS),
+    (
+        "arn:aws:s3:::wyrd-validate-probe",
+        "arn%3Aaws%3As3%3A%3A%3Awyrd-validate-probe",
+    ),
+    ("arn:wyrd-validate-probe", "arn%3Awyrd-validate-probe"),
+    (".", "."),
+    ("..", ".."),
+];
+/// An S3 on Outposts access-point alias, in the shape the SDK's endpoint tests give one
+/// (`aws-sdk-s3` 1.155.0 `config/endpoint.rs:6438`).
+const OUTPOSTS_ALIAS: &str = "test-accessp-o0b1d075431d83bebde8xz5w8ijx1qzlbp3i3kuse10--op-s3";
 
 /// The test's own bound on any one call. Longer than every client deadline, so a production
 /// deadline fires first where one applies.
@@ -155,11 +255,16 @@ async fn start_gateway() -> GatewayFixture {
 /// As [`start_gateway`], with the markers of `buckets` seeded: none at all, for a gateway on
 /// which [`BUCKET`] has no record.
 async fn start_gateway_seeding(buckets: &[&str]) -> GatewayFixture {
-    let dir = tempfile::tempdir().expect("temp dir");
     let meta = RedbMetadataStore::in_memory().expect("redb");
     for bucket in buckets {
         seed_bucket(&meta, bucket).await;
     }
+    start_gateway_on(meta).await
+}
+
+/// As [`start_gateway`], on a store the test has already written to.
+async fn start_gateway_on(meta: RedbMetadataStore) -> GatewayFixture {
+    let dir = tempfile::tempdir().expect("temp dir");
     let gateway = Arc::new(
         Gateway::new(
             meta,
@@ -458,6 +563,257 @@ async fn both_listings_return_every_key_under_a_prefix_with_its_size_across_page
     assert!(v1.pages.iter().all(|head| head.status == 200));
 }
 
+// --- #956 (A): bulk delete against the real gateway -----------------------------------------
+
+#[tokio::test]
+async fn delete_objects_reports_every_key_deleted_and_the_keys_are_gone() {
+    let gateway = start_gateway().await;
+    let client = client(gateway.addr, deadlines());
+    let keys = ["bulk/0", "bulk/1", "bulk/2", "bulk/3"];
+    for key in keys {
+        put(&client, key, key.as_bytes()).await;
+    }
+
+    let result = bounded("DeleteObjects", client.delete_objects(&keys))
+        .await
+        .unwrap_or_else(|e| panic!("DeleteObjects: {e}"));
+    assert_eq!(result.head.status, 200, "{result:?}");
+    let mut deleted: Vec<&str> = result.deleted().collect();
+    deleted.sort_unstable();
+    assert_eq!(deleted, keys, "every key under <Deleted>: {result:?}");
+    assert_eq!(result.errors().count(), 0, "no <Error> row: {result:?}");
+    assert_eq!(result.requested, keys, "{result:?}");
+    assert_eq!(
+        result.keys_without_a_row().count(),
+        0,
+        "every key has its row: {result:?}"
+    );
+    assert_eq!(
+        result.rows_not_requested().count(),
+        0,
+        "every row names a requested key: {result:?}"
+    );
+
+    for key in keys {
+        let head = bounded(key, client.head_object(key))
+            .await
+            .unwrap_or_else(|e| panic!("HEAD {key}: no answer: {e}"));
+        assert_eq!(head.head.status, 404, "{key} is gone: {head:?}");
+    }
+}
+
+/// Keys XML's line-ending rule rewrites, each with what a row naming it reads as: a raw carriage
+/// return, alone or before a line feed, is one line feed (XML 1.0 §2.11). The gateway writes a
+/// row's key into its `<DeleteResult>` raw (`crates/gateway-s3/src/lib.rs`, `xml_escape`
+/// escapes the five predefined entities and nothing else), so the client reads these two back
+/// with a line feed in the carriage return's place. Fixing the gateway to escape the carriage
+/// return (`&#13;`) would make each row name its key, and this test would say so.
+const CR_KEYS: [(&str, &str); 2] = [("cr\rkey", "cr\nkey"), ("crlf\r\nkey", "crlf\nkey")];
+
+#[tokio::test]
+async fn a_key_holding_a_carriage_return_is_deleted_but_its_row_comes_back_with_a_line_feed() {
+    let gateway = start_gateway().await;
+    let client = client(gateway.addr, deadlines());
+    let keys: Vec<&str> = CR_KEYS.iter().map(|&(sent, _)| sent).collect();
+    let mut read_as: Vec<&str> = CR_KEYS.iter().map(|&(_, read)| read).collect();
+    read_as.sort_unstable();
+    for key in &keys {
+        put(&client, key, key.as_bytes()).await;
+    }
+
+    let result = bounded("DeleteObjects", client.delete_objects(&keys))
+        .await
+        .unwrap_or_else(|e| panic!("DeleteObjects: {e}"));
+    assert_eq!(result.head.status, 200, "{result:?}");
+    assert_eq!(result.requested, keys, "{result:?}");
+    assert_eq!(result.errors().count(), 0, "no <Error> row: {result:?}");
+    let mut deleted: Vec<&str> = result.deleted().collect();
+    deleted.sort_unstable();
+    assert_eq!(
+        deleted, read_as,
+        "each row names the key with a line feed where the carriage return was: {result:?}"
+    );
+    // What the comparison then finds, reported and not judged.
+    assert_eq!(
+        result.keys_without_a_row().collect::<Vec<_>>(),
+        keys,
+        "the keys as requested have no row: {result:?}"
+    );
+    let mut not_requested: Vec<&str> = result.rows_not_requested().map(DeleteRow::key).collect();
+    not_requested.sort_unstable();
+    assert_eq!(
+        not_requested, read_as,
+        "every row names a key that was not requested: {result:?}"
+    );
+
+    // The gateway deleted the objects all the same: the request named the keys with the
+    // carriage return escaped, and only the answer lost it.
+    for key in &keys {
+        let head = bounded(key, client.head_object(key))
+            .await
+            .unwrap_or_else(|e| panic!("HEAD {key:?}: no answer: {e}"));
+        assert_eq!(head.head.status, 404, "{key:?} is gone: {head:?}");
+    }
+}
+
+/// `count` keys of exactly `len` bytes.
+fn keys_of(count: usize, len: usize) -> Vec<String> {
+    (0..count).map(|i| format!("{i:0len$}")).collect()
+}
+
+/// A result's size as the gateway declared it.
+fn declared_length(result: &DeleteResult) -> Option<&str> {
+    result.head.header("content-length")
+}
+
+/// A delete result refused for passing the budget, its `200` kept, and the size the gateway
+/// declared for it. How many bytes were held when it was refused depends on how the response
+/// split over TCP, so that is only checked to be past the budget.
+fn assert_refused_over_budget_beside_its_200(
+    case: &str,
+    refused: &Result<DeleteResult, NoResult>,
+    declared: &str,
+) {
+    match refused {
+        Err(NoResult::Answered(Answer {
+            head,
+            outcome: Outcome::BodyFailed(BodyFailure::OverBudget { received }),
+        })) if head.status == 200 && *received > BUFFERED_BODY_BUDGET => {
+            assert_eq!(head.header("content-length"), Some(declared), "{case}");
+        }
+        other => panic!("{case}: not refused beside the 200: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_bulk_delete_whose_result_passes_the_budget_keeps_its_200_after_the_gateway_deleted_the_keys(
+) {
+    let gateway = start_gateway().await;
+    let client = client(gateway.addr, deadlines());
+
+    // The sizes the docs give: 115 bytes, 30 a row, and the key as XML escapes it.
+    let result = bounded("DeleteObjects", client.delete_objects(&["plain", "a&b"]))
+        .await
+        .unwrap_or_else(|e| panic!("two keys: {e}"));
+    let escaped = 115 + 2 * 30 + "plain".len() + "a&amp;b".len();
+    assert_eq!(
+        declared_length(&result),
+        Some(escaped.to_string().as_str()),
+        "{result:?}"
+    );
+
+    // Only the result's size is at stake here: a key with no object has its row too.
+    let fits = keys_of(1000, 32);
+    for key in fits.iter().step_by(50) {
+        put(&client, key, b"x").await;
+    }
+    let result = bounded("1,000 keys of 32 bytes", client.delete_objects(&fits))
+        .await
+        .unwrap_or_else(|e| panic!("1,000 keys of 32 bytes: {e}"));
+    assert_eq!(declared_length(&result), Some("62115"), "{:?}", result.head);
+    assert_eq!(result.deleted().count(), 1000);
+    assert_eq!(result.errors().count(), 0);
+    assert_eq!(result.keys_without_a_row().count(), 0);
+
+    // Sampled as above: the size comes from the gateway's `Content-Length`, and a key with no
+    // object has its row too. Every PUT and HEAD is a fresh connection, which the client closes,
+    // so 1,000 of each would leave about 2,000 sockets in `TIME_WAIT` and can run the host out
+    // of ephemeral ports when many runs share it.
+    let over = keys_of(1000, 40);
+    for key in over.iter().step_by(50) {
+        put(&client, key, b"x").await;
+    }
+    let refused = bounded("1,000 keys of 40 bytes", client.delete_objects(&over)).await;
+    assert_refused_over_budget_beside_its_200("1,000 keys of 40 bytes", &refused, "70115");
+    for key in over.iter().step_by(50) {
+        let head = bounded(key, client.head_object(key))
+            .await
+            .unwrap_or_else(|e| panic!("HEAD {key}: no answer: {e}"));
+        assert_eq!(
+            head.head.status, 404,
+            "{key} is gone, every row lost: {head:?}"
+        );
+    }
+}
+
+/// The first [`DOOMED`] keys of the test below have a directory entry the store cannot decode.
+const DOOMED: usize = 42;
+
+/// What the gateway's own `<Error>` rows cost, from a real fault in the real store: the
+/// gateway's `delete_object` cannot decode the entry, and its `classify` answers `InternalError`
+/// in the row its `render_delete_result` writes.
+#[tokio::test]
+async fn a_bulk_delete_with_failed_keys_fits_the_budget_with_41_internal_errors_and_not_42() {
+    let keys = keys_of(1001, 32);
+    let meta = RedbMetadataStore::in_memory().expect("redb");
+    seed_bucket(&meta, BUCKET).await;
+    for key in &keys[..DOOMED] {
+        // Inode 0 is the gateway's root (`ROOT`, `crates/server/src/lib.rs`).
+        let entry = wyrd_core::metadata::dirent_key(0, &format!("{BUCKET}/{key}"));
+        meta.commit(WriteBatch::new().put(entry, b"not a directory entry".to_vec()))
+            .await
+            .expect("commit the undecodable entry");
+    }
+    let gateway = start_gateway_on(meta).await;
+    let client = client(gateway.addr, deadlines());
+
+    // The sizes the docs give: 115 bytes, the key in each row, 30 for a `<Deleted>` row and
+    // 113 for an `<Error>` row.
+    let result = bounded(
+        "one of each",
+        client.delete_objects(&[&keys[1], &keys[DOOMED]]),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("one of each: {e}"));
+    let one_of_each = 115 + 30 + 113 + 2 * 32;
+    assert_eq!(
+        declared_length(&result),
+        Some(one_of_each.to_string().as_str()),
+        "{result:?}"
+    );
+    assert_eq!(
+        result.rows,
+        [
+            deleted_row(&keys[DOOMED]),
+            DeleteRow::Error(KeyError {
+                key: keys[1].clone(),
+                code: ErrorCode::Code("InternalError".to_string()),
+                message: Some("the gateway could not complete the request".to_string()),
+            }),
+        ]
+    );
+
+    // 41 doomed keys of the 1,000 requested: 62,115 + 41 x 83 bytes.
+    let result = bounded("41 error rows", client.delete_objects(&keys[1..]))
+        .await
+        .unwrap_or_else(|e| panic!("41 error rows: {e}"));
+    assert_eq!(result.head.status, 200);
+    assert_eq!(declared_length(&result), Some("65518"), "{:?}", result.head);
+    assert_eq!(result.deleted().count(), 959);
+    assert_eq!(result.errors().count(), 41);
+    assert_eq!(result.keys_without_a_row().count(), 0);
+    assert!(
+        result
+            .errors()
+            .all(|row| row.code == ErrorCode::Code("InternalError".to_string())),
+        "{:?}",
+        result.rows
+    );
+
+    // 42 of the 1,000: 62,115 + 42 x 83 bytes, one row more than fits, and all of them lost.
+    let deleted_anyway = &keys[DOOMED];
+    put(&client, deleted_anyway, b"x").await;
+    let refused = bounded("42 error rows", client.delete_objects(&keys[..1000])).await;
+    assert_refused_over_budget_beside_its_200("42 error rows", &refused, "65601");
+    let head = bounded(deleted_anyway, client.head_object(deleted_anyway))
+        .await
+        .unwrap_or_else(|e| panic!("HEAD {deleted_anyway}: no answer: {e}"));
+    assert_eq!(
+        head.head.status, 404,
+        "a key with no fault is gone, its row lost: {head:?}"
+    );
+}
+
 // --- what a request carried ----------------------------------------------------------------
 
 /// A request head's method, path and query.
@@ -488,6 +844,1063 @@ fn request_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+// --- the relay (#956) -----------------------------------------------------------------------------
+
+/// A loopback forwarder in front of the gateway that records every request it forwards (the
+/// client opens one connection per request), and counts the connections it accepts.
+struct Relay {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<Request>>>,
+    accepted: Arc<AtomicUsize>,
+    _task: JoinSet<()>,
+}
+
+impl Relay {
+    async fn start(upstream: SocketAddr) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("relay bind");
+        let addr = listener.local_addr().expect("relay addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&accepted);
+        let mut task = JoinSet::new();
+        task.spawn(async move {
+            // Owned by the accept loop, so every connection's task goes with the relay.
+            let mut connections = JoinSet::new();
+            while let Ok((client, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                connections.spawn(forward(client, upstream, Arc::clone(&recorded)));
+            }
+        });
+        Self {
+            addr,
+            requests,
+            accepted,
+            _task: task,
+        }
+    }
+
+    /// The requests recorded since the last call.
+    fn take_requests(&self) -> Vec<Request> {
+        std::mem::take(&mut *self.requests.lock().expect("relay lock"))
+    }
+
+    /// The heads of the requests recorded since the last call.
+    fn take(&self) -> Vec<String> {
+        self.take_requests()
+            .into_iter()
+            .map(|request| request.head)
+            .collect()
+    }
+
+    /// How many connections the relay has accepted.
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+/// Forward one connection, recording its request whole before any of it reaches the gateway.
+async fn forward(mut client: TcpStream, upstream: SocketAddr, requests: Arc<Mutex<Vec<Request>>>) {
+    let Ok(mut server) = TcpStream::connect(upstream).await else {
+        return;
+    };
+    let Ok((request, bytes)) = read_request(&mut client).await else {
+        return;
+    };
+    requests.lock().expect("relay lock").push(request);
+    if server.write_all(&bytes).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+}
+
+// --- #956 (B): every unsupported operation reaches the gateway, as its own request -----------
+
+/// The query parameters that tell S3 operations apart. Each request carries exactly its own,
+/// with the values given, and none of another's; other parameters the SDK adds (`x-id`) are not
+/// the operation's, and are ignored.
+const OPERATION_PARAMS: [&str; 5] = ["uploads", "uploadId", "partNumber", "location", "delete"];
+
+/// The operation parameters `query` carries, each with its decoded value (a bare one has an empty
+/// value), sorted; one given twice is there twice.
+fn operation_params(query: &str) -> Vec<(String, String)> {
+    let mut params: Vec<(String, String)> = query
+        .split('&')
+        .filter_map(|pair| {
+            let (field, value) = pair.split_once('=').unwrap_or((pair, ""));
+            OPERATION_PARAMS
+                .contains(&field)
+                .then(|| (field.to_string(), percent_decoded(value)))
+        })
+        .collect();
+    params.sort();
+    params
+}
+
+/// What a probe's request body must be, the framing off.
+#[derive(Clone, Copy)]
+enum SentBody {
+    /// Nothing. A `CreateBucket` with a `<CreateBucketConfiguration>`, or an `UploadPart` of a
+    /// part with bytes in it, is another request than the probe's.
+    Empty,
+    /// A `<CompleteMultipartUpload>` naming the one empty part, and nothing else.
+    TheEmptyPart,
+}
+
+impl SentBody {
+    /// What is wrong with `payload` as this body, when anything is.
+    fn fault(self, payload: &[u8]) -> Option<String> {
+        let text = String::from_utf8_lossy(payload);
+        match self {
+            Self::Empty => {
+                (!payload.is_empty()).then(|| format!("its body is {text:?}, not empty"))
+            }
+            Self::TheEmptyPart => {
+                let names_the_part = (|| {
+                    let document = roxmltree::Document::parse(&text).ok()?;
+                    let root = document.root_element();
+                    if root.tag_name().name() != "CompleteMultipartUpload" {
+                        return Some(false);
+                    }
+                    let parts = elements(root);
+                    let [part] = parts.as_slice() else {
+                        return Some(false);
+                    };
+                    let mut fields: Vec<(&str, &str)> = elements(*part)
+                        .iter()
+                        .map(|field| (field.tag_name().name(), field.text().unwrap_or_default()))
+                        .collect();
+                    fields.sort_unstable();
+                    Some(
+                        part.tag_name().name() == "Part"
+                            && fields == [("ETag", EMPTY_PART_ETAG), ("PartNumber", "1")],
+                    )
+                })();
+                (names_the_part != Some(true))
+                    .then(|| format!("its body is {text:?}, not the one empty part"))
+            }
+        }
+    }
+}
+
+/// The child elements of `node`.
+fn elements<'a, 'input>(node: roxmltree::Node<'a, 'input>) -> Vec<roxmltree::Node<'a, 'input>> {
+    node.children()
+        .filter(roxmltree::Node::is_element)
+        .collect()
+}
+
+/// How a probe must reach the endpoint and what the gateway answers it.
+struct ProbeCase {
+    probe: Probe,
+    method: &'static str,
+    path: String,
+    /// Every operation parameter the request must carry, with its value, sorted by name.
+    params: Vec<(String, String)>,
+    /// The `x-amz-copy-source` the request must carry; `None` for a request that carries none.
+    copy_source: Option<&'static str>,
+    /// What the request's body must be, the framing off.
+    body: SentBody,
+    status: u16,
+    code: ErrorCode,
+}
+
+impl ProbeCase {
+    /// What is wrong with `head` as the request of this probe, when anything is.
+    fn request_fault(&self, head: &str) -> Option<String> {
+        let (method, path, query) = request_line(head);
+        if (method, path) != (self.method, self.path.as_str()) {
+            return Some(format!(
+                "sent as {method} {path}, not {} {}: {head}",
+                self.method, self.path
+            ));
+        }
+        let params = operation_params(query);
+        if params != self.params {
+            return Some(format!(
+                "its operation parameters are {params:?}, not {:?}: {head}",
+                self.params
+            ));
+        }
+        let copy_source = request_header(head, "x-amz-copy-source");
+        if copy_source != self.copy_source {
+            return Some(format!(
+                "its x-amz-copy-source is {copy_source:?}, not {:?}: {head}",
+                self.copy_source
+            ));
+        }
+        None
+    }
+
+    /// What is wrong with `request` as the request of this probe, its body included, when
+    /// anything is.
+    fn sent_fault(&self, request: &Request) -> Option<String> {
+        self.request_fault(&request.head)
+            .or_else(|| self.body.fault(&request.body))
+    }
+}
+
+fn not_implemented() -> ErrorCode {
+    ErrorCode::Code("NotImplemented".to_string())
+}
+
+fn invalid_request() -> ErrorCode {
+    ErrorCode::Code("InvalidRequest".to_string())
+}
+
+/// The upload id every multipart probe names.
+const UPLOAD_ID: &str = "wyrd-validate-probe-upload";
+
+fn probe_cases() -> Vec<ProbeCase> {
+    let key = "probe/object".to_string();
+    let upload_id = UPLOAD_ID.to_string();
+    let object_path = format!("/{BUCKET}/probe/object");
+    // Path-style, a bucket-level request's path is the bucket and a slash.
+    let bucket_path = format!("/{BUCKET}/");
+    let forbidden_path = format!("/{FORBIDDEN_BUCKET}/");
+    let case = |probe, method, path: &str, params: &[(&str, &str)], status, code| ProbeCase {
+        probe,
+        method,
+        path: path.to_string(),
+        params: params
+            .iter()
+            .map(|&(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+        copy_source: None,
+        body: SentBody::Empty,
+        status,
+        code,
+    };
+    let with_upload_id = [("uploadId", UPLOAD_ID)];
+    vec![
+        ProbeCase {
+            copy_source: Some("validate/probe/source"),
+            ..case(
+                Probe::CopyObject {
+                    key: key.clone(),
+                    source_key: "probe/source".to_string(),
+                },
+                "PUT",
+                &object_path,
+                &[],
+                501,
+                not_implemented(),
+            )
+        },
+        case(
+            Probe::CreateMultipartUpload { key: key.clone() },
+            "POST",
+            &object_path,
+            &[("uploads", "")],
+            501,
+            not_implemented(),
+        ),
+        case(
+            Probe::UploadPart {
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+            },
+            "PUT",
+            &object_path,
+            &[("partNumber", "1"), ("uploadId", UPLOAD_ID)],
+            501,
+            not_implemented(),
+        ),
+        ProbeCase {
+            body: SentBody::TheEmptyPart,
+            ..case(
+                Probe::CompleteMultipartUpload {
+                    key: key.clone(),
+                    upload_id: upload_id.clone(),
+                },
+                "POST",
+                &object_path,
+                &with_upload_id,
+                501,
+                not_implemented(),
+            )
+        },
+        case(
+            Probe::AbortMultipartUpload {
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+            },
+            "DELETE",
+            &object_path,
+            &with_upload_id,
+            501,
+            not_implemented(),
+        ),
+        case(
+            Probe::ListParts { key, upload_id },
+            "GET",
+            &object_path,
+            &with_upload_id,
+            501,
+            not_implemented(),
+        ),
+        case(
+            Probe::ListMultipartUploads,
+            "GET",
+            &bucket_path,
+            &[("uploads", "")],
+            501,
+            not_implemented(),
+        ),
+        case(
+            Probe::GetBucketLocation,
+            "GET",
+            &bucket_path,
+            &[("location", "")],
+            501,
+            not_implemented(),
+        ),
+        case(
+            Probe::CreateBucket {
+                bucket: FORBIDDEN_BUCKET.to_string(),
+            },
+            "PUT",
+            &forbidden_path,
+            &[],
+            400,
+            invalid_request(),
+        ),
+        case(
+            Probe::DeleteBucket {
+                bucket: FORBIDDEN_BUCKET.to_string(),
+            },
+            "DELETE",
+            &forbidden_path,
+            &[],
+            400,
+            invalid_request(),
+        ),
+        case(Probe::ListBuckets, "GET", "/", &[], 400, invalid_request()),
+        case(
+            Probe::HeadBucket,
+            "HEAD",
+            &bucket_path,
+            &[],
+            400,
+            ErrorCode::NoBody,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_unsupported_operation_reaches_the_gateway_and_comes_back_with_its_status_and_code() {
+    let names: Vec<&str> = probe_cases()
+        .iter()
+        .map(|case| case.probe.operation())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "CopyObject",
+            "CreateMultipartUpload",
+            "UploadPart",
+            "CompleteMultipartUpload",
+            "AbortMultipartUpload",
+            "ListParts",
+            "ListMultipartUploads",
+            "GetBucketLocation",
+            "CreateBucket",
+            "DeleteBucket",
+            "ListBuckets",
+            "HeadBucket",
+        ],
+        "each probe names the S3 operation it sends"
+    );
+    let gateway = start_gateway().await;
+    let relay = Relay::start(gateway.addr).await;
+    for (endpoint, host) in endpoint_forms(relay.addr) {
+        let client = client_at(&endpoint, deadlines());
+        for case in probe_cases() {
+            probe_reaches_the_gateway(&client, &relay, &endpoint, &host, case).await;
+        }
+    }
+}
+
+/// Send `case`'s probe through `relay` and check what reached the gateway and what came back.
+async fn probe_reaches_the_gateway(
+    client: &S3Client,
+    relay: &Relay,
+    endpoint: &str,
+    host: &str,
+    case: ProbeCase,
+) {
+    let name = format!("{} on {endpoint}", case.probe.operation());
+    let name = name.as_str();
+    let answer = bounded(name, client.probe(&case.probe))
+        .await
+        .unwrap_or_else(|e| panic!("{name}: no answer: {e}"));
+
+    let requests = relay.take_requests();
+    let [request] = requests.as_slice() else {
+        panic!("{name}: one request reached the gateway, not {requests:?}");
+    };
+    if let Some(fault) = case.sent_fault(request) {
+        panic!("{name}: not the operation's request: {fault}");
+    }
+    let head = &request.head;
+    assert_eq!(
+        request_header(head, "host"),
+        Some(host),
+        "{name}: addressed to the endpoint: {head}"
+    );
+
+    assert_eq!(answer.head.status, case.status, "{name}: {answer:?}");
+    let message = match &answer.outcome {
+        Outcome::Error { code, message } => {
+            assert_eq!(code, &case.code, "{name}: the S3 code: {answer:?}");
+            message.clone()
+        }
+        other => panic!("{name}: not an S3 error response: {other:?}"),
+    };
+    if case.code == ErrorCode::NoBody {
+        assert_eq!(message, None, "{name}: no body, so no message");
+    }
+    assert_gateway_answered(&answer, name);
+}
+
+/// The forms an operator may type the endpoint `addr` in, each with the `Host` header a request
+/// to it carries: its IP address, and the host name `localhost`, on which the SDK's own
+/// endpoint rules would address an S3 Express bucket virtual-host style.
+fn endpoint_forms(addr: SocketAddr) -> [(String, String); 2] {
+    let port = addr.port();
+    [
+        (format!("http://{addr}"), addr.to_string()),
+        (
+            format!("http://localhost:{port}"),
+            format!("localhost:{port}"),
+        ),
+    ]
+}
+
+/// A bucket-level request to a bucket the gateway does not have, as the bucket probes send:
+/// `CreateBucket` and `DeleteBucket` naming `bucket`, each with its method.
+fn bucket_probes(bucket: &str) -> [(Probe, &'static str); 2] {
+    [
+        (
+            Probe::CreateBucket {
+                bucket: bucket.to_string(),
+            },
+            "PUT",
+        ),
+        (
+            Probe::DeleteBucket {
+                bucket: bucket.to_string(),
+            },
+            "DELETE",
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn bucket_probes_send_every_name_as_one_path_segment_on_an_ip_or_a_host_name_endpoint() {
+    let gateway = start_gateway().await;
+    let relay = Relay::start(gateway.addr).await;
+    let mut failures = Vec::new();
+    for (endpoint, host) in endpoint_forms(relay.addr) {
+        let client = client_at(&endpoint, deadlines());
+        for (bucket, segment) in
+            std::iter::once((FORBIDDEN_BUCKET, FORBIDDEN_BUCKET)).chain(MORE_FORBIDDEN_BUCKETS)
+        {
+            for (probe, method) in bucket_probes(bucket) {
+                let case = format!("{} {bucket:?} on {endpoint}", probe.operation());
+                let sent = bounded(&case, client.probe(&probe)).await;
+                let heads = relay.take();
+                let answer = match sent {
+                    Ok(answer) => answer,
+                    Err(e) => {
+                        failures.push(format!(
+                            "{case}: refused or unanswered: {e}; sent {heads:?}"
+                        ));
+                        continue;
+                    }
+                };
+                // One request, the probe's own: never a `CreateSession` of the SDK's before it.
+                let [head] = heads.as_slice() else {
+                    failures.push(format!("{case}: not one request, but {heads:?}"));
+                    continue;
+                };
+                let (sent_method, path, _) = request_line(head);
+                let expected = format!("/{segment}/");
+                if (sent_method, path) != (method, expected.as_str()) {
+                    failures.push(format!(
+                        "{case}: reached the gateway as {sent_method} {path}, not {method} \
+                         {expected}"
+                    ));
+                }
+                // Addressed to the endpoint itself, never to a host named after the bucket.
+                if request_header(head, "host") != Some(host.as_str()) {
+                    failures.push(format!("{case}: not addressed to {host}: {head}"));
+                }
+                if !request_header(head, "authorization")
+                    .is_some_and(|auth| auth.contains(&format!("/{REGION}/s3/aws4_request")))
+                {
+                    failures.push(format!("{case}: not signed for s3 in {REGION}: {head}"));
+                }
+                // The gateway judged the operation: a signature it refused would be a 403.
+                let refusal = Outcome::Error {
+                    code: invalid_request(),
+                    message: answer_message(&answer),
+                };
+                if answer.head.status != 400 || answer.outcome != refusal {
+                    failures.push(format!("{case}: not the gateway's own refusal: {answer:?}"));
+                }
+                assert_gateway_answered(&answer, &case);
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) not sent as one path segment:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// A bare `400` with no body: what the scripted endpoint answers every request of the path
+/// test with.
+fn bare_400(request_id: &str) -> Script {
+    Script::ended(head(
+        "400 Bad Request",
+        request_id,
+        &[("Content-Length", "0".to_string())],
+    ))
+}
+
+#[tokio::test]
+async fn an_endpoint_path_comes_before_the_bucket_on_every_request() {
+    for path in ["/s3-prefix", "/s3-prefix/"] {
+        let mut endpoint = Endpoint::start((0..9).map(|_| bare_400("path-case")).collect()).await;
+        let url = format!("http://localhost:{}{path}", endpoint.addr.port());
+        let client = client_at(&url, deadlines());
+        for probe in [
+            Probe::CreateBucket {
+                bucket: FORBIDDEN_BUCKET.to_string(),
+            },
+            Probe::ListBuckets,
+            Probe::HeadBucket,
+            // Dot segments, sent as they are: what they mean is the server's to decide.
+            Probe::CreateBucket {
+                bucket: ".".to_string(),
+            },
+            Probe::DeleteBucket {
+                bucket: "..".to_string(),
+            },
+        ] {
+            let case = format!("{} on {url}", probe.operation());
+            let answer = bounded(&case, client.probe(&probe))
+                .await
+                .unwrap_or_else(|e| panic!("{case}: no answer: {e}"));
+            assert_eq!(answer.head.status, 400, "{case}: {answer:?}");
+        }
+        let answer = bounded("HEAD", client.head_object("dir/key"))
+            .await
+            .unwrap_or_else(|e| panic!("HEAD on {url}: no answer: {e}"));
+        assert_eq!(answer.head.status, 400, "HEAD on {url}: {answer:?}");
+        // The older verbs go through the same resolution.
+        let refused = |verb: &str, sent: Option<S3Error>| match sent {
+            Some(S3Error::Service { status: 400, .. }) => {}
+            other => panic!("{verb} on {url}: not the endpoint's 400: {other:?}"),
+        };
+        let source = PutSource::new(
+            1,
+            stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"a"))]),
+        );
+        refused(
+            "PUT",
+            bounded("PUT", client.put_object("dir/key", source))
+                .await
+                .err(),
+        );
+        refused(
+            "GET",
+            bounded("GET", client.get_object("dir/key")).await.err(),
+        );
+        refused(
+            "DELETE",
+            bounded("DELETE", client.delete_object("dir/key"))
+                .await
+                .err(),
+        );
+        drop(client);
+        let lines: Vec<(String, String)> = endpoint
+            .heads()
+            .await
+            .iter()
+            .map(|head| {
+                let (method, path, _) = request_line(head);
+                (method.to_string(), path.to_string())
+            })
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("PUT", format!("/s3-prefix/{FORBIDDEN_BUCKET}/")),
+            ("GET", "/s3-prefix/".to_string()),
+            ("HEAD", format!("/s3-prefix/{BUCKET}/")),
+            ("PUT", "/s3-prefix/./".to_string()),
+            ("DELETE", "/s3-prefix/../".to_string()),
+            ("HEAD", format!("/s3-prefix/{BUCKET}/dir/key")),
+            ("PUT", format!("/s3-prefix/{BUCKET}/dir/key")),
+            ("GET", format!("/s3-prefix/{BUCKET}/dir/key")),
+            ("DELETE", format!("/s3-prefix/{BUCKET}/dir/key")),
+        ]
+        .into_iter()
+        .map(|(method, path)| (method.to_string(), path))
+        .collect();
+        assert_eq!(
+            lines, expected,
+            "the endpoint {url}'s path, then the bucket"
+        );
+    }
+}
+
+/// The first 300 characters of `text`: a failure that quotes a 70,000-byte name stays readable.
+fn first_chars(text: &str) -> String {
+    text.chars().take(300).collect()
+}
+
+#[tokio::test]
+async fn a_request_stopped_before_it_reaches_the_connector_is_request_not_built() {
+    let gateway = start_gateway().await;
+    let relay = Relay::start(gateway.addr).await;
+
+    // Names the client cannot send. One the SDK reads as no name at all, empty or all white
+    // space, which it refuses as a missing field; and one whose request URL would be longer
+    // than an `http` URI may be (65,534 bytes).
+    let long_name = "a".repeat(70_000);
+    let client = client(relay.addr, deadlines());
+    for (name, bucket, reason) in [
+        ("an empty name", "", "bucket"),
+        ("a name of white space", " \t", "bucket"),
+        ("a 70,000-byte name", long_name.as_str(), "endpoint"),
+    ] {
+        for (probe, _) in bucket_probes(bucket) {
+            let case = format!("{} of {name}", probe.operation());
+            match bounded(&case, client.probe(&probe)).await {
+                Err(S3Error::RequestNotBuilt { detail }) => assert!(
+                    detail.contains(reason),
+                    "{case}: the reason names the {reason}: {}",
+                    first_chars(&detail)
+                ),
+                other => panic!(
+                    "{case}: not refused as unsent: {}",
+                    first_chars(&format!("{other:?}"))
+                ),
+            }
+        }
+    }
+
+    // Endpoints the client's endpoint resolution refuses, as the SDK's endpoint rules refuse
+    // them: one with a query, and one whose scheme is neither `http` nor `https`.
+    for (endpoint, reason) in [
+        (format!("http://{}/?x=1", relay.addr), "query"),
+        (format!("ftp://{}", relay.addr), "scheme"),
+    ] {
+        let client = client_at(&endpoint, deadlines());
+        let refused = |case: &str, e: &S3Error| match e {
+            S3Error::RequestNotBuilt { detail } => assert!(
+                detail.contains(reason),
+                "{case} on {endpoint}: the reason names the {reason}: {detail}"
+            ),
+            other => panic!("{case} on {endpoint}: not refused as unsent: {other:?}"),
+        };
+        for probe in [
+            Probe::ListBuckets,
+            Probe::CreateBucket {
+                bucket: FORBIDDEN_BUCKET.to_string(),
+            },
+        ] {
+            let case = probe.operation();
+            match bounded(case, client.probe(&probe)).await {
+                Err(e) => refused(case, &e),
+                Ok(answer) => panic!("{case} on {endpoint}: answered: {answer:?}"),
+            }
+        }
+        match bounded("HEAD", client.head_object("dir/key")).await {
+            Err(e) => refused("HEAD", &e),
+            Ok(answer) => panic!("HEAD on {endpoint}: answered: {answer:?}"),
+        }
+        match bounded("ListObjectsV2", client.list_objects_v2("dir/", 10)).await {
+            Err(ListingError::Page {
+                page: 1,
+                cause: NoResult::NoAnswer(e),
+            }) => refused("ListObjectsV2", &e),
+            other => panic!("ListObjectsV2 on {endpoint}: not refused as unsent: {other:?}"),
+        }
+        match bounded("DeleteObjects", client.delete_objects(&["dir/key"])).await {
+            Err(NoResult::NoAnswer(e)) => refused("DeleteObjects", &e),
+            other => panic!("DeleteObjects on {endpoint}: not refused as unsent: {other:?}"),
+        }
+    }
+    assert_eq!(relay.accepted(), 0, "no connection was opened");
+    assert_eq!(relay.take(), Vec::<String>::new(), "no request was sent");
+}
+
+/// The most percent-encoded bytes of key and upload id a probe may have: an `http` URI's 65,534,
+/// less the 64 the client leaves for the rest of it.
+const LONGEST_KEY_AND_UPLOAD_ID: usize = 65_534 - 64;
+
+/// The probes that name both a key and an upload id.
+fn probes_with_an_upload_id(key: &str, upload_id: &str) -> Vec<Probe> {
+    let (key, upload_id) = (key.to_string(), upload_id.to_string());
+    vec![
+        Probe::UploadPart {
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+        },
+        Probe::CompleteMultipartUpload {
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+        },
+        Probe::AbortMultipartUpload {
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+        },
+        Probe::ListParts { key, upload_id },
+    ]
+}
+
+/// Every probe that names a key.
+fn probes_with_a_key(key: &str, upload_id: &str) -> Vec<Probe> {
+    let mut probes = vec![
+        Probe::CopyObject {
+            key: key.to_string(),
+            source_key: "source".to_string(),
+        },
+        Probe::CreateMultipartUpload {
+            key: key.to_string(),
+        },
+    ];
+    probes.extend(probes_with_an_upload_id(key, upload_id));
+    probes
+}
+
+#[tokio::test]
+async fn a_probe_whose_key_or_upload_id_is_too_long_for_a_uri_is_request_not_built_and_sends_nothing(
+) {
+    let gateway = start_gateway().await;
+    let relay = Relay::start(gateway.addr).await;
+    let client = client(relay.addr, deadlines());
+    let past = LONGEST_KEY_AND_UPLOAD_ID + 1;
+
+    // What the SDK writes into the URI is what counts, not the key's own length: a raw length
+    // would let the `&`s and the two-byte characters through, and the SDK would panic on them.
+    let mut cases = Vec::new();
+    for (name, key, encoded) in [
+        ("70,000 bytes", "k".repeat(70_000), 70_000),
+        ("one byte past the limit", "k".repeat(past), past),
+        ("30,000 `&`", "&".repeat(30_000), 90_000),
+        ("10,912 two-byte characters", "é".repeat(10_912), 65_472),
+        ("a key of slashes", "/".repeat(past), past),
+    ] {
+        cases.push((name, probes_with_a_key(&key, ""), encoded));
+    }
+    for (name, upload_id, encoded) in [
+        (
+            "an upload id that reaches the limit beside a key of one byte",
+            "u".repeat(past - 1),
+            past,
+        ),
+        ("an upload id of 70,000 bytes", "u".repeat(70_000), 70_001),
+        ("an upload id of 30,000 `&`", "&".repeat(30_000), 90_001),
+        // A query value's `/` is encoded, where a key's is not.
+        ("an upload id of 22,000 `/`", "/".repeat(22_000), 66_001),
+    ] {
+        cases.push((name, probes_with_an_upload_id("k", &upload_id), encoded));
+    }
+
+    for (name, probes, encoded) in cases {
+        for probe in probes {
+            let case = format!("{} with {name}", probe.operation());
+            match bounded(&case, client.probe(&probe)).await {
+                Err(S3Error::RequestNotBuilt { detail })
+                    if detail
+                        .contains(&format!("this {} take {encoded} bytes", probe.operation())) => {}
+                other => panic!(
+                    "{case}: not refused for its {encoded} bytes: {}",
+                    first_chars(&format!("{other:?}"))
+                ),
+            }
+        }
+    }
+    assert_eq!(relay.accepted(), 0, "no connection was opened");
+}
+
+#[tokio::test]
+async fn a_probe_whose_key_and_upload_id_just_fit_goes_on_to_the_sdk() {
+    let limit = LONGEST_KEY_AND_UPLOAD_ID;
+    let plain = "k".repeat(limit);
+    let slashed = "k/".repeat(limit / 2);
+    let upload_id = "u".repeat(limit - 1);
+    let copy_source = "s".repeat(70_000);
+
+    // Sent, its URL under the limit with the endpoint's own bytes added: a key's `/` counts as
+    // one byte, and a copy source is a header, which the limit does not reach.
+    let sent = [
+        (
+            Probe::CreateMultipartUpload { key: plain.clone() },
+            format!("/{BUCKET}/{plain}"),
+            ("uploads", ""),
+        ),
+        (
+            Probe::CreateMultipartUpload {
+                key: slashed.clone(),
+            },
+            format!("/{BUCKET}/{slashed}"),
+            ("uploads", ""),
+        ),
+        (
+            Probe::ListParts {
+                key: "k".to_string(),
+                upload_id: upload_id.clone(),
+            },
+            format!("/{BUCKET}/k"),
+            ("uploadId", upload_id.as_str()),
+        ),
+        (
+            Probe::CopyObject {
+                key: "k".to_string(),
+                source_key: copy_source.clone(),
+            },
+            format!("/{BUCKET}/k"),
+            ("", ""),
+        ),
+    ];
+    for (probe, path, (param, value)) in sent {
+        let name = probe.operation();
+        let mut endpoint = Endpoint::start(vec![bare_400(name)]).await;
+        let client = client(endpoint.addr, deadlines());
+        let answer = bounded(name, client.probe(&probe)).await;
+        drop(client);
+        match answer {
+            Ok(answer) => assert_eq!(answer.head.status, 400, "{name}"),
+            Err(e) => panic!("{name}: not sent: {}", first_chars(&format!("{e:?}"))),
+        }
+        let heads = endpoint.heads().await;
+        let [head] = heads.as_slice() else {
+            panic!("{name}: not one request");
+        };
+        let (_, sent_path, query) = request_line(head);
+        assert!(sent_path == path, "{name}: another path");
+        if !param.is_empty() {
+            assert!(query_has(query, param), "{name}: no {param}");
+        }
+        if !value.is_empty() {
+            assert!(
+                query_value(query, param).as_deref() == Some(value),
+                "{name}: another {param}"
+            );
+        }
+        if matches!(probe, Probe::CopyObject { .. }) {
+            assert!(
+                request_header(head, "x-amz-copy-source")
+                    == Some(format!("{BUCKET}/{copy_source}").as_str()),
+                "{name}: another copy source"
+            );
+        }
+    }
+
+    // The most the SDK writes around them. Too long once the endpoint is added, which the SDK
+    // reports itself, in the same way, and with no panic.
+    let client = client("127.0.0.1:9".parse().expect("an address"), deadlines());
+    let probe = Probe::UploadPart {
+        key: "k".to_string(),
+        upload_id,
+    };
+    match bounded("UploadPart", client.probe(&probe)).await {
+        Err(S3Error::RequestNotBuilt { detail }) if !detail.contains(" take ") => {}
+        other => panic!(
+            "UploadPart: not the SDK's own refusal: {}",
+            first_chars(&format!("{other:?}"))
+        ),
+    }
+}
+
+#[tokio::test]
+async fn a_probe_that_reached_the_connector_and_got_no_answer_is_no_response_never_unsent() {
+    let probe = Probe::CreateBucket {
+        bucket: FORBIDDEN_BUCKET.to_string(),
+    };
+
+    // Sent, read whole by the endpoint, and the connection closed, or reset, with no response.
+    for (case, then) in [("closed unanswered", Then::Cut), ("reset", Then::Reset)] {
+        let mut endpoint = Endpoint::start(vec![Script {
+            response: Vec::new(),
+            then,
+        }])
+        .await;
+        // The `client` function, shadowed further down.
+        let client = crate::client(endpoint.addr, deadlines());
+        let lost = bounded(case, client.probe(&probe)).await;
+        drop(client);
+        let heads = endpoint.heads().await;
+        assert_eq!(heads.len(), 1, "{case}: the probe reached the endpoint");
+        assert!(
+            matches!(lost, Err(S3Error::NoResponse { .. })),
+            "{case}: {lost:?}"
+        );
+    }
+
+    // No listener: the connection is refused, after the request was handed over. The port is
+    // held by a socket that is bound but not listening, as `s3_client_roundtrip.rs` holds one:
+    // the kernel refuses every connection to it at once, and no other test can take the port
+    // meanwhile (a freed port can be taken by another test's listener, whose answer would
+    // then reach this probe). Held to the end of the test: the relay below is pointed at it.
+    let holder = TcpSocket::new_v4().expect("socket");
+    holder
+        .bind("127.0.0.1:0".parse().expect("loopback"))
+        .expect("bind");
+    let refused_addr = holder.local_addr().expect("addr");
+    assert!(
+        std::net::TcpListener::bind(refused_addr).is_err(),
+        "the refused port is held, so no other listener can take it"
+    );
+    let refused_client = client(refused_addr, deadlines());
+    let refused = bounded("refused", refused_client.probe(&probe)).await;
+    assert!(
+        matches!(refused, Err(S3Error::NoResponse { .. })),
+        "a refused connection: {refused:?}"
+    );
+
+    // An `https` endpoint: the endpoint resolution accepts it, as the SDK's rules do, and the
+    // plain-HTTP connector refuses it before it opens a connection. Nothing is sent, but the
+    // connector was called, so the call is no response, as it is for the older verbs.
+    let relay = Relay::start(refused_addr).await;
+    let https_client = client_at(&format!("https://{}", relay.addr), deadlines());
+    let https = bounded("https", https_client.probe(&probe)).await;
+    assert!(
+        matches!(&https, Err(S3Error::NoResponse { detail }) if detail.contains("plain HTTP")),
+        "an https endpoint: {https:?}"
+    );
+    assert_eq!(relay.accepted(), 0, "no connection was opened");
+}
+
+#[tokio::test]
+async fn the_region_is_signed_as_given_whether_or_not_it_could_name_a_host() {
+    // `aws-global`, which the SDK's endpoint rules sign as `us-east-1`; and a region that is
+    // not a DNS label, which they refuse.
+    for region in ["aws-global", "us-east-2!"] {
+        let mut endpoint =
+            Endpoint::start(vec![bare_400("region-case"), bare_400("region-case")]).await;
+        let config = resolved(&format!("http://{}", endpoint.addr), region);
+        let client = S3Client::with_deadlines(&config, deadlines());
+        let answer = bounded(region, client.probe(&Probe::ListBuckets))
+            .await
+            .unwrap_or_else(|e| panic!("{region}: not sent: {e}"));
+        assert_eq!(answer.head.status, 400, "{region}: {answer:?}");
+        // An older verb goes through the same resolution.
+        let deleted = bounded(region, client.delete_object("dir/key")).await;
+        assert!(
+            matches!(deleted, Err(S3Error::Service { status: 400, .. })),
+            "{region}: not sent: {deleted:?}"
+        );
+        drop(client);
+        let heads = endpoint.heads().await;
+        assert_eq!(heads.len(), 2, "{region}: {heads:?}");
+        let scope = format!("/{region}/s3/aws4_request");
+        for head in &heads {
+            assert!(
+                request_header(head, "authorization").is_some_and(|auth| auth.contains(&scope)),
+                "{region}: signed for {scope}: {head}"
+            );
+        }
+    }
+}
+
+/// A listener whose accept queue is full, as `s3_client_roundtrip.rs`'s: further connection
+/// attempts hang in SYN-SENT. Returned with the queued connections so they stay open.
+async fn saturated_listener() -> (SocketAddr, TcpListener, Vec<TcpStream>) {
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket
+        .bind("127.0.0.1:0".parse().expect("loopback"))
+        .expect("bind");
+    let listener = socket.listen(1).expect("listen");
+    let addr = listener.local_addr().expect("addr");
+    let mut queued = Vec::new();
+    while let Ok(connected) = timeout(Duration::from_millis(500), TcpStream::connect(addr)).await {
+        queued.push(connected.expect("a queued connection"));
+        assert!(queued.len() < 64, "the accept queue never filled");
+    }
+    (addr, listener, queued)
+}
+
+/// Every probe, sent at once to `addr` under `limits`, and what each came back as.
+async fn every_probe_under(
+    addr: SocketAddr,
+    limits: Deadlines,
+) -> Vec<(String, Result<Answer, S3Error>)> {
+    let mut sends = JoinSet::new();
+    for case in probe_cases() {
+        let client = client(addr, limits);
+        sends.spawn(async move {
+            let name = case.probe.operation().to_string();
+            (name, bounded("a probe", client.probe(&case.probe)).await)
+        });
+    }
+    sends.join_all().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_under_the_connect_deadline_expires_as_a_connect_timeout() {
+    let (addr, _listener, _queued) = saturated_listener().await;
+    let limits = Deadlines {
+        connect: Duration::from_millis(500),
+        ..deadlines()
+    };
+    let started = Instant::now();
+    for (name, outcome) in every_probe_under(addr, limits).await {
+        assert_eq!(
+            outcome.err(),
+            Some(S3Error::Timeout {
+                phase: Phase::Connect,
+                limit: limits.connect,
+            }),
+            "{name}"
+        );
+    }
+    assert!(started.elapsed() >= limits.connect);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_under_the_operation_deadline_expires_as_an_operation_timeout() {
+    // A peer that accepts and never answers.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let mut peer = JoinSet::new();
+    peer.spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    let limits = Deadlines {
+        operation: Duration::from_millis(500),
+        ..deadlines()
+    };
+    let started = Instant::now();
+    for (name, outcome) in every_probe_under(addr, limits).await {
+        assert_eq!(
+            outcome.err(),
+            Some(S3Error::Timeout {
+                phase: Phase::Operation,
+                limit: limits.operation,
+            }),
+            "{name}"
+        );
+    }
+    assert!(started.elapsed() >= limits.operation);
+}
+
+fn answer_message(answer: &Answer) -> Option<String> {
+    match &answer.outcome {
+        Outcome::Error { message, .. } => message.clone(),
+        _ => None,
+    }
+}
+
 // --- the scripted endpoint -----------------------------------------------------------------
 
 /// What the endpoint does once it has written a response's bytes.
@@ -499,6 +1912,8 @@ enum Then {
     Hold,
     /// Close the connection at once.
     Cut,
+    /// Reset the connection at once: a close that discards, and an RST on the wire.
+    Reset,
     /// Write these bytes one at a time, `every` apart, then hold.
     Trickle { bytes: Vec<u8>, every: Duration },
 }
@@ -536,7 +1951,7 @@ impl Endpoint {
             let mut heads = Vec::new();
             for script in scripts {
                 let (mut stream, _) = listener.accept().await?;
-                heads.push(read_request(&mut stream).await?);
+                heads.push(read_request(&mut stream).await?.0.head);
                 serve(&mut stream, script).await;
             }
             Ok(heads)
@@ -580,9 +1995,48 @@ async fn line_end(
     }
 }
 
+/// One request as it was read.
+#[derive(Debug)]
+struct Request {
+    head: String,
+    /// The body with its framing off (a chunked or an `aws-chunked` one's chunks put together),
+    /// since the SDK may frame a body with checksums.
+    body: Vec<u8>,
+}
+
+/// The size a chunk's size line gives.
+fn chunk_size(line: &[u8]) -> usize {
+    let line = String::from_utf8_lossy(line);
+    let size = line.split(';').next().unwrap_or_default().trim();
+    usize::from_str_radix(size, 16).expect("a hex chunk size")
+}
+
+/// `body`'s payload, by what `head` says frames it.
+fn unframed(head: &str, body: &[u8]) -> Vec<u8> {
+    let chunked = request_header(head, "transfer-encoding")
+        .is_some_and(|te| te.eq_ignore_ascii_case("chunked"))
+        || request_header(head, "content-encoding")
+            .is_some_and(|ce| ce.eq_ignore_ascii_case("aws-chunked"));
+    if !chunked {
+        return body.to_vec();
+    }
+    let mut payload = Vec::new();
+    let mut rest = body;
+    loop {
+        let end = find(rest, b"\r\n").expect("a chunk's size line");
+        let size = chunk_size(&rest[..end]);
+        if size == 0 {
+            return payload;
+        }
+        payload.extend_from_slice(&rest[end + 2..end + 2 + size]);
+        rest = &rest[end + 2 + size + 2..];
+    }
+}
+
 /// Read one whole request, head and body, so the response is never written over unread
-/// request bytes (`s3_client_nonconforming_responses.rs`'s `read_request`). Returns its head.
-async fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
+/// request bytes (`s3_client_nonconforming_responses.rs`'s `read_request`). Returns it, and
+/// every byte of it as read.
+async fn read_request(stream: &mut TcpStream) -> std::io::Result<(Request, Vec<u8>)> {
     let mut buf = Vec::with_capacity(8192);
     let head_end = loop {
         if let Some(i) = find(&buf, b"\r\n\r\n") {
@@ -602,18 +2056,17 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
         let mut pos = head_end;
         loop {
             let end = line_end(stream, &mut buf, pos).await?;
-            let size_text = String::from_utf8_lossy(&buf[pos..end]).into_owned();
-            let size_text = size_text.split(';').next().unwrap_or_default().trim();
-            let size = usize::from_str_radix(size_text, 16).expect("a hex chunk size");
+            let size = chunk_size(&buf[pos..end]);
             if size == 0 {
                 let mut line = end + 2;
                 loop {
                     let end = line_end(stream, &mut buf, line).await?;
                     if end == line {
-                        return Ok(head);
+                        break;
                     }
                     line = end + 2;
                 }
+                break;
             }
             let next = end + 2 + size + 2;
             while buf.len() < next {
@@ -622,7 +2075,8 @@ async fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
             pos = next;
         }
     }
-    Ok(head)
+    let body = unframed(&head, &buf[head_end..]);
+    Ok((Request { head, body }, buf))
 }
 
 /// Write the script's response, then do what it says. A client that has closed the
@@ -638,6 +2092,9 @@ async fn serve(stream: &mut TcpStream, script: Script) {
         }
         Then::Hold => hold(stream).await,
         Then::Cut => {}
+        Then::Reset => {
+            let _ = stream.set_zero_linger();
+        }
         Then::Trickle { bytes, every } => {
             for byte in bytes {
                 tokio::time::sleep(every).await;
@@ -749,8 +2206,7 @@ const BODY_FAULTS: [BodyFault; 5] = [
 /// How much of the body a stalled or cut response sends before it stops.
 const SENT_BEFORE_FAULT: usize = 10;
 
-fn fault_script(fault: BodyFault, request_id: &str) -> Script {
-    let document = cut_listing();
+fn fault_script(document: &[u8], fault: BodyFault, request_id: &str) -> Script {
     // Room for more than the deadlines let through: a trickle of it takes several seconds.
     let declared = document.len() + 64;
     match fault {
@@ -761,7 +2217,7 @@ fn fault_script(fault: BodyFault, request_id: &str) -> Script {
         BodyFault::Trickle => Script {
             response: ok_with_length(request_id, declared, b""),
             then: Then::Trickle {
-                bytes: [document.clone(), vec![b' '; 64]].concat(),
+                bytes: [document, &[b' '; 64]].concat(),
                 every: TRICKLE_EVERY,
             },
         },
@@ -770,13 +2226,71 @@ fn fault_script(fault: BodyFault, request_id: &str) -> Script {
             then: Then::Cut,
         },
         BodyFault::NotADocument => {
-            Script::ended(ok_with_length(request_id, document.len(), &document))
+            Script::ended(ok_with_length(request_id, document.len(), document))
         }
         BodyFault::ErrorDocument => {
             let error = internal_error_document();
             Script::ended(ok_with_length(request_id, error.len(), error.as_bytes()))
         }
     }
+}
+
+/// What is wrong with `answer` as the report of a `200` from `request_id` whose body failed as
+/// `fault` says, when anything is. `document` is the body a [`BodyFault::NotADocument`] sent, and
+/// `refusal` words its refusal.
+fn misreported_fault(
+    answer: &Answer,
+    fault: BodyFault,
+    request_id: &str,
+    document: &[u8],
+    refusal: &str,
+) -> Option<String> {
+    if answer.head.status != 200 || answer.head.request_id() != Some(request_id) {
+        return Some(format!("not the 200 the endpoint sent: {answer:?}"));
+    }
+    let sent = SENT_BEFORE_FAULT as u64;
+    // The answer in words: its status and request id, then the failure.
+    let shown = answer.to_string();
+    let said = match fault {
+        BodyFault::Stall => "a body that failed: the body-idle deadline",
+        BodyFault::Trickle => "a body that failed: the body deadline",
+        BodyFault::Cut => "a body that failed: reading the body failed",
+        BodyFault::NotADocument => "an unreadable",
+        BodyFault::ErrorDocument => "an S3 error",
+    };
+    if !shown.starts_with(&format!("HTTP 200, x-amz-request-id {request_id}: {said}")) {
+        return Some(format!("shown as {shown:?}"));
+    }
+    let fits = match (&answer.outcome, fault) {
+        (
+            Outcome::BodyFailed(BodyFailure::Timeout {
+                phase: Phase::BodyIdle,
+                limit,
+                received,
+            }),
+            BodyFault::Stall,
+        ) => *limit == SHORT_IDLE && *received == sent,
+        (
+            Outcome::BodyFailed(BodyFailure::Timeout {
+                phase: Phase::Body,
+                limit,
+                received,
+            }),
+            BodyFault::Trickle,
+        ) => *limit == SHORT_BODY && *received > 0,
+        (Outcome::BodyFailed(BodyFailure::Transport { received, detail }), BodyFault::Cut) => {
+            *received <= sent && !detail.is_empty()
+        }
+        (Outcome::Unreadable { body, detail }, BodyFault::NotADocument) => {
+            body[..] == *document && detail.contains(refusal)
+        }
+        (Outcome::Error { code, message }, BodyFault::ErrorDocument) => {
+            *code == ErrorCode::Code("InternalError".to_string())
+                && message.as_deref() == Some("We encountered an internal error. Please try again.")
+        }
+        _ => false,
+    };
+    (!fits).then(|| format!("the wrong failure beside the 200: {answer:?}"))
 }
 
 #[tokio::test]
@@ -786,7 +2300,8 @@ async fn a_listing_page_answered_200_keeps_its_200_when_the_body_stalls_trickles
     for fault in BODY_FAULTS {
         cases.spawn(async move {
             let request_id = format!("ListObjectsV2-{fault:?}");
-            let mut endpoint = Endpoint::start(vec![fault_script(fault, &request_id)]).await;
+            let mut endpoint =
+                Endpoint::start(vec![fault_script(&cut_listing(), fault, &request_id)]).await;
             let client = client(endpoint.addr, short_deadlines());
             let outcome = timeout(STALL, client.list_objects_v2("list/", 2)).await;
             drop(client);
@@ -819,60 +2334,15 @@ async fn a_listing_page_answered_200_keeps_its_200_when_the_body_stalls_trickles
                 continue;
             }
         };
-        if answer.head.status != 200 || answer.head.request_id() != Some(request_id.as_str()) {
-            failures.push(format!("{case}: not the 200 the endpoint sent: {answer:?}"));
-            continue;
-        }
-        let sent = SENT_BEFORE_FAULT as u64;
-        // The answer in words: its status and request id, then the failure.
-        let shown = answer.to_string();
-        let said = match fault {
-            BodyFault::Stall => "a body that failed: the body-idle deadline",
-            BodyFault::Trickle => "a body that failed: the body deadline",
-            BodyFault::Cut => "a body that failed: reading the body failed",
-            BodyFault::NotADocument => "an unreadable",
-            BodyFault::ErrorDocument => "an S3 error",
-        };
-        if !shown.starts_with(&format!("HTTP 200, x-amz-request-id {request_id}: {said}")) {
-            failures.push(format!("{case}: shown as {shown:?}"));
-            continue;
-        }
-        let fits = match (&answer.outcome, fault) {
-            (
-                Outcome::BodyFailed(BodyFailure::Timeout {
-                    phase: Phase::BodyIdle,
-                    limit,
-                    received,
-                }),
-                BodyFault::Stall,
-            ) => *limit == SHORT_IDLE && *received == sent,
-            (
-                Outcome::BodyFailed(BodyFailure::Timeout {
-                    phase: Phase::Body,
-                    limit,
-                    received,
-                }),
-                BodyFault::Trickle,
-            ) => *limit == SHORT_BODY && *received > 0,
-            (Outcome::BodyFailed(BodyFailure::Transport { received, detail }), BodyFault::Cut) => {
-                *received <= sent && !detail.is_empty()
-            }
-            (Outcome::Unreadable { body, detail }, BodyFault::NotADocument) => {
-                body[..] == cut_listing()[..] && detail.contains("the listing body")
-            }
-            (Outcome::Error { code, message }, BodyFault::ErrorDocument) => {
-                *code == ErrorCode::Code("InternalError".to_string())
-                    && message.as_deref()
-                        == Some("We encountered an internal error. Please try again.")
-            }
-            _ => false,
-        };
-        if fits {
-            eprintln!("GREEN {case}: {answer}");
-        } else {
-            failures.push(format!(
-                "{case}: the wrong failure beside the 200: {answer:?}"
-            ));
+        match misreported_fault(
+            &answer,
+            fault,
+            &request_id,
+            &cut_listing(),
+            "the listing body",
+        ) {
+            None => eprintln!("GREEN {case}: {answer}"),
+            Some(fault) => failures.push(format!("{case}: {fault}")),
         }
     }
     assert!(
@@ -883,7 +2353,152 @@ async fn a_listing_page_answered_200_keeps_its_200_when_the_body_stalls_trickles
     );
 }
 
-// --- (D) unreadable listing pages are refused ----------------------------------------------
+// --- #956 (C): a 2xx head survives its body, on every probe that can carry one ---------------
+
+/// A body that starts like the operation's success document and is cut short: not a readable
+/// document, nor the empty body a headers-only success has.
+fn cut_document(probe: &Probe) -> Vec<u8> {
+    format!(
+        "{XML_DECL}<{}Result><ETag>&quot;0123&quot;</ETag>",
+        probe.operation()
+    )
+    .into_bytes()
+}
+
+/// Every probe whose answer can carry a body: a HEAD's never does.
+fn bodied_probes() -> Vec<Probe> {
+    probe_cases()
+        .into_iter()
+        .map(|case| case.probe)
+        .filter(|probe| *probe != Probe::HeadBucket)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_probe_answered_200_keeps_its_200_when_the_body_stalls_trickles_is_cut_or_is_unreadable()
+{
+    let mut cases = JoinSet::new();
+    for probe in bodied_probes() {
+        // `a_200_whose_body_is_an_s3_error_document…` is the fifth fault's, for a probe.
+        for fault in BODY_FAULTS
+            .into_iter()
+            .filter(|fault| !matches!(fault, BodyFault::ErrorDocument))
+        {
+            let probe = probe.clone();
+            cases.spawn(async move {
+                let request_id = format!("{}-{fault:?}", probe.operation());
+                let script = fault_script(&cut_document(&probe), fault, &request_id);
+                let mut endpoint = Endpoint::start(vec![script]).await;
+                let client = client(endpoint.addr, short_deadlines());
+                let outcome = timeout(STALL, client.probe(&probe)).await;
+                drop(client);
+                let _ = endpoint.heads().await;
+                (probe, fault, request_id, outcome)
+            });
+        }
+    }
+    let mut failures = Vec::new();
+    while let Some(joined) = cases.join_next().await {
+        let (probe, fault, request_id, outcome) = joined.expect("a case task");
+        let case = format!("{} {fault:?}", probe.operation());
+        let answer = match outcome {
+            Err(_) => {
+                failures.push(format!("{case}: no outcome within {STALL:?}"));
+                continue;
+            }
+            Ok(Err(e)) => {
+                failures.push(format!("{case}: the 200 head was lost: {e:?}"));
+                continue;
+            }
+            Ok(Ok(answer)) => answer,
+        };
+        match misreported_fault(
+            &answer,
+            fault,
+            &request_id,
+            &cut_document(&probe),
+            "success",
+        ) {
+            None => eprintln!("GREEN {case}: {answer}"),
+            Some(fault) => failures.push(format!("{case}: {fault}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) lost or misreported the 200:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// --- #956 (C): a 2xx head survives its body, on a bulk delete --------------------------------
+
+/// A `<DeleteResult>` cut short: not a readable document.
+fn cut_delete_result() -> Vec<u8> {
+    let document = delete_result(&["list/a", "list/b"]);
+    document.as_bytes()[..document.len() - 20].to_vec()
+}
+
+#[tokio::test]
+async fn a_delete_result_answered_200_keeps_its_200_when_the_body_stalls_trickles_is_cut_or_is_unreadable(
+) {
+    let mut cases = JoinSet::new();
+    for fault in BODY_FAULTS {
+        cases.spawn(async move {
+            let request_id = format!("DeleteObjects-{fault:?}");
+            let script = fault_script(&cut_delete_result(), fault, &request_id);
+            let mut endpoint = Endpoint::start(vec![script]).await;
+            let client = client(endpoint.addr, short_deadlines());
+            let outcome = timeout(STALL, client.delete_objects(&["list/a", "list/b"])).await;
+            drop(client);
+            let heads = endpoint.heads().await;
+            (fault, request_id, outcome, heads)
+        });
+    }
+    let mut failures = Vec::new();
+    while let Some(joined) = cases.join_next().await {
+        let (fault, request_id, outcome, heads) = joined.expect("a case task");
+        let case = format!("DeleteObjects {fault:?}");
+        match heads.as_slice() {
+            [request]
+                if request_line(request).0 == "POST"
+                    && query_has(request_line(request).2, "delete") => {}
+            _ => {
+                failures.push(format!("{case}: not one DeleteObjects request: {heads:?}"));
+                continue;
+            }
+        }
+        let answer = match outcome {
+            Err(_) => {
+                failures.push(format!("{case}: no outcome within {STALL:?}"));
+                continue;
+            }
+            Ok(Err(NoResult::Answered(answer))) => answer,
+            Ok(other) => {
+                failures.push(format!("{case}: the 200 head was lost: {other:?}"));
+                continue;
+            }
+        };
+        match misreported_fault(
+            &answer,
+            fault,
+            &request_id,
+            &cut_delete_result(),
+            "the delete result body",
+        ) {
+            None => eprintln!("GREEN {case}: {answer}"),
+            Some(fault) => failures.push(format!("{case}: {fault}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) lost or misreported the 200:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// --- (D) unreadable listing pages (#955) and delete results (#956) are refused ----------------------------------------------
 
 fn contents(key: &str, size: u64) -> String {
     format!(
@@ -927,6 +2542,15 @@ fn listing_v1_page(keys: &[&str], truncated: bool, next_marker: Option<&str>) ->
     )
 }
 
+/// A whole `<DeleteResult>` reporting `keys` deleted.
+fn delete_result(keys: &[&str]) -> String {
+    let rows: String = keys
+        .iter()
+        .map(|key| format!("<Deleted><Key>{key}</Key></Deleted>"))
+        .collect();
+    format!("{XML_DECL}<DeleteResult xmlns=\"{S3_NS}\">{rows}</DeleteResult>")
+}
+
 /// `document` with a comment after its root that brings it to exactly `len` bytes.
 fn padded(document: &str, len: usize) -> String {
     let fill = len
@@ -942,9 +2566,15 @@ fn padded(document: &str, len: usize) -> String {
 enum DocumentVerb {
     ListV2,
     ListV1,
+    Delete,
 }
 
-const DOCUMENT_VERBS: [DocumentVerb; 2] = [DocumentVerb::ListV2, DocumentVerb::ListV1];
+const LISTING_VERBS: [DocumentVerb; 2] = [DocumentVerb::ListV2, DocumentVerb::ListV1];
+const DOCUMENT_VERBS: [DocumentVerb; 3] = [
+    DocumentVerb::ListV2,
+    DocumentVerb::ListV1,
+    DocumentVerb::Delete,
+];
 
 impl DocumentVerb {
     /// A whole, readable document of this verb's result.
@@ -952,6 +2582,15 @@ impl DocumentVerb {
         match self {
             Self::ListV2 => listing_v2(&["list/a", "list/b"], None),
             Self::ListV1 => listing_v1(&["list/a", "list/b"]),
+            Self::Delete => delete_result(&["list/a", "list/b"]),
+        }
+    }
+
+    /// What a refusal of this verb's document calls the body it refused.
+    fn body_name(self) -> &'static str {
+        match self {
+            Self::ListV2 | Self::ListV1 => "the listing body",
+            Self::Delete => "the delete result body",
         }
     }
 
@@ -960,15 +2599,18 @@ impl DocumentVerb {
         match self {
             Self::ListV2 => ("GET", "list-type"),
             Self::ListV1 => ("GET", "prefix"),
+            Self::Delete => ("POST", "delete"),
         }
     }
 }
 
-/// What a (D) verb returned: the entries it read, or why it read none.
+/// What a (D) verb returned: the entries or rows it read, or why it read none.
 #[derive(Debug)]
 enum Read {
     Listed(Vec<ListEntry>),
+    Deleted(Vec<DeleteRow>),
     Listing(ListingError),
+    Delete(NoResult),
 }
 
 async fn call_document_verb(verb: DocumentVerb, client: &S3Client) -> Read {
@@ -981,16 +2623,22 @@ async fn call_document_verb(verb: DocumentVerb, client: &S3Client) -> Read {
             Ok(listing) => Read::Listed(listing.entries),
             Err(e) => Read::Listing(e),
         },
+        DocumentVerb::Delete => match client.delete_objects(&["list/a", "list/b"]).await {
+            Ok(result) => Read::Deleted(result.rows),
+            Err(e) => Read::Delete(e),
+        },
     }
 }
 
-/// The answer a (D) refusal kept, when it is one of page `page`.
+/// The answer a (D) refusal kept, when it is one of page `page` (listings) or of the one request
+/// (delete).
 fn refused_answer(read: &Read, page: usize) -> Option<&Answer> {
     match read {
         Read::Listing(ListingError::Page {
             page: failed,
             cause: NoResult::Answered(answer),
         }) if *failed == page => Some(answer),
+        Read::Delete(NoResult::Answered(answer)) => Some(answer),
         _ => None,
     }
 }
@@ -1009,13 +2657,13 @@ enum Refused {
     OverBudget,
 }
 
-fn refused_as(answer: &Answer, how: Refused) -> bool {
+fn refused_as(answer: &Answer, how: Refused, verb: DocumentVerb) -> bool {
     match (&answer.outcome, how) {
         (Outcome::Unreadable { detail, .. }, Refused::Unreadable) => {
-            detail.contains("the listing body")
+            detail.contains(verb.body_name())
         }
         (Outcome::Unreadable { body, detail }, Refused::UnreadableEmpty) => {
-            body.is_empty() && detail.contains("the listing body")
+            body.is_empty() && detail.contains(verb.body_name())
         }
         (Outcome::BodyFailed(BodyFailure::Overrun { after, .. }), Refused::Overrun) => *after > 0,
         (Outcome::BodyFailed(BodyFailure::OverBudget { received }), Refused::OverBudget) => {
@@ -1026,7 +2674,7 @@ fn refused_as(answer: &Answer, how: Refused) -> bool {
 }
 
 #[tokio::test]
-async fn listing_pages_that_are_not_whole_documents_are_refused_never_partial() {
+async fn listing_and_delete_result_documents_that_are_not_whole_are_refused_never_partial() {
     let budget = usize::try_from(BUFFERED_BODY_BUDGET).expect("the budget fits usize");
     let mut failures = Vec::new();
     for verb in DOCUMENT_VERBS {
@@ -1098,7 +2746,7 @@ async fn listing_pages_that_are_not_whole_documents_are_refused_never_partial() 
                 Some(answer)
                     if answer.head.status == 200
                         && answer.head.request_id() == Some(id(case).as_str())
-                        && refused_as(answer, how) =>
+                        && refused_as(answer, how, verb) =>
                 {
                     eprintln!("GREEN {name}: {answer}");
                 }
@@ -1123,8 +2771,12 @@ async fn listing_pages_that_are_not_whole_documents_are_refused_never_partial() 
             size: 7,
             etag: Some(SOME_ETAG.to_string()),
         });
+        let rows = ["list/a", "list/b"].map(|key| DeleteRow::Deleted {
+            key: key.to_string(),
+        });
         match read {
             Read::Listed(entries) if entries == expected => {}
+            Read::Deleted(got) if got == rows => {}
             other => failures.push(format!(
                 "{verb:?} exactly the budget: not read whole: {other:?}"
             )),
@@ -1257,7 +2909,7 @@ const SPOILED_PAGES: [(&str, &str, &str, &str); 19] = [
 #[tokio::test]
 async fn a_listing_page_whose_truncation_or_fields_cannot_be_read_is_refused_never_partial() {
     let mut failures = Vec::new();
-    for verb in DOCUMENT_VERBS {
+    for verb in LISTING_VERBS {
         for (case, from, to, said) in SPOILED_PAGES {
             let name = format!("{verb:?} {case}");
             let document = verb.document();
@@ -1442,6 +3094,384 @@ async fn a_truncated_v1_page_whose_last_key_is_empty_is_refused_and_asks_for_no_
             other => panic!("{case}: page 1 must be refused: {other:?}"),
         }
     }
+}
+
+// --- #956 (F): a mixed <DeleteResult> is reported row by row ----------------------------------
+
+#[tokio::test]
+async fn a_mixed_delete_result_is_reported_row_by_row_in_document_order() {
+    let document = format!(
+        "{XML_DECL}<DeleteResult xmlns=\"{S3_NS}\">\
+         <Deleted><Key>mixed/a</Key></Deleted>\
+         <Error><Key>mixed/b</Key><Code>AccessDenied</Code><Message>Access Denied</Message>\
+         </Error>\
+         <Deleted><Key>mixed/c</Key></Deleted>\
+         </DeleteResult>"
+    );
+    let mut endpoint = Endpoint::start(vec![Script::ended(ok_with_length(
+        "mixed",
+        document.len(),
+        document.as_bytes(),
+    ))])
+    .await;
+    let client = client(endpoint.addr, deadlines());
+    let keys = ["mixed/a", "mixed/b", "mixed/c"];
+    let result = bounded("DeleteObjects", client.delete_objects(&keys)).await;
+    drop(client);
+    let heads = endpoint.heads().await;
+    let (method, path, query) = request_line(&heads[0]);
+    assert_eq!((method, path), ("POST", format!("/{BUCKET}/").as_str()));
+    assert_eq!(
+        operation_params(query),
+        [("delete".to_string(), String::new())],
+        "{}",
+        heads[0]
+    );
+
+    let result = result.unwrap_or_else(|e| panic!("DeleteObjects: {e}"));
+    assert_eq!(result.head.status, 200);
+    assert_eq!(result.head.request_id(), Some("mixed"));
+    let denied = KeyError {
+        key: "mixed/b".to_string(),
+        code: ErrorCode::Code("AccessDenied".to_string()),
+        message: Some("Access Denied".to_string()),
+    };
+    assert_eq!(
+        result.rows,
+        [
+            DeleteRow::Deleted {
+                key: "mixed/a".to_string()
+            },
+            DeleteRow::Error(denied.clone()),
+            DeleteRow::Deleted {
+                key: "mixed/c".to_string()
+            },
+        ],
+        "every row, as sent, in document order"
+    );
+    assert_eq!(
+        result.deleted().collect::<Vec<_>>(),
+        ["mixed/a", "mixed/c"],
+        "exactly the two deleted keys"
+    );
+    assert_eq!(
+        result.errors().cloned().collect::<Vec<_>>(),
+        [denied],
+        "exactly the one error row, its key, code and message as sent"
+    );
+    assert_eq!(result.requested, keys);
+    assert_eq!(result.keys_without_a_row().count(), 0, "{result:?}");
+    assert_eq!(result.rows_not_requested().count(), 0, "{result:?}");
+}
+
+/// A `<Deleted>` row of `key`, as read.
+fn deleted_row(key: &str) -> DeleteRow {
+    DeleteRow::Deleted {
+        key: key.to_string(),
+    }
+}
+
+/// An `<Error>` row of `key` with code `AccessDenied` and no message, as read.
+fn denied_row(key: &str) -> DeleteRow {
+    DeleteRow::Error(KeyError {
+        key: key.to_string(),
+        code: ErrorCode::Code("AccessDenied".to_string()),
+        message: None,
+    })
+}
+
+#[tokio::test]
+async fn a_delete_result_reports_requested_keys_with_no_row_and_rows_naming_no_requested_key() {
+    struct Case {
+        name: &'static str,
+        keys: &'static [&'static str],
+        rows: &'static str,
+        expected_rows: Vec<DeleteRow>,
+        without_a_row: &'static [&'static str],
+        not_requested: Vec<DeleteRow>,
+    }
+    let cases = [
+        Case {
+            name: "empty",
+            keys: &["a", "b"],
+            rows: "",
+            expected_rows: vec![],
+            without_a_row: &["a", "b"],
+            not_requested: vec![],
+        },
+        Case {
+            name: "partial",
+            keys: &["a", "b", "c"],
+            rows: "<Deleted><Key>b</Key></Deleted>",
+            expected_rows: vec![deleted_row("b")],
+            without_a_row: &["a", "c"],
+            not_requested: vec![],
+        },
+        Case {
+            name: "unrequested-deleted",
+            keys: &["a"],
+            rows: "<Deleted><Key>c</Key></Deleted>",
+            expected_rows: vec![deleted_row("c")],
+            without_a_row: &["a"],
+            not_requested: vec![deleted_row("c")],
+        },
+        Case {
+            name: "unrequested-error",
+            keys: &["a"],
+            rows: "<Deleted><Key>a</Key></Deleted>\
+                   <Error><Key>c</Key><Code>AccessDenied</Code></Error>",
+            expected_rows: vec![deleted_row("a"), denied_row("c")],
+            without_a_row: &[],
+            not_requested: vec![denied_row("c")],
+        },
+        // An error row accounts for its key as a deleted row does: judging it is the caller's.
+        Case {
+            name: "all-errors",
+            keys: &["a", "b"],
+            rows: "<Error><Key>b</Key><Code>AccessDenied</Code></Error>\
+                   <Error><Key>a</Key><Code>AccessDenied</Code></Error>",
+            expected_rows: vec![denied_row("b"), denied_row("a")],
+            without_a_row: &[],
+            not_requested: vec![],
+        },
+        // Compared once the document's escapes are read, and exactly: `A` is not `a`, nor is
+        // ` a` (S3 allows a key of white space, which is a key).
+        Case {
+            name: "as-sent",
+            keys: &["x&y", "a", " "],
+            rows: "<Deleted><Key>x&amp;y</Key></Deleted>\
+                   <Deleted><Key>A</Key></Deleted>\
+                   <Deleted><Key> </Key></Deleted>",
+            expected_rows: vec![deleted_row("x&y"), deleted_row("A"), deleted_row(" ")],
+            without_a_row: &["a"],
+            not_requested: vec![deleted_row("A")],
+        },
+        // A key asked for twice and a key answered twice: every line as it came.
+        Case {
+            name: "repeated",
+            keys: &["a", "a", "b", "b"],
+            rows: "<Deleted><Key>b</Key></Deleted><Deleted><Key>b</Key></Deleted>",
+            expected_rows: vec![deleted_row("b"), deleted_row("b")],
+            without_a_row: &["a", "a"],
+            not_requested: vec![],
+        },
+        // Compared with the document's line endings read as XML reads them (XML 1.0 §2.11): a
+        // raw carriage return, alone or before a line feed, is one line feed, so a key that
+        // holds one and is written raw comes back changed and names no requested key; one
+        // escaped as `&#13;` is read as the carriage return and names its key.
+        Case {
+            name: "line-endings",
+            keys: &["cr\rkey", "crlf\r\nkey", "escaped\rkey"],
+            rows: "<Deleted><Key>cr\rkey</Key></Deleted>\
+                   <Deleted><Key>crlf\r\nkey</Key></Deleted>\
+                   <Deleted><Key>escaped&#13;key</Key></Deleted>",
+            expected_rows: vec![
+                deleted_row("cr\nkey"),
+                deleted_row("crlf\nkey"),
+                deleted_row("escaped\rkey"),
+            ],
+            without_a_row: &["cr\rkey", "crlf\r\nkey"],
+            not_requested: vec![deleted_row("cr\nkey"), deleted_row("crlf\nkey")],
+        },
+    ];
+    for case in cases {
+        let name = case.name;
+        let document = delete_result_of(case.rows);
+        let response = ok_with_length(name, document.len(), document.as_bytes());
+        let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+        let client = client(endpoint.addr, deadlines());
+        let result = bounded(name, client.delete_objects(case.keys))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: reported, not refused: {e}"));
+        drop(client);
+        let _ = endpoint.heads().await;
+        assert_eq!(result.head.status, 200, "{name}: {result:?}");
+        assert_eq!(result.requested, case.keys, "{name}: {result:?}");
+        assert_eq!(result.rows, case.expected_rows, "{name}: every row as sent");
+        assert_eq!(
+            result.keys_without_a_row().collect::<Vec<_>>(),
+            case.without_a_row,
+            "{name}: the requested keys no row names, in the order given: {result:?}"
+        );
+        assert_eq!(
+            result.rows_not_requested().cloned().collect::<Vec<_>>(),
+            case.not_requested,
+            "{name}: the rows that name no requested key, in document order: {result:?}"
+        );
+    }
+}
+
+/// A `<DeleteResult>` of `rows`.
+fn delete_result_of(rows: &str) -> String {
+    format!("{XML_DECL}<DeleteResult xmlns=\"{S3_NS}\">{rows}</DeleteResult>")
+}
+
+/// `<DeleteResult>` rows that hold no row the client can report, and the words of the refusal.
+const SPOILED_ROWS: [(&str, &str, &str); 14] = [
+    (
+        "deleted-no-key",
+        "<Deleted><VersionId>1</VersionId></Deleted>",
+        "a <Deleted> row names no <Key>",
+    ),
+    (
+        "error-no-key",
+        "<Error><Code>AccessDenied</Code></Error>",
+        "an <Error> row names no <Key>",
+    ),
+    (
+        "deleted-key-twice",
+        "<Deleted><Key>a</Key><Key>b</Key></Deleted>",
+        "more than one <Key>",
+    ),
+    (
+        "error-code-twice",
+        "<Error><Key>a</Key><Code>x</Code><Code>y</Code></Error>",
+        "more than one <Code>",
+    ),
+    (
+        "deleted-key-markup",
+        "<Deleted><Key><b>a</b></Key></Deleted>",
+        "holds markup",
+    ),
+    (
+        "error-message-markup",
+        "<Error><Key>a</Key><Message><b>m</b></Message></Error>",
+        "holds markup",
+    ),
+    // An empty `<Key>` names no key, as an empty `<Code>` names no code.
+    (
+        "deleted-self-closed-key",
+        "<Deleted><Key/></Deleted>",
+        "a <Deleted> row names no <Key>",
+    ),
+    (
+        "deleted-empty-key",
+        "<Deleted><Key></Key></Deleted>",
+        "a <Deleted> row names no <Key>",
+    ),
+    (
+        "error-empty-key",
+        "<Error><Key></Key><Code>AccessDenied</Code></Error>",
+        "an <Error> row names no <Key>",
+    ),
+    // S3 sends nothing there but rows, and a failed key must not vanish in a row left unread:
+    // a row in the wrong case, an element of no kind, a row's field on its own, text, and a
+    // processing instruction.
+    (
+        "error-row-in-the-wrong-case",
+        "<error><Key>a</Key><Code>AccessDenied</Code></error>",
+        "the <DeleteResult> holds a <error>",
+    ),
+    (
+        "element-of-no-kind",
+        "<Failed><Key>a</Key></Failed>",
+        "the <DeleteResult> holds a <Failed>",
+    ),
+    (
+        "bare-key",
+        "<Key>a</Key>",
+        "the <DeleteResult> holds a <Key>",
+    ),
+    (
+        "text-outside-any-row",
+        "and that is all",
+        "the <DeleteResult> holds text outside any row",
+    ),
+    (
+        "processing-instruction",
+        "<?pi data?>",
+        "the <DeleteResult> holds a processing instruction",
+    ),
+];
+
+#[tokio::test]
+async fn a_delete_result_row_that_cannot_be_read_is_refused_never_a_short_result() {
+    let mut failures = Vec::new();
+    for (case, row, said) in SPOILED_ROWS {
+        // A good row first: the refusal discards it.
+        let document = delete_result_of(&format!("<Deleted><Key>good</Key></Deleted>{row}"));
+        let response = ok_with_length(case, document.len(), document.as_bytes());
+        let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+        let client = client(endpoint.addr, deadlines());
+        let result = bounded(case, client.delete_objects(&["good", "a"])).await;
+        drop(client);
+        let _ = endpoint.heads().await;
+        match result {
+            Err(NoResult::Answered(Answer {
+                head,
+                outcome: Outcome::Unreadable { body, detail },
+            })) if head.status == 200
+                && head.request_id() == Some(case)
+                && body[..] == *document.as_bytes()
+                && detail.contains(said) =>
+            {
+                eprintln!("GREEN {case}: {detail}");
+            }
+            other => failures.push(format!("{case}: not refused for {said:?}: {other:?}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) not refused as they must be:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn white_space_and_comments_beside_delete_result_rows_are_read_past() {
+    let document =
+        delete_result_of("\r\n\t <!-- a comment -->\n  <Deleted><Key>a</Key></Deleted>\n");
+    let response = ok_with_length("laid-out", document.len(), document.as_bytes());
+    let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+    let client = client(endpoint.addr, deadlines());
+    let result = bounded("laid-out", client.delete_objects(&["a"]))
+        .await
+        .unwrap_or_else(|e| panic!("a laid-out document: {e}"));
+    drop(client);
+    let _ = endpoint.heads().await;
+    assert_eq!(result.rows, [deleted_row("a")]);
+}
+
+#[tokio::test]
+async fn a_delete_error_row_with_no_code_or_message_reports_none_and_a_rows_own_other_fields_are_passed_over(
+) {
+    // `<VersionId>`, `<DeleteMarker>` and `<DeleteMarkerVersionId>` are what S3 sends in a row
+    // beside the fields the client reads.
+    let document = delete_result_of(
+        "<Error><Key>no-code</Key><Message>why</Message></Error>\
+         <Error><Key>empty-code</Key><Code></Code><VersionId>1</VersionId></Error>\
+         <Deleted><Key>versioned</Key><VersionId>2</VersionId><DeleteMarker>true</DeleteMarker>\
+         <DeleteMarkerVersionId>3</DeleteMarkerVersionId></Deleted>",
+    );
+    let response = ok_with_length("sparse", document.len(), document.as_bytes());
+    let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+    let client = client(endpoint.addr, deadlines());
+    let result = bounded(
+        "DeleteObjects",
+        client.delete_objects(&["no-code", "empty-code", "versioned"]),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("DeleteObjects: {e}"));
+    drop(client);
+    let _ = endpoint.heads().await;
+    assert_eq!(
+        result.rows,
+        [
+            DeleteRow::Error(KeyError {
+                key: "no-code".to_string(),
+                code: ErrorCode::MissingInXml,
+                message: Some("why".to_string()),
+            }),
+            DeleteRow::Error(KeyError {
+                key: "empty-code".to_string(),
+                code: ErrorCode::MissingInXml,
+                message: None,
+            }),
+            deleted_row("versioned"),
+        ],
+        "nothing filled in on the server's behalf"
+    );
 }
 
 // --- (G) on the scripted endpoint: header lines, listing continuation, the page cap -------
@@ -2627,8 +4657,8 @@ async fn an_s3_error_through_every_new_read_verb_keeps_its_status_headers_code_a
 
 #[tokio::test]
 async fn a_read_verb_stopped_before_the_connector_is_request_not_built_and_reaches_no_endpoint() {
-    // A listener the client must not reach: the SDK's endpoint rules refuse an endpoint with a
-    // query, before the request is signed or the connector called.
+    // A listener the client must not reach: the client's endpoint resolution refuses an endpoint
+    // with a query, before the request is signed or the connector called.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let unsent = client_at(&format!("http://{addr}/?x=1"), deadlines());
@@ -2686,6 +4716,432 @@ async fn a_read_verb_stopped_before_the_connector_is_request_not_built_and_reach
             })
         ),
         "ListObjectsV2: {listed:?}"
+    );
+}
+
+// --- #956 (G): a whole success, and a 304's framing, on a probe -------------------------------
+
+/// The `ETag` S3 gives an empty part.
+const EMPTY_PART_ETAG: &str = "\"d41d8cd98f00b204e9800998ecf8427e\"";
+
+/// A `200` (`204` where S3 answers so) carrying `probe`'s whole S3 success, and the body it
+/// carries.
+fn success_script(probe: &Probe, request_id: &str) -> (Script, u16, Bytes) {
+    let document =
+        |root: &str, inner: &str| format!("{XML_DECL}<{root} xmlns=\"{S3_NS}\">{inner}</{root}>");
+    let etag = "<ETag>&quot;0123456789abcdef0123456789abcdef&quot;</ETag>";
+    let body = match probe {
+        Probe::CopyObject { .. } => document(
+            "CopyObjectResult",
+            &format!("<LastModified>2026-10-23T00:00:00.000Z</LastModified>{etag}"),
+        ),
+        Probe::CreateMultipartUpload { .. } => document(
+            "InitiateMultipartUploadResult",
+            "<Bucket>validate</Bucket><Key>probe/object</Key><UploadId>upload-1</UploadId>",
+        ),
+        Probe::CompleteMultipartUpload { .. } => document(
+            "CompleteMultipartUploadResult",
+            &format!(
+                "<Location>http://127.0.0.1/validate/probe/object</Location>\
+                 <Bucket>validate</Bucket><Key>probe/object</Key>{etag}"
+            ),
+        ),
+        Probe::ListParts { .. } => document(
+            "ListPartsResult",
+            &format!(
+                "<Bucket>validate</Bucket><Key>probe/object</Key>\
+                 <UploadId>{UPLOAD_ID}</UploadId><IsTruncated>false</IsTruncated>"
+            ),
+        ),
+        Probe::ListMultipartUploads => document(
+            "ListMultipartUploadsResult",
+            "<Bucket>validate</Bucket><IsTruncated>false</IsTruncated>",
+        ),
+        Probe::GetBucketLocation => document("LocationConstraint", "us-west-2"),
+        Probe::ListBuckets => document(
+            "ListAllMyBucketsResult",
+            "<Owner><ID>wyrd</ID></Owner><Buckets><Bucket><Name>validate</Name>\
+             <CreationDate>2026-10-23T00:00:00.000Z</CreationDate></Bucket></Buckets>",
+        ),
+        // Headers only: S3's success for these has no body.
+        Probe::UploadPart { .. } => {
+            let response = head(
+                "200 OK",
+                request_id,
+                &[
+                    ("ETag", EMPTY_PART_ETAG.to_string()),
+                    ("Content-Length", "0".to_string()),
+                ],
+            );
+            return (Script::ended(response), 200, Bytes::new());
+        }
+        Probe::CreateBucket { bucket } => {
+            let response = head(
+                "200 OK",
+                request_id,
+                &[
+                    ("Location", format!("/{bucket}")),
+                    ("Content-Length", "0".to_string()),
+                ],
+            );
+            return (Script::ended(response), 200, Bytes::new());
+        }
+        Probe::HeadBucket => {
+            let response = head(
+                "200 OK",
+                request_id,
+                &[
+                    ("x-amz-bucket-region", REGION.to_string()),
+                    ("Content-Length", "0".to_string()),
+                ],
+            );
+            return (Script::ended(response), 200, Bytes::new());
+        }
+        Probe::AbortMultipartUpload { .. } | Probe::DeleteBucket { .. } => {
+            let response = head("204 No Content", request_id, &[]);
+            return (Script::ended(response), 204, Bytes::new());
+        }
+    };
+    let response = ok_with_length(request_id, body.len(), body.as_bytes());
+    (Script::ended(response), 200, Bytes::from(body))
+}
+
+#[tokio::test]
+async fn a_2xx_carrying_the_operations_whole_s3_success_is_a_success() {
+    let mut failures = Vec::new();
+    for case in probe_cases() {
+        let name = case.probe.operation();
+        let request_id = format!("{name}-success");
+        let (script, status, body) = success_script(&case.probe, &request_id);
+        let mut endpoint = Endpoint::start(vec![script]).await;
+        let client = client(endpoint.addr, deadlines());
+        let answer = bounded(name, client.probe(&case.probe)).await;
+        drop(client);
+        // The request first, so a success answered to the wrong request cannot pass.
+        let heads = endpoint.heads().await;
+        let [head] = heads.as_slice() else {
+            failures.push(format!("{name}: not one request: {heads:?}"));
+            continue;
+        };
+        if let Some(fault) = case.request_fault(head) {
+            failures.push(format!("{name}: not the operation's request: {fault}"));
+            continue;
+        }
+        match answer {
+            Ok(answer)
+                if answer.head.status == status
+                    && answer.head.request_id() == Some(request_id.as_str())
+                    && answer.outcome == (Outcome::Success { body: body.clone() }) =>
+            {
+                eprintln!("GREEN {name}: {answer}");
+            }
+            other => failures.push(format!("{name}: not its success: {other:?}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} success(es) not reported as one:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn a_2xx_whose_whole_document_is_under_another_root_is_no_success() {
+    let document = format!("{XML_DECL}<SomeOtherResult xmlns=\"{S3_NS}\"></SomeOtherResult>");
+    let mut failures = Vec::new();
+    for probe in bodied_probes() {
+        let name = probe.operation();
+        let request_id = format!("{name}-another-root");
+        let response = ok_with_length(&request_id, document.len(), document.as_bytes());
+        let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+        let client = client(endpoint.addr, deadlines());
+        let answer = bounded(name, client.probe(&probe)).await;
+        drop(client);
+        let _ = endpoint.heads().await;
+        match answer {
+            Ok(answer)
+                if answer.head.status == 200
+                    && matches!(&answer.outcome, Outcome::Unreadable { body, .. }
+                        if body[..] == *document.as_bytes()) => {}
+            other => failures.push(format!("{name}: {other:?}")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) read as a success:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+// --- #956 (D) for a probe: the budget caps its body as it caps a listing page's ----------------
+
+/// How a sizing leg frames a probe's success document against the budget.
+#[derive(Clone, Copy, Debug)]
+enum Sizing {
+    /// One byte past the budget, with a `Content-Length`.
+    OverWithLength,
+    /// One byte past the budget, chunked.
+    OverChunked,
+    /// Exactly the budget, with a `Content-Length`.
+    Exact,
+}
+
+const SIZINGS: [Sizing; 3] = [Sizing::OverWithLength, Sizing::OverChunked, Sizing::Exact];
+
+#[tokio::test]
+async fn a_probe_body_past_the_budget_is_refused_beside_its_200_and_one_of_exactly_the_budget_is_read(
+) {
+    let budget = usize::try_from(BUFFERED_BODY_BUDGET).expect("the budget fits usize");
+    let mut failures = Vec::new();
+    let mut sized = Vec::new();
+    for case in probe_cases() {
+        let name = case.probe.operation();
+        let (_, _, document) = success_script(&case.probe, "sizing");
+        if document.is_empty() {
+            // A headers-only success: a body of any size is not its success, and
+            // `a_probe_answered_200_keeps_its_200…` has its body faults.
+            continue;
+        }
+        sized.push(name);
+        let document = std::str::from_utf8(&document).expect("the success document is text");
+        let over = padded(document, budget + 1);
+        let exact = padded(document, budget);
+        for sizing in SIZINGS {
+            let leg = format!("{name} {sizing:?}");
+            let request_id = format!("{name}-{sizing:?}");
+            let response = match sizing {
+                Sizing::OverWithLength => ok_with_length(&request_id, over.len(), over.as_bytes()),
+                Sizing::OverChunked => ok_chunked(&request_id, over.as_bytes()),
+                Sizing::Exact => ok_with_length(&request_id, exact.len(), exact.as_bytes()),
+            };
+            let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+            let client = client(endpoint.addr, deadlines());
+            let answer = bounded(&leg, client.probe(&case.probe)).await;
+            drop(client);
+            // The request first, as the success legs check it: a body answered to the wrong
+            // request shows nothing about this probe.
+            let heads = endpoint.heads().await;
+            let [head] = heads.as_slice() else {
+                failures.push(format!("{leg}: not one request: {heads:?}"));
+                continue;
+            };
+            if let Some(fault) = case.request_fault(head) {
+                failures.push(format!("{leg}: not the operation's request: {fault}"));
+                continue;
+            }
+            let answer = match answer {
+                Ok(answer)
+                    if answer.head.status == 200
+                        && answer.head.request_id() == Some(request_id.as_str()) =>
+                {
+                    answer
+                }
+                other => {
+                    failures.push(format!("{leg}: the 200 head was lost: {other:?}"));
+                    continue;
+                }
+            };
+            let fits = match (&answer.outcome, sizing) {
+                (
+                    Outcome::BodyFailed(BodyFailure::OverBudget { received }),
+                    Sizing::OverWithLength | Sizing::OverChunked,
+                ) => *received > BUFFERED_BODY_BUDGET,
+                (Outcome::Success { body }, Sizing::Exact) => body[..] == *exact.as_bytes(),
+                _ => false,
+            };
+            if fits {
+                eprintln!("GREEN {leg}: {answer}");
+            } else {
+                failures.push(format!(
+                    "{leg}: the wrong outcome beside the 200: {answer:?}"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} leg(s) not read against the budget as they must be:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    // The seven probes whose S3 success is a document, so the legs above cannot thin out
+    // unnoticed should a success script change.
+    assert_eq!(
+        sized,
+        [
+            "CopyObject",
+            "CreateMultipartUpload",
+            "CompleteMultipartUpload",
+            "ListParts",
+            "ListMultipartUploads",
+            "GetBucketLocation",
+            "ListBuckets",
+        ],
+        "every document probe was sized against the budget"
+    );
+}
+
+#[tokio::test]
+async fn a_304_that_frames_a_chunked_body_is_refused_only_for_a_probe_that_is_not_a_get_or_head() {
+    let cases = probe_cases();
+    let mut failures = Vec::new();
+    for case in &cases {
+        let name = case.probe.operation();
+        let request_id = format!("{name}-304");
+        let response = head(
+            "304 Not Modified",
+            &request_id,
+            &[("Transfer-Encoding", "chunked".to_string())],
+        );
+        let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+        let client = client(endpoint.addr, deadlines());
+        let answer = bounded(name, client.probe(&case.probe)).await;
+        drop(client);
+        let heads = endpoint.heads().await;
+        if let Some(fault) = heads.first().and_then(|head| case.request_fault(head)) {
+            failures.push(format!("{name}: not the operation's request: {fault}"));
+            continue;
+        }
+        // RFC 9112 §6.1: a `Transfer-Encoding` on a `304` only in answer to a GET (or a HEAD,
+        // which is answered as the GET would be).
+        let reads = matches!(case.method, "GET" | "HEAD");
+        let expected = if reads {
+            Outcome::Error {
+                code: ErrorCode::NoBody,
+                message: None,
+            }
+        } else {
+            Outcome::BodyFailed(BodyFailure::Framing {
+                transfer_encoding: Some("chunked".to_string()),
+                content_length: None,
+            })
+        };
+        match answer {
+            Ok(answer) if answer.head.status == 304 && answer.outcome == expected => {
+                eprintln!("GREEN {name} ({}): {answer}", case.method);
+            }
+            other => failures.push(format!(
+                "{name} ({}): expected {expected:?}, got {other:?}",
+                case.method
+            )),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} case(s) misread:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn a_304_that_frames_a_chunked_body_is_refused_for_a_bulk_delete_beside_its_status() {
+    let response = head(
+        "304 Not Modified",
+        "DeleteObjects-304",
+        &[("Transfer-Encoding", "chunked".to_string())],
+    );
+    let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+    let client = client(endpoint.addr, deadlines());
+    let result = bounded("DeleteObjects", client.delete_objects(&["a"])).await;
+    drop(client);
+    let heads = endpoint.heads().await;
+    assert_eq!(request_line(&heads[0]).0, "POST", "{heads:?}");
+    // RFC 9112 §6.1: a `Transfer-Encoding` on a `304` only in answer to a GET or a HEAD.
+    match result {
+        Err(NoResult::Answered(Answer {
+            head,
+            outcome:
+                Outcome::BodyFailed(BodyFailure::Framing {
+                    transfer_encoding: Some(coding),
+                    content_length: None,
+                }),
+        })) if head.status == 304 && coding == "chunked" => {}
+        other => panic!("not refused beside the 304: {other:?}"),
+    }
+}
+
+// --- #956 (C): a 2xx whose body is an S3 error document --------------------------------------
+
+fn internal_error() -> Outcome {
+    Outcome::Error {
+        code: ErrorCode::Code("InternalError".to_string()),
+        message: Some("We encountered an internal error. Please try again.".to_string()),
+    }
+}
+
+#[tokio::test]
+async fn a_200_whose_body_is_an_s3_error_document_keeps_the_200_and_reports_its_code_and_message() {
+    let document = internal_error_document();
+    let mut failures = Vec::new();
+    for probe in bodied_probes() {
+        let name = probe.operation();
+        let request_id = format!("{name}-error-in-200");
+        let response = ok_with_length(&request_id, document.len(), document.as_bytes());
+        let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+        let client = client(endpoint.addr, deadlines());
+        let answer = bounded(name, client.probe(&probe)).await;
+        drop(client);
+        let _ = endpoint.heads().await;
+        match answer {
+            Ok(answer)
+                if answer.head.status == 200
+                    && answer.head.request_id() == Some(request_id.as_str())
+                    && answer.outcome == internal_error() =>
+            {
+                eprintln!("GREEN {name}: {answer}");
+            }
+            other => failures.push(format!("{name}: {other:?}")),
+        }
+    }
+
+    // A listing page and a delete result: no result, the 200 and the error kept.
+    for verb in [DocumentVerb::ListV2, DocumentVerb::Delete] {
+        let request_id = format!("{verb:?}-error-in-200");
+        let response = ok_with_length(&request_id, document.len(), document.as_bytes());
+        let mut endpoint = Endpoint::start(vec![Script::ended(response)]).await;
+        let client = client(endpoint.addr, deadlines());
+        let read = bounded("a document verb", call_document_verb(verb, &client)).await;
+        drop(client);
+        let _ = endpoint.heads().await;
+        match refused_answer(&read, 1) {
+            Some(answer)
+                if answer.head.status == 200
+                    && answer.head.request_id() == Some(request_id.as_str())
+                    && answer.outcome == internal_error() =>
+            {
+                eprintln!("GREEN {verb:?}: {answer}");
+            }
+            _ => failures.push(format!("{verb:?}: {read:?}")),
+        }
+    }
+
+    // An empty body names no error: a 200 with none, where a document is due, is unreadable.
+    let copy = Probe::CopyObject {
+        key: "probe/object".to_string(),
+        source_key: "probe/source".to_string(),
+    };
+    let mut endpoint =
+        Endpoint::start(vec![Script::ended(ok_with_length("empty-200", 0, b""))]).await;
+    let client = client(endpoint.addr, deadlines());
+    let answer = bounded("CopyObject empty", client.probe(&copy)).await;
+    drop(client);
+    let _ = endpoint.heads().await;
+    match answer {
+        Ok(answer)
+            if answer.head.status == 200
+                && matches!(&answer.outcome, Outcome::Unreadable { body, .. } if body.is_empty()) =>
+            {}
+        other => failures.push(format!("CopyObject, an empty 200: {other:?}")),
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{} case(s) lost the 200 or the error:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
 }
 
