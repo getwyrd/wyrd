@@ -1,9 +1,12 @@
 //! The S3 client every validator scenario calls through (proposal 0017 §6-7).
 //!
-//! It is `aws-sdk-s3` pointed at an arbitrary `--endpoint`: path-style addressing, static
-//! SigV4 credentials, and retries and stalled-stream protection **off**, so every request the
-//! validator reports on is exactly one request on the wire. On top of the SDK it adds eight
-//! things:
+//! It is `aws-sdk-s3` pointed at an arbitrary `--endpoint`: static SigV4 credentials, retries
+//! and stalled-stream protection **off**, and an endpoint resolution of the client's own in
+//! place of the SDK's endpoint rules (`PathStyle`). Every request goes to that endpoint,
+//! path-style, its bucket one path segment whatever the bucket is named, so the client reads
+//! no name as an S3 Express bucket, an S3 on Outposts access point or an ARN, and every
+//! request the validator reports on is at most one request on the wire, to the endpoint it
+//! was given. On top of the SDK it adds eight things:
 //!
 //! * a plain-HTTP connector of its own (TLS is terminated in front of the gateway, proposal
 //!   0017 §10), with one connection per request, which counts what the endpoint sent after
@@ -20,14 +23,15 @@
 //!   `<Message>` hold only text is [`S3Error::Unreadable`]. Framing that cannot mark where a
 //!   body ends is refused: both `Transfer-Encoding` and `Content-Length`, a transfer coding
 //!   other than exactly `chunked`, a `204` that frames a body, a `Transfer-Encoding` on a
-//!   `304` to a PUT or a DELETE, or neither header on a GET object. So are bytes after the
-//!   end the framing marks, a PUT or DELETE success that carries a body, and a success the
-//!   SDK cannot read, with the SDK's diagnostic kept;
-//! * a byte budget, [`BUFFERED_BODY_BUDGET`] (64 KiB), on every body the SDK buffers — every
-//!   error response and every PUT or DELETE response — and on every body the client reads
-//!   whole itself (an [`Answer`]'s: a HEAD's, a listing page's, a ranged or conditional GET's
-//!   that is not a 2xx), counted as the body arrives, so a body with no declared length is cut
-//!   off at the budget rather than read whole;
+//!   `304` to anything but a GET or a HEAD, or neither header on a GET object. So are bytes
+//!   after the end the framing marks, a success of the PUT or DELETE of one object that
+//!   carries a body, and a success the SDK cannot read, with the SDK's diagnostic kept;
+//! * a byte budget, [`BUFFERED_BODY_BUDGET`] (64 KiB), on every body the SDK buffers — on the
+//!   PUT, GET and DELETE of one object, every error response and every PUT or DELETE
+//!   response — and on every body the client reads whole itself (an [`Answer`]'s: a HEAD's, a
+//!   probe's, a listing page's, a delete result's, a ranged or conditional GET's that is not a
+//!   2xx), counted as the body arrives, so a body with no declared length is cut off at the
+//!   budget rather than read whole;
 //! * bounded waits ([`Deadlines`]): connect, operation, body-idle, and whole body, each
 //!   expiring as a typed timeout naming its phase;
 //! * bodies that stream both ways ([`PutSource`], [`ObjectBody`]), so what the client holds
@@ -36,17 +40,21 @@
 //! * PUTs that end with their call ([`S3Client::put_object`]): a receipt only when the source
 //!   had ended before the answer, and neither the source nor the connection left behind when
 //!   the call returns;
-//! * answers kept whole for the verbs `smoke` sends beyond those three that only read
-//!   (`s3/verbs.rs`, #938): HEAD, a ranged and a conditional GET, and `ListObjectsV2` and
-//!   `ListObjects` followed across pages. Each reports the head as the server sent it, every
-//!   header field line included, and reads the body itself, under the budget and the body
-//!   deadlines, so a body that fails after a 2xx head is reported beside that 2xx, never in
-//!   its place ([`Answer`], `s3/answer.rs`), and a listing page whose 2xx carries an S3
-//!   `<Error>` document in place of the listing is reported with that document's code and
-//!   message beside the 2xx. Listing pages are read by the same strict rules as an error
-//!   document (`s3/document.rs`). A request that fails before the SDK calls the connector (an
-//!   endpoint the SDK's endpoint rules refuse, for one) is [`S3Error::RequestNotBuilt`], since
-//!   it was never sent.
+//! * answers kept whole for the verbs `smoke` sends beyond those three (`s3/verbs.rs`, #938):
+//!   HEAD, a ranged and a conditional GET, `ListObjectsV2` and `ListObjects` followed across
+//!   pages, bulk `DeleteObjects` row by row, and one [`Probe`] of each operation the capability
+//!   matrix may declare unsupported. Each reports the head as the server sent it, every header
+//!   field line included, and reads the body itself, under the budget and the body deadlines,
+//!   so a body that fails after a 2xx head is reported beside that 2xx, never in its place
+//!   ([`Answer`], `s3/answer.rs`), and a 2xx that carries an S3 `<Error>` document in place
+//!   of its success body is reported with that document's code and message beside the 2xx.
+//!   Listings and delete results are read by the same strict rules as an error document
+//!   (`s3/document.rs`). A request that fails before the SDK calls the connector is
+//!   [`S3Error::RequestNotBuilt`], since nothing was sent: an endpoint `PathStyle` refuses, a
+//!   bucket name the SDK reads as none (empty or all white space), a bucket name that makes the
+//!   URL longer than an `http` URI may be, a [`Probe`]'s key or upload id too long for one. The
+//!   SDK panics on a key too long for a URI, so [`S3Client::probe`] refuses it first; the other
+//!   verbs that name a key do not check it.
 
 mod answer;
 mod body;
@@ -56,10 +64,12 @@ mod response;
 mod verbs;
 mod wire;
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_sdk_s3::config::endpoint::{Endpoint, EndpointFuture, Params, ResolveEndpoint};
 use aws_sdk_s3::config::http::HttpResponse;
 use aws_sdk_s3::config::interceptors::BeforeDeserializationInterceptorContextRef;
 use aws_sdk_s3::config::retry::RetryConfig;
@@ -74,9 +84,12 @@ use futures_util::future::{self, Either};
 
 pub use answer::{Answer, BodyFailure, Fetched, Head, NoResult, Outcome};
 pub use body::{ObjectBody, PutSource};
-pub use document::{ListEntry, Listing, ListingError, MAX_LISTING_PAGES};
+pub use document::{
+    DeleteResult, DeleteRow, KeyError, ListEntry, Listing, ListingError, MAX_LISTING_PAGES,
+};
 pub use error::{BodyError, ErrorCode, Phase, S3Error};
 pub use response::BUFFERED_BODY_BUDGET;
+pub use verbs::Probe;
 
 use body::Upload;
 use response::{error_document, Framing, ResponseGuard};
@@ -173,6 +186,12 @@ impl S3Client {
             .endpoint_url(config.args.endpoint.as_str())
             .credentials_provider(credentials)
             .force_path_style(true)
+            .endpoint_resolver(PathStyle)
+            // Never a `CreateSession` request of the SDK's own before the one asked for. No
+            // endpoint `PathStyle` resolves names the S3 Express auth scheme, which is what
+            // turns session auth on, so this guards only against a later SDK that turns it on
+            // some other way.
+            .disable_s3_express_session_auth(true)
             .retry_config(RetryConfig::disabled())
             .stalled_stream_protection(StalledStreamProtectionConfig::disabled())
             .timeout_config(timeouts)
@@ -435,6 +454,109 @@ fn object_length(framing: Framing) -> Result<Option<u64>, BodyError> {
 /// The `x-amz-request-id` header, read directly.
 fn request_id(raw: &HttpResponse) -> Option<String> {
     raw.headers().get(REQUEST_ID_HEADER).map(str::to_owned)
+}
+
+/// The client's own endpoint resolution, in place of the SDK's endpoint rules: every request
+/// goes to the configured endpoint, path-style, whatever its bucket is named.
+///
+/// The URL is the endpoint's scheme, authority and path, then, for a request that names a
+/// bucket, `/` and the bucket as one path segment ([`path_segment`]); a request that names none
+/// (ListBuckets) goes to the endpoint itself. The SDK joins the operation's own path and query
+/// on after it, with one `/` between (`aws-smithy-runtime-api` 1.19.2 `http/request.rs:149-167`).
+/// An endpoint path therefore comes before the bucket with one `/` between, with or without its
+/// trailing slash, where the rules set a path with no trailing slash straight against the bucket.
+///
+/// No bucket name is read. The SDK's rules read some (`aws-sdk-s3` 1.155.0
+/// `config/endpoint.rs`): a name ending in `--x-s3` or `--xa-s3` as an S3 Express bucket,
+/// signed for the `s3express` service and, on an endpoint that is a host name, sent
+/// virtual-host style whatever path-style is set to, or refused where no host label can carry
+/// it; a name in the shape of an S3 on Outposts access-point alias (it ends in `--op-s3`),
+/// resolved to an `amazonaws.com` https URL whatever the endpoint; and a name starting `arn:`
+/// as an ARN, refused path-style. Here each is one path segment, as every other name is.
+///
+/// The endpoint names no auth scheme, so the SDK chooses none of S3 Express's (its session
+/// auth included: `s3_express.rs:913-934`) and signs every request as the operation's own
+/// options say: SigV4 for `s3` in the configured region, with no double URI encoding and no
+/// path normalisation (`operation/create_bucket.rs:106-110`), the signing the rules give a
+/// path-style bucket on a custom endpoint (`config/endpoint.rs:1867-1894`). The region is only
+/// ever that signing region, never part of a host name, so two of the rules' region rules do
+/// not apply either: a region of `aws-global` is signed as given, where the rules sign it as
+/// `us-east-1`, and a region that is not a DNS label is sent, where the rules refuse it
+/// (`config/endpoint.rs:3206-3218`). Nor do their FIPS, dual-stack and accelerate rules: the
+/// client sets none of those options.
+///
+/// The endpoint is checked as the rules check it (`endpoint_lib/parse_url.rs:49-62`): a URL,
+/// `http` or `https`, with no query. A request to one the check refuses fails before anything
+/// is sent.
+#[derive(Debug)]
+struct PathStyle;
+
+impl ResolveEndpoint for PathStyle {
+    fn resolve_endpoint<'a>(&'a self, params: &'a Params) -> EndpointFuture<'a> {
+        let url = match params.endpoint() {
+            Some(endpoint) => path_style_url(endpoint, params.bucket()),
+            None => Err("no endpoint is configured".to_owned()),
+        };
+        EndpointFuture::ready(
+            url.map(|url| Endpoint::builder().url(url).build())
+                .map_err(BoxError::from),
+        )
+    }
+}
+
+/// The URL of a request at `endpoint` to `bucket`, or to no bucket ([`PathStyle`]); or why
+/// `endpoint` is refused.
+fn path_style_url(endpoint: &str, bucket: Option<&str>) -> Result<String, String> {
+    let uri = endpoint
+        .parse::<hyper::Uri>()
+        .map_err(|e| format!("the endpoint {endpoint:?} is not a URL: {e}"))?;
+    let scheme = match uri.scheme_str() {
+        Some(scheme)
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") =>
+        {
+            scheme.to_ascii_lowercase()
+        }
+        scheme => {
+            return Err(format!(
+                "the endpoint {endpoint:?} is not an http or https URL: its scheme is {}",
+                scheme.unwrap_or("missing")
+            ))
+        }
+    };
+    if let Some(query) = uri.query() {
+        return Err(format!(
+            "the endpoint {endpoint:?} has a query, {query:?}, where a request's own path would \
+             follow its path"
+        ));
+    }
+    let authority = uri
+        .authority()
+        .ok_or_else(|| format!("the endpoint {endpoint:?} names no host"))?;
+    let path = uri.path();
+    Ok(match bucket {
+        Some(bucket) => format!(
+            "{scheme}://{authority}{}/{}",
+            path.strip_suffix('/').unwrap_or(path),
+            path_segment(bucket)
+        ),
+        None => format!("{scheme}://{authority}{path}"),
+    })
+}
+
+/// `name` as one URI path segment: every byte but URI's unreserved characters (RFC 3986 §2.3)
+/// percent-encoded, in upper-case hex, as the SDK's endpoint rules encode a bucket (`aws-sdk-s3`
+/// 1.155.0 `endpoint_lib/uri_encode.rs:11-40`, the same set).
+fn path_segment(name: &str) -> String {
+    let mut segment = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            segment.push(char::from(byte));
+        } else {
+            // Writing to a `String` cannot fail.
+            let _ = write!(segment, "%{byte:02X}");
+        }
+    }
+    segment
 }
 
 /// Run `request` on a current-thread runtime of its own, on a thread of its own, and shut

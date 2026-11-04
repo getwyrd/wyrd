@@ -10,8 +10,10 @@
 //!
 //! * for a body the SDK will buffer, refuses framing that cannot mark the body's end and caps
 //!   the body as it arrives: an error response's at [`BUFFERED_BODY_BUDGET`], so a body with
-//!   no declared length is cut off at the budget rather than read whole, and a PUT's or a
-//!   DELETE's success at nothing, since S3 sends neither with a body;
+//!   no declared length is cut off at the budget rather than read whole, and the success of
+//!   the PUT or DELETE of one object at nothing, since S3 sends neither with a body (a
+//!   `CopyObject` is a PUT whose success carries a `<CopyObjectResult>`; it is a probe, read
+//!   as the last paragraph says, not guarded here);
 //! * for a GET success, which streams, records the framing for the caller to enforce piece by
 //!   piece ([`super::ObjectBody`]), and leaves the body uncapped.
 //!
@@ -39,12 +41,14 @@ use super::error::ErrorCode;
 
 /// The most bytes of a response body the client buffers: 64 KiB.
 ///
-/// It applies to every body the SDK reads whole (every error response, and every PUT or
-/// DELETE response), to every body the client reads whole itself (the body of an
-/// [`super::Answer`]: a HEAD's, a listing page's, and a ranged or conditional GET's that is not
-/// a 2xx), and to no successful GET body, which streams. A PUT
-/// or DELETE success has no body at all, so one that sends a byte is refused at that byte,
-/// well inside the budget. S3 error documents are small: a few hundred bytes, except
+/// It applies to every body the SDK reads whole (on the PUT, GET and DELETE of one object:
+/// every error response, and every PUT or DELETE response), to every body the client reads
+/// whole itself (the body of an [`super::Answer`]: a HEAD's, a probe's, a listing page's, a
+/// delete result's, and a ranged or conditional GET's that is not a 2xx), and to no successful
+/// GET body, which streams. The success of the PUT or DELETE of one object has no body at all,
+/// so one that sends a byte is refused at that byte, well inside the budget; a probe's success
+/// may carry a document (a `CopyObject`'s `<CopyObjectResult>`), read under the budget as any
+/// answer's body is. S3 error documents are small: a few hundred bytes, except
 /// `SignatureDoesNotMatch`, which echoes the canonical request twice (as text, and as hex
 /// bytes at three characters a byte) and the string to sign. For this client's requests that
 /// is at most about 20 KiB, even with a 1024-byte key whose every byte is percent-encoded,
