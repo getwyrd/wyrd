@@ -33,6 +33,7 @@ docs/**/*.md   →   render_site.py + page.html + style.css   →   static HTML 
     └── publishing/           ← build tooling + site inputs (excluded from the published docs)
         ├── site/
         │   ├── assets/style.css
+        │   ├── assets/og.png ← social card, rendered from docs/brand/getwyrd-og.svg
         │   ├── CNAME         ← getwyrd.dev
         │   └── .nojekyll
         ├── templates/
