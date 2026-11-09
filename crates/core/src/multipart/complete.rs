@@ -1,10 +1,12 @@
-//! `CompleteMultipartUpload` (#658): its **fence phase** (#1007, slice 1 of 5) and the **flat
-//! publication** composed onto it (#1008, slice 2). [`fence_complete`] is the fence, the
-//! validation of the named parts against the part set the fence froze, and the release of a
-//! rejected request's fence; it publishes nothing, and hands a valid request's fence back as a
-//! [`HeldFence`]. [`complete_upload`] is the verb: that phase, then the publication of what the
-//! fence holds as one flat root (the *Root flip* row, `0016:663`; module doc *Publication*).
-//! Segmented publication is #1009's, and settling an unknown outcome #1010's.
+//! `CompleteMultipartUpload` (#658): its **fence phase** (#1007, slice 1 of 5) and the
+//! **publication** composed onto it, flat (#1008, slice 2) and segmented (#1009, slice 3).
+//! [`fence_complete`] is the fence, the validation of the named parts against the part set the
+//! fence froze, and the release of a rejected request's fence; it publishes nothing, and hands a
+//! valid request's fence back as a [`HeldFence`]. [`complete_upload`] is the verb: that phase,
+//! then the publication of what the fence holds: one flat root, or past
+//! [`MAX_MAP_CHUNKS`](super::MAX_MAP_CHUNKS) chunks the attempt's `seg:` records and then the
+//! root that names them (the *Segment write* and *Root flip* rows, `0016:662-663`; module doc
+//! *Publication*). Settling an unknown outcome is #1010's.
 //!
 //! [`fence_complete`] reads the session and answers every state but `Open` as decision 3's table
 //! does (`0016:976`, [`super::complete_answer`]). An `Open@E` session is fenced to
@@ -24,11 +26,14 @@
 //!
 //! # The budget, and what a rejection costs (`0016:994-1000`)
 //!
-//! `attempts` bounds how many `seg:` epochs one session can mint (`0016:661`, `:1477`). A fence
+//! `attempts` bounds how many `seg:` epochs one session can mint (`0016:661`, `:1479`). A fence
 //! that is released before it wrote a segment minted none, so the release puts `attempts` back
 //! to the value read before the fence. A client error therefore never spends the budget, and an
 //! `Open` session can always be fenced again: three typos do not leave a correct fourth request
-//! answering [`Refusal::CompleteAttemptsExhausted`], which is the wedge #636's patch had.
+//! answering [`Refusal::CompleteAttemptsExhausted`], which is the wedge #636's patch had. A
+//! fence whose segment batch landed did mint one, and its release keeps the attempt spent
+//! (*Publication* below), so [`MAX_COMPLETE_ATTEMPTS`] bounds every fence that wrote a segment
+//! (X58, `0016:2577`).
 //!
 //! The list is checked before the fence too, against the part set and bucket as they are then,
 //! so a request that is already invalid is answered without fencing (no commit, and no in-flight
@@ -49,9 +54,9 @@
 //! off by another writer, and a valid request hands it over in the [`HeldFence`]; only an error
 //! may leave it standing (**C-1**, `docs/principles.md` §5):
 //!
-//! * [`CompleteError::InDoubt`]: a fence, release or flip commit of this Complete came back with
-//!   an unknown outcome ([`CommitUnknownResult`]). It is returned at once, with nothing sent after
-//!   it; settling such an outcome by reading the session again is #1010's.
+//! * [`CompleteError::InDoubt`]: a fence, release, segment or flip commit of this Complete came
+//!   back with an unknown outcome ([`CommitUnknownResult`]). It is returned at once, with nothing
+//!   sent after it; settling such an outcome by reading the session again is #1010's.
 //! * [`CompleteError::Stopped`]: nothing is in doubt, and the error says what became of this
 //!   Complete's fence ([`FenceState`]). The release is the one way this slice takes its own
 //!   fence down; when its rounds run out ([`RELEASE_ROUNDS`]) or the store refuses it for good,
@@ -64,13 +69,14 @@
 //! one: it ends in an error, unless that release finds the session moved to a state with an answer
 //! of its own. The Complete tries to take its fence down, because a fence that wrote no segment
 //! minted nothing the cap bounds, and left standing it would cost the client a wait and an attempt
-//! for a fault of the store's. It tries with **one** release commit, the same exact-bytes check and
-//! the same record as a rejection's release:
+//! for a fault of the store's. It tries with **one** release round, the same exact-bytes check and
+//! the same record as a rejection's release (a second commit only for a session found at a later
+//! segment cursor of the same fence, *The release once a segment landed*):
 //!
 //! | The release | The error |
 //! |---|---|
-//! | lands | [`FenceState::Released`]: the session is `Open@E+2` with `attempts` as read before the fence |
-//! | fails for good, or answers `Conflict` with the session still the fence's bytes | [`FenceState::Stands`] |
+//! | lands | [`FenceState::Released`]: the session is `Open@E+2` with `attempts` as read before the fence, unless a segment batch of the attempt landed (*The release once a segment landed*) |
+//! | fails for good, or answers `Conflict` with the session still the bytes it required | [`FenceState::Stands`] |
 //! | comes back with an unknown outcome | [`CompleteError::InDoubt`], about the release |
 //! | answers `Conflict` and the session moved | the answer for its new state, as a rejection's release gets; an `Open` session has no rejection to answer, and a torn record no answer at all, so those are [`FenceState::Gone`] |
 //! | answers `Conflict` and the session cannot be read | [`FenceState::Unknown`] |
@@ -82,26 +88,39 @@
 //! its fence, or whose one release does not land, still costs the wait 0016 accepts for that case,
 //! up to `W_completing` (`0016:956-962`).
 //!
-//! # Publication (#1008)
+//! # Publication (#1008, #1009)
 //!
-//! [`complete_upload`] fences as [`fence_complete`] does, with one more check before and behind
-//! the fence: the named parts' chunks, counted from their summaries, must fit one flat map
-//! ([`MAX_MAP_CHUNKS`]). A list past it stops with [`Stop::SegmentedUnsupported`]: with no commit
-//! when the check before the fence sees it, and after one release when only the frozen set does.
-//! #1009 replaces that refusal with segmented publication.
+//! [`complete_upload`] fences as [`fence_complete`] does. Behind the held fence it reads each
+//! named part's `part:` record, in the list's order, and requires it to agree with the summary
+//! the fence froze, which carries the digest the list names ([`Stop::PartDisagrees`]). Those
+//! chunk lists, concatenated in that order, are the object. It then reads the target: the dirent
+//! the session names and, when one is bound, the inode it names. Publication goes through
+//! [`crate::staged_publication`], whose own rows pin the dirent and the inode on both branches
+//! (both `require_absent` for a free name, both exact bytes for a bound one) and write version
+//! 1, or the re-read prior's version + 1.
 //!
-//! Behind the held fence it reads each named part's `part:` record, in the list's order, and
-//! requires it to agree with the summary the fence froze, which carries the digest the list
-//! names ([`Stop::PartDisagrees`]). Those chunk lists, concatenated in that order, are the
-//! object. It then reads the target: the dirent the session names and, when one is bound, the
-//! inode it names. The flip is one batch through [`crate::staged_publication`], whose own rows
-//! pin the dirent and the inode on both branches (both `require_absent` for a free name, both
-//! exact bytes for a bound one) and write version 1, or the re-read prior's version + 1. The
-//! flip's contribution, for an `Open@E` session fenced at `Completing@E+1`:
+//! Up to [`MAX_MAP_CHUNKS`](super::MAX_MAP_CHUNKS) chunks the publication is the flip alone, one
+//! flat root. Past it the committer first writes the chunk list as the attempt's `seg:`
+//! records, under the group `(segment_nonce, E+1)` ([`SessionRecord::attempt_segment_group`]),
+//! in batches sized to the transaction envelope, and reads every one back before the flip
+//! publishes a root that names them (decision 7(b), `0016:2342-2356`). Each segment batch
+//! carries this contribution, which moves the session's segment cursor in the batch that writes
+//! the records it counts (`0016:613-620`, `:662`):
 //!
 //! | Precondition | Mutation |
 //! |---|---|
-//! | `require(mpu:<id> == the fence's bytes)` | the session at `Completed@E+2`, recording the inode, the version, the multipart ETag, `completed_at_millis` and the list's `complete_fingerprint` |
+//! | `require(mpu:<id> == Completing@E+1 at segments_written = first)` | the session at `segments_written = written` |
+//!
+//! `first` and `written` are the batch's cursor positions ([`SegmentBatchInfo`]). The count the
+//! flip requires the cursor at is the committer's ([`staged_publication::planned_segments`]),
+//! never re-derived from the chunk count: wide chunk refs close a segment early. A later round
+//! of the same attempt resumes from the cursor the session holds (`resume_from`): every record
+//! below it is read back and pinned, never written again (`0016:2392-2401`). The flip's
+//! contribution, for an `Open@E` session fenced at `Completing@E+1`:
+//!
+//! | Precondition | Mutation |
+//! |---|---|
+//! | `require(mpu:<id> == Completing@E+1 at the cursor the segment phase leaves)`, 0 for a flat map | the session at `Completed@E+2`, recording the inode, the version, the multipart ETag, `completed_at_millis` and the list's `complete_fingerprint` |
 //! | `require(bucket:<name> == the marker bytes validated behind the fence)` (ADR-0046 §4) | none |
 //! | `require_absent(retire:records:s:<id>:<E+1>)` | `{parts}` naming the **published** parts only (`0016:910-925`) |
 //! | `require_absent(retire:bytes:s:<id>:<E+1>)`, when a frozen part is unnamed | `{parts}` naming the unnamed parts: their bytes, then their records |
@@ -112,24 +131,52 @@
 //! session's, and its `modified` the publication stamp ordered after the prior's
 //! ([`metadata::overwrite_modified`], which the committer applies).
 //!
-//! A flip that answers `Conflict` is judged from what the store then holds, in this order:
+//! A round that answers `Conflict` (its flip lost, or one of its segment batches did) is judged
+//! from what the store then holds, in this order:
 //!
 //! | Found | Then |
 //! |---|---|
-//! | the session moved off the fence | the answer for its new state, as a release that finds it moved gets; an `Open` session answers [`Refusal::OperationAborted`] |
+//! | the session is not this fence at any cursor | the answer for its new state, as a release that finds it moved gets; an `Open` session answers [`Refusal::OperationAborted`] |
 //! | the bucket marker absent, or not the bytes validated | release, then [`Refusal::NoSuchBucket`] |
-//! | [`R_PUBLISH`] flips sent | release, then [`Refusal::OperationAborted`]; the session is `Open` and the client may retry |
-//! | otherwise | read the target again and flip again, the version recomputed from the prior read now (`0016:926-941`) |
+//! | [`R_PUBLISH`] rounds sent | release, then [`Refusal::OperationAborted`]; the session is `Open` and the client may retry |
+//! | otherwise | read the target again and send the next round from the cursor found, the version recomputed from the prior read now (`0016:926-941`) |
 //!
 //! Those releases are a rejection's, so a release that cannot land ends in the error that says
-//! the fence still stands. A flip the store refuses for good (a definite error, neither `Conflict`
-//! nor an unknown outcome) is followed by no other flip: the request tries one release, as for a
-//! fault behind the fence (the table under *Ownership*), and ends [`CompleteError::Stopped`]
-//! with that error as its cause and the fence's state. So does a fault reading the parts or the
-//! target, a part or target record that is damaged, and a flip the committer refuses before
-//! writing ([`Stop::Publication`]). A flip whose outcome is unknown ends
-//! [`CompleteError::InDoubt`] at once, with nothing sent after it: it may have published, so no
-//! release may follow it.
+//! the fence still stands. A round the store refuses for good (a definite error, neither
+//! `Conflict` nor an unknown outcome) is followed by no other round: the request tries one
+//! release, as for a fault behind the fence (the table under *Ownership*), and ends
+//! [`CompleteError::Stopped`] with that error as its cause and the fence's state. So does a
+//! fault reading the parts or the target, a part or target record that is damaged, and a
+//! publication the committer refuses before writing ([`Stop::Publication`]). A round whose
+//! outcome is unknown ends [`CompleteError::InDoubt`] at once, with nothing sent after it: it
+//! may have published, so no release may follow it. The committer does not say which of a
+//! round's commits that was, so the error names the flip only for a round with no segment batch
+//! to send ([`DoubtfulCommit::Flip`]), and the round otherwise ([`DoubtfulCommit::Publication`]).
+//!
+//! # The release once a segment landed
+//!
+//! A segment batch moves the cursor in the batch that writes its records, so a cursor above 0 is
+//! the proof that this attempt wrote `seg:` records, and a cursor of 0 that it wrote none. Every
+//! release requires the session at the cursor it holds, read after the round that moved it, and
+//! from a cursor above 0 it is the whole *Fence release* row (`0016:664`):
+//!
+//! | Precondition | Mutation |
+//! |---|---|
+//! | `require(mpu:<id> == Completing@E+1 at that cursor)` | the session at `Open@E+2`, `attempts` as the fence left them |
+//! | `require_absent(retire:records:s:<id>:<E+1>)` | `{seg: (segment_nonce, E+1)}`, which deletes those records and never orphan-marks a fragment |
+//!
+//! So every `seg:` record a fence wrote is named by the root the flip published or by the
+//! obligation the batch that releases the fence installs, and the attempt stays charged: it
+//! minted a segment epoch and a rollback obligation, which is what [`MAX_COMPLETE_ATTEMPTS`]
+//! bounds (X58, `0016:2577`). A release from cursor 0 is the one the fence phase sends, with
+//! `attempts` given back and no obligation, so a fence that wrote no segment never spends the
+//! budget.
+//!
+//! A release that answers `Conflict` and finds the session at a later cursor of this same fence
+//! (a segment batch landed that this Complete had not read back, because the read after a failed
+//! round failed too) is sent again from that cursor. That spends no release round: only this
+//! Complete's segment batches move the cursor, and only forward, so it happens at most once per
+//! batch that landed.
 //!
 //! # Runtime-free (ADR-0009), and one clock per session
 //!
@@ -149,8 +196,8 @@
 //! publication, so the flip mixes no clocks. The inode a free name is published under
 //! ([`PublishRequest::fresh_inode`]) is the caller's too.
 //!
-//! Production calls nothing here yet: the S3 verb that will is #670, once #1009–#1011 complete
-//! publication.
+//! Production calls nothing here yet: the S3 verb that will is #670, once #1010 and #1011
+//! complete publication.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -164,7 +211,7 @@ use super::{
     decode_session_record, mpu_key, multipart_etag, parse_psum_key, part_key, psum_range,
     CompleteAnswer, CompleteOutcome, Completion, Digest, InvalidPart, MultipartEtag, PartNumber,
     PartNumberSet, PartSummary, Publication, RecordError, Refusal, RetireObligation, RetiredMap,
-    SessionRecord, UploadId, MAX_COMPLETE_ATTEMPTS, MAX_MAP_CHUNKS, R_PUBLISH,
+    SessionRecord, SessionState, UploadId, MAX_COMPLETE_ATTEMPTS, R_PUBLISH,
 };
 use crate::metadata::{
     self, ChunkMap, ChunkRef, DirentRecord, InodeId, InodeRecord, ObjectMeta, SegmentGroup,
@@ -186,11 +233,12 @@ pub const FENCE_ROUNDS: u32 = ABORT_ROUNDS;
 /// standing: [`ABORT_ROUNDS`].
 ///
 /// A release round is spent only by a commit that answered `Conflict` while the session is still
-/// exactly the fence's bytes, a conflict nothing a read can see explains (on TiKV, a lock another
-/// writer held): a session moved off the fence ends the release and is answered from its new
-/// state. Bounded so a Complete terminates with no
-/// reaper running, at the same budget an Abort spends against the same key. A Complete that
-/// spends it ends with [`Stop::ReleaseRoundsSpent`] and its fence standing.
+/// exactly the bytes the release required, a conflict nothing a read can see explains (on TiKV,
+/// a lock another writer held): a session moved off the fence ends the release and is answered
+/// from its new state, and one found at a later segment cursor of the same fence is released
+/// again from there. Bounded so a Complete terminates with no reaper running, at the same budget
+/// an Abort spends against the same key. A Complete that spends it ends with
+/// [`Stop::ReleaseRoundsSpent`] and its fence standing.
 pub const RELEASE_ROUNDS: u32 = ABORT_ROUNDS;
 
 /// How many `psum:` records one page of the frozen-set read asks for. At the value ceiling a
@@ -267,11 +315,7 @@ pub enum FenceOutcome {
 #[derive(Debug)]
 pub struct HeldFence {
     upload_id: UploadId,
-    session: SessionRecord,
-    bytes: Bytes,
-    /// The bytes this fence's release puts, minted with the fence: `Open@E+2`, `attempts` as read
-    /// before the fence.
-    released: Bytes,
+    placed: Placed,
     attempts_before: u32,
     named: NamedParts,
     frozen: BTreeMap<PartNumber, PartSummary>,
@@ -286,18 +330,18 @@ impl HeldFence {
 
     /// The fence epoch `E+1`: the session's epoch and its `publish_target.epoch`.
     pub const fn epoch(&self) -> u64 {
-        self.session.epoch()
+        self.placed.session.epoch()
     }
 
-    /// The session as the fence left it, at `Completing@E+1`.
+    /// The session as the fence left it, at `Completing@E+1` with no segment written.
     pub const fn session(&self) -> &SessionRecord {
-        &self.session
+        &self.placed.session
     }
 
     /// The exact bytes the fence put at `mpu:<id>`: what every later batch of this attempt
-    /// requires there.
+    /// requires there until a segment batch of it moves the segment cursor.
     pub const fn session_bytes(&self) -> &Bytes {
-        &self.bytes
+        &self.placed.bytes
     }
 
     /// `attempts` as read before the fence: the value a release of a fence that wrote no
@@ -325,6 +369,69 @@ impl HeldFence {
     }
 }
 
+/// A Complete fence and every record that takes it down, minted together before the fence is
+/// sent, so no fence is placed that could not be released (`0016:661`, `:664`).
+#[derive(Debug)]
+struct Placed {
+    /// The session as the fence puts it: `Completing@E+1`, no segment written.
+    session: SessionRecord,
+    /// Its encoding: what the fence puts.
+    bytes: Bytes,
+    /// The segment group the attempt writes under ([`SessionRecord::attempt_segment_group`]): the
+    /// session's nonce at `E+1`.
+    group: SegmentGroup,
+    /// The release while no segment batch of the attempt landed: `Open@E+2`, `attempts` as read
+    /// before the fence.
+    restored: Bytes,
+    /// The release once one did: `Open@E+2`, `attempts` as the fence left them.
+    charged: Bytes,
+}
+
+impl Placed {
+    /// The fence of `opened` stamped `fenced_at_millis`, and its releases. `None` when the session
+    /// cannot be fenced and released: not `Open`, or too near the epoch or attempts ceiling.
+    fn mint(opened: &SessionRecord, fenced_at_millis: u64) -> Option<Self> {
+        let session = opened.complete_fence(fenced_at_millis)?;
+        let restored = session.fence_released(opened.attempts())?;
+        let charged = session.fence_released(session.attempts())?;
+        Some(Self {
+            bytes: metadata::encode(&session),
+            group: session.attempt_segment_group()?,
+            restored: metadata::encode(&restored),
+            charged: metadata::encode(&charged),
+            session,
+        })
+    }
+
+    /// The fence epoch, `E+1`.
+    const fn epoch(&self) -> u64 {
+        self.session.epoch()
+    }
+
+    /// The session's bytes at segment cursor `written`: the fence's record with only
+    /// `segments_written` moved. `None` past the cursor's decode bound, which no plan the
+    /// committer accepts reaches ([`crate::metadata::MAX_ROOT_SEGMENTS`] segments at most).
+    fn at(&self, written: u32) -> Option<Bytes> {
+        self.session
+            .with_segments_written(written)
+            .map(|session| metadata::encode(&session))
+    }
+
+    /// The segment cursor `found` holds, when it is this fence at some cursor: byte for byte the
+    /// record [`Self::at`] mints there. `None` for any other value.
+    fn cursor_of(&self, found: &[u8]) -> Option<u32> {
+        let session = decode_session_record(found).ok()?;
+        let SessionState::Completing {
+            segments_written, ..
+        } = session.state()
+        else {
+            return None;
+        };
+        let cursor = *segments_written;
+        (self.at(cursor)?.as_ref() == found).then_some(cursor)
+    }
+}
+
 /// A Complete that ended with neither an answer nor a held fence.
 ///
 /// # Error class
@@ -336,8 +443,8 @@ impl HeldFence {
 /// [`TransientFault`](wyrd_traits::TransientFault) is transient, because nothing is in doubt.
 #[derive(Debug)]
 pub enum CompleteError {
-    /// A fence, release or flip commit of this Complete may have landed, or may still land. Never
-    /// "nothing was written".
+    /// A fence, release, segment or flip commit of this Complete may have landed, or may still
+    /// land. Never "nothing was written".
     InDoubt(Box<InDoubt>),
     /// The Complete stopped, and no commit of it is in doubt.
     Stopped(Box<Stopped>),
@@ -379,10 +486,20 @@ pub enum DoubtfulCommit {
         epoch: u64,
     },
     /// The root flip `Completing@epoch → Completed@epoch+1` of a fence this Complete owns, one
-    /// batch with the root and its obligations: either the object is published and the session
-    /// `Completed`, or neither is and the fence still stands.
+    /// batch with the root and its obligations, in a round with no segment batch to send: either
+    /// the object is published and the session `Completed`, or neither is and the fence still
+    /// stands.
     Flip {
         /// The epoch of the fence the flip requires.
+        epoch: u64,
+    },
+    /// A commit of a publication round of a fence this Complete owns that had segment batches to
+    /// send (`0016:662-663`): one of them, or the root flip after them. The committer returns the
+    /// store's unknown outcome as it gave it, without saying which batch it was. Either the
+    /// object is published and the session `Completed`, or the fence still stands, at the segment
+    /// cursor the last landed batch moved it to.
+    Publication {
+        /// The epoch of the fence every batch of the round requires.
         epoch: u64,
     },
 }
@@ -439,10 +556,10 @@ pub enum Stop {
         /// Fence commits made.
         rounds: u32,
     },
-    /// All [`RELEASE_ROUNDS`] release commits answered `Conflict` with the session still exactly
-    /// the fence's bytes.
+    /// All [`RELEASE_ROUNDS`] release rounds were spent: each a release commit that answered
+    /// `Conflict` with the session still exactly the bytes it required.
     ReleaseRoundsSpent {
-        /// Release commits made.
+        /// Release commits that answered so.
         rounds: u32,
     },
     /// The session is `Open` at an epoch too high for a fence and its release both to be
@@ -461,18 +578,9 @@ pub enum Stop {
     Record(RecordError),
     /// A store operation failed, or a page of the `psum:` range broke the paging contract (a key
     /// at or below the last one read, or outside the range asked for). After a held fence, this
-    /// is also a flip the store refused for good: a definite error that is neither `Conflict`
-    /// nor an unknown outcome.
+    /// is also a publication round the store refused for good: a definite error that is neither
+    /// `Conflict` nor an unknown outcome.
     Store(BoxError),
-    /// The named parts total `chunks` chunks by their summaries, past the `limit` one flat map
-    /// holds ([`MAX_MAP_CHUNKS`]), and segmented publication is not supported yet.
-    // deferred: #1009 — segmented publication; this stop is deleted with it.
-    SegmentedUnsupported {
-        /// The chunks the named parts' summaries total.
-        chunks: u64,
-        /// [`MAX_MAP_CHUNKS`].
-        limit: u64,
-    },
     /// A named part's `part:` record is absent, or disagrees with the `psum:` summary the fence
     /// froze, which carries the digest the list names. The commit writes the pair in one batch
     /// and no part commits behind a fence, so this is a damaged record, never a request to answer.
@@ -483,8 +591,10 @@ pub enum Stop {
     /// The publish target's dirent, or the inode it names, is absent where it must be present or
     /// is not a record that decodes.
     Target(BoxError),
-    /// The staged-publication committer refused the flip before writing anything (a value over
-    /// the ceiling, a batch over its envelope, a version with no successor).
+    /// The staged-publication committer refused the publication (a value over the ceiling, a
+    /// batch over its envelope, a version with no successor, more segments than one root may
+    /// name), before writing anything or, for a `seg:` range it read back, before the batch that
+    /// would have depended on it.
     // deferred: #1011 — the value ceiling a flip's records are sized against.
     Publication(PublicationError),
 }
@@ -524,6 +634,10 @@ impl fmt::Display for DoubtfulCommit {
             Self::Fence { epoch } => write!(f, "its fence at Completing@{epoch}"),
             Self::Release { epoch } => write!(f, "the release of its fence at Completing@{epoch}"),
             Self::Flip { epoch } => write!(f, "its root flip from Completing@{epoch}"),
+            Self::Publication { epoch } => write!(
+                f,
+                "a segment batch or the root flip of its publication from Completing@{epoch}"
+            ),
         }
     }
 }
@@ -575,18 +689,15 @@ impl fmt::Display for Stop {
             ),
             Self::Record(torn) => write!(f, "a stored record is invalid: {torn}"),
             Self::Store(fault) => write!(f, "store fault: {fault}"),
-            Self::SegmentedUnsupported { chunks, limit } => write!(
-                f,
-                "the named parts total {chunks} chunks, past the {limit} one flat map holds, and \
-                 segmented publication is not supported yet"
-            ),
             Self::PartDisagrees { part_number } => write!(
                 f,
                 "part {part_number}'s part: record is absent or disagrees with the summary the \
                  fence froze"
             ),
             Self::Target(torn) => write!(f, "the publish target is not readable: {torn}"),
-            Self::Publication(refused) => write!(f, "the committer refused the flip: {refused}"),
+            Self::Publication(refused) => {
+                write!(f, "the committer refused the publication: {refused}")
+            }
         }
     }
 }
@@ -603,7 +714,6 @@ impl std::error::Error for CompleteError {
                 | Stop::ReleaseRoundsSpent { .. }
                 | Stop::EpochExhausted
                 | Stop::ForeignClock { .. }
-                | Stop::SegmentedUnsupported { .. }
                 | Stop::PartDisagrees { .. } => None,
             },
         }
@@ -611,11 +721,13 @@ impl std::error::Error for CompleteError {
 }
 
 // deferred: #660. Seeded Tier-0 DST coverage of this fence racing an Abort, a rival Complete and
-// the reaper's rollback, and of the flip racing a `PutObject`, a bucket delete and the reaper, is
-// #660's (out of #1007's and #1008's scope). Meanwhile the integration test
-// `crates/core/tests/multipart_complete.rs` lands a rival fence, a teardown and a rollback at the
-// fence's and the release's commit points, and an overwrite, a bucket delete, a refused flip and
-// an unknown flip outcome at the flip's, through a store wrapper.
+// the reaper's rollback, and of the segment batches and the flip racing a `PutObject`, a bucket
+// delete and the reaper, is #660's (out of #1007's, #1008's and #1009's scope). Meanwhile the
+// integration test `crates/core/tests/multipart_complete.rs` lands a rival fence, a teardown and
+// a rollback at the fence's and the release's commit points, an overwrite, a bucket delete, a
+// refused flip and an unknown flip outcome at the flip's, and lost flips, a bucket delete, a
+// refused flip and an unknown segment-batch outcome behind landed segment batches, through a
+// store wrapper.
 
 /// **`CompleteMultipartUpload`'s fence phase**: fence the session `upload_id` names
 /// (`0016:661`), validate `request` against the part set the fence froze, and either hand the
@@ -680,52 +792,6 @@ pub async fn fence_complete(
     upload_id: &UploadId,
     request: &CompleteRequest<'_>,
 ) -> Result<FenceOutcome, CompleteError> {
-    fence(store, upload_id, request, Admit::Any).await
-}
-
-/// Which valid lists a fence is held for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Admit {
-    /// Every valid list: the fence phase on its own ([`fence_complete`]).
-    Any,
-    /// A valid list whose named parts fit one flat map, by their summaries: what
-    /// [`complete_upload`] can publish.
-    // deferred: #1009 — segmented publication; this arm is deleted with it.
-    Flat,
-}
-
-impl Admit {
-    /// The stop for a valid `named` list this fence is not held for, judged on the part set
-    /// `frozen` read with it. Every part a valid list names is in that set.
-    fn refuses(
-        self,
-        frozen: &BTreeMap<PartNumber, PartSummary>,
-        named: &[(PartNumber, Digest)],
-    ) -> Option<Stop> {
-        match self {
-            Self::Any => None,
-            Self::Flat => {
-                let chunks: u64 = named
-                    .iter()
-                    .filter_map(|(part_number, _)| frozen.get(part_number))
-                    .map(|summary| u64::from(summary.chunks))
-                    .sum();
-                let limit = u64::from(MAX_MAP_CHUNKS);
-                (chunks > limit).then_some(Stop::SegmentedUnsupported { chunks, limit })
-            }
-        }
-    }
-}
-
-/// [`fence_complete`], holding the fence only for a list `admit` admits. A valid list it does not
-/// admit stops with its [`Admit::refuses`] cause: before the fence, with nothing written; behind
-/// it, after one release, as a fault behind the fence does (the module doc's table).
-async fn fence(
-    store: &impl MetadataStore,
-    upload_id: &UploadId,
-    request: &CompleteRequest<'_>,
-    admit: Admit,
-) -> Result<FenceOutcome, CompleteError> {
     let session_key = mpu_key(upload_id);
     let bucket_key = metadata::bucket_key(request.bucket);
     let named = request.parts.as_slice();
@@ -738,7 +804,7 @@ async fn fence(
         .get(&session_key)
         .await
         .map_err(|fault| not_placed(Stop::Store(fault)))?;
-    let (opened, fenced, released) = loop {
+    let (opened, placed) = loop {
         // `found` is always the result of a read that succeeded.
         let Some(read) = found else {
             return Ok(refused(Refusal::NoSuchUpload));
@@ -758,26 +824,14 @@ async fn fence(
         if opened.attempts() >= MAX_COMPLETE_ATTEMPTS {
             return Ok(refused(Refusal::CompleteAttemptsExhausted));
         }
-        // The release is minted with the fence, so no fence is placed that could not be taken
+        // The releases are minted with the fence, so no fence is placed that could not be taken
         // down again.
-        let Some((fenced, released)) =
-            opened
-                .complete_fence(request.fenced_at_millis)
-                .and_then(|fenced| {
-                    let released = fenced.fence_released(opened.attempts())?;
-                    Some((fenced, released))
-                })
-        else {
+        let Some(placed) = Placed::mint(&opened, request.fenced_at_millis) else {
             return Err(not_placed(Stop::EpochExhausted));
         };
-        // The optimization: a request already invalid is answered without a fence, and one this
-        // fence would not be held for is stopped without one.
+        // The optimization: a request already invalid is answered without a fence.
         match validate(store, upload_id, &bucket_key, named).await {
-            Ok(Validation::Valid { frozen, .. }) => {
-                if let Some(cause) = admit.refuses(&frozen, named) {
-                    return Err(not_placed(cause));
-                }
-            }
+            Ok(Validation::Valid { .. }) => {}
             Ok(Validation::Rejected(refusal)) => return Ok(refused(refusal)),
             Err(cause) => return Err(not_placed(cause)),
         }
@@ -787,9 +841,9 @@ async fn fence(
         rounds += 1;
         let batch = WriteBatch::new()
             .require(session_key.clone(), read)
-            .put(session_key.clone(), metadata::encode(&fenced));
+            .put(session_key.clone(), placed.bytes.clone());
         match store.commit(batch).await {
-            Ok(CommitOutcome::Committed) => break (opened, fenced, released),
+            Ok(CommitOutcome::Committed) => break (opened, placed),
             // Answered from what the store holds now: moved, from its new state; still the
             // bytes read, the round is spent and the fence tried again.
             Ok(CommitOutcome::Conflict) => {
@@ -803,7 +857,7 @@ async fn fence(
                     Some(unknown) => in_doubt(
                         upload_id,
                         DoubtfulCommit::Fence {
-                            epoch: fenced.epoch(),
+                            epoch: placed.epoch(),
                         },
                         unknown,
                         None,
@@ -815,34 +869,24 @@ async fn fence(
     };
 
     // The fence is this Complete's: its commit answered `Committed`.
-    let own = OwnFence {
-        upload_id,
-        session_key: &session_key,
-        epoch: fenced.epoch(),
-        bytes: metadata::encode(&fenced),
-        released: metadata::encode(&released),
-    };
     let why = match validate(store, upload_id, &bucket_key, named).await {
-        Ok(Validation::Valid { frozen, marker }) => match admit.refuses(&frozen, named) {
-            None => {
-                return Ok(FenceOutcome::Held(Box::new(HeldFence {
-                    upload_id: upload_id.clone(),
-                    attempts_before: opened.attempts(),
-                    session: fenced,
-                    bytes: own.bytes,
-                    released: own.released,
-                    named: request.parts.clone(),
-                    frozen,
-                    bucket_marker: marker,
-                })))
-            }
-            Some(cause) => ReleaseFor::Fault(cause),
-        },
+        Ok(Validation::Valid { frozen, marker }) => {
+            return Ok(FenceOutcome::Held(Box::new(HeldFence {
+                upload_id: upload_id.clone(),
+                attempts_before: opened.attempts(),
+                placed,
+                named: request.parts.clone(),
+                frozen,
+                bucket_marker: marker,
+            })))
+        }
         Ok(Validation::Rejected(rejection)) => ReleaseFor::Rejection(rejection),
         // Never answered as a rejection; see the module doc.
         Err(cause) => ReleaseFor::Fault(cause),
     };
-    release(store, &own, why, fingerprint.as_ref().ok())
+    // No segment batch was sent, so the release is from cursor 0: `attempts` given back.
+    let mut own = OwnFence::new(upload_id, &session_key, &placed);
+    release(store, &mut own, why, fingerprint.as_ref().ok())
         .await
         .map(FenceOutcome::Answered)
 }
@@ -976,34 +1020,86 @@ async fn read_part_set(
     }
 }
 
-/// The fence this Complete owns, and the release that takes it down.
+/// The fence this Complete owns, the segment cursor its session is at as far as this Complete
+/// knows, and the release that takes it down from there (module doc, *The release once a
+/// segment landed*).
 struct OwnFence<'a> {
     upload_id: &'a UploadId,
     session_key: &'a [u8],
-    /// The fence epoch, `E+1`.
-    epoch: u64,
-    /// The bytes the fence put: `Completing@E+1`.
+    placed: &'a Placed,
+    /// The segment cursor: 0 until a read finds a segment batch of this attempt landed.
+    cursor: u32,
+    /// The session's bytes at that cursor: what a release requires.
     bytes: Bytes,
-    /// The bytes the release puts: `Open@E+2`, `attempts` as read before the fence.
-    released: Bytes,
+}
+
+impl<'a> OwnFence<'a> {
+    /// The fence `placed`, at cursor 0: its bytes as the fence put them.
+    fn new(upload_id: &'a UploadId, session_key: &'a [u8], placed: &'a Placed) -> Self {
+        Self {
+            upload_id,
+            session_key,
+            placed,
+            cursor: 0,
+            bytes: placed.bytes.clone(),
+        }
+    }
+
+    /// The fence epoch, `E+1`.
+    const fn epoch(&self) -> u64 {
+        self.placed.epoch()
+    }
+
+    /// Whether `found`, a read of the session, is still this fence: at the cursor known, or at a
+    /// later one, which this then follows. Never an earlier one: only this Complete's segment
+    /// batches move the cursor, and only forward. `false` for anything else, which another writer
+    /// put there.
+    fn follow(&mut self, found: Option<&Bytes>) -> bool {
+        let Some(found) = found else {
+            return false;
+        };
+        match self.placed.cursor_of(found) {
+            Some(cursor) if cursor >= self.cursor => {
+                self.cursor = cursor;
+                self.bytes = found.clone();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The release from where the session is (`0016:664`): from cursor 0, the session at
+    /// `Open@E+2` with `attempts` given back; from a later cursor, with `attempts` as the fence
+    /// left them and the attempt's `retire:records:{seg}` obligation, under `require_absent`.
+    fn release_batch(&self) -> WriteBatch {
+        let batch = WriteBatch::new().require(self.session_key.to_vec(), self.bytes.clone());
+        if self.cursor == 0 {
+            return batch.put(self.session_key.to_vec(), self.placed.restored.clone());
+        }
+        let segments =
+            RetireObligation::attempt_segments(self.upload_id, self.placed.group.clone());
+        batch
+            .require_absent(segments.key())
+            .put(self.session_key.to_vec(), self.placed.charged.clone())
+            .put(segments.key(), metadata::encode(segments.payload()))
+    }
 }
 
 /// Why a Complete is taking its own fence down.
 enum ReleaseFor {
     /// The request is answered with this refusal once its fence is down: a list rejected behind
-    /// the fence, or a publication whose flip lost for good ([`Refusal::NoSuchBucket`],
+    /// the fence, or a publication whose rounds lost for good ([`Refusal::NoSuchBucket`],
     /// [`Refusal::OperationAborted`]). The release is what lets it be answered.
     Rejection(Refusal),
     /// The request cannot go on, for a reason that is no answer: validation or publication behind
-    /// the fence could not finish (a store fault, a damaged record, a flip the store refused for
-    /// good), or the list is one this fence is not held for ([`Admit::refuses`]). The release is
-    /// best effort, and the error the request ends in keeps this cause; only a session moved to a
-    /// state with an answer of its own ends it without one ([`moved`]).
+    /// the fence could not finish (a store fault, a damaged record, a round the store refused for
+    /// good). The release is best effort, and the error the request ends in keeps this cause; only
+    /// a session moved to a state with an answer of its own ends it without one ([`moved`]).
     Fault(Stop),
 }
 
 impl ReleaseFor {
-    /// How many commits the release may make.
+    /// How many release commits may answer `Conflict` with the session unchanged.
     const fn rounds(&self) -> u32 {
         match self {
             Self::Rejection(_) => RELEASE_ROUNDS,
@@ -1039,23 +1135,24 @@ impl ReleaseFor {
     }
 }
 
-/// Release `own` (`0016:664`, `:994-1000`) in at most [`ReleaseFor::rounds`] commits, and end the
-/// request as `why` says.
+/// Release `own` (`0016:664`, `:994-1000`) from the cursor it is at, with at most
+/// [`ReleaseFor::rounds`] commits answering `Conflict` on an unchanged session, and end the
+/// request as `why` says. A `Conflict` that finds the session at a later cursor of this fence
+/// sends the release again from there without spending a round; that happens at most once per
+/// segment batch that landed, since the cursor only moves forward.
 async fn release(
     store: &impl MetadataStore,
-    own: &OwnFence<'_>,
+    own: &mut OwnFence<'_>,
     why: ReleaseFor,
     fingerprint: Option<&Digest>,
 ) -> Result<CompleteOutcome, CompleteError> {
-    let epoch = own.epoch;
-    let stands = |cause| stopped(own.upload_id, FenceState::Stands { epoch }, cause);
+    let epoch = own.epoch();
+    let upload_id = own.upload_id;
+    let stands = |cause| stopped(upload_id, FenceState::Stands { epoch }, cause);
     let mut rounds = 0u32;
     loop {
-        rounds += 1;
-        let batch = WriteBatch::new()
-            .require(own.session_key.to_vec(), own.bytes.clone())
-            .put(own.session_key.to_vec(), own.released.clone());
-        match store.commit(batch).await {
+        let cursor = own.cursor;
+        match store.commit(own.release_batch()).await {
             Ok(CommitOutcome::Committed) => return why.end(own, FenceState::Released { epoch }),
             Ok(CommitOutcome::Conflict) => {
                 let now = match store.get(own.session_key).await {
@@ -1066,10 +1163,16 @@ async fn release(
                         return Err(stopped(own.upload_id, FenceState::Unknown { epoch }, cause));
                     }
                 };
-                if now.as_ref() != Some(&own.bytes) {
+                if !own.follow(now.as_ref()) {
                     return moved(own, now, why, fingerprint);
                 }
+                // A segment batch of this fence landed that this Complete had not read back: the
+                // release goes again from the cursor the session holds.
+                if own.cursor > cursor {
+                    continue;
+                }
                 // Nothing a read can see explains the conflict (on TiKV, a lock): spend the round.
+                rounds += 1;
                 if rounds == why.rounds() {
                     return Err(stands(why.cause(Stop::ReleaseRoundsSpent { rounds })));
                 }
@@ -1101,7 +1204,7 @@ fn moved(
     why: ReleaseFor,
     fingerprint: Option<&Digest>,
 ) -> Result<CompleteOutcome, CompleteError> {
-    let epoch = own.epoch;
+    let epoch = own.epoch();
     let Some(bytes) = found else {
         return Ok(CompleteOutcome::Refused(Refusal::NoSuchUpload));
     };
@@ -1136,46 +1239,52 @@ pub struct PublishRequest {
     pub completed_at_millis: u64,
 }
 
-/// **`CompleteMultipartUpload`** (#658, flat objects only until #1009): fence the session as
-/// [`fence_complete`] does, then publish the named parts as one flat root (`0016:663`) in a flip
-/// that also moves the session to `Completed` and installs its `retire:` obligations, all in one
-/// batch. Answers in the landed vocabulary ([`CompleteOutcome`], [`Refusal`]); the module doc's
-/// *Publication* states the flip, its preconditions, and what a lost or refused flip does.
+/// **`CompleteMultipartUpload`** (#658): fence the session as [`fence_complete`] does, then
+/// publish the named parts (`0016:662-663`): one flat root, or past
+/// [`MAX_MAP_CHUNKS`](super::MAX_MAP_CHUNKS) chunks the attempt's `seg:` records and then the
+/// root that names them, in a flip that also moves the session to `Completed` and installs its
+/// `retire:` obligations, all in one batch. Answers in the landed vocabulary
+/// ([`CompleteOutcome`], [`Refusal`]); the module doc's *Publication* states the segment batches
+/// and the flip, their preconditions, and what a lost or refused round does.
 ///
-/// * The fence phase's answers and errors are this verb's too, plus one stop: a list whose named
-///   parts total more than [`MAX_MAP_CHUNKS`] chunks ([`Stop::SegmentedUnsupported`]), with no
-///   commit when that shows before the fence and after one release when only the frozen set
-///   shows it.
+/// * The fence phase's answers and errors are this verb's too.
 /// * A flip that lands answers [`CompleteOutcome::Published`]. A later identical request answers
 ///   [`CompleteOutcome::AlreadyCompleted`] with that publication, from the `Completed` record.
-/// * A flip that loses for good answers [`Refusal::NoSuchBucket`] (the bucket marker is gone) or
-///   [`Refusal::OperationAborted`] (another writer took the fence, or [`R_PUBLISH`] flips lost),
-///   with the fence released and the session `Open`, unless another writer moved it.
+/// * A publication that loses for good answers [`Refusal::NoSuchBucket`] (the bucket marker is
+///   gone) or [`Refusal::OperationAborted`] (another writer took the fence, or [`R_PUBLISH`]
+///   rounds lost), with the fence released and the session `Open`, unless another writer moved
+///   it. A fence whose segment batch landed stays charged, and its release installs the
+///   attempt's `retire:records:{seg}` obligation (module doc, *The release once a segment
+///   landed*).
 ///
 /// # Termination
 ///
 /// The fence phase's bound, then one read of each named part's record, then at most
-/// [`R_PUBLISH`] flips. Each flip follows one read of the target (its dirent and, when bound, the
-/// inode it names), and a flip that loses is followed by one read of the session and one of the
-/// bucket marker. Then at most [`RELEASE_ROUNDS`] release commits, each followed by at most one
-/// read of the session. Each store call is bounded by the store's own contract.
+/// [`R_PUBLISH`] rounds. Each round follows one read of the target (its dirent and, when bound,
+/// the inode it names); it is the committer's segment batches, at most one per segment and at
+/// most [`crate::metadata::MAX_ROOT_SEGMENTS`] of them, its two reads of the attempt's bounded
+/// `seg:` range, and one flip. A round that loses is followed by one read of the session and one
+/// of the bucket marker, and a round the store refuses for good after a segment batch may have
+/// landed by one read of the session. Then at most [`RELEASE_ROUNDS`] release commits that find
+/// the session unchanged, plus at most one per segment batch that landed, each followed by at
+/// most one read of the session. Each store call is bounded by the store's own contract.
 ///
-/// **Not cancel-safe once a commit is sent**, as [`fence_complete`] is not: a fence or a flip left
-/// unanswered by a dropped future is the reaper's or #1010's to settle.
+/// **Not cancel-safe once a commit is sent**, as [`fence_complete`] is not: a fence, a segment
+/// batch or a flip left unanswered by a dropped future is the reaper's or #1010's to settle.
 pub async fn complete_upload(
     store: &impl MetadataStore,
     upload_id: &UploadId,
     request: &CompleteRequest<'_>,
     publish: &PublishRequest,
 ) -> Result<CompleteOutcome, CompleteError> {
-    match fence(store, upload_id, request, Admit::Flat).await? {
+    match fence_complete(store, upload_id, request).await? {
         FenceOutcome::Answered(outcome) => Ok(outcome),
-        FenceOutcome::Held(fence) => publish_flat(store, &fence, request.bucket, publish).await,
+        FenceOutcome::Held(fence) => publish_held(store, &fence, request.bucket, publish).await,
     }
 }
 
-/// Publish what `fence` holds as one flat root (module doc, *Publication*).
-async fn publish_flat(
+/// Publish what `fence` holds (module doc, *Publication*).
+async fn publish_held(
     store: &impl MetadataStore,
     fence: &HeldFence,
     bucket: &str,
@@ -1183,55 +1292,62 @@ async fn publish_flat(
 ) -> Result<CompleteOutcome, CompleteError> {
     let session_key = mpu_key(&fence.upload_id);
     let bucket_key = metadata::bucket_key(bucket);
-    let own = OwnFence {
-        upload_id: &fence.upload_id,
-        session_key: &session_key,
-        epoch: fence.epoch(),
-        bytes: fence.bytes.clone(),
-        released: fence.released.clone(),
-    };
+    let placed = &fence.placed;
+    let mut own = OwnFence::new(&fence.upload_id, &session_key, placed);
     // The list was validated behind the fence, so neither digest can refuse it.
     let named = fence.named_parts();
     let identity = complete_fingerprint(named)
         .and_then(|fingerprint| Ok((fingerprint, multipart_etag(named)?)));
     let (fingerprint, etag) = match identity {
         Ok(identity) => identity,
-        Err(torn) => return give_up(store, &own, Stop::Record(torn), None).await,
+        Err(torn) => return give_up(store, &mut own, Stop::Record(torn), None).await,
     };
     let lost = |refusal| ReleaseFor::Rejection(refusal);
     let plan = match FlipPlan::read(store, fence).await {
         Ok(plan) => plan,
-        Err(cause) => return give_up(store, &own, cause, Some(&fingerprint)).await,
+        Err(cause) => return give_up(store, &mut own, cause, Some(&fingerprint)).await,
     };
-    let parent = fence.session.parent();
-    let name = fence.session.object();
+    let parent = placed.session.parent();
+    let name = placed.session.object();
     let mut target = match read_target(store, parent, name).await {
         Ok(target) => target,
-        Err(cause) => return give_up(store, &own, cause, Some(&fingerprint)).await,
+        Err(cause) => return give_up(store, &mut own, cause, Some(&fingerprint)).await,
     };
     let meta = ObjectMeta {
         etag: Some(etag.to_string()),
-        content_type: fence.session.content_type().map(str::to_owned),
+        content_type: placed.session.content_type().map(str::to_owned),
         modified: Some(publish.completed_at_millis),
     };
-    let group = SegmentGroup::from_nonce(fence.session.segment_nonce().clone(), fence.epoch());
-    let mut flips = 0u32;
+    // Each segment batch's contribution: the session at the cursor the batch starts from, moved
+    // to the count it leaves durable (`0016:613-620`, `:662`). A cursor past the decode bound has
+    // no record, so its batch pins nothing and the committer refuses it before writing
+    // ([`PublicationError::Unfenced`]); no plan the committer accepts reaches one.
+    let step = |info: SegmentBatchInfo| match (placed.at(info.first_index), placed.at(info.written))
+    {
+        (Some(from), Some(to)) => WriteBatch::new()
+            .require(session_key.clone(), from)
+            .put(session_key.clone(), to),
+        _ => WriteBatch::new(),
+    };
+    let mut rounds = 0u32;
     loop {
-        flips += 1;
+        rounds += 1;
         let flip = match plan.flip(fence, &bucket_key, &target, publish, (etag, fingerprint)) {
             Ok(flip) => flip,
-            Err(cause) => return give_up(store, &own, cause, Some(&fingerprint)).await,
+            Err(cause) => return give_up(store, &mut own, cause, Some(&fingerprint)).await,
         };
+        // A round that resumes below the plan's count sends segment batches before its flip.
+        let writes_segments = own.cursor < plan.segments;
         let publication = staged_publication::Publication {
             parent,
             name,
             root: flip.root,
-            group: group.clone(),
+            group: placed.group.clone(),
             chunks: &plan.chunks,
             meta: &meta,
             fence_key: &session_key,
-            segment_contribution: &no_segments,
-            resume_from: 0,
+            segment_contribution: &step,
+            resume_from: own.cursor,
             byte_budget: None,
             ops_budget: None,
             flip_contribution: flip.contribution,
@@ -1243,26 +1359,42 @@ async fn publish_flat(
             Ok(CommitOutcome::Conflict) => {}
             Err(fault) => {
                 if let Some(unknown) = fault.downcast_ref::<CommitUnknownResult>() {
-                    let commit = DoubtfulCommit::Flip { epoch: own.epoch };
+                    let epoch = own.epoch();
+                    let commit = if writes_segments {
+                        DoubtfulCommit::Publication { epoch }
+                    } else {
+                        DoubtfulCommit::Flip { epoch }
+                    };
                     return Err(in_doubt(&fence.upload_id, commit, unknown, None));
                 }
-                // Refused before anything was written, or a flip the store refused for good: no
-                // other flip, one release.
+                // Refused before anything was written, or a round the store refused for good: no
+                // other round, one release.
                 let cause = match fault.downcast_ref::<PublicationError>() {
                     Some(refused) => Stop::Publication(refused.clone()),
                     None => Stop::Store(fault),
                 };
-                return give_up(store, &own, cause, Some(&fingerprint)).await;
+                // A segment batch of the round may have landed first: the release goes from the
+                // cursor the session holds. A read that fails here leaves that to the release.
+                if writes_segments {
+                    if let Ok(session) = store.get(&session_key).await {
+                        if !own.follow(session.as_ref()) {
+                            let why = ReleaseFor::Fault(cause);
+                            return moved(&own, session, why, Some(&fingerprint));
+                        }
+                    }
+                }
+                return give_up(store, &mut own, cause, Some(&fingerprint)).await;
             }
         }
-        // The flip lost: judged from what the store holds now.
+        // The round lost: judged from what the store holds now, which also says how far the
+        // segment phase got.
         let session = match store.get(&session_key).await {
             Ok(session) => session,
             Err(fault) => {
-                return give_up(store, &own, Stop::Store(fault), Some(&fingerprint)).await
+                return give_up(store, &mut own, Stop::Store(fault), Some(&fingerprint)).await
             }
         };
-        if session.as_ref() != Some(&own.bytes) {
+        if !own.follow(session.as_ref()) {
             return moved(
                 &own,
                 session,
@@ -1273,19 +1405,20 @@ async fn publish_flat(
         let marker = match store.get(&bucket_key).await {
             Ok(marker) => marker,
             Err(fault) => {
-                return give_up(store, &own, Stop::Store(fault), Some(&fingerprint)).await
+                return give_up(store, &mut own, Stop::Store(fault), Some(&fingerprint)).await
             }
         };
         if marker.as_ref() != Some(&fence.bucket_marker) {
-            return release(store, &own, lost(Refusal::NoSuchBucket), Some(&fingerprint)).await;
+            let why = lost(Refusal::NoSuchBucket);
+            return release(store, &mut own, why, Some(&fingerprint)).await;
         }
-        if flips == R_PUBLISH {
+        if rounds == R_PUBLISH {
             let why = lost(Refusal::OperationAborted);
-            return release(store, &own, why, Some(&fingerprint)).await;
+            return release(store, &mut own, why, Some(&fingerprint)).await;
         }
         target = match read_target(store, parent, name).await {
             Ok(target) => target,
-            Err(cause) => return give_up(store, &own, cause, Some(&fingerprint)).await,
+            Err(cause) => return give_up(store, &mut own, cause, Some(&fingerprint)).await,
         };
     }
 }
@@ -1294,26 +1427,24 @@ async fn publish_flat(
 /// ([`ReleaseFor::Fault`]), so the error keeps `cause` and says what became of the fence.
 async fn give_up(
     store: &impl MetadataStore,
-    own: &OwnFence<'_>,
+    own: &mut OwnFence<'_>,
     cause: Stop,
     fingerprint: Option<&Digest>,
 ) -> Result<CompleteOutcome, CompleteError> {
     release(store, own, ReleaseFor::Fault(cause), fingerprint).await
 }
 
-/// The segment-batch contribution of a flat publication. The committer asks for one only for a
-/// map past [`MAX_MAP_CHUNKS`] chunks, and [`complete_upload`] never hands it one: the fence is
-/// held only for a list whose summaries total at most that ([`Admit::Flat`]), and
-/// [`FlipPlan::read`] requires each record to agree with its summary. Were it ever asked, this
-/// contribution pins no fence, so the committer would refuse the publication before writing.
-fn no_segments(_: SegmentBatchInfo) -> WriteBatch {
-    WriteBatch::new()
-}
-
-/// What every flip of one publication shares: the object's chunk list and the two part-scoped
-/// obligations, both fixed by the frozen set and the named list.
+/// What every round of one publication shares: the object's chunk list, the segment count the
+/// committer plans for it, the session the flip requires, and the two part-scoped obligations,
+/// all fixed by the frozen set and the named list.
 struct FlipPlan {
     chunks: Vec<ChunkRef>,
+    /// How many `seg:` records the committer writes for `chunks`
+    /// ([`staged_publication::planned_segments`]), 0 for a flat map: the cursor the segment phase
+    /// leaves the session at.
+    segments: u32,
+    /// The session at that cursor: what the flip requires.
+    ready: Bytes,
     /// `retire:records:` for the published parts.
     published: RetireObligation,
     /// `retire:bytes:` for the frozen parts left unnamed, if any.
@@ -1332,7 +1463,8 @@ impl FlipPlan {
     /// the summary the fence froze ([`Stop::PartDisagrees`]): its chunk count, length, digest and
     /// commit stamp. Validation behind the fence checked that summary's digest against the list,
     /// so the record carries the digest the list names. Their chunk lists, concatenated in that
-    /// order, are the object.
+    /// order, are the object. The segment count is the committer's, never re-derived from the
+    /// chunk count: wide chunk refs close a segment early.
     async fn read(store: &impl MetadataStore, fence: &HeldFence) -> Result<Self, Stop> {
         let upload_id = &fence.upload_id;
         let named = fence.named_parts();
@@ -1359,6 +1491,12 @@ impl FlipPlan {
                 }
             }
         }
+        let segments = staged_publication::planned_segments(&chunks).map_err(Stop::Publication)?;
+        let ready = fence.placed.at(segments).ok_or(Stop::Record(
+            RecordError::SegmentCursorUnaddressable {
+                segments_written: segments,
+            },
+        ))?;
         let epoch = fence.epoch();
         let published =
             PartNumberSet::from_numbers(named.iter().map(|(part_number, _)| *part_number))
@@ -1370,6 +1508,8 @@ impl FlipPlan {
             .copied();
         Ok(Self {
             chunks,
+            segments,
+            ready,
             published: RetireObligation::published_parts(upload_id, epoch, published),
             unnamed: PartNumberSet::from_numbers(unnamed)
                 .map(|parts| RetireObligation::unnamed_parts(upload_id, epoch, parts)),
@@ -1378,8 +1518,9 @@ impl FlipPlan {
 
     /// The flip onto `target`: version 1 under [`PublishRequest::fresh_inode`] for a free name, or
     /// the prior's version + 1 for a bound one, recomputed from the prior read for this flip
-    /// (`0016:926-941`); the session at `Completed` recording that publication; the bucket marker
-    /// validated behind the fence pinned; and each obligation under `require_absent`.
+    /// (`0016:926-941`); the session required at the cursor the segment phase leaves and put at
+    /// `Completed` recording that publication; the bucket marker validated behind the fence
+    /// pinned; and each obligation under `require_absent`.
     fn flip<'a>(
         &self,
         fence: &HeldFence,
@@ -1416,6 +1557,7 @@ impl FlipPlan {
         };
         let publication = Publication::of(&completion);
         let completed = fence
+            .placed
             .session
             .completed(completion)
             .ok_or(Stop::EpochExhausted)?;
@@ -1426,7 +1568,7 @@ impl FlipPlan {
             superseded.as_ref(),
         ];
         let mut contribution = WriteBatch::new()
-            .require(session_key.clone(), fence.bytes.clone())
+            .require(session_key.clone(), self.ready.clone())
             // ADR-0046 §4: the bucket is the one validated behind the fence, byte for byte.
             .require(bucket_key.to_vec(), fence.bucket_marker.clone());
         for obligation in obligations.iter().flatten() {
