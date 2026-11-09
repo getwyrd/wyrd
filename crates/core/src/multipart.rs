@@ -11,7 +11,8 @@
 //! the validation against the frozen part set, and the release of a rejected request's fence
 //! (#1007), [`stage`], `UploadPart`'s staging half: the slot reserve and the owned intent
 //! per chunk (#932), and [`commit`], `UploadPart`'s commit half: the part commit and its
-//! live-session compensation (#1027). After this file a reader can name every key the protocol
+//! live-session compensation (#1027), and the classification of either one answered `Conflict`
+//! (#1028). After this file a reader can name every key the protocol
 //! will ever write (`0016` §1, `:333-527`), parse it back, **and decode the record values that
 //! key space names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and
 //! the two derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence`
@@ -378,13 +379,32 @@ pub enum RecordError {
         chunks: usize,
     },
     /// A session record whose bytes differ from the ones a batch of the attempt required, at the
-    /// same or a lower epoch. Every fence and every rollback bumps the epoch
-    /// ([`SessionRecord::epoch`], `0016:364`, `:704-708`), so no legal history wrote it: this is
-    /// damage, and no batch is sent under it.
+    /// same or a lower epoch, **whatever its state**. Every fence and every rollback bumps the
+    /// epoch ([`SessionRecord::epoch`], `0016:364`, `:704-708`), so no legal history wrote it:
+    /// this is damage, never a rollback or a fence the batch lost to, and no batch is sent under
+    /// it.
     SessionEpochNotRisen {
         /// The epoch the stored record carries.
         found: u64,
         /// The epoch of the bytes the attempt required.
+        required: u64,
+    },
+    /// A part record a part commit required is gone while the session is still the bytes that
+    /// commit required. A `part:` record's only remover is the retirement drain (`0016:351`),
+    /// which reaches a part only after its session has left `Open`, so this is damage, not a
+    /// rival's commit.
+    PartRecordMissing {
+        /// The part number whose record is gone.
+        part_number: u32,
+    },
+    /// A session record a batch of the attempt required is gone, and a read of the attempt's slot
+    /// key made **after** that finds a record there, the attempt's own or another's. A terminal
+    /// session delete removes every surviving `slot:` record in the same batch as the session
+    /// record (`0016:674`), and a reservation requires the session's `Open` bytes
+    /// ([`stage::reserve_slot`]), so no legal history leaves a slot behind a missing session: this
+    /// is damage, not that delete.
+    SessionRecordMissing {
+        /// The epoch of the bytes the batch required.
         required: u64,
     },
     /// A part-number set run whose bounds are reversed, `lo > hi` (`0016:382-388`). A reversed
@@ -726,6 +746,16 @@ impl fmt::Display for RecordError {
                 f,
                 "a session record at epoch {found} differs from the bytes required at epoch \
                  {required}: only a higher epoch can replace them"
+            ),
+            Self::PartRecordMissing { part_number } => write!(
+                f,
+                "part {part_number}'s record is gone while its session is still the bytes the \
+                 commit required"
+            ),
+            Self::SessionRecordMissing { required } => write!(
+                f,
+                "the session record required at epoch {required} is gone while the slot key \
+                 still holds a record; a terminal delete removes both in one batch"
             ),
             Self::PartNumberRunReversed { lo, hi } => {
                 write!(f, "part-number run [{lo}, {hi}] is reversed")
@@ -4722,8 +4752,18 @@ pub enum Refusal {
     NoSuchUpload,
     /// The target bucket has no `bucket:` record (ADR-0046 §4).
     NoSuchBucket,
-    /// The session is fenced into `Completing` by a publisher that still owns it. There is
-    /// **no** client path that resumes a `Completing` session (`0016:980-986`).
+    /// A conflicting operation on the upload intervened, and the client may retry:
+    ///
+    /// * the session is fenced into `Completing` by a publisher that still owns it. There is
+    ///   **no** client path that resumes a `Completing` session (`0016:980-986`);
+    /// * or a part attempt lost its commit while the session stayed, or came back, `Open`
+    ///   ([`commit::commit_part`], `0016:1597-1647`): a rival attempt for the **same part
+    ///   number** committed first, a repair rewrote the prior part record a re-upload required,
+    ///   or a Complete fenced the session and rolled it back to a newer `Open` epoch between the
+    ///   attempt's last renewal and its commit (`0016:1607-1620`). What the attempt staged was
+    ///   compensated in one batch (its chunks owed to a `retire:bytes:` obligation, its slot
+    ///   released, its owned entries deleted), so the session is still usable and the client
+    ///   may upload the part again.
     OperationAborted,
     /// The named-part list is invalid (`0016:993-999`): a named part is absent from the frozen
     /// part set or carries another digest, or the part numbers are not strictly ascending. The

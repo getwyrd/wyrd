@@ -2,12 +2,13 @@
 //! [`super::stage`]): turn a staged attempt into a committed part, or into a compensated stop, and
 //! compose the whole verb, reserve → stage → commit ([`upload_part`]). Proposal 0016's *Part commit*
 //! and *Live-session compensation* rows (`0016:660`, `:673`), the post-staging refusal rule
-//! (`0016:1420-1431`) and the quiesce rule (`0016:1720-1733`).
+//! (`0016:1420-1431`) and the quiesce rule (`0016:1720-1733`). A commit or a compensation
+//! answered `Conflict` is classified from a re-read (#1028, the second slice; `0016:1584-1653`).
 //!
 //! | Batch | Preconditions | Mutations |
 //! |---|---|---|
 //! | part commit | `require(mpu:<id> == Open@E)`, `require_absent(part:<id>:<n>)` or `require(part:<id>:<n> == prior)`, `require(slot:<id>:<k> == the bytes this attempt last wrote)`, and for a re-upload over a non-empty prior `require_absent(retire:bytes:s:<id>:<E>:<n>:<attempt>)` | put `part:`, put its `psum:` summary, delete the slot, delete every owned `sidx:` entry, and for that re-upload put the `{chunks}` obligation naming the **prior** part's chunks |
-//! | compensation | `require(mpu:<id> == Open@E)`, `require(slot:<id>:<k> == the bytes this attempt last wrote)`, and for a non-empty part `require_absent` of its obligation key | delete the slot, delete every owned `sidx:` entry, and for a non-empty part put the `{chunks}` obligation naming **this attempt's own** chunks |
+//! | compensation | `require(mpu:<id> == Open@E)`, where `E` is the epoch it compensates under (the commit's, or the newer `Open` epoch a rollback left), `require(slot:<id>:<k> == the bytes this attempt last wrote)`, and for a non-empty part `require_absent` of its obligation key | delete the slot, delete every owned `sidx:` entry, and for a non-empty part put the `{chunks}` obligation naming **this attempt's own** chunks, keyed under `E` |
 //!
 //! An obligation names at least one chunk (`RetireObligation` refuses an empty list), so an empty
 //! part, or a re-upload over an empty prior, installs none, and its slot release and owned-entry
@@ -30,10 +31,10 @@
 //!
 //! # What the lease check does and does not promise
 //!
-//! A renewal guarantees its cover only at the moment it returns, and the reads spend from it. So the
-//! clock is read before the commit, and the commit is sent only with [`DISPATCH_MARGIN_MILLIS`] left
-//! on the lease. The attempt never renews again to buy time: that would rewrite the slot the commit
-//! requires.
+//! A renewal guarantees its cover only at the moment it returns, and the reads and each earlier
+//! round spend from it. So the clock is read before every commit round, the first included, and a
+//! round is sent only with [`DISPATCH_MARGIN_MILLIS`] left on the lease. The attempt never renews
+//! again to buy time: that would rewrite the slot the commit requires.
 //!
 //! That is a promise about dispatch, and only about dispatch. The margin is `E_tx`'s five seconds,
 //! not a deadline on `commit`: the store promises termination, not five seconds, and a commit
@@ -44,24 +45,110 @@
 //! bytes and pins that slot (`0016:1859-1863`), so whichever lands first makes the other fail. A
 //! lapsed lease is therefore never evidence about whether a commit landed.
 //!
+//! # A commit that lost
+//!
+//! The store answers `Conflict` without naming the precondition that failed, so a commit answered
+//! `Conflict` is never compensated blind (`0016:1792`): it is classified from a re-read
+//! (`0016:1597-1647`). Each round reads, in this order, the part key, the session, the attempt's
+//! own slot, then the session again, each read its own transaction. Only the last session read
+//! decides the answer:
+//!
+//! | The session (last read) | The part key | Answer |
+//! |---|---|---|
+//! | still `Open@E` | what the commit requires | a conflict no read explains (on TiKV, a lock another writer held): the same batch again |
+//! | still `Open@E` | changed: a same-number rival won, or a repair rewrote the prior | compensate under `Open@E`; [`Refusal::OperationAborted`] |
+//! | back at a newer `Open@E'` | any | compensate under `Open@E'`; [`Refusal::OperationAborted`] |
+//! | not `Open`, at a higher epoch (a fence) | any | [`Refusal::NoSuchUpload`], nothing written: the residue is the reaper's, whose walk covers every non-`Open` state |
+//! | gone, and a slot read made after it finds the key absent | any | [`Refusal::NoSuchUpload`]: a terminal delete took the session and the slot in one batch (`0016:674`) |
+//! | gone, and that later slot read finds any record there, this attempt's or another's | any | [`Stop::Record`] ([`RecordError::SessionRecordMissing`]): damage |
+//!
+//! The reaper does not walk an `Open` session (`0016:1600-1620`), so a commit that lost to a live
+//! session compensates: nothing else would free its slot before `W_session`. That covers the
+//! Complete that fenced the session and rolled it back between the last renewal and the commit
+//! (`0016:1607-1620`): the session is `Open` again, at a newer epoch, and an `Open` session is
+//! never answered `NoSuchUpload`. A repair that rewrote the prior is answered like a rival, with
+//! no retry against the new record.
+//!
+//! A re-upload over a non-empty prior also requires its obligation key absent, and no read of a
+//! round looks there. So when rounds that no read explained come to an end, spent or stopped by
+//! the lease, the attempt reads that key before it compensates: a record there is
+//! [`Stop::ObligationKeyTaken`], with no compensation, since the key names this attempt
+//! (`0016:364`) and none of its batches landed. Without that read an empty re-upload, whose
+//! compensation installs no obligation and so does not require that key, would land its
+//! compensation and report the rounds spent, the damage unreported.
+//!
+//! A session read is evidence only once it is judged. It has **moved** when the record decodes at
+//! a higher epoch than the bytes the batch required, `Open` (a rollback) or not (a fence): every
+//! fence and every rollback bumps the epoch (`0016:364`, `:704-708`). Bytes that do not decode,
+//! and a record under other bytes at the same or a lower epoch, whatever its state
+//! ([`RecordError::SessionEpochNotRisen`]), are damage (ADR-0045), never a rollback or a fence.
+//! At the round's last read damage stops the attempt with [`Stop::Record`]. The round's first
+//! session read is passed over, damage and all: it is the read that settles a commit in doubt, and
+//! with nothing in doubt it decides nothing.
+//!
+//! A missing session record shows a terminal delete only together with the slot key found absent
+//! by a read made **after** it. A slot read made before the read that found the change proves
+//! nothing, since the delete can land between the two, so a round whose last session read finds
+//! no record reads the slot key once more. That read tests the key itself: a terminal delete
+//! removes every surviving slot in its one batch, and a reservation requires the session's `Open`
+//! bytes ([`super::stage::reserve_slot`]), so any record there behind a missing session is damage,
+//! another attempt's as much as this one's.
+//!
+//! The rest of the damage a round can find stops the attempt the same way, with no compensation:
+//! bytes at the part key that do not decode, whatever the session (a rival's record must decode,
+//! ADR-0045); and a prior part record gone while the session is still `Open@E`
+//! ([`RecordError::PartRecordMissing`]), since a `part:` record's only remover is the retirement
+//! drain, which reaches it only once the session has left `Open` (`0016:351`). Under a session that
+//! moved, the moved session's row answers instead.
+//!
+//! A slot found **gone** is absent or holds another attempt's `attempt_id` (the index was released
+//! and reserved again); one under this attempt's id at bytes it did not last write is
+//! **rewritten**. With nothing in doubt neither has a cause while the session is live: only this
+//! attempt writes its own slot, it has quiesced, and none of its batches landed. So a slot gone
+//! under an `Open` session, and a slot rewritten under any session record, is [`Stop::SlotLost`],
+//! claiming no release. A fenced session answers its refusal whatever else its slot holds, and a
+//! missing one has its own two rows.
+//!
+//! # The compensation, and the epoch chase
+//!
+//! A compensation answered `Conflict` is classified the same way, from a re-read in this order:
+//! its obligation key (for a non-empty part), the attempt's own slot, then the session.
+//!
+//! | What the re-read found | Then |
+//! |---|---|
+//! | any record at the obligation key | [`Stop::ObligationKeyTaken`]: the key names this attempt (`0016:364`), and no batch of it put that record; the record is kept |
+//! | the session at a newer `Open` epoch, the slot held | **the epoch chase**: the same compensation under that epoch, its obligation keyed under it (`0016:1607-1620`) |
+//! | the session unchanged, the slot held | a conflict no read explains: the same batch again |
+//! | the session fenced | its refusal, with no further write; the residue is the reaper's |
+//! | the session gone | the slot key read once more, as for the commit: [`Refusal::NoSuchUpload`] or [`RecordError::SessionRecordMissing`] |
+//! | a slot lost or rewritten, or damage | [`Stop::SlotLost`], [`Stop::Record`] |
+//!
+//! Every answer but the landed one is the compensation's own: a session it found fenced or deleted
+//! is the refusal, whatever stopped the commit, and a stop of the compensation itself is its own
+//! typed error and claims no release.
+//!
 //! # The stops
 //!
 //! The reaper does not walk an `Open` session (`0016:1600-1620`), so a stop that left an attempt's
 //! slot held under a live session would keep it until `W_session`, and repeated stops would fill
-//! `MAX_INFLIGHT_PARTS` (`0016:1420-1431`). So a settled stop before any commit is sent compensates:
+//! `MAX_INFLIGHT_PARTS` (`0016:1420-1431`). So a settled stop with no commit able to land
+//! compensates:
 //!
 //! | The stop | Action |
 //! |---|---|
 //! | the quiesce renewal stopped by `CoverShort`, `RenewalRoundsSpent`, `LeaseLapsed` or `InvalidRequest` | compensate; the answer keeps the renewal's error |
-//! | the lease short before the commit | compensate; [`Stop::LeaseShort`] |
+//! | the lease short before a commit round | compensate; [`Stop::LeaseShort`] |
 //! | over the per-part or the cumulative ceiling | compensate; [`Refusal::EntityTooLarge`] |
+//! | a commit that lost to a live session | compensate; [`Refusal::OperationAborted`] |
+//! | the commit rounds spent, every one answered `Conflict` with nothing a read explains | compensate; [`Stop::CommitRoundsSpent`] |
+//! | the commit rounds spent, or the lease short before a later round, when a re-upload's commit's obligation key holds a record | no compensation; [`Stop::ObligationKeyTaken`] |
 //! | the quiesce renewal in doubt | keep the doubt; no compensation |
 //! | `SlotLost`, and staging's `EntryLost` | no compensation: the attempt cannot show the records are its own |
-//! | the session has left `Open` | answer the refusal; the residue is the reaper's |
+//! | the session has left `Open`, or was deleted with its slots | answer the refusal; the residue is the reaper's |
 //! | a store fault or a damaged record | no compensation; the residue stays, as after a crash (`0016:1778`) |
-//! | a sent commit answered `Conflict` | stop, the slot still held; no compensation, no second commit |
-//! | a sent commit answered unknown | stop in doubt, since it may have landed; no compensation, no second commit |
-//! | a compensation answered `Conflict` or unknown | stop, claiming no release; no further batch |
+//! | a sent commit answered unknown | stop in doubt, since it may have landed; no compensation, no further batch |
+//! | a compensation answered unknown | stop in doubt, claiming no release; no further batch |
+//! | a compensation's own stop: its rounds spent, its obligation key taken, the slot lost | that stop, claiming no release |
 //!
 //! An owned entry lost after staging has no stop of its own: the renewal requires that entry,
 //! conflicts on every round and ends `RenewalRoundsSpent`, which compensates like any other.
@@ -70,6 +157,20 @@
 //! (`0016:1845`), but the compensation revives nothing and lands only if the session and the slot
 //! are unchanged (`0016:1651-1653`). The caller gets the original stop's typed error, in its own
 //! error class, and [`CommitError::slot_released`] says whether the slot was released.
+//!
+//! # Bounds
+//!
+//! | Loop | At most |
+//! |---|---|
+//! | the quiesce renewal | [`super::stage::RENEWAL_ROUNDS`] commits |
+//! | the part commit, its retries included | [`COMMIT_ROUNDS`] commits, then [`Stop::CommitRoundsSpent`] |
+//! | the compensation, the epoch chase included | [`COMPENSATION_ROUNDS`] commits, then [`Stop::CompensationRoundsSpent`] |
+//!
+//! A commit round is followed by at most five reads: its four, then either the slot key once more
+//! behind a missing session or, before the compensation that follows rounds no read explained, a
+//! re-upload's obligation key. A compensation round is followed by at most four. Each store call
+//! is bounded by the store's own contract (every operation terminates, `crates/traits/src/lib.rs`,
+//! "Operational envelope").
 //!
 //! # Every batch requires the slot bytes this attempt last wrote
 //!
@@ -86,10 +187,11 @@
 //!
 //! # One clock (ADR-0009)
 //!
-//! The quiesce renewal, the lease check before the commit and the part's `committed_at_millis` stamp
-//! all read the caller's [`StageClock`], the clock that owns the attempt's lease lifecycle and that
-//! staging ran on ([`super::stage`]'s "One clock"). Nothing else here reads a clock, and the
-//! compensation reads none.
+//! The quiesce renewal, the lease check before each commit round and the part's
+//! `committed_at_millis` stamp (taken once, at the first round's reading, so every round sends the
+//! same bytes) all read the caller's [`StageClock`], the clock that owns the attempt's lease
+//! lifecycle and that staging ran on ([`super::stage`]'s "One clock"). Nothing else here reads a
+//! clock: the re-reads and the compensation read none.
 //!
 //! No production path calls this module yet: the S3 `UploadPart` verb is #669, and the part records
 //! it writes are consumed by Complete (#658). The tests drive every branch over a real store with
@@ -112,9 +214,10 @@ use super::stage::{
     StagedAttempt, Stop as StageStop,
 };
 use super::{
-    decode_part_record, decode_part_summary, decode_session_record, mpu_key, parse_psum_key,
-    part_key, psum_key, psum_range, PartRecord, RecordError, Refusal, RetireObligation, UploadId,
-    UploadPartOutcome, E_TX_MILLIS, MAX_PART_CHUNKS, MAX_STAGED_CHUNKS,
+    decode_part_record, decode_part_summary, decode_session_record, decode_slot_record, mpu_key,
+    parse_psum_key, part_key, psum_key, psum_range, upload_part_answer, PartRecord, RecordError,
+    Refusal, RetireObligation, UploadId, UploadPartAnswer, UploadPartOutcome, E_TX_MILLIS,
+    MAX_COMPLETE_ATTEMPTS, MAX_PART_CHUNKS, MAX_STAGED_CHUNKS,
 };
 use crate::metadata;
 
@@ -125,6 +228,28 @@ use crate::metadata;
 /// request staged with a lease TTL not above it cannot be committed: the renewal refuses a cover it
 /// could not give.
 pub const DISPATCH_MARGIN_MILLIS: u64 = E_TX_MILLIS;
+
+/// The most part-commit batches one [`commit_part`] sends: its first, and three more for a
+/// conflict no read explains (on TiKV, a lock another writer held while the commit's locking reads
+/// ran). Nothing else sends the batch again: a conflict a read explains is answered from that read
+/// (the module doc's *A commit that lost*), and a commit shares no writable key with another part
+/// number (`0016:1597-1610`), so no other part's progress spends a round. A budget for the work,
+/// not for the answer: a commit that spends it compensates and returns
+/// [`Stop::CommitRoundsSpent`], unless a re-upload finds its commit's obligation key holding a
+/// record ([`Stop::ObligationKeyTaken`]).
+pub const COMMIT_ROUNDS: u32 = 4;
+
+/// The most compensation batches one [`commit_part`] sends: [`MAX_COMPLETE_ATTEMPTS`] `+ 1`, the
+/// budget [`super::abort::ABORT_ROUNDS`] takes and for the same reason. A session goes back to a
+/// newer `Open` epoch only when a Complete fence is released, and it can spend at most
+/// [`MAX_COMPLETE_ATTEMPTS`] charged fences, so that many rounds cover the epoch chase after each
+/// of them; the one more is the round that lands. A Complete rejected behind its fence gives its
+/// attempt back when it releases that fence (#1007), so such Completes can move the session more
+/// often than that, and each such move spends a round too, as does a conflict no read explains.
+/// A budget for the work, not for the answer: a compensation that spends it returns
+/// [`Stop::CompensationRoundsSpent`], claiming no release, and what it staged stays until
+/// `W_session`.
+pub const COMPENSATION_ROUNDS: u32 = MAX_COMPLETE_ATTEMPTS + 1;
 
 /// Which of the attempt's batches a [`CommitError::InDoubt`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,15 +327,36 @@ pub struct InDoubt {
 /// What stopped a part commit ([`CommitError::Stopped`]).
 #[derive(Debug)]
 pub enum Stop {
-    /// A sent part commit was answered `Conflict`. No read has classified it, so nothing more is
-    /// sent, and the attempt's slot and owned entries stay as they are.
-    // deferred: #1028 — the classification of a commit's `Conflict` and its answer.
-    CommitConflict,
-    /// The compensation was answered `Conflict`, so it released nothing.
-    // deferred: #1028 — the epoch chase of a compensation that lost to a rollback.
-    CompensationConflict,
-    /// The attempt's lease had less than [`DISPATCH_MARGIN_MILLIS`] left when the commit came to be
-    /// sent, so it was not.
+    /// All [`COMMIT_ROUNDS`] part commits were sent, each answered `Conflict` with nothing a read
+    /// could see to explain it. The attempt then compensates.
+    CommitRoundsSpent {
+        /// Part commits sent.
+        rounds: u32,
+    },
+    /// All [`COMPENSATION_ROUNDS`] compensations were sent without one landing, each lost to a
+    /// rollback or to a conflict no read explains. It released nothing.
+    CompensationRoundsSpent {
+        /// Compensations sent.
+        rounds: u32,
+    },
+    /// The attempt's slot is gone (absent, or another attempt's) under a live session, or
+    /// rewritten under this attempt's id, and nothing explains it: no batch of this attempt landed,
+    /// and the session's state does not account for it. Nothing is released.
+    SlotLost {
+        /// The slot key, as UTF-8 (lossy).
+        key: String,
+    },
+    /// An obligation key of this attempt holds a record no batch of this attempt put: the key its
+    /// compensation requires absent, or the one a re-upload's commit required absent in every
+    /// round no read explained. The key names this attempt, and a token is minted once
+    /// (`0016:364`), so this is damage a retry cannot clear. The record is kept, and nothing is
+    /// released.
+    ObligationKeyTaken {
+        /// The `retire:` key, as UTF-8 (lossy).
+        key: String,
+    },
+    /// The attempt's lease had less than [`DISPATCH_MARGIN_MILLIS`] left when a commit round came
+    /// to be sent, so it was not.
     LeaseShort {
         /// The lease the quiesce renewal wrote.
         lease_expiry_millis: u64,
@@ -276,19 +422,31 @@ impl fmt::Display for CommitError {
 impl fmt::Display for Stop {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CommitConflict => f.write_str(
-                "the part commit was answered Conflict, and this attempt's slot is still held",
+            Self::CommitRoundsSpent { rounds } => write!(
+                f,
+                "all {rounds} part commits were answered Conflict with nothing a read could see \
+                 to explain it"
             ),
-            Self::CompensationConflict => {
-                f.write_str("the compensation was answered Conflict, so it released nothing")
-            }
+            Self::CompensationRoundsSpent { rounds } => write!(
+                f,
+                "all {rounds} compensations were sent without one landing"
+            ),
+            Self::SlotLost { key } => write!(
+                f,
+                "the slot {key} was removed or rewritten by something other than this attempt"
+            ),
+            Self::ObligationKeyTaken { key } => write!(
+                f,
+                "the obligation key {key} holds a record no batch of this attempt put; this is \
+                 damage a retry cannot clear"
+            ),
             Self::LeaseShort {
                 lease_expiry_millis,
                 now_millis,
             } => write!(
                 f,
                 "the lease expiring at {lease_expiry_millis} had less than \
-                 {DISPATCH_MARGIN_MILLIS} ms left at {now_millis}, so no commit was sent"
+                 {DISPATCH_MARGIN_MILLIS} ms left at {now_millis}, so no further commit was sent"
             ),
             Self::Record(err) => write!(f, "invalid record: {err}"),
             Self::Store(err) => write!(f, "store fault: {err}"),
@@ -304,7 +462,11 @@ impl std::error::Error for CommitError {
             Self::Stopped { cause, .. } => match cause {
                 Stop::Record(err) => Some(err),
                 Stop::Store(err) => Some(err.as_ref()),
-                Stop::CommitConflict | Stop::CompensationConflict | Stop::LeaseShort { .. } => None,
+                Stop::CommitRoundsSpent { .. }
+                | Stop::CompensationRoundsSpent { .. }
+                | Stop::SlotLost { .. }
+                | Stop::ObligationKeyTaken { .. }
+                | Stop::LeaseShort { .. } => None,
             },
         }
     }
@@ -352,6 +514,133 @@ impl Session {
             bytes: bytes.clone(),
             epoch: decode_session_record(bytes)?.epoch(),
         })
+    }
+}
+
+/// What a read of the session found, judged against the session a batch of this attempt required
+/// ([`judge_session`]).
+#[derive(Debug)]
+enum SessionSeen {
+    /// Those very bytes.
+    Same,
+    /// An `Open` record at a higher epoch: a Complete fenced the session and rolled it back.
+    Open(Session),
+    /// A record at a higher epoch that is not `Open`: a fence, whose state gives the refusal.
+    Left(Refusal),
+    /// No record. A terminal delete only together with a slot read made after this one
+    /// ([`session_gone`]).
+    Gone,
+}
+
+/// Judge a read of the session against `required` (the module doc's *A commit that lost*). Bytes
+/// that do not decode, and any other record at an epoch that has not risen, whatever its state, are
+/// an error (ADR-0045), never a moved session.
+fn judge_session(found: Option<&Bytes>, required: &Session) -> Result<SessionSeen, RecordError> {
+    let Some(bytes) = found else {
+        return Ok(SessionSeen::Gone);
+    };
+    if *bytes == required.bytes {
+        return Ok(SessionSeen::Same);
+    }
+    let record = decode_session_record(bytes)?;
+    if record.epoch() <= required.epoch {
+        return Err(RecordError::SessionEpochNotRisen {
+            found: record.epoch(),
+            required: required.epoch,
+        });
+    }
+    Ok(match upload_part_answer(Some(record.state())) {
+        UploadPartAnswer::Accepted => SessionSeen::Open(Session {
+            bytes: bytes.clone(),
+            epoch: record.epoch(),
+        }),
+        UploadPartAnswer::Refused(refusal) => SessionSeen::Left(refusal),
+    })
+}
+
+/// What a read of the attempt's own slot found ([`judge_slot`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlotSeen {
+    /// The bytes this attempt last wrote.
+    Held,
+    /// Absent, or another attempt's record (`SlotRecord`'s `attempt_id`): the index was released.
+    Gone,
+    /// This attempt's id, under bytes it did not last write.
+    Rewritten,
+}
+
+/// Judge a read of the attempt's slot. A stored slot that does not decode is an error (ADR-0045),
+/// never "another attempt's".
+fn judge_slot(found: Option<&Bytes>, attempt: &StagedAttempt) -> Result<SlotSeen, RecordError> {
+    let Some(bytes) = found else {
+        return Ok(SlotSeen::Gone);
+    };
+    if bytes == attempt.slot_bytes() {
+        return Ok(SlotSeen::Held);
+    }
+    Ok(
+        if decode_slot_record(bytes)?.attempt_id() == attempt.attempt_id() {
+            SlotSeen::Rewritten
+        } else {
+            SlotSeen::Gone
+        },
+    )
+}
+
+fn lossy(key: &[u8]) -> String {
+    String::from_utf8_lossy(key).into_owned()
+}
+
+/// The attempt's slot is lost: [`Stop::SlotLost`], claiming no release.
+fn slot_lost(attempt: &StagedAttempt) -> CommitError {
+    stopped(
+        attempt.upload_id(),
+        Stop::SlotLost {
+            key: lossy(attempt.slot_key()),
+        },
+    )
+}
+
+/// Read `obligation`'s key, which a batch of this attempt requires absent: any record there is
+/// [`Stop::ObligationKeyTaken`]. The key names this attempt (`0016:364`), and with nothing in doubt
+/// none of its batches landed, so none of them put that record. The record is kept.
+async fn obligation_key_free(
+    store: &impl MetadataStore,
+    attempt: &StagedAttempt,
+    obligation: &RetireObligation,
+) -> Result<(), CommitError> {
+    let upload_id = attempt.upload_id();
+    let key = obligation.key();
+    match store.get(&key).await {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(stopped(
+            upload_id,
+            Stop::ObligationKeyTaken { key: lossy(&key) },
+        )),
+        Err(fault) => Err(stopped(upload_id, Stop::Store(fault))),
+    }
+}
+
+/// The last session read found no record (the module doc's *A commit that lost*): read the slot key
+/// once more, now, since a slot read made before that session read proves nothing. Absent, a
+/// terminal delete took the session and the slot together (`0016:674`): [`Refusal::NoSuchUpload`].
+/// Any record there, this attempt's or another's, is damage
+/// ([`RecordError::SessionRecordMissing`]).
+async fn session_gone(
+    store: &impl MetadataStore,
+    attempt: &StagedAttempt,
+    required: &Session,
+) -> Result<Refusal, CommitError> {
+    let upload_id = attempt.upload_id();
+    match store.get(attempt.slot_key()).await {
+        Ok(None) => Ok(Refusal::NoSuchUpload),
+        Ok(Some(_)) => Err(stopped(
+            upload_id,
+            Stop::Record(RecordError::SessionRecordMissing {
+                required: required.epoch,
+            }),
+        )),
+        Err(fault) => Err(stopped(upload_id, Stop::Store(fault))),
     }
 }
 
@@ -532,43 +821,201 @@ fn compensation_batch(
     batch
 }
 
-/// **The live-session compensation** (`0016:673`): one batch that releases the slot, deletes the
-/// owned entries and, for a non-empty part, installs one `{chunks}` obligation naming the attempt's
-/// own chunks. Called only before any commit of the attempt is sent. The clock plays no part.
+/// What a compensation that ended without an error came to ([`compensate`]).
+#[derive(Debug)]
+enum Compensated {
+    /// It landed: the slot released, the owned entries deleted, the chunks owed.
+    Released,
+    /// No round landed, and the session has left `Open` or was deleted with its slots: this
+    /// refusal, with nothing more written. The residue is the reaper's.
+    Left(Refusal),
+}
+
+/// **The live-session compensation** (`0016:673`, `:1607-1620`): one batch that releases the slot,
+/// deletes the owned entries and, for a non-empty part, installs one `{chunks}` obligation naming
+/// the attempt's own chunks, under `session`. Called only when no commit of the attempt can land:
+/// none was sent, or each one sent was answered `Conflict`. A round answered `Conflict` is
+/// classified from a re-read (the module doc's *The compensation, and the epoch chase*), within
+/// [`COMPENSATION_ROUNDS`] rounds. The clock plays no part.
 async fn compensate(
     store: &impl MetadataStore,
     attempt: &StagedAttempt,
     session: &Session,
-) -> Result<(), CommitError> {
+) -> Result<Compensated, CommitError> {
     let upload_id = attempt.upload_id();
-    let obligation = obligation_for(attempt, session, attempt.chunks())
-        .map_err(|err| stopped(upload_id, Stop::Record(err)))?;
-    let batch = compensation_batch(attempt, &session.bytes, obligation.as_ref());
-    match store.commit(batch).await {
-        Ok(CommitOutcome::Committed) => Ok(()),
-        // deferred: #1028, #1030 — the classification of a compensation's `Conflict`, and the
-        // settling of its unknown outcome.
-        Ok(CommitOutcome::Conflict) => Err(stopped(upload_id, Stop::CompensationConflict)),
-        Err(fault) => Err(failed(upload_id, DoubtfulBatch::Compensation, fault)),
+    let fault = |fault| stopped(upload_id, Stop::Store(fault));
+    let damage = |err| stopped(upload_id, Stop::Record(err));
+    let session_key = mpu_key(upload_id);
+    let mut session = session.clone();
+    let mut rounds = 0u32;
+    loop {
+        // The attempt's own chunks, under the epoch this round requires; none for an empty part.
+        let obligation = obligation_for(attempt, &session, attempt.chunks()).map_err(damage)?;
+        let batch = compensation_batch(attempt, &session.bytes, obligation.as_ref());
+        rounds += 1;
+        match store.commit(batch).await {
+            Ok(CommitOutcome::Committed) => return Ok(Compensated::Released),
+            Ok(CommitOutcome::Conflict) => {}
+            // deferred: #1030 — the settling of a compensation's unknown outcome.
+            Err(fault) => return Err(failed(upload_id, DoubtfulBatch::Compensation, fault)),
+        }
+        // The re-read, in order: the obligation key, the slot, the session.
+        if let Some(obligation) = &obligation {
+            obligation_key_free(store, attempt, obligation).await?;
+        }
+        let slot = store.get(attempt.slot_key()).await.map_err(fault)?;
+        let now = store.get(&session_key).await.map_err(fault)?;
+        let slot = judge_slot(slot.as_ref(), attempt).map_err(damage)?;
+        match (judge_session(now.as_ref(), &session).map_err(damage)?, slot) {
+            (SessionSeen::Gone, _) => {
+                return session_gone(store, attempt, &session)
+                    .await
+                    .map(Compensated::Left)
+            }
+            (_, SlotSeen::Rewritten)
+            | (SessionSeen::Same | SessionSeen::Open(_), SlotSeen::Gone) => {
+                return Err(slot_lost(attempt))
+            }
+            (SessionSeen::Left(refusal), _) => return Ok(Compensated::Left(refusal)),
+            // The epoch chase: the same compensation, under the newer `Open` epoch.
+            (SessionSeen::Open(newer), SlotSeen::Held) => session = newer,
+            // A conflict no read explains: the same batch again.
+            (SessionSeen::Same, SlotSeen::Held) => {}
+        }
+        if rounds == COMPENSATION_ROUNDS {
+            return Err(stopped(upload_id, Stop::CompensationRoundsSpent { rounds }));
+        }
     }
 }
 
-/// Refuse the part with `refusal`, once what it staged is compensated under `session`.
+/// Refuse the part with `refusal`, once what it staged is compensated under `session`. A session
+/// the compensation found fenced or deleted answers its own refusal instead.
 async fn refuse(
     store: &impl MetadataStore,
     attempt: &StagedAttempt,
     session: &Session,
     refusal: Refusal,
 ) -> Result<UploadPartOutcome, CommitError> {
-    compensate(store, attempt, session).await?;
-    Ok(UploadPartOutcome::Refused(refusal))
+    Ok(UploadPartOutcome::Refused(
+        match compensate(store, attempt, session).await? {
+            Compensated::Released => refusal,
+            Compensated::Left(left) => left,
+        },
+    ))
 }
 
-/// **The commit round**: read the clock, send the commit only with [`DISPATCH_MARGIN_MILLIS`] left
-/// on the lease, and answer what the store says. Once it has sent the batch it sends nothing more:
-/// `Committed` is answered only when the store answered this batch as landed, `Conflict` stops with
-/// the slot held, and an unknown outcome stops in doubt.
-async fn commit_round(
+/// The commit stopped for `cause` with nothing in doubt: compensate under `session`, and return
+/// `cause` reporting the slot released. A session the compensation found fenced or deleted answers
+/// its refusal instead.
+async fn compensated_stop(
+    store: &impl MetadataStore,
+    attempt: &StagedAttempt,
+    session: &Session,
+    cause: Stop,
+) -> Result<UploadPartOutcome, CommitError> {
+    match compensate(store, attempt, session).await? {
+        Compensated::Released => Err(CommitError::Stopped {
+            upload_id: attempt.upload_id().clone(),
+            cause,
+            slot_released: true,
+        }),
+        Compensated::Left(refusal) => Ok(UploadPartOutcome::Refused(refusal)),
+    }
+}
+
+/// The commit rounds end for `cause` after a round no read explained, and the attempt
+/// compensates. A re-upload over a non-empty prior required `retire`'s key absent in every round,
+/// and no read of a round looks there, so it is read first: a record there is
+/// [`Stop::ObligationKeyTaken`], with no compensation (the module doc's *A commit that lost*).
+async fn unexplained_stop(
+    store: &impl MetadataStore,
+    attempt: &StagedAttempt,
+    session: &Session,
+    retire: Option<&RetireObligation>,
+    cause: Stop,
+) -> Result<UploadPartOutcome, CommitError> {
+    if let Some(obligation) = retire {
+        obligation_key_free(store, attempt, obligation).await?;
+    }
+    compensated_stop(store, attempt, session, cause).await
+}
+
+/// What the re-read after a part commit answered `Conflict` found ([`lost_commit`]).
+#[derive(Debug)]
+enum Lost {
+    /// A conflict no read explains: the same batch again.
+    Unexplained,
+    /// The live session the commit lost to, the same one or the newer `Open` one a rollback
+    /// left: compensate under it and answer [`Refusal::OperationAborted`].
+    Compensate(Session),
+    /// The session has left `Open`, or was deleted with its slots: this refusal, with nothing more
+    /// written.
+    Refused(Refusal),
+}
+
+/// **Classify a part commit answered `Conflict`** (the module doc's *A commit that lost*): read the
+/// part key, the session, the attempt's own slot and the session again, in that order, then judge
+/// them, damage first, and answer from the last session read.
+async fn lost_commit(
+    store: &impl MetadataStore,
+    attempt: &StagedAttempt,
+    session: &Session,
+    required: Option<&Bytes>,
+) -> Result<Lost, CommitError> {
+    let upload_id = attempt.upload_id();
+    let fault = |fault| stopped(upload_id, Stop::Store(fault));
+    let damage = |err| stopped(upload_id, Stop::Record(err));
+    let session_key = mpu_key(upload_id);
+    let part_now = store
+        .get(&part_key(upload_id, attempt.part_number()))
+        .await
+        .map_err(fault)?;
+    // deferred: #1029 — this first session read is the one that settles a commit in doubt. With
+    // nothing in doubt only the last session read decides, so what it found is passed over.
+    store.get(&session_key).await.map_err(fault)?;
+    let slot = store.get(attempt.slot_key()).await.map_err(fault)?;
+    let last = store.get(&session_key).await.map_err(fault)?;
+    // A changed part key is another writer's record only if it decodes (ADR-0045).
+    if part_now.as_ref() != required {
+        if let Some(bytes) = &part_now {
+            decode_part_record(bytes).map_err(damage)?;
+        }
+    }
+    let slot = judge_slot(slot.as_ref(), attempt).map_err(damage)?;
+    match (judge_session(last.as_ref(), session).map_err(damage)?, slot) {
+        (SessionSeen::Gone, _) => session_gone(store, attempt, session)
+            .await
+            .map(Lost::Refused),
+        (_, SlotSeen::Rewritten) | (SessionSeen::Same | SessionSeen::Open(_), SlotSeen::Gone) => {
+            Err(slot_lost(attempt))
+        }
+        // Not `Open` any more: the residue is the reaper's.
+        (SessionSeen::Left(refusal), _) => Ok(Lost::Refused(refusal)),
+        // A Complete fenced and rolled the session back: the reaper does not walk an `Open`
+        // session, so this attempt compensates under the newer epoch.
+        (SessionSeen::Open(newer), SlotSeen::Held) => Ok(Lost::Compensate(newer)),
+        (SessionSeen::Same, SlotSeen::Held) => {
+            if part_now.as_ref() == required {
+                Ok(Lost::Unexplained)
+            } else if required.is_some() && part_now.is_none() {
+                Err(damage(RecordError::PartRecordMissing {
+                    part_number: attempt.part_number().get(),
+                }))
+            } else {
+                // A same-number rival won, or a repair rewrote the prior.
+                Ok(Lost::Compensate(session.clone()))
+            }
+        }
+    }
+}
+
+/// **The commit rounds**: read the clock before each round and send it only with
+/// [`DISPATCH_MARGIN_MILLIS`] left on the lease; answer `Committed` only for a round the store
+/// answered as landed; classify a `Conflict` from a re-read ([`lost_commit`]) and send the same
+/// batch again only for a conflict no read explains, within [`COMMIT_ROUNDS`], reading a
+/// re-upload's obligation key before the compensation that ends those rounds
+/// ([`unexplained_stop`]); stop in doubt on an unknown outcome, sending nothing more.
+async fn commit_rounds(
     store: &impl MetadataStore,
     clock: &impl StageClock,
     attempt: &StagedAttempt,
@@ -579,18 +1026,19 @@ async fn commit_round(
 ) -> Result<UploadPartOutcome, CommitError> {
     let upload_id = attempt.upload_id();
     let damage = |err| stopped(upload_id, Stop::Record(err));
-    // One reading, for the check and for the stamp: the clock that owns the attempt's leases.
-    let now_millis = clock.now_millis();
-    if lease_expiry_millis.saturating_sub(now_millis) < DISPATCH_MARGIN_MILLIS {
-        compensate(store, attempt, session).await?;
-        return Err(CommitError::Stopped {
-            upload_id: upload_id.clone(),
-            cause: Stop::LeaseShort {
+    let short = |now_millis: u64| {
+        (lease_expiry_millis.saturating_sub(now_millis) < DISPATCH_MARGIN_MILLIS).then_some(
+            Stop::LeaseShort {
                 lease_expiry_millis,
                 now_millis,
             },
-            slot_released: true,
-        });
+        )
+    };
+    // One reading for the first round's check and for the stamp: the clock that owns the
+    // attempt's leases. Every round sends this one batch, so a retry puts the same bytes.
+    let now_millis = clock.now_millis();
+    if let Some(cause) = short(now_millis) {
+        return compensated_stop(store, attempt, session, cause).await;
     }
     let record = PartRecord::commit(
         attempt.chunks().to_vec(),
@@ -603,20 +1051,42 @@ async fn commit_round(
     let retire = obligation_for(attempt, session, prior.map_or(&[], |prior| prior.chunks()))
         .map_err(damage)?;
     let batch = commit_batch(attempt, &session.bytes, required, &record, retire.as_ref());
-    match store.commit(batch).await {
-        Ok(CommitOutcome::Committed) => Ok(UploadPartOutcome::Committed {
-            part_number: attempt.part_number(),
-            digest: *attempt.digest(),
-        }),
-        // deferred: #1028, #1029 — the classification of a commit's `Conflict`, and the settling
-        // of its unknown outcome.
-        Ok(CommitOutcome::Conflict) => Err(stopped(upload_id, Stop::CommitConflict)),
-        Err(fault) => Err(failed(upload_id, DoubtfulBatch::Commit, fault)),
+    let mut rounds = 0u32;
+    loop {
+        rounds += 1;
+        match store.commit(batch.clone()).await {
+            Ok(CommitOutcome::Committed) => {
+                return Ok(UploadPartOutcome::Committed {
+                    part_number: attempt.part_number(),
+                    digest: *attempt.digest(),
+                })
+            }
+            Ok(CommitOutcome::Conflict) => {}
+            // deferred: #1029 — the settling of a commit's unknown outcome.
+            Err(fault) => return Err(failed(upload_id, DoubtfulBatch::Commit, fault)),
+        }
+        match lost_commit(store, attempt, session, required).await? {
+            Lost::Unexplained => {}
+            Lost::Compensate(live) => {
+                return refuse(store, attempt, &live, Refusal::OperationAborted).await
+            }
+            Lost::Refused(refusal) => return Ok(UploadPartOutcome::Refused(refusal)),
+        }
+        if rounds == COMMIT_ROUNDS {
+            let cause = Stop::CommitRoundsSpent { rounds };
+            return unexplained_stop(store, attempt, session, retire.as_ref(), cause).await;
+        }
+        // Each later round's own reading, on the same clock that owns the attempt's leases: the
+        // reads and the rounds before it spent from the lease.
+        if let Some(cause) = short(clock.now_millis()) {
+            return unexplained_stop(store, attempt, session, retire.as_ref(), cause).await;
+        }
     }
 }
 
-/// **Commit a staged part** (`0016:660`, `:1720-1733`), answering in the landed vocabulary
-/// ([`UploadPartOutcome`], [`Refusal`]). The module doc states the batches and the stops.
+/// **Commit a staged part** (`0016:660`, `:1584-1653`, `:1720-1733`), answering in the landed
+/// vocabulary ([`UploadPartOutcome`], [`Refusal`]). The module doc states the batches, the
+/// classification of a lost commit, the stops and the bounds.
 ///
 /// * A part past [`MAX_PART_CHUNKS`], however it was staged, is refused
 ///   [`Refusal::EntityTooLarge`] and compensated. So is a body truncated at the request's bound,
@@ -626,7 +1096,14 @@ async fn commit_round(
 /// * A part that would take the session's committed chunks past [`MAX_STAGED_CHUNKS`], counted over
 ///   the `psum:` summaries of every other part number, is refused [`Refusal::EntityTooLarge`]
 ///   (`chunks` the total it would reach, `limit` the ceiling) and compensated.
-/// * Otherwise one commit batch, sent only with [`DISPATCH_MARGIN_MILLIS`] left on the lease.
+/// * Otherwise the commit batch, each round sent only with [`DISPATCH_MARGIN_MILLIS`] left on the
+///   lease: [`UploadPartOutcome::Committed`] once a round lands. A round answered `Conflict` is
+///   classified from a re-read: a commit that lost to a live session (a same-number rival, a
+///   repair of the prior, a rollback to a newer `Open` epoch) compensates and answers
+///   [`Refusal::OperationAborted`]; one that lost to a fence, or to a terminal delete, answers
+///   [`Refusal::NoSuchUpload`] with nothing written; a conflict no read explains sends the same
+///   batch again, within [`COMMIT_ROUNDS`], and then compensates, unless a re-upload finds the
+///   obligation key its commit required absent holding a record ([`Stop::ObligationKeyTaken`]).
 ///
 /// `clock` must be the clock the attempt was staged on.
 ///
@@ -657,11 +1134,13 @@ pub async fn commit_part(
         Ok(RenewOutcome::Refused(refusal)) => return Ok(UploadPartOutcome::Refused(refusal)),
         Err(error) if compensates_after(&error) => {
             let session = renewed_session(&attempt, &staged).map_err(damage)?;
-            compensate(store, &attempt, &session).await?;
-            return Err(CommitError::Renewal {
-                error,
-                slot_released: true,
-            });
+            return match compensate(store, &attempt, &session).await? {
+                Compensated::Released => Err(CommitError::Renewal {
+                    error,
+                    slot_released: true,
+                }),
+                Compensated::Left(refusal) => Ok(UploadPartOutcome::Refused(refusal)),
+            };
         }
         // Nothing more is sent, so nothing is judged: a renewal in doubt keeps its doubt.
         Err(error) => {
@@ -692,7 +1171,7 @@ pub async fn commit_part(
         .map(decode_part_record)
         .transpose()
         .map_err(damage)?;
-    commit_round(
+    commit_rounds(
         store,
         clock,
         &attempt,
