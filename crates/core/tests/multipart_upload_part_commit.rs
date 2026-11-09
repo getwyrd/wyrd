@@ -15,13 +15,29 @@
 //! * **(G)** a settled stop before any commit compensates, and the others do not.
 //! * **(H2)** a damaged session a renewal adopted is never compensated under.
 //! * **(H3)** the slot guard names the submitter.
-//! * **(H4)** the stops later slices replace.
+//! * **(H4)** the stops later slices replace: a batch answered unknown.
+//!
+//! Issue #1028 (657.2b, the second slice) appends what a `Conflict` means for a commit and for a
+//! compensation (`0016:1584-1653`, `:673`, `:674`), every leg with nothing in doubt:
+//!
+//! * **(B)** a lost commit is classified from a re-read, never compensated blind: a fence, a
+//!   rollback, a same-number rival, a repair, and a conflict no read explains.
+//! * **(T)** a terminal delete is not damage, and a slot behind a missing session is.
+//! * **(R)** damage is a record stop, never a rival or a fence.
+//! * **(O)** a taken obligation key, under a re-upload with chunks and an empty one.
+//! * **(L)** the loop bounds, the epoch chase under every charged Complete fence, and the lease
+//!   between rounds.
+//!
+//! For those the wrapper can also run **an action between two reads** ([`Step::AfterRead`]): a
+//! step beside a batch arms it, and it runs right after the next read of its key, so a delete can
+//! land between a re-read's slot read and its session read.
 //!
 //! The wrapper is handed each batch's submitter apart from the batch, by the [`As`] view each
 //! attempt's store calls go through. On **every** batch of every leg it checks that a batch naming a
 //! `slot:` key is either that submitter's reservation or requires exactly the bytes the submitter
 //! last landed there; that a part commit is sent with the dispatch margin left on the lease the
-//! submitter last wrote; and that every value a batch puts decodes back unchanged.
+//! submitter last wrote; that no submitter sends more part commits or compensations than
+//! [`MOST_ROUNDS`]; and that every value a batch puts decodes back unchanged.
 //!
 //! The wrapper keeps its state in struct fields, never in a `static` (ADR-0035).
 
@@ -52,8 +68,8 @@ use wyrd_core::multipart::stage::{
 use wyrd_core::multipart::{
     decode_owned_entry, decode_part_record, decode_part_summary, decode_retire_obligation,
     decode_session_record, decode_slot_record, mpu_key, parse_sidx_key, part_key, psum_key,
-    psum_range, sidx_range, slot_range, AbortOutcome, AttemptId, Budget, CreateOutcome, Digest,
-    PartNumber, PartRecord, PartSummary, RecordError, Refusal, ReserveOutcome, RetireMode,
+    psum_range, retire_key, sidx_range, slot_range, AbortOutcome, AttemptId, Budget, CreateOutcome,
+    Digest, PartNumber, PartRecord, PartSummary, RecordError, Refusal, ReserveOutcome, RetireMode,
     RetireToken, SessionState, UploadId, UploadPartOutcome, MAX_INFLIGHT_PARTS, MAX_PART_CHUNKS,
     MAX_STAGED_CHUNKS, PART_PREFIX, PSUM_PREFIX, RETIRE_BYTES_PREFIX, SIDX_PREFIX, SLOT_PREFIX,
 };
@@ -85,6 +101,10 @@ const TTL: u64 = 10_000;
 /// that changing the production value fails this file.
 const MARGIN: u64 = 5_000;
 const _: () = assert!(MARGIN < TTL);
+/// The most part commits, and the most compensations, one attempt may send (`COMMIT_ROUNDS`,
+/// `COMPENSATION_ROUNDS`), written here rather than imported. The wrapper fails the leg at the first
+/// batch past it, so a loop that never reaches its bound fails there, not at [`LEG_TIMEOUT`].
+const MOST_ROUNDS: u32 = 4;
 /// `W_write`.
 const W: u64 = 3_000;
 /// The body-idle bound: never reached, since no leg moves the clock while staging.
@@ -264,6 +284,27 @@ impl Log {
             .collect()
     }
 
+    /// The keys read through the wrapper after the `nth` batch of `of` was answered (from 0), up to
+    /// the next batch: that batch's re-read, in order.
+    fn reads_after(&self, of: Kind, nth: usize) -> Vec<Vec<u8>> {
+        let events = self.events();
+        let at = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, Event::Commit { kind, .. } if *kind == of))
+            .nth(nth)
+            .map(|(at, _)| at)
+            .expect("that batch was sent");
+        events[at + 1..]
+            .iter()
+            .take_while(|event| !matches!(event, Event::Commit { .. }))
+            .filter_map(|event| match event {
+                Event::Read { key } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn gated(&self, of: Kind) -> usize {
         self.events()
             .iter()
@@ -291,6 +332,11 @@ enum Step {
     Run(Action),
     /// Move the test clock forward.
     Advance(u64),
+    /// **An action between two reads**: run these steps right after the next `get` of this key
+    /// through the wrapper has read the inner store, before that read is answered and so before
+    /// the next read is made. Armed when the step runs, so a step beside a batch arms it for the
+    /// re-read that follows that batch.
+    AfterRead(Vec<u8>, Vec<Step>),
 }
 
 /// How the wrapper answers one batch.
@@ -374,6 +420,8 @@ struct ScriptState {
     scan_steps: Vec<Step>,
     /// Keys, or scan prefixes, whose reads answer a store fault.
     read_faults: Vec<Vec<u8>>,
+    /// Steps armed by [`Step::AfterRead`], each to run once after the next `get` of its key.
+    read_hooks: Vec<(Vec<u8>, Vec<Step>)>,
     /// The slot bytes each attempt holds from its own last landed write, per slot key; gone once
     /// that attempt's own batch released the slot. Recorded only from the attempt's own batches as
     /// they landed, so another attempt's write to the key never changes it.
@@ -381,6 +429,8 @@ struct ScriptState {
     /// Every batch that landed through the wrapper, held ones released included, with its
     /// submitter.
     landed: Vec<(AttemptId, WriteBatch)>,
+    /// How many part commits and how many compensations each submitter has sent.
+    sent: HashMap<(AttemptId, Kind), u32>,
 }
 
 struct Scripted {
@@ -565,6 +615,18 @@ impl Scripted {
         );
     }
 
+    /// **The loop bounds**, on every part commit and compensation of every leg: `submitter` sends
+    /// at most [`MOST_ROUNDS`] of each.
+    fn check_rounds(&self, submitter: &AttemptId, kind: Kind) {
+        let mut state = self.state.lock().unwrap();
+        let sent = state.sent.entry((submitter.clone(), kind)).or_default();
+        *sent += 1;
+        assert!(
+            *sent <= MOST_ROUNDS,
+            "{submitter} sent {sent} batches of {kind:?}, past the bound of {MOST_ROUNDS}"
+        );
+    }
+
     /// How many landed batches of `submitter` deleted `key`.
     fn releases(&self, submitter: &AttemptId, key: &[u8]) -> usize {
         self.state
@@ -581,6 +643,12 @@ impl Scripted {
             match step {
                 Step::Run(action) => action().await,
                 Step::Advance(millis) => self.clock.advance(*millis),
+                Step::AfterRead(key, then) => self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .read_hooks
+                    .push((key.clone(), then.clone())),
             }
         }
     }
@@ -590,12 +658,25 @@ impl Scripted {
         self.clock.advance(self.state.lock().unwrap().read_tick);
     }
 
+    /// The steps armed for the read of `key` just made, if any; disarmed as they are taken.
+    fn take_read_hook(&self, key: &[u8]) -> Option<Vec<Step>> {
+        let mut state = self.state.lock().unwrap();
+        let at = state
+            .read_hooks
+            .iter()
+            .position(|(armed, _)| armed == key)?;
+        Some(state.read_hooks.remove(at).1)
+    }
+
     async fn get(&self, key: &[u8]) -> StoreResult<Option<Bytes>> {
         if self.read_faults(key) {
             return Err("scripted read fault".into());
         }
         let found = self.inner.get(key).await;
         self.on_read(key);
+        if let Some(then) = self.take_read_hook(key) {
+            self.run(&then).await;
+        }
         found
     }
 
@@ -617,6 +698,9 @@ impl Scripted {
             .expect("the slot guard");
         if kind == Kind::Commit {
             self.check_margin(submitter, &batch);
+        }
+        if matches!(kind, Kind::Commit | Kind::Compensation) {
+            self.check_rounds(submitter, kind);
         }
         let act = {
             let mut state = self.state.lock().unwrap();
@@ -819,6 +903,15 @@ impl PlacementChunkStore for Fleet {
 }
 
 // ─────────────────────────────── the runtime ───────────────────────────────
+
+/// The test clock as a [`StageClock`], for a rival's commit on the inner store.
+struct At(ManualClock);
+
+impl StageClock for At {
+    fn now_millis(&self) -> u64 {
+        self.0.now_millis()
+    }
+}
 
 /// The clock every attempt is staged and committed on, and a timer that never fires: no leg moves
 /// the clock while staging, so no renewal falls due and no staging bound is reached.
@@ -1026,6 +1119,51 @@ impl Rig {
     /// Run the steps now.
     async fn run(&self, steps: Vec<Step>) {
         self.store.run(&steps).await;
+    }
+
+    /// A rival attempt's commit of `attempt` (staged on this rig) on the inner store, which must
+    /// land: the wrapper neither logs nor scripts it.
+    fn rival(&self, attempt: StagedAttempt) -> Step {
+        let inner = Arc::clone(&self.inner);
+        let clock = At(self.clock.clone());
+        Step::Run(once(async move {
+            let outcome = commit_part(&*inner, &clock, attempt)
+                .await
+                .expect("the rival's commit ran");
+            assert!(
+                matches!(outcome, UploadPartOutcome::Committed { .. }),
+                "the rival committed: {outcome:?}"
+            );
+        }))
+    }
+
+    /// Deletes `keys` on the inner store, in one batch.
+    fn erased(&self, keys: Vec<Vec<u8>>) -> Step {
+        let inner = Arc::clone(&self.inner);
+        Step::Run(once(async move {
+            let mut batch = WriteBatch::new();
+            for key in keys {
+                batch = batch.delete(key);
+            }
+            assert_eq!(inner.commit(batch).await.unwrap(), CommitOutcome::Committed);
+        }))
+    }
+
+    /// **The terminal session delete** (`0016:674`), as this file needs it: the session record,
+    /// every surviving `slot:` record and every owned `sidx:` entry of the session, removed in one
+    /// batch on the inner store.
+    fn terminal_delete(&self) -> Step {
+        let inner = Arc::clone(&self.inner);
+        let upload = self.upload.clone();
+        Step::Run(once(async move {
+            let mut batch = WriteBatch::new().delete(mpu_key(&upload));
+            for range in [slot_range(&upload), sidx_range(&upload)] {
+                for (key, _) in inner.scan(&range).await.unwrap() {
+                    batch = batch.delete(key);
+                }
+            }
+            assert_eq!(inner.commit(batch).await.unwrap(), CommitOutcome::Committed);
+        }))
     }
 
     /// Writes `bytes` at `key` on the inner store: damage, or another writer's value.
@@ -1905,7 +2043,7 @@ async fn f_a_commit_is_sent_with_exactly_the_margin_and_not_with_a_millisecond_l
                 cause.to_string(),
                 format!(
                     "the lease expiring at {expiry} had less than 5000 ms left at {now}, so no \
-                     commit was sent"
+                     further commit was sent"
                 )
             );
             assert_eq!(rig.log.commits(Kind::Commit).len(), 0, "not sent");
@@ -2436,28 +2574,6 @@ async fn h3_the_slot_guard_rejects_a_batch_carrying_another_attempts_bytes() {
 
 // ─────────────── (H4) the stops later slices replace ───────────────
 
-/// **(H4)** A commit answered `Conflict` returns a typed stop that says the slot is still held, with
-/// no compensation and no second commit.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn h4_a_commit_answered_conflict_stops_with_the_slot_held() {
-    within(async {
-        let mut rig = Rig::new().await;
-        let attempt = rig.stage(1, &body(CHUNK, 161)).await;
-        rig.store
-            .script(Kind::Commit, vec![], Some(Act::conflict()));
-        let cause = stopped(rig.commit(attempt.clone()).await, false);
-        assert!(matches!(cause, Stop::CommitConflict), "{cause:?}");
-        assert!(cause.to_string().contains("slot is still held"), "{cause}");
-        assert_eq!(rig.log.commits(Kind::Commit).len(), 1, "no second commit");
-        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0);
-        assert_eq!(rig.slots_of(&attempt).await, 1, "the slot stays");
-        assert_eq!(rig.owned_of(&attempt).await, 1, "the owned entry stays");
-        assert!(rig.part(1).await.is_none());
-        rig.assert_every_fragment_named().await;
-    })
-    .await;
-}
-
 /// **(H4)** A commit answered `CommitUnknownResult` returns `CommitError::InDoubt` keeping the flag
 /// as reported, with no further batch, even for `may_still_commit: false`, since it may have landed.
 /// `Committed` is never answered, even for the one that did land.
@@ -2524,30 +2640,6 @@ async fn compensating(route: &str, seed: u8) -> (Rig, StagedAttempt) {
         _ => {}
     }
     (rig, attempt)
-}
-
-/// **(H4)** A compensation answered `Conflict` returns a typed stop that claims no release, on each
-/// route to a compensation, with no further batch.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn h4_a_compensation_answered_conflict_claims_no_release() {
-    for route in ["renewal", "lease", "ceiling"] {
-        within(async {
-            let (rig, attempt) = compensating(route, 164).await;
-            rig.store
-                .script(Kind::Compensation, vec![], Some(Act::conflict()));
-            let cause = stopped(rig.commit(attempt.clone()).await, false);
-            assert!(
-                matches!(cause, Stop::CompensationConflict),
-                "{route}: {cause:?}"
-            );
-            assert_eq!(rig.log.commits(Kind::Compensation).len(), 1, "{route}");
-            assert_eq!(rig.log.commits(Kind::Commit).len(), 0, "{route}");
-            assert_eq!(rig.slots_of(&attempt).await, 1, "{route}: the slot stays");
-            assert!(rig.part_obligations().await.is_empty(), "{route}");
-            rig.assert_every_fragment_named().await;
-        })
-        .await;
-    }
 }
 
 /// **(H4)** A compensation answered `CommitUnknownResult` returns `CommitError::InDoubt` keeping the
@@ -2636,13 +2728,15 @@ async fn h4_a_composed_error_keeps_its_class_and_its_message() {
             .expect_err("the renewal is in doubt");
         assert_eq!(classify(&err), ErrorClass::Indeterminate, "{err}");
 
-        // A commit stopped with nothing in doubt is not.
+        // A commit stopped with nothing in doubt is not: every round answered `Conflict` with
+        // nothing a read explains, and then compensated.
         let mut rig = Rig::new().await;
-        rig.store.script(Kind::Commit, vec![Act::conflict()], None);
+        rig.store
+            .script(Kind::Commit, vec![], Some(Act::conflict()));
         let err = rig
             .upload(1, &body(CHUNK, 194), MAX_PART_CHUNKS)
             .await
-            .expect_err("the commit conflicted");
+            .expect_err("the commit rounds were spent");
         assert_eq!(classify(&err), ErrorClass::Terminal, "{err}");
 
         // A staging error.
@@ -2670,6 +2764,1087 @@ async fn h4_a_composed_error_keeps_its_class_and_its_message() {
             .expect("the upload ran");
         assert_eq!(outcome, UploadPartOutcome::Refused(Refusal::NoSuchUpload));
         assert_eq!(rig.log.commits(Kind::Commit).len(), 0);
+    })
+    .await;
+}
+
+// ─────────────── #1028: helpers ───────────────
+
+// deferred: #660 — seeded Tier-0 DST coverage of the races below (a commit against a rival, an
+// Abort, a Complete's rollback, a terminal delete), as `commit.rs` records; here each interleaving
+// is forced by the scripted wrapper over a real store.
+
+/// `Step::AfterRead`, spelled for a key borrowed from an attempt.
+fn after_read(key: &[u8], then: Vec<Step>) -> Step {
+    Step::AfterRead(key.to_vec(), then)
+}
+
+/// Whether two batches are the same bytes: the same preconditions, puts and deletes, in order.
+fn same_batch(a: &WriteBatch, b: &WriteBatch) -> bool {
+    a.preconditions == b.preconditions && a.puts == b.puts && a.deletes == b.deletes
+}
+
+/// The epoch each compensation batch so far required the session at, in order.
+fn compensation_epochs(rig: &Rig) -> Vec<u64> {
+    rig.log
+        .commits(Kind::Compensation)
+        .iter()
+        .map(|batch| required_epoch(batch, &rig.upload))
+        .collect()
+}
+
+/// The key `attempt`'s per-part obligation goes under at `epoch`.
+fn obligation_key(attempt: &StagedAttempt, epoch: u64) -> Vec<u8> {
+    retire_key(RetireMode::Bytes, &token_of(attempt, epoch))
+}
+
+/// `attempt`'s slot record with another attempt's id in it: what its index holds once it was
+/// released and reserved again.
+fn foreign_slot(attempt: &StagedAttempt) -> Bytes {
+    let text = std::str::from_utf8(attempt.slot_bytes()).unwrap();
+    let own = attempt.attempt_id().to_string();
+    let other = AttemptId::new("f".repeat(32)).unwrap();
+    assert_ne!(other, *attempt.attempt_id());
+    assert_eq!(text.matches(&own).count(), 1);
+    let foreign = Bytes::from(text.replace(&own, &other.to_string()));
+    let record = decode_slot_record(&foreign).expect("the foreign slot decodes");
+    assert_eq!(*record.attempt_id(), other);
+    foreign
+}
+
+/// `attempt`'s slot record under its own id with a later lease: bytes it never wrote, since no
+/// renewal of a leg that does not move the clock stamps a lease this far on.
+fn rewritten_slot(attempt: &StagedAttempt) -> Bytes {
+    let record = decode_slot_record(attempt.slot_bytes()).unwrap();
+    let text = std::str::from_utf8(attempt.slot_bytes()).unwrap();
+    let from = format!("\"lease_expiry_millis\":{}", record.lease_expiry_millis());
+    let to = format!(
+        "\"lease_expiry_millis\":{}",
+        record.lease_expiry_millis() + 1_000
+    );
+    assert_eq!(text.matches(&from).count(), 1);
+    let rewritten = Bytes::from(text.replace(&from, &to));
+    let decoded = decode_slot_record(&rewritten).expect("the rewritten slot decodes");
+    assert_eq!(decoded.attempt_id(), attempt.attempt_id());
+    rewritten
+}
+
+/// The session at `bytes` fenced to `Aborting` as a real fence writes it (`open_teardown`), but at
+/// `epoch` in place of the next one. With `epoch` not above the record's own, no legal history
+/// writes it: every fence bumps the epoch (`0016:704-708`).
+fn aborting_at(bytes: &Bytes, upload: &UploadId, epoch: u64) -> Bytes {
+    let record = decode_session_record(bytes).unwrap();
+    let fenced = metadata::encode(
+        record
+            .open_teardown(upload)
+            .expect("fenced from Open")
+            .session(),
+    );
+    let text = std::str::from_utf8(&fenced).unwrap();
+    let from = format!("\"epoch\":{},", record.epoch() + 1);
+    let to = format!("\"epoch\":{epoch},");
+    assert_eq!(text.matches(&from).count(), 1);
+    let other = Bytes::from(text.replace(&from, &to));
+    let decoded = decode_session_record(&other).expect("the planted session decodes");
+    assert_eq!(decoded.epoch(), epoch);
+    assert!(matches!(decoded.state(), SessionState::Aborting {}));
+    other
+}
+
+/// A repair of part `n` in the shape of the custodian's staged re-place (`0016:671`): under
+/// `require` on the session and the part bytes read, the record put back with chunk `chunk`'s first
+/// fragment placed on a server that chunk does not use, every other byte kept.
+fn repair(rig: &Rig, n: u32, chunk: usize) -> Step {
+    let inner = Arc::clone(&rig.inner);
+    let upload = rig.upload.clone();
+    Step::Run(once(async move {
+        let session_key = mpu_key(&upload);
+        let session = inner.get(&session_key).await.unwrap().unwrap();
+        let key = part_key(&upload, part(n));
+        let stored = inner.get(&key).await.unwrap().expect("the part exists");
+        let record = decode_part_record(&stored).unwrap();
+        let mut chunks = record.chunks().to_vec();
+        let to = (0..SERVERS)
+            .find(|server| !chunks[chunk].placement.contains(server))
+            .expect("a server the chunk does not use");
+        chunks[chunk].placement[0] = to;
+        let list = metadata::encode(&record.chunks());
+        let at = stored
+            .windows(list.len())
+            .position(|window| window == &list[..])
+            .expect("the stored bytes spell the chunk list canonically");
+        let mut next = Vec::with_capacity(stored.len());
+        next.extend_from_slice(&stored[..at]);
+        next.extend_from_slice(&metadata::encode(&chunks));
+        next.extend_from_slice(&stored[at + list.len()..]);
+        let read_back = decode_part_record(&next).expect("the repaired record decodes");
+        assert_eq!(read_back.chunks(), chunks.as_slice());
+        let batch = WriteBatch::new()
+            .require(session_key, session)
+            .require(key.clone(), stored)
+            .put(key, next);
+        assert_eq!(inner.commit(batch).await.unwrap(), CommitOutcome::Committed);
+    }))
+}
+
+/// A rig with part 1 staged as `bytes` by the attempt under test, and a rival attempt for the same
+/// part number, staged after it, whose commit lands on the inner store just before the attempt's
+/// own commit is sent. Returns the rival as staged.
+async fn losing_to_a_rival(bytes: &[u8], seed: u8) -> (Rig, StagedAttempt, StagedAttempt) {
+    let mut rig = Rig::new().await;
+    let attempt = rig.stage(1, bytes).await;
+    let rival = rig.stage(1, &body(CHUNK, seed)).await;
+    rig.store.script(
+        Kind::Commit,
+        vec![Act::pass().before(rig.rival(rival.clone()))],
+        None,
+    );
+    (rig, attempt, rival)
+}
+
+/// `cause` is `Stop::SlotLost`, naming `attempt`'s slot key.
+fn assert_slot_lost(cause: &Stop, attempt: &StagedAttempt, at: &str) {
+    let expected = String::from_utf8_lossy(attempt.slot_key()).into_owned();
+    assert!(
+        matches!(cause, Stop::SlotLost { key } if *key == expected),
+        "{at}: {cause:?}"
+    );
+    assert!(cause.to_string().contains(&expected), "{at}: {cause}");
+}
+
+/// `cause` is `Stop::Record(SessionRecordMissing)` for the epoch the batch required.
+fn assert_session_record_missing(cause: &Stop, required: u64, at: &str) {
+    assert!(
+        matches!(
+            cause,
+            Stop::Record(RecordError::SessionRecordMissing { required: found })
+                if *found == required
+        ),
+        "{at}: {cause:?}"
+    );
+}
+
+/// Asserts that `attempt` ended compensated by the last of its compensation batches, under
+/// `epoch`, after any number that lost: one obligation for its own chunks under that epoch (none for
+/// an empty part), its slot released once, no owned entry left.
+async fn assert_finally_compensated(rig: &Rig, attempt: &StagedAttempt, epoch: u64) {
+    let batches = rig.log.commits(Kind::Compensation);
+    let last = batches.last().expect("a compensation was sent");
+    assert_eq!(required_epoch(last, &rig.upload), epoch);
+    let expected = if attempt.chunks().is_empty() {
+        Vec::new()
+    } else {
+        vec![(token_of(attempt, epoch), chunk_ids(attempt.chunks()))]
+    };
+    assert_eq!(rig.part_obligations().await, expected);
+    assert_eq!(rig.slots_of(attempt).await, 0, "no slot of the attempt");
+    assert_eq!(rig.owned_of(attempt).await, 0, "no owned entry");
+    assert_eq!(rig.releases(attempt), 1, "released once");
+    rig.assert_every_fragment_named().await;
+}
+
+// ─────────────── (B) a lost commit is classified (#1028) ───────────────
+
+/// **(B)** The session fenced to `Aborting` by a real Abort between the last renewal and the
+/// commit: `NoSuchUpload`, and nothing more written. No compensation: the slot and the owned entries
+/// are the reaper's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b_a_fenced_session_answers_no_such_upload_and_writes_nothing() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK + 1, 9)).await;
+        rig.store
+            .script(Kind::Commit, vec![Act::pass().before(rig.abort())], None);
+        refused(&rig.commit(attempt.clone()).await, Refusal::NoSuchUpload);
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 1, "no retry");
+        assert_eq!(
+            rig.log.commits(Kind::Compensation).len(),
+            0,
+            "no compensation"
+        );
+        assert_eq!(rig.slots_of(&attempt).await, 1, "the slot is the reaper's");
+        assert_eq!(rig.owned_of(&attempt).await, attempt.owned().len());
+        assert_eq!(rig.releases(&attempt), 0);
+        assert!(rig.part(1).await.is_none());
+        assert!(rig.part_obligations().await.is_empty());
+        rig.assert_every_fragment_named().await;
+    })
+    .await;
+}
+
+/// **(B)** The session rolled back to `Open@E'` (`E' = E + 2`: a Complete fenced and rolled back)
+/// between the last renewal and the commit: the attempt compensates under `require(mpu ==
+/// Open@E')`, one obligation for its own chunks under `E'`, its slot released and its owned entries
+/// deleted in one batch, and answers exactly `OperationAborted`, never `Committed` and never
+/// `NoSuchUpload`. For a part with chunks and for an empty one, which writes no obligation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b_a_rolled_back_session_is_compensated_under_its_newer_epoch() {
+    for bytes in [body(2 * CHUNK, 4), Vec::new()] {
+        within(async {
+            let mut rig = Rig::new().await;
+            let attempt = rig.stage(1, &bytes).await;
+            rig.store
+                .script(Kind::Commit, vec![Act::pass().before(rig.rollback())], None);
+            refused(
+                &rig.commit(attempt.clone()).await,
+                Refusal::OperationAborted,
+            );
+            assert_eq!(rig.log.commits(Kind::Commit).len(), 1, "no retry");
+            let session = decode_session_record(&rig.session().await).unwrap();
+            assert_eq!(session.epoch(), 2);
+            assert!(
+                matches!(session.state(), SessionState::Open {}),
+                "still Open"
+            );
+            rig.assert_compensated(&attempt, 2).await;
+            assert!(rig.part(1).await.is_none());
+        })
+        .await;
+    }
+}
+
+/// **(B)** A same-part rival committed between the loser's last renewal and its commit: the loser
+/// commits one obligation for its **own** chunks (decoded by `decode_retire_obligation`), releases
+/// its slot and deletes its owned entries in one batch, and answers exactly `OperationAborted`. The
+/// rival's part stands. An empty loser writes no obligation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b_a_same_part_loser_compensates_its_own_chunks() {
+    for bytes in [body(CHUNK, 1), Vec::new()] {
+        within(async {
+            let (rig, loser, rival) = losing_to_a_rival(&bytes, 2).await;
+            refused(&rig.commit(loser.clone()).await, Refusal::OperationAborted);
+            let (record, _) = rig.part(1).await.unwrap();
+            assert!(is_own(&record, &rival), "the rival's part stands");
+            assert_eq!(rig.log.commits(Kind::Commit).len(), 1, "no retry");
+            rig.assert_compensated(&loser, 0).await;
+            let puts = rig.log.commits(Kind::Compensation)[0].puts.len();
+            assert_eq!(
+                puts,
+                usize::from(!loser.chunks().is_empty()),
+                "the obligation"
+            );
+        })
+        .await;
+    }
+}
+
+/// **(B)** A repair rewrote the prior part record a re-upload required, with nothing in doubt: the
+/// re-upload compensates and answers `OperationAborted`, with no retry against the new record. The
+/// repaired prior stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b_a_repair_of_the_prior_is_compensated_with_no_retry() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let prior = rig.committed(1, &body(2 * CHUNK, 5)).await;
+        let attempt = rig.stage(1, &body(CHUNK, 6)).await;
+        rig.store.script(
+            Kind::Commit,
+            vec![Act::pass().before(repair(&rig, 1, 0))],
+            None,
+        );
+        refused(
+            &rig.commit(attempt.clone()).await,
+            Refusal::OperationAborted,
+        );
+        assert_eq!(
+            rig.log.commits(Kind::Commit).len(),
+            1,
+            "no retry against the new record"
+        );
+        let (record, _) = rig.part(1).await.unwrap();
+        assert_eq!(record.digest(), prior.digest(), "the prior stands");
+        assert_eq!(chunk_ids(record.chunks()), chunk_ids(prior.chunks()));
+        assert_ne!(record, prior, "repaired");
+        rig.assert_compensated(&attempt, 0).await;
+    })
+    .await;
+}
+
+/// **(B)** A conflict no read explains (the part as required, the session `Open@E`, the slot held):
+/// the same batch is sent again, and lands. Between the two, the re-read is the part key, the
+/// session, the attempt's own slot and the session again, in that order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b_a_conflict_no_read_explains_sends_the_same_batch_again() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 7)).await;
+        rig.store.script(Kind::Commit, vec![Act::conflict()], None);
+        committed_as(&rig.commit(attempt.clone()).await, &attempt);
+        let commits = rig.log.commits(Kind::Commit);
+        assert_eq!(commits.len(), 2);
+        assert!(same_batch(&commits[0], &commits[1]), "the same batch");
+        let session = mpu_key(&rig.upload);
+        assert_eq!(
+            rig.log.reads_after(Kind::Commit, 0),
+            vec![
+                part_key(&rig.upload, part(1)),
+                session.clone(),
+                attempt.slot_key().to_vec(),
+                session,
+            ]
+        );
+        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0);
+        assert!(is_own(&rig.part(1).await.unwrap().0, &attempt));
+        assert_eq!(rig.releases(&attempt), 1);
+        rig.assert_every_fragment_named().await;
+    })
+    .await;
+}
+
+/// **(B)** A compensation answered `Conflict` with nothing a read explains (no record at its
+/// obligation key, the slot held, the session unchanged) sends the same batch again, on each route
+/// to a compensation, and the route's own answer stands once it lands. Its re-read is the obligation
+/// key, the slot and the session, in that order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b_a_compensation_conflict_no_read_explains_sends_the_same_batch_again() {
+    for route in ["renewal", "lease", "ceiling"] {
+        within(async {
+            let (rig, attempt) = compensating(route, 164).await;
+            rig.store
+                .script(Kind::Compensation, vec![Act::conflict()], None);
+            let outcome = rig.commit(attempt.clone()).await;
+            match route {
+                "renewal" => {
+                    renewal_stopped(outcome, true);
+                }
+                "lease" => {
+                    let cause = stopped(outcome, true);
+                    assert!(matches!(cause, Stop::LeaseShort { .. }), "{cause:?}");
+                }
+                _ => refused(
+                    &outcome,
+                    Refusal::EntityTooLarge {
+                        chunks: u64::from(MAX_STAGED_CHUNKS) + 1,
+                        limit: u64::from(MAX_STAGED_CHUNKS),
+                    },
+                ),
+            }
+            let batches = rig.log.commits(Kind::Compensation);
+            assert_eq!(batches.len(), 2, "{route}");
+            assert!(same_batch(&batches[0], &batches[1]), "{route}");
+            assert_eq!(
+                rig.log.reads_after(Kind::Compensation, 0),
+                vec![
+                    obligation_key(&attempt, 0),
+                    attempt.slot_key().to_vec(),
+                    mpu_key(&rig.upload),
+                ],
+                "{route}"
+            );
+            assert_finally_compensated(&rig, &attempt, 0).await;
+        })
+        .await;
+    }
+}
+
+// ─────────────── (T) a terminal delete is not damage (#1028) ───────────────
+
+/// **(T) At the commit's re-read.** A real Abort fences the session, so the commit answers
+/// `Conflict`; the re-read finds the part as required, the session `Aborting` and the slot held;
+/// **then** the terminal delete lands, removing the session, the slots and the owned entries in one
+/// batch, and the last session read finds nothing. The slot key read once more after that is
+/// absent: `NoSuchUpload`, never `SessionRecordMissing`. The same with the delete landing before the
+/// commit, so that every read finds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a_terminal_delete_between_the_commits_reads_answers_no_such_upload() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 11)).await;
+        let slot = attempt.slot_key().to_vec();
+        let delete = after_read(&slot, vec![rig.terminal_delete()]);
+        rig.store.script(
+            Kind::Commit,
+            vec![Act::pass().before(rig.abort()).after(delete)],
+            None,
+        );
+        refused(&rig.commit(attempt.clone()).await, Refusal::NoSuchUpload);
+        let session = mpu_key(&rig.upload);
+        assert_eq!(
+            rig.log.reads_after(Kind::Commit, 0),
+            vec![
+                part_key(&rig.upload, part(1)),
+                session.clone(),
+                slot.clone(),
+                session.clone(),
+                slot,
+            ],
+            "the four reads, then the slot key once more"
+        );
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 1);
+        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0);
+        assert!(rig.inner.get(&session).await.unwrap().is_none(), "deleted");
+        assert_eq!(rig.slots().await, 0);
+
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 12)).await;
+        rig.store.script(
+            Kind::Commit,
+            vec![Act::pass().before(rig.terminal_delete())],
+            None,
+        );
+        refused(&rig.commit(attempt.clone()).await, Refusal::NoSuchUpload);
+        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0);
+    })
+    .await;
+}
+
+/// **(T) At the compensation's re-read.** A loser to a same-number rival compensates; a real Abort
+/// fences the session first, so the compensation answers `Conflict`; its re-read finds no record at
+/// the obligation key and the slot held; **then** the terminal delete lands, and its session read
+/// finds nothing. The slot key read once more after that is absent: `NoSuchUpload`, with no further
+/// write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a_terminal_delete_between_the_compensations_reads_answers_no_such_upload() {
+    within(async {
+        let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 13), 14).await;
+        let slot = loser.slot_key().to_vec();
+        let delete = after_read(&slot, vec![rig.terminal_delete()]);
+        rig.store.script(
+            Kind::Compensation,
+            vec![Act::pass().before(rig.abort()).after(delete)],
+            None,
+        );
+        refused(&rig.commit(loser.clone()).await, Refusal::NoSuchUpload);
+        assert_eq!(
+            rig.log.reads_after(Kind::Compensation, 0),
+            vec![
+                obligation_key(&loser, 0),
+                slot.clone(),
+                mpu_key(&rig.upload),
+                slot,
+            ],
+            "its three reads, then the slot key once more"
+        );
+        assert_eq!(
+            rig.log.commits(Kind::Compensation).len(),
+            1,
+            "no further write"
+        );
+        assert!(rig.part_obligations().await.is_empty());
+        assert_eq!(rig.slots().await, 0);
+    })
+    .await;
+}
+
+/// **(T) The slot still held behind a missing session.** Only the session record is erased, which
+/// no terminal delete does (it takes the slots in the same batch): the slot key read after the
+/// missing session still holds this attempt's slot, so the answer is
+/// `Stop::Record(SessionRecordMissing)`, with no compensation and no release claimed, at the
+/// commit's re-read and at the compensation's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_a_missing_session_with_the_slot_still_held_is_damage() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 15)).await;
+        let gone = rig.erased(vec![mpu_key(&rig.upload)]);
+        rig.store
+            .script(Kind::Commit, vec![Act::pass().before(gone)], None);
+        let cause = stopped(rig.commit(attempt.clone()).await, false);
+        assert_session_record_missing(&cause, 0, "commit");
+        assert!(cause.to_string().contains("terminal delete"), "{cause}");
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 1);
+        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0);
+        assert_eq!(rig.slots_of(&attempt).await, 1, "the slot stays");
+        assert_eq!(rig.releases(&attempt), 0);
+
+        let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 16), 17).await;
+        let gone = rig.erased(vec![mpu_key(&rig.upload)]);
+        rig.store
+            .script(Kind::Compensation, vec![Act::pass().before(gone)], None);
+        let cause = stopped(rig.commit(loser.clone()).await, false);
+        assert_session_record_missing(&cause, 0, "compensation");
+        assert_eq!(
+            rig.log.commits(Kind::Compensation).len(),
+            1,
+            "no further write"
+        );
+        assert!(rig.part_obligations().await.is_empty());
+        assert_eq!(rig.slots_of(&loser).await, 1, "the slot stays");
+        assert_eq!(rig.releases(&loser), 0);
+    })
+    .await;
+}
+
+/// **(T) Another attempt's slot behind a missing session.** Right after the re-read's slot read
+/// finds this attempt's slot held, the session record is erased and the slot key given another
+/// attempt's record. The slot key read after the missing session holds that record: damage,
+/// `Stop::Record(SessionRecordMissing)`, never a terminal delete, at the commit's re-read and at
+/// the compensation's. Nothing is compensated or released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t_another_attempts_slot_behind_a_missing_session_is_damage() {
+    for phase in ["commit", "compensation"] {
+        within(async {
+            let (rig, attempt) = if phase == "commit" {
+                let mut rig = Rig::new().await;
+                let attempt = rig.stage(1, &body(CHUNK, 18)).await;
+                (rig, attempt)
+            } else {
+                let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 19), 20).await;
+                (rig, loser)
+            };
+            let slot = attempt.slot_key().to_vec();
+            let swap = after_read(
+                &slot,
+                vec![
+                    rig.erased(vec![mpu_key(&rig.upload)]),
+                    rig.plant(slot.clone(), foreign_slot(&attempt)),
+                ],
+            );
+            let kind = if phase == "commit" {
+                Kind::Commit
+            } else {
+                Kind::Compensation
+            };
+            rig.store
+                .script(kind, vec![Act::conflict().after(swap)], None);
+            let cause = stopped(rig.commit(attempt.clone()).await, false);
+            assert_session_record_missing(&cause, 0, phase);
+            let sent = usize::from(phase == "compensation");
+            assert_eq!(rig.log.commits(Kind::Compensation).len(), sent, "{phase}");
+            assert!(rig.part_obligations().await.is_empty(), "{phase}");
+            assert_eq!(rig.releases(&attempt), 0, "{phase}");
+            assert_eq!(
+                rig.inner.get(&slot).await.unwrap(),
+                Some(foreign_slot(&attempt)),
+                "{phase}: the other attempt's slot is left as it is"
+            );
+        })
+        .await;
+    }
+}
+
+// ─────────────── (R) damage is a record stop (#1028) ───────────────
+
+/// **(R) Bytes at the part key that do not decode**, planted before the commit over no prior, a
+/// non-empty prior and an empty one, and under a session that moved (a rollback, a fence): a record
+/// stop, never a rival, with no compensation, no retry and no release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r_a_damaged_part_record_is_a_record_stop_not_a_rival() {
+    for (prior, moved) in [
+        (None, "none"),
+        (Some(body(CHUNK, 21)), "none"),
+        (Some(Vec::new()), "none"),
+        (None, "rollback"),
+        (None, "abort"),
+    ] {
+        within(async {
+            let at = format!(
+                "{:?} prior bytes, moved {moved}",
+                prior.as_ref().map(Vec::len)
+            );
+            let mut rig = Rig::new().await;
+            if let Some(bytes) = &prior {
+                rig.committed(1, bytes).await;
+            }
+            let attempt = rig.stage(1, &body(CHUNK, 22)).await;
+            let mut act = Act::pass()
+                .before(rig.plant(part_key(&rig.upload, part(1)), Bytes::from_static(b"torn")));
+            act = match moved {
+                "rollback" => act.before(rig.rollback()),
+                "abort" => act.before(rig.abort()),
+                _ => act,
+            };
+            rig.store.script(Kind::Commit, vec![act], None);
+            let cause = stopped(rig.commit(attempt.clone()).await, false);
+            assert!(matches!(cause, Stop::Record(_)), "{at}: {cause:?}");
+            assert_eq!(rig.log.commits(Kind::Commit).len(), 1, "{at}: no retry");
+            assert_eq!(rig.log.commits(Kind::Compensation).len(), 0, "{at}");
+            assert_eq!(rig.slots_of(&attempt).await, 1, "{at}: the slot stays");
+            assert_eq!(rig.owned_of(&attempt).await, 1, "{at}: the entry stays");
+            assert_eq!(rig.releases(&attempt), 0, "{at}");
+        })
+        .await;
+    }
+}
+
+/// **(R) A prior part record gone while the session is still `Open@E`**: `PartRecordMissing`, never
+/// `OperationAborted`, with no compensation, over a non-empty prior and an empty one. Under a session
+/// that moved, that session's row answers instead: a rollback compensates, a fence refuses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r_a_prior_part_record_gone_under_the_same_session_is_damage() {
+    for prior in [body(CHUNK, 23), Vec::new()] {
+        for moved in ["none", "rollback", "abort"] {
+            within(async {
+                let at = format!("{} prior bytes, moved {moved}", prior.len());
+                let mut rig = Rig::new().await;
+                rig.committed(1, &prior).await;
+                let attempt = rig.stage(1, &body(CHUNK, 24)).await;
+                let gone = rig.erased(vec![
+                    part_key(&rig.upload, part(1)),
+                    psum_key(&rig.upload, part(1)),
+                ]);
+                let mut act = Act::pass().before(gone);
+                act = match moved {
+                    "rollback" => act.before(rig.rollback()),
+                    "abort" => act.before(rig.abort()),
+                    _ => act,
+                };
+                rig.store.script(Kind::Commit, vec![act], None);
+                let outcome = rig.commit(attempt.clone()).await;
+                match moved {
+                    "none" => {
+                        let cause = stopped(outcome, false);
+                        assert!(
+                            matches!(
+                                cause,
+                                Stop::Record(RecordError::PartRecordMissing { part_number: 1 })
+                            ),
+                            "{at}: {cause:?}"
+                        );
+                        assert!(
+                            cause.to_string().contains("part 1's record is gone"),
+                            "{at}: {cause}"
+                        );
+                        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0, "{at}");
+                        assert_eq!(rig.slots_of(&attempt).await, 1, "{at}: the slot stays");
+                    }
+                    "rollback" => {
+                        refused(&outcome, Refusal::OperationAborted);
+                        assert_eq!(compensation_epochs(&rig), vec![2], "{at}");
+                        assert_eq!(rig.slots_of(&attempt).await, 0, "{at}");
+                        assert_eq!(rig.releases(&attempt), 1, "{at}");
+                    }
+                    _ => {
+                        refused(&outcome, Refusal::NoSuchUpload);
+                        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0, "{at}");
+                    }
+                }
+                assert_eq!(rig.log.commits(Kind::Commit).len(), 1, "{at}: no retry");
+            })
+            .await;
+        }
+    }
+}
+
+/// **(R) A damaged session at the last read.** The session is staged at epoch 2 (one rollback), and
+/// planted before the batch, at the commit's re-read and at the compensation's: bytes that do not
+/// decode, and records under other bytes at an epoch that has not risen, `Open` and `Aborting`, at
+/// the same epoch and a lower one. Each is a record stop (`SessionEpochNotRisen` for a record),
+/// never a rollback and never a fence, with no compensation and no release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r_a_damaged_session_at_the_last_read_is_a_record_stop() {
+    for phase in ["commit", "compensation"] {
+        for kind in [
+            "torn",
+            "Open, same",
+            "Open, lower",
+            "Aborting, same",
+            "Aborting, lower",
+        ] {
+            within(async {
+                let at = format!("{kind} at the {phase}'s re-read");
+                let mut rig = Rig::new().await;
+                let older = rig.session().await;
+                rig.run(vec![rig.rollback()]).await;
+                let session = rig.session().await;
+                let attempt = rig.stage(1, &body(CHUNK, 25)).await;
+                let (planted, found) = match kind {
+                    "torn" => (Bytes::from_static(b"torn"), None),
+                    "Open, same" => (same_epoch_other_bytes(&session), Some(2)),
+                    "Open, lower" => (older, Some(0)),
+                    "Aborting, same" => (aborting_at(&session, &rig.upload, 2), Some(2)),
+                    _ => (aborting_at(&session, &rig.upload, 1), Some(1)),
+                };
+                let plant = rig.plant(mpu_key(&rig.upload), planted);
+                if phase == "commit" {
+                    rig.store
+                        .script(Kind::Commit, vec![Act::pass().before(plant)], None);
+                } else {
+                    let rival = rig.stage(1, &body(CHUNK, 26)).await;
+                    rig.store.script(
+                        Kind::Commit,
+                        vec![Act::pass().before(rig.rival(rival))],
+                        None,
+                    );
+                    rig.store
+                        .script(Kind::Compensation, vec![Act::pass().before(plant)], None);
+                }
+                let cause = stopped(rig.commit(attempt.clone()).await, false);
+                match found {
+                    Some(found) => assert!(
+                        matches!(
+                            cause,
+                            Stop::Record(RecordError::SessionEpochNotRisen { found: f, required: 2 })
+                                if f == found
+                        ),
+                        "{at}: {cause:?}"
+                    ),
+                    None => assert!(matches!(cause, Stop::Record(_)), "{at}: {cause:?}"),
+                }
+                let sent = usize::from(phase == "compensation");
+                assert_eq!(rig.log.commits(Kind::Compensation).len(), sent, "{at}");
+                assert!(rig.part_obligations().await.is_empty(), "{at}");
+                assert_eq!(rig.slots_of(&attempt).await, 1, "{at}: the slot stays");
+                assert_eq!(rig.releases(&attempt), 0, "{at}");
+            })
+            .await;
+        }
+    }
+}
+
+/// **(R) Damage at the round's first session read is passed over.** The session is torn just before
+/// the commit and restored right after the re-read's first session read: the last session read
+/// finds it as the commit required, so the conflict is one no read explains, and the same batch is
+/// sent again and lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r_damage_at_the_first_session_read_is_passed_over() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 27)).await;
+        let session = rig.session().await;
+        let key = mpu_key(&rig.upload);
+        let tear = rig.plant(key.clone(), Bytes::from_static(b"torn"));
+        let restore = after_read(&key, vec![rig.plant(key.clone(), session)]);
+        rig.store.script(
+            Kind::Commit,
+            vec![Act::conflict().before(tear).after(restore)],
+            None,
+        );
+        committed_as(&rig.commit(attempt.clone()).await, &attempt);
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 2);
+        assert_eq!(rig.log.commits(Kind::Compensation).len(), 0);
+    })
+    .await;
+}
+
+/// **(R) A slot lost or rewritten at a re-read**: deleted, given another attempt's record, or
+/// rewritten under this attempt's id, just before the commit and just before the compensation,
+/// under a live session and under one a real Abort fenced just before that.
+///
+/// * Live: each is `SlotLost` naming the key.
+/// * Fenced: only the slot rewritten under this attempt's id is `SlotLost` (only this attempt
+///   writes its own id, and it has quiesced). A slot deleted or holding another attempt's record
+///   is answered by the fence, `NoSuchUpload`, the residue the reaper's. So these legs tell
+///   "another attempt's" from "this attempt's" by the answer.
+/// * Bytes there that do not decode are `Record` under either session, never another attempt's.
+///
+/// In every leg: no compensation at the commit's re-read and no further batch after either
+/// re-read, the slot key left as the step put it, and no release claimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r_a_slot_lost_or_rewritten_at_a_re_read_stops_without_a_release() {
+    for session in ["live", "fenced"] {
+        for phase in ["commit", "compensation"] {
+            for how in ["gone", "foreign", "rewritten", "torn"] {
+                within(async {
+                    let at = format!("slot {how} at the {phase}'s re-read, session {session}");
+                    let (rig, attempt) = if phase == "commit" {
+                        let mut rig = Rig::new().await;
+                        let attempt = rig.stage(1, &body(CHUNK, 28)).await;
+                        (rig, attempt)
+                    } else {
+                        let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 29), 30).await;
+                        (rig, loser)
+                    };
+                    let key = attempt.slot_key().to_vec();
+                    let (step, left) = match how {
+                        "gone" => (rig.erased(vec![key.clone()]), None),
+                        "foreign" => {
+                            let foreign = foreign_slot(&attempt);
+                            (rig.plant(key.clone(), foreign.clone()), Some(foreign))
+                        }
+                        "rewritten" => {
+                            let rewritten = rewritten_slot(&attempt);
+                            (rig.plant(key.clone(), rewritten.clone()), Some(rewritten))
+                        }
+                        _ => {
+                            let torn = Bytes::from_static(b"torn");
+                            (rig.plant(key.clone(), torn.clone()), Some(torn))
+                        }
+                    };
+                    let kind = if phase == "commit" {
+                        Kind::Commit
+                    } else {
+                        Kind::Compensation
+                    };
+                    let mut act = Act::conflict();
+                    if session == "fenced" {
+                        act = act.before(rig.abort());
+                    }
+                    rig.store.script(kind, vec![act.before(step)], None);
+                    let outcome = rig.commit(attempt.clone()).await;
+                    match (session, how) {
+                        (_, "torn") => {
+                            let cause = stopped(outcome, false);
+                            assert!(matches!(cause, Stop::Record(_)), "{at}: {cause:?}");
+                        }
+                        ("fenced", "gone" | "foreign") => refused(&outcome, Refusal::NoSuchUpload),
+                        _ => assert_slot_lost(&stopped(outcome, false), &attempt, &at),
+                    }
+                    assert_eq!(rig.log.commits(Kind::Commit).len(), 1, "{at}");
+                    let sent = usize::from(phase == "compensation");
+                    assert_eq!(rig.log.commits(Kind::Compensation).len(), sent, "{at}");
+                    assert!(rig.part_obligations().await.is_empty(), "{at}");
+                    assert_eq!(rig.releases(&attempt), 0, "{at}");
+                    assert_eq!(
+                        rig.inner.get(&key).await.unwrap(),
+                        left,
+                        "{at}: the slot key"
+                    );
+                    if session == "fenced" {
+                        let fenced = decode_session_record(&rig.session().await).unwrap();
+                        assert!(
+                            matches!(fenced.state(), SessionState::Aborting {}),
+                            "{at}: fenced"
+                        );
+                    }
+                })
+                .await;
+            }
+        }
+    }
+}
+
+// ─────────────── (O) a taken obligation key (#1028) ───────────────
+
+/// **(O)** Other bytes planted at the obligation's key, then a re-upload over a non-empty prior,
+/// one with chunks and an empty one. Its commit requires that key absent, so every round answers
+/// `Conflict` with nothing the round's four reads explain. When the rounds end, spent or stopped by
+/// the lease before a later round, the attempt reads that key before it compensates, finds the
+/// bytes, and stops `ObligationKeyTaken` with no compensation sent. The empty re-upload is the one
+/// that needs that read: its compensation installs no obligation, so it would land past the bytes
+/// and report the rounds spent. Those bytes and the prior are kept, and nothing is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o_a_taken_obligation_key_keeps_those_bytes_and_the_prior_part() {
+    for bytes in [body(CHUNK, 32), Vec::new()] {
+        for end in ["rounds", "lease"] {
+            within(async {
+                let at = format!("{} bytes, rounds ended by the {end}", bytes.len());
+                let mut rig = Rig::new().await;
+                let prior = rig.committed(1, &body(CHUNK, 31)).await;
+                let attempt = rig.stage(1, &bytes).await;
+                let key = obligation_key(&attempt, 0);
+                let planted = Bytes::from_static(b"other");
+                rig.run(vec![rig.plant(key.clone(), planted.clone())]).await;
+                // Ended by the lease: every read moves the clock an eighth of the lease's spare
+                // over the margin, so the reads after the second round take it below the margin.
+                let rounds = if end == "lease" {
+                    let spare = left_after_renewal(&rig, &attempt) - MARGIN;
+                    rig.store.tick_reads(spare / 8);
+                    2
+                } else {
+                    4
+                };
+                let cause = stopped(rig.commit(attempt.clone()).await, false);
+                let expected = String::from_utf8_lossy(&key).into_owned();
+                assert!(
+                    matches!(&cause, Stop::ObligationKeyTaken { key } if *key == expected),
+                    "{at}: {cause:?}"
+                );
+                assert!(cause.to_string().contains(&expected), "{at}: {cause}");
+                assert_eq!(rig.inner.get(&key).await.unwrap(), Some(planted), "{at}");
+                let (record, _) = rig.part(1).await.unwrap();
+                assert_eq!(record, prior, "{at}: the prior part stands");
+                assert_eq!(rig.log.commits(Kind::Commit).len(), rounds, "{at}");
+                let session = mpu_key(&rig.upload);
+                assert_eq!(
+                    rig.log.reads_after(Kind::Commit, rounds - 1),
+                    vec![
+                        part_key(&rig.upload, part(1)),
+                        session.clone(),
+                        attempt.slot_key().to_vec(),
+                        session,
+                        key.clone(),
+                    ],
+                    "{at}: the round's four reads, then the obligation key"
+                );
+                assert_eq!(
+                    rig.log.commits(Kind::Compensation).len(),
+                    0,
+                    "{at}: no compensation"
+                );
+                assert_eq!(
+                    rig.slots_of(&attempt).await,
+                    1,
+                    "{at}: nothing was released"
+                );
+                assert_eq!(rig.owned_of(&attempt).await, attempt.owned().len(), "{at}");
+                assert_eq!(rig.releases(&attempt), 0, "{at}");
+            })
+            .await;
+        }
+    }
+}
+
+// ─────────────── (L) bounds and the lease (#1028) ───────────────
+
+/// **(L) Every loop ends after exactly its bound**, counted against numbers written here, never the
+/// imported constants, with the wrapper answering every batch `Conflict` unapplied: the commit
+/// rounds, whose compensation then lands; the commit rounds and then the compensation rounds; the
+/// compensation rounds of a loser to a rival; and the epoch chase, every compensation losing to one
+/// more rollback, each under a newer epoch than the last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l_every_loop_ends_after_exactly_its_bound() {
+    within(async {
+        // The commit rounds, spent with nothing in doubt: compensate.
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 41)).await;
+        rig.store
+            .script(Kind::Commit, vec![], Some(Act::conflict()));
+        let cause = stopped(rig.commit(attempt.clone()).await, true);
+        assert!(
+            matches!(cause, Stop::CommitRoundsSpent { rounds: 4 }),
+            "{cause:?}"
+        );
+        assert_eq!(
+            cause.to_string(),
+            "all 4 part commits were answered Conflict with nothing a read could see to explain it"
+        );
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 4);
+        rig.assert_compensated(&attempt, 0).await;
+
+        // The commit rounds, then the compensation rounds.
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 42)).await;
+        rig.store
+            .script(Kind::Commit, vec![], Some(Act::conflict()));
+        rig.store
+            .script(Kind::Compensation, vec![], Some(Act::conflict()));
+        let cause = stopped(rig.commit(attempt.clone()).await, false);
+        assert!(
+            matches!(cause, Stop::CompensationRoundsSpent { rounds: 4 }),
+            "{cause:?}"
+        );
+        assert_eq!(
+            cause.to_string(),
+            "all 4 compensations were sent without one landing"
+        );
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 4);
+        assert_eq!(rig.log.commits(Kind::Compensation).len(), 4);
+        assert_eq!(rig.slots_of(&attempt).await, 1, "nothing was released");
+        assert!(rig.part_obligations().await.is_empty());
+
+        // The compensation rounds of a loser to a rival.
+        let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 43), 44).await;
+        rig.store
+            .script(Kind::Compensation, vec![], Some(Act::conflict()));
+        let cause = stopped(rig.commit(loser.clone()).await, false);
+        assert!(
+            matches!(cause, Stop::CompensationRoundsSpent { rounds: 4 }),
+            "{cause:?}"
+        );
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 1);
+        assert_eq!(rig.log.commits(Kind::Compensation).len(), 4);
+        assert_eq!(rig.slots_of(&loser).await, 1, "nothing was released");
+
+        // The epoch chase: every compensation loses to one more rollback.
+        let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 45), 46).await;
+        let chase = (0..4).map(|_| Act::pass().before(rig.rollback())).collect();
+        rig.store.script(Kind::Compensation, chase, None);
+        let cause = stopped(rig.commit(loser.clone()).await, false);
+        assert!(
+            matches!(cause, Stop::CompensationRoundsSpent { rounds: 4 }),
+            "{cause:?}"
+        );
+        assert_eq!(compensation_epochs(&rig), vec![0, 2, 4, 6]);
+        assert_eq!(rig.slots_of(&loser).await, 1, "nothing was released");
+        assert!(rig.part_obligations().await.is_empty());
+    })
+    .await;
+}
+
+/// **(L) The epoch chase under every charged Complete fence.** A same-part rival beats the commit,
+/// which spends no rollback; then three rollbacks, one per charged Complete fence the shipped
+/// `MAX_COMPLETE_ATTEMPTS` allows (each spends an attempt, so the session ends at three), each beat
+/// one compensation, and the fourth compensation lands: exactly four, the last under `Open@6`. Only
+/// this run needs the whole budget. In a second run a rollback beats the commit, and two more beat
+/// compensations: the third compensation lands, under `Open@6`.
+///
+/// Three is the most rollbacks **charged** fences can make, not the most a session can see: a
+/// Complete rejected behind its fence gives its attempt back when it releases it (#1007), so
+/// rejected Completes can roll the session back any number of times. `COMPENSATION_ROUNDS` is a
+/// budget for the work, not for the answer, and a fourth rollback against a compensation spends
+/// it (`l_every_loop_ends_after_exactly_its_bound`'s chase leg).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l_the_epoch_chase_lands_within_its_bound_after_one_rollback_per_charged_complete() {
+    within(async {
+        let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 47), 48).await;
+        let chase = (0..3).map(|_| Act::pass().before(rig.rollback())).collect();
+        rig.store.script(Kind::Compensation, chase, None);
+        refused(&rig.commit(loser.clone()).await, Refusal::OperationAborted);
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 1);
+        assert_eq!(compensation_epochs(&rig), vec![0, 2, 4, 6], "exactly 4");
+        let session = decode_session_record(&rig.session().await).unwrap();
+        assert_eq!((session.epoch(), session.attempts()), (6, 3));
+        assert!(matches!(session.state(), SessionState::Open {}), "live");
+        assert_finally_compensated(&rig, &loser, 6).await;
+
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 49)).await;
+        rig.store
+            .script(Kind::Commit, vec![Act::pass().before(rig.rollback())], None);
+        let chase = (0..2).map(|_| Act::pass().before(rig.rollback())).collect();
+        rig.store.script(Kind::Compensation, chase, None);
+        refused(
+            &rig.commit(attempt.clone()).await,
+            Refusal::OperationAborted,
+        );
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 1);
+        assert_eq!(compensation_epochs(&rig), vec![2, 4, 6], "exactly 3");
+        assert_finally_compensated(&rig, &attempt, 6).await;
+    })
+    .await;
+}
+
+/// **(L) During a compensation**, on each route to one: a real Abort fences the session before the
+/// compensation, which answers `Conflict`, and its re-read finds the session fenced:
+/// `NoSuchUpload`, with no further write. The slot and the owned entries are the reaper's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l_a_compensation_that_finds_the_session_fenced_answers_no_such_upload() {
+    for route in ["renewal", "lease", "ceiling", "rival", "rounds"] {
+        within(async {
+            let (rig, attempt) = match route {
+                "rival" => {
+                    let (rig, loser, _) = losing_to_a_rival(&body(CHUNK, 51), 52).await;
+                    (rig, loser)
+                }
+                "rounds" => {
+                    let mut rig = Rig::new().await;
+                    let attempt = rig.stage(1, &body(CHUNK, 53)).await;
+                    rig.store
+                        .script(Kind::Commit, vec![], Some(Act::conflict()));
+                    (rig, attempt)
+                }
+                _ => compensating(route, 54).await,
+            };
+            rig.store.script(
+                Kind::Compensation,
+                vec![Act::pass().before(rig.abort())],
+                None,
+            );
+            refused(&rig.commit(attempt.clone()).await, Refusal::NoSuchUpload);
+            assert_eq!(
+                rig.log.commits(Kind::Compensation).len(),
+                1,
+                "{route}: no further write"
+            );
+            assert_eq!(rig.slots_of(&attempt).await, 1, "{route}: the reaper's");
+            assert_eq!(rig.owned_of(&attempt).await, 1, "{route}");
+            assert!(rig.part_obligations().await.is_empty(), "{route}");
+            assert_eq!(rig.releases(&attempt), 0, "{route}");
+        })
+        .await;
+    }
+}
+
+/// **(L) The lease between rounds.** `Conflict` rounds separated by slow reads (every read moves the
+/// clock an eighth of the lease's spare over the margin): the first two rounds are sent with the
+/// margin left, and the four reads after the second take the lease below it, so no third commit is
+/// sent and the attempt compensates. The answer is `LeaseShort`, never `Committed`; the wrapper
+/// fails any round sent with less.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l_a_lease_used_up_between_rounds_stops_them_and_compensates() {
+    within(async {
+        let mut rig = Rig::new().await;
+        let attempt = rig.stage(1, &body(CHUNK, 55)).await;
+        let spare = left_after_renewal(&rig, &attempt) - MARGIN;
+        rig.store.tick_reads(spare / 8);
+        rig.store
+            .script(Kind::Commit, vec![], Some(Act::conflict()));
+        let cause = stopped(rig.commit(attempt.clone()).await, true);
+        assert!(matches!(cause, Stop::LeaseShort { .. }), "{cause:?}");
+        assert_eq!(rig.log.commits(Kind::Commit).len(), 2, "no third commit");
+        rig.assert_compensated(&attempt, 0).await;
+        assert!(rig.part(1).await.is_none());
     })
     .await;
 }
