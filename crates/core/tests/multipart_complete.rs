@@ -41,33 +41,77 @@
 //!   that finds the session moved, a definite fence failure and a torn session record.
 //!
 //! The wrapper keeps its state in struct fields, never in a `static` (ADR-0035).
+//!
+//! # Issue #1008: the flat publication
+//!
+//! The legs from *the flat publication* on drive the verb,
+//! `wyrd_core::multipart::complete::complete_upload`: the fence above, then one root flip through
+//! #653's committer (proposal 0016's *Root flip* row, `0016:663`; decision 3, `0016:910-941`).
+//! Their parts are staged by `UploadPart` (`commit::upload_part`, #1027) onto a placement-aware
+//! chunk-store double, so the object they publish is read back through `read::read_object`. An
+//! ordinary `PutObject` here goes through the single-PUT write path (`write.rs`). Every
+//! interference is forced by the same wrapper, at the flip's commit point:
+//!
+//! * **(A)** parts staged out of order publish one flat root that reads back byte for byte, with
+//!   the multipart ETag on the inode and in the `Completed` session; an identical retry answers
+//!   the recorded publication.
+//! * **(D2-tail)** after D1's typos and D2's parts replaced before the fence, a valid list
+//!   publishes.
+//! * **(C)** a subset Complete retires the published parts' records and the unnamed part's bytes,
+//!   in two obligations that never name a published chunk.
+//! * **(F)** a flip that loses to an ordinary overwrite publishes the version after the one it
+//!   lost to, and retires that generation; flips that all lose release the fence.
+//! * **(F2)** a zero-byte prior is superseded with no obligation for it.
+//! * **(H2)** a bucket marker deleted just before the flip answers `NoSuchBucket`.
+//! * **(J)** a flip the store refuses for good releases the fence and stops.
+//! * **(G0-flip)** an unknown flip outcome stops in doubt, with nothing sent after it.
+//! * **(K)** a list past one flat map stops, with no commit or after one release.
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
-use std::sync::Mutex;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use wyrd_core::metadata::{self, ChunkRef, EcScheme, InodeId, SegmentGroup, SegmentNonce};
+use futures_util::stream::{self, Stream};
+use sha2::{Digest as _, Sha256};
+use wyrd_core::metadata::{
+    self, ChunkMap, ChunkRef, DirentRecord, EcScheme, InodeId, InodeRecord, ObjectMeta,
+    SegmentGroup, SegmentNonce,
+};
 use wyrd_core::multipart::abort::abort_session;
+use wyrd_core::multipart::commit::upload_part;
 use wyrd_core::multipart::complete::{
-    fence_complete, CompleteError, CompleteRequest, DoubtfulCommit, FenceOutcome, FenceState,
-    HeldFence, InDoubt, NamedParts, Stop, Stopped,
+    complete_upload, fence_complete, CompleteError, CompleteRequest, DoubtfulCommit, FenceOutcome,
+    FenceState, HeldFence, InDoubt, NamedParts, PublishRequest, Stop, Stopped,
 };
 use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
+use wyrd_core::multipart::stage::{StageClock, StageRequest, StageRuntime};
 use wyrd_core::multipart::{
-    complete_fingerprint, decode_part_record, decode_part_summary, decode_session_record, mpu_key,
-    multipart_etag, part_key, psum_key, psum_range, AbortOutcome, Budget, CompleteOutcome,
-    CreateOutcome, Digest, InvalidPart, PartNumber, PartSummary, Publication, RecordError, Refusal,
-    SessionRecord, SessionState, UploadId, MAX_COMPLETE_ATTEMPTS, MPU_PREFIX,
+    complete_fingerprint, decode_part_record, decode_part_summary, decode_retire_obligation,
+    decode_session_record, mpu_key, multipart_etag, part_key, part_range, psum_key, psum_range,
+    AbortOutcome, AttemptId, Budget, CompleteOutcome, CreateOutcome, Digest, InvalidPart,
+    PartNumber, PartNumberSet, PartScope, PartSummary, Publication, RecordError, Refusal,
+    RetireMode, RetirePayload, RetireToken, RetiredMap, SessionRecord, SessionState, UploadId,
+    UploadPartOutcome, MAX_COMPLETE_ATTEMPTS, MAX_INFLIGHT_PARTS, MAX_PART_CHUNKS, MPU_PREFIX,
+    RETIRE_BYTES_PREFIX, RETIRE_RECORDS_PREFIX,
 };
+use wyrd_core::placement::Topology;
+use wyrd_core::read::read_object;
+use wyrd_core::staged_publication::{self, PublicationError, SegmentBatchInfo};
+use wyrd_core::write;
 use wyrd_metadata_redb::RedbMetadataStore;
+use wyrd_testkit::{Clock, ManualClock};
 use wyrd_traits::{
-    classify, BoxError, CommitOutcome, CommitUnknownResult, ErrorClass, MetadataStore,
-    Result as StoreResult, ScanPage, TransientFault, WriteBatch,
+    classify, BoxError, ChunkId, ChunkStore, CommitOutcome, CommitUnknownResult, DServerId,
+    ErrorClass, FragmentId, Health, MetadataStore, PlacementChunkStore, Result as StoreResult,
+    ScanPage, TransientFault, WriteBatch, WriteDeadlineExpired,
 };
 
 // ─────────────────────────────── fixtures ───────────────────────────────
@@ -288,6 +332,26 @@ enum OnCommit {
     /// Arm this for the reads after it — a read that fails only behind the fence — then do the
     /// step it carries.
     Arm(Arm, Box<OnCommit>),
+    /// Run this real operation on the inner store first — an `UploadPart`, an ordinary
+    /// `PutObject` — then do the step it carries (#1008).
+    Run(Interfere, Box<OnCommit>),
+}
+
+/// A real operation [`Logged`] runs on its inner store just before a commit of the Complete under
+/// test: what another client does at that instant, through the production path it would use.
+#[async_trait]
+trait Interference: Send + Sync {
+    async fn run(&self, store: &RedbMetadataStore);
+}
+
+/// An [`Interference`] a script step carries.
+#[derive(Clone)]
+struct Interfere(Arc<dyn Interference>);
+
+impl fmt::Debug for Interfere {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Interfere")
+    }
 }
 
 /// Something [`Logged`] does to reads from the moment it is armed.
@@ -399,6 +463,10 @@ impl Logged {
                 self.arm(arm);
                 Box::pin(self.step(*then, batch)).await
             }
+            OnCommit::Run(interfere, then) => {
+                interfere.0.run(&self.inner).await;
+                Box::pin(self.step(*then, batch)).await
+            }
         }
     }
 }
@@ -473,6 +541,11 @@ struct Upload {
 /// A store holding the bucket and session 1, made by Create, with each `(n, digest byte)` of
 /// `parts` planted as a committed part.
 async fn upload(parts: &[(u32, u8)]) -> Upload {
+    upload_with(parts, None).await
+}
+
+/// [`upload`], with the session created declaring `content_type`.
+async fn upload_with(parts: &[(u32, u8)], content_type: Option<&str>) -> Upload {
     let inner = RedbMetadataStore::in_memory().unwrap();
     let bucket = WriteBatch::new().put(metadata::bucket_key(BUCKET), MARKER);
     assert_eq!(
@@ -484,7 +557,7 @@ async fn upload(parts: &[(u32, u8)]) -> Upload {
         bucket: BUCKET,
         parent: ROOT,
         object: &object,
-        content_type: None,
+        content_type,
         created_at_millis: CREATED_AT,
         clock_source: CLOCK,
     };
@@ -623,7 +696,10 @@ fn stopped_error(
     );
     assert_eq!(
         has_source,
-        matches!(stopped.cause, Stop::Store(_) | Stop::Record(_)),
+        matches!(
+            stopped.cause,
+            Stop::Store(_) | Stop::Record(_) | Stop::Target(_) | Stop::Publication(_)
+        ),
         "the source is the cause's own error: {text}"
     );
     (text, stopped)
@@ -692,6 +768,7 @@ fn in_doubt_error(
         DoubtfulCommit::Release { epoch } => {
             format!("the release of its fence at Completing@{epoch}")
         }
+        DoubtfulCommit::Flip { epoch } => format!("its root flip from Completing@{epoch}"),
     };
     assert!(text.contains(&about), "expected {about:?} in: {text}");
     let may = if may_still_commit {
@@ -2593,4 +2670,1664 @@ async fn a_definite_fence_failure_or_a_torn_session_is_stopped_with_no_fence_pla
 #[test]
 fn an_empty_list_is_not_a_request() {
     assert_eq!(NamedParts::new(Vec::new()), Err(RecordError::NoPartsNamed));
+}
+
+// ═════════════════════════════ #1008: the flat publication ═════════════════════════════
+
+/// Bytes per staged chunk: small, so a part spans several chunks.
+const CHUNK: usize = 64;
+/// Six fragments per chunk.
+const RS42: EcScheme = EcScheme::ReedSolomon { k: 4, m: 2 };
+/// Twelve D servers, each its own failure domain.
+const SERVERS: u64 = 12;
+/// The lease every part attempt is staged with: above the part commit's five-second dispatch
+/// margin, which it must exceed.
+const TTL: u64 = 10_000;
+/// `W_write` for a staged fragment.
+const W: u64 = 3_000;
+/// The body-idle bound: never reached, since no leg moves the staging clock.
+const IDLE: u64 = 100 * TTL;
+/// When the caller read the clock for the flip: the session's clock, after the fence.
+const COMPLETED_AT: u64 = 2_500;
+/// The inode a flip onto a free name creates.
+const FRESH_INODE: InodeId = 500;
+/// The content type the (A) session is created with.
+const CONTENT_TYPE: &str = "video/mp4";
+/// The inode an ordinary `PutObject` creates the target under, when a leg needs a prior.
+const PUT_INODE: InodeId = 900;
+/// The stated bound on one Complete's flips, written out rather than read from `R_PUBLISH`, so a
+/// change to the bound has to change this number too.
+const STATED_PUBLISH_ROUNDS: u32 = 3;
+/// The stated flat ceiling, written out rather than read from `MAX_MAP_CHUNKS`, for the same
+/// reason.
+const STATED_FLAT_CHUNKS: u64 = 158;
+
+/// What every leg's Complete publishes with.
+const PUBLISH: PublishRequest = PublishRequest {
+    fresh_inode: FRESH_INODE,
+    completed_at_millis: COMPLETED_AT,
+};
+
+/// `len` deterministic body bytes, distinct per `seed`.
+fn body(len: usize, seed: u8) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+        .collect()
+}
+
+fn sha256(bytes: &[u8]) -> Digest {
+    Digest::from_bytes(Sha256::digest(bytes).into())
+}
+
+type Body = Pin<Box<dyn Stream<Item = StoreResult<Bytes>> + Send>>;
+
+fn stream_of(body: &[u8]) -> Body {
+    let pieces = if body.is_empty() {
+        Vec::new()
+    } else {
+        vec![Ok(Bytes::copy_from_slice(body))]
+    };
+    Box::pin(stream::iter(pieces))
+}
+
+fn topology() -> Topology {
+    let mut topology = Topology::default();
+    for id in 0..SERVERS {
+        topology.register(id, format!("d{id:02}"));
+    }
+    topology
+}
+
+// ──────────────────────── the placement-aware chunk store ────────────────────────
+
+/// In-process D servers addressed by id: what staging writes each fragment to, at the server its
+/// placement names, and what `read_object` reads them back from. A put past its deadline is
+/// refused at its publication point, as `PlacementChunkStore::put_fragment_at` requires.
+#[derive(Clone)]
+struct Fleet(Arc<FleetState>);
+
+struct FleetState {
+    servers: Mutex<HashMap<DServerId, HashMap<FragmentId, Bytes>>>,
+    clock: ManualClock,
+}
+
+impl Fleet {
+    fn new(clock: &ManualClock) -> Self {
+        Self(Arc::new(FleetState {
+            servers: Mutex::new((0..SERVERS).map(|id| (id, HashMap::new())).collect()),
+            clock: clock.clone(),
+        }))
+    }
+
+    /// Every chunk id a fragment of which is stored anywhere.
+    fn chunks(&self) -> BTreeSet<ChunkId> {
+        self.0
+            .servers
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|held| held.keys().map(|id| id.chunk).collect::<Vec<_>>())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ChunkStore for Fleet {
+    async fn put_fragment(
+        &self,
+        _id: FragmentId,
+        _fragment: Bytes,
+        _deadline_millis: Option<u64>,
+    ) -> StoreResult<()> {
+        Err("Fleet: a write must address a D server".into())
+    }
+
+    async fn get_fragment(&self, _id: FragmentId) -> StoreResult<Option<Bytes>> {
+        Ok(None)
+    }
+
+    async fn list_fragments(&self) -> StoreResult<Vec<FragmentId>> {
+        Ok(self
+            .0
+            .servers
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|held| held.keys().copied().collect::<Vec<_>>())
+            .collect())
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> StoreResult<()> {
+        for held in self.0.servers.lock().unwrap().values_mut() {
+            held.remove(&id);
+        }
+        Ok(())
+    }
+
+    async fn health(&self) -> StoreResult<Health> {
+        Ok(Health::Healthy)
+    }
+}
+
+#[async_trait]
+impl PlacementChunkStore for Fleet {
+    async fn get_fragment_at(
+        &self,
+        dserver: DServerId,
+        id: FragmentId,
+    ) -> StoreResult<Option<Bytes>> {
+        Ok(self
+            .0
+            .servers
+            .lock()
+            .unwrap()
+            .get(&dserver)
+            .and_then(|held| held.get(&id).cloned()))
+    }
+
+    async fn put_fragment_at(
+        &self,
+        dserver: DServerId,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> StoreResult<()> {
+        if let Some(deadline) = deadline_millis {
+            if let Some(refused) =
+                WriteDeadlineExpired::if_elapsed(id, deadline, self.0.clock.now_millis())
+            {
+                return Err(Box::new(refused));
+            }
+        }
+        self.0
+            .servers
+            .lock()
+            .unwrap()
+            .get_mut(&dserver)
+            .ok_or_else(|| format!("Fleet: unknown D server {dserver}"))?
+            .insert(id, fragment);
+        Ok(())
+    }
+}
+
+// ─────────────────────────── staging and ordinary writes ───────────────────────────
+
+/// The clock every part is staged and committed on, and a timer that never fires: no leg moves
+/// the clock, so no renewal falls due and no staging bound is reached.
+struct Runtime {
+    clock: ManualClock,
+    next_chunk: Arc<AtomicU64>,
+}
+
+impl StageClock for Runtime {
+    fn now_millis(&self) -> u64 {
+        self.clock.now_millis()
+    }
+}
+
+impl StageRuntime for Runtime {
+    fn next_chunk_id(&mut self) -> ChunkId {
+        ChunkId::from(self.next_chunk.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn wait(&self, _millis: u64) -> impl Future<Output = ()> + Send {
+        std::future::pending()
+    }
+}
+
+/// What every `UploadPart` and ordinary `PutObject` of one leg shares: the chunk store, the
+/// staging clock, one chunk-id sequence (so no two writes mint the same chunk) and the session.
+#[derive(Clone)]
+struct Stager {
+    fleet: Fleet,
+    clock: ManualClock,
+    topology: Arc<Topology>,
+    upload: UploadId,
+    next_chunk: Arc<AtomicU64>,
+    next_attempt: Arc<AtomicU64>,
+}
+
+impl Stager {
+    /// `UploadPart` of `bytes` as part `n` in chunks of `chunk_size`, through #1027's composed
+    /// verb (reserve, stage, commit) on `store`. It must commit; returns the part's digest.
+    async fn upload(
+        &self,
+        store: &RedbMetadataStore,
+        n: u32,
+        bytes: &[u8],
+        chunk_size: usize,
+    ) -> Digest {
+        let attempt = self.next_attempt.fetch_add(1, Ordering::SeqCst) + 1;
+        let attempt =
+            AttemptId::new(format!("{:032x}", 0xa77e_0000_u128 + u128::from(attempt))).unwrap();
+        let request = StageRequest {
+            upload_id: &self.upload,
+            part_number: part(n),
+            attempt_id: &attempt,
+            max_inflight_parts: MAX_INFLIGHT_PARTS,
+            lease_ttl_millis: TTL,
+            chunk_size,
+            scheme: RS42,
+            topology: &self.topology,
+            write_window_millis: W,
+            max_part_chunks: MAX_PART_CHUNKS,
+            body_idle_millis: IDLE,
+        };
+        let mut runtime = Runtime {
+            clock: self.clock.clone(),
+            next_chunk: Arc::clone(&self.next_chunk),
+        };
+        let outcome =
+            upload_part(store, &self.fleet, &mut runtime, &request, stream_of(bytes)).await;
+        match outcome {
+            Ok(UploadPartOutcome::Committed {
+                part_number,
+                digest,
+            }) => {
+                assert_eq!(part_number, part(n));
+                assert_eq!(digest, sha256(bytes), "part {n}'s digest is its body's");
+                digest
+            }
+            other => panic!("expected part {n} committed, got {other:?}"),
+        }
+    }
+
+    /// An ordinary `PutObject` of `bytes` at `name`, through the single-PUT write path
+    /// (`write.rs`: plan, place, intent, fragments, commit, release), stamped `at`: a create under
+    /// `fresh` when the name is free, else an overwrite of the inode its dirent names. Returns
+    /// the inode, the version it committed and that version's chunk list.
+    async fn put_object(
+        &self,
+        store: &RedbMetadataStore,
+        name: &str,
+        fresh: InodeId,
+        bytes: &[u8],
+        at: u64,
+    ) -> (InodeId, u64, Vec<ChunkRef>) {
+        let next = Arc::clone(&self.next_chunk);
+        let mut plan = write::plan_write(bytes, CHUNK, RS42, || {
+            ChunkId::from(next.fetch_add(1, Ordering::SeqCst) + 1)
+        })
+        .unwrap();
+        plan.place(&self.topology).unwrap();
+        plan.object_meta = ObjectMeta {
+            etag: Some(sha256(bytes).to_hex()),
+            content_type: None,
+            modified: Some(at),
+        };
+        write::intent(store, &plan, at + TTL).await.unwrap();
+        write::write_fragments(&self.fleet, &plan).await.unwrap();
+        let dirent = store.get(&metadata::dirent_key(ROOT, name)).await.unwrap();
+        let (id, outcome) = match dirent {
+            None => (
+                fresh,
+                write::commit_create(store, ROOT, name, fresh, &plan, at)
+                    .await
+                    .unwrap(),
+            ),
+            Some(dirent) => {
+                let DirentRecord { inode: id } = metadata::decode(&dirent).unwrap();
+                let prior = inode_at(store, id).await.expect("the bound inode");
+                let outcome = write::commit_overwrite(store, id, &prior, &plan, at)
+                    .await
+                    .unwrap();
+                (id, outcome)
+            }
+        };
+        assert_eq!(outcome, CommitOutcome::Committed, "the PutObject lands");
+        write::release(store, &plan).await.unwrap();
+        let record = inode_at(store, id).await.expect("the published inode");
+        (id, record.version, plan.chunk_refs())
+    }
+}
+
+/// The inode record `id`, if present.
+async fn inode_at(store: &impl MetadataStore, id: InodeId) -> Option<InodeRecord> {
+    let bytes = store.get(&metadata::inode_key(id)).await.unwrap();
+    bytes.map(|bytes| metadata::decode(&bytes).expect("a valid inode"))
+}
+
+/// Another client's `UploadPart` of part `n`, landing just before a commit of the Complete.
+struct ReUpload {
+    stager: Stager,
+    n: u32,
+    bytes: Vec<u8>,
+    chunk_size: usize,
+}
+
+#[async_trait]
+impl Interference for ReUpload {
+    async fn run(&self, store: &RedbMetadataStore) {
+        self.stager
+            .upload(store, self.n, &self.bytes, self.chunk_size)
+            .await;
+    }
+}
+
+/// Another client's ordinary `PutObject` overwrite of `name`, landing just before a commit of the
+/// Complete. It keeps what it published, so a leg can name the generation it superseded.
+struct Overwrite {
+    stager: Stager,
+    name: String,
+    bytes: Vec<u8>,
+    at: u64,
+    landed: Mutex<Vec<(u64, Vec<ChunkRef>)>>,
+}
+
+#[async_trait]
+impl Interference for Overwrite {
+    async fn run(&self, store: &RedbMetadataStore) {
+        let (_, version, chunks) = self
+            .stager
+            .put_object(store, &self.name, PUT_INODE, &self.bytes, self.at)
+            .await;
+        self.landed.lock().unwrap().push((version, chunks));
+    }
+}
+
+/// One session made by Create, with a stager for it and nothing staged yet.
+struct Rig {
+    up: Upload,
+    stager: Stager,
+}
+
+async fn rig() -> Rig {
+    rig_with(None).await
+}
+
+/// [`rig`], with the session created declaring `content_type`.
+async fn rig_with(content_type: Option<&str>) -> Rig {
+    let up = upload_with(&[], content_type).await;
+    let clock = ManualClock::new(CREATED_AT);
+    let stager = Stager {
+        fleet: Fleet::new(&clock),
+        clock,
+        topology: Arc::new(topology()),
+        upload: up.id.clone(),
+        next_chunk: Arc::new(AtomicU64::new(0)),
+        next_attempt: Arc::new(AtomicU64::new(0)),
+    };
+    Rig { up, stager }
+}
+
+impl Rig {
+    /// `UploadPart` of part `n` in [`CHUNK`]-byte chunks, outside the wrapper. Returns its digest.
+    async fn stage(&self, n: u32, bytes: &[u8]) -> Digest {
+        self.stager
+            .upload(&self.up.store.inner, n, bytes, CHUNK)
+            .await
+    }
+
+    /// The verb, through the wrapper.
+    async fn complete(&self, parts: &NamedParts) -> Result<CompleteOutcome, CompleteError> {
+        complete_upload(
+            &self.up.store,
+            &self.up.id,
+            &self.up.request(parts),
+            &PUBLISH,
+        )
+        .await
+    }
+
+    /// An ordinary `PutObject` at the session's own target, outside the wrapper.
+    async fn put_target(&self, bytes: &[u8], at: u64) -> (InodeId, u64, Vec<ChunkRef>) {
+        self.stager
+            .put_object(&self.up.store.inner, &self.up.object, PUT_INODE, bytes, at)
+            .await
+    }
+
+    /// A step that re-uploads part `n` as `bytes` in `chunk_size`-byte chunks, then does `then`.
+    fn re_upload(&self, n: u32, bytes: &[u8], chunk_size: usize, then: OnCommit) -> OnCommit {
+        let interference = ReUpload {
+            stager: self.stager.clone(),
+            n,
+            bytes: bytes.to_vec(),
+            chunk_size,
+        };
+        OnCommit::Run(Interfere(Arc::new(interference)), Box::new(then))
+    }
+
+    /// An overwrite of the session's target as `bytes`, for a [`Self::run`] step.
+    fn overwrite(&self, bytes: &[u8], at: u64) -> Arc<Overwrite> {
+        Arc::new(Overwrite {
+            stager: self.stager.clone(),
+            name: self.up.object.clone(),
+            bytes: bytes.to_vec(),
+            at,
+            landed: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The inode the session's target name is bound to, if any.
+    async fn target(&self) -> Option<InodeId> {
+        let key = metadata::dirent_key(ROOT, &self.up.object);
+        let dirent = self.up.store.inner.get(&key).await.unwrap()?;
+        let DirentRecord { inode } = metadata::decode(&dirent).unwrap();
+        Some(inode)
+    }
+
+    /// What `read_object` returns for `inode`, which must be a committed object.
+    async fn read(&self, inode: InodeId) -> Vec<u8> {
+        read_object(&self.up.store.inner, &self.stager.fleet, inode)
+            .await
+            .expect("the read ran")
+            .expect("a committed object")
+    }
+
+    /// Every `retire:` obligation under `prefix`, each decoded against its own key: one that does
+    /// not decode fails the leg.
+    async fn obligations(&self, prefix: &[u8]) -> Vec<(RetireMode, RetireToken, RetirePayload)> {
+        let mut found = Vec::new();
+        for (key, value) in self.up.store.inner.scan(prefix).await.unwrap() {
+            let decoded = decode_retire_obligation(&key, &value);
+            found.push(decoded.unwrap_or_else(|torn| {
+                panic!("{} does not decode: {torn}", String::from_utf8_lossy(&key))
+            }));
+        }
+        found
+    }
+
+    /// The chunk ids part `n`'s `part:` record names, which must exist.
+    async fn part_chunks(&self, n: u32) -> BTreeSet<ChunkId> {
+        let key = part_key(&self.up.id, part(n));
+        let value = self.up.store.inner.get(&key).await.unwrap();
+        let record = decode_part_record(&value.expect("the part record")).unwrap();
+        record.chunks().iter().map(|chunk| chunk.id).collect()
+    }
+
+    /// **C-1, whole-store**: every chunk a fragment of which the fleet stores is named by a
+    /// published root, a `part:` record, an owned `sidx:` entry or a `retire:bytes:` obligation's
+    /// chunk list (an ordinary overwrite's superseded chunks carry `orphan:` marks instead, so
+    /// `superseded` names them).
+    async fn assert_every_fragment_named(&self, superseded: &BTreeSet<ChunkId>) {
+        let inner = &self.up.store.inner;
+        let mut named = superseded.clone();
+        for (_, value) in inner.scan(b"inode:").await.unwrap() {
+            let record: InodeRecord = metadata::decode(&value).unwrap();
+            let chunks = record.chunk_map.as_flat().expect("a flat root");
+            named.extend(chunks.iter().map(|chunk| chunk.id));
+        }
+        for (_, value) in inner.scan(wyrd_core::multipart::PART_PREFIX).await.unwrap() {
+            let record = decode_part_record(&value).unwrap();
+            named.extend(record.chunks().iter().map(|chunk| chunk.id));
+        }
+        for (key, _) in inner.scan(wyrd_core::multipart::SIDX_PREFIX).await.unwrap() {
+            named.insert(wyrd_core::multipart::parse_sidx_key(&key).unwrap().2);
+        }
+        for (_, _, payload) in self.obligations(RETIRE_BYTES_PREFIX).await {
+            named.extend(payload.chunks().iter().map(|chunk| chunk.id));
+            if let Some(RetiredMap::Flat(chunks)) = payload.generation().map(|g| g.map()) {
+                named.extend(chunks.iter().map(|chunk| chunk.id));
+            }
+        }
+        let unnamed: Vec<_> = self
+            .stager
+            .fleet
+            .chunks()
+            .difference(&named)
+            .copied()
+            .collect();
+        assert!(
+            unnamed.is_empty(),
+            "stored chunks nothing names: {unnamed:?}"
+        );
+    }
+}
+
+/// `outcome` as the fence phase's, for the assertions above that read one.
+fn as_fence(
+    outcome: Result<CompleteOutcome, CompleteError>,
+) -> Result<FenceOutcome, CompleteError> {
+    outcome.map(FenceOutcome::Answered)
+}
+
+/// The publication a request answered `Published` with.
+fn published(outcome: Result<CompleteOutcome, CompleteError>) -> Publication {
+    match outcome {
+        Ok(CompleteOutcome::Published(publication)) => publication,
+        other => panic!("expected Published, got {other:?}"),
+    }
+}
+
+/// The named list over `parts`, each with its staged digest.
+fn list_of(parts: &[(u32, Digest)]) -> NamedParts {
+    NamedParts::new(parts.iter().map(|&(n, d)| (part(n), d)).collect()).unwrap()
+}
+
+/// The set of part numbers `numbers`.
+fn set_of(numbers: &[u32]) -> PartScope {
+    PartScope::Set(PartNumberSet::from_numbers(numbers.iter().map(|&n| part(n))).unwrap())
+}
+
+/// The session token at the fence epoch `epoch`.
+fn session_token(id: &UploadId, epoch: u64) -> RetireToken {
+    RetireToken::Session {
+        upload_id: id.clone(),
+        epoch,
+        part: None,
+    }
+}
+
+/// `batch`'s exact-value precondition at `key`, if it has one.
+fn required(batch: &WriteBatch, key: &[u8]) -> Option<Bytes> {
+    batch
+        .preconditions
+        .iter()
+        .find(|p| p.key == key)
+        .and_then(|p| p.expected.clone())
+}
+
+/// The version a flip `batch` puts at inode `id`.
+fn flip_version(batch: &WriteBatch, id: InodeId) -> u64 {
+    let key = metadata::inode_key(id);
+    let (_, value) = batch
+        .puts
+        .iter()
+        .find(|(k, _)| *k == key)
+        .expect("the flip puts the root");
+    metadata::decode::<InodeRecord>(value).unwrap().version
+}
+
+/// `flip` is a root flip of the fence `fence` put: it requires the fence's bytes and the bucket
+/// marker validated behind it, puts the session at `Completed`, and installs every obligation it
+/// puts under `require_absent`.
+fn assert_flip(flip: &WriteBatch, up: &Upload, fence: &Bytes) {
+    assert_eq!(
+        required(flip, &mpu_key(&up.id)).as_ref(),
+        Some(fence),
+        "the fence pin"
+    );
+    assert_eq!(
+        required(flip, &metadata::bucket_key(BUCKET)).as_deref(),
+        Some(MARKER),
+        "the bucket marker pin"
+    );
+    let (_, session) = flip
+        .puts
+        .iter()
+        .find(|(k, _)| *k == mpu_key(&up.id))
+        .expect("the flip moves the session");
+    let session = decode_session_record(session).unwrap();
+    assert!(matches!(session.state(), SessionState::Completed { .. }));
+    for (key, _) in flip.puts.iter().filter(|(k, _)| k.starts_with(b"retire:")) {
+        assert!(
+            flip.preconditions
+                .iter()
+                .any(|p| p.key == *key && p.expected.is_none()),
+            "{} is installed under require_absent",
+            String::from_utf8_lossy(key)
+        );
+    }
+}
+
+/// `up`'s session is `Open@2` with no attempt spent — the fence at `Completing@1` released by
+/// `release`, the last batch, which required the fence's bytes — and no name is bound.
+async fn assert_released_with_nothing_published(
+    rig: &Rig,
+    fence: &WriteBatch,
+    release: &WriteBatch,
+) {
+    assert_released(rig, fence, release).await;
+    assert_eq!(rig.target().await, None, "no dirent for the key");
+}
+
+/// `up`'s session is `Open@2` with no attempt spent — the fence at `Completing@1` released by
+/// `release`, which required the fence's bytes — and the flip published nothing: no inode under
+/// [`FRESH_INODE`] and no flip obligation.
+async fn assert_released(rig: &Rig, fence: &WriteBatch, release: &WriteBatch) {
+    let up = &rig.up;
+    let (_, fenced) = session_cas(fence, &up.id);
+    let (required, put) = session_cas(release, &up.id);
+    assert_eq!(
+        required, fenced,
+        "the release requires the fence's own bytes"
+    );
+    let expected = session_bytes(&up.open, 2, 0, OPEN);
+    assert_eq!(put, expected, "Open@E+2, the attempt given back");
+    assert_eq!(up.session().await.0, expected, "the release landed");
+    assert_eq!(
+        inode_at(&up.store.inner, FRESH_INODE).await,
+        None,
+        "no inode"
+    );
+    assert!(
+        rig.obligations(RETIRE_RECORDS_PREFIX).await.is_empty(),
+        "no flip obligation"
+    );
+}
+
+/// Three parts of several chunks each: part 1 is 100 bytes, a non-final part whose length is not
+/// a whole multiple of [`CHUNK`].
+fn three_bodies() -> [(u32, Vec<u8>); 3] {
+    [(1, body(100, 1)), (2, body(128, 2)), (3, body(70, 3))]
+}
+
+/// Stage `bodies` in the order given; returns each part's digest by part number.
+async fn stage_all(rig: &Rig, bodies: &[(u32, Vec<u8>)]) -> BTreeMap<u32, Digest> {
+    let mut digests = BTreeMap::new();
+    for (n, bytes) in bodies {
+        digests.insert(*n, rig.stage(*n, bytes).await);
+    }
+    digests
+}
+
+// ───────────────────────── (A) publish and read back ─────────────────────────
+
+/// **(A)** Parts staged out of order — 3, 1, 2 — with part 1 a non-final part of 100 bytes in
+/// 64-byte chunks. A Complete naming all three answers `Published` in two commits, the fence and
+/// the flip, and:
+///
+/// * `read_object` returns the three bodies concatenated in part order, byte for byte;
+/// * the root is a flat map of every part's chunks, in part order, at version 1 under the fresh
+///   inode, stamped with the publication time and the session's content type, and the dirent
+///   names it;
+/// * the inode's ETag and the session's `Completion.etag` are both `multipart_etag` over the
+///   named `(part, digest)` list, and the session is `Completed@2` with that list's
+///   `complete_fingerprint`, the publication stamp, and the fence's attempt still spent.
+///
+/// An identical retry then answers `AlreadyCompleted` with that same publication, sending nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parts_staged_out_of_order_publish_one_flat_object_that_reads_back() {
+    within(async {
+        let rig = rig_with(Some(CONTENT_TYPE)).await;
+        let bodies = three_bodies();
+        assert_ne!(
+            bodies[0].1.len() % CHUNK,
+            0,
+            "a non-final part off the chunk size"
+        );
+        let out_of_order = [bodies[2].clone(), bodies[0].clone(), bodies[1].clone()];
+        let digests = stage_all(&rig, &out_of_order).await;
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2]), (3, digests[&3])]);
+        let (_, before) = rig.up.session().await;
+
+        let publication = published(rig.complete(&list).await);
+
+        let commits = rig.up.store.take_commits();
+        assert_eq!(commits.len(), 2, "the fence and the flip");
+        let (_, fence) = session_cas(&commits[0], &rig.up.id);
+        assert_flip(&commits[1], &rig.up, &fence);
+        let etag = multipart_etag(list.as_slice()).unwrap();
+        assert_eq!(
+            publication,
+            Publication {
+                inode: FRESH_INODE,
+                version: 1,
+                etag,
+                completed_at_millis: COMPLETED_AT,
+            }
+        );
+        let concatenated: Vec<u8> = bodies.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(rig.read(FRESH_INODE).await, concatenated, "byte for byte");
+        assert_eq!(rig.target().await, Some(FRESH_INODE), "the dirent names it");
+
+        let inode = inode_at(&rig.up.store.inner, FRESH_INODE).await.unwrap();
+        let ChunkMap::Flat(chunks) = &inode.chunk_map else {
+            panic!("expected a flat root, got {:?}", inode.chunk_map);
+        };
+        let mut in_part_order = Vec::new();
+        for n in 1..=3 {
+            let key = part_key(&rig.up.id, part(n));
+            let record = rig.up.store.inner.get(&key).await.unwrap().unwrap();
+            in_part_order.extend(decode_part_record(&record).unwrap().chunks().to_vec());
+        }
+        assert_eq!(chunks, &in_part_order, "every part's chunks, in part order");
+        assert_eq!(inode.size, concatenated.len() as u64);
+        assert_eq!(inode.version, 1);
+        assert_eq!(inode.etag, Some(etag.to_string()), "the inode's ETag");
+        assert_eq!(inode.modified, Some(COMPLETED_AT));
+        assert_eq!(
+            inode.content_type.as_deref(),
+            Some(CONTENT_TYPE),
+            "the session's content type"
+        );
+
+        let (_, after) = rig.up.session().await;
+        let SessionState::Completed { completion } = after.state() else {
+            panic!("expected Completed, got {:?}", after.state());
+        };
+        assert_eq!(completion.etag, etag, "the session's ETag");
+        assert_eq!(
+            completion.complete_fingerprint,
+            complete_fingerprint(list.as_slice()).unwrap()
+        );
+        assert_eq!((completion.inode, completion.version), (FRESH_INODE, 1));
+        assert_eq!(completion.completed_at_millis, COMPLETED_AT);
+        assert_eq!(after.epoch(), before.epoch() + 2, "Completed@E+2");
+        assert_eq!(
+            after.attempts(),
+            before.attempts() + 1,
+            "the fence's attempt stays spent"
+        );
+        rig.assert_every_fragment_named(&BTreeSet::new()).await;
+
+        let again = rig.complete(&list).await;
+        let Ok(CompleteOutcome::AlreadyCompleted(recorded)) = again else {
+            panic!("expected AlreadyCompleted, got {again:?}");
+        };
+        assert_eq!(recorded, publication, "the recorded publication");
+        assert!(
+            rig.up.store.take_commits().is_empty(),
+            "the retry sends nothing"
+        );
+    })
+    .await;
+}
+
+// ─────────────────── (D2-tail) after D1 and D2, a valid list publishes ───────────────────
+
+/// **(D2-tail)** On one session: `MAX_COMPLETE_ATTEMPTS` typos (D1), each refused with nothing
+/// written; then `MAX_COMPLETE_ATTEMPTS` requests each valid when first read while another
+/// client's `UploadPart` replaces part 2 just before the fence commits (D2), each fenced,
+/// rejected and released. Then a valid list answers `Published`, not
+/// `CompleteAttemptsExhausted`, and the object reads back with part 2's last body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn d2_tail_after_typos_and_replaced_parts_a_valid_list_publishes() {
+    within(async {
+        let rig = rig().await;
+        let mut bodies = three_bodies();
+        let digests = stage_all(&rig, &bodies).await;
+        let mut current = digests[&2];
+
+        // D1.
+        let typos = [
+            list_of(&[(1, digests[&1]), (4, digests[&1])]),
+            list_of(&[(1, digests[&1]), (2, digests[&1])]),
+            list_of(&[(2, digests[&2]), (1, digests[&1])]),
+        ];
+        assert!(typos.len() >= MAX_COMPLETE_ATTEMPTS as usize);
+        for typo in &typos {
+            let refusal = refused(as_fence(rig.complete(typo).await));
+            assert!(
+                matches!(refusal, Refusal::InvalidPart { .. }),
+                "{refusal:?}"
+            );
+            assert!(
+                rig.up.store.take_commits().is_empty(),
+                "a typo fences nothing"
+            );
+        }
+
+        // D2.
+        for k in 0..MAX_COMPLETE_ATTEMPTS {
+            let list = list_of(&[(1, digests[&1]), (2, current), (3, digests[&3])]);
+            let replacement = body(128, 0x40 + k as u8);
+            rig.up.store.script(
+                vec![rig.re_upload(2, &replacement, CHUNK, OnCommit::Pass)],
+                None,
+            );
+            let (before_bytes, before) = rig.up.session().await;
+            assert_eq!(
+                refused(as_fence(rig.complete(&list).await)),
+                part_2_replaced(),
+                "replacement {k}"
+            );
+            assert_fenced_and_released(&rig.up, (&before_bytes, &before)).await;
+            current = sha256(&replacement);
+            bodies[1].1 = replacement;
+        }
+
+        let (_, before) = rig.up.session().await;
+        assert_eq!(before.attempts(), 0, "no request spent the budget");
+        let list = list_of(&[(1, digests[&1]), (2, current), (3, digests[&3])]);
+        let publication = published(rig.complete(&list).await);
+        let concatenated: Vec<u8> = bodies.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(rig.read(publication.inode).await, concatenated);
+        assert_eq!(rig.up.session().await.1.attempts(), 1);
+    })
+    .await;
+}
+
+// ─────────────────────────── (C) a subset Complete ───────────────────────────
+
+/// **(C)** Stage parts 1, 2 and 3; a Complete naming 1 and 3 publishes parts 1 + 3 (`0016:1034`).
+/// The flip installs exactly two obligations, each decoding against its key: `retire:records:`
+/// naming **only** parts 1 and 3, and `retire:bytes:` naming part 2, its bytes and then its
+/// records.
+/// No chunk of part 1 or 3 is in any `retire:bytes:` obligation, and part 2's `part:` record is
+/// still there for that obligation's drain to read (`0016:910-925`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn c_a_subset_complete_retires_the_published_records_and_the_unnamed_bytes() {
+    within(async {
+        let rig = rig().await;
+        let bodies = three_bodies();
+        let digests = stage_all(&rig, &bodies).await;
+        let list = list_of(&[(1, digests[&1]), (3, digests[&3])]);
+
+        let publication = published(rig.complete(&list).await);
+
+        let expected: Vec<u8> = [&bodies[0].1, &bodies[2].1]
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(rig.read(publication.inode).await, expected, "parts 1 + 3");
+        let token = session_token(&rig.up.id, 1);
+
+        let records = rig.obligations(RETIRE_RECORDS_PREFIX).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "one retire:records: obligation: {records:?}"
+        );
+        let (mode, found, payload) = &records[0];
+        assert_eq!((mode, found), (&RetireMode::Records, &token));
+        assert_eq!(
+            payload.parts(),
+            Some(&set_of(&[1, 3])),
+            "only the published parts"
+        );
+        assert!(!payload.session() && payload.chunks().is_empty());
+        assert!(payload.generation().is_none() && payload.segments().is_none());
+
+        let bytes = rig.obligations(RETIRE_BYTES_PREFIX).await;
+        assert_eq!(bytes.len(), 1, "one retire:bytes: obligation: {bytes:?}");
+        let (mode, found, payload) = &bytes[0];
+        assert_eq!((mode, found), (&RetireMode::Bytes, &token));
+        assert_eq!(payload.parts(), Some(&set_of(&[2])), "the unnamed part");
+        assert!(!payload.session() && payload.generation().is_none());
+
+        let published_chunks: BTreeSet<ChunkId> =
+            [rig.part_chunks(1).await, rig.part_chunks(3).await]
+                .into_iter()
+                .flatten()
+                .collect();
+        for (_, token, payload) in &bytes {
+            let mut owed: BTreeSet<ChunkId> = payload.chunks().iter().map(|c| c.id).collect();
+            if let Some(RetiredMap::Flat(chunks)) = payload.generation().map(|g| g.map()) {
+                owed.extend(chunks.iter().map(|c| c.id));
+            }
+            assert!(
+                owed.is_disjoint(&published_chunks),
+                "{token}: no published chunk is owed"
+            );
+        }
+        assert!(
+            !rig.part_chunks(2).await.is_empty(),
+            "part 2's record is still there"
+        );
+        rig.assert_every_fragment_named(&BTreeSet::new()).await;
+    })
+    .await;
+}
+
+// ──────────────────── (F) the version comes from the re-read prior ────────────────────
+
+/// **(F)** The target exists at version 1, from an ordinary `PutObject`. An ordinary overwrite
+/// lands just before the first flip, taking it to version 2, so that flip loses. The retry
+/// re-reads the prior and publishes version **3**, never 2 again (`0016:1025`), and installs a
+/// `retire:bytes:g:` obligation naming generation 2 by its chunk list. The flip that lost
+/// offered 2; the object reads back as the parts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_a_flip_that_loses_to_an_overwrite_publishes_the_next_version_and_retires_it() {
+    within(async {
+        let rig = rig().await;
+        let (id, version, v1_chunks) = rig.put_target(&body(90, 0x71), 1_100).await;
+        assert_eq!((id, version), (PUT_INODE, 1));
+        let bodies = [(1, body(100, 1)), (2, body(80, 2))];
+        let digests = stage_all(&rig, &bodies).await;
+        let interloper = rig.overwrite(&body(150, 0x72), 1_200);
+        rig.up.store.script(
+            vec![
+                OnCommit::Pass,
+                OnCommit::Run(Interfere(interloper.clone()), Box::new(OnCommit::Pass)),
+            ],
+            None,
+        );
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+        let publication = published(rig.complete(&list).await);
+
+        assert_eq!((publication.inode, publication.version), (PUT_INODE, 3));
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            3,
+            "the fence, the flip that lost, the flip that won"
+        );
+        assert_eq!(
+            flip_version(&commits[1], PUT_INODE),
+            2,
+            "offered against version 1"
+        );
+        assert_eq!(
+            flip_version(&commits[2], PUT_INODE),
+            3,
+            "recomputed from version 2"
+        );
+        let landed = interloper.landed.lock().unwrap().clone();
+        let [(2, v2_chunks)] = landed.as_slice() else {
+            panic!("expected one overwrite to version 2, got {landed:?}");
+        };
+        let inode = inode_at(&rig.up.store.inner, PUT_INODE).await.unwrap();
+        assert_eq!(inode.version, 3);
+        assert_eq!(
+            inode.etag,
+            Some(multipart_etag(list.as_slice()).unwrap().to_string())
+        );
+        let (_, after) = rig.up.session().await;
+        let SessionState::Completed { completion } = after.state() else {
+            panic!("expected Completed, got {:?}", after.state());
+        };
+        assert_eq!((completion.inode, completion.version), (PUT_INODE, 3));
+        let concatenated: Vec<u8> = bodies.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(rig.read(PUT_INODE).await, concatenated);
+
+        let generations: Vec<_> = rig
+            .obligations(RETIRE_BYTES_PREFIX)
+            .await
+            .into_iter()
+            .filter(|(_, token, _)| matches!(token, RetireToken::Generation { .. }))
+            .collect();
+        assert_eq!(generations.len(), 1, "{generations:?}");
+        let (_, token, payload) = &generations[0];
+        assert_eq!(
+            token,
+            &RetireToken::Generation {
+                inode: PUT_INODE,
+                version: 2
+            }
+        );
+        let owed = payload.generation().expect("a generation");
+        assert_eq!(
+            owed.map(),
+            &RetiredMap::Flat(v2_chunks.clone()),
+            "generation 2's chunks"
+        );
+        // Generation 1 was superseded by the ordinary overwrite, which marked its fragments.
+        let superseded: BTreeSet<ChunkId> = v1_chunks.iter().map(|c| c.id).collect();
+        rig.assert_every_fragment_named(&superseded).await;
+    })
+    .await;
+}
+
+/// **(F, exhausted)** Every flip loses, each to an ordinary overwrite that lands just before it:
+/// [`STATED_PUBLISH_ROUNDS`] flips, each offering the version after the one just read, then the
+/// release. The request answers `OperationAborted`, the session is `Open@2` with the attempt
+/// given back, and nothing it named is published. The session stays usable: a later request
+/// with no interference publishes the next version.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f_when_every_flip_loses_the_fence_is_released_and_the_session_stays_usable() {
+    within(async {
+        let rig = rig().await;
+        rig.put_target(&body(90, 0x71), 1_100).await;
+        let digests = stage_all(&rig, &[(1, body(100, 1)), (2, body(80, 2))]).await;
+        let mut plan = vec![OnCommit::Pass];
+        for k in 0..STATED_PUBLISH_ROUNDS {
+            let interloper = rig.overwrite(&body(150, 0x72 + k as u8), 1_200 + u64::from(k));
+            plan.push(OnCommit::Run(
+                Interfere(interloper),
+                Box::new(OnCommit::Pass),
+            ));
+        }
+        rig.up.store.script(plan, None);
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+        let refusal = refused(as_fence(rig.complete(&list).await));
+
+        assert_eq!(refusal, Refusal::OperationAborted);
+        let commits = rig.up.store.take_commits();
+        let flips = STATED_PUBLISH_ROUNDS as usize;
+        assert_eq!(
+            commits.len(),
+            1 + flips + 1,
+            "the fence, the flips, the release"
+        );
+        for (k, flip) in commits[1..=flips].iter().enumerate() {
+            assert_eq!(
+                flip_version(flip, PUT_INODE),
+                k as u64 + 2,
+                "flip {k} recomputed from the prior it read"
+            );
+        }
+        let (_, fenced) = session_cas(&commits[0], &rig.up.id);
+        let (required, put) = session_cas(&commits[flips + 1], &rig.up.id);
+        assert_eq!(
+            required, fenced,
+            "the release requires the fence's own bytes"
+        );
+        let open = session_bytes(&rig.up.open, 2, 0, OPEN);
+        assert_eq!(put, open, "Open@E+2, the attempt given back");
+        assert_eq!(rig.up.session().await.0, open);
+        let inode = inode_at(&rig.up.store.inner, PUT_INODE).await.unwrap();
+        assert_eq!(
+            inode.version,
+            1 + u64::from(STATED_PUBLISH_ROUNDS),
+            "the last overwrite's"
+        );
+        assert_ne!(
+            inode.etag,
+            Some(multipart_etag(list.as_slice()).unwrap().to_string())
+        );
+        assert!(
+            rig.obligations(RETIRE_RECORDS_PREFIX).await.is_empty(),
+            "no flip obligation"
+        );
+
+        let publication = published(rig.complete(&list).await);
+        assert_eq!(
+            (publication.inode, publication.version),
+            (PUT_INODE, 2 + u64::from(STATED_PUBLISH_ROUNDS))
+        );
+    })
+    .await;
+}
+
+// ───────────────────────── (F2) an empty prior owes nothing ─────────────────────────
+
+/// **(F2)** The target exists as a zero-byte object, from an ordinary `PutObject` of an empty
+/// body (an empty chunk map, `write.rs:166-168`, `:277-281`). A Complete over it answers
+/// `Published` at version 2 and installs **no** generation obligation for that prior: it names no
+/// chunk, and an obligation naming none would not decode. Every obligation it installs decodes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f2_superseding_a_zero_byte_prior_installs_no_obligation_for_it() {
+    within(async {
+        let rig = rig().await;
+        let (id, version, chunks) = rig.put_target(&[], 1_100).await;
+        assert_eq!((id, version), (PUT_INODE, 1));
+        assert!(chunks.is_empty(), "a zero-byte object names no chunk");
+        let prior = inode_at(&rig.up.store.inner, PUT_INODE).await.unwrap();
+        assert_eq!(prior.chunk_map, ChunkMap::Flat(Vec::new()));
+        let bodies = [(1, body(100, 1)), (2, body(80, 2))];
+        let digests = stage_all(&rig, &bodies).await;
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+        let publication = published(rig.complete(&list).await);
+
+        assert_eq!((publication.inode, publication.version), (PUT_INODE, 2));
+        let concatenated: Vec<u8> = bodies.iter().flat_map(|(_, b)| b.clone()).collect();
+        assert_eq!(rig.read(PUT_INODE).await, concatenated);
+        let bytes = rig.obligations(RETIRE_BYTES_PREFIX).await;
+        assert!(
+            bytes.is_empty(),
+            "no generation, and no part left unnamed: {bytes:?}"
+        );
+        let records = rig.obligations(RETIRE_RECORDS_PREFIX).await;
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].2.parts(), Some(&set_of(&[1, 2])));
+        // Every `retire:` key in the store decodes, under either mode.
+        assert_eq!(rig.obligations(b"retire:").await.len(), 1);
+    })
+    .await;
+}
+
+// ──────────────────────── (H2) the bucket removed just before the flip ────────────────────────
+
+/// **(H2)** The bucket marker is deleted after the validation behind the fence, just before the
+/// flip commits. The flip pins the marker's exact bytes (`create.rs:698-705`, `0016:663`), so it
+/// loses, and the request answers `NoSuchBucket`: never `OperationAborted`, and never a second
+/// flip. No dirent or inode exists for the key, and the session is `Open@2` with the attempt
+/// given back. A bucket deleted and created again in that window, its marker present but no
+/// longer the bytes validated, answers the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn h2_a_bucket_removed_just_before_the_flip_answers_no_such_bucket() {
+    within(async {
+        let marker = metadata::bucket_key(BUCKET);
+        let recreated = br#"{"name":"photos","created_at_millis":2}"#;
+        for (label, write) in [
+            ("removed", WriteBatch::new().delete(marker.clone())),
+            (
+                "recreated",
+                WriteBatch::new().put(marker.clone(), &recreated[..]),
+            ),
+        ] {
+            let rig = rig().await;
+            let digests = stage_all(&rig, &[(1, body(100, 1)), (2, body(80, 2))]).await;
+            rig.up.store.script(
+                vec![OnCommit::Pass, OnCommit::write_first(write, OnCommit::Pass)],
+                None,
+            );
+            let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+            assert_eq!(
+                refused(as_fence(rig.complete(&list).await)),
+                Refusal::NoSuchBucket,
+                "{label}"
+            );
+
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                3,
+                "{label}: the fence, one flip, the release"
+            );
+            let (_, fence) = session_cas(&commits[0], &rig.up.id);
+            assert_flip(&commits[1], &rig.up, &fence);
+            assert_released_with_nothing_published(&rig, &commits[0], &commits[2]).await;
+        }
+    })
+    .await;
+}
+
+// ───────────────────── a flip that loses its fence to another writer ─────────────────────
+
+/// **Another writer takes the fence before the flip.** Just before the flip commits, the session
+/// moves off the fence: the reaper's rollback to `Open@2`, or a teardown fence to `Aborting@2`.
+/// The flip loses, and the request is answered from what the session now is —
+/// `OperationAborted`, and `NoSuchUpload` — with no release, since the fence is no longer this
+/// Complete's to take down, and no other flip. Nothing is published, and the session is left as
+/// it moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flip_that_loses_its_fence_to_another_writer_is_answered_from_the_new_state() {
+    within(async {
+        for (label, state, expected) in [
+            ("rolled back", OPEN, Refusal::OperationAborted),
+            ("torn down", ABORTING, Refusal::NoSuchUpload),
+        ] {
+            let rig = rig().await;
+            let digests = stage_all(&rig, &[(1, body(100, 1))]).await;
+            let moved = session_bytes(&rig.up.open, 2, 1, state);
+            let write = WriteBatch::new().put(mpu_key(&rig.up.id), moved.clone());
+            rig.up.store.script(
+                vec![OnCommit::Pass, OnCommit::write_first(write, OnCommit::Pass)],
+                None,
+            );
+
+            let outcome = rig.complete(&list_of(&[(1, digests[&1])])).await;
+
+            assert_eq!(refused(as_fence(outcome)), expected, "{label}");
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                2,
+                "{label}: the fence and one flip, no release"
+            );
+            assert_eq!(rig.up.session().await.0, moved, "{label}: left as it moved");
+            assert_eq!(rig.target().await, None, "{label}: nothing published");
+            assert!(rig.obligations(RETIRE_RECORDS_PREFIX).await.is_empty());
+        }
+    })
+    .await;
+}
+
+// ──────────────────── a damaged part or target behind the fence ────────────────────
+
+/// **A damaged part or target behind the fence stops, after one release.** In each case the list
+/// is valid against the part set the fence froze, and a record publication reads next is not
+/// what it must be:
+///
+/// * part 2's `part:` record deleted, or replaced by one whose summary is not the frozen one,
+///   just before the fence commits ([`Stop::PartDisagrees`]): the pair is written in one batch,
+///   so this is damage;
+/// * the target's dirent names an inode that has no record ([`Stop::Target`]);
+/// * the target's inode is at the last version, which has no successor ([`Stop::Publication`]).
+///
+/// No flip is sent. The fence is released (`Open@2`, the attempt given back) and the stopped error
+/// says so, with that cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damaged_part_or_target_behind_the_fence_stops_after_one_release() {
+    within(async {
+        // The part record.
+        for label in ["deleted", "replaced"] {
+            let rig = rig().await;
+            let digests = stage_all(&rig, &[(1, body(100, 1)), (2, body(80, 2))]).await;
+            let key = part_key(&rig.up.id, part(2));
+            let damage = if label == "deleted" {
+                WriteBatch::new().delete(key)
+            } else {
+                // A canonical part record, without the `psum:` summary that would pair with it.
+                let planted = plant_part(&rig.up.id, 2, digests[&2]);
+                assert_eq!(planted.puts[0].0, key);
+                WriteBatch::new().put(key, planted.puts[0].1.clone())
+            };
+            rig.up
+                .store
+                .script(vec![OnCommit::write_first(damage, OnCommit::Pass)], None);
+            let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+            let (_, stopped) = stopped_error(as_fence(rig.complete(&list).await), &rig.up.id);
+
+            assert_eq!(stopped.fence, FenceState::Released { epoch: 1 }, "{label}");
+            assert!(
+                matches!(
+                    stopped.cause,
+                    Stop::PartDisagrees { part_number } if part_number == part(2)
+                ),
+                "{label}: {:?}",
+                stopped.cause
+            );
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                2,
+                "{label}: the fence and its release, no flip"
+            );
+            assert_released_with_nothing_published(&rig, &commits[0], &commits[1]).await;
+        }
+
+        // The target.
+        let dangling = WriteBatch::new().put(
+            metadata::dirent_key(ROOT, "photos/object-1"),
+            metadata::encode(&DirentRecord { inode: 777 }),
+        );
+        let last = InodeRecord {
+            version: u64::MAX,
+            state: metadata::InodeState::Committed,
+            ..InodeRecord::default()
+        };
+        let at_last_version = WriteBatch::new()
+            .put(
+                metadata::dirent_key(ROOT, "photos/object-1"),
+                metadata::encode(&DirentRecord { inode: PUT_INODE }),
+            )
+            .put(metadata::inode_key(PUT_INODE), metadata::encode(&last));
+        for (label, plant) in [
+            ("dangling", dangling),
+            ("at the last version", at_last_version),
+        ] {
+            let rig = rig().await;
+            assert_eq!(rig.up.object, "photos/object-1");
+            let digests = stage_all(&rig, &[(1, body(100, 1))]).await;
+            let planted = rig.up.store.inner.commit(plant).await.unwrap();
+            assert_eq!(planted, CommitOutcome::Committed);
+
+            let outcome = rig.complete(&list_of(&[(1, digests[&1])])).await;
+
+            let (_, stopped) = stopped_error(as_fence(outcome), &rig.up.id);
+            assert_eq!(stopped.fence, FenceState::Released { epoch: 1 }, "{label}");
+            if label == "dangling" {
+                assert!(
+                    matches!(
+                        &stopped.cause,
+                        Stop::Target(torn) if torn.to_string().contains("777")
+                    ),
+                    "{label}: {:?}",
+                    stopped.cause
+                );
+            } else {
+                assert!(
+                    matches!(
+                        stopped.cause,
+                        Stop::Publication(PublicationError::VersionOverflow { inode })
+                            if inode == PUT_INODE
+                    ),
+                    "{label}: {:?}",
+                    stopped.cause
+                );
+            }
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                2,
+                "{label}: the fence and its release, no flip"
+            );
+            assert_released(&rig, &commits[0], &commits[1]).await;
+        }
+    })
+    .await;
+}
+
+// ─────────────────── a read that fails after a lost flip, or before one ───────────────────
+
+/// **A read that fails after a lost flip is a fault behind the fence.** The flip answers
+/// `Conflict` with nothing changed (the TiKV lock), and the read that would judge it fails: the
+/// session, the bucket marker, or the target's dirent before the next flip. A part record that
+/// cannot be read before any flip is the same. Each ends in the stopped error with that read's
+/// fault as its cause, after one release that takes the fence down, and no other flip is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_that_fails_after_a_lost_flip_releases_the_fence_and_stops() {
+    within(async {
+        let dirent = metadata::dirent_key(ROOT, "photos/object-1");
+        let after_a_lost_flip = [
+            ("the session", MPU_PREFIX.to_vec()),
+            ("the bucket marker", metadata::bucket_key(BUCKET)),
+            ("the target's dirent", dirent),
+        ];
+        for (label, prefix) in after_a_lost_flip {
+            let rig = rig().await;
+            let digests = stage_all(&rig, &[(1, body(100, 1))]).await;
+            rig.up.store.script(
+                vec![
+                    OnCommit::Pass,
+                    OnCommit::arm(Arm::FailGets(prefix), OnCommit::ConflictUnmoved),
+                ],
+                None,
+            );
+
+            let outcome = rig.complete(&list_of(&[(1, digests[&1])])).await;
+
+            let (_, stopped) = stopped_error(as_fence(outcome), &rig.up.id);
+            assert_eq!(stopped.fence, FenceState::Released { epoch: 1 }, "{label}");
+            assert_read_fault(&stopped.cause);
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                3,
+                "{label}: the fence, one flip, the release"
+            );
+            assert_released_with_nothing_published(&rig, &commits[0], &commits[2]).await;
+        }
+
+        let rig = rig().await;
+        let digests = stage_all(&rig, &[(1, body(100, 1))]).await;
+        let parts = part_range(&rig.up.id);
+        rig.up
+            .store
+            .script(vec![fence_then(Arm::FailGets(parts))], None);
+        let outcome = rig.complete(&list_of(&[(1, digests[&1])])).await;
+        let (_, stopped) = stopped_error(as_fence(outcome), &rig.up.id);
+        assert_eq!(stopped.fence, FenceState::Released { epoch: 1 });
+        assert_read_fault(&stopped.cause);
+        let commits = rig.up.store.take_commits();
+        assert_eq!(commits.len(), 2, "the fence and its release, no flip");
+        assert_released_with_nothing_published(&rig, &commits[0], &commits[1]).await;
+    })
+    .await;
+}
+
+// ──────────────────────── (J) a flip the store refuses for good ────────────────────────
+
+/// **(J)** The store answers the flip with a definite error that is neither `Conflict` nor an
+/// unknown outcome. The request sends no other flip and releases the fence (`Open@2`, the attempt
+/// given back), then returns the stopped error with that store error as its cause, saying the
+/// fence was taken down. No dirent or inode exists. When that release fails too, the stopped
+/// error says the fence still stands, with the flip's error still its cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn j_a_flip_the_store_refuses_for_good_releases_the_fence_and_stops() {
+    within(async {
+        let rig = rig().await;
+        let digests = stage_all(&rig, &[(1, body(100, 1)), (2, body(80, 2))]).await;
+        rig.up.store.script(
+            vec![OnCommit::Pass, OnCommit::Fail { transient: true }],
+            None,
+        );
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+        let outcome = rig.complete(&list).await;
+
+        assert_eq!(
+            outcome.as_ref().err().map(|err| classify(err)),
+            Some(ErrorClass::Transient),
+            "the store error's own class"
+        );
+        let (text, stopped) = stopped_error(as_fence(outcome), &rig.up.id);
+        assert_eq!(stopped.fence, FenceState::Released { epoch: 1 });
+        assert!(
+            matches!(&stopped.cause, Stop::Store(fault) if fault.is::<TransientFault>()),
+            "{:?}",
+            stopped.cause
+        );
+        assert!(text.contains("was taken down"), "{text}");
+        let commits = rig.up.store.take_commits();
+        assert_eq!(commits.len(), 3, "the fence, one flip, the release");
+        assert_released_with_nothing_published(&rig, &commits[0], &commits[2]).await;
+
+        // The release fails for good as well: the fence stands.
+        let rig = self::rig().await;
+        let digests = stage_all(&rig, &[(1, body(100, 1))]).await;
+        rig.up.store.script(
+            vec![
+                OnCommit::Pass,
+                OnCommit::Fail { transient: true },
+                OnCommit::Fail { transient: false },
+            ],
+            None,
+        );
+        let list = list_of(&[(1, digests[&1])]);
+        let (_, stopped) = stopped_error(as_fence(rig.complete(&list).await), &rig.up.id);
+        assert_eq!(stopped.fence, FenceState::Stands { epoch: 1 });
+        assert!(
+            matches!(&stopped.cause, Stop::Store(fault) if fault.is::<TransientFault>()),
+            "the flip's error is the cause: {:?}",
+            stopped.cause
+        );
+        let commits = rig.up.store.take_commits();
+        assert_eq!(commits.len(), 3, "the fence, one flip, one release");
+        assert_eq!(
+            rig.up.session().await.0,
+            session_cas(&commits[0], &rig.up.id).1
+        );
+        assert_eq!(rig.target().await, None);
+    })
+    .await;
+}
+
+// ──────────────────────── (G0-flip) an unknown flip outcome ────────────────────────
+
+/// **(G0-flip)** The store answers the flip `CommitUnknownResult`, once applied and once not. Each
+/// time the request returns the in-doubt error about the flip, carrying that outcome, and sends no
+/// further commit: no release, which could not tell a flip that landed from one that did not.
+/// Applied, the object is published and the session `Completed`; not applied, the session is
+/// still the fence's bytes and no name is bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g0_an_unknown_flip_outcome_returns_the_in_doubt_error_and_nothing_more() {
+    within(async {
+        for (applied, may_still_commit) in [(true, false), (false, true)] {
+            let rig = rig().await;
+            let digests = stage_all(&rig, &[(1, body(100, 1)), (2, body(80, 2))]).await;
+            rig.up.store.script(
+                vec![
+                    OnCommit::Pass,
+                    OnCommit::Unknown {
+                        applied,
+                        may_still_commit,
+                    },
+                ],
+                None,
+            );
+            let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+            let doubt = in_doubt_error(
+                as_fence(rig.complete(&list).await),
+                &rig.up.id,
+                DoubtfulCommit::Flip { epoch: 1 },
+                may_still_commit,
+            );
+
+            assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+            let commits = rig.up.store.take_commits();
+            assert_eq!(commits.len(), 2, "the fence, the flip, and nothing after");
+            let (stored, record) = rig.up.session().await;
+            if applied {
+                assert!(matches!(record.state(), SessionState::Completed { .. }));
+                assert_eq!(rig.target().await, Some(FRESH_INODE));
+            } else {
+                assert_eq!(stored, session_cas(&commits[0], &rig.up.id).1, "the fence");
+                assert_eq!(rig.target().await, None);
+            }
+        }
+    })
+    .await;
+}
+
+// ─────────────────────────── (K) flat only, for now ───────────────────────────
+
+/// **(K)** Parts totalling [`STATED_FLAT_CHUNKS`]` + 1` chunks by their summaries: the request
+/// stops with the cause that names segmented publication as unsupported, sending **no** commit,
+/// since the check before the fence sees the excess. The session is as Create left it. Naming
+/// part 1 alone, exactly [`STATED_FLAT_CHUNKS`] chunks, then publishes one flat root of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k_a_list_past_one_flat_map_stops_before_the_fence() {
+    within(async {
+        let rig = rig().await;
+        let flat = STATED_FLAT_CHUNKS as usize;
+        let digests = stage_all(&rig, &[(1, body(flat * CHUNK, 1)), (2, body(10, 2))]).await;
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+        let (text, stopped) = stopped_error(as_fence(rig.complete(&list).await), &rig.up.id);
+
+        assert_eq!(stopped.fence, FenceState::NotPlaced);
+        assert!(
+            matches!(stopped.cause, Stop::SegmentedUnsupported { chunks, limit }
+                if chunks == STATED_FLAT_CHUNKS + 1 && limit == STATED_FLAT_CHUNKS),
+            "{:?}",
+            stopped.cause
+        );
+        assert!(
+            text.contains("segmented publication is not supported"),
+            "{text}"
+        );
+        assert!(rig.up.store.take_commits().is_empty(), "zero commits");
+        assert_eq!(rig.up.session().await.0, rig.up.open);
+
+        let publication = published(rig.complete(&list_of(&[(1, digests[&1])])).await);
+        let inode = inode_at(&rig.up.store.inner, publication.inode)
+            .await
+            .unwrap();
+        assert_eq!(inode.chunk_map.as_flat().map(<[ChunkRef]>::len), Some(flat));
+        assert_eq!(rig.read(publication.inode).await, body(flat * CHUNK, 1));
+    })
+    .await;
+}
+
+/// **(K, behind the fence)** Parts totalling [`STATED_FLAT_CHUNKS`] chunks when first read; just
+/// before the fence commits, another client re-uploads part 2 with the **same** body in smaller
+/// chunks, so its digest is unchanged and the list still valid, but the frozen set totals one
+/// chunk more. The request stops with that cause after one release: the session is `Open@2`
+/// with the attempt given back, and nothing is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k_a_list_only_the_frozen_set_shows_past_one_flat_map_releases_the_fence() {
+    within(async {
+        let rig = rig().await;
+        let first = STATED_FLAT_CHUNKS as usize - 1;
+        let part_2 = body(CHUNK, 2);
+        let digests = stage_all(&rig, &[(1, body(first * CHUNK, 1)), (2, part_2.clone())]).await;
+        rig.up.store.script(
+            vec![rig.re_upload(2, &part_2, CHUNK / 2, OnCommit::Pass)],
+            None,
+        );
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+        let (_, stopped) = stopped_error(as_fence(rig.complete(&list).await), &rig.up.id);
+
+        assert_eq!(stopped.fence, FenceState::Released { epoch: 1 });
+        assert!(
+            matches!(stopped.cause, Stop::SegmentedUnsupported { chunks, limit }
+                if chunks == STATED_FLAT_CHUNKS + 1 && limit == STATED_FLAT_CHUNKS),
+            "{:?}",
+            stopped.cause
+        );
+        let commits = rig.up.store.take_commits();
+        assert_eq!(commits.len(), 2, "the fence and its release");
+        assert_released_with_nothing_published(&rig, &commits[0], &commits[1]).await;
+    })
+    .await;
+}
+
+// ─────────────────────── (F3) a segmented prior is retired by its group ───────────────────────
+
+/// A segmented object at `name` under inode `id`, published by #653's committer: `count` chunk
+/// refs, past one flat map, under a fence record of the test's own whose value is the segment
+/// cursor. Its chunks are refs only; no leg reads them. Returns the group its root names.
+async fn put_segmented(
+    store: &RedbMetadataStore,
+    name: &str,
+    id: InodeId,
+    count: u64,
+) -> SegmentGroup {
+    let fence_key = b"test-fence".to_vec();
+    let cursor = |n: u32| Bytes::from(n.to_string());
+    let seed = WriteBatch::new().put(fence_key.clone(), cursor(0));
+    assert_eq!(store.commit(seed).await.unwrap(), CommitOutcome::Committed);
+    let chunks: Vec<ChunkRef> = (0..count)
+        .map(|i| ChunkRef {
+            id: 70_000 + u128::from(i),
+            scheme: EcScheme::None,
+            len: 10,
+            placement: vec![0],
+        })
+        .collect();
+    let segments = staged_publication::planned_segments(&chunks).unwrap();
+    assert!(segments > 0, "a segmented map");
+    let group = SegmentGroup::new(format!("{:032x}", 0xfeed_u32), 1).unwrap();
+    let step = |info: SegmentBatchInfo| {
+        WriteBatch::new()
+            .require(fence_key.clone(), cursor(info.first_index))
+            .put(fence_key.clone(), cursor(info.written))
+    };
+    let flip = WriteBatch::new()
+        .require(fence_key.clone(), cursor(segments))
+        .put(fence_key.clone(), Bytes::from_static(b"done"));
+    let publication = staged_publication::Publication {
+        parent: ROOT,
+        name,
+        root: staged_publication::RootTarget::Fresh { id },
+        group: group.clone(),
+        chunks: &chunks,
+        meta: &ObjectMeta::default(),
+        fence_key: &fence_key,
+        segment_contribution: &step,
+        resume_from: 0,
+        byte_budget: None,
+        ops_budget: None,
+        flip_contribution: flip,
+    };
+    let outcome = staged_publication::publish(store, &publication)
+        .await
+        .unwrap();
+    assert_eq!(outcome, CommitOutcome::Committed);
+    group
+}
+
+/// **(F3)** The target is a segmented object at version 1. A Complete over it publishes version 2
+/// and retires the superseded generation by the segment group its root named
+/// (`retire:bytes:g:<inode>:1`, `{generation: {segments}}`, `0016:2417`), never by a chunk list:
+/// its chunks live in `seg:` records the drain resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn f3_a_segmented_prior_is_retired_by_its_segment_group() {
+    within(async {
+        let rig = rig().await;
+        let group = put_segmented(
+            &rig.up.store.inner,
+            &rig.up.object,
+            PUT_INODE,
+            STATED_FLAT_CHUNKS + 1,
+        )
+        .await;
+        let prior = inode_at(&rig.up.store.inner, PUT_INODE).await.unwrap();
+        assert!(prior.chunk_map.is_segmented());
+        let bodies = [(1, body(100, 1))];
+        let digests = stage_all(&rig, &bodies).await;
+
+        let publication = published(rig.complete(&list_of(&[(1, digests[&1])])).await);
+
+        assert_eq!((publication.inode, publication.version), (PUT_INODE, 2));
+        assert_eq!(rig.read(PUT_INODE).await, bodies[0].1);
+        let generations: Vec<_> = rig
+            .obligations(RETIRE_BYTES_PREFIX)
+            .await
+            .into_iter()
+            .filter(|(_, token, _)| matches!(token, RetireToken::Generation { .. }))
+            .collect();
+        assert_eq!(generations.len(), 1, "{generations:?}");
+        let (_, token, payload) = &generations[0];
+        assert_eq!(
+            token,
+            &RetireToken::Generation {
+                inode: PUT_INODE,
+                version: 1
+            }
+        );
+        let owed = payload.generation().expect("a generation");
+        assert_eq!(
+            owed.map(),
+            &RetiredMap::Segmented(group),
+            "by its segment group"
+        );
+    })
+    .await;
+}
+
+/// **(K) is the verb's, not the fence phase's.** `fence_complete` on its own holds a fence for a
+/// list past one flat map: the flat-only stop is [`complete_upload`]'s until #1009, and the fence
+/// phase it composes stays the one #1009 builds segmented publication on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn k_the_fence_phase_on_its_own_holds_a_list_past_one_flat_map() {
+    within(async {
+        let rig = rig().await;
+        let flat = STATED_FLAT_CHUNKS as usize;
+        let digests = stage_all(&rig, &[(1, body(flat * CHUNK, 1)), (2, body(10, 2))]).await;
+        let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+
+        let fence = held(rig.up.complete(&list).await);
+
+        let chunks: u64 = fence
+            .frozen_parts()
+            .values()
+            .map(|summary| u64::from(summary.chunks))
+            .sum();
+        assert_eq!(chunks, STATED_FLAT_CHUNKS + 1);
+        assert_eq!(rig.up.store.take_commits().len(), 1, "the fence alone");
+    })
+    .await;
 }
