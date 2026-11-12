@@ -7,11 +7,13 @@
 //! `async fn`. The protocol's store round trips live beside it, in child modules, and use only
 //! what this file defines: [`create`], `CreateMultipartUpload`'s admission and session creation
 //! (#894), [`abort`], `AbortMultipartUpload`'s teardown fence and the one builder of that
-//! fence's batch (#895), [`complete`], the fence phase of `CompleteMultipartUpload`: the fence,
-//! the validation against the frozen part set, and the release of a rejected request's fence
-//! (#1007), [`stage`], `UploadPart`'s staging half: the slot reserve and the owned intent
+//! fence's batch (#895), [`complete`], `CompleteMultipartUpload`: the fence, the validation
+//! against the frozen part set, and the release of a rejected request's fence (#1007), then the
+//! flat publication and its root flip (#1008), [`stage`], `UploadPart`'s staging half: the slot
+//! reserve and the owned intent
 //! per chunk (#932), and [`commit`], `UploadPart`'s commit half: the part commit and its
-//! live-session compensation (#1027). After this file a reader can name every key the protocol
+//! live-session compensation (#1027), and the classification of either one answered `Conflict`
+//! (#1028). After this file a reader can name every key the protocol
 //! will ever write (`0016` §1, `:333-527`), parse it back, **and decode the record values that
 //! key space names** — the `mpuctl` singleton ([`AdmissionRecord`], its [`Budget`] profile and
 //! the two derivations that profile establishes, `0016:348`, `:1469-1470`), the `mpufence`
@@ -103,11 +105,12 @@
 //! writer-side API is the post-restore fence's two teardowns ([`SessionRecord::open_teardown`],
 //! #841, and [`SessionRecord::completing_teardown`], #842), the generation record that pass
 //! keeps ([`FenceGeneration`], #810), one creation route each for a fresh session and for
-//! the admission ledger, which [`create::create_session`] commits (#894), and the part
+//! the admission ledger, which [`create::create_session`] commits (#894), the part
 //! commit's part record, the summary derived from it, and its per-part `{chunks}` obligation,
-//! which [`commit::commit_part`] commits (#1027). So Create now writes
-//! `mpuctl`, `mpu:` and `seggrp:`, and Abort ([`abort::abort_session`], #895) writes `mpu:` and
-//! `retire:bytes:` through the one fence batch builder the restore fence also commits
+//! which [`commit::commit_part`] commits (#1027), and the root flip's `Completed` session and
+//! its three obligation rows, which [`complete::complete_upload`] commits (#1008). So Create
+//! now writes `mpuctl`, `mpu:` and `seggrp:`, and Abort ([`abort::abort_session`], #895) writes
+//! `mpu:` and `retire:bytes:` through the one fence batch builder the restore fence also commits
 //! ([`abort::fence_batch`]); neither has a production caller until the S3 verbs are wired
 //! (#668). Staging ([`stage::stage_part`], #932) writes `slot:` and `sidx:`, and the part
 //! commit ([`commit::commit_part`], #1027) writes `part:`, `psum:` and a per-part
@@ -115,9 +118,16 @@
 //! the same batch; neither has a production caller until the S3 `UploadPart` verb is wired
 //! (#669). The Complete fence
 //! ([`complete::fence_complete`], #1007) writes `mpu:` only: the fence and, for a rejected
-//! request, its release; it publishes nothing and has no production caller until the S3 verb
-//! is wired (#670). Every other first writer is a store round trip still to land: publication
-//! (#1008–#1011), then #659.
+//! request, its release. The Complete verb ([`complete::complete_upload`], #1008) adds the flat
+//! root flip: the session at `Completed`, the inode and dirent through
+//! [`crate::staged_publication`], and the flip's `retire:records:` and `retire:bytes:`
+//! obligations, in one batch. Past one flat map it first writes the attempt's `seg:` records,
+//! moving the session's segment cursor in each batch, and a release once one landed installs
+//! that attempt's `retire:records:` `{seg}` obligation (#1009). Neither has a production caller
+//! until the S3 verb is wired (#670); the recovery from an unknown commit outcome (#1010) only
+//! re-sends those batches. Sizing the flip's part sets against the value ceiling (#1011) adds no
+//! writer either: a set too large is a rejection, answered before the fence or through the
+//! fence's release. Every other first writer is a store round trip still to land (#659).
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -378,13 +388,32 @@ pub enum RecordError {
         chunks: usize,
     },
     /// A session record whose bytes differ from the ones a batch of the attempt required, at the
-    /// same or a lower epoch. Every fence and every rollback bumps the epoch
-    /// ([`SessionRecord::epoch`], `0016:364`, `:704-708`), so no legal history wrote it: this is
-    /// damage, and no batch is sent under it.
+    /// same or a lower epoch, **whatever its state**. Every fence and every rollback bumps the
+    /// epoch ([`SessionRecord::epoch`], `0016:364`, `:704-708`), so no legal history wrote it:
+    /// this is damage, never a rollback or a fence the batch lost to, and no batch is sent under
+    /// it.
     SessionEpochNotRisen {
         /// The epoch the stored record carries.
         found: u64,
         /// The epoch of the bytes the attempt required.
+        required: u64,
+    },
+    /// A part record a part commit required is gone while the session is still the bytes that
+    /// commit required. A `part:` record's only remover is the retirement drain (`0016:351`),
+    /// which reaches a part only after its session has left `Open`, so this is damage, not a
+    /// rival's commit.
+    PartRecordMissing {
+        /// The part number whose record is gone.
+        part_number: u32,
+    },
+    /// A session record a batch of the attempt required is gone, and a read of the attempt's slot
+    /// key made **after** that finds a record there, the attempt's own or another's. A terminal
+    /// session delete removes every surviving `slot:` record in the same batch as the session
+    /// record (`0016:674`), and a reservation requires the session's `Open` bytes
+    /// ([`stage::reserve_slot`]), so no legal history leaves a slot behind a missing session: this
+    /// is damage, not that delete.
+    SessionRecordMissing {
+        /// The epoch of the bytes the batch required.
         required: u64,
     },
     /// A part-number set run whose bounds are reversed, `lo > hi` (`0016:382-388`). A reversed
@@ -726,6 +755,16 @@ impl fmt::Display for RecordError {
                 f,
                 "a session record at epoch {found} differs from the bytes required at epoch \
                  {required}: only a higher epoch can replace them"
+            ),
+            Self::PartRecordMissing { part_number } => write!(
+                f,
+                "part {part_number}'s record is gone while its session is still the bytes the \
+                 commit required"
+            ),
+            Self::SessionRecordMissing { required } => write!(
+                f,
+                "the session record required at epoch {required} is gone while the slot key \
+                 still holds a record; a terminal delete removes both in one batch"
             ),
             Self::PartNumberRunReversed { lo, hi } => {
                 write!(f, "part-number run [{lo}, {hi}] is reversed")
@@ -2378,9 +2417,12 @@ struct SessionRecordWire {
 /// [`Budget`] omit one too. The writer-side routes are the one creation route Create uses
 /// (`SessionRecord::open`, crate-private, #894), which can only mint an `Open` session, and the
 /// transitions of a record that already decoded: the teardowns ([`Self::open_teardown`],
-/// [`Self::completing_teardown`]), which change only `epoch` and `state`, and the Complete fence
+/// [`Self::completing_teardown`]), which change only `epoch` and `state`, the Complete fence
 /// and its release (`SessionRecord::complete_fence` and `SessionRecord::fence_released`,
-/// crate-private, #1007), which also move `attempts`.
+/// crate-private, #1007), which also move `attempts`, the segment cursor's move
+/// (`SessionRecord::with_segments_written`, crate-private, #1009), which changes only
+/// `segments_written`, and the root flip's move to `Completed` (`SessionRecord::completed`,
+/// crate-private, #1008), which changes only `epoch` and `state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SessionRecordWire")]
 pub struct SessionRecord {
@@ -2666,11 +2708,45 @@ impl SessionRecord {
         })
     }
 
+    /// The **segment-write cursor's move** (`0016:613-620`, `:662`): this `Completing` session
+    /// with `segments_written` at `written`, every other field as it is. A segment batch requires
+    /// the session at the cursor it starts from and puts it at the count it leaves durable, so the
+    /// cursor moves only in the batch that writes the records it counts ([`complete`], #1009).
+    ///
+    /// `None` unless the session is `Completing`, or for a cursor past the bound its decode
+    /// enforces ([`RecordError::SegmentCursorUnaddressable`]), so no record it returns is one the
+    /// decoder refuses.
+    pub(crate) fn with_segments_written(&self, written: u32) -> Option<Self> {
+        let SessionState::Completing {
+            fenced_at_millis,
+            publish_target,
+            ..
+        } = &self.state
+        else {
+            return None;
+        };
+        if written > metadata::MAX_SEGMENT_INDEX + 1 {
+            return None;
+        }
+        Some(Self {
+            state: SessionState::Completing {
+                fenced_at_millis: *fenced_at_millis,
+                segments_written: written,
+                publish_target: publish_target.clone(),
+            },
+            ..self.clone()
+        })
+    }
+
     /// The **release of a Complete fence** (`0016:664`): this `Completing@E` session back at
     /// `Open@E+1`, with its fence stamps dropped and `attempts` set to the value given. For a
     /// fence that wrote no segment that value is the one read before the fence: such a fence
     /// minted no `seg:` epoch, which is all the cap bounds (`0016:661`), so a rejected request
-    /// spends nothing (#1007). The charging rule for a fence that did write segments is #1009's.
+    /// spends nothing (#1007). For a fence whose segment batch landed it is the fence's own
+    /// count: that fence minted a segment epoch, and the release installs the attempt's
+    /// `retire:records:{seg}` obligation beside it, so the attempt stays charged and the cap
+    /// bounds how many such obligations one session can install (X58, `0016:2577`; [`complete`],
+    /// #1009).
     ///
     /// The segment-group nonce stays, for the next attempt (`0016:538-552`). `None` unless the
     /// session is `Completing` below `u64::MAX`.
@@ -2682,6 +2758,24 @@ impl SessionRecord {
             epoch: self.epoch.checked_add(1)?,
             attempts,
             state: SessionState::Open {},
+            ..self.clone()
+        })
+    }
+
+    /// The **root flip of a `Completing@E` session** (`0016:663`, `:942-944`): this session at
+    /// `Completed@E+1`, recording `completion`. The flip commits it in the same batch as the root
+    /// it records, so no state has the object published and the session not `Completed`, or the
+    /// reverse (`0016:942-949`). `attempts` stays as the fence left it: the fence that published
+    /// spent its attempt.
+    ///
+    /// `None` unless the session is `Completing` below `u64::MAX`.
+    pub(crate) fn completed(&self, completion: Completion) -> Option<Self> {
+        if !matches!(self.state, SessionState::Completing { .. }) {
+            return None;
+        }
+        Some(Self {
+            epoch: self.epoch.checked_add(1)?,
+            state: SessionState::Completed { completion },
             ..self.clone()
         })
     }
@@ -3244,8 +3338,12 @@ pub fn decode_part_summary(value: &[u8]) -> Result<PartSummary, RecordError> {
 // ===========================================================================
 
 /// A **range-encoded** part-number set (`0016:382-388`): `[[1, 400]]` for a contiguous run, so
-/// the common "every staged part was published" case is a few bytes and the worst case — 10,000
-/// alternating part numbers — still fits inside one value.
+/// the common "every staged part was published" case is a few bytes. Each isolated part number
+/// is a run of its own, so the size depends on how far apart the numbers are. Inside S3's
+/// part-number range (1 to 10,000) the widest set, every even number, is 58,909 bytes as a
+/// `{parts}` obligation value, inside [`MAX_VALUE_BYTES`]. Past that range it need not fit:
+/// 10,000 parts at 1, 3, …, 19,999 are 128,901 bytes (#842), which is why a Complete measures the
+/// sets its flip installs before it writes anything ([`complete`], #1011).
 ///
 /// The encoding is **canonical**, and that is the whole reason this is a type rather than a
 /// `Vec<(u32, u32)>`: the runs are ordered, non-overlapping and **non-adjacent**, so `[[1,4]]`
@@ -3501,10 +3599,10 @@ struct RetireGenerationWire {
 ///
 /// Its arms are open, as [`crate::metadata::ChunkMap`]'s are, so the **non-emptiness** of a
 /// `Flat` list is not a property of this type but of the decode that reads one (`checked_chunks`
-/// — an obligation owing nothing is residue no drain can clear). That is sound here for the same
-/// reason a generation has no writer-side constructor: a [`RetireGeneration`] can
-/// only come into existence by decoding, so a hand-built `RetiredMap` has nowhere to go. The
-/// first writers (#656–#659) inherit that obligation with the constructor they add.
+/// — an obligation owing nothing is residue no drain can clear). That is sound here because a
+/// [`RetireGeneration`] comes into existence only by decoding or through the one writer-side
+/// constructor, `RetireObligation::superseded_generation` (#1008), which refuses an empty flat
+/// list as the decode does, so a hand-built `RetiredMap` has nowhere else to go.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetiredMap {
     /// A **flat** generation's own chunk list, copied into the obligation because the root that
@@ -3804,8 +3902,10 @@ struct RetirePayloadWire {
 /// There is no free constructor either: a value built without decode's rules is one a writer
 /// could make durable without them. The one writer-side route, [`RetireObligation`], mints a
 /// payload **with the key it goes under**, for the restore fence's two rows (`{session, all}` and
-/// a `Completing` attempt's `{seg}`) and the part commit's per-part `{chunks}` row ([`commit`],
-/// #1027); the later store round trips (#658–#659) add their rows there.
+/// a `Completing` attempt's `{seg}`), the part commit's per-part `{chunks}` row ([`commit`],
+/// #1027), the root flip's three rows ([`complete`], #1008) and the Complete fence release's
+/// `{seg}` row, the same row the restore fence installs ([`complete`], #1009); the later store
+/// round trips (#659) add their rows there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetirePayload {
     /// Omitted when absent rather than spelled `false` (`AGENTS.md:170-172`), so the accepted
@@ -4096,11 +4196,16 @@ pub fn decode_retire_obligation(
 /// A retirement obligation **as a writer installs it**: key and payload minted by one constructor,
 /// so they cannot disagree — the writer-side mirror of [`decode_retire_obligation`]. Its
 /// constructors are the teardown fence's rows ([`SessionRecord::open_teardown`], which the
-/// restore fence and Abort commit, and [`SessionRecord::completing_teardown`]) and the part
-/// commit's per-part `{chunks}` row (`RetireObligation::part_chunks`, [`commit`]); a later
-/// writer's row is added as its own constructor, never as a payload handed in beside a key the
-/// caller chose. That is what lets [`abort::fence_batch`] and the part commit write only
-/// obligations this decoder accepts.
+/// restore fence and Abort commit, and [`SessionRecord::completing_teardown`]), the part
+/// commit's per-part `{chunks}` row (`RetireObligation::part_chunks`, [`commit`]), the root
+/// flip's three rows: the published parts' `{parts}` records, the unnamed parts' `{parts}` bytes
+/// and a superseded `{generation}` (`RetireObligation::published_parts`,
+/// `RetireObligation::unnamed_parts`, `RetireObligation::superseded_generation`, [`complete`],
+/// #1008), and the Complete fence release's `{seg}` row once a segment batch of the attempt
+/// landed (`RetireObligation::attempt_segments`, the row `completing_teardown` installs too,
+/// [`complete`], #1009). A later writer's row is added as its own constructor, never as a
+/// payload handed in beside a key the caller chose. That is what lets [`abort::fence_batch`],
+/// the part commit, the flip and the release write only obligations this decoder accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetireObligation {
     mode: RetireMode,
@@ -4188,6 +4293,79 @@ impl RetireObligation {
         })
     }
 
+    /// `retire:records:s:<upload-id>:<epoch>` owing `{parts: published}` (`0016:356`, `:663`,
+    /// `:910-925`): the `part:` and `psum:` records of the parts a root flip **published**, whose
+    /// bytes the root installed in the same batch now protects. Never a part the Complete left
+    /// unnamed: those go to [`Self::unnamed_parts`], so their bytes are marked before their records
+    /// are deleted. `epoch` is the `Completing` epoch the flip requires.
+    pub(crate) fn published_parts(upload_id: &UploadId, epoch: u64, parts: PartNumberSet) -> Self {
+        Self::part_set(RetireMode::Records, upload_id, epoch, parts)
+    }
+
+    /// `retire:bytes:s:<upload-id>:<epoch>` owing `{parts: unnamed}` (`0016:663`, `:910-925`): the
+    /// staged parts a root flip left unnamed, one obligation that orphan-marks their bytes and then
+    /// deletes their `part:` and `psum:` records. `epoch` is the `Completing` epoch the flip
+    /// requires.
+    pub(crate) fn unnamed_parts(upload_id: &UploadId, epoch: u64, parts: PartNumberSet) -> Self {
+        Self::part_set(RetireMode::Bytes, upload_id, epoch, parts)
+    }
+
+    /// The two rows above: `{parts: <set>}` under the suffix-free session token, in `mode`.
+    fn part_set(mode: RetireMode, upload_id: &UploadId, epoch: u64, parts: PartNumberSet) -> Self {
+        Self {
+            mode,
+            token: RetireToken::Session {
+                upload_id: upload_id.clone(),
+                epoch,
+                part: None,
+            },
+            payload: RetirePayload {
+                session: false,
+                parts: Some(PartScope::Set(parts)),
+                chunks: Vec::new(),
+                generation: None,
+                seg: None,
+            },
+        }
+    }
+
+    /// `retire:bytes:g:<inode>:<version>` owing `{generation: {inode, version, map}}` (`0016:355`,
+    /// `:663`, `:2417`): the generation a publication superseded, by the one map that named its
+    /// bytes. Refuses what [`decode_retire_obligation`] refuses: an empty flat list
+    /// ([`RecordError::RetireObligationOwesNothing`]), so a zero-byte prior installs no obligation,
+    /// and a chunk whose scheme the coder does not support.
+    pub(crate) fn superseded_generation(
+        inode: InodeId,
+        version: u64,
+        map: RetiredMap,
+    ) -> Result<Self, RecordError> {
+        if let RetiredMap::Flat(chunks) = &map {
+            if chunks.is_empty() {
+                return Err(RecordError::RetireObligationOwesNothing {
+                    component: "generation.chunks",
+                });
+            }
+            for chunk in chunks {
+                checked_chunk_scheme(chunk)?;
+            }
+        }
+        Ok(Self {
+            mode: RetireMode::Bytes,
+            token: RetireToken::Generation { inode, version },
+            payload: RetirePayload {
+                session: false,
+                parts: None,
+                chunks: Vec::new(),
+                generation: Some(RetireGeneration {
+                    inode,
+                    version,
+                    map,
+                }),
+                seg: None,
+            },
+        })
+    }
+
     /// The key it is installed under ([`retire_key`]).
     pub fn key(&self) -> Vec<u8> {
         retire_key(self.mode, &self.token)
@@ -4196,6 +4374,13 @@ impl RetireObligation {
     /// What it owes: the value, through [`crate::metadata::encode`].
     pub const fn payload(&self) -> &RetirePayload {
         &self.payload
+    }
+
+    /// The value it is installed with: [`Self::payload`] through [`crate::metadata::encode`]. The
+    /// bytes a writer puts at [`Self::key`], so they are what the store's value ceiling
+    /// ([`MAX_VALUE_BYTES`]) measures: a Complete sizes its flip's part sets by this (#1011).
+    pub(crate) fn value(&self) -> bytes::Bytes {
+        metadata::encode(&self.payload)
     }
 }
 
@@ -4722,8 +4907,18 @@ pub enum Refusal {
     NoSuchUpload,
     /// The target bucket has no `bucket:` record (ADR-0046 §4).
     NoSuchBucket,
-    /// The session is fenced into `Completing` by a publisher that still owns it. There is
-    /// **no** client path that resumes a `Completing` session (`0016:980-986`).
+    /// A conflicting operation on the upload intervened, and the client may retry:
+    ///
+    /// * the session is fenced into `Completing` by a publisher that still owns it. There is
+    ///   **no** client path that resumes a `Completing` session (`0016:980-986`);
+    /// * or a part attempt lost its commit while the session stayed, or came back, `Open`
+    ///   ([`commit::commit_part`], `0016:1597-1647`): a rival attempt for the **same part
+    ///   number** committed first, a repair rewrote the prior part record a re-upload required,
+    ///   or a Complete fenced the session and rolled it back to a newer `Open` epoch between the
+    ///   attempt's last renewal and its commit (`0016:1607-1620`). What the attempt staged was
+    ///   compensated in one batch (its chunks owed to a `retire:bytes:` obligation, its slot
+    ///   released, its owned entries deleted), so the session is still usable and the client
+    ///   may upload the part again.
     OperationAborted,
     /// The named-part list is invalid (`0016:993-999`): a named part is absent from the frozen
     /// part set or carries another digest, or the part numbers are not strictly ascending. The
@@ -4743,14 +4938,26 @@ pub enum Refusal {
         /// The ceiling it crossed.
         limit: u64,
     },
-    /// The session a Create asked for could not reach every later state inside the value
-    /// ceiling every backend inherits: the widest encoding its record can reach in any later
-    /// state (`Completing` carries the object name, JSON escapes included, twice; `Completed`
-    /// carries a fixed payload that is wider for a short name) is `bytes`, past `limit`. Refused
-    /// before any read or write, because a session admitted at `Open` that could not later be
-    /// fenced would hold its admission slot forever (#894).
+    /// A session that does not fit the value ceiling every backend inherits ([`MAX_VALUE_BYTES`]):
+    /// `bytes` is the value that would cross it, past `limit`. Two verbs answer it.
+    ///
+    /// * **Create**: the session it asked for could not reach every later state inside the
+    ///   ceiling. `bytes` is the widest encoding its record can reach in any later state
+    ///   (`Completing` carries the object name, JSON escapes included, twice; `Completed` carries
+    ///   a fixed payload that is wider for a short name). Refused before any read or write,
+    ///   because a session admitted at `Open` that could not later be fenced would hold its
+    ///   admission slot forever (#894).
+    /// * **Complete**: a part set its flip installs inside one obligation value, the published
+    ///   parts' `retire:records:{parts}` or the unnamed parts' `retire:bytes:{parts}`, encodes
+    ///   past the ceiling, so that flip could never land (#842). `bytes` is the obligation's
+    ///   stored value, `{"parts":…}`, not the bare set. Part numbers spread past S3's range (1 to
+    ///   10,000) are what reach it. Answered with nothing written when the set read before the
+    ///   fence is already too large, and otherwise against the set the fence froze, with that
+    ///   fence released and its attempt given back, so the session stays `Open` and can still be
+    ///   aborted ([`complete`], #1011).
     SessionTooLarge {
-        /// The widest encoding the session's record could reach, in bytes.
+        /// The value that would cross the ceiling, in bytes: the widest encoding the session's
+        /// record could reach (Create), or the part-set obligation's (Complete).
         bytes: u64,
         /// The ceiling it crosses ([`MAX_VALUE_BYTES`]).
         limit: u64,
@@ -5834,6 +6041,202 @@ mod open_teardown {
         );
         for state in [r#"{"kind":"Open"}"#, r#"{"kind":"Aborting"}"#, &completed] {
             assert_eq!(session(state, 3).completing_teardown(&id), None, "{state}");
+        }
+    }
+}
+
+/// The root flip's writer-side records (#1008): [`SessionRecord::completed`] moves only a
+/// `Completing` session below `u64::MAX`, and each of the flip's three obligation rows decodes
+/// against the very key it carries, with an empty flat generation refused as the decode refuses it.
+#[cfg(test)]
+mod flip_records {
+    use super::*;
+
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
+    fn session(state: &str, epoch: u64) -> SessionRecord {
+        let json = format!(
+            "{{\"parent\":42,\"object\":\"o\",\"created_at_millis\":100,\"clock_source\":\"wall\",\
+             \"segment_nonce\":\"{NONCE}\",\"epoch\":{epoch},\"attempts\":2,\"state\":{state}}}"
+        );
+        decode_session_record(json.as_bytes()).expect("a canonical session")
+    }
+
+    fn completing(epoch: u64) -> String {
+        format!(
+            "{{\"kind\":\"Completing\",\"fenced_at_millis\":900,\"segments_written\":0,\
+             \"publish_target\":{{\"parent\":42,\"name\":\"o\",\"epoch\":{epoch}}}}}"
+        )
+    }
+
+    fn completion() -> Completion {
+        Completion {
+            inode: 7,
+            version: 4,
+            etag: MultipartEtag::parse(&format!("{}-2", "ab".repeat(32))).expect("an etag"),
+            completed_at_millis: 950,
+            complete_fingerprint: Digest::from_bytes([0xcd; 32]),
+        }
+    }
+
+    fn chunk(id: u128) -> ChunkRef {
+        ChunkRef {
+            id,
+            scheme: EcScheme::None,
+            len: 10,
+            placement: vec![3],
+        }
+    }
+
+    /// `obligation` decodes against its own key as `(mode, token, its own payload)`.
+    fn assert_decodes(obligation: &RetireObligation, mode: RetireMode, token: &RetireToken) {
+        assert_eq!(obligation.key(), retire_key(mode, token));
+        let value = metadata::encode(obligation.payload());
+        let decoded = decode_retire_obligation(&obligation.key(), &value).expect("it decodes");
+        assert_eq!(decoded, (mode, token.clone(), obligation.payload().clone()));
+    }
+
+    #[test]
+    fn only_a_completing_session_completes_one_epoch_on_with_its_attempts_kept() {
+        let flipped = session(&completing(3), 3).completed(completion());
+        let flipped = flipped.expect("Completing@3 completes");
+        assert_eq!(flipped.epoch(), 4);
+        assert_eq!(flipped.attempts(), 2, "the fence's attempt stays spent");
+        assert_eq!(
+            flipped.state(),
+            &SessionState::Completed {
+                completion: completion()
+            }
+        );
+        let encoded = metadata::encode(&flipped);
+        assert_eq!(
+            decode_session_record(&encoded).expect("it decodes"),
+            flipped
+        );
+
+        let last = session(&completing(u64::MAX), u64::MAX);
+        assert_eq!(last.completed(completion()), None, "no epoch past u64::MAX");
+        for state in [r#"{"kind":"Open"}"#, r#"{"kind":"Aborting"}"#] {
+            assert_eq!(session(state, 3).completed(completion()), None, "{state}");
+        }
+    }
+
+    #[test]
+    fn the_flips_obligations_decode_against_their_keys() {
+        let id = UploadId::new("ab".repeat(16)).expect("an upload id");
+        let token = RetireToken::Session {
+            upload_id: id.clone(),
+            epoch: 3,
+            part: None,
+        };
+        let set = |numbers: &[u32]| {
+            PartNumberSet::from_numbers(numbers.iter().map(|&n| PartNumber::new(n).unwrap()))
+                .expect("a non-empty set")
+        };
+
+        let published = RetireObligation::published_parts(&id, 3, set(&[1, 3]));
+        assert_decodes(&published, RetireMode::Records, &token);
+        assert_eq!(
+            published.payload().parts(),
+            Some(&PartScope::Set(set(&[1, 3])))
+        );
+        assert!(!published.payload().session());
+
+        let unnamed = RetireObligation::unnamed_parts(&id, 3, set(&[2]));
+        assert_decodes(&unnamed, RetireMode::Bytes, &token);
+        assert_eq!(unnamed.payload().parts(), Some(&PartScope::Set(set(&[2]))));
+        assert!(!unnamed.payload().session());
+
+        let generation = RetireToken::Generation {
+            inode: 7,
+            version: 4,
+        };
+        let flat = RetiredMap::Flat(vec![chunk(1), chunk(2)]);
+        let superseded = RetireObligation::superseded_generation(7, 4, flat.clone());
+        let superseded = superseded.expect("a flat generation with chunks");
+        assert_decodes(&superseded, RetireMode::Bytes, &generation);
+        let owed = superseded.payload().generation().expect("a generation");
+        assert_eq!((owed.inode(), owed.version(), owed.map()), (7, 4, &flat));
+
+        let group = SegmentGroup::new(NONCE, 5).expect("a group");
+        let segmented = RetiredMap::Segmented(group);
+        let superseded = RetireObligation::superseded_generation(7, 4, segmented.clone());
+        let superseded = superseded.expect("a segmented generation");
+        assert_decodes(&superseded, RetireMode::Bytes, &generation);
+        assert_eq!(
+            superseded.payload().generation().map(RetireGeneration::map),
+            Some(&segmented)
+        );
+
+        assert_eq!(
+            RetireObligation::superseded_generation(7, 4, RetiredMap::Flat(Vec::new())),
+            Err(RecordError::RetireObligationOwesNothing {
+                component: "generation.chunks"
+            }),
+            "a zero-byte prior owes nothing, so it gets no obligation"
+        );
+    }
+}
+
+/// [`SessionRecord::with_segments_written`] (#1009): only a `Completing` session moves its segment
+/// cursor, with every other field kept, and the bound it refuses past is exactly the one its decode
+/// enforces, so every record it returns decodes and none past that bound is ever minted.
+#[cfg(test)]
+mod segment_cursor {
+    use super::*;
+
+    fn json(state: &str) -> String {
+        format!(
+            "{{\"parent\":42,\"object\":\"o\",\"created_at_millis\":100,\"clock_source\":\"wall\",\
+             \"segment_nonce\":\"0123456789abcdef0123456789abcdef\",\"epoch\":3,\
+             \"attempts\":1,\"state\":{state}}}"
+        )
+    }
+
+    fn session(state: &str) -> SessionRecord {
+        decode_session_record(json(state).as_bytes()).expect("a canonical session")
+    }
+
+    fn completing(segments_written: u32) -> String {
+        format!(
+            "{{\"kind\":\"Completing\",\"fenced_at_millis\":900,\
+             \"segments_written\":{segments_written},\
+             \"publish_target\":{{\"parent\":42,\"name\":\"o\",\"epoch\":3}}}}"
+        )
+    }
+
+    #[test]
+    fn the_cursor_moves_up_to_the_decode_bound_and_never_past_it() {
+        let fence = session(&completing(0));
+        let bound = metadata::MAX_SEGMENT_INDEX + 1;
+        for written in [0, 1, 512, bound - 1, bound] {
+            let moved = fence.with_segments_written(written);
+            let moved = moved.expect("a cursor the decoder accepts");
+            assert_eq!(
+                moved,
+                session(&completing(written)),
+                "only the cursor moves"
+            );
+            let encoded = metadata::encode(&moved);
+            assert_eq!(decode_session_record(&encoded), Ok(moved), "{written}");
+        }
+        for past in [bound + 1, bound + 2, u32::MAX] {
+            assert_eq!(fence.with_segments_written(past), None, "{past}");
+            assert_eq!(
+                decode_session_record(json(&completing(past)).as_bytes()),
+                Err(RecordError::SegmentCursorUnaddressable {
+                    segments_written: past
+                }),
+                "the decoder refuses the same cursor: {past}"
+            );
+        }
+        let completed = format!(
+            "{{\"kind\":\"Completed\",\"completion\":{{\"inode\":7,\"version\":1,\"etag\":\
+             \"{0}-1\",\"completed_at_millis\":950,\"complete_fingerprint\":\"{0}\"}}}}",
+            "ab".repeat(32)
+        );
+        for state in [r#"{"kind":"Open"}"#, r#"{"kind":"Aborting"}"#, &completed] {
+            assert_eq!(session(state).with_segments_written(1), None, "{state}");
         }
     }
 }
