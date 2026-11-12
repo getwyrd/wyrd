@@ -2062,8 +2062,9 @@ async fn ledger_page(
 /// bound and its termination rest on: the page is no longer than it asked for, and it either
 /// ends the walk or carries it past `after`. Anything else is an error, never a page accepted
 /// silently. Shared by every paged walk in this module — the `orphan:` ledger's and the staged
-/// protection class's — so they cannot disagree about what a usable page is.
-async fn checked_page(
+/// protection class's — and by the retirement drain's walks of the `retire:` ledger and of a
+/// segment group (`crate::retirement`), so they cannot disagree about what a usable page is.
+pub(crate) async fn checked_page(
     meta: &dyn MetadataStore,
     prefix: &[u8],
     walk: &str,

@@ -4985,6 +4985,7 @@ dependencies = [
  "wyrd-chunkstore-fs",
  "wyrd-coordination-mem",
  "wyrd-core",
+ "wyrd-metadata-redb",
  "wyrd-telemetry",
  "wyrd-testkit",
  "wyrd-traits",
