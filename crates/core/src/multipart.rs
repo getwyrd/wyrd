@@ -124,8 +124,9 @@
 //! obligations, in one batch. Past one flat map it first writes the attempt's `seg:` records,
 //! moving the session's segment cursor in each batch, and a release once one landed installs
 //! that attempt's `retire:records:` `{seg}` obligation (#1009). Neither has a production caller
-//! until the S3 verb is wired (#670). Every other first writer is a store round trip still to
-//! land: the rest of Complete (#1010, #1011), then #659.
+//! until the S3 verb is wired (#670); the recovery from an unknown commit outcome (#1010) only
+//! re-sends those batches. Every other first writer is a store round trip still to land: the
+//! rest of Complete (#1011), then #659.
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -3899,7 +3900,7 @@ struct RetirePayloadWire {
 /// a `Completing` attempt's `{seg}`), the part commit's per-part `{chunks}` row ([`commit`],
 /// #1027), the root flip's three rows ([`complete`], #1008) and the Complete fence release's
 /// `{seg}` row, the same row the restore fence installs ([`complete`], #1009); the later store
-/// round trips (#1010, #1011, #659) add their rows there.
+/// round trips (#1011, #659) add their rows there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetirePayload {
     /// Omitted when absent rather than spelled `false` (`AGENTS.md:170-172`), so the accepted
