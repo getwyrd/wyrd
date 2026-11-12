@@ -5,7 +5,8 @@
 //! (`0016:1420-1431`) and the quiesce rule (`0016:1720-1733`). A commit or a compensation
 //! answered `Conflict` is classified from a re-read (#1028, the second slice; `0016:1584-1653`).
 //! A commit answered `CommitUnknownResult` sends nothing more and is settled from reads alone
-//! (#1029, the third slice; `0016:1630-1651`).
+//! (#1029, the third slice; `0016:1630-1651`), and so is a compensation answered unknown (#1030,
+//! the fourth).
 //!
 //! | Batch | Preconditions | Mutations |
 //! |---|---|---|
@@ -129,17 +130,41 @@
 //!
 //! The attempt reads instead, in laps of the same four reads in the same order (the part key, the
 //! session, its own slot, the session again), at most [`SETTLE_LAPS`] of them, and the clock plays
-//! no part:
+//! no part. A lap whose slot read finds the slot gone, under a commit that required the part key
+//! absent, reads that key once more before its last session read.
 //!
 //! * **This attempt's own commit, checked first.** The slot read finds the slot gone (absent, or
 //!   holding another attempt's `attempt_id`), and the session read made **after** it still finds
-//!   the `Open@E` bytes the commit required: `Committed`, whatever the part key holds. While the
-//!   session is `Open@E` only this attempt's own commit and its own compensation delete its slot
-//!   (no reaper touches an `Open` session, `0016:1625-1628`, and no staging batch deletes a slot),
-//!   and it sent no compensation; once that index is free another attempt may reserve it, so
-//!   another `attempt_id` there is the same proof. A session read made before the slot read proves
-//!   nothing, since a teardown can take the slot between the two. The part's bytes prove nothing
-//!   either: a `PartRecord` names no attempt, and an empty part names no chunk.
+//!   the `Open@E` bytes the commit required: `Committed`. While the session is `Open@E` only this
+//!   attempt's own commit and its own compensation delete its slot (no reaper touches an `Open`
+//!   session, `0016:1625-1628`, and no staging batch deletes a slot), and it sent no compensation;
+//!   once that index is free another attempt may reserve it, so another `attempt_id` there is the
+//!   same proof. A session read made before the slot read proves nothing, since a teardown can take
+//!   the slot between the two. The part's bytes prove nothing either: a `PartRecord` names no
+//!   attempt, and an empty part names no chunk.
+//! * **But no record at the part key disproves it.** A slot erased by damage looks the same as a
+//!   released one. So a commit that required the part key absent also needs a record at that key
+//!   when it is read again **after** that slot read and **before** that last session read. A
+//!   landed commit left its record there, and a `part:` record's only remover is the retirement
+//!   drain, once the session has left `Open` (`0016:351`); with `Open@E` read after it, no drain
+//!   ran in between. So the key found absent there means no commit of this attempt landed: the
+//!   doubt kept, with [`Stop::SlotLost`]. Any record there is a record, this attempt's or a
+//!   rival's. Bytes there that do not decode are no record (ADR-0045) and prove nothing either way:
+//!   the doubt kept, with [`Stop::Record`], the flag as it stood. A part read made before the slot
+//!   read disproves nothing, since the commit may land between the two. This check only ever turns
+//!   a `Committed` into the doubt.
+//! * **Two limits of the proof, each reached only through damage**, a slot key erased while the
+//!   session is `Open@E`, which no legal writer does. Both answer `Committed`, since no read can
+//!   tell them from a commit of this attempt that landed. A re-upload's commit required the
+//!   prior's bytes, which a rival or a repair can leave too, so for it the slot alone answers. And
+//!   a same-number rival's record found at the part key is a record: a first upload whose commit
+//!   never landed, a rival's first upload landing in its place and its slot then erased, reads
+//!   exactly like its commit landing and then being replaced by that rival's re-upload, since a
+//!   `PartRecord` names no attempt, and the obligation a re-upload installs is keyed under the
+//!   rival's attempt, which this one cannot name (and over an empty prior there is none). In both
+//!   no chunk is left unnamed: the commit never landed, so this attempt's owned `sidx:` entries
+//!   still name its chunks, and a Complete checks the digest it names against the record that
+//!   stands ([`super::complete::fence_complete`]).
 //! * **Anything else keeps the doubt.** A slot still held at the bytes this attempt last wrote
 //!   proves nothing, since late staging rebuilds them. With the slot held and the session
 //!   unchanged the attempt reads one more lap, while the round may still land and laps are left:
@@ -147,7 +172,9 @@
 //!
 //! | What a lap found | Answer |
 //! |---|---|
-//! | the slot gone, the last session read still `Open@E` | `Committed` |
+//! | the slot gone, the last session read still `Open@E`, and, for a commit that required the part key absent, a record at that key read between the two | `Committed` |
+//! | the slot gone, the last session read still `Open@E`, and the part key the commit required absent found absent between the two | [`CommitError::InDoubt`], [`Stop::SlotLost`] |
+//! | the slot gone, the last session read still `Open@E`, and bytes that do not decode at the part key the commit required absent, read between the two | [`CommitError::InDoubt`], [`Stop::Record`] |
 //! | the slot held, the session still `Open@E` | another lap while one is left and the round may still land; then [`CommitError::InDoubt`], [`Stop::OutcomeUnknown`] |
 //! | the session moved, the slot held or gone | [`CommitError::InDoubt`], [`Stop::SessionMoved`]: a teardown removes slots too, and an epoch only rises, so no later read can prove the commit |
 //! | the session gone, and the slot key, read once more, absent | [`CommitError::InDoubt`], [`Stop::SessionMoved`]: the terminal delete took both, perhaps after the commit landed |
@@ -189,6 +216,68 @@
 //! is the refusal, whatever stopped the commit, and a stop of the compensation itself is its own
 //! typed error and claims no release.
 //!
+//! # A compensation in doubt
+//!
+//! A compensation answered [`CommitUnknownResult`] is settled by the rule a commit in doubt
+//! follows: it is never read as `Conflict`, and **the attempt sends no further batch**, not the
+//! compensation again and nothing else. Nothing a read can see proves that a compensation did
+//! **not** land. Its slot found held at the bytes it required proves nothing, since late staging
+//! of this attempt rebuilds them after the compensation deleted them, just as after a landed
+//! commit (*A commit in doubt*). Its obligation key found absent proves nothing either: the
+//! retirement drain deletes a drained obligation whatever the session's state. And an empty
+//! part's compensation, sent again after a landing that late staging then hid, would land twice.
+//!
+//! So the attempt reads, in laps of its re-read's reads in the same order (its obligation key, for
+//! a non-empty part, its own slot, then the session), at most [`SETTLE_LAPS`] of them, then, for a
+//! non-empty part, its obligation key once more. The clock plays no part. It takes the
+//! compensation as landed, and gives the answer it would give had the store answered `Committed`,
+//! only on evidence that no other batch can produce:
+//!
+//! * **A non-empty part: its own obligation, at the exact bytes the round put**, under the epoch
+//!   that round required. The key names this attempt and that epoch (`0016:358-366`), and no
+//!   staging batch writes a `retire:` key. The one other batch of the attempt with a key of this
+//!   form is a re-upload's commit, which puts the prior's chunks and cannot land once a
+//!   compensation is sent: every commit sent before it was answered `Conflict`. A session that
+//!   moved does not erase an obligation, so the key is read again after the other reads.
+//! * **An empty part: its slot found gone, and a session read made after that slot read still the
+//!   bytes the round required.** While the session holds those bytes, only this attempt's commit
+//!   and its compensation remove its slot, and no commit of it can land. A slot gone under a moved
+//!   session proves nothing, since a teardown of a fenced session removes slots too.
+//!
+//! A non-empty part never settles on its slot alone: a slot erased by damage looks the same as a
+//! released one, and the obligation is what tells them apart. An empty part's slot erased by
+//! damage does look like a landed compensation; answering it so promises nothing, since an empty
+//! part owes no chunk, and no legal writer erases a slot. That is a limit of the proof, reached
+//! only through damage, as the own-commit proof's two are (*A commit in doubt*).
+//!
+//! Anything else keeps the doubt: [`CommitError::InDoubt`] for [`DoubtfulBatch::Compensation`],
+//! whose cause is what ended the reads. Another lap is read only while the slot is held, the
+//! session unchanged and the round may still land. [`InDoubt::may_still_commit`] falls by the rule
+//! a commit's follows: once a read finds the session at a higher epoch than the round required,
+//! `Open` or not, or finds no session record and then a slot read made after that read finds the
+//! slot key absent (the terminal delete). Damage settles nothing, so the flag stays: bytes that do
+//! not decode, a missing session record with a record still at the slot key, and other bytes at the
+//! obligation key, which the round required absent but which are not there for good (the drain
+//! and a repair both remove them). A fault or damage ends the reads, keeping what the reads before
+//! it showed.
+//!
+//! | What the reads found | Answer |
+//! |---|---|
+//! | a non-empty part's obligation at the bytes the round put, at either read of it | the landed answer |
+//! | an empty part's slot gone, the session read after it still the bytes the round required | the landed answer |
+//! | other bytes at the obligation key | [`CommitError::InDoubt`], [`Stop::ObligationKeyTaken`], the flag kept |
+//! | the session moved | [`CommitError::InDoubt`], [`Stop::SessionMoved`] |
+//! | the session gone, and the slot key, read once more, absent | [`CommitError::InDoubt`], [`Stop::SessionMoved`] |
+//! | the session gone, and any record at the slot key read once more | [`CommitError::InDoubt`], [`Stop::Record`] ([`RecordError::SessionRecordMissing`]) |
+//! | the slot rewritten under this attempt's id | [`CommitError::InDoubt`], [`Stop::SlotLost`] |
+//! | the slot held under the unchanged session, or a non-empty part's slot gone under it with no obligation found | [`CommitError::InDoubt`], [`Stop::OutcomeUnknown`] |
+//! | bytes that do not decode at the slot or the session, a session at an epoch that has not risen, a read that fails | [`CommitError::InDoubt`], [`Stop::Record`] or [`Stop::Store`] |
+//!
+//! The cost is availability, which 0016's refutation standard allows (`0016:2811-2813`): a
+//! compensation that did not land, or that landed and was then hidden (its obligation drained, or
+//! an empty part's slot rebuilt), is answered in doubt, and its slot stays held until the session
+//! ends.
+//!
 //! # The stops
 //!
 //! The reaper does not walk an `Open` session (`0016:1600-1620`), so a stop that left an attempt's
@@ -209,7 +298,7 @@
 //! | the session has left `Open`, or was deleted with its slots | answer the refusal; the residue is the reaper's |
 //! | a store fault or a damaged record | no compensation; the residue stays, as after a crash (`0016:1778`) |
 //! | a sent commit answered unknown | no further batch and no compensation: the reads of *A commit in doubt*, then `Committed` on the own-commit proof, or else keep the doubt ([`CommitError::InDoubt`], its cause what ended the reads) |
-//! | a compensation answered unknown | stop in doubt ([`Stop::OutcomeUnknown`]), claiming no release; no further batch |
+//! | a compensation answered unknown | no further batch: the reads of *A compensation in doubt*, then the stop's own answer, the slot released, on the compensation's proof, or else keep the doubt ([`CommitError::InDoubt`], claiming no release, its cause what ended the reads) |
 //! | a compensation's own stop: its rounds spent, its obligation key taken, the slot lost | that stop, claiming no release |
 //!
 //! An owned entry lost after staging has no stop of its own: the renewal requires that entry,
@@ -226,16 +315,20 @@
 //! |---|---|
 //! | the quiesce renewal | [`super::stage::RENEWAL_ROUNDS`] commits |
 //! | the part commit, its retries included | [`COMMIT_ROUNDS`] commits, then [`Stop::CommitRoundsSpent`]; a round answered unknown is the last |
-//! | the reads after a commit answered unknown | [`SETTLE_LAPS`] laps of four reads, no batch |
-//! | the compensation, the epoch chase included | [`COMPENSATION_ROUNDS`] commits, then [`Stop::CompensationRoundsSpent`] |
+//! | the reads after a commit answered unknown | [`SETTLE_LAPS`] laps of four reads (five in a lap that reads the part key again), no batch |
+//! | the compensation, the epoch chase included | [`COMPENSATION_ROUNDS`] commits, then [`Stop::CompensationRoundsSpent`]; a round answered unknown is the last |
+//! | the reads after a compensation answered unknown | [`SETTLE_LAPS`] laps of three reads (two for an empty part), no batch |
 //!
 //! A commit round answered `Conflict` is followed by at most five reads: its four, then either the
 //! slot key once more behind a missing session or, before the compensation that follows rounds no
 //! read explained, a re-upload's obligation key. A commit round answered unknown is followed by at
-//! most [`SETTLE_LAPS`] laps of four reads, and then the slot key once more behind a missing
-//! session. A compensation round is followed by at most four. Each store call is bounded by the
-//! store's own contract (every operation terminates, `crates/traits/src/lib.rs`, "Operational
-//! envelope").
+//! most [`SETTLE_LAPS`] laps of four reads, a lap that finds the slot gone reading the part key once
+//! more, and then the slot key once more behind a missing session. A compensation round answered
+//! `Conflict` is followed by at most four reads. One answered unknown is followed by at most
+//! [`SETTLE_LAPS`] laps of three reads (two for an empty part), then the slot key once more behind
+//! a missing session and, for a non-empty part, its obligation key once more. Each store call is
+//! bounded by the store's own contract (every operation terminates, `crates/traits/src/lib.rs`,
+//! "Operational envelope").
 //!
 //! # Every batch requires the slot bytes this attempt last wrote
 //!
@@ -314,6 +407,10 @@ pub const COMMIT_ROUNDS: u32 = 4;
 /// land, leads to another. A budget for the work, not for the answer: a commit that may land after
 /// the last lap is answered [`CommitError::InDoubt`], as Abort returns its doubt rather than wait
 /// for a fence that may land later ([`super::abort::abort_session`]).
+///
+/// The same budget, for the same reason, bounds the laps after a compensation answered
+/// `CommitUnknownResult`, each its obligation key (for a non-empty part), the attempt's own slot and
+/// the session (the module doc's *A compensation in doubt*).
 pub const SETTLE_LAPS: u32 = 2;
 
 /// The most compensation batches one [`commit_part`] sends: [`MAX_COMPLETE_ATTEMPTS`] `+ 1`, the
@@ -360,8 +457,8 @@ pub enum CommitError {
     },
     /// A batch of this attempt may have landed, or may still land, and no read showed which
     /// ([`InDoubt::cause`] says what ended the reads). The attempt sent nothing after that batch.
-    /// Never "nothing was written". A commit in doubt was re-read and not proven landed (the module
-    /// doc's *A commit in doubt*); a compensation's unknown outcome stops here unread.
+    /// Never "nothing was written". The batch was re-read and not proven landed: a commit by the
+    /// module doc's *A commit in doubt*, a compensation by its *A compensation in doubt*.
     InDoubt(Box<InDoubt>),
     /// The commit stopped, and no batch of it is in doubt.
     Stopped {
@@ -378,7 +475,10 @@ pub enum CommitError {
 impl CommitError {
     /// Whether this error's stop was followed by a compensation that landed: the attempt's slot is
     /// released, its owned entries are deleted, and its chunks are owed to a `retire:bytes:`
-    /// obligation (none for an empty part). Never `true` for [`Self::InDoubt`].
+    /// obligation (none for an empty part). A compensation the store answered
+    /// `CommitUnknownResult` counts only on its own evidence, read back: its obligation at the
+    /// bytes it put, or for an empty part its slot gone under the session bytes it required (the
+    /// module doc's *A compensation in doubt*). Never `true` for [`Self::InDoubt`].
     pub const fn slot_released(&self) -> bool {
         match self {
             Self::Renewal { slot_released, .. } | Self::Stopped { slot_released, .. } => {
@@ -398,8 +498,8 @@ pub struct InDoubt {
     pub batch: DoubtfulBatch,
     /// Whether that batch may still be applied **after** the call returned: the store reported
     /// [`CommitUnknownResult::may_still_commit`], and no read since showed it unable to land (the
-    /// module doc's *A commit in doubt*). So never `true` where the store said `false`. With
-    /// `false` it may still have landed.
+    /// module doc's *A commit in doubt* and *A compensation in doubt*). So never `true` where the
+    /// store said `false`. With `false` it may still have landed.
     pub may_still_commit: bool,
     /// The store's report for that batch. It is the error's
     /// [`source`](std::error::Error::source).
@@ -427,7 +527,10 @@ pub enum Stop {
     /// The attempt's slot is gone (absent, or another attempt's) under a live session, or
     /// rewritten under this attempt's id, and nothing explains it: the session's state does not
     /// account for it, and no batch of this attempt landed (as a stop) or none can be shown to
-    /// have (as an [`InDoubt::cause`]). Nothing is released.
+    /// have (as an [`InDoubt::cause`]). As the cause of a commit in doubt that required the part
+    /// key absent, it also covers a slot gone under the unchanged session while that key, read
+    /// after the slot, is still absent: no commit of this attempt landed (the module doc's *A
+    /// commit in doubt*). Nothing is released.
     SlotLost {
         /// The slot key, as UTF-8 (lossy).
         key: String,
@@ -436,7 +539,8 @@ pub enum Stop {
     /// compensation requires absent, or the one a re-upload's commit required absent in every
     /// round no read explained. The key names this attempt, and a token is minted once
     /// (`0016:364`), so this is damage a retry cannot clear. The record is kept, and nothing is
-    /// released.
+    /// released. As the cause of a compensation in doubt, those bytes are not its own obligation's,
+    /// and the flag is kept: the drain or a repair can clear them, and the round may then land.
     ObligationKeyTaken {
         /// The `retire:` key, as UTF-8 (lossy).
         key: String,
@@ -449,14 +553,17 @@ pub enum Stop {
         /// The reading it was judged at.
         now_millis: u64,
     },
-    /// With a commit in doubt, the session left the bytes the commit required, or was deleted with
-    /// its slots. A teardown removes slots too, and an epoch only rises, so no read can show
-    /// whether the commit landed before the session moved, and it cannot land after. Only an
-    /// [`InDoubt::cause`].
+    /// With a batch in doubt, the session left the bytes the batch required, or was deleted with
+    /// its slots. A teardown removes slots too, and an epoch only rises, so no read of the slot can
+    /// show whether the batch landed before the session moved, and it cannot land after. A
+    /// compensation's own obligation, found at the bytes it put, still proves it, so a
+    /// compensation ends here only when that read did not find them. Only an [`InDoubt::cause`].
     SessionMoved,
-    /// The store could not report the batch's outcome, and no read showed that it landed: for a
+    /// The store could not report the batch's outcome, and no read showed that it landed. For a
     /// commit, the slot was still held at the bytes it last wrote, which late staging can rebuild
-    /// after the commit landed; a compensation is not read at all. Nothing more was sent. Only an
+    /// after the commit landed. For a compensation, under the unchanged session, its slot was still
+    /// held, or, for a non-empty part, its obligation was not found at the bytes it puts, which
+    /// the retirement drain can delete after it landed. Nothing more was sent. Only an
     /// [`InDoubt::cause`].
     OutcomeUnknown,
     /// A stored record is not valid (ADR-0045), or a value this attempt would write is not one its
@@ -547,8 +654,8 @@ impl fmt::Display for Stop {
                  {DISPATCH_MARGIN_MILLIS} ms left at {now_millis}, so no further commit was sent"
             ),
             Self::SessionMoved => f.write_str(
-                "the session left the bytes the commit required, or was deleted, so no read can \
-                 say whether the commit landed before it moved",
+                "the session left the bytes the batch required, or was deleted, so no read can \
+                 say whether the batch landed before it moved",
             ),
             Self::OutcomeUnknown => f.write_str(
                 "the store could not report the batch's outcome, and no read showed that it \
@@ -766,26 +873,12 @@ fn stopped(upload_id: &UploadId, cause: Stop) -> CommitError {
     }
 }
 
-/// A compensation came back with an error: an unknown outcome stops the attempt in doubt, as the
-/// store reported it ([`Stop::OutcomeUnknown`]), and anything else is a definite failure of that
-/// batch.
-fn failed(upload_id: &UploadId, fault: BoxError) -> CommitError {
-    match fault.downcast_ref::<CommitUnknownResult>() {
-        Some(unknown) => CommitError::InDoubt(Box::new(InDoubt {
-            upload_id: upload_id.clone(),
-            batch: DoubtfulBatch::Compensation,
-            may_still_commit: unknown.may_still_commit,
-            outcome: unknown.clone(),
-            cause: Stop::OutcomeUnknown,
-        })),
-        None => stopped(upload_id, Stop::Store(fault)),
-    }
-}
-
-/// **A part commit in doubt** (the module doc's *A commit in doubt*): the round the store answered
-/// `CommitUnknownResult`, which is the last round the attempt sends.
+/// **A batch in doubt** (the module doc's *A commit in doubt* and *A compensation in doubt*): the
+/// round the store answered `CommitUnknownResult`, which is the last batch the attempt sends.
 #[derive(Debug)]
 struct Doubt {
+    /// Which batch the round was.
+    batch: DoubtfulBatch,
     /// The store's report.
     outcome: CommitUnknownResult,
     /// Whether the round may still land: the store said `may_still_commit`, and no read since
@@ -794,8 +887,9 @@ struct Doubt {
 }
 
 impl Doubt {
-    fn of(outcome: &CommitUnknownResult) -> Self {
+    fn of(batch: DoubtfulBatch, outcome: &CommitUnknownResult) -> Self {
         Self {
+            batch,
             outcome: outcome.clone(),
             may_land: outcome.may_still_commit,
         }
@@ -822,7 +916,7 @@ impl Doubt {
     fn end(&self, upload_id: &UploadId, cause: Stop) -> CommitError {
         CommitError::InDoubt(Box::new(InDoubt {
             upload_id: upload_id.clone(),
-            batch: DoubtfulBatch::Commit,
+            batch: self.batch,
             may_still_commit: self.may_land,
             outcome: self.outcome.clone(),
             cause,
@@ -842,37 +936,61 @@ impl Doubt {
             .await
             .map_err(|fault| self.end(upload_id, Stop::Store(fault)))
     }
+
+    /// With a compensation in doubt, read `obligation`'s key, which the round put under
+    /// `require_absent`: whether it holds the exact bytes the round put. The key names this
+    /// attempt and the epoch the round required (`0016:358-366`), and of this attempt's batches
+    /// only that round can have put those bytes there, so they prove it landed. Absent proves
+    /// nothing: the retirement drain deletes a drained obligation whatever the session's state.
+    /// Other bytes there are damage, which ends the reads with [`Stop::ObligationKeyTaken`] and the
+    /// flag kept, since they are not there for good.
+    async fn owns(
+        &self,
+        store: &impl MetadataStore,
+        upload_id: &UploadId,
+        obligation: &RetireObligation,
+    ) -> Result<bool, CommitError> {
+        let key = obligation.key();
+        match self.read(store, upload_id, &key).await? {
+            None => Ok(false),
+            Some(found) if found == metadata::encode(obligation.payload()) => Ok(true),
+            Some(_) => Err(self.end(upload_id, Stop::ObligationKeyTaken { key: lossy(&key) })),
+        }
+    }
 }
 
-/// With a commit in doubt, a lap's last session read found no record: read the slot key once more,
+/// With a batch in doubt, a lap's last session read found no record: read the slot key once more,
 /// now, since a slot read made before that session read proves nothing. Absent, a terminal delete
-/// took the session and the slot together (`0016:674`), perhaps after the commit landed, and the
-/// commit cannot land after it: [`Stop::SessionMoved`]. Any record there, this attempt's or
-/// another's, is damage ([`RecordError::SessionRecordMissing`]). Either way the doubt is kept.
+/// took the session and the slot together (`0016:674`), perhaps after the batch landed, and the
+/// batch cannot land after it: [`Stop::SessionMoved`]. Any record there, this attempt's or
+/// another's, is damage ([`RecordError::SessionRecordMissing`]), and the flag is kept. Returns the
+/// cause the doubt is kept with; a fault ends the reads at once.
 async fn gone_in_doubt(
     store: &impl MetadataStore,
     attempt: &StagedAttempt,
     required: &Session,
-    mut doubt: Doubt,
-) -> CommitError {
-    let cause = match store.get(attempt.slot_key()).await {
-        Ok(None) => {
+    doubt: &mut Doubt,
+) -> Result<Stop, CommitError> {
+    let found = doubt
+        .read(store, attempt.upload_id(), attempt.slot_key())
+        .await?;
+    Ok(match found {
+        None => {
             doubt.cannot_land();
             Stop::SessionMoved
         }
-        Ok(Some(_)) => Stop::Record(RecordError::SessionRecordMissing {
+        Some(_) => Stop::Record(RecordError::SessionRecordMissing {
             required: required.epoch,
         }),
-        Err(fault) => Stop::Store(fault),
-    };
-    doubt.end(attempt.upload_id(), cause)
+    })
 }
 
 /// **Settle a part commit answered `CommitUnknownResult`** (the module doc's *A commit in doubt*):
 /// send nothing more, read at most [`SETTLE_LAPS`] laps, and answer
 /// [`UploadPartOutcome::Committed`] only on the own-commit proof, the slot found gone and the
-/// session read after it still the `Open@E` bytes the commit required. Anything else keeps the
-/// doubt ([`CommitError::InDoubt`]). The clock plays no part.
+/// session read after it still the `Open@E` bytes the commit required, with, for a commit that
+/// required the part key absent, a record at that key read between the two. Anything else keeps
+/// the doubt ([`CommitError::InDoubt`]). The clock plays no part.
 async fn settle(
     store: &impl MetadataStore,
     attempt: &StagedAttempt,
@@ -882,18 +1000,13 @@ async fn settle(
 ) -> Result<UploadPartOutcome, CommitError> {
     let upload_id = attempt.upload_id();
     let session_key = mpu_key(upload_id);
+    let part_at = part_key(upload_id, attempt.part_number());
     let mut laps = 0u32;
     loop {
         laps += 1;
         // The lap's four reads, in order. Each is folded into the doubt before the next is made,
         // so a read that fails later in the lap keeps what the earlier ones showed.
-        let part = doubt
-            .read(
-                store,
-                upload_id,
-                &part_key(upload_id, attempt.part_number()),
-            )
-            .await?;
+        let part = doubt.read(store, upload_id, &part_at).await?;
         // A changed part key is another writer's record only if it decodes (ADR-0045). Damage
         // there is answered below, once the own-commit proof has been tried.
         let mut torn = None;
@@ -912,12 +1025,41 @@ async fn settle(
         doubt.seen_session(&judge_session(first.as_ref(), session));
         let slot = doubt.read(store, upload_id, attempt.slot_key()).await?;
         let slot = judge_slot(slot.as_ref(), attempt);
+        // The own-commit proof's part read, for a commit that required the part key absent and a
+        // slot found gone: after that slot read and before the last session read, so with
+        // `Open@E` read after it no drain ran in between, and the key found absent disproves the
+        // commit (a `part:` record goes only after the session leaves `Open`, `0016:351`). A part
+        // read made before the slot read disproves nothing: the commit may land between the two.
+        // What it found that keeps the proof from answering, if anything, is the doubt's cause.
+        let mut disproof = None;
+        if required.is_none() && matches!(slot, Ok(SlotSeen::Gone)) {
+            let found = doubt.read(store, upload_id, &part_at).await?;
+            match found.as_deref().map(decode_part_record).transpose() {
+                // No record: with `Open@E` read next, no commit of this attempt landed, and
+                // damage took the slot.
+                Ok(None) => disproof = Some(slot_lost_at(attempt)),
+                // A record where the commit required none, this attempt's or a rival's: it cannot
+                // land from now on. A rival's record here behind a slot erased by damage reads
+                // exactly like this commit landing and then being replaced by a rival's
+                // re-upload, so it proves the commit: a limit of the proof (the module doc's *A
+                // commit in doubt*).
+                Ok(Some(_)) => doubt.cannot_land(),
+                // Bytes that do not decode are no record either (ADR-0045), so they prove no
+                // landed commit. Damage settles nothing: the flag is kept, since a repair can
+                // let the round land.
+                Err(err) => disproof = Some(Stop::Record(err)),
+            }
+        }
         let last = doubt.read(store, upload_id, &session_key).await?;
         let last = judge_session(last.as_ref(), session);
         doubt.seen_session(&last);
-        // The own-commit proof, before anything the part key holds: while the session is `Open@E`
-        // only this attempt's own commit removes its slot, and it sent no compensation.
+        // The own-commit proof, before any damage the lap's first part read found: while the
+        // session is `Open@E` only this attempt's own commit removes its slot, and it sent no
+        // compensation.
         if let (Ok(SessionSeen::Same), Ok(SlotSeen::Gone)) = (&last, &slot) {
+            if let Some(cause) = disproof {
+                return Err(doubt.end(upload_id, cause));
+            }
             return Ok(UploadPartOutcome::Committed {
                 part_number: attempt.part_number(),
                 digest: *attempt.digest(),
@@ -929,9 +1071,7 @@ async fn settle(
         let slot = slot.map_err(|err| doubt.end(upload_id, Stop::Record(err)))?;
         let last = last.map_err(|err| doubt.end(upload_id, Stop::Record(err)))?;
         let cause = match (last, slot) {
-            (SessionSeen::Gone, _) => {
-                return Err(gone_in_doubt(store, attempt, session, doubt).await);
-            }
+            (SessionSeen::Gone, _) => gone_in_doubt(store, attempt, session, &mut doubt).await?,
             (_, SlotSeen::Rewritten) => slot_lost_at(attempt),
             // A teardown removes slots too, so a slot gone under a moved session proves nothing,
             // and no later session read can find the bytes the commit required.
@@ -1108,11 +1248,75 @@ fn compensation_batch(
 /// What a compensation that ended without an error came to ([`compensate`]).
 #[derive(Debug)]
 enum Compensated {
-    /// It landed: the slot released, the owned entries deleted, the chunks owed.
+    /// It landed: the slot released, the owned entries deleted, the chunks owed. Either the store
+    /// answered `Committed`, or a round it answered `CommitUnknownResult` was read back on the
+    /// compensation's own evidence ([`settle_compensation`]).
     Released,
     /// No round landed, and the session has left `Open` or was deleted with its slots: this
     /// refusal, with nothing more written. The residue is the reaper's.
     Left(Refusal),
+}
+
+/// **Settle a compensation answered `CommitUnknownResult`** (the module doc's *A compensation in
+/// doubt*): send nothing more, read at most [`SETTLE_LAPS`] laps of `obligation`'s key (for a
+/// non-empty part), the attempt's own slot and the session, then `obligation`'s key once more, and
+/// answer [`Compensated::Released`] only on the compensation's own evidence: for a non-empty part,
+/// `obligation` at the exact bytes the round put, under the epoch the round required; for an
+/// empty part, its slot found gone and the session read after that slot read still the bytes
+/// `session` holds. Anything else keeps the doubt ([`CommitError::InDoubt`],
+/// [`DoubtfulBatch::Compensation`]). The clock plays no part.
+async fn settle_compensation(
+    store: &impl MetadataStore,
+    attempt: &StagedAttempt,
+    session: &Session,
+    obligation: Option<&RetireObligation>,
+    mut doubt: Doubt,
+) -> Result<Compensated, CommitError> {
+    let upload_id = attempt.upload_id();
+    let session_key = mpu_key(upload_id);
+    let mut laps = 0u32;
+    let cause = loop {
+        laps += 1;
+        // The lap's reads, in the re-read's order. Each is folded into the doubt before the next
+        // is made, so a read that fails later keeps what the earlier ones showed.
+        if let Some(obligation) = obligation {
+            if doubt.owns(store, upload_id, obligation).await? {
+                return Ok(Compensated::Released);
+            }
+        }
+        let slot = doubt.read(store, upload_id, attempt.slot_key()).await?;
+        let slot = judge_slot(slot.as_ref(), attempt)
+            .map_err(|err| doubt.end(upload_id, Stop::Record(err)))?;
+        let now = doubt.read(store, upload_id, &session_key).await?;
+        let now = judge_session(now.as_ref(), session);
+        doubt.seen_session(&now);
+        let now = now.map_err(|err| doubt.end(upload_id, Stop::Record(err)))?;
+        match (now, slot) {
+            // An empty part's proof: while the session holds the bytes the round required only
+            // this attempt's commit and compensation remove its slot, and no commit of it can
+            // land. A non-empty part never settles on its slot: damage can erase one too.
+            (SessionSeen::Same, SlotSeen::Gone) if obligation.is_none() => {
+                return Ok(Compensated::Released)
+            }
+            (SessionSeen::Gone, _) => {
+                break gone_in_doubt(store, attempt, session, &mut doubt).await?;
+            }
+            (_, SlotSeen::Rewritten) => break slot_lost_at(attempt),
+            // A teardown removes slots too, so a slot gone under a moved session proves nothing.
+            (SessionSeen::Open(_) | SessionSeen::Left(_), _) => break Stop::SessionMoved,
+            // The round may have landed after this lap's slot read: one more lap.
+            (SessionSeen::Same, SlotSeen::Held) if doubt.may_land && laps < SETTLE_LAPS => {}
+            (SessionSeen::Same, _) => break Stop::OutcomeUnknown,
+        }
+    };
+    // A session that moved does not erase an obligation, and the round may have landed after the
+    // first read of it: a non-empty part reads it once more, last.
+    if let Some(obligation) = obligation {
+        if doubt.owns(store, upload_id, obligation).await? {
+            return Ok(Compensated::Released);
+        }
+    }
+    Err(doubt.end(upload_id, cause))
 }
 
 /// **The live-session compensation** (`0016:673`, `:1607-1620`): one batch that releases the slot,
@@ -1120,7 +1324,8 @@ enum Compensated {
 /// the attempt's own chunks, under `session`. Called only when no commit of the attempt can land:
 /// none was sent, or each one sent was answered `Conflict`. A round answered `Conflict` is
 /// classified from a re-read (the module doc's *The compensation, and the epoch chase*), within
-/// [`COMPENSATION_ROUNDS`] rounds. The clock plays no part.
+/// [`COMPENSATION_ROUNDS`] rounds. A round answered `CommitUnknownResult` is the last batch the
+/// attempt sends, settled from reads alone ([`settle_compensation`]). The clock plays no part.
 async fn compensate(
     store: &impl MetadataStore,
     attempt: &StagedAttempt,
@@ -1140,8 +1345,18 @@ async fn compensate(
         match store.commit(batch).await {
             Ok(CommitOutcome::Committed) => return Ok(Compensated::Released),
             Ok(CommitOutcome::Conflict) => {}
-            // deferred: #1030 — the settling of a compensation's unknown outcome.
-            Err(fault) => return Err(failed(upload_id, fault)),
+            Err(fault) => {
+                return match fault.downcast_ref::<CommitUnknownResult>() {
+                    // Never read as `Conflict`, and never followed by another batch: the reads
+                    // prove it landed, or keep the doubt.
+                    Some(unknown) => {
+                        let doubt = Doubt::of(DoubtfulBatch::Compensation, unknown);
+                        settle_compensation(store, attempt, &session, obligation.as_ref(), doubt)
+                            .await
+                    }
+                    None => Err(stopped(upload_id, Stop::Store(fault))),
+                };
+            }
         }
         // The re-read, in order: the obligation key, the slot, the session.
         if let Some(obligation) = &obligation {
@@ -1352,7 +1567,8 @@ async fn commit_rounds(
                     // Never read as `Conflict`, and never followed by another batch: the reads
                     // prove it landed, or keep the doubt.
                     Some(unknown) => {
-                        settle(store, attempt, session, required, Doubt::of(unknown)).await
+                        let doubt = Doubt::of(DoubtfulBatch::Commit, unknown);
+                        settle(store, attempt, session, required, doubt).await
                     }
                     None => Err(stopped(upload_id, Stop::Store(fault))),
                 };
