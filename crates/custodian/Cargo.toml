@@ -58,6 +58,11 @@ wyrd-chunk-format.workspace = true
 # the scrub loop itself still depends only on the trait seam.
 wyrd-chunkstore-fs.workspace = true
 tempfile.workspace = true
+# The retirement drain's test (`tests/multipart_retirement_drain.rs`, #1061) drives the leg over
+# a real metadata backend, the in-memory redb store, so the multipart records it drains are the
+# ones the production Complete and restore fence write. A test/dev composition may name a
+# concrete (ADR-0010); the drain itself depends only on the `MetadataStore` seam.
+wyrd-metadata-redb.workspace = true
 
 # Inherit the workspace lint policy (single source of truth).
 [lints]

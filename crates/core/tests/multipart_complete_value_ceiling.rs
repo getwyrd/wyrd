@@ -17,10 +17,14 @@
 //! * **(I2)** Parts 1, 3, …, 19,999, a Complete naming all of them (128,901 bytes as a `{parts}`
 //!   value): refused `SessionTooLarge` with zero commits; the session stays `Open` with
 //!   `attempts` unchanged, and an Abort then fences it.
-//! * **(I3)** The boundary is the stored value, not the bare set: parts 1, 3, …, 15,869 encode to
-//!   99,981 bytes and 99,991 as the value, and publish; parts 1, 3, …, 15,871 encode to 99,995
-//!   bytes, inside the ceiling, but 100,005 as the value, and are refused with zero commits. A set
-//!   whose value is exactly 100,000 bytes, the ceiling itself, publishes.
+//! * **(I3)** The boundary is the stored value, not the bare set, and it is the installer ceiling
+//!   `RETIRE_VALUE_CEILING` (99,931 bytes): `MAX_VALUE_BYTES` less the room the retirement drain's
+//!   cursor takes (#1061). Parts 1, 3, …, 15,859 encode to 99,911 bytes and 99,921 as the value,
+//!   and publish; parts 1, 3, …, 15,861 encode to 99,925 bytes, inside the ceiling, but 99,935 as
+//!   the value, and are refused with zero commits. A set whose value is exactly 99,931 bytes, the
+//!   ceiling itself, publishes. A set whose value is 100,000 bytes, which `MAX_VALUE_BYTES` alone
+//!   would take, is refused with zero commits, as one past it is: installed, its drain could never
+//!   write its cursor back.
 //! * **(I4)** A part committed after the first read: the set fits when the Complete first reads it,
 //!   and the wrapper plants one more unnamed part just before the fence commits, which carries the
 //!   unnamed parts' `retire:bytes:` value across the ceiling. The Complete fences, refuses against
@@ -52,7 +56,7 @@ use wyrd_core::multipart::{
     decode_part_record, decode_part_summary, decode_retire_obligation, decode_session_record,
     mpu_key, part_key, psum_key, retire_key, AbortOutcome, Budget, CompleteOutcome, CreateOutcome,
     Digest, PartNumber, PartNumberSet, PartScope, PartSummary, Refusal, RetireMode, RetireToken,
-    SessionState, UploadId,
+    SessionState, UploadId, RETIRE_VALUE_CEILING,
 };
 use wyrd_metadata_redb::RedbMetadataStore;
 use wyrd_traits::{
@@ -89,19 +93,24 @@ const FENCE_EPOCH: u64 = 1;
 const ODD_TO_9_999_VALUE: usize = 58_901;
 const EVEN_TO_10_000_VALUE: usize = 58_909;
 const ODD_TO_19_999_VALUE: usize = 128_901;
-const ODD_TO_15_869_SET: usize = 99_981;
-const ODD_TO_15_869_VALUE: usize = 99_991;
-const ODD_TO_15_871_SET: usize = 99_995;
-const ODD_TO_15_871_VALUE: usize = 100_005;
-const AT_CEILING_VALUE: usize = 100_000;
+const ODD_TO_15_859_SET: usize = 99_911;
+const ODD_TO_15_859_VALUE: usize = 99_921;
+const ODD_TO_15_861_SET: usize = 99_925;
+const ODD_TO_15_861_VALUE: usize = 99_935;
+const AT_CEILING_VALUE: usize = 99_931;
+const AT_MAX_VALUE_BYTES_VALUE: usize = 100_000;
 
-// (I3)'s pairs straddle the ceiling where the legs say: inside, both the bare set and the value
-// fit; past, the bare set fits and the value does not; at, the value is the ceiling itself.
-const _: () = assert!(ODD_TO_15_869_SET < ODD_TO_15_869_VALUE);
-const _: () = assert!(ODD_TO_15_869_VALUE <= MAX_VALUE_BYTES);
-const _: () = assert!(ODD_TO_15_871_SET <= MAX_VALUE_BYTES);
-const _: () = assert!(ODD_TO_15_871_VALUE > MAX_VALUE_BYTES);
-const _: () = assert!(AT_CEILING_VALUE == MAX_VALUE_BYTES);
+// (I3)'s pairs straddle the installer ceiling where the legs say: inside, both the bare set and
+// the value fit; past, the bare set fits and the value does not; at, the value is the ceiling
+// itself; at `MAX_VALUE_BYTES`, the store would take the value but the drain's cursor would not
+// fit beside it.
+const _: () = assert!(ODD_TO_15_859_SET < ODD_TO_15_859_VALUE);
+const _: () = assert!(ODD_TO_15_859_VALUE <= RETIRE_VALUE_CEILING);
+const _: () = assert!(ODD_TO_15_861_SET <= RETIRE_VALUE_CEILING);
+const _: () = assert!(ODD_TO_15_861_VALUE > RETIRE_VALUE_CEILING);
+const _: () = assert!(AT_CEILING_VALUE == RETIRE_VALUE_CEILING);
+const _: () = assert!(AT_MAX_VALUE_BYTES_VALUE == MAX_VALUE_BYTES);
+const _: () = assert!(RETIRE_VALUE_CEILING < MAX_VALUE_BYTES);
 
 async fn within<T>(leg: impl Future<Output = T>) -> T {
     tokio::time::timeout(LEG_TIMEOUT, leg)
@@ -420,11 +429,11 @@ impl Upload {
 
 // ─────────────────────────────── assertions ───────────────────────────────
 
-/// The refusal `SessionTooLarge` naming `bytes` against the ceiling.
+/// The refusal `SessionTooLarge` naming `bytes` against the installer ceiling.
 fn too_large(bytes: usize) -> Refusal {
     Refusal::SessionTooLarge {
         bytes: bytes as u64,
-        limit: MAX_VALUE_BYTES as u64,
+        limit: RETIRE_VALUE_CEILING as u64,
     }
 }
 
@@ -522,32 +531,40 @@ async fn i2_ten_thousand_sparse_parts_are_refused_with_zero_commits_and_stay_abo
 
 // ──────────────────── (I3) the stored value, not the bare set ────────────────────
 
-/// **(I3, inside)** Parts 1, 3, …, 15,869 (7,935 of them), a Complete naming all: the set encodes
-/// to 99,981 bytes and its `{"parts":…}` value to 99,991, inside the ceiling, so it publishes,
-/// and the installed obligation is stored at that length. No part is left unnamed, so no
-/// `retire:bytes:` obligation is installed.
+/// **(I3, inside)** Parts 1, 3, …, 15,859 (7,930 of them), a Complete naming all: the set encodes
+/// to 99,911 bytes and its `{"parts":…}` value to 99,921, inside the installer ceiling, so it
+/// publishes, and the installed obligation is stored at that length. No part is left unnamed, so
+/// no `retire:bytes:` obligation is installed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i3_a_value_just_inside_the_ceiling_publishes() {
-    let parts = odd_to(15_869);
-    assert_eq!(parts.len(), 7_935);
-    assert_eq!(bare_set(&parts).len(), ODD_TO_15_869_SET);
+    let parts = odd_to(15_859);
+    assert_eq!(parts.len(), 7_930);
+    assert_eq!(bare_set(&parts).len(), ODD_TO_15_859_SET);
     let up = upload(&parts).await;
 
     let outcome = up.complete(&named(&parts)).await;
 
     assert_published(&outcome);
     assert_all_inside(&up.store.take_sent());
-    up.assert_obligation(RetireMode::Records, &parts, ODD_TO_15_869_VALUE)
+    up.assert_obligation(RetireMode::Records, &parts, ODD_TO_15_859_VALUE)
         .await;
     assert_eq!(up.obligation(RetireMode::Bytes).await, None);
 }
 
-/// Parts whose `{"parts":…}` value is exactly [`MAX_VALUE_BYTES`]. Each isolated number costs
-/// `[n,n]` and a comma, an even count of bytes, and the frame `{"parts":[…]}` less one comma is 11
-/// more, so a set of isolated numbers always has a value of odd length. One run whose two ends
-/// differ in width supplies the byte that makes it even: 1, 3, …, 9,997, the run 9,999 to
-/// 10,000, then 10,002, 10,004, …, 15,862, then four six-digit numbers.
+/// Parts whose `{"parts":…}` value is exactly [`RETIRE_VALUE_CEILING`]: 6,245 six-digit numbers,
+/// no two adjacent. Each costs `[n,n]` and a comma, 16 bytes, and the frame `{"parts":[…]}` less
+/// one comma is 11 more: `6,245 × 16 + 11 = 99,931`.
 fn at_ceiling_parts() -> Vec<u32> {
+    (0..6_245).map(|i| 100_001 + 2 * i).collect()
+}
+
+/// Parts whose `{"parts":…}` value is exactly [`MAX_VALUE_BYTES`]: the value the store takes, and
+/// the one #1011 published. Each isolated number costs `[n,n]` and a comma, an even count of
+/// bytes, and the frame `{"parts":[…]}` less one comma is 11 more, so a set of isolated numbers
+/// always has a value of odd length. One run whose two ends differ in width supplies the byte that
+/// makes it even: 1, 3, …, 9,997, the run 9,999 to 10,000, then 10,002, 10,004, …, 15,862, then
+/// four six-digit numbers.
+fn at_max_value_bytes_parts() -> Vec<u32> {
     let mut parts = odd_to(9_997);
     parts.extend([9_999, 10_000]);
     parts.extend((10_002..=15_862).step_by(2));
@@ -555,9 +572,10 @@ fn at_ceiling_parts() -> Vec<u32> {
     parts
 }
 
-/// **(I3, at)** The ceiling's admissible side: a Complete naming [`at_ceiling_parts`], whose
-/// `{"parts":…}` value lands exactly on [`MAX_VALUE_BYTES`], publishes, and the obligation is
-/// stored at exactly that length. A value at the ceiling is one the store takes.
+/// **(I3, at)** The installer ceiling's admissible side: a Complete naming [`at_ceiling_parts`],
+/// whose `{"parts":…}` value lands exactly on [`RETIRE_VALUE_CEILING`], publishes, and the
+/// obligation is stored at exactly that length. A value at the ceiling is one whose drain can
+/// always write its cursor back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i3_a_value_exactly_at_the_ceiling_publishes() {
     let parts = at_ceiling_parts();
@@ -572,22 +590,42 @@ async fn i3_a_value_exactly_at_the_ceiling_publishes() {
         .await;
 }
 
-/// **(I3, past)** Parts 1, 3, …, 15,871 (7,936 of them), a Complete naming all: the bare set is
-/// 99,995 bytes, inside the ceiling, but the `{"parts":…}` value the flip stores is 100,005, past
-/// it. A check on the bare set would let it through to a flip that can never land; it is refused
-/// `SessionTooLarge` naming the value's size, with zero commits.
+/// **(I3, cursor's room)** A Complete naming [`at_max_value_bytes_parts`], whose `{"parts":…}`
+/// value is exactly [`MAX_VALUE_BYTES`]: the store would take it, but it leaves no room for the
+/// retirement drain's cursor, so a flip installing it would leave an obligation its drain could
+/// never advance (#1061). It is refused `SessionTooLarge` naming that size against the installer
+/// ceiling, with zero commits, where a value past [`MAX_VALUE_BYTES`] is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i3_a_value_past_the_ceiling_is_refused_though_its_bare_set_fits() {
-    let parts = odd_to(15_871);
-    assert_eq!(parts.len(), 7_936);
-    assert_eq!(bare_set(&parts).len(), ODD_TO_15_871_SET);
-    assert_eq!(parts_value(&parts).len(), ODD_TO_15_871_VALUE);
+async fn i3_a_value_leaving_no_room_for_the_drain_cursor_is_refused() {
+    let parts = at_max_value_bytes_parts();
+    assert_eq!(parts_value(&parts).len(), AT_MAX_VALUE_BYTES_VALUE);
     let up = upload(&parts).await;
     let (_, _, before) = up.session().await;
 
     let outcome = up.complete(&named(&parts)).await;
 
-    assert_refused(outcome, &too_large(ODD_TO_15_871_VALUE));
+    assert_refused(outcome, &too_large(AT_MAX_VALUE_BYTES_VALUE));
+    assert!(up.store.take_sent().is_empty(), "zero commits");
+    let (_, _, after) = up.session().await;
+    assert_eq!(after, before, "the session as it was");
+}
+
+/// **(I3, past)** Parts 1, 3, …, 15,861 (7,931 of them), a Complete naming all: the bare set is
+/// 99,925 bytes, inside the installer ceiling, but the `{"parts":…}` value the flip stores is
+/// 99,935, past it. A check on the bare set would let it through to a flip whose drain could never
+/// advance; it is refused `SessionTooLarge` naming the value's size, with zero commits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i3_a_value_past_the_ceiling_is_refused_though_its_bare_set_fits() {
+    let parts = odd_to(15_861);
+    assert_eq!(parts.len(), 7_931);
+    assert_eq!(bare_set(&parts).len(), ODD_TO_15_861_SET);
+    assert_eq!(parts_value(&parts).len(), ODD_TO_15_861_VALUE);
+    let up = upload(&parts).await;
+    let (_, _, before) = up.session().await;
+
+    let outcome = up.complete(&named(&parts)).await;
+
+    assert_refused(outcome, &too_large(ODD_TO_15_861_VALUE));
     assert!(up.store.take_sent().is_empty(), "zero commits");
     let (_, _, after) = up.session().await;
     assert_eq!(after, before, "the session as it was");
@@ -595,18 +633,18 @@ async fn i3_a_value_past_the_ceiling_is_refused_though_its_bare_set_fits() {
 
 // ──────────────────── (I4) a part added after the first read ────────────────────
 
-/// The parts of (I4): part 2, which the request names, and 1, 3, …, 15,869, which it leaves
-/// unnamed. The unnamed set is (I3)'s, 99,991 bytes as a value.
+/// The parts of (I4): part 2, which the request names, and 1, 3, …, 15,859, which it leaves
+/// unnamed. The unnamed set is (I3)'s, 99,921 bytes as a value.
 fn i4_parts() -> Vec<u32> {
-    let mut parts = odd_to(15_869);
+    let mut parts = odd_to(15_859);
     parts.push(2);
     parts.sort_unstable();
     parts
 }
 
 /// **(I4, control)** Without another writer, (I4)'s request publishes: the unnamed parts'
-/// `retire:bytes:` value is 99,991 bytes, inside the ceiling, so the set the Complete first reads
-/// fits.
+/// `retire:bytes:` value is 99,921 bytes, inside the installer ceiling, so the set the Complete
+/// first reads fits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i4_control_the_set_first_read_fits_and_publishes() {
     let up = upload(&i4_parts()).await;
@@ -617,23 +655,23 @@ async fn i4_control_the_set_first_read_fits_and_publishes() {
     assert_all_inside(&up.store.take_sent());
     up.assert_obligation(RetireMode::Records, &[2], parts_value(&[2]).len())
         .await;
-    up.assert_obligation(RetireMode::Bytes, &odd_to(15_869), ODD_TO_15_869_VALUE)
+    up.assert_obligation(RetireMode::Bytes, &odd_to(15_859), ODD_TO_15_859_VALUE)
         .await;
 }
 
-/// **(I4)** As the control, but the wrapper plants part 15,871, unnamed, just before the fence
-/// commits: the frozen set's unnamed parts are then 100,005 bytes as a value. The check before the
+/// **(I4)** As the control, but the wrapper plants part 15,861, unnamed, just before the fence
+/// commits: the frozen set's unnamed parts are then 99,935 bytes as a value. The check before the
 /// fence passed, so the request fences; the check against the frozen set refuses it
 /// `SessionTooLarge` naming that size, and the fence is released. Two commits, the fence and its
 /// release; the session ends `Open@2` with `attempts` given back, and nothing is published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i4_a_part_added_before_the_fence_is_refused_against_the_frozen_set_and_released() {
     let up = upload(&i4_parts()).await;
-    up.store.before_next_commit(plant_part(&up.id, 15_871));
+    up.store.before_next_commit(plant_part(&up.id, 15_861));
 
     let outcome = up.complete(&named(&[2])).await;
 
-    assert_refused(outcome, &too_large(ODD_TO_15_871_VALUE));
+    assert_refused(outcome, &too_large(ODD_TO_15_861_VALUE));
     let sent = up.store.take_sent();
     assert_eq!(sent.len(), 2, "the fence and its release");
     let session_put = |batch: &WriteBatch| {
@@ -666,17 +704,17 @@ async fn i4_a_part_added_before_the_fence_is_refused_against_the_frozen_set_and_
     assert_eq!(dirent, None, "nothing published");
 }
 
-/// **(I4, already past)** As (I4), but part 15,871 is there from the start, with no other writer:
+/// **(I4, already past)** As (I4), but part 15,861 is there from the start, with no other writer:
 /// the request names only part 2, so its published set is a few bytes, and it is the *unnamed*
-/// parts' `retire:bytes:` value, 100,005 bytes, that is past the ceiling when the Complete first
+/// parts' `retire:bytes:` value, 99,935 bytes, that is past the ceiling when the Complete first
 /// reads the set. The check before the fence measures that obligation too, so the request is
 /// refused `SessionTooLarge` naming that size with **zero** commits: no fence, no release, the
 /// session byte-for-byte as it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i4_an_unnamed_set_already_past_the_ceiling_is_refused_with_zero_commits() {
     let mut parts = i4_parts();
-    parts.push(15_871);
-    assert_eq!(parts_value(&odd_to(15_871)).len(), ODD_TO_15_871_VALUE);
+    parts.push(15_861);
+    assert_eq!(parts_value(&odd_to(15_861)).len(), ODD_TO_15_861_VALUE);
     assert_eq!(
         parts_value(&[2]),
         r#"{"parts":[[2,2]]}"#,
@@ -687,7 +725,7 @@ async fn i4_an_unnamed_set_already_past_the_ceiling_is_refused_with_zero_commits
 
     let outcome = up.complete(&named(&[2])).await;
 
-    assert_refused(outcome, &too_large(ODD_TO_15_871_VALUE));
+    assert_refused(outcome, &too_large(ODD_TO_15_861_VALUE));
     assert!(up.store.take_sent().is_empty(), "zero commits");
     let (epoch, attempts, after) = up.session().await;
     assert_eq!((epoch, attempts), (0, 0), "Open@0, no attempt spent");
