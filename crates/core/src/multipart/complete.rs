@@ -19,7 +19,7 @@
 //! | Found | Answer | Written |
 //! |---|---|---|
 //! | `Open@E`, a valid list | [`FenceOutcome::Held`] | the fence: `require(mpu:<id> == bytes read)`; put the session at `Completing@E+1`, with `fenced_at_millis`, `segments_written: 0`, `publish_target {parent, name, epoch: E+1}` and `attempts + 1` |
-//! | `Open@E`, a list rejected against the frozen set or the bucket | [`Refusal::InvalidPart`] or [`Refusal::NoSuchBucket`] | the fence, then its release: `require(mpu:<id> == the fence's bytes)`; put the session at `Open@E+2` with `attempts` as read |
+//! | `Open@E`, a list rejected against the frozen set or the bucket | [`Refusal::InvalidPart`], [`Refusal::SessionTooLarge`] or [`Refusal::NoSuchBucket`] | the fence, then its release: `require(mpu:<id> == the fence's bytes)`; put the session at `Open@E+2` with `attempts` as read |
 //! | `Open@E`, a list already invalid before the fence | the same refusals | nothing |
 //! | `Open@E`, `attempts` at [`MAX_COMPLETE_ATTEMPTS`] | [`Refusal::CompleteAttemptsExhausted`] | nothing |
 //! | `Completing` (another publisher's fence) | [`Refusal::OperationAborted`] | nothing |
@@ -48,6 +48,32 @@
 //! the part's digest, plus its chunk count and length, so the next slices can size an assembly
 //! before they read a chunk list. The `part:` records themselves are not read here: their chunk
 //! lists can total tens of megabytes for one session, and only publication needs them.
+//!
+//! # The value ceiling (#1011)
+//!
+//! The flip installs each part set inside one obligation value (*Publication* below): the
+//! published parts' `retire:records:{parts}` and the unnamed parts' `retire:bytes:{parts}`. A set
+//! is range-encoded ([`PartNumberSet`]), so a contiguous run costs a few bytes, but every isolated
+//! part number is a run of its own, and the format allows numbers up to
+//! [`super::MAX_PART_NUMBER`]. Spread that far, a set can encode past [`MAX_VALUE_BYTES`], the
+//! ceiling every backend inherits: 10,000 parts at 1, 3, …, 19,999 are 128,901 bytes as a
+//! `{parts}` value (#842). The committer refuses such a flip before sending it, and FoundationDB
+//! would refuse it for good (`2103 value_too_large`), so it could never land: every retry would
+//! fence, be refused at the flip and release, and the session could only be aborted.
+//!
+//! Validation therefore also measures both obligations, as minted for the flip
+//! ([`RetireObligation`]), and refuses the request [`Refusal::SessionTooLarge`] when either
+//! one's **stored value**, `{"parts":…}` and not the bare set, is past the ceiling, with `bytes`
+//! that value's length. It runs where the rest of validation runs, after the named parts are
+//! found: before the fence, so a request already too large is answered with nothing written, and
+//! against the set the fence froze, which decides, since a part committed between the two reads
+//! can push the unnamed set across. That rejection is released like any other, with its attempt
+//! given back. A valid request's [`HeldFence`] carries the obligations measured, and those are the
+//! ones the flip installs.
+//!
+//! Inside S3's part-number range (1 to 10,000) no set crosses: the widest, every even number, is
+//! 58,909 bytes as a `{parts}` value. So a client that keeps to that range never meets this
+//! refusal.
 //!
 //! # Ownership, and the two errors
 //!
@@ -263,8 +289,7 @@
 //! publication, so the flip mixes no clocks. The inode a free name is published under
 //! ([`PublishRequest::fresh_inode`]) is the caller's too.
 //!
-//! Production calls nothing here yet: the S3 verb that will is #670, once #1011 completes
-//! publication.
+//! Production calls nothing here yet: the S3 verb that will is #670.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -282,6 +307,7 @@ use super::{
 };
 use crate::metadata::{
     self, ChunkMap, ChunkRef, DirentRecord, InodeId, InodeRecord, ObjectMeta, SegmentGroup,
+    MAX_VALUE_BYTES,
 };
 use crate::staged_publication::{self, PublicationError, RootTarget, SegmentBatchInfo};
 
@@ -374,8 +400,9 @@ pub enum FenceOutcome {
 
 /// **A fence this Complete owns**: the session at `Completing@E+1` under a fence commit of its
 /// own that answered `Committed`, with the request validated against the part set that fence
-/// froze. Only the fence phase makes one ([`fence_complete`]); it is the value publication
-/// consumes ([`complete_upload`], #1008).
+/// froze, the value ceiling included (module doc, *The value ceiling*). Only the fence phase
+/// makes one ([`fence_complete`]); it is the value publication consumes ([`complete_upload`],
+/// #1008).
 ///
 /// It is neither `Clone` nor constructible elsewhere: one fence, one holder. Dropping it leaves
 /// the fence standing until the reaper's `W_completing` rollback (#625).
@@ -387,6 +414,9 @@ pub struct HeldFence {
     named: NamedParts,
     frozen: BTreeMap<PartNumber, PartSummary>,
     bucket_marker: Bytes,
+    /// The flip's two part-set obligations, as validation measured them against the value
+    /// ceiling: what the flip installs.
+    retired: PartRetirement,
 }
 
 impl HeldFence {
@@ -666,7 +696,6 @@ pub enum Stop {
     /// batch over its envelope, a version with no successor, more segments than one root may
     /// name), before writing anything or, for a `seg:` range it read back, before the batch that
     /// would have depended on it.
-    // deferred: #1011 — the value ceiling a flip's records are sized against.
     Publication(PublicationError),
 }
 
@@ -798,7 +827,9 @@ impl std::error::Error for CompleteError {
 // at the fence's and the release's commit points, an overwrite, a bucket delete, a refused flip
 // and applied, held and unread unknown flip outcomes at the flip's, lost flips, a bucket delete,
 // a refused flip and an unknown segment-batch outcome behind landed segment batches, and two
-// Completes racing byte-identical fences, through a store wrapper.
+// Completes racing byte-identical fences, through a store wrapper; and
+// `crates/core/tests/multipart_complete_value_ceiling.rs` lands a part between the check before
+// the fence and the fence, over a store that refuses a value past the ceiling.
 
 /// **`CompleteMultipartUpload`'s fence phase**: fence the session `upload_id` names
 /// (`0016:661`), validate `request` against the part set the fence froze, and either hand the
@@ -816,7 +847,8 @@ impl std::error::Error for CompleteError {
 /// request whose clock source is not the session's stops ([`Stop::ForeignClock`]); a session at
 /// [`MAX_COMPLETE_ATTEMPTS`] answers [`Refusal::CompleteAttemptsExhausted`]; a session too near
 /// the epoch ceiling stops ([`Stop::EpochExhausted`]); and the list is checked against the bucket
-/// and the part set as they are now (the module doc's optimization). None of that writes anything.
+/// and the part set as they are now (the module doc's optimization), the value ceiling included
+/// ([`Refusal::SessionTooLarge`], module doc *The value ceiling*). None of that writes anything.
 ///
 /// # The fence
 ///
@@ -834,8 +866,9 @@ impl std::error::Error for CompleteError {
 ///
 /// # Behind the fence
 ///
-/// Read the bucket marker and the `psum:<id>:` range in bounded pages, and require every named
-/// part to be present with the named digest. A valid request returns the [`HeldFence`]; a
+/// Read the bucket marker and the `psum:<id>:` range in bounded pages, require every named part
+/// to be present with the named digest, and require the flip's two part-set obligations against
+/// that frozen set to fit the value ceiling. A valid request returns the [`HeldFence`]; a
 /// rejected one is released: `require(mpu:<id> == the fence's bytes)` and the session put at
 /// `Open@E+2` with `attempts` as read before the fence (`SessionRecord::fence_released`). Then
 /// it is answered with the rejection. A release that answers `Conflict` reads the session again:
@@ -925,7 +958,7 @@ pub async fn fence_complete(
         // answer names. The fence below settles the doubt instead, and the validation behind it
         // decides.
         if !doubt.holds() {
-            match validate(store, upload_id, &bucket_key, named).await {
+            match validate(store, upload_id, placed.epoch(), &bucket_key, named).await {
                 Ok(Validation::Valid { .. }) => {}
                 Ok(Validation::Rejected(refusal)) => return Ok(refused(refusal)),
                 Err(cause) => return Err(stop(&doubt, cause)),
@@ -975,8 +1008,12 @@ pub async fn fence_complete(
 
     // The fence is this Complete's: its commit answered `Committed`. A fence of this call held in
     // doubt required the bytes this one replaced, which never come back, so it can no longer land.
-    let why = match validate(store, upload_id, &bucket_key, named).await {
-        Ok(Validation::Valid { frozen, marker }) => {
+    let why = match validate(store, upload_id, placed.epoch(), &bucket_key, named).await {
+        Ok(Validation::Valid {
+            frozen,
+            marker,
+            retired,
+        }) => {
             return Ok(FenceOutcome::Held(Box::new(HeldFence {
                 upload_id: upload_id.clone(),
                 attempts_before: opened.attempts(),
@@ -984,6 +1021,7 @@ pub async fn fence_complete(
                 named: request.parts.clone(),
                 frozen,
                 bucket_marker: marker,
+                retired: *retired,
             })))
         }
         Ok(Validation::Rejected(rejection)) => ReleaseFor::Rejection(rejection),
@@ -1054,12 +1092,15 @@ fn order_refusal(invalid: &RecordError) -> Result<Refusal, RecordError> {
 
 /// What a validation found.
 enum Validation {
-    /// Every named part is present with the named digest, and the bucket marker is present.
+    /// Every named part is present with the named digest, the bucket marker is present, and the
+    /// flip's part-set obligations fit the value ceiling.
     Valid {
         /// The part set read.
         frozen: BTreeMap<PartNumber, PartSummary>,
         /// The bucket marker bytes read.
         marker: Bytes,
+        /// The flip's part-set obligations against `frozen`, measured.
+        retired: Box<PartRetirement>,
     },
     /// The request is rejected with this refusal.
     Rejected(Refusal),
@@ -1068,10 +1109,14 @@ enum Validation {
 /// Validate `named` against the bucket and the session's part set as the store holds them now
 /// (`0016:994-1000`): the bucket marker first, which is one read; then every `psum:` record of
 /// the session; then each named part, in order, which must be present with the named digest.
-/// The first part that is not answers [`Refusal::InvalidPart`].
+/// The first part that is not answers [`Refusal::InvalidPart`]. Last, the two part-set
+/// obligations a flip from fence epoch `epoch` would install against that set must each fit the
+/// value ceiling as stored, or the request answers [`Refusal::SessionTooLarge`] (module doc,
+/// *The value ceiling*).
 async fn validate(
     store: &impl MetadataStore,
     upload_id: &UploadId,
+    epoch: u64,
     bucket_key: &[u8],
     named: &[(PartNumber, Digest)],
 ) -> Result<Validation, Stop> {
@@ -1090,7 +1135,69 @@ async fn validate(
             reason,
         }));
     }
-    Ok(Validation::Valid { frozen, marker })
+    let retired = PartRetirement::of(upload_id, epoch, named, &frozen)
+        .ok_or(Stop::Record(RecordError::NoPartsNamed))?;
+    if let Some(too_large) = retired.past_ceiling() {
+        return Ok(Validation::Rejected(too_large));
+    }
+    Ok(Validation::Valid {
+        frozen,
+        marker,
+        retired: Box::new(retired),
+    })
+}
+
+/// The two part-set obligations a flip installs (module doc, *Publication* and *The value
+/// ceiling*), minted where the list is validated so the obligations measured against the ceiling
+/// are the ones the flip writes.
+#[derive(Debug)]
+struct PartRetirement {
+    /// `retire:records:` for the published parts.
+    published: RetireObligation,
+    /// `retire:bytes:` for the frozen parts left unnamed, if any.
+    unnamed: Option<RetireObligation>,
+}
+
+impl PartRetirement {
+    /// What a flip from fence epoch `epoch` installs for `named`, a strictly ascending list,
+    /// against the part set `parts`: the named parts as published, and every other part of the
+    /// set as unnamed. `None` for a list naming no part, which [`NamedParts`] cannot hold.
+    fn of(
+        upload_id: &UploadId,
+        epoch: u64,
+        named: &[(PartNumber, Digest)],
+        parts: &BTreeMap<PartNumber, PartSummary>,
+    ) -> Option<Self> {
+        let published =
+            PartNumberSet::from_numbers(named.iter().map(|(part_number, _)| *part_number))?;
+        let unnamed = parts
+            .keys()
+            .filter(|part_number| named.binary_search_by_key(part_number, |(n, _)| n).is_err())
+            .copied();
+        Some(Self {
+            published: RetireObligation::published_parts(upload_id, epoch, published),
+            unnamed: PartNumberSet::from_numbers(unnamed)
+                .map(|parts| RetireObligation::unnamed_parts(upload_id, epoch, parts)),
+        })
+    }
+
+    /// The obligations, published first.
+    fn obligations(&self) -> impl Iterator<Item = &RetireObligation> {
+        std::iter::once(&self.published).chain(self.unnamed.as_ref())
+    }
+
+    /// [`Refusal::SessionTooLarge`] for the first obligation whose stored value
+    /// ([`RetireObligation::value`]) is past [`MAX_VALUE_BYTES`], with that value's length: a
+    /// flip writing it could never land. A value exactly at the ceiling fits.
+    fn past_ceiling(&self) -> Option<Refusal> {
+        self.obligations()
+            .map(|obligation| obligation.value().len())
+            .find(|&bytes| bytes > MAX_VALUE_BYTES)
+            .map(|bytes| Refusal::SessionTooLarge {
+                bytes: bytes as u64,
+                limit: MAX_VALUE_BYTES as u64,
+            })
+    }
 }
 
 /// Every `psum:<id>:` record, by part number, read in pages of [`PART_PAGE_LIMIT`] with
@@ -1201,7 +1308,7 @@ impl<'a> OwnFence<'a> {
         batch
             .require_absent(segments.key())
             .put(self.session_key.to_vec(), self.placed.charged.clone())
-            .put(segments.key(), metadata::encode(segments.payload()))
+            .put(segments.key(), segments.value())
     }
 }
 
@@ -1611,8 +1718,8 @@ async fn end_publication(
 }
 
 /// What every round of one publication shares: the object's chunk list, the segment count the
-/// committer plans for it, the session the flip requires, and the two part-scoped obligations,
-/// all fixed by the frozen set and the named list.
+/// committer plans for it, and the session the flip requires, all fixed by the frozen set and the
+/// named list. The two part-scoped obligations are the fence's ([`HeldFence`]).
 struct FlipPlan {
     chunks: Vec<ChunkRef>,
     /// How many `seg:` records the committer writes for `chunks`
@@ -1621,10 +1728,6 @@ struct FlipPlan {
     segments: u32,
     /// The session at that cursor: what the flip requires.
     ready: Bytes,
-    /// `retire:records:` for the published parts.
-    published: RetireObligation,
-    /// `retire:bytes:` for the frozen parts left unnamed, if any.
-    unnamed: Option<RetireObligation>,
 }
 
 /// One flip: the root it publishes, the contribution that rides with it, the session record that
@@ -1676,22 +1779,10 @@ impl FlipPlan {
                 segments_written: segments,
             },
         ))?;
-        let epoch = fence.epoch();
-        let published =
-            PartNumberSet::from_numbers(named.iter().map(|(part_number, _)| *part_number))
-                .ok_or(Stop::Record(RecordError::NoPartsNamed))?;
-        let unnamed = fence
-            .frozen
-            .keys()
-            .filter(|part_number| named.binary_search_by_key(part_number, |(n, _)| n).is_err())
-            .copied();
         Ok(Self {
             chunks,
             segments,
             ready,
-            published: RetireObligation::published_parts(upload_id, epoch, published),
-            unnamed: PartNumberSet::from_numbers(unnamed)
-                .map(|parts| RetireObligation::unnamed_parts(upload_id, epoch, parts)),
         })
     }
 
@@ -1699,7 +1790,8 @@ impl FlipPlan {
     /// the prior's version + 1 for a bound one, recomputed from the prior read for this flip
     /// (`0016:926-941`); the session required at the cursor the segment phase leaves and put at
     /// `Completed` recording that publication; the bucket marker validated behind the fence
-    /// pinned; and each obligation under `require_absent`.
+    /// pinned; and each obligation under `require_absent`, the part-set ones as validation
+    /// measured them ([`HeldFence`]).
     fn flip<'a>(
         &self,
         fence: &HeldFence,
@@ -1741,23 +1833,19 @@ impl FlipPlan {
             .completed(completion)
             .ok_or(Stop::EpochExhausted)?;
         let session_key = mpu_key(&fence.upload_id);
-        let obligations = [
-            Some(&self.published),
-            self.unnamed.as_ref(),
-            superseded.as_ref(),
-        ];
+        let obligations: Vec<&RetireObligation> =
+            fence.retired.obligations().chain(&superseded).collect();
         let mut contribution = WriteBatch::new()
             .require(session_key.clone(), self.ready.clone())
             // ADR-0046 §4: the bucket is the one validated behind the fence, byte for byte.
             .require(bucket_key.to_vec(), fence.bucket_marker.clone());
-        for obligation in obligations.iter().flatten() {
+        for obligation in &obligations {
             contribution = contribution.require_absent(obligation.key());
         }
         let completed = metadata::encode(&completed);
         contribution = contribution.put(session_key, completed.clone());
-        for obligation in obligations.iter().flatten() {
-            contribution =
-                contribution.put(obligation.key(), metadata::encode(obligation.payload()));
+        for obligation in &obligations {
+            contribution = contribution.put(obligation.key(), obligation.value());
         }
         Ok(Flip {
             root,
