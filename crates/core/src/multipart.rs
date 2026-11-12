@@ -125,8 +125,9 @@
 //! moving the session's segment cursor in each batch, and a release once one landed installs
 //! that attempt's `retire:records:` `{seg}` obligation (#1009). Neither has a production caller
 //! until the S3 verb is wired (#670); the recovery from an unknown commit outcome (#1010) only
-//! re-sends those batches. Every other first writer is a store round trip still to land: the
-//! rest of Complete (#1011), then #659.
+//! re-sends those batches. Sizing the flip's part sets against the value ceiling (#1011) adds no
+//! writer either: a set too large is a rejection, answered before the fence or through the
+//! fence's release. Every other first writer is a store round trip still to land (#659).
 //! An earlier revision of this header deferred the living-architecture update to "the slice
 //! that first *persists* one"; that clause is **withdrawn**, because it is not what the doc or
 //! the convention ended up saying. The living architecture doc describes the system **as it
@@ -3337,8 +3338,12 @@ pub fn decode_part_summary(value: &[u8]) -> Result<PartSummary, RecordError> {
 // ===========================================================================
 
 /// A **range-encoded** part-number set (`0016:382-388`): `[[1, 400]]` for a contiguous run, so
-/// the common "every staged part was published" case is a few bytes and the worst case — 10,000
-/// alternating part numbers — still fits inside one value.
+/// the common "every staged part was published" case is a few bytes. Each isolated part number
+/// is a run of its own, so the size depends on how far apart the numbers are. Inside S3's
+/// part-number range (1 to 10,000) the widest set, every even number, is 58,909 bytes as a
+/// `{parts}` obligation value, inside [`MAX_VALUE_BYTES`]. Past that range it need not fit:
+/// 10,000 parts at 1, 3, …, 19,999 are 128,901 bytes (#842), which is why a Complete measures the
+/// sets its flip installs before it writes anything ([`complete`], #1011).
 ///
 /// The encoding is **canonical**, and that is the whole reason this is a type rather than a
 /// `Vec<(u32, u32)>`: the runs are ordered, non-overlapping and **non-adjacent**, so `[[1,4]]`
@@ -3900,7 +3905,7 @@ struct RetirePayloadWire {
 /// a `Completing` attempt's `{seg}`), the part commit's per-part `{chunks}` row ([`commit`],
 /// #1027), the root flip's three rows ([`complete`], #1008) and the Complete fence release's
 /// `{seg}` row, the same row the restore fence installs ([`complete`], #1009); the later store
-/// round trips (#1011, #659) add their rows there.
+/// round trips (#659) add their rows there.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RetirePayload {
     /// Omitted when absent rather than spelled `false` (`AGENTS.md:170-172`), so the accepted
@@ -4369,6 +4374,13 @@ impl RetireObligation {
     /// What it owes: the value, through [`crate::metadata::encode`].
     pub const fn payload(&self) -> &RetirePayload {
         &self.payload
+    }
+
+    /// The value it is installed with: [`Self::payload`] through [`crate::metadata::encode`]. The
+    /// bytes a writer puts at [`Self::key`], so they are what the store's value ceiling
+    /// ([`MAX_VALUE_BYTES`]) measures: a Complete sizes its flip's part sets by this (#1011).
+    pub(crate) fn value(&self) -> bytes::Bytes {
+        metadata::encode(&self.payload)
     }
 }
 
@@ -4926,14 +4938,26 @@ pub enum Refusal {
         /// The ceiling it crossed.
         limit: u64,
     },
-    /// The session a Create asked for could not reach every later state inside the value
-    /// ceiling every backend inherits: the widest encoding its record can reach in any later
-    /// state (`Completing` carries the object name, JSON escapes included, twice; `Completed`
-    /// carries a fixed payload that is wider for a short name) is `bytes`, past `limit`. Refused
-    /// before any read or write, because a session admitted at `Open` that could not later be
-    /// fenced would hold its admission slot forever (#894).
+    /// A session that does not fit the value ceiling every backend inherits ([`MAX_VALUE_BYTES`]):
+    /// `bytes` is the value that would cross it, past `limit`. Two verbs answer it.
+    ///
+    /// * **Create**: the session it asked for could not reach every later state inside the
+    ///   ceiling. `bytes` is the widest encoding its record can reach in any later state
+    ///   (`Completing` carries the object name, JSON escapes included, twice; `Completed` carries
+    ///   a fixed payload that is wider for a short name). Refused before any read or write,
+    ///   because a session admitted at `Open` that could not later be fenced would hold its
+    ///   admission slot forever (#894).
+    /// * **Complete**: a part set its flip installs inside one obligation value, the published
+    ///   parts' `retire:records:{parts}` or the unnamed parts' `retire:bytes:{parts}`, encodes
+    ///   past the ceiling, so that flip could never land (#842). `bytes` is the obligation's
+    ///   stored value, `{"parts":…}`, not the bare set. Part numbers spread past S3's range (1 to
+    ///   10,000) are what reach it. Answered with nothing written when the set read before the
+    ///   fence is already too large, and otherwise against the set the fence froze, with that
+    ///   fence released and its attempt given back, so the session stays `Open` and can still be
+    ///   aborted ([`complete`], #1011).
     SessionTooLarge {
-        /// The widest encoding the session's record could reach, in bytes.
+        /// The value that would cross the ceiling, in bytes: the widest encoding the session's
+        /// record could reach (Create), or the part-set obligation's (Complete).
         bytes: u64,
         /// The ceiling it crosses ([`MAX_VALUE_BYTES`]).
         limit: u64,
