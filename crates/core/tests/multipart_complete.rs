@@ -23,8 +23,9 @@
 //!   fence still stands, never with an answer.
 //! * **(H)** A bucket deleted while the session is open answers `NoSuchBucket`, and the session is
 //!   `Open` again with `attempts` given back (`0016:1035`).
-//! * **(G0-fence)** An unknown outcome on the fence or the release returns the in-doubt error at
-//!   once; a failed first read returns an error, never an answer.
+//! * **(G0-fence)** An unknown outcome on a fence that landed, or on the release, returns the
+//!   in-doubt error with nothing sent after it; a failed first read returns an error, never an
+//!   answer. A fence that did not land is (G6)'s.
 //! * **The budget, away from zero.** D2, H and a held fence from `Open@E` with attempts already
 //!   spent: the fence charges one more, a release restores that exact count.
 //! * **Paging.** A frozen set larger than one page is read whole, and a page breaking the paging
@@ -64,7 +65,6 @@
 //! * **(F2)** a zero-byte prior is superseded with no obligation for it.
 //! * **(H2)** a bucket marker deleted just before the flip answers `NoSuchBucket`.
 //! * **(J)** a flip the store refuses for good releases the fence and stops.
-//! * **(G0-flip)** an unknown flip outcome stops in doubt, with nothing sent after it.
 //!
 //! # Issue #1009: segmented publication
 //!
@@ -83,15 +83,71 @@
 //!   valid Complete with zero commits (X58, `0016:2577`).
 //! * **(H2-seg)**, **(J-seg)** a bucket deleted, and a flip refused for good, after the segments
 //!   land: released with the segment obligation, charged.
-//! * **(G0-seg)** an unknown segment-batch outcome stops in doubt, with nothing sent after it; an
-//!   unknown flip outcome is in doubt about the flip alone only in a round resumed past the
-//!   segment phase, with no segment batch to send.
 //! * **(M)** the **deep fixture**, parts planted rather than staged, has a segment phase of two
 //!   batches. When the second loses after the first landed, the next round resumes at the cursor
 //!   the first left and publishes; when it is refused for good, the release goes from that cursor,
 //!   following it there when the read before the release fails.
 //!
 //! Leg K of #1008, a list past one flat map refused, is replaced by (B).
+//!
+//! # Issue #1010: unknown outcomes
+//!
+//! The legs from *unknown outcomes* on drive the verb into commits whose outcome the store could
+//! not report, and check that the request re-reads the session and answers only from what it can
+//! attribute to itself (`0016:942-964`). The wrapper gains a **hold** step, which keeps a batch
+//! with `may_still_commit: true` and lands it when the test says or a later step does, and gates
+//! that order two requests racing on one store. Every leg is a wrapper step, never timing:
+//!
+//! * **(G1)** a flip applied and answered unknown is `Published` once, from the `Completed`
+//!   record it put: the version advanced once, one set of obligations, for a flat object and for
+//!   a round that wrote its segment batch first. A session found rolled back to `Open` instead
+//!   answers `OperationAborted`, with nothing of the request able to land.
+//! * **(G2)** a held flip, then every later commit `Conflict`: the request ends in doubt when its
+//!   rounds run out, releasing nothing, and the held flip lands afterwards, published once.
+//! * **(G3)** after an unknown flip outcome the read of the session fails: the in-doubt error,
+//!   never an answer, about the flip only in a round with no segment batch to send.
+//! * **(G4)** a segment batch answered unknown, applied or not: the request resumes from the cursor
+//!   at the same epoch, writes no `seg:` record twice, and publishes once.
+//! * **(G5)** two Completes build byte-identical fences: the one whose fence answered unknown finds
+//!   those bytes and ends in doubt, whether its own fence or the rival's put them.
+//! * **(G6)** an initial fence answered unknown that did not land is sent again and publishes once.
+//!
+//! The G0 legs for the flip and the segment batch are replaced by (G1), (G3) and (G4), and the G0
+//! cases for a fence that did not land by (G6).
+//!
+//! The legs from *what settles, keeps, moves and clears a doubt* on pin the doubt bookkeeping that
+//! a leg ending `Published` never reaches:
+//!
+//! * **(G6-held)** while a held fence may still land, no check before the fence answers: the fence
+//!   is sent again, and the request ends in doubt when those rounds run out, or when the store
+//!   refuses a fence sent again for good. A read that finds the session moved off the bytes the
+//!   held fence requires clears it, and the check answers again.
+//! * **(G6-rolled-back)** after an unknown fence, a read that finds the session `Open` with an
+//!   attempt spent since, the shape the reaper's rollback leaves, answers `OperationAborted` and
+//!   never fences again with the request's stamp, which the rollback may have found too old. One
+//!   with no attempt spent since, a rival's fence released with its attempt given back, is fenced
+//!   again.
+//! * **(G3-fence)** a read that fails after an unknown fence outcome is the in-doubt error about
+//!   the fence, never "no fence placed", about the first held outcome when there is one.
+//! * **(G3-torn)** a read after an unknown fence or flip outcome that finds a session record that
+//!   does not decode settles nothing: the in-doubt error, never a stop that blames the record.
+//! * **(G6-spent)** an unknown fence a read showed did not land is settled: fences that then all
+//!   lose stop with no fence placed and nothing in doubt.
+//! * **(G2-refused)** a round refused for good while a flip is held ends in doubt, with no release.
+//! * **(G2-unread)** so does a failed read of the bucket marker or the target while a flip is held.
+//! * **(G2-first)** the first held outcome is the one reported, over a later out-of-flight one and
+//!   a later held one.
+//! * **(G2-settled)** an unknown flip a read showed did not land is settled: flips that then all
+//!   lose release the fence and answer `OperationAborted`.
+//! * **(G4-landed)** a held segment batch that lands later is settled by the read that finds the
+//!   cursor moved, and the request releases from there.
+//! * **(G4-repin)** a second held segment batch moves the bytes the doubt is kept against, so the
+//!   cursor moving past the first does not clear it.
+//! * **(G4-unbuilt)** a flip that cannot be built while a segment batch is held ends in doubt,
+//!   with no release for the held batch to race.
+//!
+//! (G5) runs two requests on one store; each opens every gate when it returns, so a request that
+//! stops before the commit its run expects fails the leg instead of hanging it.
 
 #![forbid(unsafe_code)]
 
@@ -336,8 +392,7 @@ fn fault(transient: bool) -> BoxError {
 
 // ──────────────────────────── the logging wrapper ────────────────────────────
 
-/// What [`Logged`] does with one commit of the Complete under test. Later slices add steps here
-/// (a hold step that keeps a batch back until the test releases it, say).
+/// What [`Logged`] does with one commit of the Complete under test.
 #[derive(Debug, Clone)]
 enum OnCommit {
     /// Delegate unchanged.
@@ -352,9 +407,31 @@ enum OnCommit {
         applied: bool,
         may_still_commit: bool,
     },
+    /// Keep the batch unapplied and answer `CommitUnknownResult { may_still_commit: true }`; it
+    /// lands when the test releases it ([`Logged::release_held`]), as the hold step of Abort's
+    /// wrapper does (`multipart_abort.rs:961-980`), or when a later step lands it
+    /// ([`OnCommit::Land`]). Several may be held at once; they land oldest first (#1010).
+    Hold,
+    /// Apply the batch held longest ([`OnCommit::Hold`]) to the inner store first, which must
+    /// take it, then do the step it carries: a held batch the store applies while the request
+    /// is still running, after a read of it found the session where the batch required it.
+    Land(Box<OnCommit>),
+    /// Open this gate, then do the step it carries: a commit telling the test it has arrived.
+    Reach(Gate, Box<OnCommit>),
+    /// Wait for this gate, then do the step it carries: a commit held back while another request
+    /// runs, in an order the test chooses. A leg that waits opens every gate it uses once each of
+    /// its requests returns ([`then_open`]), so a request that stops before the commit the order
+    /// expects fails the leg instead of hanging it.
+    Wait(Gate, Box<OnCommit>),
+    /// Do the step it carries, then open this gate.
+    Then(Box<OnCommit>, Gate),
     /// Apply this blind batch to the inner store first — re-plant a part, remove the bucket,
     /// move the session — then do the step it carries.
     WriteFirst(WriteBatch, Box<OnCommit>),
+    /// Do the step it carries, then apply this batch to the inner store, which must take it:
+    /// another writer between the commit and the request's next read, such as the reaper
+    /// rolling back the fence that commit just put (#1010).
+    WriteAfter(Box<OnCommit>, WriteBatch),
     /// Arm this for the reads after it — a read that fails only behind the fence — then do the
     /// step it carries.
     Arm(Arm, Box<OnCommit>),
@@ -380,6 +457,34 @@ impl fmt::Debug for Interfere {
     }
 }
 
+/// A one-shot signal between a scripted step and the test. [`Gate::open`] lets one
+/// [`Gate::wait`] through, whichever of the two comes first.
+#[derive(Debug, Clone, Default)]
+struct Gate(Arc<tokio::sync::Notify>);
+
+impl Gate {
+    fn open(&self) {
+        self.0.notify_one();
+    }
+
+    async fn wait(&self) {
+        self.0.notified().await;
+    }
+}
+
+/// `request`, then every gate in `gates` opened. Each gate a leg uses has one [`Gate::wait`], and
+/// a gate holds at most one opening, so opening one a step already opened changes nothing. What
+/// it changes is a request that returns before the step that would open a gate another request
+/// waits on: that wait goes on, and the leg fails its assertions instead of waiting out
+/// [`LEG_TIMEOUT`].
+async fn then_open<T>(request: impl Future<Output = T>, gates: &[&Gate]) -> T {
+    let outcome = request.await;
+    for gate in gates {
+        gate.open();
+    }
+    outcome
+}
+
 /// Something [`Logged`] does to reads from the moment it is armed.
 #[derive(Debug, Clone)]
 enum Arm {
@@ -387,6 +492,9 @@ enum Arm {
     FailGets(Vec<u8>),
     /// The next `get` of a key under this prefix fails with a plain fault; later ones do not.
     FailGetOnce(Vec<u8>),
+    /// The next `get` of a key under this prefix opens this gate once it has read; later ones do
+    /// not: a request's read the test orders another request's commit after.
+    OpenOnGet(Vec<u8>, Gate),
     /// Every `scan_page` under this prefix fails with a plain fault.
     FailScans(Vec<u8>),
     /// The next `scan_page` calls answer these pages, one each, instead of asking the store: what
@@ -399,8 +507,16 @@ impl OnCommit {
         Self::WriteFirst(write, Box::new(then))
     }
 
+    fn write_after(then: Self, write: WriteBatch) -> Self {
+        Self::WriteAfter(Box::new(then), write)
+    }
+
     fn arm(arm: Arm, then: Self) -> Self {
         Self::Arm(arm, Box::new(then))
+    }
+
+    fn land(then: Self) -> Self {
+        Self::Land(Box::new(then))
     }
 }
 
@@ -413,6 +529,10 @@ struct Script {
     fail_gets_under: Option<Vec<u8>>,
     /// The next `get` of a key under this prefix fails with a plain fault.
     fail_get_once_under: Option<Vec<u8>>,
+    /// The next `get` of a key under this prefix opens this gate once it has read.
+    open_on_get: Option<(Vec<u8>, Gate)>,
+    /// The batches [`OnCommit::Hold`] kept back, oldest first.
+    held: VecDeque<WriteBatch>,
     /// Every `scan_page` under this prefix fails with a plain fault.
     fail_scans_under: Option<Vec<u8>>,
     /// What the next `scan_page` calls answer.
@@ -442,9 +562,16 @@ impl Logged {
         match arm {
             Arm::FailGets(prefix) => script.fail_gets_under = Some(prefix),
             Arm::FailGetOnce(prefix) => script.fail_get_once_under = Some(prefix),
+            Arm::OpenOnGet(prefix, gate) => script.open_on_get = Some((prefix, gate)),
             Arm::FailScans(prefix) => script.fail_scans_under = Some(prefix),
             Arm::NextPages(pages) => script.next_pages = pages.into(),
         }
+    }
+
+    /// Apply the batch held longest to the inner store now; what it met.
+    async fn release_held(&self) -> CommitOutcome {
+        let held = self.state().held.pop_front().expect("a batch is held");
+        self.inner.commit(held).await.unwrap()
     }
 
     /// Every armed read fault gone, for a request after the faulty one.
@@ -486,9 +613,43 @@ impl Logged {
                 }
                 Err(unknown(may_still_commit))
             }
+            OnCommit::Hold => {
+                self.state().held.push_back(batch);
+                Err(unknown(true))
+            }
+            OnCommit::Land(then) => {
+                assert_eq!(
+                    self.release_held().await,
+                    CommitOutcome::Committed,
+                    "the held batch lands"
+                );
+                Box::pin(self.step(*then, batch)).await
+            }
+            OnCommit::Reach(gate, then) => {
+                gate.open();
+                Box::pin(self.step(*then, batch)).await
+            }
+            OnCommit::Wait(gate, then) => {
+                gate.wait().await;
+                Box::pin(self.step(*then, batch)).await
+            }
+            OnCommit::Then(then, gate) => {
+                let outcome = Box::pin(self.step(*then, batch)).await;
+                gate.open();
+                outcome
+            }
             OnCommit::WriteFirst(write, then) => {
                 assert_eq!(self.inner.commit(write).await?, CommitOutcome::Committed);
                 Box::pin(self.step(*then, batch)).await
+            }
+            OnCommit::WriteAfter(then, write) => {
+                let outcome = Box::pin(self.step(*then, batch)).await;
+                assert_eq!(
+                    self.inner.commit(write).await?,
+                    CommitOutcome::Committed,
+                    "the write after the commit lands"
+                );
+                outcome
             }
             OnCommit::Arm(arm, then) => {
                 self.arm(arm);
@@ -505,21 +666,32 @@ impl Logged {
 #[async_trait]
 impl MetadataStore for Logged {
     async fn get(&self, key: &[u8]) -> StoreResult<Option<Bytes>> {
-        let fails = {
+        let (fails, opens) = {
             let mut script = self.state();
             let once = script
                 .fail_get_once_under
                 .take_if(|prefix| key.starts_with(prefix))
                 .is_some();
-            once || script
-                .fail_gets_under
-                .as_ref()
-                .is_some_and(|prefix| key.starts_with(prefix))
+            let opens = script
+                .open_on_get
+                .take_if(|(prefix, _)| key.starts_with(prefix))
+                .map(|(_, gate)| gate);
+            let fails = once
+                || script
+                    .fail_gets_under
+                    .as_ref()
+                    .is_some_and(|prefix| key.starts_with(prefix));
+            (fails, opens)
         };
-        if fails {
-            return Err(fault(false));
+        let read = if fails {
+            Err(fault(false))
+        } else {
+            self.inner.get(key).await
+        };
+        if let Some(gate) = opens {
+            gate.open();
         }
-        self.inner.get(key).await
+        read
     }
 
     async fn scan(&self, prefix: &[u8]) -> StoreResult<Vec<(Vec<u8>, Bytes)>> {
@@ -1412,20 +1584,19 @@ async fn h_a_bucket_deleted_while_the_session_is_open_answers_no_such_bucket() {
 
 // ──────────────────── (G0-fence) unknown outcomes stop in doubt ────────────────────
 
-/// **(G0-fence)** The wrapper answers `CommitUnknownResult` on the initial fence, applied or not,
-/// with either `may_still_commit`. Each time the request returns the in-doubt error carrying that
-/// outcome, never a `CompleteOutcome` (the list is valid, so a fence taken as won would be held),
-/// and sends no further commit.
+/// **(G0-fence)** The wrapper applies the initial fence and answers `CommitUnknownResult`, with
+/// either `may_still_commit`. The read after it finds the fence's own bytes, which a rival's
+/// byte-identical fence would leave too, so each time the request returns the in-doubt error
+/// carrying that outcome, never a `CompleteOutcome` (the list is valid, so a fence taken as won
+/// would be held), and sends no further commit. The unapplied fence is (G6)'s (#1010).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g0_an_unknown_fence_outcome_returns_the_in_doubt_error_and_nothing_more() {
     within(async {
-        for (applied, may_still_commit) in
-            [(true, false), (false, true), (true, true), (false, false)]
-        {
+        for may_still_commit in [false, true] {
             let up = upload(&PARTS).await;
             up.store.script(
                 vec![OnCommit::Unknown {
-                    applied,
+                    applied: true,
                     may_still_commit,
                 }],
                 None,
@@ -1441,12 +1612,7 @@ async fn g0_an_unknown_fence_outcome_returns_the_in_doubt_error_and_nothing_more
             let commits = up.store.take_commits();
             assert_eq!(commits.len(), 1, "no commit after the unknown fence");
             let (stored, _) = up.session().await;
-            let expected = if applied {
-                session_cas(&commits[0], &up.id).1
-            } else {
-                up.open.clone()
-            };
-            assert_eq!(stored, expected, "applied={applied}");
+            assert_eq!(stored, session_cas(&commits[0], &up.id).1, "the fence");
         }
     })
     .await;
@@ -3942,6 +4108,22 @@ async fn a_flip_that_loses_its_fence_to_another_writer_is_answered_from_the_new_
 
 // ──────────────────── a damaged part or target behind the fence ────────────────────
 
+/// The session's target name bound to [`PUT_INODE`], whose record is at the last version, which
+/// has no successor: no flip onto it can be built ([`PublicationError::VersionOverflow`]).
+fn bound_at_last_version() -> WriteBatch {
+    let last = InodeRecord {
+        version: u64::MAX,
+        state: metadata::InodeState::Committed,
+        ..InodeRecord::default()
+    };
+    WriteBatch::new()
+        .put(
+            metadata::dirent_key(ROOT, "photos/object-1"),
+            metadata::encode(&DirentRecord { inode: PUT_INODE }),
+        )
+        .put(metadata::inode_key(PUT_INODE), metadata::encode(&last))
+}
+
 /// **A damaged part or target behind the fence stops, after one release.** In each case the list
 /// is valid against the part set the fence froze, and a record publication reads next is not
 /// what it must be:
@@ -4000,20 +4182,9 @@ async fn a_damaged_part_or_target_behind_the_fence_stops_after_one_release() {
             metadata::dirent_key(ROOT, "photos/object-1"),
             metadata::encode(&DirentRecord { inode: 777 }),
         );
-        let last = InodeRecord {
-            version: u64::MAX,
-            state: metadata::InodeState::Committed,
-            ..InodeRecord::default()
-        };
-        let at_last_version = WriteBatch::new()
-            .put(
-                metadata::dirent_key(ROOT, "photos/object-1"),
-                metadata::encode(&DirentRecord { inode: PUT_INODE }),
-            )
-            .put(metadata::inode_key(PUT_INODE), metadata::encode(&last));
         for (label, plant) in [
             ("dangling", dangling),
-            ("at the last version", at_last_version),
+            ("at the last version", bound_at_last_version()),
         ] {
             let rig = rig().await;
             assert_eq!(rig.up.object, "photos/object-1");
@@ -4178,54 +4349,6 @@ async fn j_a_flip_the_store_refuses_for_good_releases_the_fence_and_stops() {
             session_cas(&commits[0], &rig.up.id).1
         );
         assert_eq!(rig.target().await, None);
-    })
-    .await;
-}
-
-// ──────────────────────── (G0-flip) an unknown flip outcome ────────────────────────
-
-/// **(G0-flip)** The store answers the flip `CommitUnknownResult`, once applied and once not. Each
-/// time the request returns the in-doubt error about the flip, carrying that outcome, and sends no
-/// further commit: no release, which could not tell a flip that landed from one that did not.
-/// Applied, the object is published and the session `Completed`; not applied, the session is
-/// still the fence's bytes and no name is bound.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g0_an_unknown_flip_outcome_returns_the_in_doubt_error_and_nothing_more() {
-    within(async {
-        for (applied, may_still_commit) in [(true, false), (false, true)] {
-            let rig = rig().await;
-            let digests = stage_all(&rig, &[(1, body(100, 1)), (2, body(80, 2))]).await;
-            rig.up.store.script(
-                vec![
-                    OnCommit::Pass,
-                    OnCommit::Unknown {
-                        applied,
-                        may_still_commit,
-                    },
-                ],
-                None,
-            );
-            let list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
-
-            let doubt = in_doubt_error(
-                as_fence(rig.complete(&list).await),
-                &rig.up.id,
-                DoubtfulCommit::Flip { epoch: 1 },
-                may_still_commit,
-            );
-
-            assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
-            let commits = rig.up.store.take_commits();
-            assert_eq!(commits.len(), 2, "the fence, the flip, and nothing after");
-            let (stored, record) = rig.up.session().await;
-            if applied {
-                assert!(matches!(record.state(), SessionState::Completed { .. }));
-                assert_eq!(rig.target().await, Some(FRESH_INODE));
-            } else {
-                assert_eq!(stored, session_cas(&commits[0], &rig.up.id).1, "the fence");
-                assert_eq!(rig.target().await, None);
-            }
-        }
     })
     .await;
 }
@@ -5031,141 +5154,6 @@ async fn j_seg_a_flip_refused_for_good_after_the_segments_land_releases_with_the
     .await;
 }
 
-// ──────────────── (G0-seg) an unknown segment-batch outcome ────────────────
-
-/// **(G0-seg)** The store answers the segment batch `CommitUnknownResult`, once applied and once
-/// not. Each time the request returns the in-doubt error about that publication round, carrying
-/// that outcome, and sends no further commit: no flip, and no release, which could not tell a
-/// batch that landed from one that did not. Applied, the session is the fence at the cursor the
-/// batch left, with every `seg:` record of the attempt durable; not applied, it is still the
-/// fence's bytes and the attempt's `seg:` range is empty. No name is bound either way.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g0_seg_an_unknown_segment_batch_outcome_returns_the_in_doubt_error_and_nothing_more() {
-    within(async {
-        for (applied, may_still_commit) in [(true, false), (false, true)] {
-            let staged = staged_wide().await;
-            let rig = &staged.rig;
-            rig.up.store.script(
-                vec![
-                    OnCommit::Pass,
-                    OnCommit::Unknown {
-                        applied,
-                        may_still_commit,
-                    },
-                ],
-                None,
-            );
-
-            let doubt = in_doubt_error(
-                as_fence(rig.complete(&staged.list).await),
-                &rig.up.id,
-                DoubtfulCommit::Publication { epoch: 1 },
-                may_still_commit,
-            );
-
-            assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
-            let commits = rig.up.store.take_commits();
-            assert_eq!(
-                commits.len(),
-                2,
-                "the fence, the segment batch, and nothing after"
-            );
-            let (_, fence) = session_cas(&commits[0], &rig.up.id);
-            let group = group_of(&fence);
-            let (stored, _) = rig.up.session().await;
-            if applied {
-                assert_eq!(
-                    stored,
-                    at_cursor(&fence, staged.planned),
-                    "the batch's cursor"
-                );
-                assert_eq!(rig.segments_of(&group).await, staged.planned as usize);
-            } else {
-                assert_eq!(stored, fence, "the fence's own bytes");
-                assert_eq!(rig.segments_of(&group).await, 0);
-            }
-            assert_eq!(rig.target().await, None);
-        }
-    })
-    .await;
-}
-
-/// **(G0-seg, resumed)** What an unknown publication outcome is in doubt about follows from the
-/// round that sent it. The wide fixture; in each case below the flip's outcome is withheld, once
-/// applied and once not, and nothing is sent after it:
-///
-/// * In the first round the flip follows that round's segment batch, and the committer does not
-///   say which of the round's commits the outcome came from: the error is about the publication
-///   ([`DoubtfulCommit::Publication`]).
-/// * When that first flip answers `Conflict` instead, unapplied, the next round resumes at the
-///   committer's count and has no segment batch to send. Its flip, sent alone and requiring the
-///   session at that count, is the only commit the outcome can be about: the error names the
-///   flip ([`DoubtfulCommit::Flip`]).
-///
-/// Applied, the object is published and the session `Completed`; not applied, the session is the
-/// fence at that count and no name is bound. The attempt's `seg:` records are durable either way.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn g0_seg_an_unknown_flip_names_the_flip_only_in_a_round_with_no_segment_batch() {
-    within(async {
-        for resumed in [false, true] {
-            for (applied, may_still_commit) in [(true, false), (false, true)] {
-                let staged = staged_wide().await;
-                let rig = &staged.rig;
-                let id = &rig.up.id;
-                let mut plan = vec![OnCommit::Pass; 1 + SEGMENT_BATCHES];
-                if resumed {
-                    plan.push(OnCommit::ConflictUnmoved);
-                }
-                plan.push(OnCommit::Unknown {
-                    applied,
-                    may_still_commit,
-                });
-                rig.up.store.script(plan, None);
-                let commit = if resumed {
-                    DoubtfulCommit::Flip { epoch: 1 }
-                } else {
-                    DoubtfulCommit::Publication { epoch: 1 }
-                };
-
-                let doubt = in_doubt_error(
-                    as_fence(rig.complete(&staged.list).await),
-                    id,
-                    commit,
-                    may_still_commit,
-                );
-
-                assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
-                let commits = rig.up.store.take_commits();
-                let flips = if resumed { 2 } else { 1 };
-                assert_eq!(
-                    commits.len(),
-                    1 + SEGMENT_BATCHES + flips,
-                    "resumed: {resumed}; the fence, the segment batch, the flips, and nothing after"
-                );
-                let (_, fence) = session_cas(&commits[0], id);
-                let moved = at_cursor(&fence, staged.planned);
-                assert_eq!(put_at(&commits[1], &mpu_key(id)), Some(moved.clone()));
-                for flip in &commits[1 + SEGMENT_BATCHES..] {
-                    assert_flip(flip, &rig.up, &moved);
-                }
-                let (stored, after) = rig.up.session().await;
-                if applied {
-                    assert!(matches!(after.state(), SessionState::Completed { .. }));
-                    assert_eq!(rig.target().await, Some(FRESH_INODE));
-                } else {
-                    assert_eq!(stored, moved, "the fence at the committer's count");
-                    assert_eq!(rig.target().await, None);
-                }
-                assert_eq!(
-                    rig.segments_of(&group_of(&fence)).await,
-                    staged.planned as usize
-                );
-            }
-        }
-    })
-    .await;
-}
-
 // ──────────────── (M) a segment phase of two batches, the second one lost ────────────────
 
 /// **(M) A later segment batch that loses resumes from the cursor the earlier one left.** The
@@ -5355,6 +5343,1778 @@ async fn m_a_later_segment_batch_refused_for_good_releases_from_the_cursor_the_e
             assert_eq!(rig.target().await, None);
             rig.assert_every_segment_named().await;
         }
+    })
+    .await;
+}
+
+// ═════════════════════════════ #1010: unknown outcomes ═════════════════════════════
+
+/// Parts 1 and 2 staged on `rig`, the list naming both, and the object it publishes: what the
+/// flat legs below complete.
+async fn two_parts(rig: &Rig) -> (NamedParts, Vec<u8>) {
+    let bodies = [(1, body(100, 1)), (2, body(80, 2))];
+    let digests = stage_all(rig, &bodies).await;
+    let object = bodies.iter().flat_map(|(_, b)| b.clone()).collect();
+    (list_of(&[(1, digests[&1]), (2, digests[&2])]), object)
+}
+
+/// What a request naming `list` publishes on a free name: version 1 under [`FRESH_INODE`], with
+/// `list`'s multipart ETag and the publication stamp.
+fn fresh_publication(list: &NamedParts) -> Publication {
+    Publication {
+        inode: FRESH_INODE,
+        version: 1,
+        etag: multipart_etag(list.as_slice()).unwrap(),
+        completed_at_millis: COMPLETED_AT,
+    }
+}
+
+/// `rig`'s object is published **once**, by a request naming `list`, with the frozen parts
+/// `unnamed` left out:
+///
+/// * `publication` is [`fresh_publication`], the dirent names that inode, its version advanced
+///   once, to 1, and it reads back as `object`;
+/// * the session is `Completed@2`, recording that publication and `list`'s fingerprint, with one
+///   fence's attempt spent;
+/// * the store holds exactly one set of obligations under the fence epoch's token: the flip's
+///   `retire:records:` naming the published parts and, when a part was left out, its
+///   `retire:bytes:` naming those; no other `retire:` record.
+async fn assert_published_once(
+    rig: &Rig,
+    list: &NamedParts,
+    publication: &Publication,
+    object: &[u8],
+    unnamed: &[u32],
+) {
+    let expected = fresh_publication(list);
+    assert_eq!(publication, &expected, "the publication");
+    assert_eq!(rig.target().await, Some(FRESH_INODE), "the dirent names it");
+    let inode = inode_at(&rig.up.store.inner, FRESH_INODE)
+        .await
+        .expect("the published inode");
+    assert_eq!(inode.version, 1, "the version advanced once");
+    assert_eq!(rig.read(FRESH_INODE).await, object, "byte for byte");
+    let (_, after) = rig.up.session().await;
+    let SessionState::Completed { completion } = after.state() else {
+        panic!("expected Completed, got {:?}", after.state());
+    };
+    assert_eq!(
+        Publication::of(completion),
+        expected,
+        "the recorded publication"
+    );
+    assert_eq!(
+        completion.complete_fingerprint,
+        complete_fingerprint(list.as_slice()).unwrap(),
+        "the list's fingerprint"
+    );
+    assert_eq!(
+        (after.epoch(), after.attempts()),
+        (2, 1),
+        "Completed@2, one fence's attempt spent"
+    );
+    let named: Vec<u32> = list.as_slice().iter().map(|(n, _)| n.get()).collect();
+    let token = session_token(&rig.up.id, 1);
+    let mut owed = vec![(RetireMode::Records, set_of(&named))];
+    if !unnamed.is_empty() {
+        owed.push((RetireMode::Bytes, set_of(unnamed)));
+    }
+    let all = rig.obligations(b"retire:").await;
+    assert_eq!(all.len(), owed.len(), "one set of obligations: {all:?}");
+    for (mode, parts) in owed {
+        assert!(
+            all.iter().any(|(m, t, payload)| *m == mode
+                && *t == token
+                && payload.parts() == Some(&parts)),
+            "{mode:?} for {parts:?} under {token}: {all:?}"
+        );
+    }
+}
+
+// ─────────────── (G1) a flip that landed, answered unknown ───────────────
+
+/// **(G1)** The wrapper applies the flip and answers `CommitUnknownResult`, with either
+/// `may_still_commit`. The request reads the session, finds the `Completed` record its own flip
+/// put, and answers `Published` with that flip's publication, once: nothing is sent after the
+/// flip, the inode version advanced once, and exactly one set of obligations exists.
+///
+/// Both for a flat object and for the wide fixture, whose round sends its segment batch before
+/// the flip: there the outcome is about a round with a segment batch, and the flip that landed is
+/// still this request's. The segmented root names the group and the committer's count, and every
+/// `seg:` record is named by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g1_a_flip_that_landed_answered_unknown_is_published_once() {
+    within(async {
+        for may_still_commit in [false, true] {
+            let staged = staged_wide().await;
+            let rig = &staged.rig;
+            let id = &rig.up.id;
+            let mut plan = vec![OnCommit::Pass; 1 + SEGMENT_BATCHES];
+            plan.push(OnCommit::Unknown {
+                applied: true,
+                may_still_commit,
+            });
+            rig.up.store.script(plan, None);
+
+            let publication = published(rig.complete(&staged.list).await);
+
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                1 + SEGMENT_BATCHES + 1,
+                "wide, may_still_commit={may_still_commit}: the fence, the segment batch, the \
+                 flip, and nothing after"
+            );
+            let (_, fence) = session_cas(&commits[0], id);
+            let group = group_of(&fence);
+            let flip = &commits[commits.len() - 1];
+            assert_flip(flip, &rig.up, &at_cursor(&fence, staged.planned));
+            assert_eq!(
+                put_at(flip, &mpu_key(id)),
+                Some(rig.up.session().await.0),
+                "the session is the record the flip put"
+            );
+            let inode = inode_at(&rig.up.store.inner, FRESH_INODE).await.unwrap();
+            let ChunkMap::Segmented(map) = &inode.chunk_map else {
+                panic!("expected a segmented root, got {:?}", inode.chunk_map);
+            };
+            assert_eq!(map.group(), &group);
+            assert_eq!(map.segment_count(), staged.planned, "the committer's count");
+            assert_published_once(rig, &staged.list, &publication, &staged.object(), &[]).await;
+            rig.assert_every_segment_named().await;
+        }
+        for may_still_commit in [false, true] {
+            let rig = rig().await;
+            let (list, object) = two_parts(&rig).await;
+            rig.up.store.script(
+                vec![
+                    OnCommit::Pass,
+                    OnCommit::Unknown {
+                        applied: true,
+                        may_still_commit,
+                    },
+                ],
+                None,
+            );
+
+            let publication = published(rig.complete(&list).await);
+
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                2,
+                "may_still_commit={may_still_commit}: the fence, the flip, and nothing after"
+            );
+            let (_, fence) = session_cas(&commits[0], &rig.up.id);
+            assert_flip(&commits[1], &rig.up, &fence);
+            assert_eq!(
+                put_at(&commits[1], &mpu_key(&rig.up.id)),
+                Some(rig.up.session().await.0),
+                "the session is the record the flip put"
+            );
+            assert_published_once(&rig, &list, &publication, &object, &[]).await;
+        }
+    })
+    .await;
+}
+
+/// **(G1-open)** The flip's outcome is unknown, unapplied, with either `may_still_commit`, and
+/// before the read after it the session is rolled back to `Open@2`, as the reaper's
+/// `W_completing` rollback leaves it (#625). That read finds no flip of the request landed and the
+/// session off its fence, so nothing of the request can land any more: it answers
+/// `OperationAborted`, the answer that tells the client to retry, and sends nothing after the
+/// flip. It never fences again: its fence stamp is the one the rollback found past
+/// `W_completing`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g1_open_a_session_rolled_back_under_an_unknown_flip_answers_operation_aborted() {
+    within(async {
+        for may_still_commit in [false, true] {
+            let rig = rig().await;
+            let (list, _) = two_parts(&rig).await;
+            let rolled_back = session_bytes(&rig.up.open, 2, 1, OPEN);
+            let rollback = WriteBatch::new().put(mpu_key(&rig.up.id), rolled_back.clone());
+            rig.up.store.script(
+                vec![
+                    OnCommit::Pass,
+                    OnCommit::write_first(
+                        rollback,
+                        OnCommit::Unknown {
+                            applied: false,
+                            may_still_commit,
+                        },
+                    ),
+                ],
+                None,
+            );
+
+            let outcome = rig.complete(&list).await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(CompleteOutcome::Refused(Refusal::OperationAborted))
+                ),
+                "may_still_commit={may_still_commit}: {outcome:?}"
+            );
+            assert_eq!(
+                rig.up.store.take_commits().len(),
+                2,
+                "the fence, the flip, and nothing after"
+            );
+            assert_eq!(
+                rig.up.session().await.0,
+                rolled_back,
+                "the rollback's session"
+            );
+            assert_eq!(rig.target().await, None, "nothing published");
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G2) a held flip ───────────────
+
+/// **(G2) A held flip.** The wrapper keeps the flip (`may_still_commit: true`) and answers every
+/// later commit `Conflict` without applying it. Every read after finds the session still at the
+/// bytes the held flip requires, so the doubt stands: the request flips again until its
+/// [`STATED_PUBLISH_ROUNDS`] rounds run out, then returns the in-doubt error about the held flip
+/// and sends no release, which would race it. Released afterwards, the held flip lands: the object
+/// is published once, with one set of obligations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g2_a_held_flip_ends_in_doubt_when_the_rounds_run_out_and_lands_once() {
+    within(async {
+        let rig = rig().await;
+        let id = &rig.up.id;
+        let (list, object) = two_parts(&rig).await;
+        rig.up.store.script(
+            vec![OnCommit::Pass, OnCommit::Hold],
+            Some(OnCommit::ConflictUnmoved),
+        );
+
+        let doubt = in_doubt_error(
+            as_fence(rig.complete(&list).await),
+            id,
+            DoubtfulCommit::Flip { epoch: 1 },
+            true,
+        );
+
+        assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            1 + STATED_PUBLISH_ROUNDS as usize,
+            "the fence and one flip per round, and no release"
+        );
+        let (_, fence) = session_cas(&commits[0], id);
+        for flip in &commits[1..] {
+            assert_flip(flip, &rig.up, &fence);
+        }
+        assert_eq!(rig.up.session().await.0, fence, "the fence still stands");
+        assert_eq!(rig.target().await, None, "nothing published yet");
+
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Committed,
+            "the held flip lands"
+        );
+        assert_eq!(
+            put_at(&commits[1], &mpu_key(id)),
+            Some(rig.up.session().await.0),
+            "the session is the record the held flip put"
+        );
+        let publication = fresh_publication(&list);
+        assert_published_once(&rig, &list, &publication, &object, &[]).await;
+    })
+    .await;
+}
+
+// ─────────────── (G3) a failed re-read ───────────────
+
+/// **(G3) A failed re-read.** After an unknown flip outcome, applied or not, with either
+/// `may_still_commit`, every read of `mpu:<id>` fails. The request returns the in-doubt error about
+/// that round, carrying that outcome, never an answer, and sends nothing after it. What it is about
+/// follows from the round, since the committer does not say which of a round's commits the
+/// outcome came from:
+///
+/// * a flat object: the flip, the round's only commit;
+/// * the wide fixture's first round, whose flip follows its segment batch: the publication;
+/// * the wide fixture's second round, after the first flip answered `Conflict`: resumed at the
+///   committer's count with no segment batch to send, the flip.
+///
+/// Applied, the object is published and the session `Completed`; not applied, the session is the
+/// fence at the cursor the round required.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g3_a_failed_re_read_after_an_unknown_flip_outcome_is_in_doubt_never_an_answer() {
+    within(async {
+        for (applied, may_still_commit) in [(true, false), (false, true)] {
+            let unread = || {
+                OnCommit::arm(
+                    Arm::FailGets(MPU_PREFIX.to_vec()),
+                    OnCommit::Unknown {
+                        applied,
+                        may_still_commit,
+                    },
+                )
+            };
+            let case = format!("applied={applied}, may_still_commit={may_still_commit}");
+
+            let rig = rig().await;
+            let (list, _) = two_parts(&rig).await;
+            rig.up.store.script(vec![OnCommit::Pass, unread()], None);
+            let doubt = in_doubt_error(
+                as_fence(rig.complete(&list).await),
+                &rig.up.id,
+                DoubtfulCommit::Flip { epoch: 1 },
+                may_still_commit,
+            );
+            assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+            let commits = rig.up.store.take_commits();
+            assert_eq!(commits.len(), 2, "{case}: the fence, the flip, nothing after");
+            let (stored, record) = rig.up.session().await;
+            if applied {
+                assert!(matches!(record.state(), SessionState::Completed { .. }));
+            } else {
+                assert_eq!(stored, session_cas(&commits[0], &rig.up.id).1, "the fence");
+            }
+
+            for resumed in [false, true] {
+                let staged = staged_wide().await;
+                let rig = &staged.rig;
+                let id = &rig.up.id;
+                let mut plan = vec![OnCommit::Pass; 1 + SEGMENT_BATCHES];
+                if resumed {
+                    plan.push(OnCommit::ConflictUnmoved);
+                }
+                plan.push(unread());
+                rig.up.store.script(plan, None);
+                let commit = if resumed {
+                    DoubtfulCommit::Flip { epoch: 1 }
+                } else {
+                    DoubtfulCommit::Publication { epoch: 1 }
+                };
+
+                let doubt = in_doubt_error(
+                    as_fence(rig.complete(&staged.list).await),
+                    id,
+                    commit,
+                    may_still_commit,
+                );
+
+                assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+                let commits = rig.up.store.take_commits();
+                let flips = if resumed { 2 } else { 1 };
+                assert_eq!(
+                    commits.len(),
+                    1 + SEGMENT_BATCHES + flips,
+                    "{case}, resumed={resumed}: the fence, the segment batch, the flips, nothing after"
+                );
+                let (_, fence) = session_cas(&commits[0], id);
+                let moved = at_cursor(&fence, staged.planned);
+                for flip in &commits[1 + SEGMENT_BATCHES..] {
+                    assert_flip(flip, &rig.up, &moved);
+                }
+                let (stored, after) = rig.up.session().await;
+                if applied {
+                    assert!(matches!(after.state(), SessionState::Completed { .. }));
+                } else {
+                    assert_eq!(stored, moved, "the fence at the committer's count");
+                }
+            }
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G4) an unknown segment write ───────────────
+
+/// **(G4) An unknown segment write.** The wide fixture. The segment batch answers
+/// `CommitUnknownResult { may_still_commit: false }`, applied in one run and not in the other. The
+/// request reads the session and resumes from the `segments_written` it finds, at the same epoch,
+/// with no second fence:
+///
+/// * applied, the cursor is at the committer's count, so the next round reads every record back
+///   and sends the flip alone;
+/// * not applied, the cursor is 0, so the next round sends that segment batch again, byte for
+///   byte, and then the flip.
+///
+/// Across the batches that landed every `seg:` record is written exactly once, and no batch after
+/// them puts one. The request answers `Published` once: a segmented root naming the group (the
+/// session's nonce, 1) and every segment, which reads back byte for byte, with one set of
+/// obligations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g4_an_unknown_segment_batch_resumes_from_the_cursor_and_publishes_once() {
+    within(async {
+        for applied in [true, false] {
+            let staged = staged_wide().await;
+            let rig = &staged.rig;
+            let id = &rig.up.id;
+            let (_, before) = rig.up.session().await;
+            rig.up.store.script(
+                vec![
+                    OnCommit::Pass,
+                    OnCommit::Unknown {
+                        applied,
+                        may_still_commit: false,
+                    },
+                ],
+                None,
+            );
+
+            let publication = published(rig.complete(&staged.list).await);
+
+            let commits = rig.up.store.take_commits();
+            let again = if applied { 0 } else { SEGMENT_BATCHES };
+            assert_eq!(
+                commits.len(),
+                1 + SEGMENT_BATCHES + again + 1,
+                "applied={applied}: the fence, the segment batch, {again} sent again, the flip"
+            );
+            let (required_first, fence) = session_cas(&commits[0], id);
+            assert_eq!(required_first, rig.up.open, "the fence, from Open@0");
+            for later in &commits[1..] {
+                assert_ne!(
+                    required(later, &mpu_key(id)),
+                    Some(rig.up.open.clone()),
+                    "no second fence"
+                );
+            }
+            let group = group_of(&fence);
+            assert_eq!(
+                group,
+                SegmentGroup::from_nonce(before.segment_nonce().clone(), 1),
+                "the same epoch"
+            );
+            let moved = at_cursor(&fence, staged.planned);
+            let unknown = &commits[1];
+            assert_eq!(required(unknown, &mpu_key(id)), Some(fence.clone()));
+            assert_eq!(put_at(unknown, &mpu_key(id)), Some(moved.clone()));
+            let every: Vec<u32> = (0..staged.planned).collect();
+            assert_eq!(segments_put(unknown, &group), every);
+            let landed = if applied { 1 } else { 2 };
+            if !applied {
+                assert_same_batch(
+                    &commits[landed],
+                    unknown,
+                    "the batch that did not land, sent again from cursor 0",
+                );
+            }
+            assert_eq!(
+                segments_put(&commits[landed], &group),
+                every,
+                "every record, in the batch that landed"
+            );
+            for after in &commits[landed + 1..] {
+                assert!(
+                    segments_put(after, &group).is_empty(),
+                    "no seg: record written twice"
+                );
+            }
+            assert_flip(commits.last().unwrap(), &rig.up, &moved);
+
+            let inode = inode_at(&rig.up.store.inner, FRESH_INODE).await.unwrap();
+            let ChunkMap::Segmented(map) = &inode.chunk_map else {
+                panic!("expected a segmented root, got {:?}", inode.chunk_map);
+            };
+            assert_eq!(map.group(), &group);
+            assert_eq!(map.segment_count(), staged.planned, "the committer's count");
+            assert_eq!(rig.segments_of(&group).await, staged.planned as usize);
+            let all = rig.up.store.inner.scan(metadata::SEG_PREFIX).await.unwrap();
+            assert_eq!(all.len(), staged.planned as usize, "no other seg: record");
+            assert_published_once(rig, &staged.list, &publication, &staged.object(), &[]).await;
+            rig.assert_every_segment_named().await;
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G5) an unknown initial fence never proves ownership ───────────────
+
+/// **(G5) An unknown initial fence never proves ownership.** Parts 1, 2 and 3 staged. With the
+/// clock fixed, Complete A names parts 1 and 2 and Complete B parts 1 and 3; both read `Open@0`
+/// and build byte-identical fences, since a `Completing` record names no request.
+///
+/// * **Run 1.** The wrapper holds A's fence back while B's commits (a definite success), then
+///   answers A's `CommitUnknownResult { may_still_commit: false }`, unapplied. A's read finds
+///   `Completing@1` at exactly the bytes it proposed: B's. B's flip waits until A has made that
+///   read, or has returned.
+/// * **Run 2.** B reads `Open@0`, and its fence is held back while A's fence is applied and
+///   answered `CommitUnknownResult { may_still_commit: false }`; then B's fence goes on and
+///   conflicts. A's read finds `Completing@1` at exactly the bytes it proposed: its own.
+///
+/// Both times A returns the in-doubt error about its fence and sends nothing after it: no `seg:`
+/// record and no flip. In run 1, B publishes parts 1 + 3 once. In run 2, B answers
+/// `Refused(OperationAborted)`, nothing is published, and the session stays `Completing@1` for the
+/// reaper (#625).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g5_an_unknown_initial_fence_never_proves_ownership() {
+    within(async {
+        for run in [1, 2] {
+            let rig = rig().await;
+            let id = &rig.up.id;
+            let bodies = three_bodies();
+            let digests = stage_all(&rig, &bodies).await;
+            let a_list = list_of(&[(1, digests[&1]), (2, digests[&2])]);
+            let b_list = list_of(&[(1, digests[&1]), (3, digests[&3])]);
+            // `arrived`: the first request's fence reached the wrapper. `a_read`: A read the
+            // session after its fence, or returned without that read; either way no later commit
+            // can change what A answers. `b_fenced` (run 1): B's fence landed. Each request opens
+            // all three when it returns, so one that stops before the commit its run expects ends
+            // the leg in a failed assertion, never a hang.
+            let (arrived, a_read, b_fenced) = (Gate::default(), Gate::default(), Gate::default());
+            let gates = [&arrived, &a_read, &b_fenced];
+            let a_request = then_open(rig.complete(&a_list), &gates);
+            let a_unknown = |applied| {
+                OnCommit::arm(
+                    Arm::OpenOnGet(MPU_PREFIX.to_vec(), a_read.clone()),
+                    OnCommit::Unknown {
+                        applied,
+                        may_still_commit: false,
+                    },
+                )
+            };
+            let (a, b) = if run == 1 {
+                rig.up.store.script(
+                    vec![
+                        // A's fence: held back until B's has landed, then unknown, unapplied.
+                        OnCommit::Reach(
+                            arrived.clone(),
+                            Box::new(OnCommit::Wait(b_fenced.clone(), Box::new(a_unknown(false)))),
+                        ),
+                        // B's fence.
+                        OnCommit::Then(Box::new(OnCommit::Pass), b_fenced.clone()),
+                        // B's flip, once A has read the session.
+                        OnCommit::Wait(a_read.clone(), Box::new(OnCommit::Pass)),
+                    ],
+                    None,
+                );
+                let b = async {
+                    arrived.wait().await;
+                    then_open(rig.complete(&b_list), &gates).await
+                };
+                tokio::join!(a_request, b)
+            } else {
+                rig.up.store.script(
+                    vec![
+                        // B's fence: held back until A has read the session after its own.
+                        OnCommit::Reach(
+                            arrived.clone(),
+                            Box::new(OnCommit::Wait(a_read.clone(), Box::new(OnCommit::Pass))),
+                        ),
+                        // A's fence: applied, then unknown.
+                        a_unknown(true),
+                    ],
+                    None,
+                );
+                let a = async {
+                    arrived.wait().await;
+                    a_request.await
+                };
+                let (b, a) = tokio::join!(then_open(rig.complete(&b_list), &gates), a);
+                (a, b)
+            };
+
+            let doubt = in_doubt_error(as_fence(a), id, DoubtfulCommit::Fence { epoch: 1 }, false);
+            assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+            let commits = rig.up.store.take_commits();
+            let (a_fence, b_fence) = if run == 1 {
+                (&commits[0], &commits[1])
+            } else {
+                (&commits[1], &commits[0])
+            };
+            let (a_required, a_put) = session_cas(a_fence, id);
+            let (b_required, b_put) = session_cas(b_fence, id);
+            assert_eq!(
+                (&a_required, &b_required),
+                (&rig.up.open, &rig.up.open),
+                "run {run}: both read Open@0"
+            );
+            assert_eq!(a_put, b_put, "run {run}: byte-identical fences");
+            assert!(
+                commits.iter().all(|c| !c
+                    .puts
+                    .iter()
+                    .any(|(k, _)| k.starts_with(metadata::SEG_PREFIX))),
+                "run {run}: no seg: record written"
+            );
+            let segments = rig.up.store.inner.scan(metadata::SEG_PREFIX).await.unwrap();
+            assert!(segments.is_empty(), "run {run}: no seg: record");
+            if run == 1 {
+                assert_eq!(
+                    commits.len(),
+                    3,
+                    "A's fence, B's fence, B's flip: nothing of A's after its fence"
+                );
+                assert_flip(&commits[2], &rig.up, &b_put);
+                let publication = published(b);
+                let object: Vec<u8> = [&bodies[0].1, &bodies[2].1]
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .collect();
+                assert_published_once(&rig, &b_list, &publication, &object, &[2]).await;
+            } else {
+                assert_eq!(
+                    commits.len(),
+                    2,
+                    "B's fence, A's fence, and nothing after either"
+                );
+                assert!(
+                    matches!(b, Ok(CompleteOutcome::Refused(Refusal::OperationAborted))),
+                    "{b:?}"
+                );
+                let (stored, record) = rig.up.session().await;
+                assert_eq!(stored, a_put, "the session stays at the fence");
+                assert!(
+                    matches!(record.state(), SessionState::Completing { .. }),
+                    "{record:?}"
+                );
+                assert_eq!(record.epoch(), 1, "Completing@1, for the reaper");
+                assert_eq!(rig.target().await, None, "nothing published");
+                assert_eq!(inode_at(&rig.up.store.inner, FRESH_INODE).await, None);
+                assert!(rig.obligations(RETIRE_RECORDS_PREFIX).await.is_empty());
+            }
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G6) an unknown initial fence that did not land ───────────────
+
+/// **(G6) An unknown initial fence that did not land is sent again.** The first fence answers
+/// `CommitUnknownResult`, unapplied, and the read after it finds `Open@0` unchanged:
+///
+/// * `may_still_commit: false`: that fence is out of flight and did not land, so it never will;
+/// * `may_still_commit: true`: the wrapper keeps it (the hold step), so it may still land, and the
+///   fence is sent again without the check before it.
+///
+/// Either way the request sends the fence again, byte for byte, gets a definite success and
+/// publishes once. Released afterwards, the held fence meets the session it required gone and
+/// conflicts: the retried fence's success settled it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_an_unknown_initial_fence_that_did_not_land_is_sent_again_and_publishes_once() {
+    within(async {
+        for may_still_commit in [false, true] {
+            let rig = rig().await;
+            let (list, object) = two_parts(&rig).await;
+            let first = if may_still_commit {
+                OnCommit::Hold
+            } else {
+                OnCommit::Unknown {
+                    applied: false,
+                    may_still_commit,
+                }
+            };
+            rig.up.store.script(vec![first], None);
+
+            let publication = published(rig.complete(&list).await);
+
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                3,
+                "may_still_commit={may_still_commit}: the fence, the fence again, the flip"
+            );
+            assert_same_batch(&commits[1], &commits[0], "the fence sent again");
+            let (required_first, fence) = session_cas(&commits[0], &rig.up.id);
+            assert_eq!(required_first, rig.up.open, "from Open@0");
+            assert_flip(&commits[2], &rig.up, &fence);
+            assert_published_once(&rig, &list, &publication, &object, &[]).await;
+            if may_still_commit {
+                let completed = rig.up.session().await.0;
+                assert_eq!(
+                    rig.up.store.release_held().await,
+                    CommitOutcome::Conflict,
+                    "the held fence can no longer land"
+                );
+                assert_eq!(rig.up.session().await.0, completed, "nothing moved");
+            }
+        }
+    })
+    .await;
+}
+
+// ═══════════════ #1010: what settles, keeps, moves and clears a doubt ═══════════════
+//
+// Each leg below pins one rule of the doubt bookkeeping (the module doc of `complete.rs`,
+// *Unknown outcomes*) that the G legs above can pass without: a leg that ends `Published` never
+// asks what was in doubt.
+
+/// The bucket marker removed: a blind batch for a [`OnCommit::WriteFirst`] step.
+fn bucket_removed() -> WriteBatch {
+    WriteBatch::new().delete(metadata::bucket_key(BUCKET))
+}
+
+// ─────────────── (G6-held) no check answers while a held fence may land ───────────────
+
+/// **(G6-held) No check answers while a held fence may land.** The first fence is held
+/// (`may_still_commit: true`), and the bucket marker is removed just before it, so the check
+/// before the fence would now refuse the request. The read after it finds `Open@0` unchanged,
+/// the bytes the held fence requires, so that fence may still land, and an answer now would leave
+/// the session to a fence no answer names. The request sends the fence again without that check:
+///
+/// * the fence sent again lands: the held one can never land now, and the check behind the fence
+///   refuses the request, which releases its own fence and answers `NoSuchBucket`. Released
+///   afterwards, the held fence conflicts;
+/// * every fence sent again answers `Conflict` with the session unchanged: the request spends its
+///   [`STATED_FENCE_ROUNDS`] fence commits and returns the in-doubt error about the held fence,
+///   never `NoSuchBucket` and never "no fence placed". Released afterwards, the held fence lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_held_no_check_before_the_fence_answers_while_a_held_fence_may_land() {
+    within(async {
+        for retried_lands in [true, false] {
+            let up = upload(&PARTS).await;
+            let (open, before) = up.session().await;
+            let retried = if retried_lands {
+                OnCommit::Pass
+            } else {
+                OnCommit::ConflictUnmoved
+            };
+            up.store.script(
+                vec![OnCommit::write_first(bucket_removed(), OnCommit::Hold)],
+                Some(retried),
+            );
+
+            let outcome = up.complete(&named(&PARTS)).await;
+
+            let commits = up.store.take_commits();
+            if retried_lands {
+                assert_eq!(refused(outcome), Refusal::NoSuchBucket);
+                assert_eq!(
+                    commits.len(),
+                    3,
+                    "the fence held, the fence again, its release"
+                );
+                assert_same_batch(&commits[1], &commits[0], "the fence sent again");
+                assert_batches_fenced_and_released(&up, &commits[1..], (&open, &before)).await;
+                let released = up.session().await.0;
+                assert_eq!(
+                    up.store.release_held().await,
+                    CommitOutcome::Conflict,
+                    "the held fence can no longer land"
+                );
+                assert_eq!(up.session().await.0, released, "nothing moved");
+            } else {
+                let doubt =
+                    in_doubt_error(outcome, &up.id, DoubtfulCommit::Fence { epoch: 1 }, true);
+                assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+                assert_eq!(
+                    commits.len() as u32,
+                    STATED_FENCE_ROUNDS,
+                    "every fence round, and nothing else"
+                );
+                for again in &commits[1..] {
+                    assert_same_batch(again, &commits[0], "the fence sent again");
+                }
+                assert_eq!(
+                    up.session().await.0,
+                    open,
+                    "Open@0, as the held fence requires"
+                );
+                assert_eq!(
+                    up.store.release_held().await,
+                    CommitOutcome::Committed,
+                    "the held fence lands after the request returned"
+                );
+                assert_eq!(
+                    up.session().await.0,
+                    session_cas(&commits[0], &up.id).1,
+                    "the session is the fence the in-doubt error warned of"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// **(G6-held) A read that finds the session moved clears a held fence.** The first fence is
+/// held, and just before it another request fences the session and releases it again, leaving it
+/// at `Open@2`, and the bucket marker is removed. The read after the held fence finds `Open@2`.
+/// The held fence requires `Open@0`, which never comes back, so it can no longer land and nothing
+/// is in doubt: the check before the fence runs again and answers `NoSuchBucket`, with nothing
+/// sent after the held fence. Released afterwards, the held fence conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_held_a_read_that_finds_the_session_moved_clears_a_held_fence() {
+    within(async {
+        let up = upload(&PARTS).await;
+        let later = session_bytes(&up.open, 2, 0, OPEN);
+        let moved = bucket_removed().put(mpu_key(&up.id), later.clone());
+        up.store
+            .script(vec![OnCommit::write_first(moved, OnCommit::Hold)], None);
+
+        assert_eq!(
+            refused(up.complete(&named(&PARTS)).await),
+            Refusal::NoSuchBucket
+        );
+
+        assert_eq!(
+            up.store.take_commits().len(),
+            1,
+            "the held fence, and nothing after it"
+        );
+        assert_eq!(
+            up.store.release_held().await,
+            CommitOutcome::Conflict,
+            "the held fence can no longer land"
+        );
+        assert_eq!(
+            up.session().await.0,
+            later,
+            "the session as the other request left it"
+        );
+    })
+    .await;
+}
+
+/// **(G6-held) A fence sent again and refused for good while the first is held.** The first fence
+/// is held, and the read after it finds `Open@0` unchanged, the bytes the held fence requires. The
+/// fence sent again is refused for good (a definite store error). Without a doubt that stops the
+/// request with no fence placed, but the held fence may still land, so "no fence placed" may be
+/// false: the request returns the in-doubt error about the held fence and sends nothing more.
+/// Released afterwards, the held fence lands, the fence the error warned of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_held_a_fence_sent_again_and_refused_for_good_ends_in_doubt() {
+    within(async {
+        let up = upload(&PARTS).await;
+        up.store.script(
+            vec![OnCommit::Hold, OnCommit::Fail { transient: true }],
+            None,
+        );
+
+        let outcome = up.complete(&named(&PARTS)).await;
+
+        let doubt = in_doubt_error(outcome, &up.id, DoubtfulCommit::Fence { epoch: 1 }, true);
+        assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+        let commits = up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            2,
+            "the held fence, the fence again, and nothing after"
+        );
+        assert_same_batch(&commits[1], &commits[0], "the fence sent again");
+        assert_eq!(up.session().await.0, up.open, "nothing landed yet");
+        assert_eq!(
+            up.store.release_held().await,
+            CommitOutcome::Committed,
+            "the held fence lands"
+        );
+        assert_eq!(
+            up.session().await.0,
+            session_cas(&commits[0], &up.id).1,
+            "the fence the in-doubt error warned of"
+        );
+    })
+    .await;
+}
+
+// ─────────────── (G6-rolled-back) the session `Open` again after an unknown fence ───────────────
+
+/// `open`'s session as a request here fences it from `Open@0`: `Completing@1`, stamped
+/// [`FENCED_AT`], no segment written, one attempt spent.
+fn own_fence(open: &Bytes) -> Bytes {
+    let record = decode_session_record(open).unwrap();
+    let state = format!(
+        "{{\"kind\":\"Completing\",\"fenced_at_millis\":{FENCED_AT},\"segments_written\":0,\
+         \"publish_target\":{{\"parent\":{},\"name\":{},\"epoch\":1}}}}",
+        record.parent(),
+        json_string(record.object()),
+    );
+    session_bytes(open, 1, 1, &state)
+}
+
+/// `mpu:<id>` moved from exactly `from` to `to`: a writer that read `from`.
+fn session_moved(id: &UploadId, from: &Bytes, to: &Bytes) -> WriteBatch {
+    WriteBatch::new()
+        .require(mpu_key(id), from.clone())
+        .put(mpu_key(id), to.clone())
+}
+
+/// **(G6-rolled-back) An `Open` session with an attempt spent since is never fenced again.** The
+/// first fence's outcome is unknown, and the read after it finds the session `Open` again with one
+/// attempt more than `Open@0`: a fence came down and kept its attempt, which is what the reaper's
+/// `W_completing` rollback does (#625). The bucket marker and every part are still valid, so only
+/// that read stops the request. The fence rolled back may have been this request's, rolled back
+/// because its stamp was past `W_completing`, and a fence with that stamp again would be past the
+/// window from the start. So the request answers `OperationAborted`, which tells the client to
+/// retry with a fresh stamp, and sends no fence after the first:
+///
+/// * the fence lands, the reaper rolls it back to `Open@2` (conditioned on the fence's bytes, so
+///   the leg proves the fence landed), and the outcome comes back unknown, with either
+///   `may_still_commit`;
+/// * the same, and then another Complete fences `Open@2` and releases it with its own attempt
+///   given back, leaving `Open@4` with the attempt the rollback kept;
+/// * the fence does not land, and the session is already that `Open@2` (a rival's fence rolled
+///   back): out of flight, or held, and released afterwards the held fence conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_rolled_back_an_open_session_with_an_attempt_spent_since_is_never_fenced_again() {
+    within(async {
+        let landed = |may_still_commit| OnCommit::Unknown {
+            applied: true,
+            may_still_commit,
+        };
+        for case in 0..5 {
+            let up = upload(&PARTS).await;
+            let fence = own_fence(&up.open);
+            let rolled_back = session_bytes(&up.open, 2, 1, OPEN);
+            let rollback = session_moved(&up.id, &fence, &rolled_back);
+            let given_back = session_bytes(&up.open, 4, 1, OPEN);
+            let rival = WriteBatch::new().put(mpu_key(&up.id), rolled_back.clone());
+            let (label, step, found) = match case {
+                0 => (
+                    "landed, rolled back, out of flight",
+                    OnCommit::write_after(landed(false), rollback),
+                    &rolled_back,
+                ),
+                1 => (
+                    "landed, rolled back, may still commit",
+                    OnCommit::write_after(landed(true), rollback),
+                    &rolled_back,
+                ),
+                2 => (
+                    "landed, rolled back, then a rival's fence given back",
+                    OnCommit::write_after(
+                        OnCommit::write_after(landed(false), rollback),
+                        session_moved(&up.id, &rolled_back, &given_back),
+                    ),
+                    &given_back,
+                ),
+                3 => (
+                    "not landed, a rival's fence rolled back, out of flight",
+                    OnCommit::write_first(
+                        rival,
+                        OnCommit::Unknown {
+                            applied: false,
+                            may_still_commit: false,
+                        },
+                    ),
+                    &rolled_back,
+                ),
+                _ => (
+                    "not landed, a rival's fence rolled back, held",
+                    OnCommit::write_first(rival, OnCommit::Hold),
+                    &rolled_back,
+                ),
+            };
+            up.store.script(vec![step], None);
+
+            let outcome = up.complete(&named(&PARTS)).await;
+
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(FenceOutcome::Answered(CompleteOutcome::Refused(
+                        Refusal::OperationAborted
+                    )))
+                ),
+                "{label}: {outcome:?}"
+            );
+            let commits = up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                1,
+                "{label}: the first fence, and no fence after it"
+            );
+            assert_eq!(
+                session_cas(&commits[0], &up.id),
+                (up.open.clone(), fence.clone()),
+                "{label}: the fence from Open@0, stamped FENCED_AT"
+            );
+            if case == 4 {
+                assert_eq!(
+                    up.store.release_held().await,
+                    CommitOutcome::Conflict,
+                    "the held fence can no longer land"
+                );
+            }
+            assert_eq!(
+                up.session().await.0,
+                *found,
+                "{label}: the session as the others left it"
+            );
+        }
+    })
+    .await;
+}
+
+/// **(G6-rolled-back) An `Open` session with no attempt spent since is fenced again.** The first
+/// fence's outcome is unknown and it does not land, and before the read after it another Complete
+/// fences `Open@0` and releases its fence with the attempt given back, leaving `Open@2` with no
+/// attempt spent. Only a Complete that owned its fence gives the attempt back, and a fence of this
+/// request has no owner, so no fence of this request was rolled back: the request fences `Open@2`
+/// with its one stamp and holds that fence, the bucket and every part being valid. Out of flight
+/// or held; released afterwards, the held fence conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_rolled_back_an_open_session_with_no_attempt_spent_since_is_fenced_again() {
+    within(async {
+        for kept in [false, true] {
+            let up = upload(&PARTS).await;
+            let given_back = session_bytes(&up.open, 2, 0, OPEN);
+            let rival = WriteBatch::new().put(mpu_key(&up.id), given_back.clone());
+            let first = if kept {
+                OnCommit::Hold
+            } else {
+                OnCommit::Unknown {
+                    applied: false,
+                    may_still_commit: false,
+                }
+            };
+            up.store
+                .script(vec![OnCommit::write_first(rival, first)], None);
+
+            let fence = held(up.complete(&named(&PARTS)).await);
+
+            let commits = up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                2,
+                "held={kept}: the first fence, and the fence of Open@2"
+            );
+            assert_eq!(
+                session_cas(&commits[0], &up.id),
+                (up.open.clone(), own_fence(&up.open)),
+                "held={kept}: the first fence, from Open@0"
+            );
+            let (required_again, again) = session_cas(&commits[1], &up.id);
+            assert_eq!(required_again, given_back, "fenced from Open@2");
+            let record = decode_session_record(&again).unwrap();
+            assert_eq!((record.epoch(), record.attempts()), (3, 1));
+            assert!(
+                matches!(
+                    record.state(),
+                    SessionState::Completing {
+                        fenced_at_millis: FENCED_AT,
+                        segments_written: 0,
+                        ..
+                    }
+                ),
+                "{record:?}"
+            );
+            assert_eq!(fence.session_bytes(), &again, "the fence handed back");
+            assert_eq!(fence.attempts_before(), 0);
+            if kept {
+                assert_eq!(
+                    up.store.release_held().await,
+                    CommitOutcome::Conflict,
+                    "the held fence can no longer land"
+                );
+            }
+            assert_eq!(up.session().await.0, again, "the request's fence stands");
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G3-fence) a failed re-read after an unknown fence ───────────────
+
+/// **(G3-fence) A failed re-read after an unknown fence outcome.** Every read of `mpu:<id>` fails
+/// once the fence's outcome came back unknown, so no read settles it. The request returns the
+/// in-doubt error about the fence, never "no fence placed", and sends nothing after it:
+///
+/// * the fence applied and answered `may_still_commit: false`: the fence stands, and the error
+///   says it may have been applied;
+/// * the fence held: the error says it may still be applied, and released afterwards it lands;
+/// * the fence held, then, after a read found `Open@0` unchanged, the fence sent again and
+///   answered `may_still_commit: false`, unapplied: the error is about the first, held outcome,
+///   which no read has cleared, and released afterwards the held fence lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g3_fence_a_failed_re_read_after_an_unknown_fence_outcome_is_in_doubt() {
+    within(async {
+        let unread = |then| OnCommit::arm(Arm::FailGets(MPU_PREFIX.to_vec()), then);
+        let out_of_flight = |applied| OnCommit::Unknown {
+            applied,
+            may_still_commit: false,
+        };
+        let cases = [
+            (vec![unread(out_of_flight(true))], false),
+            (vec![unread(OnCommit::Hold)], true),
+            (vec![OnCommit::Hold, unread(out_of_flight(false))], true),
+        ];
+        for (plan, held) in cases {
+            let up = upload(&PARTS).await;
+            let sent = plan.len();
+            up.store.script(plan, None);
+
+            let outcome = up.complete(&named(&PARTS)).await;
+
+            let doubt = in_doubt_error(outcome, &up.id, DoubtfulCommit::Fence { epoch: 1 }, held);
+            assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+            let commits = up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                sent,
+                "held={held}: the fences, and nothing after"
+            );
+            for again in &commits[1..] {
+                assert_same_batch(again, &commits[0], "the fence sent again");
+            }
+            if held {
+                assert_eq!(up.session().await.0, up.open, "nothing landed yet");
+                assert_eq!(
+                    up.store.release_held().await,
+                    CommitOutcome::Committed,
+                    "the held fence lands"
+                );
+            }
+            assert_eq!(
+                up.session().await.0,
+                session_cas(&commits[0], &up.id).1,
+                "held={held}: the fence the in-doubt error is about"
+            );
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G3-torn) a session record that does not decode ───────────────
+
+/// A session record that does not decode: what damage, or a record format this build cannot
+/// read, leaves at `mpu:<id>`.
+const TORN: &[u8] = b"not a record";
+
+/// `mpu:<id>` overwritten with [`TORN`]: a blind batch for an [`OnCommit::WriteAfter`] step.
+fn session_torn(id: &UploadId) -> WriteBatch {
+    WriteBatch::new().put(mpu_key(id), TORN)
+}
+
+/// **(G3-torn, fence) A session record that does not decode after an unknown fence outcome.** The
+/// fence's outcome comes back unknown, and before the read after it the session record is
+/// overwritten with bytes that do not decode. That read succeeds, but a record it cannot decode
+/// says nothing of what the fence did, so it settles nothing: the request returns the in-doubt
+/// error about the fence, never "no fence placed" blaming the record, and sends nothing after the
+/// fence. The record is left as it was:
+///
+/// * the fence applied, `may_still_commit: false`: it landed before the damage;
+/// * the fence unapplied, `may_still_commit: false`: the request cannot tell that apart;
+/// * the fence held: the error says it may still be applied. Released afterwards, it conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g3_torn_a_session_that_does_not_decode_after_an_unknown_fence_is_in_doubt() {
+    within(async {
+        let out_of_flight = |applied| OnCommit::Unknown {
+            applied,
+            may_still_commit: false,
+        };
+        let cases = [
+            (out_of_flight(true), false),
+            (out_of_flight(false), false),
+            (OnCommit::Hold, true),
+        ];
+        for (first, held) in cases {
+            let label = format!("{first:?}");
+            let up = upload(&PARTS).await;
+            up.store.script(
+                vec![OnCommit::write_after(first, session_torn(&up.id))],
+                None,
+            );
+
+            let outcome = up.complete(&named(&PARTS)).await;
+
+            let doubt = in_doubt_error(outcome, &up.id, DoubtfulCommit::Fence { epoch: 1 }, held);
+            assert!(doubt.fault_behind_fence.is_none(), "{label}: {doubt:?}");
+            assert_eq!(
+                up.store.take_commits().len(),
+                1,
+                "{label}: the fence, and nothing after it"
+            );
+            if held {
+                assert_eq!(
+                    up.store.release_held().await,
+                    CommitOutcome::Conflict,
+                    "the held fence can no longer land"
+                );
+            }
+            let stored = up.store.inner.get(&mpu_key(&up.id)).await.unwrap();
+            assert_eq!(stored.as_deref(), Some(TORN), "{label}: the record as left");
+        }
+    })
+    .await;
+}
+
+/// **(G3-torn, publication) A session record that does not decode after an unknown flip
+/// outcome.** The fence lands, the flip's outcome comes back unknown, and before the read after it
+/// the session record is overwritten with bytes that do not decode. That read finds neither a flip
+/// of the request nor its fence, but a record it cannot decode says nothing of what landed before
+/// it, so it settles nothing: the request returns the in-doubt error about the flip, never "the
+/// fence no longer stands" blaming the record, and sends nothing after the flip, no release
+/// included:
+///
+/// * the flip applied, `may_still_commit: false`: the object is published, as the error warns;
+/// * the flip unapplied, `may_still_commit: false`: nothing is published;
+/// * the flip held: the error says it may still be applied. Released afterwards, it conflicts, and
+///   nothing is published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g3_torn_a_session_that_does_not_decode_after_an_unknown_flip_is_in_doubt() {
+    within(async {
+        let out_of_flight = |applied| OnCommit::Unknown {
+            applied,
+            may_still_commit: false,
+        };
+        let cases = [
+            (out_of_flight(true), false, true),
+            (out_of_flight(false), false, false),
+            (OnCommit::Hold, true, false),
+        ];
+        for (flip, held, applied) in cases {
+            let label = format!("{flip:?}");
+            let rig = rig().await;
+            let id = &rig.up.id;
+            let (list, _) = two_parts(&rig).await;
+            rig.up.store.script(
+                vec![
+                    OnCommit::Pass,
+                    OnCommit::write_after(flip, session_torn(id)),
+                ],
+                None,
+            );
+
+            let doubt = in_doubt_error(
+                as_fence(rig.complete(&list).await),
+                id,
+                DoubtfulCommit::Flip { epoch: 1 },
+                held,
+            );
+
+            assert!(doubt.fault_behind_fence.is_none(), "{label}: {doubt:?}");
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                2,
+                "{label}: the fence, the flip, and nothing after"
+            );
+            let (_, fence) = session_cas(&commits[0], id);
+            assert_flip(&commits[1], &rig.up, &fence);
+            if held {
+                assert_eq!(
+                    rig.up.store.release_held().await,
+                    CommitOutcome::Conflict,
+                    "the held flip can no longer land"
+                );
+            }
+            let published = applied.then_some(FRESH_INODE);
+            assert_eq!(rig.target().await, published, "{label}: the name");
+            let stored = rig.up.store.inner.get(&mpu_key(id)).await.unwrap();
+            assert_eq!(stored.as_deref(), Some(TORN), "{label}: the record as left");
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G6-spent) an unknown fence a read settled ───────────────
+
+/// **(G6-spent) An unknown fence a read settled.** The first fence answers `CommitUnknownResult {
+/// may_still_commit: false }`, unapplied, and the read after it finds `Open@0` unchanged: that
+/// fence did not land and never will, so nothing is in doubt any more. Every fence sent again
+/// answers `Conflict` with the session unchanged. The request spends its [`STATED_FENCE_ROUNDS`]
+/// fence commits and stops with no fence placed and nothing in doubt, as a request whose every
+/// fence lost does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g6_spent_an_unknown_fence_a_read_settled_stops_with_no_fence_placed() {
+    within(async {
+        let up = upload(&PARTS).await;
+        up.store.script(
+            vec![OnCommit::Unknown {
+                applied: false,
+                may_still_commit: false,
+            }],
+            Some(OnCommit::ConflictUnmoved),
+        );
+
+        let (_, stopped) = stopped_error(up.complete(&named(&PARTS)).await, &up.id);
+
+        assert_eq!(stopped.fence, FenceState::NotPlaced);
+        assert!(
+            matches!(stopped.cause, Stop::FenceRoundsSpent { rounds } if rounds == STATED_FENCE_ROUNDS),
+            "{:?}",
+            stopped.cause
+        );
+        let commits = up.store.take_commits();
+        assert_eq!(commits.len() as u32, STATED_FENCE_ROUNDS);
+        for again in &commits[1..] {
+            assert_same_batch(again, &commits[0], "the fence sent again");
+        }
+        assert_eq!(up.session().await.0, up.open, "no fence placed");
+    })
+    .await;
+}
+
+// ─────────────── (G2-refused) a round refused for good while a flip is held ───────────────
+
+/// **(G2-refused) A round refused for good while a flip is held.** The first flip is held, the
+/// read after it finds the fence unchanged, and the next flip is refused for good (a definite
+/// store error). Without a doubt that ends the request with one release, but the release requires
+/// the bytes the held flip requires, and the held flip may still land. So no release is sent: the
+/// request returns the in-doubt error about the held flip, and the fence still stands. Released
+/// afterwards, the held flip lands, and the object is published once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g2_refused_a_round_refused_for_good_while_a_flip_is_held_sends_no_release() {
+    within(async {
+        let rig = rig().await;
+        let id = &rig.up.id;
+        let (list, object) = two_parts(&rig).await;
+        rig.up.store.script(
+            vec![
+                OnCommit::Pass,
+                OnCommit::Hold,
+                OnCommit::Fail { transient: true },
+            ],
+            None,
+        );
+
+        let doubt = in_doubt_error(
+            as_fence(rig.complete(&list).await),
+            id,
+            DoubtfulCommit::Flip { epoch: 1 },
+            true,
+        );
+
+        assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            3,
+            "the fence, the held flip, the refused flip, and no release"
+        );
+        let (_, fence) = session_cas(&commits[0], id);
+        for flip in &commits[1..] {
+            assert_flip(flip, &rig.up, &fence);
+        }
+        assert_eq!(rig.up.session().await.0, fence, "the fence still stands");
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Committed,
+            "the held flip lands"
+        );
+        assert_published_once(&rig, &list, &fresh_publication(&list), &object, &[]).await;
+    })
+    .await;
+}
+
+// ─────────────── (G2-unread) a read that fails while a flip is held ───────────────
+
+/// **(G2-unread) A read that fails while a flip is held sends no release.** The fence lands, the
+/// flip is held, and the read after it finds the fence unchanged, the bytes the held flip requires.
+/// The next read of the round then fails: the bucket marker's, or the target's dirent before the
+/// next flip. Without a doubt that ends the request with one release, but the release requires the
+/// bytes the held flip requires, and the held flip may still land. So no release is sent: the
+/// request returns the in-doubt error about the held flip, and the fence still stands. With the
+/// faults cleared and the held flip released, it lands, and the object is published once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g2_unread_a_read_that_fails_while_a_flip_is_held_sends_no_release() {
+    within(async {
+        let unreadable = [
+            ("the bucket marker", metadata::bucket_key(BUCKET)),
+            (
+                "the target's dirent",
+                metadata::dirent_key(ROOT, "photos/object-1"),
+            ),
+        ];
+        for (label, prefix) in unreadable {
+            let rig = rig().await;
+            let id = &rig.up.id;
+            let (list, object) = two_parts(&rig).await;
+            rig.up.store.script(
+                vec![
+                    OnCommit::Pass,
+                    OnCommit::arm(Arm::FailGets(prefix), OnCommit::Hold),
+                ],
+                None,
+            );
+
+            let doubt = in_doubt_error(
+                as_fence(rig.complete(&list).await),
+                id,
+                DoubtfulCommit::Flip { epoch: 1 },
+                true,
+            );
+
+            assert!(doubt.fault_behind_fence.is_none(), "{label}: {doubt:?}");
+            let commits = rig.up.store.take_commits();
+            assert_eq!(
+                commits.len(),
+                2,
+                "{label}: the fence, the held flip, and no release"
+            );
+            let (_, fence) = session_cas(&commits[0], id);
+            assert_flip(&commits[1], &rig.up, &fence);
+            assert_eq!(
+                rig.up.session().await.0,
+                fence,
+                "{label}: the fence still stands"
+            );
+            assert_eq!(rig.target().await, None, "{label}: nothing published yet");
+            rig.up.store.clear_read_faults();
+            assert_eq!(
+                rig.up.store.release_held().await,
+                CommitOutcome::Committed,
+                "{label}: the held flip lands"
+            );
+            assert_published_once(&rig, &list, &fresh_publication(&list), &object, &[]).await;
+        }
+    })
+    .await;
+}
+
+// ─────────────── (G2-first) the first held outcome is the one reported ───────────────
+
+/// **(G2-first) The first held outcome is the one reported.** A flip is held, and a later commit
+/// of the request comes back unknown too before the request ends in doubt. The in-doubt error is
+/// about the held outcome, the first that said `may_still_commit`, whatever came after it:
+///
+/// * a flat object: the next flip answers `may_still_commit: false`, unapplied, and the read
+///   after it fails. The error says the commit may still be applied: an out-of-flight outcome
+///   never hides a held one;
+/// * the wide fixture: the round-1 flip, sent after the segment batch, is held; the round-2 flip,
+///   resumed at the committer's count with no segment batch to send, is held too; the round-3
+///   flip answers `Conflict` and the rounds run out. The error is about the round-1 outcome, a
+///   commit of a round with a segment batch, not the later flip.
+///
+/// Released afterwards, the first held flip lands and the object is published once; a second
+/// held flip then conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g2_first_the_first_held_outcome_is_the_one_reported() {
+    within(async {
+        let rig = rig().await;
+        let id = &rig.up.id;
+        let (list, object) = two_parts(&rig).await;
+        let unread = OnCommit::arm(
+            Arm::FailGets(MPU_PREFIX.to_vec()),
+            OnCommit::Unknown {
+                applied: false,
+                may_still_commit: false,
+            },
+        );
+        rig.up
+            .store
+            .script(vec![OnCommit::Pass, OnCommit::Hold, unread], None);
+
+        let doubt = in_doubt_error(
+            as_fence(rig.complete(&list).await),
+            id,
+            DoubtfulCommit::Flip { epoch: 1 },
+            true,
+        );
+
+        assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            3,
+            "the fence, the held flip, the unread flip"
+        );
+        let (_, fence) = session_cas(&commits[0], id);
+        assert_eq!(rig.up.session().await.0, fence, "the fence still stands");
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Committed,
+            "the held flip lands"
+        );
+        assert_published_once(&rig, &list, &fresh_publication(&list), &object, &[]).await;
+
+        let staged = staged_wide().await;
+        let rig = &staged.rig;
+        let id = &rig.up.id;
+        let mut plan = vec![OnCommit::Pass; 1 + SEGMENT_BATCHES];
+        plan.extend([OnCommit::Hold, OnCommit::Hold]);
+        rig.up.store.script(plan, Some(OnCommit::ConflictUnmoved));
+
+        let doubt = in_doubt_error(
+            as_fence(rig.complete(&staged.list).await),
+            id,
+            DoubtfulCommit::Publication { epoch: 1 },
+            true,
+        );
+
+        assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            1 + SEGMENT_BATCHES + STATED_PUBLISH_ROUNDS as usize,
+            "the fence, the segment batch, one flip per round, and no release"
+        );
+        let (_, fence) = session_cas(&commits[0], id);
+        let moved = at_cursor(&fence, staged.planned);
+        for flip in &commits[1 + SEGMENT_BATCHES..] {
+            assert_flip(flip, &rig.up, &moved);
+        }
+        assert_eq!(
+            rig.up.session().await.0,
+            moved,
+            "the fence at the committer's count"
+        );
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Committed,
+            "the first held flip lands"
+        );
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Conflict,
+            "the second can no longer land"
+        );
+        let publication = fresh_publication(&staged.list);
+        assert_published_once(rig, &staged.list, &publication, &staged.object(), &[]).await;
+    })
+    .await;
+}
+
+// ─────────────── (G2-settled) an unknown flip a read settled ───────────────
+
+/// **(G2-settled) An unknown flip a read settled.** The first flip answers `CommitUnknownResult {
+/// may_still_commit: false }`, unapplied, and the read after it finds the fence unchanged: that
+/// flip did not land and never will, so nothing is in doubt any more. Every later flip answers
+/// `Conflict` with the session unchanged until the [`STATED_PUBLISH_ROUNDS`] rounds run out. The
+/// request then ends as one whose every flip lost does: it releases its fence and answers
+/// `OperationAborted`, the session `Open@2` with the attempt given back, never the in-doubt error
+/// that would leave the fence to the reaper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g2_settled_an_unknown_flip_a_read_settled_ends_as_lost_flips_do() {
+    within(async {
+        let rig = rig().await;
+        let (list, _) = two_parts(&rig).await;
+        let mut plan = vec![
+            OnCommit::Pass,
+            OnCommit::Unknown {
+                applied: false,
+                may_still_commit: false,
+            },
+        ];
+        plan.extend(vec![
+            OnCommit::ConflictUnmoved;
+            STATED_PUBLISH_ROUNDS as usize - 1
+        ]);
+        rig.up.store.script(plan, None);
+
+        let outcome = rig.complete(&list).await;
+
+        assert_eq!(refused(as_fence(outcome)), Refusal::OperationAborted);
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            1 + STATED_PUBLISH_ROUNDS as usize + 1,
+            "the fence, one flip per round, the release"
+        );
+        let (_, fence) = session_cas(&commits[0], &rig.up.id);
+        let release = &commits[commits.len() - 1];
+        for flip in &commits[1..commits.len() - 1] {
+            assert_flip(flip, &rig.up, &fence);
+        }
+        assert_released_with_nothing_published(&rig, &commits[0], release).await;
+    })
+    .await;
+}
+
+// ─────────────── (G4-landed) a held segment batch that lands later ───────────────
+
+/// **(G4-landed) A held segment batch that lands is settled by the read that finds it.** The
+/// wide fixture, whose segment phase is one batch ([`SEGMENT_BATCHES`]). That batch is held, and
+/// the read after it finds the fence at cursor 0, the bytes the batch requires, so it may still
+/// land. The next round sends it again from cursor 0; just before that commit the held batch
+/// lands, moving the cursor to the committer's count, and the bucket marker is removed. The batch
+/// sent again answers `Conflict`, and the read after it finds the fence at the committer's count:
+/// the held batch landed, so nothing is in doubt any more. The removed marker then ends the
+/// request as it ends one with no doubt: one release, from that cursor, with the attempt still
+/// spent and the segment obligation installed, and `NoSuchBucket`. Every `seg:` record was
+/// written once, by the held batch, and that obligation names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g4_landed_a_held_segment_batch_that_lands_is_settled_by_the_read_that_finds_it() {
+    within(async {
+        let staged = staged_wide().await;
+        let rig = &staged.rig;
+        let id = &rig.up.id;
+        rig.up.store.script(
+            vec![
+                OnCommit::Pass,
+                OnCommit::Hold,
+                OnCommit::write_first(bucket_removed(), OnCommit::land(OnCommit::Pass)),
+            ],
+            None,
+        );
+
+        let refusal = refused(as_fence(rig.complete(&staged.list).await));
+
+        assert_eq!(refusal, Refusal::NoSuchBucket);
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            4,
+            "the fence, the segment batch held, the segment batch again, the release"
+        );
+        let (_, fence) = session_cas(&commits[0], id);
+        let group = group_of(&fence);
+        assert_eq!(
+            required(&commits[1], &mpu_key(id)),
+            Some(fence.clone()),
+            "the held batch requires the fence at cursor 0"
+        );
+        assert_same_batch(&commits[2], &commits[1], "the segment batch sent again");
+        let moved = at_cursor(&fence, staged.planned);
+        assert_eq!(put_at(&commits[1], &mpu_key(id)), Some(moved.clone()));
+        assert_released_charged(rig, &fence, &moved, &commits[3]).await;
+        assert_eq!(
+            rig.segments_of(&group).await,
+            staged.planned as usize,
+            "every record, written once, by the held batch"
+        );
+        assert_eq!(rig.target().await, None, "nothing published");
+        rig.assert_every_segment_named().await;
+    })
+    .await;
+}
+
+// ─────────────── (G4-repin) a second held segment batch ───────────────
+
+/// **(G4-repin) A second held segment batch moves what the doubt is kept against.** The deep
+/// fixture: a segment phase of [`DEEP_SEGMENT_BATCHES`] batches. Round 1's first batch is held,
+/// and the read after it finds the fence at cursor 0. Round 2 sends that batch again; it lands
+/// and moves the cursor to `k`, strictly between 0 and the committer's count. Round 2's second
+/// batch, which requires the session at `k`, is held too, and the bucket marker is removed just
+/// before it. The read after it finds the fence at `k`. The first held batch can no longer land,
+/// but the second requires exactly those bytes and still may: the doubt is now kept against `k`,
+/// not cleared because the cursor left 0. So the removed marker sends no release: the request
+/// returns the in-doubt error about the first held outcome, with the fence standing at `k`.
+/// Released afterwards, the first held batch conflicts and the second lands, moving the cursor to
+/// the committer's count, which a release from `k` would have raced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g4_repin_a_second_held_segment_batch_moves_what_the_doubt_is_kept_against() {
+    within(async {
+        let deep = planted_deep().await;
+        let rig = &deep.rig;
+        let id = &rig.up.id;
+        rig.up.store.script(
+            vec![
+                OnCommit::Pass,
+                OnCommit::Hold,
+                OnCommit::Pass,
+                OnCommit::write_first(bucket_removed(), OnCommit::Hold),
+            ],
+            None,
+        );
+
+        let doubt = in_doubt_error(
+            as_fence(rig.complete(&deep.list).await),
+            id,
+            DoubtfulCommit::Publication { epoch: 1 },
+            true,
+        );
+
+        assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            4,
+            "the fence, the first batch held, the first batch again, the second held, no release"
+        );
+        let (_, fence) = session_cas(&commits[0], id);
+        let group = group_of(&fence);
+        assert_same_batch(&commits[2], &commits[1], "the first batch sent again");
+        let landed = cursor_left(&commits[2], id);
+        assert!(
+            0 < landed && landed < deep.planned,
+            "the first batch leaves the cursor mid-plan: {landed} of {}",
+            deep.planned
+        );
+        let at_k = at_cursor(&fence, landed);
+        assert_eq!(
+            required(&commits[3], &mpu_key(id)),
+            Some(at_k.clone()),
+            "the second batch requires the session at k"
+        );
+        assert_eq!(
+            cursor_left(&commits[3], id),
+            deep.planned,
+            "and ends the phase"
+        );
+        assert_eq!(rig.up.session().await.0, at_k, "the fence stands at k");
+        assert_eq!(rig.segments_of(&group).await, landed as usize);
+
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Conflict,
+            "the first held batch can no longer land"
+        );
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Committed,
+            "the second still could, and does"
+        );
+        assert_eq!(
+            rig.up.session().await.0,
+            at_cursor(&fence, deep.planned),
+            "the fence at the committer's count"
+        );
+        assert_eq!(
+            rig.segments_of(&group).await,
+            deep.planned as usize,
+            "every record, each written once"
+        );
+    })
+    .await;
+}
+
+// ─────────────── (G4-unbuilt) a flip that cannot be built under a held batch ───────────────
+
+/// **(G4-unbuilt) A flip that cannot be built while a segment batch is held sends no release.** The
+/// wide fixture, whose segment phase is one batch ([`SEGMENT_BATCHES`]). That batch is held, and
+/// just after it the target name is bound to an inode at the last version
+/// ([`bound_at_last_version`]). The read after the held batch finds the fence at cursor 0, the
+/// bytes that batch requires, so it may still land. The next round's flip cannot be built
+/// ([`PublicationError::VersionOverflow`]). Without a doubt that ends the request with one release
+/// from cursor 0, which the held batch would race. So no release is sent: the request returns the
+/// in-doubt error about the held round, and the fence stands at cursor 0. Released afterwards, the
+/// held batch lands, moving the cursor to the committer's count and writing every `seg:` record
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g4_unbuilt_a_flip_that_cannot_be_built_while_a_segment_batch_is_held_sends_no_release() {
+    within(async {
+        let staged = staged_wide().await;
+        let rig = &staged.rig;
+        let id = &rig.up.id;
+        rig.up.store.script(
+            vec![
+                OnCommit::Pass,
+                OnCommit::write_after(OnCommit::Hold, bound_at_last_version()),
+            ],
+            None,
+        );
+
+        let doubt = in_doubt_error(
+            as_fence(rig.complete(&staged.list).await),
+            id,
+            DoubtfulCommit::Publication { epoch: 1 },
+            true,
+        );
+
+        assert!(doubt.fault_behind_fence.is_none(), "{doubt:?}");
+        let commits = rig.up.store.take_commits();
+        assert_eq!(
+            commits.len(),
+            1 + SEGMENT_BATCHES,
+            "the fence, the segment batch held, and no flip or release after it"
+        );
+        let (_, fence) = session_cas(&commits[0], id);
+        let group = group_of(&fence);
+        assert_eq!(
+            required(&commits[1], &mpu_key(id)),
+            Some(fence.clone()),
+            "the held batch requires the fence at cursor 0"
+        );
+        assert_eq!(rig.up.session().await.0, fence, "the fence at cursor 0");
+        assert_eq!(rig.segments_of(&group).await, 0, "no seg: record yet");
+
+        assert_eq!(
+            rig.up.store.release_held().await,
+            CommitOutcome::Committed,
+            "the held batch lands"
+        );
+        assert_eq!(
+            rig.up.session().await.0,
+            at_cursor(&fence, staged.planned),
+            "the fence at the committer's count"
+        );
+        assert_eq!(
+            rig.segments_of(&group).await,
+            staged.planned as usize,
+            "every record, written once"
+        );
+        assert_eq!(rig.target().await, Some(PUT_INODE), "the name as bound");
     })
     .await;
 }

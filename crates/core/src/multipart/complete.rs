@@ -1,12 +1,14 @@
 //! `CompleteMultipartUpload` (#658): its **fence phase** (#1007, slice 1 of 5) and the
-//! **publication** composed onto it, flat (#1008, slice 2) and segmented (#1009, slice 3).
+//! **publication** composed onto it, flat (#1008, slice 2) and segmented (#1009, slice 3), with
+//! the recovery from a commit whose outcome the store could not report (#1010, slice 4).
 //! [`fence_complete`] is the fence, the validation of the named parts against the part set the
 //! fence froze, and the release of a rejected request's fence; it publishes nothing, and hands a
 //! valid request's fence back as a [`HeldFence`]. [`complete_upload`] is the verb: that phase,
 //! then the publication of what the fence holds: one flat root, or past
 //! [`MAX_MAP_CHUNKS`](super::MAX_MAP_CHUNKS) chunks the attempt's `seg:` records and then the
 //! root that names them (the *Segment write* and *Root flip* rows, `0016:662-663`; module doc
-//! *Publication*). Settling an unknown outcome is #1010's.
+//! *Publication*). *Unknown outcomes* below is how both phases settle a commit whose outcome the
+//! store could not report.
 //!
 //! [`fence_complete`] reads the session and answers every state but `Open` as decision 3's table
 //! does (`0016:976`, [`super::complete_answer`]). An `Open@E` session is fenced to
@@ -52,11 +54,13 @@
 //! A fence is this Complete's only once a fence commit of its own answered `Committed`. From
 //! then on, every answer this function returns finds it down, released by this Complete or moved
 //! off by another writer, and a valid request hands it over in the [`HeldFence`]; only an error
-//! may leave it standing (**C-1**, `docs/principles.md` §5):
+//! may leave it standing (**C-1**, `docs/principles.md` §5). A fence commit whose outcome is
+//! unknown never makes it this Complete's, whatever a read then finds (*Unknown outcomes*):
 //!
 //! * [`CompleteError::InDoubt`]: a fence, release, segment or flip commit of this Complete came
-//!   back with an unknown outcome ([`CommitUnknownResult`]). It is returned at once, with nothing
-//!   sent after it; settling such an outcome by reading the session again is #1010's.
+//!   back with an unknown outcome ([`CommitUnknownResult`]) that no read settled: a read that
+//!   failed, a fence found at its own bytes, a release, or a batch that may still land when the
+//!   Complete had to stop (*Unknown outcomes*).
 //! * [`CompleteError::Stopped`]: nothing is in doubt, and the error says what became of this
 //!   Complete's fence ([`FenceState`]). The release is the one way this slice takes its own
 //!   fence down; when its rounds run out ([`RELEASE_ROUNDS`]) or the store refuses it for good,
@@ -148,10 +152,10 @@
 //! [`CompleteError::Stopped`] with that error as its cause and the fence's state. So does a
 //! fault reading the parts or the target, a part or target record that is damaged, and a
 //! publication the committer refuses before writing ([`Stop::Publication`]). A round whose
-//! outcome is unknown ends [`CompleteError::InDoubt`] at once, with nothing sent after it: it
-//! may have published, so no release may follow it. The committer does not say which of a
-//! round's commits that was, so the error names the flip only for a round with no segment batch
-//! to send ([`DoubtfulCommit::Flip`]), and the round otherwise ([`DoubtfulCommit::Publication`]).
+//! outcome is unknown is never read as `Conflict`: the session is read again first (*Unknown
+//! outcomes*). The committer does not say which of a round's commits that was, so an error about
+//! it names the flip only for a round with no segment batch to send ([`DoubtfulCommit::Flip`]),
+//! and the round otherwise ([`DoubtfulCommit::Publication`]).
 //!
 //! # The release once a segment landed
 //!
@@ -178,6 +182,66 @@
 //! Complete's segment batches move the cursor, and only forward, so it happens at most once per
 //! batch that landed.
 //!
+//! # Unknown outcomes (#1010)
+//!
+//! A commit that answers [`CommitUnknownResult`] is never read as `Conflict`: the Complete reads
+//! the session again and answers only from a state it found and can attribute to itself
+//! (`0016:942-964`). It keeps the two kinds of doubt an Abort keeps (`abort.rs:259-273`). An
+//! outcome that said `may_still_commit` is **held**, the first one kept, until a read finds the
+//! session off the bytes a batch of this Complete that may still land requires; one that did not
+//! is **unsettled** until the next read that succeeds. A session record that does not decode
+//! says nothing of what landed before it, so a read that finds one settles neither kind. While
+//! either stands, a read that fails and every other stop ends the request in
+//! [`CompleteError::InDoubt`], about the first held outcome, else the unsettled one: never an
+//! answer, and never [`CompleteError::Stopped`].
+//!
+//! **The initial fence.** A fence's bytes are fixed by the session read and the request's
+//! stamp, and a `Completing` record names no request (`multipart.rs:2276-2285`), so a rival
+//! Complete that read the same `Open@E` with the same stamp builds a byte-identical fence.
+//! Finding those bytes proves nothing about who owns them:
+//!
+//! | Read after a fence whose outcome is in doubt | Then |
+//! |---|---|
+//! | the fence's own bytes | [`CompleteError::InDoubt`] about the fence, and nothing more written: it landed, or a rival's did |
+//! | `Open@E` unchanged, the outcome out of flight | the fence did not land and never will: it is sent again, within [`FENCE_ROUNDS`] |
+//! | `Open@E` unchanged, the outcome held | the fence is sent again, without the check before it; a `Committed` settles the held one, whose required bytes are then gone |
+//! | `Open` with more attempts spent than `Open@E` | [`Refusal::OperationAborted`], and nothing written: a fence came down and kept its attempt, as the reaper's rollback does, and it may have been this one |
+//! | any other state | answered from it, as after a `Conflict`; an `Open` session with no attempt spent since is fenced again |
+//!
+//! So a fence this Complete did place, but cannot prove, is left to the reaper's `W_completing`
+//! rollback (#625), and its attempt stays charged. Once a read finds the session `Open` with an
+//! attempt spent since, that rollback may have come, and this call does not fence again: its stamp
+//! may be the one the reaper found past `W_completing`, and a fence stamped with it would be past
+//! the window from the start (F16, `0016:1005-1009`). The client's retry is the fresh Complete,
+//! with a fresh stamp, as after a rollback behind the fence (below). An `Open` session with no
+//! attempt spent since was fenced and released only by Completes that owned their fences and gave
+//! the attempt back. A fence of this call has no owner, so no such release took it down, and the
+//! request fences again.
+//!
+//! **Behind the fence.** The fence is this Complete's, so what a read finds there is
+//! attributable:
+//!
+//! | Read after a publication round whose outcome is in doubt | Then |
+//! |---|---|
+//! | the `Completed` record a flip of this Complete put | [`CompleteOutcome::Published`], with that flip's publication |
+//! | this fence, at a segment cursor | the next round, from that cursor (`resume_from`): no `seg:` record is written twice, and the version is recomputed from the target read again |
+//! | any other state | answered from it, as after a round that lost |
+//!
+//! An `Open` session there is the reaper's rollback (`0016:951-953`), answered
+//! [`Refusal::OperationAborted`] with nothing of this Complete able to land: the fresh Complete is
+//! the client's retry. This call does not fence again, because its fence stamp is a reading taken
+//! before the fence the reaper just found past `W_completing`, and a second fence stamped with it
+//! would be past the window from the start (F16, `0016:1005-1009`).
+//!
+//! An unknown round counts against [`R_PUBLISH`]. The committer does not say which of a round's
+//! batches the outcome is about, but every batch before it answered `Committed`, so the one in
+//! doubt required the session where they left it: the read after it finds the session there, or
+//! past it if it landed. Those bytes are what a held outcome is kept against. Every later batch
+//! of the attempt requires them as well, so the first of those to land settles it. While a held
+//! outcome stands, the Complete sends no release: a round that would release (its bucket marker
+//! gone, [`R_PUBLISH`] rounds spent, a fault) ends the request in doubt instead, and the fence is
+//! left to the batch that may still land, or to the reaper.
+//!
 //! # Runtime-free (ADR-0009), and one clock per session
 //!
 //! Core reads no clock, draws no randomness and never sleeps here. The fence stamp
@@ -185,7 +249,10 @@
 //! clock. That stamp belongs to the session's residency lifecycle: the reaper measures
 //! `W_completing` from it (`0016:1005-1009`) under the clock the session record names, so a
 //! request whose clock source is not the session's is stopped before anything is written
-//! ([`Stop::ForeignClock`], `0016:1966-1976`). A lost round is retried at once, with no backoff.
+//! ([`Stop::ForeignClock`], `0016:1966-1976`). A lost round, and a fence a read showed did not
+//! land, is retried at once, with no backoff; a retried fence carries the request's one stamp,
+//! for the same session lifecycle, and is never sent once a read found that the reaper may have
+//! rolled a fence with that stamp back (*Unknown outcomes*).
 //!
 //! The publication stamp ([`PublishRequest::completed_at_millis`]) is read by the caller on that
 //! same clock, the session's, which the fence has just checked is the request's: the
@@ -196,8 +263,8 @@
 //! publication, so the flip mixes no clocks. The inode a free name is published under
 //! ([`PublishRequest::fresh_inode`]) is the caller's too.
 //!
-//! Production calls nothing here yet: the S3 verb that will is #670, once #1010 and #1011
-//! complete publication.
+//! Production calls nothing here yet: the S3 verb that will is #670, once #1011 completes
+//! publication.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -455,13 +522,16 @@ pub enum CompleteError {
 pub struct InDoubt {
     /// The upload whose session is in doubt.
     pub upload_id: UploadId,
-    /// Which commit's outcome the store could not report.
+    /// Which commit's outcome the store could not report: the one [`Self::outcome`] is about.
     pub commit: DoubtfulCommit,
-    /// Whether that commit may still be applied **after** this Complete returned
-    /// ([`CommitUnknownResult::may_still_commit`]).
+    /// Whether a commit of this Complete may still be applied **after** it returned
+    /// ([`CommitUnknownResult::may_still_commit`]). Once one said so, only a read that found the
+    /// session off the bytes it requires clears it, so later outcomes, failed reads and other
+    /// stops leave it `true`.
     pub may_still_commit: bool,
-    /// The store's report of the unknown outcome. It is the error's
-    /// [`source`](std::error::Error::source).
+    /// The store's report of the unknown outcome that keeps the doubt: the first that said
+    /// `may_still_commit`, or else the latest one no successful read has settled (module doc,
+    /// *Unknown outcomes*). It is the error's [`source`](std::error::Error::source).
     pub outcome: CommitUnknownResult,
     /// The fault behind the fence that made this Complete try the release, when that is why it
     /// tried: a release of a rejected request, or a fence commit, has none. Kept so an operator
@@ -473,8 +543,9 @@ pub struct InDoubt {
 /// The commit a [`CompleteError::InDoubt`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoubtfulCommit {
-    /// The fence `Open@E → Completing@epoch`: the session is still `Open@E`, or fenced by this
-    /// Complete.
+    /// The fence `Open@E → Completing@epoch`: the session is still `Open@E`, or fenced at those
+    /// bytes by this Complete or by a rival whose fence is byte-identical, which a `Completing`
+    /// record cannot tell apart (module doc, *Unknown outcomes*).
     Fence {
         /// The fence epoch, `E+1`.
         epoch: u64,
@@ -722,12 +793,12 @@ impl std::error::Error for CompleteError {
 
 // deferred: #660. Seeded Tier-0 DST coverage of this fence racing an Abort, a rival Complete and
 // the reaper's rollback, and of the segment batches and the flip racing a `PutObject`, a bucket
-// delete and the reaper, is #660's (out of #1007's, #1008's and #1009's scope). Meanwhile the
-// integration test `crates/core/tests/multipart_complete.rs` lands a rival fence, a teardown and
-// a rollback at the fence's and the release's commit points, an overwrite, a bucket delete, a
-// refused flip and an unknown flip outcome at the flip's, and lost flips, a bucket delete, a
-// refused flip and an unknown segment-batch outcome behind landed segment batches, through a
-// store wrapper.
+// delete and the reaper, is #660's (out of #1007's to #1010's scope). Meanwhile the integration
+// test `crates/core/tests/multipart_complete.rs` lands a rival fence, a teardown and a rollback
+// at the fence's and the release's commit points, an overwrite, a bucket delete, a refused flip
+// and applied, held and unread unknown flip outcomes at the flip's, lost flips, a bucket delete,
+// a refused flip and an unknown segment-batch outcome behind landed segment batches, and two
+// Completes racing byte-identical fences, through a store wrapper.
 
 /// **`CompleteMultipartUpload`'s fence phase**: fence the session `upload_id` names
 /// (`0016:661`), validate `request` against the part set the fence froze, and either hand the
@@ -753,7 +824,13 @@ impl std::error::Error for CompleteError {
 /// (`SessionRecord::complete_fence`). A `Conflict` reads the session again and answers from what
 /// is there, so a rival Complete that fenced first answers [`Refusal::OperationAborted`] and an
 /// Abort that did answers [`Refusal::NoSuchUpload`]; a session still `Open` spends one of
-/// [`FENCE_ROUNDS`]. A [`CommitUnknownResult`] is [`CompleteError::InDoubt`] at once.
+/// [`FENCE_ROUNDS`]. A [`CommitUnknownResult`] spends a round too, and reads the session again
+/// (the module doc, *Unknown outcomes*): the fence's own bytes there are
+/// [`CompleteError::InDoubt`], never a fence this call owns; `Open@E` unchanged sends the fence
+/// again, skipping the check before it while the outcome may still land; and an `Open` session
+/// with an attempt spent since answers [`Refusal::OperationAborted`], since the reaper may have
+/// rolled this fence back. While an outcome is in doubt, every stop of this phase is
+/// [`CompleteError::InDoubt`].
 ///
 /// # Behind the fence
 ///
@@ -786,7 +863,7 @@ impl std::error::Error for CompleteError {
 /// standing that no answer or error names; the reaper's `W_completing` rollback is then what
 /// takes it down (#625). Bound a Complete through the store's own deadlines, never by dropping
 /// the future: a commit the store abandons at its deadline comes back as a
-/// [`CommitUnknownResult`], which this function reports.
+/// [`CommitUnknownResult`], which this function settles by a read or reports.
 pub async fn fence_complete(
     store: &impl MetadataStore,
     upload_id: &UploadId,
@@ -799,27 +876,41 @@ pub async fn fence_complete(
     // an `Open` session refuses it at the part it names.
     let fingerprint = complete_fingerprint(named);
     let not_placed = |cause| stopped(upload_id, FenceState::NotPlaced, cause);
+    // Every stop is the in-doubt error while a fence of this call is in doubt.
+    let stop = |doubt: &Doubt, cause| doubt.end(upload_id, not_placed(cause));
+    let mut doubt = Doubt::default();
     let mut rounds = 0u32;
     let mut found = store
         .get(&session_key)
         .await
         .map_err(|fault| not_placed(Stop::Store(fault)))?;
     let (opened, placed) = loop {
-        // `found` is always the result of a read that succeeded.
+        // `found` is always the result of a read that succeeded, and never the bytes of a fence of
+        // this call whose outcome is in doubt: those end the request below.
         let Some(read) = found else {
             return Ok(refused(Refusal::NoSuchUpload));
         };
-        let opened = decode_session_record(&read).map_err(|torn| not_placed(Stop::Record(torn)))?;
+        // A record that does not decode says nothing of what a fence of this call did, so it
+        // settles no doubt: the stop is the in-doubt error while one stands.
+        let opened =
+            decode_session_record(&read).map_err(|torn| stop(&doubt, Stop::Record(torn)))?;
+        doubt.settle(&read);
+        // A fence of this call held in doubt outlives that only when `read` is the very bytes it
+        // required, which passed every check below in the round that sent it. So none of them
+        // answers while it may still land, the optimization aside, which skips itself.
         let answer = answer_without_fence(&opened, request, &fingerprint)
-            .map_err(|torn| not_placed(Stop::Record(torn)))?;
+            .map_err(|torn| stop(&doubt, Stop::Record(torn)))?;
         if let Some(answer) = answer {
             return Ok(answered(answer));
         }
         if opened.clock_source() != request.clock_source {
-            return Err(not_placed(Stop::ForeignClock {
-                session: opened.clock_source().to_owned(),
-                request: request.clock_source.to_owned(),
-            }));
+            return Err(stop(
+                &doubt,
+                Stop::ForeignClock {
+                    session: opened.clock_source().to_owned(),
+                    request: request.clock_source.to_owned(),
+                },
+            ));
         }
         if opened.attempts() >= MAX_COMPLETE_ATTEMPTS {
             return Ok(refused(Refusal::CompleteAttemptsExhausted));
@@ -827,48 +918,63 @@ pub async fn fence_complete(
         // The releases are minted with the fence, so no fence is placed that could not be taken
         // down again.
         let Some(placed) = Placed::mint(&opened, request.fenced_at_millis) else {
-            return Err(not_placed(Stop::EpochExhausted));
+            return Err(stop(&doubt, Stop::EpochExhausted));
         };
-        // The optimization: a request already invalid is answered without a fence.
-        match validate(store, upload_id, &bucket_key, named).await {
-            Ok(Validation::Valid { .. }) => {}
-            Ok(Validation::Rejected(refusal)) => return Ok(refused(refusal)),
-            Err(cause) => return Err(not_placed(cause)),
+        // The optimization: a request already invalid is answered without a fence. Never while a
+        // fence of this call may still land: that answer would leave the session to a fence no
+        // answer names. The fence below settles the doubt instead, and the validation behind it
+        // decides.
+        if !doubt.holds() {
+            match validate(store, upload_id, &bucket_key, named).await {
+                Ok(Validation::Valid { .. }) => {}
+                Ok(Validation::Rejected(refusal)) => return Ok(refused(refusal)),
+                Err(cause) => return Err(stop(&doubt, cause)),
+            }
         }
         if rounds == FENCE_ROUNDS {
-            return Err(not_placed(Stop::FenceRoundsSpent { rounds }));
+            return Err(stop(&doubt, Stop::FenceRoundsSpent { rounds }));
         }
         rounds += 1;
         let batch = WriteBatch::new()
-            .require(session_key.clone(), read)
+            .require(session_key.clone(), read.clone())
             .put(session_key.clone(), placed.bytes.clone());
-        match store.commit(batch).await {
+        let reread = match store.commit(batch).await {
             Ok(CommitOutcome::Committed) => break (opened, placed),
             // Answered from what the store holds now: moved, from its new state; still the
             // bytes read, the round is spent and the fence tried again.
-            Ok(CommitOutcome::Conflict) => {
-                found = store
-                    .get(&session_key)
-                    .await
-                    .map_err(|fault| not_placed(Stop::Store(fault)))?;
-            }
+            Ok(CommitOutcome::Conflict) => store.get(&session_key).await,
+            // Never read as `Conflict`: the read below says whether it can be settled.
             Err(fault) => {
-                return Err(match fault.downcast_ref::<CommitUnknownResult>() {
-                    Some(unknown) => in_doubt(
-                        upload_id,
-                        DoubtfulCommit::Fence {
-                            epoch: placed.epoch(),
-                        },
-                        unknown,
-                        None,
-                    ),
-                    None => not_placed(Stop::Store(fault)),
-                });
+                let Some(unknown) = fault.downcast_ref::<CommitUnknownResult>() else {
+                    return Err(stop(&doubt, Stop::Store(fault)));
+                };
+                let commit = DoubtfulCommit::Fence {
+                    epoch: placed.epoch(),
+                };
+                doubt.observe(commit, unknown, Some(read));
+                store.get(&session_key).await
+            }
+        };
+        found = reread.map_err(|fault| stop(&doubt, Stop::Store(fault)))?;
+        if let Some(doubtful) = doubt.in_doubt(upload_id) {
+            // A fence of this call in doubt, and the session at the bytes it puts: it landed, or a
+            // rival's byte-identical fence did (a `Completing` record names no request,
+            // `multipart.rs:2276-2285`). Never ownership, so nothing more is written.
+            if found.as_ref() == Some(&placed.bytes) {
+                return Err(doubtful);
+            }
+            // `Open` again, with an attempt spent since the session this fence was built from:
+            // a fence was taken down and its attempt kept, which the reaper's rollback does, and
+            // this fence may be the one it rolled back. Its stamp may then be one the reaper found
+            // past `W_completing`, so the request never fences with it again.
+            if open_and_charged_since(found.as_ref(), opened.attempts()) {
+                return Ok(refused(Refusal::OperationAborted));
             }
         }
     };
 
-    // The fence is this Complete's: its commit answered `Committed`.
+    // The fence is this Complete's: its commit answered `Committed`. A fence of this call held in
+    // doubt required the bytes this one replaced, which never come back, so it can no longer land.
     let why = match validate(store, upload_id, &bucket_key, named).await {
         Ok(Validation::Valid { frozen, marker }) => {
             return Ok(FenceOutcome::Held(Box::new(HeldFence {
@@ -889,6 +995,20 @@ pub async fn fence_complete(
     release(store, &mut own, why, fingerprint.as_ref().ok())
         .await
         .map(FenceOutcome::Answered)
+}
+
+/// Whether `found`, a read of the session, is `Open` with more attempts spent than `attempts`.
+///
+/// Only a fence spends an attempt, and every fence moves the epoch forward, so such a session is
+/// past every state a fence built on a session with `attempts` spent requires. Of the ways a fence
+/// comes down, only one that keeps its attempt leaves an `Open` session with more of them spent:
+/// the reaper's `W_completing` rollback (#625), or a release once a segment batch landed (module
+/// doc, *The release once a segment landed*). A release that gives the attempt back does not.
+fn open_and_charged_since(found: Option<&Bytes>, attempts: u32) -> bool {
+    let Some(session) = found.and_then(|found| decode_session_record(found).ok()) else {
+        return false;
+    };
+    matches!(session.state(), SessionState::Open {}) && session.attempts() > attempts
 }
 
 /// Decision 3's answer for a session a Complete found (`0016:976`), or `None` when it may fence:
@@ -1256,21 +1376,28 @@ pub struct PublishRequest {
 ///   it. A fence whose segment batch landed stays charged, and its release installs the
 ///   attempt's `retire:records:{seg}` obligation (module doc, *The release once a segment
 ///   landed*).
+/// * A round whose outcome the store could not report is settled by reading the session
+///   (module doc, *Unknown outcomes*): a flip of this Complete found landed answers
+///   [`CompleteOutcome::Published`] with that flip's publication, and this fence found at a
+///   cursor is resumed from there. What no read settles is [`CompleteError::InDoubt`], and while
+///   a batch may still land nothing is released.
 ///
 /// # Termination
 ///
 /// The fence phase's bound, then one read of each named part's record, then at most
-/// [`R_PUBLISH`] rounds. Each round follows one read of the target (its dirent and, when bound,
-/// the inode it names); it is the committer's segment batches, at most one per segment and at
-/// most [`crate::metadata::MAX_ROOT_SEGMENTS`] of them, its two reads of the attempt's bounded
-/// `seg:` range, and one flip. A round that loses is followed by one read of the session and one
-/// of the bucket marker, and a round the store refuses for good after a segment batch may have
-/// landed by one read of the session. Then at most [`RELEASE_ROUNDS`] release commits that find
-/// the session unchanged, plus at most one per segment batch that landed, each followed by at
-/// most one read of the session. Each store call is bounded by the store's own contract.
+/// [`R_PUBLISH`] rounds, a round whose outcome is unknown among them. Each round follows one
+/// read of the target (its dirent and, when bound, the inode it names); it is the committer's
+/// segment batches, at most one per segment and at most
+/// [`crate::metadata::MAX_ROOT_SEGMENTS`] of them, its two reads of the attempt's bounded `seg:`
+/// range, and one flip. A round that loses or whose outcome is unknown is followed by one read
+/// of the session and one of the bucket marker, and a round the store refuses for good after a
+/// segment batch may have landed by one read of the session. Then at most [`RELEASE_ROUNDS`]
+/// release commits that find the session unchanged, plus at most one per segment batch that
+/// landed, each followed by at most one read of the session. Each store call is bounded by the
+/// store's own contract.
 ///
 /// **Not cancel-safe once a commit is sent**, as [`fence_complete`] is not: a fence, a segment
-/// batch or a flip left unanswered by a dropped future is the reaper's or #1010's to settle.
+/// batch or a flip left unanswered by a dropped future is the reaper's to settle.
 pub async fn complete_upload(
     store: &impl MetadataStore,
     upload_id: &UploadId,
@@ -1329,12 +1456,21 @@ async fn publish_held(
             .put(session_key.clone(), to),
         _ => WriteBatch::new(),
     };
+    let mut doubt = Doubt::default();
+    // Every flip of this Complete whose outcome the store could not report: the session record it
+    // puts, and the publication that record names. Each names this fence's epoch and the version
+    // that flip offered, and only this Complete flips from this fence, so a read that finds one of
+    // them has found that flip landed.
+    let mut unknown_flips: Vec<(Bytes, Publication)> = Vec::new();
     let mut rounds = 0u32;
     loop {
         rounds += 1;
         let flip = match plan.flip(fence, &bucket_key, &target, publish, (etag, fingerprint)) {
             Ok(flip) => flip,
-            Err(cause) => return give_up(store, &mut own, cause, Some(&fingerprint)).await,
+            Err(cause) => {
+                let why = ReleaseFor::Fault(cause);
+                return end_publication(store, &mut own, &doubt, why, &fingerprint).await;
+            }
         };
         // A round that resumes below the plan's count sends segment batches before its flip.
         let writes_segments = own.cursor < plan.segments;
@@ -1357,68 +1493,92 @@ async fn publish_held(
                 return Ok(CompleteOutcome::Published(flip.publication))
             }
             Ok(CommitOutcome::Conflict) => {}
-            Err(fault) => {
-                if let Some(unknown) = fault.downcast_ref::<CommitUnknownResult>() {
+            Err(failure) => {
+                // Never read as `Conflict`: the read below settles it, or the request ends in
+                // doubt. Which batch of the round it was is not known, so neither are the bytes it
+                // requires: that read pins them (module doc, *Unknown outcomes*).
+                if let Some(unknown) = failure.downcast_ref::<CommitUnknownResult>() {
                     let epoch = own.epoch();
                     let commit = if writes_segments {
                         DoubtfulCommit::Publication { epoch }
                     } else {
                         DoubtfulCommit::Flip { epoch }
                     };
-                    return Err(in_doubt(&fence.upload_id, commit, unknown, None));
-                }
-                // Refused before anything was written, or a round the store refused for good: no
-                // other round, one release.
-                let cause = match fault.downcast_ref::<PublicationError>() {
-                    Some(refused) => Stop::Publication(refused.clone()),
-                    None => Stop::Store(fault),
-                };
-                // A segment batch of the round may have landed first: the release goes from the
-                // cursor the session holds. A read that fails here leaves that to the release.
-                if writes_segments {
-                    if let Ok(session) = store.get(&session_key).await {
-                        if !own.follow(session.as_ref()) {
-                            let why = ReleaseFor::Fault(cause);
-                            return moved(&own, session, why, Some(&fingerprint));
+                    doubt.observe(commit, unknown, None);
+                    unknown_flips.push((flip.completed, flip.publication));
+                } else {
+                    // Refused before anything was written, or a round the store refused for good:
+                    // no other round, and one release unless a batch of this Complete may still
+                    // land.
+                    let cause = match failure.downcast_ref::<PublicationError>() {
+                        Some(refused) => Stop::Publication(refused.clone()),
+                        None => Stop::Store(failure),
+                    };
+                    if let Some(doubtful) = doubt.in_doubt(&fence.upload_id) {
+                        return Err(doubtful);
+                    }
+                    // A segment batch of the round may have landed first: the release goes from
+                    // the cursor the session holds. A read that fails here leaves that to the
+                    // release.
+                    if writes_segments {
+                        if let Ok(session) = store.get(&session_key).await {
+                            if !own.follow(session.as_ref()) {
+                                let why = ReleaseFor::Fault(cause);
+                                return moved(&own, session, why, Some(&fingerprint));
+                            }
                         }
                     }
+                    return give_up(store, &mut own, cause, Some(&fingerprint)).await;
                 }
-                return give_up(store, &mut own, cause, Some(&fingerprint)).await;
             }
         }
-        // The round lost: judged from what the store holds now, which also says how far the
-        // segment phase got.
+        // The round lost, or its outcome is unknown: judged from what the store holds now, which
+        // also says how far the segment phase got. A read that fails leaves an unknown outcome
+        // unsettled, so that ends in doubt.
         let session = match store.get(&session_key).await {
             Ok(session) => session,
-            Err(fault) => {
-                return give_up(store, &mut own, Stop::Store(fault), Some(&fingerprint)).await
+            Err(failure) => {
+                let why = ReleaseFor::Fault(Stop::Store(failure));
+                return end_publication(store, &mut own, &doubt, why, &fingerprint).await;
             }
         };
-        if !own.follow(session.as_ref()) {
-            return moved(
-                &own,
-                session,
-                lost(Refusal::OperationAborted),
-                Some(&fingerprint),
-            );
+        if let Some((_, landed)) = unknown_flips
+            .iter()
+            .find(|(completed, _)| session.as_ref() == Some(completed))
+        {
+            return Ok(CompleteOutcome::Published(landed.clone()));
         }
+        // Off this fence, nothing of this Complete can land: every batch of it requires the
+        // session at this fence's epoch, which never comes back. For a lost round, `moved` errs
+        // only on a record that does not decode, which says nothing of what landed before it, so
+        // that stop settles no doubt: it is the in-doubt error while one stands.
+        if !own.follow(session.as_ref()) {
+            let why = lost(Refusal::OperationAborted);
+            return moved(&own, session, why, Some(&fingerprint))
+                .map_err(|stop| doubt.end(&fence.upload_id, stop));
+        }
+        doubt.settle(&own.bytes);
         let marker = match store.get(&bucket_key).await {
             Ok(marker) => marker,
-            Err(fault) => {
-                return give_up(store, &mut own, Stop::Store(fault), Some(&fingerprint)).await
+            Err(failure) => {
+                let why = ReleaseFor::Fault(Stop::Store(failure));
+                return end_publication(store, &mut own, &doubt, why, &fingerprint).await;
             }
         };
         if marker.as_ref() != Some(&fence.bucket_marker) {
             let why = lost(Refusal::NoSuchBucket);
-            return release(store, &mut own, why, Some(&fingerprint)).await;
+            return end_publication(store, &mut own, &doubt, why, &fingerprint).await;
         }
         if rounds == R_PUBLISH {
             let why = lost(Refusal::OperationAborted);
-            return release(store, &mut own, why, Some(&fingerprint)).await;
+            return end_publication(store, &mut own, &doubt, why, &fingerprint).await;
         }
         target = match read_target(store, parent, name).await {
             Ok(target) => target,
-            Err(cause) => return give_up(store, &mut own, cause, Some(&fingerprint)).await,
+            Err(cause) => {
+                let why = ReleaseFor::Fault(cause);
+                return end_publication(store, &mut own, &doubt, why, &fingerprint).await;
+            }
         };
     }
 }
@@ -1432,6 +1592,22 @@ async fn give_up(
     fingerprint: Option<&Digest>,
 ) -> Result<CompleteOutcome, CompleteError> {
     release(store, own, ReleaseFor::Fault(cause), fingerprint).await
+}
+
+/// End a publication round that cannot go on, as `why` says: the in-doubt error while `doubt`
+/// keeps one, with nothing more sent, so no release races a batch of this Complete that may still
+/// land (module doc, *Unknown outcomes*); else the release `why` asks for.
+async fn end_publication(
+    store: &impl MetadataStore,
+    own: &mut OwnFence<'_>,
+    doubt: &Doubt,
+    why: ReleaseFor,
+    fingerprint: &Digest,
+) -> Result<CompleteOutcome, CompleteError> {
+    if let Some(doubtful) = doubt.in_doubt(own.upload_id) {
+        return Err(doubtful);
+    }
+    release(store, own, why, Some(fingerprint)).await
 }
 
 /// What every round of one publication shares: the object's chunk list, the segment count the
@@ -1451,10 +1627,13 @@ struct FlipPlan {
     unnamed: Option<RetireObligation>,
 }
 
-/// One flip: the root it publishes, the contribution that rides with it, and the answer it earns.
+/// One flip: the root it publishes, the contribution that rides with it, the session record that
+/// contribution puts, and the answer it earns.
 struct Flip<'a> {
     root: RootTarget<'a>,
     contribution: WriteBatch,
+    /// The `Completed` record the flip puts at `mpu:<id>`: what a read finds once it landed.
+    completed: Bytes,
     publication: Publication,
 }
 
@@ -1574,7 +1753,8 @@ impl FlipPlan {
         for obligation in obligations.iter().flatten() {
             contribution = contribution.require_absent(obligation.key());
         }
-        contribution = contribution.put(session_key, metadata::encode(&completed));
+        let completed = metadata::encode(&completed);
+        contribution = contribution.put(session_key, completed.clone());
         for obligation in obligations.iter().flatten() {
             contribution =
                 contribution.put(obligation.key(), metadata::encode(obligation.payload()));
@@ -1582,6 +1762,7 @@ impl FlipPlan {
         Ok(Flip {
             root,
             contribution,
+            completed,
             publication,
         })
     }
@@ -1631,6 +1812,102 @@ fn superseded(id: InodeId, prior: &InodeRecord) -> Result<Option<RetireObligatio
         ChunkMap::Segmented(map) => RetiredMap::Segmented(map.group().clone()),
     };
     RetireObligation::superseded_generation(id, prior.version, map).map(Some)
+}
+
+/// One commit of this Complete whose outcome the store could not report.
+#[derive(Debug)]
+struct Unknown {
+    /// The commit it is about.
+    commit: DoubtfulCommit,
+    /// What the store said.
+    outcome: CommitUnknownResult,
+}
+
+/// What a Complete knows about its own commits whose outcome the store could not report: the two
+/// kinds of doubt an Abort keeps (`abort.rs:259-273`, `:394-451`), each with the commit it is about
+/// (module doc, *Unknown outcomes*).
+#[derive(Debug, Default)]
+struct Doubt {
+    /// **Held**: the first outcome that said `may_still_commit`, kept and never replaced by a later
+    /// one, and the session bytes a batch of this Complete that may still land requires at
+    /// `mpu:<id>`. `None` until the read after it pins them, when the caller cannot name them (a
+    /// publication round). Only a read that finds the session no longer those bytes clears it:
+    /// every batch requires exact bytes, and neither the epoch nor the segment cursor ever goes
+    /// back.
+    held: Option<(Unknown, Option<Bytes>)>,
+    /// **Unsettled**: the latest out-of-flight outcome no successful read has followed yet.
+    unsettled: Option<Unknown>,
+}
+
+impl Doubt {
+    /// A commit about `commit` answered `outcome`. `required` is the session bytes its batch
+    /// requires, or `None` when the read that follows pins them ([`Self::settle`]).
+    fn observe(
+        &mut self,
+        commit: DoubtfulCommit,
+        outcome: &CommitUnknownResult,
+        required: Option<Bytes>,
+    ) {
+        let unknown = Unknown {
+            commit,
+            outcome: outcome.clone(),
+        };
+        if !outcome.may_still_commit {
+            self.unsettled = Some(unknown);
+        } else if let Some((_, pinned)) = &mut self.held {
+            // A later batch that may still land: it was sent after a read found the session at the
+            // held bytes, so it requires those or later ones, and the read after it pins which.
+            // The held outcome stays the first one; the bytes it is kept against move on.
+            *pinned = required;
+        } else {
+            self.held = Some((unknown, required));
+        }
+    }
+
+    /// Whether a commit of this Complete may still land.
+    const fn holds(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// A read of `mpu:<id>` that succeeded and found `found`, a record that decodes, and not a
+    /// commit of this Complete that it can answer from: no out-of-flight commit of it is unsettled
+    /// any more, a held one whose bytes are not pinned yet is kept against `found`, and one whose
+    /// bytes are gone can never land. A record that does not decode is never passed here: it
+    /// settles nothing (module doc, *Unknown outcomes*). Neither is a read that found no record,
+    /// which is answered without a look at the doubt.
+    fn settle(&mut self, found: &Bytes) {
+        self.unsettled = None;
+        let Some((_, pinned)) = &mut self.held else {
+            return;
+        };
+        let kept = match pinned {
+            Some(required) => found == required,
+            None => {
+                *pinned = Some(found.clone());
+                true
+            }
+        };
+        if !kept {
+            self.held = None;
+        }
+    }
+
+    /// The in-doubt error while a commit of this Complete may still land or was never settled:
+    /// about the held outcome, else the unsettled one. `None` when nothing is in doubt.
+    fn in_doubt(&self, upload_id: &UploadId) -> Option<CompleteError> {
+        let unknown = self
+            .held
+            .as_ref()
+            .map(|(unknown, _)| unknown)
+            .or(self.unsettled.as_ref())?;
+        Some(in_doubt(upload_id, unknown.commit, &unknown.outcome, None))
+    }
+
+    /// The error a Complete stopped with `otherwise` ends in: the in-doubt error while something
+    /// is in doubt, else `otherwise`.
+    fn end(&self, upload_id: &UploadId, otherwise: CompleteError) -> CompleteError {
+        self.in_doubt(upload_id).unwrap_or(otherwise)
+    }
 }
 
 fn answered(outcome: CompleteOutcome) -> FenceOutcome {
