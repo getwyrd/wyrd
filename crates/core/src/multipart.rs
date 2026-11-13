@@ -632,6 +632,49 @@ pub enum RecordError {
         /// otherwise be reported as malformed rather than as the out-of-range number it is.
         count: String,
     },
+    /// A retirement obligation's drain [`RetireCursor`] standing in a component the payload
+    /// does not carry. The cursor is a position in the payload's own work, so one in work the
+    /// payload never owed would have the drain resume where there is nothing to drain, and
+    /// finish an obligation whose real work it never reached.
+    RetireCursorComponentAbsent {
+        /// The component the cursor names.
+        component: &'static str,
+    },
+    /// A retirement obligation's drain [`RetireCursor`] naming no entry of the work its payload
+    /// **lists**: a part number that is not a member of the `{parts}` set (past its last member,
+    /// or between two runs), or an index at or past the length of a `{chunks}` list or a flat
+    /// `{generation}` list. The drain writes the cursor at the next entry it has not drained, so
+    /// a cursor off the list was written by no drain, and trusting it would skip work or finish
+    /// the obligation with its records left.
+    RetireCursorOutsideWork {
+        /// The component the cursor names.
+        component: &'static str,
+        /// The entry it names.
+        entry: u32,
+    },
+    /// A retirement obligation's drain [`RetireCursor`] past the key grammar's bound, for work
+    /// the payload names only by a store range: a segment index past
+    /// [`crate::metadata::MAX_SEGMENT_INDEX`] (`{seg}`, a segmented `{generation}`), or a part
+    /// number outside `[1, MAX_PART_NUMBER]` (`{session}`, `{parts: "all"}`). Decode cannot
+    /// know where such a range ends, only where its keys can end.
+    RetireCursorUnaddressable {
+        /// The component the cursor names.
+        component: &'static str,
+        /// The entry it names.
+        entry: u32,
+        /// The largest entry the key grammar can spell for it.
+        max: u32,
+    },
+    /// A `retire:records:` obligation's drain [`RetireCursor`] naming an item inside its entry.
+    /// A records-mode entry has no items: a `{parts}` member is its two records, deleted in one
+    /// batch, and a `{seg}` index is one record. Only a `retire:bytes:` entry can need more
+    /// marks than one batch carries.
+    RetireCursorItemInRecordsMode {
+        /// The component the cursor names.
+        component: &'static str,
+        /// The item it names.
+        item: u32,
+    },
 }
 
 impl fmt::Display for RecordError {
@@ -876,6 +919,30 @@ impl fmt::Display for RecordError {
             Self::EtagPartCountOutOfRange { count } => write!(
                 f,
                 "a multipart ETag's part count {count} is outside [1, {MAX_PART_NUMBER}]"
+            ),
+            Self::RetireCursorComponentAbsent { component } => write!(
+                f,
+                "the retirement obligation's drain cursor stands in `{component}`, a component \
+                 its payload does not carry"
+            ),
+            Self::RetireCursorOutsideWork { component, entry } => write!(
+                f,
+                "the retirement obligation's drain cursor names entry {entry} of `{component}`, \
+                 which the payload's own list does not hold"
+            ),
+            Self::RetireCursorUnaddressable {
+                component,
+                entry,
+                max,
+            } => write!(
+                f,
+                "the retirement obligation's drain cursor names entry {entry} of `{component}`, \
+                 past the {max} its key grammar can spell"
+            ),
+            Self::RetireCursorItemInRecordsMode { component, item } => write!(
+                f,
+                "a retire:records: drain cursor names item {item} inside a `{component}` entry, \
+                 and a records-mode entry has no items"
             ),
         }
     }
@@ -3433,13 +3500,34 @@ impl PartNumberSet {
 
     /// The set's runs, `[lo, hi]` inclusive, ascending, non-adjacent and never empty.
     ///
-    /// There is deliberately no `len`, `is_empty` or member iterator beside it: the runs are the
-    /// stored shape, emptiness is not a state this type has, and the drain that walks them
-    /// (#656–#659) is what decides how to page a run of up to [`MAX_PART_NUMBER`] members. A
-    /// convenience iterator minted here would be an API this child has no consumer for and no
-    /// test that could pin its paging behaviour.
+    /// There is deliberately no `len` or `is_empty` beside it: the runs are the stored shape and
+    /// emptiness is not a state this type has. A drain pages the members with
+    /// [`Self::members_from`].
     pub fn runs(&self) -> &[(u32, u32)] {
         &self.0
+    }
+
+    /// The members from the first one at or after `from`, ascending.
+    ///
+    /// The start is found by **one binary search** over the runs, never a walk from the first
+    /// run, so a drain that resumes at its cursor costs `O(log runs)` to find its place however
+    /// far into a sparse set it is (#1061; one run per member at worst, 500,000 runs for an
+    /// alternating set over the whole key space). From there the members are read off the runs in
+    /// order, lazily, so a caller takes as many as its batch holds.
+    pub fn members_from(&self, from: u32) -> impl Iterator<Item = u32> + '_ {
+        let start = self.0.partition_point(|&(_, hi)| hi < from);
+        self.0[start..]
+            .iter()
+            .enumerate()
+            .flat_map(move |(offset, &(lo, hi))| {
+                let first = if offset == 0 { lo.max(from) } else { lo };
+                first..=hi
+            })
+    }
+
+    /// Whether `part_number` is a member, by the same binary search as [`Self::members_from`].
+    pub fn contains(&self, part_number: u32) -> bool {
+        self.members_from(part_number).next() == Some(part_number)
     }
 }
 
@@ -3823,6 +3911,173 @@ const SEG_COMPONENT: Component = Component {
     scope: TokenScope::SessionWide,
 };
 
+/// One component of a [`RetirePayload`], as a [`RetireCursor`] names it. The order of the
+/// variants is the payload's own order, the order its fields are encoded in and the order a drain
+/// works through them: `session`, `parts`, `chunks`, `generation`, `seg`. Each is spelled as the
+/// payload field it stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetireComponent {
+    /// `session`: the session's own staged residue.
+    Session,
+    /// `parts`: a part-number set, or the `all` wildcard.
+    Parts,
+    /// `chunks`: one part attempt's chunk list.
+    Chunks,
+    /// `generation`: a superseded or deleted generation.
+    Generation,
+    /// `seg`: one rolled-back attempt's segment records.
+    Seg,
+}
+
+impl RetireComponent {
+    /// The payload field it stands for, as a rejection names it.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::Parts => "parts",
+            Self::Chunks => "chunks",
+            Self::Generation => "generation",
+            Self::Seg => "seg",
+        }
+    }
+}
+
+/// Where the retirement drain stands inside its obligation: the optional `cursor` of a
+/// [`RetirePayload`] (#1061).
+///
+/// # Where it lives, and why there
+///
+/// Inside the obligation it walks, never in a record of its own (`0016:612-619`): the drain step
+/// already preconditions on the obligation's exact bytes (`require(retire:… == prior)`,
+/// `0016:668`), so the cursor's advance is part of the one mutation that authorizes the step,
+/// and two drainers can never both advance it. Only the drain writes it, in the batch of the step
+/// whose work it records; the step that deletes the obligation's last record deletes the
+/// obligation, cursor and all. **Absent means "at the start"**, and an absent cursor is omitted
+/// from the value, never spelled `null`, so no installer's bytes change.
+///
+/// # The spelling
+///
+/// `"cursor":{"component":"parts","entry":17}` — one position in the payload's own ordered work:
+///
+/// * `component`: the component the drain is in ([`RetireComponent`]). Everything in a
+///   component before it is drained.
+/// * `entry`: the next entry of that component the drain has not finished. What an entry is
+///   depends on the component:
+///
+///   | Component | `entry` | Bound decode checks |
+///   |---|---|---|
+///   | `parts` (a set) | the next part number, a member of the set | a member ([`RecordError::RetireCursorOutsideWork`]) |
+///   | `parts` (`all`), `session` | the next part number of the session's own range | `[1, MAX_PART_NUMBER]` ([`RecordError::RetireCursorUnaddressable`]) |
+///   | `chunks` | the index of the next chunk in the list | below the list's length |
+///   | `generation` (flat) | the index of the next chunk in its list | below the list's length |
+///   | `generation` (segmented), `seg` | the next segment index | `[0, MAX_SEGMENT_INDEX]` |
+///
+/// * `item`: the next item inside that entry, for an entry whose marks exceed one batch (a
+///   `retire:bytes:` part or segment). It is omitted when zero, and a `retire:records:` cursor
+///   never carries one: a records-mode entry has no items
+///   ([`RecordError::RetireCursorItemInRecordsMode`]).
+///
+/// # What decode can and cannot judge
+///
+/// [`decode_retire_obligation`] judges a cursor against the key and payload it is given, as far
+/// as those two can: a cursor in a component the payload does not carry, off a list the payload
+/// carries, or past the key grammar's bound, is an error. Work the payload names only by a store
+/// range — a `{seg}` group's records, `{parts: "all"}`, a segmented `{generation}` — has no end
+/// decode can see (a [`crate::metadata::SegmentGroup`] names a nonce and an epoch, not an
+/// extent): the drain finds that end by reading the range, and a `{seg}` component is finished
+/// only when a read of the group's whole range, from its start, finds it empty.
+///
+/// # Its room is reserved
+///
+/// The widest cursor decode accepts encodes to [`RETIRE_CURSOR_MAX_BYTES`], and every obligation
+/// is installed within [`RETIRE_VALUE_CEILING`], [`MAX_VALUE_BYTES`] less that room, so the drain
+/// can always write the cursor back without crossing the store's value ceiling. An obligation
+/// installed without the reservation (by a build before #1061, or planted) is held by the drain
+/// rather than sent to a store that would refuse it for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RetireCursor {
+    component: RetireComponent,
+    entry: u32,
+    #[serde(skip_serializing_if = "is_zero")]
+    item: u32,
+}
+
+/// Whether an item is zero — the `skip_serializing_if` that keeps a cursor's absent item omitted.
+const fn is_zero(item: &u32) -> bool {
+    *item == 0
+}
+
+impl RetireCursor {
+    /// The position `entry`, `item` inside `component`. It means something only against a
+    /// payload, which is where it is checked: [`decode_retire_obligation`] for one read from the
+    /// store, [`RetirePayload::advanced`] for one a drain is about to write.
+    pub const fn new(component: RetireComponent, entry: u32, item: u32) -> Self {
+        Self {
+            component,
+            entry,
+            item,
+        }
+    }
+
+    /// The component the drain is in.
+    pub const fn component(&self) -> RetireComponent {
+        self.component
+    }
+
+    /// The next entry of that component the drain has not finished.
+    pub const fn entry(&self) -> u32 {
+        self.entry
+    }
+
+    /// The next item inside that entry; zero for an entry not yet started.
+    pub const fn item(&self) -> u32 {
+        self.item
+    }
+}
+
+/// The wire shape of [`RetireCursor`]: closed, so a field this build does not know is a decode
+/// error rather than one dropped on the way in and missing from the re-encode the next step puts.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetireCursorWire {
+    component: RetireComponent,
+    entry: u32,
+    #[serde(default)]
+    item: u32,
+}
+
+impl From<RetireCursorWire> for RetireCursor {
+    fn from(wire: RetireCursorWire) -> Self {
+        Self::new(wire.component, wire.entry, wire.item)
+    }
+}
+
+/// The widest `cursor` field decode accepts, as it sits in an obligation value — the comma that
+/// joins it to the payload's last component included — in bytes: 69.
+///
+/// Spelled out rather than computed from the encoder, so the reservation is a reviewable
+/// literal: the longest component name (`generation`), the widest entry any component's bound
+/// admits (six digits: [`MAX_PART_NUMBER`] and [`crate::metadata::MAX_SEGMENT_INDEX`] are both
+/// 999,999, and a list index is below the list's length, which one value bounds) and the widest
+/// item (`u32::MAX`). `crates/core/tests/multipart_retire_cursor.rs` checks that this spelling is
+/// the encoder's, byte for byte.
+pub const RETIRE_CURSOR_MAX_BYTES: usize =
+    r#","cursor":{"component":"generation","entry":999999,"item":4294967295}"#.len();
+
+// The six-digit entry above covers every bound decode applies to an entry.
+const _: () = assert!(MAX_PART_NUMBER <= 999_999);
+const _: () = assert!(metadata::MAX_SEGMENT_INDEX <= 999_999);
+const _: () = assert!(MAX_VALUE_BYTES <= 999_999);
+
+/// The value ceiling every retirement obligation is **installed** within: [`MAX_VALUE_BYTES`]
+/// less [`RETIRE_CURSOR_MAX_BYTES`], 99,931 bytes. An obligation installed within it can carry
+/// any cursor decode accepts and still fit the store's ceiling, so its drain can always write
+/// its progress back. A Complete measures the part sets its flip installs against this
+/// ([`complete`], #1011, #1061); the other installers' values are a chunk list one value already
+/// carried, at most half of [`MAX_VALUE_BYTES`] (`metadata.rs:329-352`), or a few fixed fields.
+pub const RETIRE_VALUE_CEILING: usize = MAX_VALUE_BYTES - RETIRE_CURSOR_MAX_BYTES;
+
 /// The wire shape of [`RetirePayload`] — **closed** (`deny_unknown_fields`) and reading every
 /// nested chunk through this module's own [`ChunkRefWire`], for the reasons that type records: a
 /// retirement obligation is installed and drained under exact-bytes preconditions
@@ -3846,6 +4101,8 @@ struct RetirePayloadWire {
     generation: Option<RetireGenerationWire>,
     #[serde(default)]
     seg: Option<SegmentGroup>,
+    #[serde(default)]
+    cursor: Option<RetireCursorWire>,
 }
 
 /// What one retirement obligation owes — the `retire:bytes:<token>` / `retire:records:<token>`
@@ -3874,6 +4131,10 @@ struct RetirePayloadWire {
 /// The one place the record *is* a choice is one level in, and for the opposite reason: a
 /// generation's [`RetiredMap`] mirrors the two-arm committed map it retires, so its two sources
 /// are exclusive where the payload's components are combinable.
+///
+/// Beside what it owes, a payload may carry how far its drain has got: the optional
+/// [`RetireCursor`] (#1061), written only by the drain and omitted until then, so every row above
+/// is installed byte-identical to a build without it.
 ///
 /// # Its identity lives partly in its key
 ///
@@ -3920,6 +4181,10 @@ pub struct RetirePayload {
     generation: Option<RetireGeneration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     seg: Option<SegmentGroup>,
+    /// The drain's position (#1061). Encoded **last**, after every component, so its bytes are
+    /// one suffix of the value and [`RETIRE_CURSOR_MAX_BYTES`] bounds what it adds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<RetireCursor>,
 }
 
 /// Whether a presence flag is absent — the `skip_serializing_if` that keeps an absent `session`
@@ -3956,6 +4221,93 @@ impl RetirePayload {
     /// The rolled-back attempt's segment group it owes, if any.
     pub const fn segments(&self) -> Option<&SegmentGroup> {
         self.seg.as_ref()
+    }
+
+    /// How far the drain has got, or `None` at the start ([`RetireCursor`]).
+    pub const fn cursor(&self) -> Option<&RetireCursor> {
+        self.cursor.as_ref()
+    }
+
+    /// The same obligation with its drain moved to `cursor` — what a drain step puts back in the
+    /// batch that does the work up to it. `mode` is the obligation's own, read from its key.
+    ///
+    /// The cursor is checked exactly as [`decode_retire_obligation`] checks a stored one, so a
+    /// drain can never write a position its own decode would refuse on the next read; the payload
+    /// is otherwise unchanged. Whether the result fits the store is the caller's to measure
+    /// ([`RETIRE_VALUE_CEILING`] is what makes it fit for an obligation installed within it).
+    pub fn advanced(&self, mode: RetireMode, cursor: RetireCursor) -> Result<Self, RecordError> {
+        let advanced = Self {
+            cursor: Some(cursor),
+            ..self.clone()
+        };
+        advanced.checked_cursor(mode)?;
+        Ok(advanced)
+    }
+
+    /// The cursor against the payload it stands in (the table on [`RetireCursor`]): carried
+    /// component, entry within what the payload lists or the key grammar can spell, and no item
+    /// under `retire:records:`. No cursor is always valid: it means the start.
+    fn checked_cursor(&self, mode: RetireMode) -> Result<(), RecordError> {
+        let Some(cursor) = self.cursor else {
+            return Ok(());
+        };
+        let component = cursor.component.name();
+        let entry = cursor.entry;
+        let absent = || RecordError::RetireCursorComponentAbsent { component };
+        let outside = || RecordError::RetireCursorOutsideWork { component, entry };
+        let past = |max: u32| {
+            if entry > max {
+                Err(RecordError::RetireCursorUnaddressable {
+                    component,
+                    entry,
+                    max,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let part_number = || {
+            PartNumber::new(entry)
+                .map(|_| ())
+                .map_err(|_| RecordError::RetireCursorUnaddressable {
+                    component,
+                    entry,
+                    max: MAX_PART_NUMBER,
+                })
+        };
+        let listed = |len: usize| {
+            if (entry as usize) < len {
+                Ok(())
+            } else {
+                Err(outside())
+            }
+        };
+        match cursor.component {
+            RetireComponent::Session if self.session => part_number()?,
+            RetireComponent::Parts => match &self.parts {
+                Some(PartScope::Set(set)) if set.contains(entry) => {}
+                Some(PartScope::Set(_)) => return Err(outside()),
+                Some(PartScope::All) => part_number()?,
+                None => return Err(absent()),
+            },
+            RetireComponent::Chunks if !self.chunks.is_empty() => listed(self.chunks.len())?,
+            RetireComponent::Generation => match self.generation.as_ref().map(|g| &g.map) {
+                Some(RetiredMap::Flat(chunks)) => listed(chunks.len())?,
+                Some(RetiredMap::Segmented(_)) => past(metadata::MAX_SEGMENT_INDEX)?,
+                None => return Err(absent()),
+            },
+            RetireComponent::Seg if self.seg.is_some() => past(metadata::MAX_SEGMENT_INDEX)?,
+            RetireComponent::Session | RetireComponent::Chunks | RetireComponent::Seg => {
+                return Err(absent())
+            }
+        }
+        if mode == RetireMode::Records && cursor.item != 0 {
+            return Err(RecordError::RetireCursorItemInRecordsMode {
+                component,
+                item: cursor.item,
+            });
+        }
+        Ok(())
     }
 
     /// The components this payload actually carries, each with the mode and token scope its
@@ -4026,7 +4378,11 @@ impl RetirePayload {
     ///   instruction to enumerate the session's own `part:<id>:` range **at drain time**, and
     ///   only a teardown fence makes that range immutable (`0016:664`, `:2187`); without the
     ///   teardown it would name whatever a still-live session happens to hold when the drain
-    ///   arrives.
+    ///   arrives;
+    /// * **the drain cursor** — a [`RetireCursor`] stands in a component the payload carries, at
+    ///   an entry the payload lists or the key grammar can spell, and under `retire:records:`
+    ///   names no item (#1061). It is judged last, against components already proved to belong
+    ///   under this key.
     ///
     /// ## What the segment check does **not** prove
     ///
@@ -4077,7 +4433,9 @@ impl RetirePayload {
                 });
             }
         }
-        Ok(())
+        // Last: the drain's position, judged against components already proved to belong under
+        // this key, and against the mode, which decides whether its entries have items.
+        self.checked_cursor(mode)
     }
 }
 
@@ -4141,6 +4499,7 @@ impl TryFrom<RetirePayloadWire> for RetirePayload {
                 .map(RetireGeneration::try_from)
                 .transpose()?,
             seg: wire.seg,
+            cursor: wire.cursor.map(RetireCursor::from),
         };
         payload.checked_shape()?;
         Ok(payload)
@@ -4230,6 +4589,7 @@ impl RetireObligation {
                 chunks: Vec::new(),
                 generation: None,
                 seg: None,
+                cursor: None,
             },
         }
     }
@@ -4250,6 +4610,7 @@ impl RetireObligation {
                 chunks: Vec::new(),
                 generation: None,
                 seg: Some(group),
+                cursor: None,
             },
         }
     }
@@ -4289,6 +4650,7 @@ impl RetireObligation {
                 chunks: chunks.to_vec(),
                 generation: None,
                 seg: None,
+                cursor: None,
             },
         })
     }
@@ -4325,6 +4687,7 @@ impl RetireObligation {
                 chunks: Vec::new(),
                 generation: None,
                 seg: None,
+                cursor: None,
             },
         }
     }
@@ -4362,6 +4725,7 @@ impl RetireObligation {
                     map,
                 }),
                 seg: None,
+                cursor: None,
             },
         })
     }
@@ -4377,8 +4741,9 @@ impl RetireObligation {
     }
 
     /// The value it is installed with: [`Self::payload`] through [`crate::metadata::encode`]. The
-    /// bytes a writer puts at [`Self::key`], so they are what the store's value ceiling
-    /// ([`MAX_VALUE_BYTES`]) measures: a Complete sizes its flip's part sets by this (#1011).
+    /// bytes a writer puts at [`Self::key`], so they are what the installer ceiling
+    /// ([`RETIRE_VALUE_CEILING`]) measures: a Complete sizes its flip's part sets by this (#1011,
+    /// #1061).
     pub(crate) fn value(&self) -> bytes::Bytes {
         metadata::encode(&self.payload)
     }
@@ -4954,12 +5319,14 @@ pub enum Refusal {
     ///   10,000) are what reach it. Answered with nothing written when the set read before the
     ///   fence is already too large, and otherwise against the set the fence froze, with that
     ///   fence released and its attempt given back, so the session stays `Open` and can still be
-    ///   aborted ([`complete`], #1011).
+    ///   aborted ([`complete`], #1011). The ceiling here is [`RETIRE_VALUE_CEILING`], which keeps
+    ///   room for the drain's cursor (#1061).
     SessionTooLarge {
         /// The value that would cross the ceiling, in bytes: the widest encoding the session's
         /// record could reach (Create), or the part-set obligation's (Complete).
         bytes: u64,
-        /// The ceiling it crosses ([`MAX_VALUE_BYTES`]).
+        /// The ceiling it crosses: [`MAX_VALUE_BYTES`] (Create) or [`RETIRE_VALUE_CEILING`]
+        /// (Complete).
         limit: u64,
     },
     /// Designed backpressure.

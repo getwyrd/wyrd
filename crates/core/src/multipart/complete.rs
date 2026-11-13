@@ -55,7 +55,8 @@
 //! published parts' `retire:records:{parts}` and the unnamed parts' `retire:bytes:{parts}`. A set
 //! is range-encoded ([`PartNumberSet`]), so a contiguous run costs a few bytes, but every isolated
 //! part number is a run of its own, and the format allows numbers up to
-//! [`super::MAX_PART_NUMBER`]. Spread that far, a set can encode past [`MAX_VALUE_BYTES`], the
+//! [`super::MAX_PART_NUMBER`]. Spread that far, a set can encode past
+//! [`MAX_VALUE_BYTES`](metadata::MAX_VALUE_BYTES), the
 //! ceiling every backend inherits: 10,000 parts at 1, 3, …, 19,999 are 128,901 bytes as a
 //! `{parts}` value (#842). The committer refuses such a flip before sending it, and FoundationDB
 //! would refuse it for good (`2103 value_too_large`), so it could never land: every retry would
@@ -64,7 +65,13 @@
 //! Validation therefore also measures both obligations, as minted for the flip
 //! ([`RetireObligation`]), and refuses the request [`Refusal::SessionTooLarge`] when either
 //! one's **stored value**, `{"parts":…}` and not the bare set, is past the ceiling, with `bytes`
-//! that value's length. It runs where the rest of validation runs, after the named parts are
+//! that value's length. The ceiling it measures against is [`RETIRE_VALUE_CEILING`], not
+//! [`MAX_VALUE_BYTES`](metadata::MAX_VALUE_BYTES) itself: the retirement drain writes its progress
+//! back into the obligation as a cursor, and the room that cursor can take
+//! ([`super::RETIRE_CURSOR_MAX_BYTES`], 69 bytes) is reserved here, so an obligation the flip
+//! installs can always be drained (#1061). A value between the two is refused like one past
+//! [`MAX_VALUE_BYTES`](metadata::MAX_VALUE_BYTES): installed, its drain could never advance. It
+//! runs where the rest of validation runs, after the named parts are
 //! found: before the fence, so a request already too large is answered with nothing written, and
 //! against the set the fence froze, which decides, since a part committed between the two reads
 //! can push the unnamed set across. That rejection is released like any other, with its attempt
@@ -303,11 +310,10 @@ use super::{
     decode_session_record, mpu_key, multipart_etag, parse_psum_key, part_key, psum_range,
     CompleteAnswer, CompleteOutcome, Completion, Digest, InvalidPart, MultipartEtag, PartNumber,
     PartNumberSet, PartSummary, Publication, RecordError, Refusal, RetireObligation, RetiredMap,
-    SessionRecord, SessionState, UploadId, MAX_COMPLETE_ATTEMPTS, R_PUBLISH,
+    SessionRecord, SessionState, UploadId, MAX_COMPLETE_ATTEMPTS, RETIRE_VALUE_CEILING, R_PUBLISH,
 };
 use crate::metadata::{
     self, ChunkMap, ChunkRef, DirentRecord, InodeId, InodeRecord, ObjectMeta, SegmentGroup,
-    MAX_VALUE_BYTES,
 };
 use crate::staged_publication::{self, PublicationError, RootTarget, SegmentBatchInfo};
 
@@ -1187,15 +1193,17 @@ impl PartRetirement {
     }
 
     /// [`Refusal::SessionTooLarge`] for the first obligation whose stored value
-    /// ([`RetireObligation::value`]) is past [`MAX_VALUE_BYTES`], with that value's length: a
-    /// flip writing it could never land. A value exactly at the ceiling fits.
+    /// ([`RetireObligation::value`]) is past [`RETIRE_VALUE_CEILING`], with that value's length:
+    /// past [`MAX_VALUE_BYTES`](metadata::MAX_VALUE_BYTES) a flip writing it could never land, and
+    /// between the two its drain could never write its cursor back (#1061). A value exactly at the
+    /// ceiling fits.
     fn past_ceiling(&self) -> Option<Refusal> {
         self.obligations()
             .map(|obligation| obligation.value().len())
-            .find(|&bytes| bytes > MAX_VALUE_BYTES)
+            .find(|&bytes| bytes > RETIRE_VALUE_CEILING)
             .map(|bytes| Refusal::SessionTooLarge {
                 bytes: bytes as u64,
-                limit: MAX_VALUE_BYTES as u64,
+                limit: RETIRE_VALUE_CEILING as u64,
             })
     }
 }
