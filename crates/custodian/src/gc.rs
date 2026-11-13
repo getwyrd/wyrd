@@ -273,7 +273,11 @@ pub const DELTA_CLOCK_MILLIS: u64 = 1_000;
 /// the sweep leaves every structured, non-`reclaiming` mark in place (`event-may-await-write`,
 /// [`Sweep::sweep_fragment_less_marks`]; PR #821 review). The staged re-place does not settle its
 /// pre-marks that way yet (deferred: #825), so one whose move stopped before its fragment landed
-/// stays in the ledger: a mark kept too long, never a fragment left without one.
+/// stays in the ledger: a mark kept too long, never a fragment left without one. The one
+/// exception is a retirement drain's mark once its `retire:bytes:` obligation is gone: the drain
+/// authorizes no write, it marks only after every write that may still land under its mark was
+/// authorized, and nothing else would ever delete such a mark (the sweep's doc says what that
+/// trades).
 pub const LATE_WRITE_DEADLINE_MILLIS: u64 = W_REPOINT_MILLIS + W_WRITE_MILLIS + DELTA_CLOCK_MILLIS;
 
 /// Where the `orphan:` ledger walk resumes: the one persisted record of [`OrphanWindow`].
@@ -850,11 +854,24 @@ impl<'p, 'a> Sweep<'p, 'a> {
     /// - its value is none of the three shapes: there is no stamp to age, so it stays
     ///   byte-identical, as it was named when the window read it (ADR-0045 decision 3);
     /// - it is younger than `D`;
-    /// - it is a structured mark that is not `reclaiming` — one carrying an unreference event
-    ///   (`event-may-await-write`). Such a mark may have been written **ahead of** its fragment
-    ///   (a repoint's pre-mark, a teardown's planned placement), and `D` bounds when a write is
-    ///   *accepted*, not when it takes effect: a publication that straddles the deadline is
-    ///   reported as [`wyrd_traits::WriteEffect::Unknown`] with the bytes possibly landed, so a
+    /// - it names a retirement whose `retire:bytes:` obligation is still present
+    ///   (`draining-retirement`), read by one keyed `get` as [`Self::retirement_draining`] reads
+    ///   it. Once that obligation is gone the mark is swept like a legacy one: a token is never
+    ///   reused, so the drain writes no mark for it after its obligation is gone, and nothing else
+    ///   would ever delete one — over a fragment GC destroyed before the drain re-marked the
+    ///   position, say, or one a compensated attempt never wrote (`0016:1406-1408`). The drain
+    ///   marks only after its obligation is installed, and only positions a record or list names:
+    ///   a fragment lands at a committed record's position before that record commits, so the one
+    ///   write that may still be unsettled there is a compensated attempt's, authorized before
+    ///   its compensation installed the obligation. Its deadline falls at most `W_write` after the
+    ///   mark's stamp, and the listing that licenses the delete at least `D - W_write` after that
+    ///   deadline. A publication that straddles its deadline by longer lands after the sweep and
+    ///   leaves its fragment unmarked, which GC keeps: bytes kept too long, never a fragment lost.
+    /// - it is any other structured mark that is not `reclaiming` — one carrying an unreference
+    ///   event (`event-may-await-write`). Such a mark may have been written **ahead of** its
+    ///   fragment (a repoint's pre-mark, a teardown's planned placement), and `D` bounds when a
+    ///   write is *accepted*, not when it takes effect: a publication that straddles the deadline
+    ///   is reported as [`wyrd_traits::WriteEffect::Unknown`] with the bytes possibly landed, so a
     ///   listing at `orphaned_at + D` does not prove the position stays empty (PR #821 review).
     ///   The staged re-place's pre-mark is such a mark (`crate::reconstruction`); its event joins
     ///   the swept set only once that writer settles how its marks are retired — see
@@ -898,6 +915,13 @@ impl<'p, 'a> Sweep<'p, 'a> {
                     .saturating_add(LATE_WRITE_DEADLINE_MILLIS)
             {
                 Some("within-late-write-deadline")
+            } else if !mark.is_reclaiming() && mark.retire_token().is_some() {
+                // A retirement drain's mark: kept while its obligation is present, swept once it
+                // is gone — one keyed read, as the reclaim's own protection makes (see the doc
+                // above).
+                self.retirement_draining(mark)
+                    .await?
+                    .then_some("draining-retirement")
             } else if !mark.is_reclaiming() && mark.event().is_some() {
                 // Possibly written ahead of its fragment, and a straddling write's effect is
                 // not bounded by `D` — left to the writer's own slice (see the doc above).
@@ -1453,9 +1477,10 @@ impl StagedSet {
 }
 
 /// Resolve the placement a **staged** record (`sidx:` or `part:`) gives a chunk — the one rule
-/// every staged reader in this module shares ([`StagedSet::place`] for the protection class,
-/// [`read_staged_part`] for the scrub-checked one), so neither can drift from the other about
-/// which staged placements are trustworthy.
+/// every staged reader shares ([`StagedSet::place`] for the protection class,
+/// [`read_staged_part`] for the scrub-checked one, and the retirement drain, which marks a
+/// `part:` record's positions only through it, `crate::retirement`), so none can drift from the
+/// others about which staged placements are trustworthy.
 ///
 /// **Exact length, no identity fallback.** A staged placement is valid *iff* it names exactly one
 /// D server per fragment of its own scheme; any other length — the EMPTY vector included — is
@@ -1468,7 +1493,7 @@ impl StagedSet {
 /// positions on GC's side, and on scrub's fetching and then enqueueing *phantom* repair
 /// obligations against them (`0016` X65, `0016:2594`; ADR-0045 decision 3). Damage is contained
 /// instead: the caller holds or reports the chunk, and fabricates nothing.
-fn staged_placement(
+pub(crate) fn staged_placement(
     chunk: &ChunkRef,
 ) -> std::result::Result<impl Iterator<Item = (u16, DServerId)> + '_, MalformedPlacement> {
     let expected = chunk.fragment_count();
@@ -2062,8 +2087,9 @@ async fn ledger_page(
 /// bound and its termination rest on: the page is no longer than it asked for, and it either
 /// ends the walk or carries it past `after`. Anything else is an error, never a page accepted
 /// silently. Shared by every paged walk in this module — the `orphan:` ledger's and the staged
-/// protection class's — so they cannot disagree about what a usable page is.
-async fn checked_page(
+/// protection class's — and by the retirement drain's walks of the `retire:` ledger and of a
+/// segment group (`crate::retirement`), so they cannot disagree about what a usable page is.
+pub(crate) async fn checked_page(
     meta: &dyn MetadataStore,
     prefix: &[u8],
     walk: &str,
