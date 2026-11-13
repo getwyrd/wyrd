@@ -6432,6 +6432,492 @@ async fn prop_drain_ceiling_refusal_is_confirmed_on_the_segment(rng: &mut ChaCha
     assert!(copied.is_none(), "a refused move copied a fragment ({arm})");
 }
 
+// ---- property: the retirement drain's re-stamp racing GC's swap to `reclaiming` (#1062) ----
+//
+// The `retire:bytes:` drain replaces a mark of another event under an exact-value precondition
+// (arm b, `0016:1220-1226`); GC moves a mark past its grace to `reclaiming` under the same kind of
+// precondition, from the same stamped bytes (`0016:1312-1320`). At a position no record the drain
+// keeps names — a `{chunks}` obligation's, whose installing batch removed the naming record — both
+// can act on one stale mark. Exactly one commit wins. When GC's wins, the drain's re-read finds
+// `reclaiming` and leaves it byte-identical (arm 0) instead of re-stamping it, since GC deletes the
+// key blind and a value written over it would vanish with it; GC destroys the fragment and deletes
+// the key itself, and the drain then marks the position afresh (arm c) and empties the obligation.
+//
+// The race is made real, not hoped for: each writer's first commit built from the stale mark waits
+// at a rendezvous until the other's has arrived, so both are in flight against the same stale
+// bytes, and the seed's lag says which starts first — or neither, the scheduler breaking the tie —
+// over the simulated-TiKV model, whose every call spans a madsim hop. When GC's swap wins, its
+// blind key delete waits (bounded) for the drain's re-read, so the window between the swap and the
+// key delete — the one arm (0) exists for — is the one every GC-wins run exercises.
+
+const RACE_UPLOAD: &str = "10621062106210621062106210621062";
+const RACE_ATTEMPT: &str = "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7";
+const RACE_CHUNK: ChunkId = 0x1062;
+/// The stale mark both writers act on: a legacy mark stamped at 0, its grace long elapsed.
+const RACE_STALE: &[u8] = b"0";
+const RACE_GRACE: u64 = 50;
+const RACE_NOW: u64 = 10_000;
+/// How far apart, in simulated milliseconds, the two stale-value commits may start: the seed draws
+/// the drain's start relative to GC's from `-RACE_LAG_SPAN..=RACE_LAG_SPAN`. One begin hop is 1 ms,
+/// so a lag of 1 or more lets the earlier commit decide before the later one checks its
+/// precondition; 0 starts both in one tick.
+const RACE_LAG_SPAN: i64 = 2;
+/// How long a stale-value commit waits at the rendezvous for the other writer's, and GC's key
+/// delete for the drain's re-read, before going on alone — a bound, so a run whose race never forms
+/// fails its assertions instead of hanging.
+const RACE_WAIT_MILLIS: u64 = 200;
+const RACE_MAX_PASSES: usize = 32;
+
+fn race_key() -> Vec<u8> {
+    let token = RetireToken::Session {
+        upload_id: UploadId::new(RACE_UPLOAD).unwrap(),
+        epoch: 0,
+        part: Some((
+            PartNumber::new(1).unwrap(),
+            wyrd_core::multipart::AttemptId::new(RACE_ATTEMPT).unwrap(),
+        )),
+    };
+    wyrd_core::multipart::retire_key(RetireMode::Bytes, &token)
+}
+
+fn race_position() -> Vec<u8> {
+    metadata::orphan_key(1, frag_of(RACE_CHUNK))
+}
+
+/// The stale mark in GC's terminal shape: what its winning swap puts.
+fn race_reclaiming() -> Bytes {
+    metadata::encode_orphan_mark(&metadata::OrphanMark::legacy(0).into_reclaiming())
+}
+
+/// One observation at the store seam, in the order the simulation produced them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RaceEvent {
+    /// A batch preconditioned on the raced position was answered: whether it is the drain's (it
+    /// is preconditioned on the obligation too), what it required the position to hold, what it
+    /// put there, and the outcome.
+    Commit {
+        drain: bool,
+        expected: Option<Bytes>,
+        put: Option<Bytes>,
+        outcome: CommitOutcome,
+    },
+    /// A keyed read of the position returned the `reclaiming` mark. Only the drain reads a mark
+    /// by its key here; GC reads the ledger in pages.
+    ReadReclaiming,
+    /// A batch with no precondition on the position deleted its key, and committed: GC's blind key
+    /// delete after it destroyed the fragment.
+    KeyDeleted,
+}
+
+type RaceLog = Arc<Mutex<Vec<RaceEvent>>>;
+
+/// Who has reached the rendezvous, and when the commits waiting there go.
+#[derive(Default)]
+struct Rendezvous {
+    drain: bool,
+    gc: bool,
+    release: Option<madsim::time::Instant>,
+}
+
+/// A recording tap over the simulated-TiKV store, with the rendezvous and the key-delete wait
+/// above. Instance state only (ADR-0035).
+struct RaceMeta {
+    inner: SimTikvMetadataStore,
+    log: RaceLog,
+    /// How many milliseconds after GC's stale-value commit the drain's starts (negative: before).
+    lag: i64,
+    rendezvous: Mutex<Rendezvous>,
+}
+
+impl RaceMeta {
+    /// Hold a writer's first commit built from the stale mark until the other writer's has arrived
+    /// too, then start it at the shared release instant, offset by the lag for the later of the
+    /// two. A writer's later stale-value commits (GC's retry of a lost swap alone) go straight
+    /// through.
+    async fn meet(&self, drain: bool) {
+        {
+            let mut met = self.rendezvous.lock().unwrap();
+            let seat = if drain { &mut met.drain } else { &mut met.gc };
+            if std::mem::replace(seat, true) {
+                return;
+            }
+            if met.drain && met.gc {
+                // The simulation's clock (madsim virtualises `Instant`), the one every hop and
+                // sleep of this run reads; far enough ahead that the writer polling for it sees it
+                // before it passes.
+                met.release = Some(madsim::time::Instant::now() + Duration::from_millis(2));
+            }
+        }
+        let late = u64::try_from(if drain { self.lag } else { -self.lag }).unwrap_or(0);
+        for _ in 0..RACE_WAIT_MILLIS {
+            let release = self.rendezvous.lock().unwrap().release;
+            if let Some(release) = release {
+                madsim::time::sleep_until(release + Duration::from_millis(late)).await;
+                return;
+            }
+            madsim::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Hold GC's blind delete of the position's key until the drain has read the `reclaiming` mark
+    /// there, within the bound.
+    async fn await_drain_read(&self) {
+        for _ in 0..RACE_WAIT_MILLIS {
+            if self
+                .log
+                .lock()
+                .unwrap()
+                .contains(&RaceEvent::ReadReclaiming)
+            {
+                return;
+            }
+            madsim::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+#[async_trait]
+impl MetadataStore for RaceMeta {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let value = self.inner.get(key).await?;
+        if key == race_position() && value == Some(race_reclaiming()) {
+            self.log.lock().unwrap().push(RaceEvent::ReadReclaiming);
+        }
+        Ok(value)
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let position = race_position();
+        let expected = batch
+            .preconditions
+            .iter()
+            .find(|p| p.key == position)
+            .map(|p| p.expected.clone());
+        let put = batch
+            .puts
+            .iter()
+            .find(|(key, _)| *key == position)
+            .map(|(_, value)| value.clone());
+        let drain = batch.preconditions.iter().any(|p| p.key == race_key());
+        let blind_delete = expected.is_none() && batch.deletes.contains(&position);
+        if expected == Some(Some(Bytes::from_static(RACE_STALE))) {
+            self.meet(drain).await;
+        }
+        if blind_delete {
+            self.await_drain_read().await;
+        }
+        let outcome = self.inner.commit(batch).await?;
+        let mut log = self.log.lock().unwrap();
+        if let Some(expected) = expected {
+            log.push(RaceEvent::Commit {
+                drain,
+                expected,
+                put,
+                outcome,
+            });
+        } else if blind_delete && outcome == CommitOutcome::Committed {
+            log.push(RaceEvent::KeyDeleted);
+        }
+        Ok(outcome)
+    }
+}
+
+/// A D server whose listing and delete each span a simulated hop, so GC's swap, its fragment
+/// delete and its key delete are three distinct instants a concurrent drain can land between.
+struct SlowDServer<'a>(&'a MemDServer);
+
+#[async_trait]
+impl ChunkStore for SlowDServer<'_> {
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        fragment: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        self.0.put_fragment(id, fragment, deadline_millis).await
+    }
+
+    async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
+        self.0.get_fragment(id).await
+    }
+
+    async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
+        madsim::time::sleep(Duration::from_millis(1)).await;
+        self.0.list_fragments().await
+    }
+
+    async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
+        madsim::time::sleep(Duration::from_millis(2)).await;
+        self.0.delete_fragment(id).await
+    }
+
+    async fn health(&self) -> Result<Health> {
+        Ok(Health::Healthy)
+    }
+}
+
+/// One run: GC passes back to back while drain passes run from the start until the obligation is
+/// gone, the drain's stale-value commit starting `lag` milliseconds after GC's. Asserts the
+/// property and returns whether the drain's re-stamp won.
+async fn drain_races_gc(lag: i64) -> bool {
+    let d = servers();
+    let log: RaceLog = Arc::new(Mutex::new(Vec::new()));
+    let meta = Arc::new(RaceMeta {
+        inner: SimTikvMetadataStore::new(),
+        log: Arc::clone(&log),
+        lag,
+        rendezvous: Mutex::new(Rendezvous::default()),
+    });
+    let frag = frag_of(RACE_CHUNK);
+    d[1].put_fragment(frag, Bytes::from_static(b"retired"), None)
+        .await
+        .unwrap();
+    let chunk = ChunkRef {
+        id: RACE_CHUNK,
+        scheme: EcScheme::None,
+        len: 7,
+        placement: vec![1],
+    };
+    let chunks = String::from_utf8(metadata::encode(&[chunk]).to_vec()).unwrap();
+    let obligation = format!("{{\"chunks\":{chunks}}}");
+    decode_retire_obligation(&race_key(), obligation.as_bytes()).expect("a valid obligation");
+    let fixture = WriteBatch::new()
+        .put(race_key(), Bytes::from(obligation))
+        .put(race_position(), Bytes::from_static(RACE_STALE));
+    assert_eq!(
+        meta.inner.commit(fixture).await.unwrap(),
+        CommitOutcome::Committed
+    );
+
+    let done = Arc::new(AtomicBool::new(false));
+    let drainer = madsim::task::spawn({
+        let meta = Arc::clone(&meta);
+        let done = Arc::clone(&done);
+        async move {
+            let coord = MemCoordination::new();
+            let (zone, custodian) = elect(&coord, "zone-retirement-race-drain").await;
+            let clock = wyrd_testkit::ManualClock::new(RACE_NOW);
+            let topo = Topology::default();
+            for _ in 0..RACE_MAX_PASSES {
+                if meta.inner.get(&race_key()).await.unwrap().is_none() {
+                    break;
+                }
+                let ctx = ReconstructionContext {
+                    meta: &*meta,
+                    fleet: &[],
+                    topology: &topo,
+                    unreachable: &[],
+                    clock: &clock,
+                    staged_write_window_millis: 0,
+                };
+                let pass =
+                    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, RACE_NOW);
+                assert!(pass.await.is_ok(), "a drain pass failed (lag {lag} ms)");
+                madsim::time::sleep(Duration::from_millis(1)).await;
+            }
+            done.store(true, Ordering::Relaxed);
+        }
+    });
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord, "zone-retirement-race-gc").await;
+    let slow: Vec<SlowDServer<'_>> = d.iter().map(SlowDServer).collect();
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = slow
+        .iter()
+        .enumerate()
+        .map(|(id, server)| (id as DServerId, server as &dyn ChunkStore))
+        .collect();
+    let mut passes = 0;
+    // A failed GC pass is asserted after the race's own properties, which name the cause when a
+    // write over `reclaiming` made it fail (the model refuses a blind delete that loses a lock).
+    let mut failed = Vec::new();
+    loop {
+        // One more pass once the drain has finished, so a pass reads what it left.
+        let finished = done.load(Ordering::Relaxed);
+        let ctx = GcContext {
+            meta: &*meta,
+            fleet: &fleet,
+            grace_window_millis: RACE_GRACE,
+            expired_pending: ExpiredPendingPolicy::Defer,
+        };
+        let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, RACE_NOW);
+        passes += 1;
+        if let Err(fault) = outcome.await {
+            failed.push(format!("GC pass {passes}: {fault}"));
+        }
+        if finished {
+            break;
+        }
+        assert!(
+            passes < 4 * RACE_MAX_PASSES,
+            "the drain never finished (lag {lag} ms)"
+        );
+    }
+    drainer.await.expect("the drain ran to completion");
+    let events = log.lock().unwrap().clone();
+    let stale = Bytes::from_static(RACE_STALE);
+    let reclaiming = race_reclaiming();
+    let attempt = |drain: bool| {
+        events.iter().position(|event| match event {
+            RaceEvent::Commit {
+                drain: by,
+                expected: Some(expected),
+                ..
+            } => *by == drain && *expected == stale,
+            _ => false,
+        })
+    };
+    let outcome_at = |at: usize| match &events[at] {
+        RaceEvent::Commit { outcome, .. } => *outcome,
+        other => unreachable!("{other:?}"),
+    };
+
+    // A WITNESSED RACE: both writers committed a batch built from the stale mark, exactly one of
+    // the two committed, and the other lost its precondition.
+    let (Some(restamp), Some(swap)) = (attempt(true), attempt(false)) else {
+        panic!("both writers must commit from the stale mark (lag {lag} ms): {events:?}");
+    };
+    let restamp_won = outcome_at(restamp) == CommitOutcome::Committed;
+    let swap_won = outcome_at(swap) == CommitOutcome::Committed;
+    assert!(
+        restamp_won != swap_won,
+        "exactly one of the re-stamp and the swap commits over the stale mark (lag {lag} ms): \
+         {events:?}"
+    );
+    let loser = if restamp_won { swap } else { restamp };
+    assert_eq!(outcome_at(loser), CommitOutcome::Conflict, "{events:?}");
+    let stale_landed = events
+        .iter()
+        .filter(|event| {
+            matches!(event, RaceEvent::Commit {
+                expected: Some(e),
+                outcome: CommitOutcome::Committed,
+                ..
+            } if *e == stale)
+        })
+        .count();
+    assert_eq!(
+        stale_landed, 1,
+        "one commit over the stale bytes, ever: {events:?}"
+    );
+    if lag != 0 {
+        // A lag of a begin hop or more decides the order: the earlier commit wins.
+        assert_eq!(
+            restamp_won,
+            lag < 0,
+            "the earlier commit wins (lag {lag} ms): {events:?}"
+        );
+    }
+    // NO WRITE OVER `reclaiming`: no batch, the drain's or any other, is built from GC's terminal
+    // value — the drain's re-read leaves it byte-identical, never re-stamps it as arm (b).
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            RaceEvent::Commit { expected: Some(expected), .. } if *expected == reclaiming
+        )),
+        "a batch re-stamped GC's `reclaiming` mark (lag {lag} ms): {events:?}"
+    );
+    assert!(
+        failed.is_empty(),
+        "a GC pass failed (lag {lag} ms): {failed:?}"
+    );
+    if swap_won {
+        // GC won: the drain's conflict-triggered re-read met `reclaiming` after the swap and
+        // before GC's key delete, and every drain write to the position after that is arm (c).
+        let read = events
+            .iter()
+            .position(|event| *event == RaceEvent::ReadReclaiming)
+            .unwrap_or_else(|| {
+                panic!("the drain never re-read `reclaiming` (lag {lag}): {events:?}")
+            });
+        let deleted = events
+            .iter()
+            .position(|event| *event == RaceEvent::KeyDeleted)
+            .unwrap_or_else(|| panic!("GC never deleted the key (lag {lag}): {events:?}"));
+        assert!(
+            swap < read && restamp < read && read < deleted,
+            "the drain's re-read met `reclaiming` between the swap and the key delete (lag {lag}): \
+             {events:?}"
+        );
+        for event in &events[restamp + 1..] {
+            if let RaceEvent::Commit {
+                drain: true,
+                expected,
+                ..
+            } = event
+            {
+                assert_eq!(
+                    *expected, None,
+                    "after GC's swap the drain wrote over a mark (lag {lag} ms): {events:?}"
+                );
+            }
+        }
+        assert!(
+            d[1].get_fragment(frag).await.unwrap().is_none(),
+            "GC won and did not reclaim"
+        );
+    } else {
+        assert!(
+            !events.contains(&RaceEvent::KeyDeleted),
+            "the drain won and GC deleted its key: {events:?}"
+        );
+        assert!(
+            d[1].get_fragment(frag).await.unwrap().is_some(),
+            "the drain won, its fresh mark inside grace, and the fragment was reclaimed: \
+             {events:?}"
+        );
+    }
+    // THE OBLIGATION DRAINS TO EMPTY, and the position carries its event's fresh mark.
+    assert!(
+        meta.inner.get(&race_key()).await.unwrap().is_none(),
+        "the obligation did not drain (lag {lag} ms): {events:?}"
+    );
+    let mark = meta.inner.get(&race_position()).await.unwrap();
+    let mark = metadata::decode_orphan_mark(&mark.expect("the position is marked")).unwrap();
+    let event = race_key()[b"retire:bytes:".len()..].to_vec();
+    assert_eq!(mark.event().map(str::as_bytes), Some(event.as_slice()));
+    assert!(!mark.is_reclaiming());
+    restamp_won
+}
+
+/// The campaign leg: the seed draws the lag between the two stale-value commits, so the seeds
+/// sweep which one starts first and the tie the scheduler breaks.
+async fn prop_retirement_restamp_races_gc_swap(rng: &mut ChaCha8Rng) {
+    let span = 2 * RACE_LAG_SPAN + 1;
+    let lag = i64::from(rng.next_u32()) % span - RACE_LAG_SPAN;
+    drain_races_gc(lag).await;
+}
+
+/// **Both winners are genuinely REACHED.** Walks the lag across the whole span, asserting the
+/// property — a witnessed race, one winner, no write over `reclaiming`, the obligation drained — at
+/// every point, then asserts that the drain's re-stamp won in some run and GC's swap in another.
+async fn prop_retirement_restamp_reaches_both_winners() {
+    let (mut restamp, mut swap) = (false, false);
+    for lag in -RACE_LAG_SPAN..=RACE_LAG_SPAN {
+        let won = drain_races_gc(lag).await;
+        restamp |= won;
+        swap |= !won;
+    }
+    assert!(
+        restamp,
+        "no lag in ±{RACE_LAG_SPAN} ms let the drain's re-stamp win"
+    );
+    assert!(swap, "no lag in ±{RACE_LAG_SPAN} ms let GC's swap win");
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -6628,6 +7114,18 @@ dst_campaign_test! {
     }
 }
 
+dst_campaign_test! {
+    async fn retirement_restamp_races_gc_swap() {
+        prop_retirement_restamp_races_gc_swap(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn retirement_restamp_reaches_both_winners() {
+        prop_retirement_restamp_reaches_both_winners().await;
+    }
+}
+
 // ---- committed regression seeds (ADR-0009: a bug-finding seed is a permanent test) ----
 
 /// Seeds committed as **permanent regressions** (ADR-0009, `0005:374`): the campaign
@@ -6672,6 +7170,7 @@ dst_replay_test! {
             prop_restore_fence_settles_an_ambiguous_commit(&mut rng).await;
             prop_drain_repoint_versus_supersede_is_all_or_nothing(&mut rng).await;
             prop_drain_ceiling_refusal_is_confirmed_on_the_segment(&mut rng).await;
+            prop_retirement_restamp_races_gc_swap(&mut rng).await;
         }
     }
 }

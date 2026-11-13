@@ -378,8 +378,9 @@ impl RestoreReport {
     /// ([`RestoreReport::segments_unaccounted`]).
     ///
     /// **A deliberate exception to that rule:** an untrusted staged record
-    /// ([`RestoreReport::staged_untrusted`]) is left out, although no loop removes one yet
-    /// (whether the retire drain does is #659's call). It rests on the human's decision at #664's
+    /// ([`RestoreReport::staged_untrusted`]) is left out, although no loop removes one yet (the
+    /// retirement drain holds one rather than mark from its placement, #1062; retiring it by chunk
+    /// id is #1013's). It rests on the human's decision at #664's
     /// plan revision (2026-09-18), not on the rule above: once the session is fenced its staged
     /// bytes are garbage whatever the record says, so what is left is cleanup — automatic work,
     /// not a judgement — and keep-on-doubt protects user data, not system residue (#811). Its
@@ -1153,9 +1154,14 @@ fn unsettled(report: &mut RestoreReport, session: String, cause: SessionUnsettle
 /// re-run names it again. Its deleter is `retire:records:s:<id>:<E'-1>`, filed by a `Completing`
 /// fence, and trusted only if it owes `group` and nothing else: any other is the first record at
 /// fault. Its absence proves nothing (a damaged or hand-repaired store): the range must be empty.
-// deferred: #659 — a retire drain may delete part of this range, or the parts it is checked
-// against, between two runs; a half-drained range can then read as chunks no part holds, or,
-// its obligation dropped first, as records with no deleter.
+///
+/// **What the retirement drain guarantees between two runs** (`crate::retirement`): the records
+/// obligation goes only in the batch that deletes the range's last record, so a range with records
+/// left always has its deleter; and the session token's `retire:bytes:` obligation deletes no
+/// `part:` record of the session while this records obligation still owes the range (segments
+/// before parts, #1062), so every surviving segment's chunks are still held by surviving parts. A
+/// half-drained attempt therefore reads as clean here, never as chunks no part holds or as records
+/// with no deleter.
 async fn recheck_fenced(
     meta: &dyn MetadataStore,
     session: &str,
