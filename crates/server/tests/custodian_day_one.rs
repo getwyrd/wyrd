@@ -626,6 +626,8 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
         unreachable: &unreachable,
         clock: &pass_clock,
         staged_write_window_millis: 0,
+        operator_fleet_size: live_fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
     let coord = MemCoordination::new();
@@ -750,6 +752,8 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
         unreachable: &unreachable,
         clock: &pass_clock,
         staged_write_window_millis: 0,
+        operator_fleet_size: live_fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
     let coord = MemCoordination::new();
@@ -870,6 +874,8 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         unreachable: &unreachable,
         clock: &wyrd_testkit::ManualClock::new(500),
         staged_write_window_millis: 0,
+        operator_fleet_size: live_fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     service
         .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
@@ -920,6 +926,8 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         unreachable: &unreachable2,
         clock: &wyrd_testkit::ManualClock::new(600),
         staged_write_window_millis: 0,
+        operator_fleet_size: live_fleet2.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     service
         .reconcile_pass(&zone, &custodian, None, None, Some(&ctx2), None, 600)
@@ -1003,6 +1011,8 @@ async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
         unreachable: &unreachable,
         clock: &pass_clock,
         staged_write_window_millis: 0,
+        operator_fleet_size: live_fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
     let coord = MemCoordination::new();
@@ -1714,6 +1724,8 @@ async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
         unreachable: &unreachable,
         clock: &wyrd_testkit::ManualClock::new(500),
         staged_write_window_millis: 0,
+        operator_fleet_size: live_fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
     let coord = MemCoordination::new();
@@ -1813,6 +1825,8 @@ async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
         unreachable: &unreachable,
         clock: &wyrd_testkit::ManualClock::new(500),
         staged_write_window_millis: 0,
+        operator_fleet_size: live_fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
     let coord = MemCoordination::new();

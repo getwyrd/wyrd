@@ -17,9 +17,12 @@
 //! | segmented `{generation}` | a segment index | its `seg:` record's chunks, at the placement read **now** (`0016:2432-2440`) | the `seg:` record |
 //!
 //! A `session` component (`{session}`, `{session, all}`, `{session, parts}`) owes the session's
-//! owned `sidx:` residue. Walking that range is #1013's; this mode reads one row of it, and while
-//! the range is not empty the obligation is **held** ([`Hold::OwnedResidue`]): it is the only
-//! deleter in reach of that residue, so it never goes while the session still owns some.
+//! owned `sidx:` residue. Walking that range is the session leg's ([`super::sessions`]); this mode
+//! reads one row of it, and while the range is not empty the obligation never goes. For a session
+//! in `Aborting` or `Completed`, which the owned walk drains, the step **waits**
+//! ([`OWNED_RESIDUE_FIRST`]); for any other — its record absent, undecodable or still before the
+//! teardown — the obligation is the only deleter in reach of that residue and is **held**
+//! ([`Hold::OwnedResidue`]).
 //!
 //! # The mark guard: the `reclaiming` check, then three arms
 //!
@@ -74,8 +77,24 @@
 //! record was the only list of the entry's remaining positions, so the walk never takes its
 //! absence for the end of the component. The step stops there, and the obligation and its cursor
 //! stay: the safe direction, since GC reclaims no fragment it holds no mark for, and its staged
-//! class holds every fragment of an untrusted `part:` record's chunk whole. #1013 turns the hold
-//! into retirement by chunk id.
+//! class holds every fragment of an untrusted `part:` record's chunk whole.
+//!
+//! **Except for an `Aborting` session's `part:` record** (the parent module's *Untrusted records*):
+//! on a pass that sees the whole fleet its untrusted chunks are found by chunk id. Its **items**,
+//! which the cursor's `item` counts, are its trusted chunks' placed positions in record order and
+//! then its untrusted chunks in chunk-id order, **one item a chunk**: a step resumes inside the
+//! trusted positions as for any entry, and an untrusted chunk is covered only once every fragment
+//! bearing its id that the fleet's listings find has been read in that one step — marked, or
+//! already this obligation's. A listing is no order a cursor can count into: a fragment that leaves
+//! it moves every later one down, so a count would step over one never marked. Nothing adds one to
+//! a part's chunk once the session has left `Open` — the part's commit followed every write's `Ok`,
+//! and reconstruction's re-place runs only for an `Open` upload and marks its target first — so a
+//! chunk covered stays covered. The record is deleted, as any entry's, in a step after the one
+//! that marked its last item. The step lists the fleet once, when it reaches the untrusted chunks,
+//! and stops after that entry. A chunk listed past what one step reads is held
+//! ([`Hold::ListingPastStep`]); on a pass that does not see the whole fleet the entry is held
+//! before anything of it is marked ([`Hold::PartialFleet`]); for a session in any other state, or
+//! one whose record cannot be read, the hold above stays.
 //!
 //! # Segments before parts
 //!
@@ -91,24 +110,28 @@
 //!
 //! A step reads one `sidx:` row, the records obligation, at most
 //! [`super::ENTRIES_PER_MARKING_STEP`] records (one keyed read each for a part-number set, one page
-//! for `all` or a segment range) and at most [`super::MARKS_PER_STEP`] marks, and its batch carries
-//! at most two operations per mark and two per deleted entry beside its fixed two
+//! for `all` or a segment range) and at most [`super::MARKS_PER_STEP`] marks — less one, when it
+//! reads the session record of an untrusted `part:` record — and lists the fleet at most once; its
+//! batch carries at most two operations per mark and two per deleted entry beside its fixed two
 //! ([`super::READS_PER_MARKING_STEP`]).
+
+use std::collections::BTreeSet;
 
 use wyrd_core::metadata::{
     self, decode_orphan_mark, encode_orphan_mark, orphan_key, seg_key, seg_range_prefix, ChunkRef,
     OrphanMark, SegmentGroup, SegmentRecord, MAX_SEGMENT_INDEX,
 };
 use wyrd_core::multipart::{
-    decode_part_record, decode_retire_obligation, parse_part_key, part_key, part_range, psum_key,
-    retire_key, sidx_range, PartNumber, PartNumberSet, PartScope, RetireComponent, RetireCursor,
-    RetireMode, RetirePayload, RetireToken, RetiredMap, UploadId, MAX_PART_NUMBER,
+    decode_part_record, decode_retire_obligation, decode_session_record, mpu_key, parse_part_key,
+    part_key, part_range, psum_key, retire_key, sidx_range, PartNumber, PartNumberSet, PartScope,
+    RetireComponent, RetireCursor, RetireMode, RetirePayload, RetireToken, RetiredMap,
+    SessionState, UploadId, MAX_PART_NUMBER,
 };
-use wyrd_traits::{DServerId, FragmentId, MetadataStore, Result};
+use wyrd_traits::{ChunkId, DServerId, FragmentId, MetadataStore, Result};
 
 use super::{
-    advanced_value, segment_index, Budget, Held, Hold, Mark, Planned, Step,
-    ENTRIES_PER_MARKING_STEP, MARKS_PER_STEP,
+    advanced_value, listing_past_step, segment_index, Budget, ByChunk, Held, Hold, Mark, Planned,
+    Step, ENTRIES_PER_MARKING_STEP, LISTED_PER_CHUNK, MARKS_PER_STEP,
 };
 use crate::gc::{checked_page, object_name, staged_placement};
 
@@ -120,6 +143,10 @@ pub(super) const AWAITING_GC: &str = "awaiting-gc";
 /// `part:` record goes yet.
 pub(super) const SEGMENTS_FIRST: &str = "segments-first";
 
+/// A wait: the session still owns `sidx:` residue, which the owned walk ([`super::sessions`])
+/// empties first; the obligation goes only after it.
+pub(super) const OWNED_RESIDUE_FIRST: &str = "owned-residue-first";
+
 /// A wait that no state should produce — a step that read and changed nothing with no cause to
 /// name. Counted rather than taken for progress.
 const NO_PROGRESS: &str = "no-progress";
@@ -128,10 +155,11 @@ const NO_PROGRESS: &str = "no-progress";
 /// stamp and an event of [`metadata::MAX_ORPHAN_EVENT_LEN`] bytes —
 /// `{"orphaned_at_millis":` (22) + 20 + `,"event":"` (10) + 256 + `","reclaiming":true}` (20) =
 /// 328, the figure the codec's tests pin. What a re-stamp's precondition carries at most.
-const MARK_MAX_BYTES: usize = 72 + metadata::MAX_ORPHAN_EVENT_LEN;
+pub(super) const MARK_MAX_BYTES: usize = 72 + metadata::MAX_ORPHAN_EVENT_LEN;
 
 /// Plan the next step of the `retire:bytes:` obligation at `key`, whose stored bytes are `prior`,
-/// stamping every mark it writes `stamp_millis` (module doc).
+/// stamping every mark it writes `stamp_millis` (module doc). `by_chunk` is what an untrusted
+/// `part:` record of an `Aborting` session is retired through.
 pub(super) async fn plan(
     meta: &dyn MetadataStore,
     key: &[u8],
@@ -139,6 +167,7 @@ pub(super) async fn plan(
     token: &RetireToken,
     payload: &RetirePayload,
     stamp_millis: u64,
+    by_chunk: &ByChunk<'_>,
 ) -> Result<Planned> {
     let event = token.to_string();
     let stamp = match OrphanMark::structured(stamp_millis, event.clone()) {
@@ -149,8 +178,8 @@ pub(super) async fn plan(
         }
     };
     if payload.session() {
-        if let Some(held) = owned_residue(meta, token).await? {
-            return Ok(Planned::Held(held));
+        if let Some(waiting) = owned_residue(meta, token).await? {
+            return Ok(waiting);
         }
     }
     let work = if payload.parts().is_some() {
@@ -181,7 +210,7 @@ pub(super) async fn plan(
         }));
     };
     let at = cursor.map(|cursor| (cursor.entry(), cursor.item()));
-    let mut walk = Walk::new(meta, event, stamp, &Budget::for_step(key, prior));
+    let mut walk = Walk::new(meta, by_chunk, event, stamp, &Budget::for_step(key, prior));
     let tail = match (work, token) {
         (RetireComponent::Parts, RetireToken::Session { upload_id, .. }) => {
             walk.may_delete = segments_drained(meta, token).await?;
@@ -205,22 +234,38 @@ pub(super) async fn plan(
     Ok(walk.finish(payload, work, at, tail))
 }
 
-/// The hold for a session that still owns staged residue: the first key of its `sidx:` range, if
-/// the range is not empty. One row is read; the walk that empties the range is #1013's.
-async fn owned_residue(meta: &dyn MetadataStore, token: &RetireToken) -> Result<Option<Held>> {
+/// What a step does while its session still owns staged residue, if its `sidx:` range is not
+/// empty: wait for the owned walk ([`super::sessions`]) when the session is one it drains — in
+/// `Aborting` or `Completed` — and otherwise hold, naming the range's first key. One row of the
+/// range is read, and the session record when it is not empty.
+async fn owned_residue(meta: &dyn MetadataStore, token: &RetireToken) -> Result<Option<Planned>> {
     let RetireToken::Session { upload_id, .. } = token else {
         let detail = "a `session` component under a generation token".to_owned();
-        return Ok(Some(Held::of(Hold::CursorRefused, detail)));
+        return Ok(Some(Planned::Held(Held::of(Hold::CursorRefused, detail))));
     };
     let (left, _) = checked_page(meta, &sidx_range(upload_id), "retire-sidx", None, 1).await?;
-    Ok(left.first().map(|(first, _)| Held {
+    let Some((first, _)) = left.first() else {
+        return Ok(None);
+    };
+    let walked = match meta.get(&mpu_key(upload_id)).await? {
+        Some(value) => matches!(
+            decode_session_record(&value).map(|session| session.state().clone()),
+            Ok(SessionState::Aborting {} | SessionState::Completed { .. })
+        ),
+        None => false,
+    };
+    if walked {
+        return Ok(Some(Planned::Wait(OWNED_RESIDUE_FIRST)));
+    }
+    Ok(Some(Planned::Held(Held {
         reason: Hold::OwnedResidue,
-        detail: "the session still owns staged residue under its `sidx:` range; the owned walk \
-                 that empties it is #1013's, and this obligation stays until it has"
+        detail: "the session still owns staged residue under its `sidx:` range, and its record is \
+                 absent, will not decode or is not past `Open`, so no owned walk empties it; this \
+                 obligation stays"
             .to_owned(),
         position: None,
         record: Some(first.clone()),
-    }))
+    })))
 }
 
 /// Whether the session token's `retire:records:` obligation owes no segments any more — absent, or
@@ -238,7 +283,7 @@ async fn segments_drained(meta: &dyn MetadataStore, token: &RetireToken) -> Resu
 }
 
 /// What a mark read at a position says the guard must do (module doc, *The mark guard*).
-enum Arm {
+pub(super) enum Arm {
     /// (c): no mark.
     Absent,
     /// (a): this obligation's own event, not `reclaiming`.
@@ -251,7 +296,8 @@ enum Arm {
     Unreadable(String),
 }
 
-async fn read_arm(meta: &dyn MetadataStore, key: &[u8], event: &str) -> Result<Arm> {
+/// Read the mark at `key` and say which arm of the guard it takes for `event`.
+pub(super) async fn read_arm(meta: &dyn MetadataStore, key: &[u8], event: &str) -> Result<Arm> {
     let Some(stored) = meta.get(key).await? else {
         return Ok(Arm::Absent);
     };
@@ -298,9 +344,22 @@ enum Stop {
     Held(Held),
 }
 
+/// What a run of positions came to ([`Walk::run`]).
+struct Run {
+    /// How many of them, from the first, the step covered: read as this obligation's, or queued to
+    /// be marked in its batch.
+    covered: usize,
+    /// Whether every one covered already carried this obligation's mark before this step.
+    evidenced: bool,
+}
+
 /// One step's walk: what it has read, written and deleted, and where its cursor goes.
 struct Walk<'s> {
     meta: &'s dyn MetadataStore,
+    by_chunk: &'s ByChunk<'s>,
+    /// Whether the obligation's session is `Aborting`, once this step has read its record: an
+    /// untrusted `part:` record is retired by chunk id only for such a session.
+    aborting: Option<bool>,
     event: String,
     stamp: Vec<u8>,
     reads_left: usize,
@@ -322,9 +381,17 @@ struct Walk<'s> {
 }
 
 impl<'s> Walk<'s> {
-    fn new(meta: &'s dyn MetadataStore, event: String, stamp: Vec<u8>, budget: &Budget) -> Self {
+    fn new(
+        meta: &'s dyn MetadataStore,
+        by_chunk: &'s ByChunk<'s>,
+        event: String,
+        stamp: Vec<u8>,
+        budget: &Budget,
+    ) -> Self {
         Self {
             meta,
+            by_chunk,
+            aborting: None,
             event,
             stamp,
             reads_left: MARKS_PER_STEP,
@@ -356,11 +423,25 @@ impl<'s> Walk<'s> {
             self.held_at(entry.index, from, held);
             return Ok(());
         };
-        let mut covered = from as usize;
-        // Every position covered carried this obligation's mark before this step: the ones before
-        // the cursor, which no step passes unmarked, and each read below that was arm (a).
-        let mut evidenced = true;
-        for &(dserver, frag) in rest {
+        let run = self.run(rest, entry).await?;
+        let covered = from as usize + run.covered;
+        let marked = covered == total;
+        let finished = marked && (entry.deletes.is_empty() || self.delete(entry, run.evidenced));
+        if !finished {
+            self.unfinished(entry.index, covered as u32);
+        }
+        Ok(())
+    }
+
+    /// Apply the guard to each of `positions`, a run of `entry`'s, in order, until one stops the
+    /// step: queue a mark where one is owed, and say how many it covered and whether each of
+    /// those already carried this obligation's mark.
+    async fn run(&mut self, positions: &[(DServerId, FragmentId)], entry: &Entry) -> Result<Run> {
+        let mut run = Run {
+            covered: 0,
+            evidenced: true,
+        };
+        for &(dserver, frag) in positions {
             let key = orphan_key(dserver, frag);
             // Reserve the worst case before the read: two operations and a re-stamp's bytes.
             let cost = 2 * key.len() + MARK_MAX_BYTES + self.stamp.len();
@@ -373,11 +454,11 @@ impl<'s> Walk<'s> {
                 Arm::Own => {}
                 Arm::Absent => {
                     self.mark(key, None, cost);
-                    evidenced = false;
+                    run.evidenced = false;
                 }
                 Arm::Other(read) => {
                     self.mark(key, Some(read), cost);
-                    evidenced = false;
+                    run.evidenced = false;
                 }
                 Arm::Reclaiming if entry.retained => {
                     let detail = "a `reclaiming` mark over a position a record this drain keeps \
@@ -407,10 +488,132 @@ impl<'s> Walk<'s> {
                     break;
                 }
             }
-            covered += 1;
+            run.covered += 1;
         }
-        let marked = covered == total;
-        let finished = marked && (entry.deletes.is_empty() || self.delete(entry, evidenced));
+        Ok(run)
+    }
+
+    /// Part `n`'s record as [`load_part`] read it, walked from `from` when every chunk of it is
+    /// trusted. When one is not, it is retired by chunk id if its session is `Aborting`
+    /// ([`Self::by_chunk_part`]), and held otherwise.
+    async fn part(
+        &mut self,
+        upload_id: &UploadId,
+        n: u32,
+        from: u32,
+        loaded: std::result::Result<PartEntry, Held>,
+    ) -> Result<()> {
+        let PartEntry { entry, damaged } = match loaded {
+            Ok(part) => part,
+            Err(held) => {
+                self.held_at(n, from, held);
+                return Ok(());
+            }
+        };
+        let Some((chunks, held)) = damaged else {
+            return self.entry(&entry, from).await;
+        };
+        let aborting = match self.aborting {
+            Some(aborting) => aborting,
+            None if self.reads_left == 0 => {
+                self.stop = Some(Stop::Budget);
+                self.unfinished(n, from);
+                return Ok(());
+            }
+            None => {
+                // Out of the positions' share of the step's reads, so the step's bound holds.
+                self.reads_left -= 1;
+                let aborting = match self.meta.get(&mpu_key(upload_id)).await? {
+                    Some(value) => matches!(
+                        decode_session_record(&value).map(|session| session.state().clone()),
+                        Ok(SessionState::Aborting {})
+                    ),
+                    None => false,
+                };
+                *self.aborting.insert(aborting)
+            }
+        };
+        if !aborting {
+            self.held_at(n, from, held);
+            return Ok(());
+        }
+        self.by_chunk_part(&entry, &chunks, from).await
+    }
+
+    /// Part `entry` of an `Aborting` session, whose chunks `untrusted` the staged rule refuses,
+    /// retired by chunk id from item `from` (module doc, *Placements are validated before
+    /// marking*): its trusted positions from the cursor, then its untrusted chunks one item each,
+    /// a chunk covered only once every fragment of it the listings find was read in this step.
+    /// The step lists the fleet once, when it reaches those chunks, and ends after this entry.
+    async fn by_chunk_part(
+        &mut self,
+        entry: &Entry,
+        untrusted: &BTreeSet<ChunkId>,
+        from: u32,
+    ) -> Result<()> {
+        let record = entry.record.clone().unwrap_or_default();
+        if let Err(held) = self.by_chunk.whole(&record) {
+            // A short fleet changes nothing of the record, its trusted positions included.
+            self.held_at(entry.index, from, held);
+            return Ok(());
+        }
+        self.first_met.get_or_insert(entry.index);
+        let trusted = entry.positions.len();
+        let items = trusted + untrusted.len();
+        let mut covered = from as usize;
+        if covered > items {
+            let detail = format!(
+                "the cursor names item {from} of a part retired by chunk id, whose items are \
+                 {trusted} trusted position(s) and {} untrusted chunk(s)",
+                untrusted.len()
+            );
+            let held = Held {
+                reason: Hold::CursorRefused,
+                detail,
+                position: None,
+                record: entry.record.clone(),
+            };
+            self.held_at(entry.index, from, held);
+            return Ok(());
+        }
+        let mut evidenced = true;
+        if let Some(rest) = entry.positions.get(covered..) {
+            let run = self.run(rest, entry).await?;
+            covered += run.covered;
+            evidenced = run.evidenced;
+        }
+        let wanted: BTreeSet<ChunkId> = untrusted
+            .iter()
+            .skip(covered.saturating_sub(trusted))
+            .copied()
+            .collect();
+        if covered >= trusted && self.stop.is_none() && !wanted.is_empty() {
+            match self.by_chunk.listed(&wanted, &record).await {
+                Ok(listed) => {
+                    for chunk in &wanted {
+                        let fragments = listed.get(chunk).map_or(&[][..], Vec::as_slice);
+                        if fragments.len() > LISTED_PER_CHUNK {
+                            let held =
+                                listing_past_step(*chunk, fragments.len(), entry.record.clone());
+                            self.stop = Some(Stop::Held(held));
+                            break;
+                        }
+                        let run = self.run(fragments, entry).await?;
+                        if run.covered < fragments.len() {
+                            // Stopped inside the chunk: none of it is counted, and the next step
+                            // reads it whole again.
+                            break;
+                        }
+                        covered += 1;
+                        evidenced &= run.evidenced;
+                    }
+                }
+                Err(held) => self.stop = Some(Stop::Held(held)),
+            }
+            // One listing per step: the next entry waits for the next step.
+            self.stop.get_or_insert(Stop::Budget);
+        }
+        let finished = covered == items && self.delete(entry, evidenced);
         if !finished {
             self.unfinished(entry.index, covered as u32);
         }
@@ -529,10 +732,8 @@ async fn parts_set(
         let from = from_for(at, n);
         let key = part_key(upload_id, part_number(n));
         let value = walk.meta.get(&key).await?;
-        match load_part(upload_id, n, key, value.as_deref()) {
-            Ok(entry) => walk.entry(&entry, from).await?,
-            Err(held) => walk.held_at(n, from, held),
-        }
+        let loaded = load_part(upload_id, n, key, value.as_deref());
+        walk.part(upload_id, n, from, loaded).await?;
     }
 }
 
@@ -585,10 +786,8 @@ async fn parts_all(
                 return Ok(walk.held_at_cursor(held));
             }
         }
-        match load_part(upload_id, n, key, Some(value.as_ref())) {
-            Ok(entry) => walk.entry(&entry, from_for(at, n)).await?,
-            Err(held) => walk.held_at(n, from_for(at, n), held),
-        }
+        let loaded = load_part(upload_id, n, key, Some(value.as_ref()));
+        walk.part(upload_id, n, from_for(at, n), loaded).await?;
         last = Some(n);
     }
     if last.is_none() {
@@ -650,15 +849,22 @@ fn from_for(at: Option<(u32, u32)>, n: u32) -> u32 {
     }
 }
 
-/// Part `n`'s record at `key`, read as `value`, as an entry: its chunks' positions at the
-/// placement it records, each held to the staged rule, and its `part:` and `psum:` records to
-/// delete. Absent, undecodable or untrusted, it is a hold.
+/// A `part:` record read as an entry, with the chunks of it whose placement the staged rule
+/// refuses — none of whose positions is in the entry — and the hold naming the first of them.
+struct PartEntry {
+    entry: Entry,
+    damaged: Option<(BTreeSet<ChunkId>, Held)>,
+}
+
+/// Part `n`'s record at `key`, read as `value`, as an entry: its trusted chunks' positions at the
+/// placement it records, each held to the staged rule, the chunks the rule refuses set apart, and
+/// its `part:` and `psum:` records to delete. Absent or undecodable, it is a hold.
 fn load_part(
     upload_id: &UploadId,
     n: u32,
     key: Vec<u8>,
     value: Option<&[u8]>,
-) -> std::result::Result<Entry, Held> {
+) -> std::result::Result<PartEntry, Held> {
     let unreadable = |detail: String, key: &Vec<u8>| Held {
         reason: Hold::RecordUnreadable,
         detail,
@@ -673,9 +879,18 @@ fn load_part(
     };
     let record = match decode_part_record(value) {
         Ok(record) => record,
-        Err(fault) => return Err(unreadable(fault.to_string(), &key)),
+        Err(fault) => {
+            // Never retired by chunk id: the key names no chunk, so finding the record's bytes
+            // would mean trusting the value the decoder refused.
+            let detail = format!(
+                "{fault}; a `part:` key names no chunk, so its bytes cannot be found by chunk id \
+                 either — needs a human (operator repair)"
+            );
+            return Err(unreadable(detail, &key));
+        }
     };
     let mut positions = Vec::new();
+    let mut damaged: Option<(BTreeSet<ChunkId>, Held)> = None;
     for chunk in record.chunks() {
         match staged_placement(chunk) {
             Ok(fragments) => positions.extend(fragments.map(|(index, dserver)| {
@@ -686,18 +901,23 @@ fn load_part(
                 (dserver, frag)
             })),
             Err(m) => {
-                return Err(untrusted(chunk, m.expected, m.actual, Some(key)));
+                let (chunks, _) = damaged.get_or_insert_with(|| {
+                    let held = untrusted(chunk, m.expected, m.actual, Some(key.clone()));
+                    (BTreeSet::new(), held)
+                });
+                chunks.insert(chunk.id);
             }
         }
     }
     let psum = psum_key(upload_id, part_number(n));
-    Ok(Entry {
+    let entry = Entry {
         index: n,
         record: Some(key.clone()),
         deletes: vec![key, psum],
         positions,
         retained: true,
-    })
+    };
+    Ok(PartEntry { entry, damaged })
 }
 
 /// The hold for `chunk`, whose placement names `actual` D servers for a scheme of `expected`

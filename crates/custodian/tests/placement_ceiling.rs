@@ -284,6 +284,8 @@ async fn repair_pass(meta: &MemMeta, fleet: &Fleet, topology: &Topology) -> (Rec
         unreachable: &[],
         clock: &wyrd_testkit::ManualClock::new(500),
         staged_write_window_millis: 0,
+        operator_fleet_size: view.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     pass(Some(&ctx), None).await
 }
