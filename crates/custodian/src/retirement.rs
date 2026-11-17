@@ -23,7 +23,8 @@
 //!
 //! [`crate::reconcile_step`] runs the leg on the **reconstruction** input, after the
 //! reconstruction loop, so the deployed custodian runs it every reconstruction pass
-//! (`crates/server/src/custodian.rs`, `run_reconstruction_until`). One pass:
+//! (`crates/server/src/custodian.rs`, `run_reconstruction_until`). One pass of the ledger walk
+//! (the session leg before it has bounds of its own, [`sessions`]):
 //!
 //! * visits at most [`VISITS_PER_PASS`] obligations, read in pages of [`LEDGER_PAGE`]; every
 //!   obligation read counts, whether it progresses, cannot progress, or is not this build's to
@@ -105,12 +106,80 @@
 //! [`MAX_VALUE_BYTES`]. The ceiling hold is the backstop for one installed without that room.
 //!
 //! A marking step adds its own holds ([`marks`]): a session whose owned `sidx:` range is not empty
-//! ([`Hold::OwnedResidue`]), a record whose placement it cannot trust or cannot read
-//! ([`Hold::UntrustedPlacement`], [`Hold::RecordUnreadable`]), a mark that is none of the three
-//! shapes ([`Hold::UnreadableMark`]), and a `reclaiming` mark over a position a record the drain
-//! keeps still names ([`Hold::ReclaimingRetained`], which needs a human).
+//! and that the owned walk does not drain ([`Hold::OwnedResidue`]), a record whose placement it
+//! cannot trust or cannot read ([`Hold::UntrustedPlacement`], [`Hold::RecordUnreadable`]), an
+//! untrusted record of an `Aborting` session on a pass that does not see the whole fleet
+//! ([`Hold::PartialFleet`]), a mark that is none of the three shapes ([`Hold::UnreadableMark`]),
+//! and a `reclaiming` mark over a position a record the drain keeps still names
+//! ([`Hold::ReclaimingRetained`], which needs a human).
+//!
+//! # The session leg, first
+//!
+//! Before it walks the ledger the pass runs the **session leg** ([`sessions`], #1013): for every
+//! session in `Aborting` or `Completed`, the owned `sidx:` walk and then the **terminal session
+//! delete** — the session record, its surviving `slot:` records, its `seggrp:` marker when no
+//! `seg:` record names the nonce, and the one `mpuctl` decrement, in one batch preconditioned on
+//! the session record's exact bytes (`0016:674`). It runs first so a session's residue is gone
+//! before its `{session}` obligation is read, which then drains instead of waiting. The walk keeps
+//! two small records of its own per session, removed with it at the latest: how far it has got
+//! inside one entry ([`owned_walk_key`]), and where its next page starts once it has passed entries
+//! it holds ([`owned_scan_key`]).
+//!
+//! # Untrusted records, retired by chunk id
+//!
+//! For an `Aborting` session only, a record whose placement the drain cannot trust — a `part:`
+//! record or an owned `sidx:` entry whose placement is not its scheme's fragment count, or an
+//! `sidx:` value that will not decode under a key naming its chunk — is retired **by chunk id**:
+//! every fragment bearing that chunk id that the fleet's own listings find is marked, and for an
+//! `sidx:` entry that decodes every position it names as well, and only then is the record
+//! deleted (#659; decision 4 rule 2, `0016:1123`). A
+//! `part:` record's chunk has no write in flight (its commit follows every write's `Ok`); an
+//! `sidx:` entry's may (`wyrd_core::multipart::stage`, *The write deadline*), which is why the
+//! positions such an entry names are marked too. **Residual:** a write that lands after the
+//! listing at a position the entry does not name — its value undecodable, or its placement
+//! damaged where the write went — has no mark and no record, and GC keeps it for good: kept,
+//! never lost, never reclaimed automatically.
+//!
+//! **Only on a pass that sees the whole fleet** ([`ByChunk`]): `fleet.len()` equal to the
+//! operator's configured fleet size, the gate the deployed loop puts on GC
+//! (`crates/server/src/custodian.rs`, `run_reconstruction_until`). A listing finds only what the
+//! servers it reaches hold, so retiring a record on a partial one would leave a missing server's
+//! fragments with no mark and no record. On any other pass the record is held
+//! ([`Hold::PartialFleet`]) and nothing of it changes.
+//!
+//! **One chunk's listed fragments are walked within one step.** The positions a record names
+//! itself — a `part:` record's trusted chunks, an `sidx:` entry's placement — are a fixed order,
+//! so a step resumes inside them from a cursor. A listing is no such order: a fragment that leaves
+//! it shifts every later one, so a count into it could step over a fragment never marked. So a
+//! step that reaches a chunk's listed fragments reads every one of them, and progress is counted
+//! a whole chunk at a time. A chunk whose listing shows more fragments than one step reads
+//! ([`LISTED_PER_CHUNK`]) is held ([`Hold::ListingPastStep`]), its record and fragments kept.
+//!
+//! **The cost.** A listing is one `list_fragments` per configured server, taken by a step only
+//! when it reaches the listed fragments of such a record, at most once per step. The ledger walk
+//! spends a step on every obligation it plans, so it lists at most [`STEPS_PER_PASS`] times a
+//! pass. The session leg spends a step only on a commit that marks or deletes something, and a
+//! walk step that does neither ends its session's visit for the pass, so it lists at most
+//! `SESSION_STEPS_PER_PASS` times for steps that do and once more for each `Aborting` session
+//! whose step lists and then marks and deletes nothing — at most the sessions `mpuctl` admits
+//! (`max_sessions`, 46 at the shipped profile), again every pass while such a session's hold
+//! stands. That is at most `(16 + 16 + 46)` listings of the fleet a pass. A step that marks and
+//! deletes nothing is not charged, whether or not it moves the walk's bookmark: a held session
+//! would then spend a step every pass, and enough of them would starve every session listed after
+//! them. It does not reuse GC's listing: GC runs as a fenced pass of its own, after this one, so a
+//! GC fault never costs the drain its pass.
+//!
+//! For any other state the hold stays: an `Open` session's record keeps protecting its chunk. A
+//! `part:` value that will not decode is never retired: its key names no chunk, so finding its
+//! bytes would mean trusting the value the decoder refused. It is held as
+//! [`Hold::RecordUnreadable`], audited as needing a human.
 
 mod marks;
+mod sessions;
+
+pub use sessions::{owned_scan_key, owned_walk_key, OWNED_SCAN_PREFIX, OWNED_WALK_PREFIX};
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use wyrd_core::metadata::{self, seg_key, seg_range_prefix, SegmentGroup, MAX_VALUE_BYTES};
 use wyrd_core::multipart::{
@@ -118,7 +187,9 @@ use wyrd_core::multipart::{
     RetireCursor, RetireMode, RetirePayload, RetireToken, UploadId, MAX_BATCH_BYTES, MAX_BATCH_OPS,
 };
 use wyrd_testkit::Clock;
-use wyrd_traits::{CommitOutcome, MetadataStore, Result, WriteBatch};
+use wyrd_traits::{
+    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
+};
 
 use crate::gc::{checked_page, object_name};
 use crate::reconciliation::Reconciled;
@@ -179,9 +250,19 @@ pub const MARKS_PER_STEP: usize =
 
 /// The most store reads one **marking** step makes: a re-read of the obligation after its
 /// precondition failed, one row of the session's owned `sidx:` range, the session token's
-/// `retire:records:` obligation (segments before parts, [`marks`]), one read per entry
-/// ([`ENTRIES_PER_MARKING_STEP`]) and one per position ([`MARKS_PER_STEP`]): 252.
+/// `retire:records:` obligation (segments before parts, [`marks`]) — or, while that owned range is
+/// not empty, the session record instead, and nothing after it — one read per entry
+/// ([`ENTRIES_PER_MARKING_STEP`]) and one per position ([`MARKS_PER_STEP`]): 252. A step that
+/// retires an untrusted record by chunk id reads its session record once out of the positions'
+/// share, and lists the fleet at most once (module doc, *Untrusted records*).
 pub const READS_PER_MARKING_STEP: usize = 3 + ENTRIES_PER_MARKING_STEP + MARKS_PER_STEP;
+
+/// The most fragments the fleet's listings may show of one chunk that is retired by chunk id
+/// (module doc, *Untrusted records*): a step reads all of one chunk's listed fragments or counts
+/// none of them, and a step that resumes at that chunk has [`MARKS_PER_STEP`] reads, less the one
+/// a `part:` record's session record costs. A chunk listed past it is held
+/// ([`Hold::ListingPastStep`]).
+pub const LISTED_PER_CHUNK: usize = MARKS_PER_STEP - 1;
 
 // A marking step is the one that reads most, so it is the per-step bound the pass is sized by.
 const _: () = assert!(READS_PER_MARKING_STEP >= READS_PER_STEP);
@@ -190,12 +271,13 @@ const _: () = assert!(
     STEP_FIXED_OPS + 2 * MARKS_PER_STEP + 2 * ENTRIES_PER_MARKING_STEP <= MAX_BATCH_OPS as usize
 );
 
-/// The most store reads one pass makes: the resume point, the ledger pages and every step's, each
-/// at the marking step's bound — 4,038.
+/// The most store reads one pass of the ledger walk makes: the resume point, the ledger pages and
+/// every step's, each at the marking step's bound — 4,038.
 pub const READS_PER_PASS: usize =
     1 + LEDGER_PAGES_PER_PASS + READS_PER_MARKING_STEP * STEPS_PER_PASS;
 
-/// The most commits one pass makes: one per step, and the resume point when it moved.
+/// The most commits one pass of the ledger walk makes: one per step, and the resume point when it
+/// moved.
 pub const COMMITS_PER_PASS: usize = STEPS_PER_PASS + 1;
 
 /// The longest key a backend accepts — FoundationDB's 10 KB, the tightest in play
@@ -228,9 +310,11 @@ pub enum Hold {
     /// The step's commit failed: a store fault, or an outcome the store could not report. The
     /// next visit re-reads the obligation, which shows whether it landed.
     CommitFailed,
-    /// A `session` component whose session still owns staged residue: its `sidx:` range is not
-    /// empty. The owned walk that empties it is #1013's; until then the obligation is the only
-    /// deleter in reach of those entries, so it stays.
+    /// A `session` component whose session still owns staged residue — its `sidx:` range is not
+    /// empty — and is not one the owned walk drains ([`sessions`]): its record is absent, will not
+    /// decode, or is not past `Open`. The obligation is then the only deleter in reach of those
+    /// entries, so it stays. (A session in `Aborting` or `Completed` is walked, and the obligation
+    /// waits for the walk instead, with nothing at fault.)
     OwnedResidue,
     /// A record — or an obligation's own chunk list — whose placement is not exactly one D server
     /// per fragment of its scheme (the staged rule, `crate::gc::staged_placement`) or, for a
@@ -238,12 +322,30 @@ pub enum Hold {
     /// (`ChunkRef::checked_fragments`). The drain marks nothing from it and deletes nothing
     /// under it: its true positions are unknown. Its fragments stay — GC reclaims none it holds no
     /// mark for, and its staged class holds every fragment of an untrusted `part:` record's chunk
-    /// whole; #1013 retires such a record by chunk id.
+    /// whole. For an `Aborting` session on a whole-fleet pass such a `part:` or `sidx:` record is
+    /// retired by chunk id instead (module doc, *Untrusted records*).
     UntrustedPlacement,
     /// A record the obligation names is absent, will not decode, or sits under a key that is not
     /// the record the obligation names: the positions it held are unknown, so nothing of it is
-    /// marked or deleted.
+    /// marked or deleted. A `part:` value that will not decode is never retired by chunk id either
+    /// (its key names no chunk): it needs a human.
     RecordUnreadable,
+    /// An untrusted record of an `Aborting` session, met on a pass whose fleet is short of the
+    /// operator's configured fleet — a server left out at startup or unreachable this pass — or
+    /// whose listing of a server failed. Retiring it by chunk id would mark only what the
+    /// reachable servers hold and strand the rest with no record, so it waits, unchanged, for a
+    /// pass that sees the whole fleet (module doc, *Untrusted records*).
+    PartialFleet,
+    /// An untrusted record of an `Aborting` session one of whose chunks the fleet's listings show
+    /// more fragments of than one step reads ([`LISTED_PER_CHUNK`]). Retiring it by chunk id
+    /// needs every fragment of the chunk a listing shows read within one step (module doc,
+    /// *Untrusted records*), so it is held, the record and every fragment of the chunk kept —
+    /// needs a human (operator repair).
+    ListingPastStep,
+    /// The `mpuctl` admission ledger a terminal session delete must decrement is absent, will not
+    /// decode, or counts no session. The session record stays, and so does the ledger: a count
+    /// this drain cannot read is not one it may rewrite — needs a human.
+    AdmissionLedger,
     /// An `orphan:` mark the drain met is none of the three shapes
     /// (`metadata::decode_orphan_mark`): it is kept byte-identical, as GC keeps it, and nothing
     /// after it is marked.
@@ -268,9 +370,133 @@ impl Hold {
             Self::OwnedResidue => "owned-residue",
             Self::UntrustedPlacement => "untrusted-placement",
             Self::RecordUnreadable => "record-unreadable",
+            Self::PartialFleet => "partial-fleet",
+            Self::ListingPastStep => "listing-past-step",
+            Self::AdmissionLedger => "admission-ledger",
             Self::UnreadableMark => "unreadable-mark",
             Self::ReclaimingRetained => "reclaiming-under-retained-record",
         }
+    }
+}
+
+/// Whether a `Completed` session's **tombstone window** has passed — the input the terminal
+/// session delete reads for a `Completed` session (`0016:574`): deleting its record early would
+/// turn an identical Complete retry from `AlreadyCompleted` into `NoSuchUpload`
+/// (`wyrd_core::multipart::complete_answer`). Who measures the window is #625's (`W_tombstone`);
+/// until it lands the deployed loop passes [`Self::Retain`], and a `Completed` session keeps its
+/// record and its `mpuctl` slot once its obligations and residue drain. An `Aborting` session
+/// reads no tombstone input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tombstone {
+    /// The window has not passed, or nothing measures it: keep every `Completed` session record.
+    Retain,
+    /// The window has passed for every `Completed` session this pass reads: one whose obligations
+    /// and owned residue are gone is deleted as an `Aborting` one is.
+    Elapsed,
+}
+
+/// What a step needs to retire an untrusted record **by chunk id**: the pass's fleet, to list,
+/// and whether it is the whole operator-configured fleet (module doc, *Untrusted records*).
+pub(crate) struct ByChunk<'c> {
+    fleet: &'c [(DServerId, &'c dyn ChunkStore)],
+    operator_fleet_size: usize,
+}
+
+impl<'c> ByChunk<'c> {
+    fn of(ctx: &'c ReconstructionContext<'_>) -> Self {
+        Self {
+            fleet: ctx.fleet,
+            operator_fleet_size: ctx.operator_fleet_size,
+        }
+    }
+
+    /// Whether this pass's fleet is the whole operator-configured fleet (`fleet.len() ==
+    /// operator_fleet_size`, the deployed GC gate, mirrored) — no listing taken — or the hold
+    /// naming `record` for one that is not.
+    fn whole(&self, record: &[u8]) -> std::result::Result<(), Held> {
+        if self.fleet.len() == self.operator_fleet_size {
+            return Ok(());
+        }
+        Err(partial_fleet(
+            record,
+            format!(
+                "{} of {} operator-configured D server(s) in this pass's fleet: retiring by chunk \
+                 id waits for a pass that sees the whole fleet",
+                self.fleet.len(),
+                self.operator_fleet_size
+            ),
+        ))
+    }
+
+    /// Every fragment bearing one of `chunks` that the fleet's listings find, grouped by chunk, each
+    /// chunk's in position order — or the hold for a pass that cannot list the whole fleet: its
+    /// fleet is short of the operator's ([`Self::whole`]), or a listing failed. `record` is what
+    /// the hold names.
+    async fn listed(
+        &self,
+        chunks: &BTreeSet<ChunkId>,
+        record: &[u8],
+    ) -> std::result::Result<Listed, Held> {
+        self.whole(record)?;
+        // Keyed by position, so a server listed twice, or a fragment listed twice, is one position.
+        let mut found = BTreeMap::new();
+        for &(dserver, store) in self.fleet {
+            let listing = match store.list_fragments().await {
+                Ok(listing) => listing,
+                // A server that failed its listing is one this pass did not see: the fleet is not
+                // whole after all, so nothing is retired on what the others hold.
+                Err(fault) => {
+                    return Err(partial_fleet(
+                        record,
+                        format!(
+                            "listing D server {dserver} failed: {fault}; retiring by chunk id \
+                             waits for a pass that lists the whole fleet"
+                        ),
+                    ))
+                }
+            };
+            found.extend(
+                listing
+                    .into_iter()
+                    .filter(|frag| chunks.contains(&frag.chunk))
+                    .map(|frag| ((frag.chunk, dserver, frag.index), (dserver, frag))),
+            );
+        }
+        let mut listed = Listed::new();
+        for ((chunk, _, _), position) in found {
+            listed.entry(chunk).or_default().push(position);
+        }
+        Ok(listed)
+    }
+}
+
+/// What the fleet's listings found of the chunks a step retires by chunk id: each chunk's
+/// fragments, in position order.
+type Listed = BTreeMap<ChunkId, Vec<(DServerId, FragmentId)>>;
+
+/// The [`Hold::PartialFleet`] hold naming `record`.
+fn partial_fleet(record: &[u8], detail: String) -> Held {
+    Held {
+        reason: Hold::PartialFleet,
+        detail,
+        position: None,
+        record: Some(record.to_vec()),
+    }
+}
+
+/// The [`Hold::ListingPastStep`] hold for `chunk` of `record`, whose listing showed `listed`
+/// fragments.
+fn listing_past_step(chunk: ChunkId, listed: usize, record: Option<Vec<u8>>) -> Held {
+    Held {
+        reason: Hold::ListingPastStep,
+        detail: format!(
+            "the fleet's listings show {listed} fragment(s) of chunk {chunk}, more than the \
+             {LISTED_PER_CHUNK} one step reads; retiring it by chunk id needs them all read in one \
+             step, so the record and every fragment of the chunk stay — needs a human (operator \
+             repair)"
+        ),
+        position: None,
+        record,
     }
 }
 
@@ -292,12 +518,26 @@ struct Pass {
 // carries is the marking step's exact-value re-stamp racing GC's swap to `reclaiming`
 // (`crates/dst/tests/custodian.rs`, #1062).
 /// One retirement pass over the store `ctx` names — the leg [`crate::reconcile_step`] runs after
-/// reconstruction. Answers [`Reconciled::Blocked`] if it held any obligation, else
-/// [`Reconciled::Changed`] if it committed a step, else [`Reconciled::Satisfied`] only if it read
-/// the whole ledger from its head to its end and found no obligation in it, else
-/// [`Reconciled::Partial`] (module doc, *What a pass certifies*). Every marking step reads its
-/// stamp from `ctx.clock` ([`ReconstructionContext::clock`]), the loop's one time source.
+/// reconstruction: the session leg ([`sessions`]), then the ledger walk. Each answers
+/// [`Reconciled::Blocked`] if it held anything, else [`Reconciled::Changed`] if it committed a
+/// step, else [`Reconciled::Satisfied`] only if it read the whole of its input and found nothing
+/// owed, else [`Reconciled::Partial`] (module doc, *What a pass certifies*); the pass answers the
+/// least certified of the two. Every marking step reads its stamp from `ctx.clock`
+/// ([`ReconstructionContext::clock`]), the loop's one time source.
 pub(crate) async fn reconcile(ctx: &ReconstructionContext<'_>) -> Result<Reconciled> {
+    let by_chunk = ByChunk::of(ctx);
+    // The session leg first (module doc, *The session leg, first*): what it answers joins the
+    // ledger walk's, the least certified of the two.
+    let sessions = sessions::reconcile(ctx, &by_chunk).await?;
+    let ledger = walk_ledger(ctx, &by_chunk).await?;
+    Ok(sessions.least_certified(ledger))
+}
+
+/// One pass of the `retire:` ledger walk, within the bounds the module doc states.
+async fn walk_ledger(
+    ctx: &ReconstructionContext<'_>,
+    by_chunk: &ByChunk<'_>,
+) -> Result<Reconciled> {
     let meta = ctx.meta;
     let stored = meta
         .get(LEDGER_CURSOR_KEY)
@@ -345,7 +585,7 @@ pub(crate) async fn reconcile(ctx: &ReconstructionContext<'_>) -> Result<Reconci
                 break 'walk;
             }
             pass.visits_left -= 1;
-            visit(meta, ctx.clock, &mut pass, &key, value.to_vec()).await?;
+            visit(meta, ctx.clock, by_chunk, &mut pass, &key, value.to_vec()).await?;
             position = Some(key);
         }
         if next.is_none() {
@@ -395,6 +635,7 @@ pub(crate) async fn reconcile(ctx: &ReconstructionContext<'_>) -> Result<Reconci
 async fn visit(
     meta: &dyn MetadataStore,
     clock: &(dyn Clock + Sync),
+    by_chunk: &ByChunk<'_>,
     pass: &mut Pass,
     key: &[u8],
     value: Vec<u8>,
@@ -426,7 +667,7 @@ async fn visit(
                 // after this step read its obligation — never the pass's `now_millis`, which was
                 // read before reconstruction ran and could predate an obligation installed since.
                 let stamp_millis = clock.now_millis();
-                marks::plan(meta, key, &prior, &token, &payload, stamp_millis).await?
+                marks::plan(meta, key, &prior, &token, &payload, stamp_millis, by_chunk).await?
             }
         };
         let step = match planned {
@@ -510,6 +751,7 @@ type HeldRecords = (Hold, String);
 
 /// A hold, with what the audit event names: the reason, the detail, and — for a marking step —
 /// the `orphan:` position and the record the hold is about.
+#[derive(Clone)]
 struct Held {
     reason: Hold,
     detail: String,

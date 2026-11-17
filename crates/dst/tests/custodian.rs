@@ -652,6 +652,8 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
         unreachable: &[],
         clock: &wyrd_testkit::ManualClock::new(500),
         staged_write_window_millis: 0,
+        operator_fleet_size: healthy.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reconstruction").await;
@@ -707,6 +709,8 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
         unreachable: &[],
         clock: &pass_clock,
         staged_write_window_millis: 0,
+        operator_fleet_size: healthy.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-crash").await;
@@ -830,6 +834,8 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
         unreachable: &[],
         clock: &wyrd_testkit::ManualClock::new(200),
         staged_write_window_millis: 0,
+        operator_fleet_size: full.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let repaired = reconcile_step(&zone, &custodian, None, None, Some(&recon_ctx), None, 200)
         .await
@@ -1035,6 +1041,8 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
         unreachable: &[],
         clock: &pass_clock,
         staged_write_window_millis: 0,
+        operator_fleet_size: healthy.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
     // Two leadership terms: the first leader is deposed, the second is current. `zone`
@@ -1112,6 +1120,8 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
         unreachable: &[],
         clock: &pass_clock,
         staged_write_window_millis: 0,
+        operator_fleet_size: healthy.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-telemetry").await;
@@ -1221,6 +1231,8 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
         unreachable: &[],
         clock: &pass_clock,
         staged_write_window_millis: 0,
+        operator_fleet_size: healthy.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-midwrite").await;
@@ -1333,6 +1345,8 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
         unreachable: &[],
         clock: &wyrd_testkit::ManualClock::new(500),
         staged_write_window_millis: 0,
+        operator_fleet_size: healthy.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reader-race").await;
@@ -3022,6 +3036,8 @@ async fn staged_handoffs_under(driver: Driver, gaps: [u64; 3]) -> HandoffLanding
             unreachable: &[],
             clock: &wyrd_testkit::ManualClock::new(HANDOFF_NOW),
             staged_write_window_millis: 0,
+            operator_fleet_size: fleet.len(),
+            tombstone: wyrd_custodian::Tombstone::Retain,
         };
         let outcome = match driver {
             Driver::Gc => {
@@ -4863,6 +4879,8 @@ async fn replace_races_the_fence(delay_micros: u64) -> ReplaceRun {
             unreachable: &[],
             clock: &wyrd_testkit::SystemClock,
             staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
+            operator_fleet_size: fleet.len(),
+            tombstone: wyrd_custodian::Tombstone::Retain,
         };
         let outcome = reconcile_step(
             &zone,
@@ -6722,6 +6740,8 @@ async fn drain_races_gc(lag: i64) -> bool {
                     unreachable: &[],
                     clock: &clock,
                     staged_write_window_millis: 0,
+                    operator_fleet_size: 0,
+                    tombstone: wyrd_custodian::Tombstone::Retain,
                 };
                 let pass =
                     reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, RACE_NOW);

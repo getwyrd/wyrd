@@ -631,6 +631,8 @@ impl Rig {
             unreachable: &[],
             clock: &self.clock,
             staged_write_window_millis: W_WRITE_MILLIS,
+            operator_fleet_size: fleet.len(),
+            tombstone: wyrd_custodian::Tombstone::Retain,
         };
         let now = self.clock.now_millis();
         reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now)
@@ -1778,9 +1780,12 @@ async fn e_an_untrusted_chunk_in_a_segment_record_is_held() {
 // ─────────────────────────────── (R) ───────────────────────────────
 
 /// **(R)** An `Open` session owning one staged `sidx:` entry (a crashed part attempt's residue) and
-/// one committed part is aborted by a client: `retire:bytes:{session, all}`. Every pass holds it as
-/// `owned-residue`, naming the entry: the obligation and the entry byte-identical, the part's record
-/// in place. The owned walk that empties the range is #1013's.
+/// one committed part is aborted by a client: `retire:bytes:{session, all}`. While the session
+/// still owns the entry the obligation never goes. Here the owned walk (#1013) cannot finish it —
+/// the entry's first position carries a mark that is none of the three shapes, which the walk holds
+/// on — so every pass the obligation **waits** (`owned-residue-first`), never held, byte-identical,
+/// the entry and the part's record in place. Once the mark is repaired the walk marks and deletes
+/// the entry, the obligation drains, and the session's terminal delete follows.
 #[tokio::test]
 async fn r_a_session_obligation_waits_for_its_owned_residue() {
     let rig = Rig::new(3).await;
@@ -1793,8 +1798,18 @@ async fn r_a_session_obligation_waits_for_its_owned_residue() {
     let sidx = sidx_key(&id, part(2), residue);
     let sidx_value = md::encode(&entry);
     mp::decode_owned_entry(&sidx, &sidx_value).expect("an owned entry");
+    let damaged = orphan_key(
+        0,
+        FragmentId {
+            chunk: residue,
+            index: 0,
+        },
+    );
     rig.store
-        .plant(vec![(sidx.clone(), sidx_value.clone())])
+        .plant(vec![
+            (sidx.clone(), sidx_value.clone()),
+            (damaged.clone(), Bytes::from_static(b"not-a-mark")),
+        ])
         .await;
     let aborted = abort_session(&rig.store.inner, &id).await;
     assert!(matches!(aborted, Ok(AbortOutcome::Fenced)), "{aborted:?}");
@@ -1803,11 +1818,20 @@ async fn r_a_session_obligation_waits_for_its_owned_residue() {
 
     for round in 0..3 {
         let outcome = rig.drain().await.expect("no pass fails");
-        assert_eq!(outcome, Reconciled::Blocked, "round {round}");
-        let holds = rig.audit.holds(&key);
-        assert_eq!(holds.len(), 1, "round {round}");
-        assert_eq!(holds[0]["hold"], "owned-residue");
-        assert_eq!(holds[0]["record"], name(&sidx));
+        assert_eq!(
+            outcome,
+            Reconciled::Blocked,
+            "round {round}: the walk holds"
+        );
+        assert_eq!(
+            rig.audit.waits(&key),
+            vec!["owned-residue-first".to_owned()],
+            "round {round}"
+        );
+        assert!(
+            rig.audit.holds(&key).is_empty(),
+            "round {round}: never held"
+        );
         assert_eq!(
             rig.store.value(&key).await,
             Some(owed.clone()),
@@ -1820,6 +1844,29 @@ async fn r_a_session_obligation_waits_for_its_owned_residue() {
         );
         assert!(rig.store.value(&part_key(&id, part(1))).await.is_some());
     }
+
+    // The operator repairs the mark; the walk empties the residue, then the obligation drains.
+    let mut repair = WriteBatch::new();
+    repair.deletes.push(damaged);
+    assert_eq!(
+        rig.store.inner.commit(repair).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    rig.drain_until_gone(&key, 6).await;
+    assert_eq!(
+        rig.store.value(&sidx).await,
+        None,
+        "the walk deleted the entry"
+    );
+    assert!(rig.store.value(&part_key(&id, part(1))).await.is_none());
+    for _ in 0..2 {
+        rig.drain().await.expect("no pass fails");
+    }
+    assert_eq!(
+        rig.store.value(&mp::mpu_key(&id)).await,
+        None,
+        "the session's terminal delete followed"
+    );
 }
 
 // ─────────────────────────────── (S) ───────────────────────────────

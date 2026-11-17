@@ -79,7 +79,7 @@ use wyrd_core::placement::Topology;
 use wyrd_custodian::{
     reconcile_after_restore, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone,
     GcContext, RebalanceContext, ReconcileError, Reconciled, ReconstructionContext, RestoreReport,
-    ScrubContext,
+    ScrubContext, Tombstone,
 };
 use wyrd_telemetry::DurabilityTelemetry;
 use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
@@ -570,6 +570,14 @@ impl CustodianService {
                 unreachable: &unreachable,
                 clock: &clock,
                 staged_write_window_millis: STAGED_WRITE_WINDOW_MILLIS,
+                // The retirement leg retires an untrusted multipart record by chunk id only when
+                // `fleet.len()` equals this — the gate GC's pass below holds, for the reason it
+                // states: chunk-wide evidence taken from a partial fleet strands what a missing
+                // server holds.
+                operator_fleet_size,
+                // Nothing measures `W_tombstone` yet (#625): every `Completed` multipart session
+                // keeps its record, and its admission slot, until it does.
+                tombstone: Tombstone::Retain,
             };
             // Scrub and reconstruction run as TWO passes, not one. `reconcile_step` short-
             // circuits on the first loop's error (scrub's `?`), so a combined pass would let a

@@ -540,6 +540,8 @@ async fn reconstruction_pass(
         unreachable: &[],
         clock: &wyrd_testkit::ManualClock::new(now),
         staged_write_window_millis: 0,
+        operator_fleet_size: fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now).await
 }
@@ -2562,10 +2564,12 @@ async fn reconstruction_keeps_an_obligation_a_held_owned_entry_names() {
     .await;
 }
 
-/// **(Empty queue)** With nothing queued, a reconstruction pass reads no `mpu:`, `sidx:`, `part:`
-/// or `inode:` key and answers `Satisfied` — here over a store where every one of those reads
-/// would fault. Nothing is owed, so the staged read has no drain to protect (`reconstruction.rs`'s
-/// empty-queue branch). A guard, green on base: base reads no staged record at all.
+/// **(Empty queue)** With nothing queued, a reconstruction pass reads no `sidx:`, `part:` or
+/// `inode:` key and answers `Satisfied` — here over a store where every one of those reads would
+/// fault. Nothing is owed, so the staged read has no drain to protect (`reconstruction.rs`'s
+/// empty-queue branch). A guard, green on base: base reads no staged record at all. The session
+/// listing (`mpu:`) is read every pass since #1013, by the retirement leg's session teardown; for
+/// an `Open` session it reads none of the session's ranges.
 #[tokio::test]
 async fn an_empty_queue_reads_no_staged_record_and_answers_satisfied() {
     capture_audit();
@@ -2577,7 +2581,7 @@ async fn an_empty_queue_reads_no_staged_record_and_answers_satisfied() {
         part_key(&id, part_no(1)),
         part(&[chunk_ref(0x1751, EcScheme::None, &[0])]),
     );
-    let prefixes: [&[u8]; 4] = [MPU_PREFIX, SIDX_PREFIX, PART_PREFIX, b"inode:"];
+    let prefixes: [&[u8]; 3] = [SIDX_PREFIX, PART_PREFIX, b"inode:"];
     for prefix in prefixes {
         meta.fail_reads_of(prefix);
     }

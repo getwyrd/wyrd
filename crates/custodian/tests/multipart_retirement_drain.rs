@@ -543,6 +543,8 @@ async fn pass_over(
         unreachable: &[],
         clock: &clock,
         staged_write_window_millis: W_WRITE_MILLIS,
+        operator_fleet_size: fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, NOW)
         .with_subscriber(audit.dispatch())
