@@ -580,6 +580,8 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         unreachable: &[],
         clock: &wyrd_testkit::ManualClock::new(1_000),
         staged_write_window_millis: 0,
+        operator_fleet_size: recon_fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
     let recon_result =

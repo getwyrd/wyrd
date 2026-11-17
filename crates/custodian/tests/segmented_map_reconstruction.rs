@@ -420,6 +420,8 @@ async fn run(
         unreachable: &[],
         clock: &wyrd_testkit::ManualClock::new(NOW),
         staged_write_window_millis: 0,
+        operator_fleet_size: fleet.len(),
+        tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let capture = Capture::default();
     let layer = tracing_subscriber::fmt::layer()

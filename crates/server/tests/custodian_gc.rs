@@ -48,6 +48,14 @@
 //!   (a permanent leak). The fix gates GC on the OPERATOR fleet size, so it DEFERS until every
 //!   operator endpoint is visible. This is the test the hand-assembled-all-four T3 test cannot
 //!   catch (the operator count is only ever equal to `configured.len()` there).
+//! * [`deployed_retirement_leg_waits_for_the_whole_operator_fleet_and_keeps_completed_tombstones`]
+//!   — the two inputs the loop hands the multipart retirement leg (#1013): the same
+//!   `operator_fleet_size` it gates GC on, and the tombstone input `Retain`. On a startup-partial
+//!   fleet an aborted upload's untrusted staging entry is held (`partial-fleet`, on the log sink),
+//!   its record and every fragment of its chunk kept, while the leg still walks the trusted residue
+//!   beside it; a completed upload's residue is walked away and its record kept. Once the whole
+//!   fleet is visible the entry retires and the aborted upload ends; the completed one's record
+//!   still stays. Passing the live fleet's length, or `Elapsed`, from the loop turns it red.
 //! * [`deployed_run_loop_refuses_duplicate_endpoints`] /
 //!   [`deployed_run_loop_refuses_duplicate_ids`] — the #554 ITERATION-4 correction: the fleet-
 //!   identity uniqueness refusal used to guard ONLY the `--reconcile-after-restore` one-shot, but
@@ -77,14 +85,28 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_coordination_mem::MemCoordination;
-use wyrd_core::metadata::{self, orphan_key, pending_key, EcScheme, InodeId, PendingEntry};
+use wyrd_core::metadata::{
+    self, bucket_key, orphan_key, parse_orphan_key, pending_key, ChunkRef, EcScheme, InodeId,
+    PendingEntry, SegmentNonce,
+};
+use wyrd_core::multipart::abort::abort_session;
+use wyrd_core::multipart::complete::{
+    complete_upload, CompleteRequest, NamedParts, PublishRequest,
+};
+use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
+use wyrd_core::multipart::{
+    decode_admission_record, decode_part_record, mpu_key, part_key, psum_key, sidx_key,
+    AbortOutcome, Budget, CompleteOutcome, CreateOutcome, Digest, OwnedEntry, PartNumber,
+    PartSummary, StagedPlacement, UploadId, MPUCTL_KEY,
+};
 use wyrd_core::placement::Topology;
 use wyrd_core::write::write_new_object_placed;
 use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone};
@@ -153,10 +175,12 @@ impl MetadataStore for MemMeta {
 /// fragment bytes, so GC's `delete_fragment` reclaim is observable through `get_fragment`. Its
 /// reachability is toggleable (`healthy`) so a test can take the server offline for a GC pass and
 /// bring it back on a later one, driving the deployed fleet-view (`live_reconstruction_view`
-/// drops a server whose `health()` errs).
+/// drops a server whose `health()` errs). Its probes are counted: the deployed loop probes every
+/// configured server once a pass, so the count is the passes begun.
 struct MemDServer {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
     healthy: AtomicBool,
+    probes: AtomicU64,
 }
 
 impl Default for MemDServer {
@@ -164,6 +188,7 @@ impl Default for MemDServer {
         Self {
             frags: Mutex::new(HashMap::new()),
             healthy: AtomicBool::new(true),
+            probes: AtomicU64::new(0),
         }
     }
 }
@@ -172,6 +197,11 @@ impl MemDServer {
     /// Take this server reachable / unreachable for the reachability probe (`health()`).
     fn set_reachable(&self, reachable: bool) {
         self.healthy.store(reachable, Ordering::SeqCst);
+    }
+
+    /// How many reachability probes this server has answered.
+    fn probes(&self) -> u64 {
+        self.probes.load(Ordering::SeqCst)
     }
 }
 
@@ -201,6 +231,7 @@ impl ChunkStore for MemDServer {
     }
 
     async fn health(&self) -> Result<Health> {
+        self.probes.fetch_add(1, Ordering::SeqCst);
         if self.healthy.load(Ordering::SeqCst) {
             Ok(Health::Healthy)
         } else {
@@ -1128,4 +1159,370 @@ fn deployed_run_loop_refuses_a_value_after_the_valueless_gc_flag() {
         msg.contains("unexpected positional argument `false`"),
         "the refusal must name the stray token so the operator sees what was ignored; got: {msg}"
     );
+}
+
+// ---- the RETIREMENT leg reads the same operator fleet size, and keeps completed tombstones ----
+
+const BUCKET: &str = "photos";
+const BUCKET_MARKER: &[u8] = br#"{"name":"photos","created_at_millis":1}"#;
+const RS21: EcScheme = EcScheme::ReedSolomon { k: 2, m: 1 };
+const RS42: EcScheme = EcScheme::ReedSolomon { k: 4, m: 2 };
+/// The deployed loop's clock for these passes: fixed, one source for every read.
+const LOOP_NOW: u64 = 10_000_000;
+
+/// A `MakeWriter` appending everything the role's log layer writes to a shared buffer (as in
+/// `custodian_day_one.rs`), so the test reads what the role emitted.
+#[derive(Clone, Default)]
+struct Capture(Arc<Mutex<Vec<u8>>>);
+
+impl Capture {
+    fn contents(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl std::io::Write for Capture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
+    type Writer = Self;
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Install a permissive global `tracing` default once, so no callsite latches `Interest::never`
+/// while another test of this binary runs with no subscriber in scope (the pattern
+/// `custodian_day_one.rs` documents at its `enable_metric_callsites`).
+fn enable_log_callsites() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+}
+
+/// Create's runtime here: one fixed identity, no jitter, no wait.
+struct OneIdentity(Option<(UploadId, SegmentNonce)>);
+
+impl CreateRuntime for OneIdentity {
+    fn mint(&mut self) -> (UploadId, SegmentNonce) {
+        self.0.take().expect("one identity per create")
+    }
+
+    fn jitter(&mut self) -> u64 {
+        0
+    }
+
+    fn wait(&mut self, _millis: u64) -> impl Future<Output = ()> + Send {
+        std::future::ready(())
+    }
+}
+
+/// The production Create of upload `n`, targeting `object`, under a profile admitting sixty-four
+/// sessions.
+async fn create_upload(meta: &MemMeta, n: u64, object: &str) -> UploadId {
+    let profile: Budget = metadata::decode(
+        b"{\"w_ref\":128,\"max_part_chunks\":1,\"max_parts_per_session\":1,\
+          \"max_inflight_parts\":1,\"max_staged_chunks\":1}",
+    )
+    .expect("a legal profile");
+    let request = CreateRequest {
+        bucket: BUCKET,
+        parent: ROOT,
+        object,
+        content_type: None,
+        created_at_millis: 1_000,
+        clock_source: "wall",
+    };
+    let identity = (
+        UploadId::new(format!("{n:032x}")).unwrap(),
+        SegmentNonce::new(format!("{:032x}", 0x5e60_0000 + n)).unwrap(),
+    );
+    let created = create_session(meta, &profile, &request, &mut OneIdentity(Some(identity)))
+        .await
+        .unwrap();
+    let CreateOutcome::Created { upload_id } = created else {
+        panic!("expected Created, got {created:?}");
+    };
+    upload_id
+}
+
+/// The owned staging entry of `chunk`, staged by part `part` of `id` at `placement` under
+/// `scheme` — a placement whose length is not the scheme's fragment count is admitted, as the
+/// staged placement admits it: its key and value.
+fn owned_entry(
+    id: &UploadId,
+    part: u32,
+    chunk: ChunkId,
+    scheme: EcScheme,
+    placement: Vec<DServerId>,
+) -> (Vec<u8>, Bytes) {
+    let staged = StagedPlacement::new(scheme, placement).unwrap();
+    let entry = OwnedEntry::new(id.clone(), 20_000, staged).to_pending();
+    let key = sidx_key(id, PartNumber::new(part).unwrap(), chunk);
+    (key, metadata::encode(&entry))
+}
+
+/// The digest part `n` is committed and named under.
+fn digest_of(n: u32) -> Digest {
+    let mut bytes = [0x3c; 32];
+    bytes[..4].copy_from_slice(&n.to_be_bytes());
+    Digest::from_bytes(bytes)
+}
+
+/// The `part:` record of part `n` of `id` over `chunks`, checked to decode, and its `psum:`
+/// summary.
+fn part_records(id: &UploadId, n: u32, chunks: &[ChunkRef]) -> Vec<(Vec<u8>, Bytes)> {
+    let digest = digest_of(n);
+    let len: u64 = chunks.iter().map(|c| c.len).sum();
+    let value = Bytes::from(format!(
+        "{{\"chunks\":{},\"len\":{len},\"digest\":\"{digest}\",\
+         \"committed_at_millis\":1500,\"session_epoch\":0}}",
+        String::from_utf8(metadata::encode(&chunks).to_vec()).unwrap()
+    ));
+    decode_part_record(&value).expect("a canonical part");
+    let summary = PartSummary {
+        chunks: chunks.len() as u32,
+        len,
+        digest,
+        committed_at_millis: 1_500,
+    };
+    let number = PartNumber::new(n).unwrap();
+    vec![
+        (part_key(id, number), value),
+        (psum_key(id, number), metadata::encode(&summary)),
+    ]
+}
+
+/// Fragment `i` of `chunk` on server `i`, for every `i` of `servers`.
+fn diagonal(chunk: ChunkId, servers: &[u16]) -> Vec<(DServerId, FragmentId)> {
+    servers
+        .iter()
+        .map(|&i| (DServerId::from(i), FragmentId { chunk, index: i }))
+        .collect()
+}
+
+/// Put a fragment at every position of `at` on the servers it names.
+async fn land(servers: &[Arc<MemDServer>], at: &[(DServerId, FragmentId)]) {
+    for &(dserver, frag) in at {
+        let bytes = Bytes::from(format!("{frag:?}"));
+        servers[dserver as usize]
+            .put_fragment(frag, bytes, None)
+            .await
+            .unwrap();
+    }
+}
+
+/// How many `orphan:` marks name a fragment of `chunk`.
+async fn marks_of(meta: &MemMeta, chunk: ChunkId) -> usize {
+    meta.scan(b"orphan:")
+        .await
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| parse_orphan_key(key).is_some_and(|(_, frag)| frag.chunk == chunk))
+        .count()
+}
+
+/// The admission ledger's count.
+async fn sessions_counted(meta: &MemMeta) -> u64 {
+    let ledger = meta.get(MPUCTL_KEY).await.unwrap().expect("the ledger");
+    decode_admission_record(&ledger).unwrap().count()
+}
+
+/// Drive the REAL run loop for `passes` passes — counted by `probed`'s reachability probes, one a
+/// pass — over `servers`, the operator having wired `operator_fleet_size` endpoints, with the
+/// role built as `wyrd custodian` builds it (`with_logging_to`) and its log sink in `capture`.
+async fn drive_passes(
+    meta: &MemMeta,
+    servers: &[ConfiguredDServer],
+    operator_fleet_size: usize,
+    probed: &MemDServer,
+    passes: u64,
+    capture: &Capture,
+) {
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    let log = wyrd_server::logging::LogConfig::new(Some("warn"), None).unwrap();
+    let service = CustodianService::with_logging_to(telemetry, &log, capture.clone());
+    let until = probed.probes() + passes;
+    let shutdown = async move {
+        while probed.probes() < until {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let run = service.run_reconstruction_until(
+        &zone,
+        &custodian,
+        meta,
+        servers,
+        operator_fleet_size,
+        ExpiredPendingPolicy::Defer,
+        Duration::from_millis(1),
+        move || LOOP_NOW,
+        shutdown,
+    );
+    tokio::time::timeout(Duration::from_secs(120), run)
+        .await
+        .expect("the passes ran within the bound")
+        .expect("the deployed run loop survives and exits cleanly at shutdown");
+}
+
+#[tokio::test]
+async fn deployed_retirement_leg_waits_for_the_whole_operator_fleet_and_keeps_completed_tombstones()
+{
+    // The deployed loop hands the retirement leg two inputs of its own (`custodian.rs`,
+    // `run_reconstruction_until`): `operator_fleet_size`, the count it gates GC on, since an
+    // untrusted record of an aborted upload is retired by CHUNK ID from the fleet's listings and a
+    // listing that misses a server strands that server's fragments; and the tombstone input,
+    // `Retain` until #625 measures `W_tombstone`, since deleting a completed upload's record early
+    // turns an identical Complete retry from `AlreadyCompleted` into `NoSuchUpload`.
+    enable_log_callsites();
+    let meta = MemMeta::default();
+    meta.commit(WriteBatch::new().put(bucket_key(BUCKET), Bytes::from_static(BUCKET_MARKER)))
+        .await
+        .unwrap();
+    let d: Vec<Arc<MemDServer>> = (0..6).map(|_| Arc::new(MemDServer::default())).collect();
+
+    // An ABORTED upload: an untrusted staging entry — RS(4,2) placed on five servers — with its
+    // chunk's six fragments on servers 0–5, and beside it a trusted one, RS(2,1) on servers 0–2.
+    let aborted = create_upload(&meta, 1, &format!("{BUCKET}/aborted")).await;
+    const UNTRUSTED: ChunkId = 0x0A11;
+    const ABORTED_RESIDUE: ChunkId = 0x0A12;
+    let untrusted = owned_entry(&aborted, 1, UNTRUSTED, RS42, vec![0, 1, 2, 3, 4]);
+    let residue = owned_entry(&aborted, 2, ABORTED_RESIDUE, RS21, vec![0, 1, 2]);
+    let untrusted_at = diagonal(UNTRUSTED, &[0, 1, 2, 3, 4, 5]);
+    land(&d, &untrusted_at).await;
+    land(&d, &diagonal(ABORTED_RESIDUE, &[0, 1, 2])).await;
+    let mut batch = WriteBatch::new();
+    batch.puts.extend([untrusted.clone(), residue.clone()]);
+    meta.commit(batch).await.unwrap();
+    let fenced = abort_session(&meta, &aborted).await;
+    assert!(matches!(fenced, Ok(AbortOutcome::Fenced)), "{fenced:?}");
+
+    // A COMPLETED upload: part 1 published, and the trusted residue of a crashed part 2.
+    let object = format!("{BUCKET}/completed");
+    let completed = create_upload(&meta, 2, &object).await;
+    const PUBLISHED: ChunkId = 0x0C11;
+    const COMPLETED_RESIDUE: ChunkId = 0x0C12;
+    let published = ChunkRef {
+        id: PUBLISHED,
+        scheme: RS21,
+        len: 64,
+        placement: vec![0, 1, 2],
+    };
+    land(&d, &diagonal(PUBLISHED, &[0, 1, 2])).await;
+    let completed_residue = owned_entry(&completed, 2, COMPLETED_RESIDUE, RS21, vec![0, 1, 2]);
+    land(&d, &diagonal(COMPLETED_RESIDUE, &[0, 1, 2])).await;
+    let mut batch = WriteBatch::new();
+    batch.puts.extend(part_records(
+        &completed,
+        1,
+        std::slice::from_ref(&published),
+    ));
+    batch.puts.push(completed_residue.clone());
+    meta.commit(batch).await.unwrap();
+    let named = NamedParts::new(vec![(PartNumber::new(1).unwrap(), digest_of(1))]).unwrap();
+    let request = CompleteRequest {
+        bucket: BUCKET,
+        parent: ROOT,
+        object: &object,
+        parts: &named,
+        fenced_at_millis: 2_000,
+        clock_source: "wall",
+    };
+    let publish = PublishRequest {
+        fresh_inode: 9,
+        completed_at_millis: 3_000,
+    };
+    let outcome = complete_upload(&meta, &completed, &request, &publish).await;
+    assert!(
+        matches!(outcome, Ok(CompleteOutcome::Published(_))),
+        "{outcome:?}"
+    );
+    let counted = sessions_counted(&meta).await;
+    assert_eq!(counted, 2);
+
+    let build = |ids: std::ops::Range<u16>| -> Vec<ConfiguredDServer> {
+        ids.map(|i| ConfiguredDServer {
+            id: DServerId::from(i),
+            failure_domain: format!("domain-{i}"),
+            store: dyn_store(&d[usize::from(i)]),
+        })
+        .collect()
+    };
+
+    // The operator wired SIX endpoints; server 5 — which holds fragment 5 of the untrusted chunk —
+    // was unreachable at startup, so `connect_fleet` dropped it and the loop holds five. Every one
+    // of them is reachable, so nothing is `unreachable`: only the operator count says the fleet is
+    // short.
+    const OPERATOR_FLEET_SIZE: usize = 6;
+    let capture = Capture::default();
+    drive_passes(&meta, &build(0..5), OPERATOR_FLEET_SIZE, &d[0], 6, &capture).await;
+
+    assert_eq!(
+        meta.get(&untrusted.0).await.unwrap(),
+        Some(untrusted.1.clone()),
+        "the untrusted entry is held on the startup-partial fleet, byte-identical (RED if the loop \
+         hands the leg its live fleet's length: the entry is retired on a listing that misses \
+         server 5)"
+    );
+    assert_eq!(
+        marks_of(&meta, UNTRUSTED).await,
+        0,
+        "nothing of its chunk is marked"
+    );
+    for &(dserver, frag) in &untrusted_at {
+        assert!(
+            present(&d[dserver as usize], frag.chunk, frag.index).await,
+            "{frag:?} on {dserver} stays"
+        );
+    }
+    let log = capture.contents();
+    assert!(
+        log.lines().any(|line| line.contains("retire-session-held")
+            && line.contains("partial-fleet")
+            && line.contains(std::str::from_utf8(&untrusted.0).unwrap())),
+        "the hold reaches the log sink, typed `partial-fleet` and naming the entry: {log}"
+    );
+    assert!(meta.get(&mpu_key(&aborted)).await.unwrap().is_some());
+    // Not vacuous: the leg ran over both uploads on this fleet, walking their trusted residue away.
+    for (key, chunk) in [
+        (&residue.0, ABORTED_RESIDUE),
+        (&completed_residue.0, COMPLETED_RESIDUE),
+    ] {
+        assert_eq!(meta.get(key).await.unwrap(), None, "the residue is walked");
+        assert_eq!(marks_of(&meta, chunk).await, 3, "every position marked");
+    }
+    assert!(
+        meta.get(&mpu_key(&completed)).await.unwrap().is_some(),
+        "the completed upload's record — its tombstone — stays (RED if the loop hands the leg \
+         `Elapsed`)"
+    );
+    assert_eq!(sessions_counted(&meta).await, counted);
+
+    // Server 5 is back: the operator now sees all six. The untrusted entry retires by chunk id, the
+    // aborted upload ends and releases its slot; the completed upload's record still stays.
+    drive_passes(&meta, &build(0..6), OPERATOR_FLEET_SIZE, &d[0], 6, &capture).await;
+
+    assert_eq!(meta.get(&untrusted.0).await.unwrap(), None, "retired");
+    assert_eq!(
+        marks_of(&meta, UNTRUSTED).await,
+        6,
+        "every fragment of its chunk marked, server 5's included"
+    );
+    assert_eq!(meta.get(&mpu_key(&aborted)).await.unwrap(), None, "ended");
+    assert!(
+        meta.get(&mpu_key(&completed)).await.unwrap().is_some(),
+        "the tombstone still stays"
+    );
+    assert_eq!(sessions_counted(&meta).await, counted - 1);
 }
