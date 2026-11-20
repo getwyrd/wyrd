@@ -12,6 +12,7 @@ use crate::gc::{self, GcContext};
 use crate::leadership::{Custodian, FenceError, FencedZone};
 use crate::rebalance::{self, RebalanceContext};
 use crate::reconstruction::{self, ReconstructionContext};
+use crate::retirement;
 use crate::scrub::{self, ScrubContext};
 
 /// The observable outcome of a reconciliation step — "changed" vs "satisfied" are
@@ -114,7 +115,8 @@ impl std::error::Error for ReconcileError {}
 /// The supplied maintenance inputs select which loops the step dispatches: `gc`
 /// runs the **GC loop** ([`gc::reconcile`], `0005:288-295`), `scrub` runs the
 /// **scrub loop** ([`scrub::reconcile`], `0005:262-267`), `reconstruction` runs the
-/// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`), `rebalance`
+/// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`) and, after it, the
+/// **retirement leg** ([`retirement`], the `retire:` ledger's drain, `0016:668`), `rebalance`
 /// runs the **rebalance loop** — drain/decommission evacuation ([`rebalance::reconcile`],
 /// `0005:297-303`) — and all `None` exercises the fence alone (no maintenance inputs
 /// wired). When several are supplied the step runs each independent loop and reports the
@@ -153,6 +155,16 @@ pub async fn reconcile_step(
     if let Some(ctx) = reconstruction {
         outcome = outcome.least_certified(
             reconstruction::reconcile(ctx, now_millis)
+                .await
+                .map_err(ReconcileError::Store)?,
+        );
+        // The retirement leg runs on the reconstruction input, never GC's: the deployed loop runs
+        // a reconstruction pass every interval whatever the fleet's state, while a GC pass waits
+        // for the whole fleet, and a GC-only pass reads no `retire:` range
+        // (`tests/gc_reclaim_intent.rs`, leg D). After reconstruction, so a store fault in the
+        // drain never costs a pass its repairs.
+        outcome = outcome.least_certified(
+            retirement::reconcile(ctx)
                 .await
                 .map_err(ReconcileError::Store)?,
         );
