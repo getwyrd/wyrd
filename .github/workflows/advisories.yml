@@ -65,7 +65,7 @@ jobs:
             gh issue create -R "$REPO" --title "$title" --body "$text"
             exit 0
           fi
-          seen=$(gh issue view "$issue" -R "$REPO" --comments --json body,comments \
+          seen=$(gh issue view "$issue" -R "$REPO" --json body,comments \
             --jq '[.body] + [.comments[].body] | join("\n")')
           new=""
           for id in $ids; do
