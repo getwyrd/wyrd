@@ -559,7 +559,7 @@ pub fn partition_took_effect(connected_before: bool, connected_during: bool) -> 
 /// `last_heartbeat` integer (the field that shape assumed does not exist in a real PD response;
 /// Codex #453). Within a store entry `"address":"<ip>:<port>"` (in the `store` object) precedes
 /// it, so the first `last_heartbeat_ts` after the target's address is that store's own. It is
-/// converted to epoch nanoseconds via `chrono` so the downstream age threshold
+/// converted to epoch nanoseconds via `time` so the downstream age threshold
 /// ([`heartbeat_is_fresh`]) is unchanged.
 #[must_use]
 pub fn parse_store_last_heartbeat(stores_json: &str, target_ip: &str) -> Option<i128> {
@@ -573,10 +573,12 @@ pub fn parse_store_last_heartbeat(stores_json: &str, target_ip: &str) -> Option<
     // `last_heartbeat_ts` is a quoted RFC3339 string; take up to the closing quote and
     // convert to nanoseconds since the Unix epoch (parse-only — no clock read).
     let end = after.find('"')?;
-    chrono::DateTime::parse_from_rfc3339(&after[..end])
-        .ok()?
-        .timestamp_nanos_opt()
-        .map(i128::from)
+    time::OffsetDateTime::parse(
+        &after[..end],
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()
+    .map(time::OffsetDateTime::unix_timestamp_nanos)
 }
 
 /// Parse the **leader's `store_id`** for the first region in a raw PD `/pd/api/v1/regions`

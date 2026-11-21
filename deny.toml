@@ -81,6 +81,11 @@ ignore = [
     # reaches us only as a test-only transitive dependency of `madsim` (the DST
     # tier, `wyrd-dst`), never in shipped code. Revisit if madsim moves off it.
     "RUSTSEC-2025-0141",
+    # chrono 0.4.45 is "unmaintained" — a maintenance notice with no safe upgrade.
+    # Wyrd's own code no longer uses it (testkit parses RFC3339 with `time`); it
+    # reaches us only as a `cfg(madsim)` dependency of `madsim-tonic` — the DST
+    # build, never shipped code. Revisit if madsim-tonic moves off it.
+    "RUSTSEC-2026-0543",
 ]
 
 [licenses]

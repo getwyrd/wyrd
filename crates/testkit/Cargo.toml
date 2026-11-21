@@ -18,8 +18,10 @@ rand_chacha.workspace = true
 wyrd-traits.workspace = true
 # Parse PD's `last_heartbeat_ts` (the RFC3339 heartbeat timestamp in /pd/api/v1/stores)
 # into epoch nanoseconds for the metadata partition liveness oracle. Parse-only — the
-# `clock` feature is OFF, so no wall-clock source enters this DST seam crate (ADR-0009).
-chrono = { version = "0.4", default-features = false, features = ["alloc"] }
+# `std` feature is OFF (it gates `OffsetDateTime::now_utc`), so no wall-clock source
+# enters this DST seam crate (ADR-0009). `time`, not `chrono`: chrono is unmaintained
+# (RUSTSEC-2026-0543).
+time = { version = "0.3", default-features = false, features = ["parsing"] }
 
 [dev-dependencies]
 # `test_double_scan_page`'s own unit tests (#634): a `BTreeMap`-backed
