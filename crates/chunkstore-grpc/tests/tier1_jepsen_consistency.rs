@@ -935,6 +935,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
+        None,
         0,
     )
     .await
@@ -1037,6 +1038,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
+        None,
         0,
     )
     .await;
@@ -1110,6 +1112,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
+        None,
         0,
     )
     .await
@@ -1178,6 +1181,7 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
+        None,
         None,
         0,
     )
@@ -1502,6 +1506,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
+        None,
         0,
     )
     .await
@@ -1601,6 +1606,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
+        None,
         0,
     )
     .await;
@@ -1667,6 +1673,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
+        None,
         0,
     )
     .await
@@ -1725,6 +1732,7 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
+        None,
         None,
         0,
     )

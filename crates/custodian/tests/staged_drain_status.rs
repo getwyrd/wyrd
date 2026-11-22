@@ -648,7 +648,7 @@ async fn rebalance_leaves_staged_bytes_alone_while_the_drain_stays_pending() {
 
     let before_fragments = inventory(&disks);
     let before_records = meta.upload_records();
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), NOW)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, NOW)
         .await
         .unwrap();
 
@@ -687,7 +687,7 @@ async fn rebalance_leaves_staged_bytes_alone_while_the_drain_stays_pending() {
     place(&disks, DRAIN, frag(COMMITTED, 0));
     let staged_records = meta.upload_records();
 
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), NOW)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, NOW)
         .await
         .unwrap();
     assert_eq!(

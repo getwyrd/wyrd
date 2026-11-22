@@ -657,7 +657,7 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reconstruction").await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed, "the chunk was reconstructed");
@@ -717,7 +717,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
 
     // CRASH the custodian just before its version-conditional commit lands.
     meta.arm();
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -762,7 +762,7 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
     // RESTART: the custodian comes back and completes to full redundancy — fully new.
     meta.disarm();
     pass_clock.set(600);
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 600)
         .await
         .unwrap();
     assert_eq!(
@@ -810,9 +810,18 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-scrub").await;
-    let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub_ctx), None, None, 100)
-        .await
-        .unwrap();
+    let scrubbed = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        Some(&scrub_ctx),
+        None,
+        None,
+        None,
+        100,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         scrubbed,
         Reconciled::Changed,
@@ -837,9 +846,18 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
         operator_fleet_size: full.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    let repaired = reconcile_step(&zone, &custodian, None, None, Some(&recon_ctx), None, 200)
-        .await
-        .unwrap();
+    let repaired = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        None,
+        Some(&recon_ctx),
+        None,
+        None,
+        200,
+    )
+    .await
+    .unwrap();
     assert_eq!(repaired, Reconciled::Changed);
     assert!(
         repair::queued_repairs(&meta).await.unwrap().is_empty(),
@@ -976,7 +994,7 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, now)
         .await
         .unwrap();
     assert_eq!(
@@ -1059,7 +1077,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
     zone.install(usurper.leadership());
 
     // The DEPOSED leader is fenced out — its reconciliation is rejected and NOTHING lands.
-    let rejected = reconcile_step(&zone, &deposed, None, None, Some(&ctx), None, 500).await;
+    let rejected = reconcile_step(&zone, &deposed, None, None, Some(&ctx), None, None, 500).await;
     assert!(
         rejected.is_err(),
         "a deposed leader's reconciliation is rejected by its stale fencing token"
@@ -1075,7 +1093,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
     );
 
     // The CURRENT leader acts and repairs.
-    let outcome = reconcile_step(&zone, &usurper, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &usurper, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed);
@@ -1087,7 +1105,7 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
 
     // Even RACING after the new leader, the deposed leader still lands nothing.
     pass_clock.set(600);
-    let raced = reconcile_step(&zone, &deposed, None, None, Some(&ctx), None, 600).await;
+    let raced = reconcile_step(&zone, &deposed, None, None, Some(&ctx), None, None, 600).await;
     assert!(raced.is_err(), "the deposed leader stays fenced");
     assert_eq!(
         read_inode(&meta).await.version,
@@ -1128,7 +1146,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
 
     // PASS 1 — under-replicated: the count RISES, queue depth and time-to-repair emit.
     let rise = MetricCapture::default();
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .with_subscriber(tracing_subscriber::registry().with(rise.clone()))
         .await
         .unwrap();
@@ -1152,7 +1170,7 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
     // PASS 2 — repaired: the count RETURNS TO ZERO and the queue is drained.
     let settle = MetricCapture::default();
     pass_clock.set(600);
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 600)
         .with_subscriber(tracing_subscriber::registry().with(settle.clone()))
         .await
         .unwrap();
@@ -1239,7 +1257,7 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
 
     // CRASH the custodian inside the fragment-write step — the put never completes.
     armed.store(true, Ordering::Relaxed);
-    let crashed = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500).await;
+    let crashed = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500).await;
     assert!(
         crashed.is_err(),
         "a write that dies in flight surfaces as a store error — the custodian died mid-repair"
@@ -1273,7 +1291,7 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
     // RESTART: the custodian comes back, the write completes, and the repair commits once.
     armed.store(false, Ordering::Relaxed);
     pass_clock.set(600);
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 600)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 600)
         .await
         .unwrap();
     assert_eq!(
@@ -1350,7 +1368,7 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-reader-race").await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed, "the chunk was reconstructed");
@@ -1722,7 +1740,7 @@ async fn prop_gc_over_a_segmented_map_never_reclaims_it_and_never_over_certifies
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, now)
         .await
         .expect("a segmented map is resolved, or contained — never an error that ends the pass");
 
@@ -2502,8 +2520,17 @@ async fn gc_walk_under_a_concurrent_unlink(
             grace_window_millis: WALK_GRACE,
             expired_pending: ExpiredPendingPolicy::Reclaim,
         };
-        let outcome =
-            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, WALK_NOW).await;
+        let outcome = reconcile_step(
+            &zone,
+            &custodian,
+            Some(&ctx),
+            None,
+            None,
+            None,
+            None,
+            WALK_NOW,
+        )
+        .await;
         assert!(
             outcome.is_ok(),
             "GC pass {pass} failed (page cap {page_cap}, unlink at {delay_millis} ms): {:?}",
@@ -3041,7 +3068,17 @@ async fn staged_handoffs_under(driver: Driver, gaps: [u64; 3]) -> HandoffLanding
         };
         let outcome = match driver {
             Driver::Gc => {
-                reconcile_step(&zone, &custodian, Some(&gc), None, None, None, HANDOFF_NOW).await
+                reconcile_step(
+                    &zone,
+                    &custodian,
+                    Some(&gc),
+                    None,
+                    None,
+                    None,
+                    None,
+                    HANDOFF_NOW,
+                )
+                .await
             }
             Driver::Reconstruction => {
                 reconcile_step(
@@ -3050,6 +3087,7 @@ async fn staged_handoffs_under(driver: Driver, gaps: [u64; 3]) -> HandoffLanding
                     None,
                     None,
                     Some(&recon),
+                    None,
                     None,
                     HANDOFF_NOW,
                 )
@@ -3514,8 +3552,17 @@ async fn adoption_races_gc(premark: PreMark, delay_millis: u64) -> AdoptRun {
             grace_window_millis: ADOPT_GRACE,
             expired_pending: ExpiredPendingPolicy::Defer,
         };
-        let outcome =
-            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, ADOPT_NOW).await;
+        let outcome = reconcile_step(
+            &zone,
+            &custodian,
+            Some(&ctx),
+            None,
+            None,
+            None,
+            None,
+            ADOPT_NOW,
+        )
+        .await;
         passes += 1;
         assert!(
             outcome.is_ok(),
@@ -3841,8 +3888,17 @@ async fn sweep_under_a_concurrent_restamp(
             grace_window_millis: SWEEP_GRACE,
             expired_pending: ExpiredPendingPolicy::Defer,
         };
-        let outcome =
-            reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, SWEEP_NOW).await;
+        let outcome = reconcile_step(
+            &zone,
+            &custodian,
+            Some(&ctx),
+            None,
+            None,
+            None,
+            None,
+            SWEEP_NOW,
+        )
+        .await;
         assert!(
             outcome.is_ok(),
             "GC pass {pass} failed (page cap {page_cap}, {targets} targets, re-stamp of \
@@ -4256,9 +4312,18 @@ async fn sweep_judged_after_an_ambiguous_commit(
             grace_window_millis: SWEEP_GRACE,
             expired_pending: ExpiredPendingPolicy::Defer,
         };
-        let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, SWEEP_NOW)
-            .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
-            .await;
+        let outcome = reconcile_step(
+            &zone,
+            &custodian,
+            Some(&ctx),
+            None,
+            None,
+            None,
+            None,
+            SWEEP_NOW,
+        )
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+        .await;
         let answer = outcome.unwrap_or_else(|err| {
             panic!(
                 "GC pass {pass} failed ({fate:?}, {other:?} of #{raced} at {delay_millis} ms, \
@@ -4888,6 +4953,7 @@ async fn replace_races_the_fence(delay_micros: u64) -> ReplaceRun {
             None,
             None,
             Some(&ctx),
+            None,
             None,
             sim_now_millis(),
         )
@@ -6136,7 +6202,7 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-drain-race").await;
-    let answer = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let answer = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .expect("a raced move is a lost CAS, never an error that ends the pass");
 
@@ -6404,7 +6470,7 @@ async fn prop_drain_ceiling_refusal_is_confirmed_on_the_segment(rng: &mut ChaCha
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-drain-refusal").await;
     let capture = AuditCapture::default();
-    let answer = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let answer = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
         .await
         .expect("a refusal, stale or not, is never an error that ends the pass");
@@ -6743,8 +6809,16 @@ async fn drain_races_gc(lag: i64) -> bool {
                     operator_fleet_size: 0,
                     tombstone: wyrd_custodian::Tombstone::Retain,
                 };
-                let pass =
-                    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, RACE_NOW);
+                let pass = reconcile_step(
+                    &zone,
+                    &custodian,
+                    None,
+                    None,
+                    Some(&ctx),
+                    None,
+                    None,
+                    RACE_NOW,
+                );
                 assert!(pass.await.is_ok(), "a drain pass failed (lag {lag} ms)");
                 madsim::time::sleep(Duration::from_millis(1)).await;
             }
@@ -6773,7 +6847,16 @@ async fn drain_races_gc(lag: i64) -> bool {
             grace_window_millis: RACE_GRACE,
             expired_pending: ExpiredPendingPolicy::Defer,
         };
-        let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, RACE_NOW);
+        let outcome = reconcile_step(
+            &zone,
+            &custodian,
+            Some(&ctx),
+            None,
+            None,
+            None,
+            None,
+            RACE_NOW,
+        );
         passes += 1;
         if let Err(fault) = outcome.await {
             failed.push(format!("GC pass {passes}: {fault}"));
@@ -6936,6 +7019,1466 @@ async fn prop_retirement_restamp_reaches_both_winners() {
         "no lag in ±{RACE_LAG_SPAN} ms let the drain's re-stamp win"
     );
     assert!(swap, "no lag in ±{RACE_LAG_SPAN} ms let GC's swap win");
+}
+
+// ---- #625: the multipart reaper's seeded Tier-0 rows (proposal 0016 decision 6) ----
+
+/// The reaper's interleavings (`0016:2254-2278`), each forced at the exact reaper step it names
+/// by a store that commits one batch of its own there, over the real [`reconcile_step`] with the
+/// reaper input and no fleet (the operator one-shot's shape, which runs the reaper and then the
+/// retirement leg record-only). Every age is drawn from the run seed.
+///
+/// * **X60** — a part commit lands between the reaper's two progress reads: read source first
+///   (`slot:` then `psum:`), the commit is seen and the session kept.
+/// * **X62** — a renewal lands between the reaper's lapsed read and its idle fence: the fence's
+///   slot pins turn it into a `Conflict`; the residency ceiling still fences a renewing session.
+/// * **X19** — a session is created mid-pass with a live in-flight part: never fenced, its owned
+///   entries never walked, none of its positions marked.
+/// * **The pre-first-chunk window, both halves** — a production `UploadPart` that reserved its
+///   slot and keeps renewing it, its body not yet sending, survives past `W_open` and then
+///   commits its part; a request that reserved and crashed becomes reapable once its lease has
+///   lapsed and its reservation is older than `W_open`.
+/// * **A read fault** in one session's ranges holds that session and never ends the step: the
+///   retirement leg still drains an `Aborting` upload in the same pass.
+/// * **The Complete race**, both interleavings, over the production Create and Complete: a
+///   reaper that fences first leaves the Complete nothing to publish; a Complete that fences
+///   first makes the reaper's fence lose, and its published part is never marked.
+/// * **A completed slot cycle** between the reads and the idle fence — the known gap the reaper's
+///   module doc states; registered `#[ignore]`d until a protocol change closes it.
+mod reaper_rows {
+    use super::support::SIM_TRANSACTION_TIMED_OUT;
+    use super::*;
+    use wyrd_core::metadata::{InodeId, SegmentNonce};
+    use wyrd_core::multipart::commit::upload_part;
+    use wyrd_core::multipart::complete::{
+        complete_upload, CompleteError, CompleteRequest, NamedParts, PublishRequest,
+    };
+    use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
+    use wyrd_core::multipart::stage::{reserve_slot, StageClock, StageRequest, StageRuntime};
+    use wyrd_core::multipart::WALL_CLOCK_SOURCE;
+    use wyrd_core::multipart::{
+        decode_admission_record, decode_owned_entry, decode_slot_record, psum_key, psum_range,
+        retire_session_range, slot_key, slot_range, AdmissionRecord, AttemptId, Budget,
+        CompleteOutcome, CreateOutcome, Digest, PartRecord, PartSummary, Refusal, ReserveOutcome,
+        SessionRecord, SessionState, SlotIndex, SlotRecord, UploadPartOutcome, MAX_INFLIGHT_PARTS,
+        MPUCTL_KEY,
+    };
+    use wyrd_custodian::gc::W_WRITE_MILLIS;
+    use wyrd_custodian::{ReaperContext, ReaperPolicy};
+    use wyrd_testkit::ManualClock;
+
+    const DAY: u64 = 24 * 60 * 60 * 1_000;
+    const HOUR: u64 = 60 * 60 * 1_000;
+    /// A staging lease's span: what a renewal moves an expiry out to.
+    const LEASE: u64 = 60_000;
+    const RS21: EcScheme = EcScheme::ReedSolomon { k: 2, m: 1 };
+
+    /// Decode `json` as the record type and re-encode it: the canonical bytes the decoders need.
+    macro_rules! canonical {
+        ($record:ty, $json:expr) => {{
+            let value: $record = metadata::decode($json.as_bytes()).expect("a legal record");
+            metadata::encode(&value)
+        }};
+    }
+
+    fn upload(n: u8) -> UploadId {
+        UploadId::new(format!("{n:02x}").repeat(16)).unwrap()
+    }
+
+    fn part(n: u32) -> PartNumber {
+        PartNumber::new(n).unwrap()
+    }
+
+    fn ledger(count: u64) -> (Vec<u8>, Bytes) {
+        let profile = String::from_utf8(metadata::encode(&Budget::shipped()).to_vec()).unwrap();
+        let json = format!(
+            "{{\"count\":{count},\"max_sessions\":{},\"profile\":{profile}}}",
+            Budget::shipped().max_sessions()
+        );
+        (MPUCTL_KEY.to_vec(), canonical!(AdmissionRecord, json))
+    }
+
+    fn open_session(id: &UploadId, created: u64) -> (Vec<u8>, Bytes) {
+        let json = format!(
+            "{{\"parent\":42,\"object\":\"bucket/{id}\",\"created_at_millis\":{created},\
+             \"clock_source\":\"wall\",\"segment_nonce\":\"{id}\",\"epoch\":0,\"attempts\":0,\
+             \"state\":{{\"kind\":\"Open\"}}}}"
+        );
+        (mpu_key(id), canonical!(SessionRecord, json))
+    }
+
+    fn slot(id: &UploadId, n: u32, reserved: u64, lease: u64) -> (Vec<u8>, Bytes) {
+        let json = format!(
+            "{{\"part_number\":{n},\"attempt_id\":\"{}\",\"reserved_at_millis\":{reserved},\
+             \"lease_expiry_millis\":{lease}}}",
+            "ab".repeat(16)
+        );
+        (
+            slot_key(id, SlotIndex::new(0).unwrap()),
+            canonical!(SlotRecord, json),
+        )
+    }
+
+    fn chunk(id: ChunkId, placement: [DServerId; 3]) -> ChunkRef {
+        ChunkRef {
+            id,
+            scheme: RS21,
+            len: 4_096,
+            placement: placement.to_vec(),
+        }
+    }
+
+    /// Part `n` of `id` over one chunk, committed at `at`: its `part:` and `psum:` records.
+    fn committed(id: &UploadId, n: u32, chunk: &ChunkRef, at: u64) -> [(Vec<u8>, Bytes); 2] {
+        let chunks = String::from_utf8(metadata::encode(&vec![chunk.clone()]).to_vec()).unwrap();
+        let digest = format!("{n:064x}");
+        let part_json = format!(
+            "{{\"chunks\":{chunks},\"len\":4096,\"digest\":\"{digest}\",\
+             \"committed_at_millis\":{at},\"session_epoch\":0}}"
+        );
+        let summary = format!(
+            "{{\"chunks\":1,\"len\":4096,\"digest\":\"{digest}\",\"committed_at_millis\":{at}}}"
+        );
+        [
+            (part_key(id, part(n)), canonical!(PartRecord, part_json)),
+            (psum_key(id, part(n)), canonical!(PartSummary, summary)),
+        ]
+    }
+
+    fn owned(id: &UploadId, n: u32, chunk: &ChunkRef, lease: u64) -> (Vec<u8>, Bytes) {
+        let staged = StagedPlacement::new(chunk.scheme, chunk.placement.clone()).unwrap();
+        let entry = OwnedEntry::new(id.clone(), lease, staged).to_pending();
+        (sidx_key(id, part(n), chunk.id), metadata::encode(&entry))
+    }
+
+    fn batch_of(records: impl IntoIterator<Item = (Vec<u8>, Bytes)>) -> WriteBatch {
+        records
+            .into_iter()
+            .fold(WriteBatch::new(), |batch, (key, value)| {
+                batch.put(key, value)
+            })
+    }
+
+    /// Where the hooked store commits its batches, or which reads it fails.
+    enum Trigger {
+        /// Before the second read of either progress range of the session (`slot:` / `psum:`),
+        /// counted from the last [`Hooked::count_progress_reads`].
+        BetweenProgressReads(UploadId),
+        /// Before the first commit that puts this session record — the fence.
+        BeforeFenceOf(UploadId),
+        /// Before the first read of this session's `slot:` range.
+        AtFirstSlotRead(UploadId),
+        /// Every paged read under this exact prefix fails, pass after pass.
+        FailingReads(Vec<u8>),
+        /// The first commit that puts this session record — the fence — is answered with an
+        /// outcome the store does not report: the simulated FoundationDB `code` (1021, out of
+        /// flight; 1031, possibly still in flight). The batch has landed whole by then
+        /// (`lands`), or it has not and is kept for the row to land late
+        /// ([`Hooked::land_late`]).
+        UnknownFenceOf {
+            id: UploadId,
+            lands: bool,
+            code: i32,
+        },
+        /// Never: the store is a plain one.
+        Never,
+    }
+
+    /// Which **production** commit the hooked store holds at its gate, the first time one is
+    /// handed to it, until the row's trigger releases it ([`Hooked::fire`]).
+    enum Hold {
+        /// None.
+        Nothing,
+        /// The part commit of part `n` of the session: the batch that puts its summary.
+        PartCommit(UploadId, PartNumber),
+        /// A staging renewal of the session: a batch that puts one of its slots back over bytes
+        /// it requires, requires every key it names at bytes (an intent or a reserve requires
+        /// one absent), and puts no session record.
+        Renewal(UploadId),
+    }
+
+    impl Hold {
+        fn takes(&self, batch: &WriteBatch) -> bool {
+            match self {
+                Hold::Nothing => false,
+                Hold::PartCommit(id, n) => {
+                    let summary = psum_key(id, *n);
+                    batch.puts.iter().any(|(key, _)| *key == summary)
+                }
+                Hold::Renewal(id) => {
+                    let slots = slot_range(id);
+                    batch.deletes.is_empty()
+                        && batch.puts.iter().any(|(key, _)| key.starts_with(&slots))
+                        && !batch.puts.iter().any(|(key, _)| key.starts_with(b"mpu:"))
+                        && batch.preconditions.iter().all(|pre| pre.expected.is_some())
+                }
+            }
+        }
+    }
+
+    /// A [`MemMeta`] that commits `batches` once, in order, at `trigger` — and, when told to
+    /// [`Hooked::hold`] a production commit, holds the first one that arrives until `trigger`
+    /// releases it, and lets it land before the trigger's own read or commit goes on.
+    struct Hooked {
+        inner: MemMeta,
+        trigger: Trigger,
+        batches: Mutex<Vec<WriteBatch>>,
+        progress_reads: Mutex<u32>,
+        /// At most this many entries a page of the `mpu:` listing, whatever was asked.
+        listing_page: usize,
+        /// Every paged read from the head of a range, by prefix, in order.
+        reads: Mutex<Vec<Vec<u8>>>,
+        hold: Mutex<Hold>,
+        gate: tokio::sync::Semaphore,
+        holding: AtomicBool,
+        landed: Mutex<Option<CommitOutcome>>,
+        /// Whether [`Trigger::UnknownFenceOf`] has answered its one commit.
+        struck: AtomicBool,
+        /// The struck fence, when it did not land before the store answered.
+        late: Mutex<Option<WriteBatch>>,
+    }
+
+    impl Hooked {
+        fn new(
+            records: Vec<(Vec<u8>, Bytes)>,
+            trigger: Trigger,
+            batches: impl IntoIterator<Item = WriteBatch>,
+        ) -> Self {
+            let inner = MemMeta::default();
+            inner.kv.lock().unwrap().extend(records);
+            Self {
+                inner,
+                trigger,
+                batches: Mutex::new(batches.into_iter().collect()),
+                progress_reads: Mutex::new(0),
+                listing_page: usize::MAX,
+                reads: Mutex::new(Vec::new()),
+                hold: Mutex::new(Hold::Nothing),
+                gate: tokio::sync::Semaphore::new(0),
+                holding: AtomicBool::new(false),
+                landed: Mutex::new(None),
+                struck: AtomicBool::new(false),
+                late: Mutex::new(None),
+            }
+        }
+
+        /// Offer the struck fence to the store now — a commit still in flight when the store
+        /// answered, landing late — and answer what the store makes of it.
+        async fn land_late(&self) -> CommitOutcome {
+            let batch = self
+                .late
+                .lock()
+                .unwrap()
+                .take()
+                .expect("a struck fence that had not landed");
+            self.inner.commit(batch).await.unwrap()
+        }
+
+        /// Hold the first production commit `hold` takes from here on.
+        fn hold(&self, hold: Hold) {
+            *self.hold.lock().unwrap() = hold;
+        }
+
+        /// Count [`Trigger::BetweenProgressReads`]' reads from here: the reaper's, not staging's.
+        fn count_progress_reads(&self) {
+            *self.progress_reads.lock().unwrap() = 0;
+        }
+
+        /// Let the row's other branch run until the held commit is at the gate.
+        async fn until_held(&self) {
+            for _ in 0..256 {
+                if self.holding.load(Ordering::SeqCst) {
+                    return;
+                }
+                madsim::time::sleep(Duration::from_millis(1)).await;
+            }
+            panic!("the production commit never reached the gate");
+        }
+
+        /// What the held commit answered once released, `None` while it has not landed.
+        fn released(&self) -> Option<CommitOutcome> {
+            *self.landed.lock().unwrap()
+        }
+
+        async fn fire(&self) {
+            let hooked = std::mem::take(&mut *self.batches.lock().unwrap());
+            for batch in hooked {
+                let landed = self.inner.commit(batch).await.unwrap();
+                assert_eq!(
+                    landed,
+                    CommitOutcome::Committed,
+                    "the interleaved batch lands"
+                );
+            }
+            if self.holding.load(Ordering::SeqCst) && self.released().is_none() {
+                // Release the held production commit and let it land before going on.
+                self.gate.add_permits(1);
+                for _ in 0..256 {
+                    if self.released().is_some() {
+                        return;
+                    }
+                    madsim::time::sleep(Duration::from_millis(1)).await;
+                }
+                panic!("the released production commit never landed");
+            }
+        }
+
+        fn fired(&self) -> bool {
+            self.batches.lock().unwrap().is_empty()
+        }
+
+        fn value(&self, key: &[u8]) -> Option<Bytes> {
+            self.inner.kv.lock().unwrap().get(key).cloned()
+        }
+
+        fn state(&self, id: &UploadId) -> Option<SessionState> {
+            self.value(&mpu_key(id))
+                .map(|value| decode_session_record(&value).unwrap().state().clone())
+        }
+    }
+
+    #[async_trait]
+    impl MetadataStore for Hooked {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            self.inner.scan(prefix).await
+        }
+
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            if let Trigger::FailingReads(failing) = &self.trigger {
+                if prefix == failing.as_slice() {
+                    return Err(BoxError::from("an injected read fault"));
+                }
+            }
+            if after.is_none() {
+                self.reads.lock().unwrap().push(prefix.to_vec());
+            }
+            let fire = match &self.trigger {
+                Trigger::BetweenProgressReads(id)
+                    if after.is_none()
+                        && (prefix == slot_range(id).as_slice()
+                            || prefix == psum_range(id).as_slice()) =>
+                {
+                    let mut reads = self.progress_reads.lock().unwrap();
+                    *reads += 1;
+                    *reads == 2
+                }
+                Trigger::AtFirstSlotRead(id) => prefix == slot_range(id).as_slice(),
+                _ => false,
+            };
+            if fire {
+                self.fire().await;
+            }
+            let limit = if prefix == b"mpu:" {
+                limit.min(self.listing_page)
+            } else {
+                limit
+            };
+            wyrd_testkit::test_double_scan_page(&self.inner, prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            if let Trigger::BeforeFenceOf(id) = &self.trigger {
+                let key = mpu_key(id);
+                if batch.puts.iter().any(|(put, _)| *put == key) {
+                    self.fire().await;
+                }
+            }
+            if let Trigger::UnknownFenceOf { id, lands, code } = &self.trigger {
+                let key = mpu_key(id);
+                if batch.puts.iter().any(|(put, _)| *put == key)
+                    && !self.struck.swap(true, Ordering::SeqCst)
+                {
+                    if *lands {
+                        let landed = self.inner.commit(batch).await?;
+                        assert_eq!(landed, CommitOutcome::Committed, "the fence lands whole");
+                    } else {
+                        *self.late.lock().unwrap() = Some(batch);
+                    }
+                    return Err(BoxError::from(sim_commit_unknown_result(*code)));
+                }
+            }
+            let takes =
+                !self.holding.load(Ordering::SeqCst) && self.hold.lock().unwrap().takes(&batch);
+            if takes {
+                self.holding.store(true, Ordering::SeqCst);
+                self.gate
+                    .acquire()
+                    .await
+                    .expect("the gate stays open")
+                    .forget();
+                let landed = self.inner.commit(batch).await?;
+                *self.landed.lock().unwrap() = Some(landed);
+                return Ok(landed);
+            }
+            self.inner.commit(batch).await
+        }
+    }
+
+    /// One fenced pass: the reaper, then the retirement leg record-only, at the clock's instant.
+    async fn reap(meta: &dyn MetadataStore, clock: &ManualClock) -> Reconciled {
+        let coord = MemCoordination::new();
+        let (zone, custodian) = elect(&coord, "zone-reaper").await;
+        let policy = ReaperPolicy::default();
+        let reaper = ReaperContext {
+            meta,
+            clock,
+            clock_source: WALL_CLOCK_SOURCE,
+            policy: &policy,
+        };
+        let now = wyrd_testkit::Clock::now_millis(clock);
+        reconcile_step(
+            &zone,
+            &custodian,
+            None,
+            None,
+            None,
+            None,
+            Some(&reaper),
+            now,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A draw from `[lo, hi)`, off the run seed.
+    fn draw(rng: &mut ChaCha8Rng, lo: u64, hi: u64) -> u64 {
+        lo + rng.next_u64() % (hi - lo)
+    }
+
+    /// A start instant far from zero, and how far past `W_open` the session's progress is.
+    fn ages(rng: &mut ChaCha8Rng) -> (u64, u64) {
+        let t0 = 1_000 * DAY + draw(rng, 0, DAY);
+        (t0, draw(rng, HOUR, 3 * DAY))
+    }
+
+    /// A staging lease span the rows' production requests take, renewed every half of it.
+    const STAGE_LEASE: u64 = 6 * HOUR;
+
+    /// The production `UploadPart` request of part `n` of `upload_id` over the four-domain
+    /// topology: one-chunk parts of RS(2,1), leases of [`STAGE_LEASE`], and a body allowed to go
+    /// quiet for `body_idle_millis`.
+    fn stage_request<'a>(
+        upload_id: &'a UploadId,
+        n: u32,
+        attempt_id: &'a AttemptId,
+        topology: &'a Topology,
+        body_idle_millis: u64,
+    ) -> StageRequest<'a> {
+        StageRequest {
+            upload_id,
+            part_number: part(n),
+            attempt_id,
+            max_inflight_parts: MAX_INFLIGHT_PARTS,
+            lease_ttl_millis: STAGE_LEASE,
+            chunk_size: 4_096,
+            scheme: RS21,
+            topology,
+            write_window_millis: W_WRITE_MILLIS,
+            max_part_chunks: 4,
+            body_idle_millis,
+        }
+    }
+
+    /// A body the row sends by hand, piece by piece, then ends by dropping the sender.
+    fn hand_body() -> (
+        tokio::sync::mpsc::UnboundedSender<Result<Bytes>>,
+        impl futures_util::Stream<Item = Result<Bytes>> + Unpin,
+    ) {
+        let (send, recv) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes>>();
+        let body = Box::pin(futures_util::stream::unfold(recv, |mut recv| async move {
+            recv.recv().await.map(|piece| (piece, recv))
+        }));
+        (send, body)
+    }
+
+    /// **X60** (`0016:1810-1823`, `:2260`), over the production `UploadPart`. An `Open` session
+    /// past `W_open` by its creation and its one committed part, whose client uploads part 2 now:
+    /// the production request reserves its slot (stamped now, its lease live), stages one chunk
+    /// and sends its part commit — which deletes the slot and its owned entry and writes the part
+    /// and its summary, in one batch. The store holds that commit until the reaper is between its
+    /// two progress reads, then lets it land. Read source first, the reaper saw the live slot
+    /// before the commit deleted it, and the session is kept; the part is committed. A reader of
+    /// `psum:` first would find, after the commit, the new part in neither range, no slot and no
+    /// owned lease — and fence an upload that has just committed a part.
+    pub(super) async fn prop_x60_progress_reads_source_first(rng: &mut ChaCha8Rng) {
+        let (t0, past) = ages(rng);
+        let old = t0 - ReaperPolicy::default().w_open_millis - past;
+        let id = upload(0x60);
+        let mut records = vec![ledger(1), open_session(&id, old - HOUR)];
+        records.extend(committed(&id, 1, &chunk(0x60_0001, [1, 2, 3]), old));
+        let meta = Hooked::new(records, Trigger::BetweenProgressReads(id.clone()), []);
+        meta.hold(Hold::PartCommit(id.clone(), part(2)));
+        let clock = ManualClock::new(t0);
+        let (d, topology) = (servers(), four_domains());
+        let fleet = fleet_of(&d);
+        let attempt = AttemptId::new("ab".repeat(16)).unwrap();
+        let request = stage_request(&id, 2, &attempt, &topology, HOUR);
+        let mut runtime = HandTimer::new(&clock);
+        let body = futures_util::stream::iter([Ok(Bytes::from(vec![6u8; 4_096]))]);
+        let uploading = upload_part(&meta, &fleet, &mut runtime, &request, body);
+        let reaping = async {
+            meta.until_held().await;
+            meta.count_progress_reads();
+            reap(&meta, &clock).await
+        };
+
+        let (uploaded, outcome) = tokio::join!(uploading, reaping);
+
+        assert_eq!(
+            meta.released(),
+            Some(CommitOutcome::Committed),
+            "the part commit landed between the reaper's two progress reads"
+        );
+        assert!(
+            matches!(uploaded, Ok(UploadPartOutcome::Committed { .. })),
+            "{uploaded:?}"
+        );
+        assert_eq!(meta.state(&id), Some(SessionState::Open {}), "{outcome:?}");
+        assert!(meta.value(&part_key(&id, part(2))).is_some(), "the part");
+        assert!(meta.value(&psum_key(&id, part(2))).is_some());
+    }
+
+    /// The lease every one of `id`'s owned `sidx:` entries carries, if it has any (renewed
+    /// together, they carry one).
+    async fn owned_lease(meta: &Hooked, id: &UploadId) -> Option<u64> {
+        let found = meta.inner.scan(&sidx_range(id)).await.unwrap();
+        found.first().map(|(key, value)| {
+            decode_owned_entry(key, value)
+                .unwrap()
+                .2
+                .lease_expiry_millis()
+        })
+    }
+
+    /// **X62** (`0016:1843-1886`, `:2275`), over the production `UploadPart` and its own renewal
+    /// (`stage.rs`, `renewal_batch`) — the R2 schedule of `multipart_upload_part_stage.rs`, with
+    /// the real reaper. A request reserves its slot, stages a first chunk and then waits on a slow
+    /// body for longer than `W_open`, its staging renewing the slot and the owned lease every
+    /// half-TTL. Then one renewal falls due: it checks every lease live, sends, and the store holds
+    /// its commit. The clock crosses the expiry it was renewing. The reaper reads the slot and the
+    /// owned lease lapsed, the reservation and the creation past `W_open` — abandoned by every
+    /// read — and builds its idle fence; as it commits, the store releases the renewal, which
+    /// lands (the store checks bytes, not expiry). The fence pinned the slot bytes it read, so it
+    /// conflicts; the session stays `Open`, the next pass keeps it, and once the body's second
+    /// chunk arrives the part commits. Against a session past `W_session` (the seed draws which)
+    /// the same renewal saves nothing: the ceiling's fence pins no slot, and the upload never
+    /// commits.
+    pub(super) async fn prop_x62_idle_fence_pins_the_slot_evidence(rng: &mut ChaCha8Rng) {
+        let (t0, past) = ages(rng);
+        let policy = ReaperPolicy::default();
+        let ceiling = draw(rng, 0, 2) == 1;
+        let created = if ceiling {
+            t0 - policy.w_session_millis + HOUR
+        } else {
+            t0 - HOUR
+        };
+        let id = upload(0x62);
+        let meta = Hooked::new(
+            vec![ledger(1), open_session(&id, created)],
+            Trigger::BeforeFenceOf(id.clone()),
+            [],
+        );
+        let clock = ManualClock::new(t0);
+        let (d, topology) = (servers(), four_domains());
+        let fleet = fleet_of(&d);
+        let attempt = AttemptId::new("ab".repeat(16)).unwrap();
+        // The body is slow, not gone: its idle bound is past the whole stall.
+        let request = stage_request(&id, 1, &attempt, &topology, policy.w_open_millis + 5 * DAY);
+        let mut runtime = HandTimer::new(&clock);
+        let permits = Arc::clone(&runtime.permits);
+        let (send, body) = hand_body();
+        send.send(Ok(Bytes::from(vec![6u8; 4_096]))).unwrap();
+        let uploading = upload_part(&meta, &fleet, &mut runtime, &request, body);
+        let drive = async {
+            let mut lease = lease_moved(&meta, &id, None).await;
+            // The first chunk's intent: its owned entry, leased with the slot.
+            for _ in 0..64 {
+                if owned_lease(&meta, &id).await == Some(lease) {
+                    break;
+                }
+                madsim::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(owned_lease(&meta, &id).await, Some(lease), "chunk 1 staged");
+            // The stall: staging's own renewals, past `W_open` of the reservation.
+            while wyrd_testkit::Clock::now_millis(&clock) < t0 + policy.w_open_millis + past {
+                clock.advance(STAGE_LEASE / 2 + draw(rng, 1, HOUR));
+                permits.add_permits(1);
+                lease = lease_moved(&meta, &id, Some(lease)).await;
+            }
+            // The crossing renewal: due, every lease still live when it checks, held at the gate.
+            meta.hold(Hold::Renewal(id.clone()));
+            clock.advance(STAGE_LEASE / 2 + 1);
+            permits.add_permits(1);
+            meta.until_held().await;
+            let now = wyrd_testkit::Clock::now_millis(&clock);
+            assert!(now < lease, "it checked a live lease");
+            // Across the expiry it renews: every lease the reaper reads is lapsed.
+            clock.advance(lease - now + draw(rng, 0, STAGE_LEASE / 4));
+            assert_eq!(slot_lease(&meta, &id).await, Some(lease));
+            assert_eq!(owned_lease(&meta, &id).await, Some(lease));
+
+            let outcome = reap(&meta, &clock).await;
+
+            assert_eq!(
+                meta.released(),
+                Some(CommitOutcome::Committed),
+                "the renewal landed between the reaper's reads and its fence"
+            );
+            let renewed = slot_lease(&meta, &id).await.expect("the slot");
+            assert!(
+                renewed > wyrd_testkit::Clock::now_millis(&clock),
+                "renewed live"
+            );
+            if !ceiling {
+                assert_eq!(meta.state(&id), Some(SessionState::Open {}), "{outcome:?}");
+                assert_eq!(
+                    outcome,
+                    Reconciled::Partial,
+                    "the lost fence is judged again"
+                );
+                reap(&meta, &clock).await;
+                assert_eq!(
+                    meta.state(&id),
+                    Some(SessionState::Open {}),
+                    "the next pass reads the renewed lease live"
+                );
+            } else {
+                assert_ne!(
+                    meta.state(&id),
+                    Some(SessionState::Open {}),
+                    "the residency ceiling fences a renewing session: {outcome:?}"
+                );
+            }
+            // The rest of the body: a second chunk, then its end.
+            send.send(Ok(Bytes::from(vec![7u8; 4_096]))).unwrap();
+            drop(send);
+            // Whatever staging waits on from here is not this row's subject.
+            permits.add_permits(1_024);
+        };
+
+        let (uploaded, ()) = tokio::join!(uploading, drive);
+
+        if ceiling {
+            assert!(
+                !matches!(uploaded, Ok(UploadPartOutcome::Committed { .. })),
+                "an upload fenced by the ceiling commits nothing: {uploaded:?}"
+            );
+            assert!(meta.value(&part_key(&id, part(1))).is_none());
+        } else {
+            assert!(
+                matches!(uploaded, Ok(UploadPartOutcome::Committed { .. })),
+                "the upload whose renewal beat the fence commits its part: {uploaded:?}"
+            );
+            assert_eq!(meta.state(&id), Some(SessionState::Open {}));
+            assert!(meta.value(&part_key(&id, part(1))).is_some());
+            assert!(meta.value(&psum_key(&id, part(1))).is_some());
+        }
+    }
+
+    /// **X19** (`0016:1940-1950`, `:2262`). While the reaper reads an abandoned session's ranges, a
+    /// new session is created with an `UploadPart` already streaming — a reserved slot and an owned
+    /// entry, both live. The listing is read one session a page, so the new session — its id drawn
+    /// anywhere — lands on a page of the same pass when its id sorts after the abandoned one, and
+    /// that pass judges it there; behind the abandoned one, the next pass does. The pass fences and
+    /// drains the abandoned one, and never touches the new one: its record stays `Open`, its owned
+    /// entry and slot stay, and none of its fragment positions carries an `orphan:` mark.
+    pub(super) async fn prop_x19_mid_pass_session_is_never_condemned(rng: &mut ChaCha8Rng) {
+        let (t0, past) = ages(rng);
+        let old = t0 - ReaperPolicy::default().w_open_millis - past;
+        // Any id but the abandoned one's, so the new session lands anywhere in the listing.
+        let fresh = match draw(rng, 1, 256) as u8 {
+            0x19 => 0x1a,
+            n => n,
+        };
+        let later_page = fresh > 0x19;
+        let (abandoned, fresh) = (upload(0x19), upload(fresh));
+        let mut records = vec![
+            ledger(1),
+            open_session(&abandoned, old - HOUR),
+            slot(&abandoned, 2, old, old + LEASE),
+        ];
+        records.extend(committed(&abandoned, 1, &chunk(0x19_0001, [1, 2, 3]), old));
+        let streaming = chunk(0x19_0002, [4, 5, 6]);
+        let created = batch_of([
+            ledger(2),
+            open_session(&fresh, t0),
+            slot(&fresh, 1, t0, t0 + LEASE),
+            owned(&fresh, 1, &streaming, t0 + LEASE),
+        ]);
+        let mut meta = Hooked::new(
+            records,
+            Trigger::AtFirstSlotRead(abandoned.clone()),
+            [created],
+        );
+        meta.listing_page = 1;
+        let clock = ManualClock::new(t0);
+
+        reap(&meta, &clock).await;
+
+        assert!(meta.fired(), "the session was created mid-pass");
+        assert_eq!(
+            meta.reads.lock().unwrap().contains(&slot_range(&fresh)),
+            later_page,
+            "a session created on a later page of the listing is judged in the same pass"
+        );
+        for _ in 0..2 {
+            reap(&meta, &clock).await;
+        }
+        assert!(meta.reads.lock().unwrap().contains(&slot_range(&fresh)));
+        assert_ne!(meta.state(&abandoned), Some(SessionState::Open {}));
+        assert_eq!(meta.state(&fresh), Some(SessionState::Open {}));
+        assert!(meta
+            .value(&sidx_key(&fresh, part(1), streaming.id))
+            .is_some());
+        assert!(meta
+            .value(&slot_key(&fresh, SlotIndex::new(0).unwrap()))
+            .is_some());
+        for (i, &dserver) in streaming.placement.iter().enumerate() {
+            let at = FragmentId {
+                chunk: streaming.id,
+                index: i as u16,
+            };
+            assert!(
+                meta.value(&metadata::orphan_key(dserver, at)).is_none(),
+                "no mark on the live part's {dserver}/{at:?}"
+            );
+        }
+    }
+
+    /// The staging runtime of the pre-first-chunk row: the row's manual clock — the one its
+    /// reaper reads — chunk ids from 1, and a timer the row fires by hand, one permit a wake.
+    struct HandTimer {
+        clock: ManualClock,
+        next_chunk: ChunkId,
+        permits: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl HandTimer {
+        /// A runtime on `clock` whose timer has no permit yet.
+        fn new(clock: &ManualClock) -> Self {
+            Self {
+                clock: clock.clone(),
+                next_chunk: 0,
+                permits: Arc::new(tokio::sync::Semaphore::new(0)),
+            }
+        }
+    }
+
+    impl StageClock for HandTimer {
+        fn now_millis(&self) -> u64 {
+            wyrd_testkit::Clock::now_millis(&self.clock)
+        }
+    }
+
+    impl StageRuntime for HandTimer {
+        fn next_chunk_id(&mut self) -> ChunkId {
+            self.next_chunk += 1;
+            self.next_chunk
+        }
+
+        fn wait(&self, _millis: u64) -> impl std::future::Future<Output = ()> + Send {
+            let permits = Arc::clone(&self.permits);
+            async move {
+                permits
+                    .acquire()
+                    .await
+                    .expect("the timer stays open")
+                    .forget();
+            }
+        }
+    }
+
+    /// The lease of `id`'s one slot record, if it holds one.
+    async fn slot_lease(meta: &Hooked, id: &UploadId) -> Option<u64> {
+        let found = meta.inner.scan(&slot_range(id)).await.unwrap();
+        found
+            .first()
+            .map(|(_, value)| decode_slot_record(value).unwrap().lease_expiry_millis())
+    }
+
+    /// Let the request beside the row run until `id`'s slot lease is something other than
+    /// `from` — the reserve, or a renewal, landed — and answer it.
+    async fn lease_moved(meta: &Hooked, id: &UploadId, from: Option<u64>) -> u64 {
+        for _ in 0..64 {
+            match slot_lease(meta, id).await {
+                Some(lease) if Some(lease) != from => return lease,
+                _ => madsim::time::sleep(Duration::from_millis(1)).await,
+            }
+        }
+        panic!("the production staging never moved {id}'s slot lease from {from:?}");
+    }
+
+    /// **The pre-first-chunk window, both halves** (`0016:1824-1842`, `:2259`), over the
+    /// production `UploadPart` (`wyrd_core::multipart::commit::upload_part`). Two sessions with
+    /// no part yet. (a) **Live**: one `UploadPart` reserves its slot, then its body sends nothing
+    /// for longer than `W_open`; staging's own renewal (`stage.rs`, `renewal_batch`) rewrites the
+    /// slot lease every half-TTL while the read is pending, and a reaper pass runs after every
+    /// renewal. The session is never fenced, so once the body arrives the part commits, after
+    /// every one of those passes. (b) **Crashed**: a second request reserves its slot through the
+    /// production reserve and stops — it renews nothing. Within `W_open` of its reservation the
+    /// fixed stamp keeps its session; past it, with the lease long lapsed, the reaper fences it.
+    pub(super) async fn prop_pre_first_chunk_window(rng: &mut ChaCha8Rng) {
+        let (t0, past) = ages(rng);
+        let policy = ReaperPolicy::default();
+        let (live, crashed) = (upload(0x0c), upload(0x0d));
+        let meta = Hooked::new(
+            vec![
+                ledger(2),
+                open_session(&live, t0 - HOUR),
+                open_session(&crashed, t0 - HOUR),
+            ],
+            Trigger::Never,
+            [],
+        );
+        let clock = ManualClock::new(t0);
+        let d = servers();
+        let fleet = fleet_of(&d);
+        let topology = four_domains();
+        let (attempt, crashed_attempt) = (
+            AttemptId::new("ab".repeat(16)).unwrap(),
+            AttemptId::new("cd".repeat(16)).unwrap(),
+        );
+        // Longer than the stall: the body is slow, not gone.
+        let idle = policy.w_open_millis + 4 * DAY;
+        let request =
+            |upload_id, attempt_id| stage_request(upload_id, 1, attempt_id, &topology, idle);
+        // (b) the crashed request: reserved at `t0`, never renewed.
+        let reserved = reserve_slot(&meta, &request(&crashed, &crashed_attempt), t0)
+            .await
+            .unwrap();
+        assert!(
+            matches!(reserved, ReserveOutcome::Reserved { .. }),
+            "{reserved:?}"
+        );
+        // (a) the live request, its body pending until the row sends it.
+        let (send, body) = hand_body();
+        let mut runtime = HandTimer::new(&clock);
+        let permits = Arc::clone(&runtime.permits);
+        let live_request = request(&live, &attempt);
+        let uploading = upload_part(&meta, &fleet, &mut runtime, &live_request, body);
+        let until = t0 + policy.w_open_millis + past;
+        let drive = async {
+            let mut lease = lease_moved(&meta, &live, None).await;
+            let mut passes = 0u32;
+            while wyrd_testkit::Clock::now_millis(&clock) < until {
+                // Past the half-TTL the renewal falls due at, and short of the lease.
+                clock.advance(STAGE_LEASE / 2 + draw(rng, 1, HOUR));
+                permits.add_permits(1);
+                lease = lease_moved(&meta, &live, Some(lease)).await;
+                let now = wyrd_testkit::Clock::now_millis(&clock);
+                reap(&meta, &clock).await;
+                passes += 1;
+                assert_eq!(
+                    meta.state(&live),
+                    Some(SessionState::Open {}),
+                    "live at {now}"
+                );
+                if now - t0 <= policy.w_open_millis {
+                    assert_eq!(
+                        meta.state(&crashed),
+                        Some(SessionState::Open {}),
+                        "within W_open of its reservation at {now}"
+                    );
+                }
+            }
+            assert_ne!(
+                meta.state(&crashed),
+                Some(SessionState::Open {}),
+                "a lapsed slot confers no liveness once its stamp is past W_open"
+            );
+            assert!(
+                meta.value(&psum_key(&live, part(1))).is_none(),
+                "nothing committed yet"
+            );
+            // The body arrives: one chunk, then its end.
+            send.send(Ok(Bytes::from(vec![7u8; 4_096]))).unwrap();
+            drop(send);
+            passes
+        };
+
+        let (uploaded, passes) = tokio::join!(uploading, drive);
+
+        assert!(passes > 0);
+        assert!(
+            matches!(uploaded, Ok(UploadPartOutcome::Committed { .. })),
+            "the part commits after {passes} reaper passes: {uploaded:?}"
+        );
+        assert_eq!(meta.state(&live), Some(SessionState::Open {}));
+        assert!(meta.value(&part_key(&live, part(1))).is_some());
+        assert!(meta.value(&psum_key(&live, part(1))).is_some());
+        assert_eq!(
+            slot_lease(&meta, &live).await,
+            None,
+            "the commit released the slot"
+        );
+    }
+
+    /// The records of an upload already `Aborting`: fenced from `Open@0` by the one teardown the
+    /// client Abort and the reaper share, its obligation installed, a part committed and the
+    /// residue of a crashed in-flight part still owned.
+    fn aborting(
+        id: &UploadId,
+        at: u64,
+        part: &ChunkRef,
+        residue: &ChunkRef,
+    ) -> Vec<(Vec<u8>, Bytes)> {
+        let open = decode_session_record(&open_session(id, at).1).unwrap();
+        let teardown = open.open_teardown(id).unwrap();
+        let obligation = teardown.obligation();
+        let mut records = vec![
+            (mpu_key(id), metadata::encode(teardown.session())),
+            (obligation.key(), metadata::encode(obligation.payload())),
+            owned(id, 2, residue, at + LEASE),
+        ];
+        records.extend(committed(id, 1, part, at));
+        records
+    }
+
+    /// **A read fault in the reaper never costs the drain its turn.** An abandoned `Open` session
+    /// whose `slot:`, `psum:` or owned `sidx:` range — the seed draws which — the store refuses to
+    /// read, pass after pass, beside an upload already `Aborting`. Every pass holds the unreadable
+    /// session and answers `Blocked`, never an error that would end the step; the unreadable
+    /// session's records stay as they were; and the retirement leg after the reaper walks, drains
+    /// and deletes the `Aborting` upload all the same.
+    pub(super) async fn prop_read_fault_holds_the_session_and_the_drain_runs(rng: &mut ChaCha8Rng) {
+        let (t0, past) = ages(rng);
+        let old = t0 - ReaperPolicy::default().w_open_millis - past;
+        let (faulted, ended) = (upload(0x3a), upload(0x3b));
+        let failing = match draw(rng, 0, 3) {
+            0 => slot_range(&faulted),
+            1 => psum_range(&faulted),
+            _ => sidx_range(&faulted),
+        };
+        let mut records = vec![
+            ledger(2),
+            open_session(&faulted, old - HOUR),
+            slot(&faulted, 2, old, old + LEASE),
+            owned(&faulted, 2, &chunk(0x3a_0002, [4, 5, 6]), old + LEASE),
+        ];
+        records.extend(committed(&faulted, 1, &chunk(0x3a_0001, [1, 2, 3]), old));
+        let untouched: Vec<(Vec<u8>, Bytes)> = records[1..].to_vec();
+        records.extend(aborting(
+            &ended,
+            old,
+            &chunk(0x3b_0001, [1, 2, 3]),
+            &chunk(0x3b_0002, [4, 5, 6]),
+        ));
+        let meta = Hooked::new(records, Trigger::FailingReads(failing), []);
+        let clock = ManualClock::new(t0);
+
+        for _ in 0..6 {
+            if meta.state(&ended).is_none() {
+                break;
+            }
+            assert_eq!(reap(&meta, &clock).await, Reconciled::Blocked);
+        }
+
+        assert_eq!(meta.state(&ended), None, "the Aborting upload is deleted");
+        for prefix in [part_range(&ended), sidx_range(&ended)] {
+            assert!(meta.inner.scan(&prefix).await.unwrap().is_empty());
+        }
+        for (key, value) in untouched {
+            assert_eq!(
+                meta.value(&key),
+                Some(value),
+                "the held session is left as read"
+            );
+        }
+    }
+
+    /// **A fence whose outcome the store could not report lands at most once, and the upload is
+    /// torn down once.** An abandoned `Open` session — idle, or past the ceiling; the seed draws
+    /// which — whose fence commit the store answers with an unknown outcome, in each of the four
+    /// ways that can go:
+    ///
+    /// 0. it **landed** before the store answered;
+    /// 1. it **never lands**;
+    /// 2. it was still in flight, and **lands late**, before the next pass;
+    /// 3. it was still in flight, and is offered to the store only **after the next pass** has
+    ///    judged the session again and fenced it.
+    ///
+    /// The struck pass is `Blocked`, names the outcome as unknown exactly once, and never names
+    /// the session as left in place — in way 0 the retirement leg of that same step is already
+    /// tearing it down. It sends the fence once: in ways 1 to 3 the session is exactly the bytes
+    /// it read. A batch that lands late lands whole (way 2); one that arrives after another fence
+    /// moved the session finds neither the bytes it requires nor a free obligation key, and is
+    /// refused (way 3). Whichever it was, the passes after it tear the upload down, with every
+    /// position of both of its chunks marked and its admission slot released exactly once.
+    pub(super) async fn prop_unknown_fence_outcome_lands_at_most_once(rng: &mut ChaCha8Rng) {
+        for way in 0..4_u8 {
+            let (t0, past) = ages(rng);
+            let policy = ReaperPolicy::default();
+            let old = t0 - policy.w_open_millis - past;
+            let created = if draw(rng, 0, 2) == 0 {
+                old - HOUR
+            } else {
+                t0 - policy.w_session_millis - past
+            };
+            // Only a commit that may still be in flight (1031) can land after the answer.
+            let code = if way >= 2 || draw(rng, 0, 2) == 0 {
+                SIM_TRANSACTION_TIMED_OUT
+            } else {
+                SIM_COMMIT_UNKNOWN_RESULT
+            };
+            let context = format!("way {way}, code {code}, created {created}, now {t0}");
+            let id = upload(0x3c);
+            let (part_chunk, residue) = (chunk(0x3c_0001, [1, 2, 3]), chunk(0x3c_0002, [4, 5, 6]));
+            let session = open_session(&id, created);
+            let mut records = vec![
+                ledger(1),
+                session.clone(),
+                slot(&id, 2, old, old + LEASE),
+                owned(&id, 2, &residue, old + LEASE),
+            ];
+            records.extend(committed(&id, 1, &part_chunk, old));
+            let trigger = Trigger::UnknownFenceOf {
+                id: id.clone(),
+                lands: way == 0,
+                code,
+            };
+            let meta = Hooked::new(records, trigger, []);
+            let clock = ManualClock::new(t0);
+
+            let capture = AuditCapture::default();
+            let struck = reap(&meta, &clock)
+                .with_subscriber(tracing_subscriber::registry().with(capture.clone()))
+                .await;
+            assert_eq!(struck, Reconciled::Blocked, "{context}");
+            let actions = |action: &str| {
+                let lines = capture.lines.lock().unwrap();
+                lines
+                    .iter()
+                    .filter(|line| line.get("action").map(String::as_str) == Some(action))
+                    .count()
+            };
+            assert_eq!(actions("reaper-fence-outcome-unknown"), 1, "{context}");
+            assert_eq!(
+                actions("reaper-session-held"),
+                0,
+                "a fence that may have landed is not a session left in place — {context}"
+            );
+            if way == 0 {
+                assert_eq!(
+                    meta.state(&id),
+                    Some(SessionState::Aborting {}),
+                    "{context}"
+                );
+            } else {
+                assert_eq!(
+                    meta.value(&session.0),
+                    Some(session.1.clone()),
+                    "the fence was sent once and did not land — {context}"
+                );
+            }
+            match way {
+                2 => assert_eq!(
+                    meta.land_late().await,
+                    CommitOutcome::Committed,
+                    "nothing moved, so the late batch lands whole — {context}"
+                ),
+                3 => {
+                    reap(&meta, &clock).await;
+                    assert_ne!(
+                        meta.value(&session.0),
+                        Some(session.1.clone()),
+                        "the next pass judged the session again and fenced it — {context}"
+                    );
+                    assert_eq!(
+                        meta.land_late().await,
+                        CommitOutcome::Conflict,
+                        "a second fence of one session never lands — {context}"
+                    );
+                }
+                _ => {}
+            }
+
+            // From here the store answers every commit, and the upload is torn down, once.
+            for _ in 0..6 {
+                if meta.state(&id).is_none() {
+                    break;
+                }
+                reap(&meta, &clock).await;
+            }
+            assert_eq!(meta.state(&id), None, "the upload is deleted — {context}");
+            for prefix in [
+                part_range(&id),
+                psum_range(&id),
+                sidx_range(&id),
+                slot_range(&id),
+                retire_session_range(RetireMode::Bytes, &id),
+                retire_session_range(RetireMode::Records, &id),
+            ] {
+                assert!(
+                    meta.inner.scan(&prefix).await.unwrap().is_empty(),
+                    "{} is drained — {context}",
+                    String::from_utf8_lossy(&prefix)
+                );
+            }
+            for chunk in [&part_chunk, &residue] {
+                for (index, &dserver) in chunk.placement.iter().enumerate() {
+                    let frag = FragmentId {
+                        chunk: chunk.id,
+                        index: index as u16,
+                    };
+                    assert!(
+                        meta.value(&metadata::orphan_key(dserver, frag)).is_some(),
+                        "a mark on server {dserver}, {frag:?} — {context}"
+                    );
+                }
+            }
+            let counted = decode_admission_record(&meta.value(MPUCTL_KEY).unwrap())
+                .unwrap()
+                .count();
+            assert_eq!(
+                counted, 0,
+                "the admission slot is released once — {context}"
+            );
+        }
+    }
+
+    /// The bucket the Complete race row's session publishes into, and its marker.
+    const BUCKET: &str = "bucket";
+    const MARKER: &[u8] = br#"{"name":"bucket","created_at_millis":1}"#;
+
+    /// Create's runtime for one fixed identity: no jitter, no wait.
+    struct OneIdentity(Option<(UploadId, SegmentNonce)>);
+
+    impl CreateRuntime for OneIdentity {
+        fn mint(&mut self) -> (UploadId, SegmentNonce) {
+            self.0.take().expect("one identity per create")
+        }
+
+        fn jitter(&mut self) -> u64 {
+            0
+        }
+
+        async fn wait(&mut self, _millis: u64) {}
+    }
+
+    /// A session made by the production Create on a store holding its bucket, created at
+    /// `created`, with part 1 committed over `chunk` at `committed_at`: the store, the session's
+    /// id, and the named list a Complete of it sends.
+    async fn created_with_one_part(
+        id: &UploadId,
+        created: u64,
+        chunk: &ChunkRef,
+        committed_at: u64,
+    ) -> (MemMeta, NamedParts) {
+        let meta = MemMeta::default();
+        let bucket = WriteBatch::new().put(metadata::bucket_key(BUCKET), MARKER);
+        assert_eq!(meta.commit(bucket).await.unwrap(), CommitOutcome::Committed);
+        let object = format!("{BUCKET}/{id}");
+        let request = CreateRequest {
+            bucket: BUCKET,
+            parent: COMPLETE_PARENT,
+            object: &object,
+            content_type: None,
+            created_at_millis: created,
+            clock_source: WALL_CLOCK_SOURCE,
+        };
+        let nonce = SegmentNonce::new("5a".repeat(16)).unwrap();
+        let outcome = create_session(
+            &meta,
+            &Budget::shipped(),
+            &request,
+            &mut OneIdentity(Some((id.clone(), nonce))),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, CreateOutcome::Created { .. }),
+            "{outcome:?}"
+        );
+        let planted = batch_of(committed(id, 1, chunk, committed_at));
+        assert_eq!(
+            meta.commit(planted).await.unwrap(),
+            CommitOutcome::Committed
+        );
+        let mut digest = [0u8; 32];
+        digest[31] = 1;
+        let named = NamedParts::new(vec![(part(1), Digest::from_bytes(digest))]).unwrap();
+        (meta, named)
+    }
+
+    /// The dirent parent every object of the row is published under.
+    const COMPLETE_PARENT: InodeId = 0;
+
+    /// The production `CompleteMultipartUpload` of `id`, naming `parts`, on the wall clock at
+    /// `at`.
+    async fn complete(
+        meta: &impl MetadataStore,
+        id: &UploadId,
+        parts: &NamedParts,
+        at: u64,
+    ) -> std::result::Result<CompleteOutcome, CompleteError> {
+        let object = format!("{BUCKET}/{id}");
+        let request = CompleteRequest {
+            bucket: BUCKET,
+            parent: COMPLETE_PARENT,
+            object: &object,
+            parts,
+            fenced_at_millis: at,
+            clock_source: WALL_CLOCK_SOURCE,
+        };
+        let publish = PublishRequest {
+            fresh_inode: 0x00c0_ffee,
+            completed_at_millis: at,
+        };
+        complete_upload(meta, id, &request, &publish).await
+    }
+
+    /// A [`MemMeta`] that, handed the first commit putting `mpu:<id>` — the reaper's idle fence
+    /// — first runs a whole production Complete of the session on the store, so the Complete
+    /// fences and publishes after the reaper's reads and before its fence.
+    struct CompleteFirst {
+        inner: MemMeta,
+        id: UploadId,
+        parts: NamedParts,
+        at: u64,
+        completed: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl MetadataStore for CompleteFirst {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            self.inner.scan(prefix).await
+        }
+
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            self.inner.scan_page(prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            let key = mpu_key(&self.id);
+            let first = self.completed.lock().unwrap().is_none();
+            if first && batch.puts.iter().any(|(put, _)| *put == key) {
+                let outcome = complete(&self.inner, &self.id, &self.parts, self.at).await;
+                *self.completed.lock().unwrap() = Some(format!("{outcome:?}"));
+                assert!(
+                    matches!(outcome, Ok(CompleteOutcome::Published(_))),
+                    "the Complete publishes: {outcome:?}"
+                );
+            }
+            self.inner.commit(batch).await
+        }
+    }
+
+    /// A [`MemMeta`] that, handed the first commit putting `mpu:<id>` — the production Complete's
+    /// fence, built from the `Open` record that Complete read — first runs a whole reaper pass on
+    /// the store, so the reaper fences after the Complete's read and before its fence.
+    struct ReaperFirst {
+        inner: MemMeta,
+        id: UploadId,
+        clock: ManualClock,
+        reaped: Mutex<Option<Reconciled>>,
+    }
+
+    #[async_trait]
+    impl MetadataStore for ReaperFirst {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            self.inner.scan(prefix).await
+        }
+
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            self.inner.scan_page(prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            let key = mpu_key(&self.id);
+            let first = self.reaped.lock().unwrap().is_none();
+            if first && batch.puts.iter().any(|(put, _)| *put == key) {
+                let outcome = reap(&self.inner, &self.clock).await;
+                *self.reaped.lock().unwrap() = Some(outcome);
+            }
+            self.inner.commit(batch).await
+        }
+    }
+
+    /// Whether any fragment position of `chunk` carries an `orphan:` mark.
+    async fn any_marked(meta: &dyn MetadataStore, chunk: &ChunkRef) -> bool {
+        for (i, &dserver) in chunk.placement.iter().enumerate() {
+            let at = FragmentId {
+                chunk: chunk.id,
+                index: i as u16,
+            };
+            if meta
+                .get(&metadata::orphan_key(dserver, at))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// **The Complete race** (`0016:2267`), both interleavings, over the production Create,
+    /// Complete and reaper. A session only the idle arm can reap, one part committed. (i) **The
+    /// reaper fences first** — after the Complete has read the session `Open` and validated its
+    /// list, and before the Complete's fence lands: that fence required the `Open` bytes it read,
+    /// so it loses, and the Complete, reading the session again, answers `NoSuchUpload` and
+    /// publishes nothing. (ii) **The Complete fences first** — it fences and publishes after the
+    /// reaper's reads and before the reaper's fence: the fence pinned the `Open` bytes it read, so
+    /// it loses, the session stays `Completed`, and once the retirement leg has run its passes no
+    /// fragment position of the published part carries an `orphan:` mark.
+    pub(super) async fn prop_complete_race(rng: &mut ChaCha8Rng) {
+        let (t0, past) = ages(rng);
+        let old = t0 - ReaperPolicy::default().w_open_millis - past;
+        let clock = ManualClock::new(t0);
+        let published =
+            |id: &UploadId| metadata::dirent_key(COMPLETE_PARENT, &format!("{BUCKET}/{id}"));
+
+        // (i) the reaper first, between the Complete's read and its fence.
+        let id = upload(0x91);
+        let part_chunk = chunk(0x91_0001, [1, 2, 3]);
+        let (inner, named) = created_with_one_part(&id, old - HOUR, &part_chunk, old).await;
+        let meta = ReaperFirst {
+            inner,
+            id: id.clone(),
+            clock: clock.clone(),
+            reaped: Mutex::new(None),
+        };
+        let answered = complete(&meta, &id, &named, t0).await;
+        assert!(
+            meta.reaped.lock().unwrap().is_some(),
+            "the reaper ran between the Complete's read and its fence"
+        );
+        assert!(
+            matches!(
+                answered,
+                Ok(CompleteOutcome::Refused(Refusal::NoSuchUpload))
+            ),
+            "a Complete whose fence lost to the reaper's: {answered:?}"
+        );
+        let state = meta
+            .get(&mpu_key(&id))
+            .await
+            .unwrap()
+            .map(|value| decode_session_record(&value).unwrap().state().clone());
+        assert!(
+            matches!(state, None | Some(SessionState::Aborting {})),
+            "the reaper's fence stands: {state:?}"
+        );
+        assert!(
+            meta.get(&published(&id)).await.unwrap().is_none(),
+            "nothing published"
+        );
+
+        // (ii) the Complete first, between the reaper's reads and its fence.
+        let id = upload(0x92);
+        let part_chunk = chunk(0x92_0001, [1, 2, 3]);
+        let (inner, named) = created_with_one_part(&id, old - HOUR, &part_chunk, old).await;
+        let meta = CompleteFirst {
+            inner,
+            id: id.clone(),
+            parts: named,
+            at: t0,
+            completed: Mutex::new(None),
+        };
+        reap(&meta, &clock).await;
+        assert!(
+            meta.completed.lock().unwrap().is_some(),
+            "the Complete ran between the reaper's reads and its fence"
+        );
+        for _ in 0..3 {
+            reap(&meta, &clock).await;
+        }
+        let state = meta
+            .get(&mpu_key(&id))
+            .await
+            .unwrap()
+            .map(|value| decode_session_record(&value).unwrap().state().clone());
+        assert!(
+            matches!(state, Some(SessionState::Completed { .. })),
+            "the reaper never touched the Completed session: {state:?}"
+        );
+        assert!(
+            meta.get(&published(&id)).await.unwrap().is_some(),
+            "the object is published"
+        );
+        assert!(
+            !any_marked(&meta, &part_chunk).await,
+            "no fragment of the published part is marked"
+        );
+    }
+
+    /// **A completed slot cycle between the reads and the idle fence — a known gap, not closed
+    /// here** (`crates/custodian/src/reaper.rs`, *Known gap*). The idle arm judges a session
+    /// abandoned with its one slot index read free. After the reads and before the fence, a request
+    /// reserves that index and commits its part, each batch under its own preconditions, and the
+    /// commit deletes the slot again. Every precondition of the fence then holds. The row asserts
+    /// what 0016 requires (`0016:2258`): the session stays `Open` and the part survives. Today it
+    /// fails — the fence lands and aborts the upload — so it is registered `#[ignore]`d, as the
+    /// regression for the protocol change that closes it.
+    pub(super) async fn prop_slot_cycle_between_the_reads_and_the_fence(rng: &mut ChaCha8Rng) {
+        let (t0, past) = ages(rng);
+        let old = t0 - ReaperPolicy::default().w_open_millis - past;
+        let id = upload(0x63);
+        let session = open_session(&id, old - HOUR);
+        let mut records = vec![ledger(1), session.clone()];
+        records.extend(committed(&id, 1, &chunk(0x63_0001, [1, 2, 3]), old));
+        // The reserve of index 0 (`stage::reserve`), then the part commit that releases it
+        // (`commit::commit_batch`).
+        let reserved = slot(&id, 2, t0, t0 + LEASE);
+        let reserve = WriteBatch::new()
+            .require(session.0.clone(), session.1.clone())
+            .require_absent(reserved.0.clone())
+            .put(reserved.0.clone(), reserved.1.clone());
+        let [part_record, summary] = committed(&id, 2, &chunk(0x63_0002, [4, 5, 6]), t0);
+        let commit = WriteBatch::new()
+            .require(session.0.clone(), session.1.clone())
+            .require_absent(part_record.0.clone())
+            .require(reserved.0.clone(), reserved.1.clone())
+            .put(part_record.0.clone(), part_record.1)
+            .put(summary.0, summary.1)
+            .delete(reserved.0);
+        let meta = Hooked::new(
+            records,
+            Trigger::BeforeFenceOf(id.clone()),
+            [reserve, commit],
+        );
+        let clock = ManualClock::new(t0);
+
+        let outcome = reap(&meta, &clock).await;
+
+        assert!(
+            meta.fired(),
+            "the cycle landed between the reads and the fence"
+        );
+        assert_eq!(meta.state(&id), Some(SessionState::Open {}), "{outcome:?}");
+        assert!(
+            meta.value(&part_record.0).is_some(),
+            "the part just committed survives"
+        );
+    }
 }
 
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
@@ -7143,6 +8686,59 @@ dst_campaign_test! {
 dst_campaign_test! {
     async fn retirement_restamp_reaches_both_winners() {
         prop_retirement_restamp_reaches_both_winners().await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reaper_x60_progress_reads_source_first() {
+        reaper_rows::prop_x60_progress_reads_source_first(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reaper_x62_idle_fence_pins_the_slot_evidence() {
+        reaper_rows::prop_x62_idle_fence_pins_the_slot_evidence(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reaper_x19_mid_pass_session_is_never_condemned() {
+        reaper_rows::prop_x19_mid_pass_session_is_never_condemned(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reaper_pre_first_chunk_window() {
+        reaper_rows::prop_pre_first_chunk_window(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reaper_read_fault_holds_the_session_and_the_drain_runs() {
+        reaper_rows::prop_read_fault_holds_the_session_and_the_drain_runs(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reaper_unknown_fence_outcome_lands_at_most_once() {
+        reaper_rows::prop_unknown_fence_outcome_lands_at_most_once(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn reaper_complete_race_both_interleavings() {
+        reaper_rows::prop_complete_race(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    #[ignore = "known gap, accepted at #1015's sign-off: a slot reserved and released between \
+                the reaper's reads and its idle fence is not seen (crates/custodian/src/reaper.rs, \
+                Known gap). Follow-up: the reaper's slot reserve->commit->release race, which \
+                needs durable progress evidence (a proposal 0016 change) and must land before \
+                #668/#508 create sessions in production; tracker issue to be filed"]
+    async fn reaper_slot_cycle_between_the_reads_and_the_fence() {
+        reaper_rows::prop_slot_cycle_between_the_reads_and_the_fence(&mut rand_seed()).await;
     }
 }
 

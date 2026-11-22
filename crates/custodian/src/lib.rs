@@ -24,6 +24,7 @@ pub mod backfill;
 pub mod desired_state;
 pub mod gc;
 pub mod leadership;
+pub mod reaper;
 pub mod rebalance;
 pub mod reconciliation;
 pub mod reconstruction;
@@ -38,6 +39,7 @@ pub use desired_state::{
 };
 pub use gc::{mark_orphaned, ExpiredPendingPolicy, GcContext};
 pub use leadership::{Custodian, FenceError, FencedZone};
+pub use reaper::{check_admission_profile, AdmissionProfile, ReaperContext, ReaperPolicy};
 pub use rebalance::RebalanceContext;
 pub use reconciliation::{reconcile_step, ReconcileError, Reconciled};
 pub use reconstruction::{repair_priority, ReconstructionContext};

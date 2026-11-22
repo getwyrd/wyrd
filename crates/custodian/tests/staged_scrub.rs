@@ -541,7 +541,7 @@ async fn scrub_pass(meta: &Meta, d: &[Disk; 4]) -> std::result::Result<Reconcile
         meta,
         fleet: &fleet,
     };
-    reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0).await
+    reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0).await
 }
 
 // ---- the audit seam -----------------------------------------------------------------------------

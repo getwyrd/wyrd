@@ -476,7 +476,7 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         meta: &meta,
         fleet: &scrub_fleet,
     };
-    let scrub_outcome = reconcile_step(&zone, &leader, None, Some(&scrub_ctx), None, None, 0)
+    let scrub_outcome = reconcile_step(&zone, &leader, None, Some(&scrub_ctx), None, None, None, 0)
         .await
         .expect(
             "scrub reconcile_step must succeed: d1's IntegrityFault is a permanent fault that \
@@ -584,8 +584,17 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
-    let recon_result =
-        reconcile_step(&zone, &leader, None, None, Some(&recon_ctx), None, 1_000).await;
+    let recon_result = reconcile_step(
+        &zone,
+        &leader,
+        None,
+        None,
+        Some(&recon_ctx),
+        None,
+        None,
+        1_000,
+    )
+    .await;
 
     // The reconcile_step must succeed: EIO on d1 must be classified as a permanent
     // read fault via is_permanent_read_fault (issue #251) and read around — NOT

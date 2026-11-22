@@ -546,7 +546,7 @@ async fn pass_over(
         operator_fleet_size: fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, NOW)
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, NOW)
         .with_subscriber(audit.dispatch())
         .await
 }

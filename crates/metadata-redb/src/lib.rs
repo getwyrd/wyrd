@@ -39,7 +39,10 @@ use std::ops::Bound;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use redb::{backends::InMemoryBackend, Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    backends::InMemoryBackend, Database, DatabaseError, ReadableDatabase, ReadableTable,
+    StorageError, TableDefinition, TableError,
+};
 use wyrd_traits::{
     page_cursor, page_is_full, page_limit, page_start, BoxError, CommitOutcome, MetadataStore,
     PageStart, Result, ScanPage, WriteBatch,
@@ -61,10 +64,94 @@ pub struct RedbMetadataStore {
     scan_cap: usize,
 }
 
+/// Why [`RedbMetadataStore::open_existing`] opened nothing: no metadata store is at the path.
+///
+/// Every other failure of that open is redb's own error, unchanged — a lock another process
+/// holds, an I/O fault, a file that is not a redb database. Something is there in those cases,
+/// and it could not be opened; here nothing is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoExistingStore {
+    /// No file is at the path.
+    Missing,
+    /// The file is there and holds no byte: what [`RedbMetadataStore::open`] would initialize a
+    /// new store in.
+    Empty,
+    /// A redb database without the metadata table: [`RedbMetadataStore::open`] writes that table
+    /// before it returns, so no store was ever opened here.
+    Uninitialized,
+}
+
+impl NoExistingStore {
+    /// Which absence, if any, redb's refusal to open `path` reports.
+    fn behind(refusal: &DatabaseError, path: &std::path::Path) -> Option<Self> {
+        let DatabaseError::Storage(StorageError::Io(fault)) = refusal else {
+            return None;
+        };
+        match fault.kind() {
+            std::io::ErrorKind::NotFound => Some(Self::Missing),
+            // redb refuses an empty file as invalid data, the kind it also gives a file that is
+            // not a redb database. The refusal is redb's, made on the handle it opened; this
+            // length only chooses which of the two the caller is told.
+            std::io::ErrorKind::InvalidData
+                if std::fs::metadata(path).is_ok_and(|file| file.len() == 0) =>
+            {
+                Some(Self::Empty)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for NoExistingStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "no file is there",
+            Self::Empty => "the file is empty",
+            Self::Uninitialized => "the file is a redb database with no metadata table",
+        })
+    }
+}
+
+impl std::error::Error for NoExistingStore {}
+
 impl RedbMetadataStore {
     /// Open (creating if needed) a redb database at `path`.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Self::from_db(Database::create(path)?)
+    }
+
+    /// Open the store at `path` **only if one is already there** — for a caller whose answer is
+    /// a statement about an existing store, and for whom an empty store made on the spot would
+    /// be a false one.
+    ///
+    /// Nothing is created: not the file, not a database in an empty file, not the metadata table
+    /// in a database that lacks it. The decision is redb's own non-creating open, taken on the
+    /// one handle it opens, so there is no check before the open for another process to get
+    /// between.
+    ///
+    /// # Errors
+    ///
+    /// [`NoExistingStore`] when no store is at `path`; otherwise redb's own error.
+    pub fn open_existing(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let db = Database::open(path).map_err(|refusal| {
+            match NoExistingStore::behind(&refusal, path) {
+                Some(absent) => BoxError::from(absent),
+                None => BoxError::from(refusal),
+            }
+        })?;
+        // Read, never written: `from_db` would create the table this checks for.
+        match db.begin_read()?.open_table(TABLE) {
+            Ok(_) => {}
+            Err(TableError::TableDoesNotExist(_)) => {
+                return Err(NoExistingStore::Uninitialized.into())
+            }
+            Err(other) => return Err(other.into()),
+        }
+        Ok(Self {
+            db,
+            scan_cap: SCAN_CAP,
+        })
     }
 
     /// Create a store backed by an in-memory redb database — for tests and
@@ -345,6 +432,171 @@ mod error_class_tests {
         assert!(
             !classify(err.as_ref()).is_transient(),
             "an embedded store must never offer a retry that cannot help: {err}"
+        );
+    }
+}
+
+/// [`RedbMetadataStore::open_existing`] opens a store that is there and creates nothing where
+/// one is not. Each refusal is driven on a real file, and each test then reads the path back:
+/// "refused" is only half the property, "and left as it was" is the other.
+#[cfg(test)]
+mod open_existing_tests {
+    use super::*;
+
+    /// Why `open_existing` refused, as the typed absence a caller matches on.
+    fn absence(path: &std::path::Path) -> Option<NoExistingStore> {
+        let refusal = RedbMetadataStore::open_existing(path)
+            .err()
+            .expect("nothing to open here");
+        refusal.downcast_ref::<NoExistingStore>().copied()
+    }
+
+    /// Whether the redb database at `path` holds the metadata table.
+    fn has_metadata_table(path: &std::path::Path) -> bool {
+        let db = Database::open(path).expect("a redb database");
+        let txn = db.begin_read().expect("a read transaction");
+        match txn.open_table(TABLE) {
+            Ok(_) => true,
+            Err(TableError::TableDoesNotExist(_)) => false,
+            Err(other) => panic!("the table could not be looked for: {other}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_file_is_refused_and_not_created() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let path = dir.path().join("meta.redb");
+        assert_eq!(absence(&path), Some(NoExistingStore::Missing));
+        assert!(!path.exists(), "the refusal created no file");
+
+        // A missing directory is the same absence, and is not created either.
+        let nested = dir.path().join("no-such-dir").join("meta.redb");
+        assert_eq!(absence(&nested), Some(NoExistingStore::Missing));
+        assert!(!dir.path().join("no-such-dir").exists());
+    }
+
+    /// The fixture is the input `open` initializes: the last lines show it doing so, on the very
+    /// file `open_existing` has just left at zero bytes.
+    #[test]
+    fn an_empty_file_is_refused_and_left_empty() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("meta.redb");
+        std::fs::File::create(&path).expect("an empty file");
+
+        assert_eq!(absence(&path), Some(NoExistingStore::Empty));
+        assert_eq!(
+            std::fs::metadata(&path).expect("still there").len(),
+            0,
+            "no database was initialized in it"
+        );
+
+        drop(RedbMetadataStore::open(&path).expect("`open` initializes an empty file"));
+        assert!(std::fs::metadata(&path).expect("still there").len() > 0);
+        RedbMetadataStore::open_existing(&path).expect("and now a store is there");
+    }
+
+    #[test]
+    fn a_database_with_no_metadata_table_is_refused_and_given_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("meta.redb");
+        drop(Database::create(&path).expect("a redb database and nothing in it"));
+
+        assert_eq!(absence(&path), Some(NoExistingStore::Uninitialized));
+        assert!(
+            !has_metadata_table(&path),
+            "the refusal did not create the table it looked for"
+        );
+
+        drop(RedbMetadataStore::open(&path).expect("`open` writes the table"));
+        assert!(has_metadata_table(&path));
+        RedbMetadataStore::open_existing(&path).expect("and now a store is there");
+    }
+
+    /// Something is at the path and it is not a store: redb's own error, not an absence, and the
+    /// file is not touched.
+    #[test]
+    fn a_file_that_is_not_a_database_keeps_redbs_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("meta.redb");
+        let bytes = b"not a redb database, and longer than its magic number";
+        std::fs::write(&path, bytes).expect("a foreign file");
+
+        let refusal = RedbMetadataStore::open_existing(&path)
+            .err()
+            .expect("not a database");
+        assert!(
+            refusal.downcast_ref::<NoExistingStore>().is_none(),
+            "a foreign file is not reported as no file: {refusal}"
+        );
+        assert!(
+            refusal.downcast_ref::<DatabaseError>().is_some(),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read(&path).expect("still there"), bytes);
+    }
+
+    /// A store another handle holds is there. Reporting it as absent would send an operator
+    /// looking for a store that a running node has open.
+    #[test]
+    fn a_store_held_open_elsewhere_is_not_reported_absent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("meta.redb");
+        let held = RedbMetadataStore::open(&path).expect("the first handle");
+
+        let refusal = RedbMetadataStore::open_existing(&path)
+            .err()
+            .expect("redb holds an exclusive lock");
+        assert!(
+            refusal.downcast_ref::<NoExistingStore>().is_none(),
+            "{refusal}"
+        );
+        assert!(
+            matches!(
+                refusal.downcast_ref::<DatabaseError>(),
+                Some(DatabaseError::DatabaseAlreadyOpen)
+            ),
+            "{refusal}"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn an_existing_store_is_opened_with_what_it_holds() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("meta.redb");
+        pollster::block_on(async {
+            let writer = RedbMetadataStore::open(&path).expect("a writer makes the store");
+            writer
+                .commit(WriteBatch::new().put(b"k:1".to_vec(), "a"))
+                .await
+                .expect("seed");
+            drop(writer);
+
+            let store = RedbMetadataStore::open_existing(&path).expect("the store is there");
+            assert_eq!(store.scan_cap(), SCAN_CAP);
+            assert_eq!(
+                store.get(b"k:1").await.expect("get"),
+                Some(Bytes::from_static(b"a"))
+            );
+            // It is the store, not a view of it: a write through this handle lands.
+            let outcome = store
+                .commit(WriteBatch::new().put(b"k:2".to_vec(), "b"))
+                .await
+                .expect("commit");
+            assert_eq!(outcome, CommitOutcome::Committed);
+            assert_eq!(store.scan(b"k:").await.expect("scan").len(), 2);
+        });
+    }
+
+    /// The three absences read differently: a caller prints this text beside the path.
+    #[test]
+    fn each_absence_says_which_it_is() {
+        assert_eq!(NoExistingStore::Missing.to_string(), "no file is there");
+        assert_eq!(NoExistingStore::Empty.to_string(), "the file is empty");
+        assert_eq!(
+            NoExistingStore::Uninitialized.to_string(),
+            "the file is a redb database with no metadata table"
         );
     }
 }

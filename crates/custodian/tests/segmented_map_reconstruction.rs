@@ -429,7 +429,7 @@ async fn run(
         .with_writer(capture.clone());
     meta.inode_scans.store(0, Ordering::SeqCst);
     meta.seg_pages.store(0, Ordering::SeqCst);
-    let outcome = reconcile_step(&zone, &leader, None, None, Some(&ctx), None, NOW)
+    let outcome = reconcile_step(&zone, &leader, None, None, Some(&ctx), None, None, NOW)
         .with_subscriber(tracing::Dispatch::new(
             tracing_subscriber::registry().with(layer),
         ))

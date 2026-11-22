@@ -564,9 +564,18 @@ async fn without_the_pass_a_stranded_fragment_leaks_forever() {
 
     // A year later. No pass was run.
     let far_future = NOW + 365 * 24 * 60 * 60 * 1_000;
-    reconcile_step(&zone, &leader, Some(&gc), None, None, None, far_future)
-        .await
-        .unwrap();
+    reconcile_step(
+        &zone,
+        &leader,
+        Some(&gc),
+        None,
+        None,
+        None,
+        None,
+        far_future,
+    )
+    .await
+    .unwrap();
 
     assert!(
         d0.get_fragment(stray).await.unwrap().is_some(),
@@ -607,7 +616,7 @@ async fn after_the_pass_gc_reclaims_the_stranded_fragment() {
 
     // Still inside the grace window: GC must STILL decline. The reader-safety window is not
     // shortened by the pass — it is started by it.
-    reconcile_step(&zone, &leader, Some(&gc), None, None, None, NOW + 500)
+    reconcile_step(&zone, &leader, Some(&gc), None, None, None, None, NOW + 500)
         .await
         .unwrap();
     assert!(
@@ -617,9 +626,18 @@ async fn after_the_pass_gc_reclaims_the_stranded_fragment() {
     );
 
     // Past the grace window: the bytes GC could never touch are finally reclaimed.
-    reconcile_step(&zone, &leader, Some(&gc), None, None, None, NOW + 2_000)
-        .await
-        .unwrap();
+    reconcile_step(
+        &zone,
+        &leader,
+        Some(&gc),
+        None,
+        None,
+        None,
+        None,
+        NOW + 2_000,
+    )
+    .await
+    .unwrap();
     assert!(
         d0.get_fragment(stray).await.unwrap().is_none(),
         "after the grace window the marked stray must be reclaimed — this is the leak (#551) \

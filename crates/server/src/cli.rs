@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,8 +28,8 @@ use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
 use wyrd_core::multipart::FenceGeneration;
 use wyrd_core::{read, write};
-use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone};
-use wyrd_metadata_redb::RedbMetadataStore;
+use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone, Reconciled};
+use wyrd_metadata_redb::{NoExistingStore, RedbMetadataStore};
 use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, MetadataStore, PlacementChunkStore, WriteBatch,
@@ -481,7 +481,7 @@ fn usage() {
     eprintln!("  wyrd put <file> --key <name> [--data-dir DIR] [--chunk-size N] [--durability rs(k,m)|none] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd get <key> [--out <file>] [--data-dir DIR] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb]");
     eprintln!("  wyrd d-server [--bind ADDR] [--health-bind ADDR] [--advertise-addr ADDR] [--data-dir DIR] [--group NAME] [--lease-ttl-secs N] [--renew-secs N] [--coordination-backend mem|etcd] [--max-concurrent-requests N] [--request-timeout-secs N] [--otlp-endpoint URL]");
-    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore] [--gc-expired-pending]");
+    eprintln!("  wyrd custodian [--zone NAME] [--data-dir DIR] [--metadata-backend redb|tikv|fdb] [--otlp-endpoint URL] [--interval-secs N] [--connect-timeout-secs N] [--endpoints URL,URL,… --ids N,N,… --failure-domains D,D,…] [--reconcile-after-restore] [--gc-expired-pending] [--reap-abandoned-uploads]");
     eprintln!("      --reconcile-after-restore runs ONE post-restore reconciliation pass and exits (#551): after");
     eprintln!("      restoring metadata from a backup, with the writers STOPPED. It marks fragments the restore");
     eprintln!("      stranded so GC can reclaim them, and reports chunks whose bytes were already reclaimed before");
@@ -491,6 +491,9 @@ fn usage() {
     eprintln!("      backend: the CLI stamps leases from a logical clock, so an in-flight write's lease already");
     eprintln!("      reads as expired and its bytes would be swept mid-write (#557). Pass it only when you can");
     eprintln!("      attest the backend is taking no writes; without it GC still reclaims delete/overwrite orphans.");
+    eprintln!("      --reap-abandoned-uploads runs ONE multipart reaper pass and exits (#625): metadata-only, needs no --endpoints; exits non-zero when a session is held, a fence's outcome is unknown or the profile check refuses.");
+    eprintln!("      It is refused with --endpoints/--ids/--failure-domains or --gc-expired-pending (it would ignore them),");
+    eprintln!("      and on a redb --data-dir that holds no metadata store (it creates none). Its last line names the store it ran on.");
     eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--chunk-size N] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
     eprintln!("  wyrd demo");
     eprintln!();
@@ -940,6 +943,14 @@ const DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// Even absent fencing no corruption is possible: the reconstruction repoint is a
 /// version-conditional (CAS) commit, so two racing custodians never both win.
 ///
+/// Two **one-shots** run a single pass and exit instead of looping: `--reconcile-after-restore`
+/// (#551; it needs the whole fleet) and `--reap-abandoned-uploads` (#625: one multipart reaper
+/// pass and the record-only retirement drain, over metadata alone, so it needs no
+/// `--endpoints`). Each exits non-zero when its pass needs a human. The reaper one-shot is
+/// refused, before it opens anything, with a flag that selects work it does not run
+/// ([`REAPER_ONE_SHOT_EXCLUDES`]), and on a redb `--data-dir` that holds no store
+/// ([`open_existing_local_meta_redb`]); its outcome line names the store it ran on.
+///
 /// `pub` so the deployable role's own binary entry — arg parse → [`resolve_backend`] →
 /// backend open → [`connect_fleet`] (with [`require_aligned_topology`] and the concrete
 /// [`GrpcDServerConnector`] dial) → run loop — is driven **end to end** by a test, not only
@@ -996,6 +1007,23 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
     // The #551 one-shot: read here, with the other flags, so `parsed` is not borrowed across
     // the `async move` that owns the rest of the role.
     let reconcile_after_restore = parsed.flag("reconcile-after-restore").is_some();
+    // The #625 one-shot: one multipart reaper pass, then exit. Read here for the same reason.
+    let reap_abandoned_uploads = parsed.flag("reap-abandoned-uploads").is_some();
+    if reap_abandoned_uploads && reconcile_after_restore {
+        return Err(
+            "wyrd custodian: --reap-abandoned-uploads and --reconcile-after-restore are \
+                    two different one-shots; run them one at a time"
+                .into(),
+        );
+    }
+    // The reaper one-shot runs the reaper and its record-only drain, and nothing else. A flag
+    // that selects other work would be read here and then dropped, and the run would exit 0
+    // having done less than its command line asked. Refused before anything is opened.
+    if reap_abandoned_uploads {
+        if let Some(refusal) = reaper_one_shot_conflict(&parsed) {
+            return Err(refusal.into());
+        }
+    }
     // GC's expired-pending input is OFF unless the operator arms it. The input's grace is
     // the lease TTL itself, and a lease is only trustworthy if it was stamped from a live
     // clock — the CLI write path stamps `pending:` leases from a fixed logical clock
@@ -1079,6 +1107,40 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             eprintln!("wyrd custodian: shutting down");
         };
         let clock = wall_clock_millis;
+
+        // THE MULTIPART REAPER ONE-SHOT (#625) — exactly one fenced pass of the reaper and the
+        // record-only retirement drain, then exit. It needs no `--endpoints`: it reads and writes
+        // metadata only (fencing abandoned `Open` sessions, then the drain's marks and deletes),
+        // and retires nothing by chunk id, which is the one thing that would need the fleet. The
+        // same pass the deployed loop runs every interval, through the same control point.
+        if reap_abandoned_uploads {
+            let outcome =
+                run_reaper_once_over_backend(backend, data_dir, &service, &zone, &custodian, clock)
+                    .await?;
+            // The store is named beside the outcome: "nothing to reap" is a statement about one
+            // store, and an operator who pointed the one-shot at the wrong one must be able to
+            // see that from this line alone.
+            eprintln!(
+                "wyrd custodian: multipart reaper pass {} [store: {}]",
+                match outcome {
+                    Reconciled::Satisfied => "satisfied — nothing to reap or drain",
+                    Reconciled::Changed => "changed the store — re-run until it reports satisfied",
+                    Reconciled::Partial => "partial — re-run until it reports satisfied",
+                    Reconciled::Blocked => {
+                        "BLOCKED — something it cannot act on was named above \
+                         (NEEDS-HUMAN)"
+                    }
+                },
+                reaper_store_name(backend, data_dir),
+            );
+            // A pass that held something, or could not learn a fence's outcome, exits non-zero:
+            // printing NEEDS-HUMAN and exiting 0 is a hollow green for a script.
+            return Ok::<ExitCode, BoxError>(if outcome == Reconciled::Blocked {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
 
         let Some(endpoints) = endpoints else {
             if reconcile_after_restore {
@@ -1606,6 +1668,144 @@ pub async fn run_restore_reconcile_over_backend(
     }
 }
 
+/// The flags `--reap-abandoned-uploads` is refused with, each with the work it selects that the
+/// one-shot does not run. The one-shot is one multipart reaper pass and its record-only drain,
+/// over metadata: no GC pass, and nothing that dials a D server. Accepting one of these and
+/// ignoring it would let the run exit 0 while the sweep the operator armed never ran, or while
+/// the fleet they named was never reconstructed, scrubbed or collected.
+///
+/// The flags that only tune the loop (`--interval-secs`, `--connect-timeout-secs`) are not here:
+/// with no loop and no dial there is nothing they ask for that the one-shot leaves undone.
+const REAPER_ONE_SHOT_EXCLUDES: [(&str, &str); 4] = [
+    (
+        "gc-expired-pending",
+        "it arms the GC pass's expired-pending sweep, and the one-shot runs no GC pass",
+    ),
+    (
+        "endpoints",
+        "it names the D-server fleet to reconstruct, scrub and collect, and the one-shot dials \
+         no D server",
+    ),
+    (
+        "ids",
+        "it gives the D-server fleet its identities, and the one-shot dials no D server",
+    ),
+    (
+        "failure-domains",
+        "it gives the D-server fleet its failure domains, and the one-shot dials no D server",
+    ),
+];
+
+/// Why `parsed` cannot run as the `--reap-abandoned-uploads` one-shot: the first flag in it the
+/// one-shot would have to ignore ([`REAPER_ONE_SHOT_EXCLUDES`]), or `None` when there is none.
+fn reaper_one_shot_conflict(parsed: &ParsedArgs) -> Option<String> {
+    REAPER_ONE_SHOT_EXCLUDES
+        .iter()
+        .find(|(flag, _)| parsed.flag(flag).is_some())
+        .map(|(flag, why)| {
+            format!(
+                "wyrd custodian: --reap-abandoned-uploads cannot be combined with --{flag}: \
+                 {why}. It runs the multipart reaper once, with its record-only drain, over \
+                 metadata and nothing else, so --{flag} would be silently ignored. Drop \
+                 --{flag}, or run the custodian without --reap-abandoned-uploads for that work."
+            )
+        })
+}
+
+/// The store a `--reap-abandoned-uploads` run acts on, for its outcome line: **which** store,
+/// not only which kind. The redb file under `data_dir`; the TiKV cluster by its PD endpoints
+/// ([`tikv_store_name`]); the FoundationDB cluster by its cluster file ([`fdb_store_name`]).
+///
+/// A networked backend's address is its own configuration, read from the environment, not a flag
+/// of this command — which is why the line must spell it out: "nothing to reap" over `tikv` alone
+/// reads the same whichever cluster the variable pointed at. Each arm resolves the address as
+/// the open does ([`open_tikv_meta`]'s variable and its parser; the FoundationDB driver's own
+/// variable and `config::cluster_file`), from an environment this process never changes, so the
+/// store named is the store opened.
+fn reaper_store_name(backend: MetadataBackend, data_dir: &str) -> String {
+    match backend {
+        MetadataBackend::Redb => format!("redb at {}", local_meta_redb_path(data_dir).display()),
+        #[cfg(feature = "tikv")]
+        MetadataBackend::Tikv => {
+            tikv_store_name(std::env::var(TIKV_PD_ENDPOINTS_ENV).ok().as_deref())
+        }
+        #[cfg(feature = "fdb")]
+        MetadataBackend::Fdb => fdb_store_name(&wyrd_metadata_fdb::config::cluster_file(
+            std::env::var(wyrd_metadata_fdb::config::CLUSTER_FILE_ENV).ok(),
+        )),
+    }
+}
+
+/// The environment variable naming the TiKV cluster's PD endpoints, comma-separated: the one
+/// [`open_tikv_meta`] reads, spelled here for the name of the store it connects to.
+#[cfg(any(test, feature = "tikv"))]
+const TIKV_PD_ENDPOINTS_ENV: &str = "WYRD_TIKV_PD_ENDPOINTS";
+
+/// The TiKV cluster a command acts on, as an outcome line names it: the PD endpoints
+/// [`TIKV_PD_ENDPOINTS_ENV`] resolves to, parsed as [`open_tikv_meta`] parses them, so two
+/// spellings of one list give one name and two clusters give two.
+///
+/// A value naming no endpoint is said to, rather than printed as a bare `tikv`: the open refuses
+/// it before any pass runs, so that text is for a caller that names a store it has not opened.
+#[cfg(any(test, feature = "tikv"))]
+fn tikv_store_name(pd_endpoints: Option<&str>) -> String {
+    match pd_endpoints.map(parse_endpoints) {
+        Some(Ok(endpoints)) => format!("tikv at PD {}", endpoints.join(",")),
+        _ => format!("tikv, with {TIKV_PD_ENDPOINTS_ENV} naming no PD endpoint"),
+    }
+}
+
+/// The FoundationDB cluster a command acts on, as an outcome line names it: the cluster file the
+/// driver connects with — `WYRD_FDB_CLUSTER_FILE`, or the package default when that is unset —
+/// already resolved by the driver's own rule.
+#[cfg(any(test, feature = "fdb"))]
+fn fdb_store_name(cluster_file: &str) -> String {
+    format!("fdb at cluster file {cluster_file}")
+}
+
+/// Open the SAME metadata store the cluster wrote to and run ONE multipart reaper pass over it
+/// (#625) — the backend dispatch of the `--reap-abandoned-uploads` one-shot, mirroring
+/// [`run_restore_reconcile_over_backend`]: only the backend open differs per store, and the pass
+/// ([`CustodianService::reap_abandoned_uploads_once`]) is backend-agnostic.
+///
+/// The redb store must **already exist** ([`open_existing_local_meta_redb`]): the one-shot reaps
+/// a store a cluster wrote, and never creates one to report on.
+pub async fn run_reaper_once_over_backend<Clock>(
+    backend: MetadataBackend,
+    data_dir: &str,
+    service: &CustodianService,
+    zone: &FencedZone,
+    custodian: &Custodian,
+    clock: Clock,
+) -> Result<Reconciled, BoxError>
+where
+    Clock: FnMut() -> u64 + Send,
+{
+    let outcome = match backend {
+        MetadataBackend::Redb => {
+            let meta = open_existing_local_meta_redb(data_dir)?;
+            service
+                .reap_abandoned_uploads_once(zone, custodian, &meta, clock)
+                .await?
+        }
+        #[cfg(feature = "tikv")]
+        MetadataBackend::Tikv => {
+            let meta = open_tikv_meta().await?;
+            service
+                .reap_abandoned_uploads_once(zone, custodian, &meta, clock)
+                .await?
+        }
+        #[cfg(feature = "fdb")]
+        MetadataBackend::Fdb => {
+            let meta = open_fdb_meta().await?;
+            service
+                .reap_abandoned_uploads_once(zone, custodian, &meta, clock)
+                .await?
+        }
+    };
+    Ok(outcome)
+}
+
 /// Open the metadata store the cluster wrote to for the configured `backend` and run the
 /// custodian's leader-elected reconstruction loop over it — the **exact production
 /// backend-open path** `wyrd custodian` drives (redb dev / TiKV prod, ADR-0014), factored
@@ -1929,13 +2129,50 @@ fn open_local_chunks(data_dir: &str) -> Result<FsChunkStore, BoxError> {
     Ok(chunks)
 }
 
+/// Where the local redb metadata store of `data_dir` lives.
+fn local_meta_redb_path(data_dir: &str) -> PathBuf {
+    Path::new(data_dir).join("meta.redb")
+}
+
 /// Open the local redb metadata store under `data_dir`, creating the dir if
 /// needed — the dev-default backend for the local-disk path (ADR-0014).
 fn open_local_meta_redb(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
     let dir = Path::new(data_dir);
     std::fs::create_dir_all(dir)?;
-    let meta = RedbMetadataStore::open(dir.join("meta.redb"))?;
+    let meta = RedbMetadataStore::open(local_meta_redb_path(data_dir))?;
     Ok(meta)
+}
+
+/// Open the local redb metadata store under `data_dir` **only if it is already there**, for a
+/// command whose answer is a statement about an existing store.
+///
+/// [`open_local_meta_redb`] creates the directory and an empty store when there is none, which is
+/// right for a writer and wrong for the reaper one-shot: pointed at a mistyped `--data-dir` it
+/// would create a store, find nothing in it, and report that nothing is left to reap — an
+/// all-clear about a store that is not the cluster's. So a path that holds no store is refused,
+/// whichever way it holds none ([`NoExistingStore`]: no file, an empty file, a database that was
+/// never made a store), and nothing is created.
+///
+/// The open is the store's own non-creating one ([`RedbMetadataStore::open_existing`]). There is
+/// no look at the path before it: a check and then a creating open would initialize an empty
+/// file the check had passed, and whatever appeared between the two.
+fn open_existing_local_meta_redb(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
+    let path = local_meta_redb_path(data_dir);
+    RedbMetadataStore::open_existing(&path).map_err(|refusal| {
+        match refusal.downcast_ref::<NoExistingStore>() {
+            Some(absent) => format!(
+                "wyrd custodian --reap-abandoned-uploads: no metadata store at {}: {absent}. The \
+                 one-shot reaps the store a cluster already wrote and creates none: reporting \
+                 that an empty store it had just made holds nothing to reap would be a false \
+                 all-clear. Check --data-dir.",
+                path.display()
+            )
+            .into(),
+            // Something is there and could not be opened (a node holding its lock, say): the
+            // store's own error, as every other command reports it.
+            None => refusal,
+        }
+    })
 }
 
 /// Atomically allocate the next inode id from the persisted `meta:next_inode`
@@ -2792,7 +3029,12 @@ fn cluster_get(
 /// boolean": that inference would also make a *dangling* value flag (`wyrd demo --log-level`)
 /// silently parse as `true` instead of failing, which is precisely the hole the #531 guard
 /// test exists to keep shut. A flag is valueless only if it says so here.
-const VALUELESS_FLAGS: &[&str] = ["reconcile-after-restore", "gc-expired-pending"].as_slice();
+const VALUELESS_FLAGS: &[&str] = [
+    "reconcile-after-restore",
+    "gc-expired-pending",
+    "reap-abandoned-uploads",
+]
+.as_slice();
 
 /// Positional arguments plus `--flag value` pairs (and the valueless flags above).
 struct ParsedArgs {
@@ -2959,6 +3201,164 @@ mod tests {
         let err = resolve_health_bind(Some("127.0.0.1:0"), "127.0.0.1:50051".parse().unwrap())
             .expect_err("port 0 must refuse — an undiscoverable probe defeats its purpose");
         assert!(err.contains("concrete port"));
+    }
+
+    /// The reaper one-shot (#625) is refused with each flag it would have to ignore, named in
+    /// the refusal, and with none of them it is not refused. The flags that only tune the loop
+    /// are not among them.
+    #[test]
+    fn the_reaper_one_shot_refuses_each_flag_it_would_ignore() {
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            ParsedArgs::parse(&args).expect("the arguments parse")
+        };
+        for (flag, args) in [
+            ("--gc-expired-pending", &["--gc-expired-pending"][..]),
+            ("--endpoints", &["--endpoints", "http://127.0.0.1:9"]),
+            ("--ids", &["--ids", "1"]),
+            ("--failure-domains", &["--failure-domains", "rack-a"]),
+        ] {
+            let refusal = reaper_one_shot_conflict(&parse(args))
+                .unwrap_or_else(|| panic!("{flag} is refused"));
+            assert!(
+                refusal.contains(&format!(
+                    "--reap-abandoned-uploads cannot be combined with {flag}:"
+                )),
+                "{refusal}"
+            );
+            assert!(
+                refusal.contains(&format!("{flag} would be silently ignored")),
+                "{refusal}"
+            );
+        }
+        for accepted in [
+            &["--reap-abandoned-uploads"][..],
+            &["--data-dir", "d", "--zone", "z", "--reap-abandoned-uploads"],
+            &["--interval-secs", "5", "--connect-timeout-secs", "5"],
+        ] {
+            assert_eq!(reaper_one_shot_conflict(&parse(accepted)), None);
+        }
+    }
+
+    /// The reaper one-shot opens a redb store only where one already is. A data dir with no
+    /// `meta.redb`, and one whose `meta.redb` is a zero-length file, are each refused by path with
+    /// what was found there, and left as they were; an existing store is opened and named for
+    /// the outcome line by that same path.
+    #[test]
+    fn the_reaper_one_shot_opens_only_a_store_that_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = dir.path().to_str().expect("a utf-8 temp path");
+        let path = dir.path().join("meta.redb");
+        let refusal = |found: &str| {
+            let refused = open_existing_local_meta_redb(data_dir)
+                .err()
+                .expect("no store yet")
+                .to_string();
+            assert!(
+                refused.contains(&format!(
+                    "no metadata store at {}: {found}.",
+                    path.display()
+                )),
+                "{refused}"
+            );
+            assert!(refused.contains("creates none"), "{refused}");
+            assert!(refused.contains("Check --data-dir"), "{refused}");
+        };
+
+        refusal("no file is there");
+        assert!(!path.exists(), "the refusal created nothing");
+
+        // The file a creating open would take for a new store: refused the same way, and still
+        // empty afterwards — no database was initialized in it.
+        std::fs::File::create(&path).expect("a zero-length file");
+        refusal("the file is empty");
+        assert_eq!(std::fs::metadata(&path).expect("still there").len(), 0);
+        std::fs::remove_file(&path).expect("the empty file is removed");
+
+        drop(open_local_meta_redb(data_dir).expect("a writer creates the store"));
+        assert!(path.exists());
+        let held = open_existing_local_meta_redb(data_dir).expect("the store is there now");
+        assert_eq!(
+            reaper_store_name(MetadataBackend::Redb, data_dir),
+            format!("redb at {}", path.display())
+        );
+
+        // A store that is there and cannot be opened is not said to be missing: the store's own
+        // error comes back as it is.
+        let locked = open_existing_local_meta_redb(data_dir)
+            .err()
+            .expect("the first handle holds the lock")
+            .to_string();
+        assert!(!locked.contains("no metadata store at"), "{locked}");
+        drop(held);
+    }
+
+    /// The outcome line of the reaper one-shot names WHICH networked store it ran on, not only
+    /// its backend: two configurations give two names, and two spellings of one give one. The
+    /// arms of [`reaper_store_name`] that call these are compiled only with their backends.
+    #[test]
+    fn the_reaper_one_shot_names_which_networked_store_it_ran_on() {
+        let here = tikv_store_name(Some("http://pd-a:2379,http://pd-b:2379"));
+        let there = tikv_store_name(Some("http://pd-z:2379"));
+        assert_eq!(here, "tikv at PD http://pd-a:2379,http://pd-b:2379");
+        assert_eq!(there, "tikv at PD http://pd-z:2379");
+        assert_ne!(here, there, "two clusters, two names");
+        // The name is the list the open connects with, so spacing does not make a second store.
+        assert_eq!(
+            tikv_store_name(Some(" http://pd-a:2379 , http://pd-b:2379,")),
+            here
+        );
+        // No endpoint to name is said, never printed as a cluster.
+        for nothing in [None, Some(""), Some(" , ")] {
+            assert_eq!(
+                tikv_store_name(nothing),
+                "tikv, with WYRD_TIKV_PD_ENDPOINTS naming no PD endpoint"
+            );
+        }
+
+        let packaged = fdb_store_name("/etc/foundationdb/fdb.cluster");
+        let staging = fdb_store_name("/srv/staging/fdb.cluster");
+        assert_eq!(
+            packaged,
+            "fdb at cluster file /etc/foundationdb/fdb.cluster"
+        );
+        assert_eq!(staging, "fdb at cluster file /srv/staging/fdb.cluster");
+        assert_ne!(packaged, staging, "two cluster files, two names");
+    }
+
+    /// The `tikv` arm itself: the name is built from the variable the open reads. Whatever this
+    /// process's environment holds, the arm says exactly that — worked out here from the
+    /// variable's literal name, not through the constant the arm uses.
+    #[cfg(feature = "tikv")]
+    #[test]
+    fn the_tikv_arm_names_the_pd_endpoints_this_process_would_connect_to() {
+        let expected = match std::env::var("WYRD_TIKV_PD_ENDPOINTS") {
+            Ok(raw) if raw.split(',').any(|endpoint| !endpoint.trim().is_empty()) => format!(
+                "tikv at PD {}",
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|endpoint| !endpoint.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            _ => "tikv, with WYRD_TIKV_PD_ENDPOINTS naming no PD endpoint".to_owned(),
+        };
+        assert_eq!(reaper_store_name(MetadataBackend::Tikv, "unused"), expected);
+    }
+
+    /// The `fdb` arm itself: the cluster file `connect()` would use — the variable's value, or
+    /// the package default when it is unset or blank — worked out here from the literal names.
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn the_fdb_arm_names_the_cluster_file_this_process_would_connect_with() {
+        let cluster_file = match std::env::var("WYRD_FDB_CLUSTER_FILE") {
+            Ok(path) if !path.trim().is_empty() => path.trim().to_owned(),
+            _ => "/etc/foundationdb/fdb.cluster".to_owned(),
+        };
+        assert_eq!(
+            reaper_store_name(MetadataBackend::Fdb, "unused"),
+            format!("fdb at cluster file {cluster_file}")
+        );
     }
 
     /// The #551 one-shot is a VALUELESS flag — and adding it must not weaken the guard that a

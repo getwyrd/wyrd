@@ -265,7 +265,7 @@ async fn pass(
     zone.install(custodian.leadership());
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
-    let outcome = reconcile_step(&zone, &custodian, None, None, repair, drain, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, repair, drain, None, 500)
         .with_subscriber(subscriber)
         .await
         .unwrap();

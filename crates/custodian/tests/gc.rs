@@ -38,12 +38,18 @@ use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
     self, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState, PendingEntry,
 };
-use wyrd_core::multipart::{OwnedEntry, StagedPlacement, UploadId};
+use wyrd_core::multipart::{
+    mpu_key, part_key, psum_key, sidx_key, slot_key, AdmissionRecord, Budget, OwnedEntry,
+    PartNumber, PartRecord, PartSummary, SessionRecord, SlotIndex, SlotRecord, StagedPlacement,
+    UploadId, MPUCTL_KEY, WALL_CLOCK_SOURCE,
+};
+use wyrd_core::placement::Topology;
+use wyrd_custodian::gc::W_WRITE_MILLIS;
 use wyrd_custodian::{
     mark_orphaned, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone, GcContext,
-    Reconciled,
+    ReaperContext, ReaperPolicy, ReconcileError, Reconciled, ReconstructionContext,
 };
-use wyrd_testkit::Sim;
+use wyrd_testkit::{ManualClock, Sim};
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore, Result,
     WriteBatch,
@@ -238,7 +244,7 @@ async fn reclaims_expired_lease_byte_and_orphan_through_reconcile_step() {
     };
 
     // now = 200: past the lease (100) and past the orphan window (0 + 50).
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 200)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, 200)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed, "GC reclaimed fragment bytes");
@@ -303,9 +309,18 @@ async fn never_reclaims_a_referenced_fragment() {
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .unwrap();
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(outcome, Reconciled::Satisfied, "nothing was reclaimable");
     assert!(
@@ -381,9 +396,18 @@ async fn identity_fallback_none_empty_placement_protects_index0() {
 
     // now = 1_000_000: far past the orphan grace. Only protection is the identity-
     // fallback reference implied by the committed chunk map.
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .unwrap();
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         outcome,
@@ -449,9 +473,18 @@ async fn identity_fallback_rs_empty_placement_protects_index_above_zero() {
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .unwrap();
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         outcome,
@@ -519,9 +552,18 @@ async fn short_placement_vector_fallback_protects_fallback_index() {
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .unwrap();
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         outcome,
@@ -583,9 +625,18 @@ async fn identity_fallback_rs_6_3_empty_placement_protects_an_inner_index() {
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .unwrap();
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         outcome,
@@ -644,9 +695,18 @@ async fn short_placement_vector_rs_6_3_fallback_protects_fallback_index() {
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .unwrap();
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         outcome,
@@ -731,9 +791,18 @@ async fn malformed_placement_gc_treats_chunk_as_fully_referenced() {
     };
 
     // now = 1_000_000: far past the orphan grace.
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .unwrap();
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         outcome,
@@ -771,7 +840,7 @@ async fn honours_the_reader_safe_grace_window() {
 
     // WITHIN the window (now = 120 < 150): not reclaimed, and a reader holding the
     // prior version still resolves the fragment.
-    let early = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 120)
+    let early = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, 120)
         .await
         .unwrap();
     assert_eq!(
@@ -785,7 +854,7 @@ async fn honours_the_reader_safe_grace_window() {
     );
 
     // AFTER the window (now = 160 >= 150): reclaimed.
-    let late = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 160)
+    let late = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, 160)
         .await
         .unwrap();
     assert_eq!(
@@ -865,9 +934,18 @@ async fn a_segmented_root_gc_cannot_resolve_blocks_certification_and_reclaims_no
     };
 
     // now = 1_000_000: every grace window above is long elapsed.
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 1_000_000)
-        .await
-        .expect("one unreadable object is contained, not an error that ends the step");
+    let outcome = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&ctx),
+        None,
+        None,
+        None,
+        None,
+        1_000_000,
+    )
+    .await
+    .expect("one unreadable object is contained, not an error that ends the step");
     // The POSITIVE match on the outcome this slice adds. (The bundle's added discriminator
     // file cannot name `Blocked` — it must compile against the pre-fix tree — so this is
     // where the exact contract is bound; `cargo xtask ci` runs it.)
@@ -1054,7 +1132,7 @@ async fn gc_pass_over(
     };
 
     let audit = Capture::default();
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, now)
         .with_subscriber(tracing::Dispatch::new(
             tracing_subscriber::registry().with(
                 tracing_subscriber::fmt::layer()
@@ -1160,4 +1238,521 @@ async fn expired_lease_input_skips_what_it_cannot_read_under_every_scan_order() 
         gc_pass_over(seed, now, &population, order).await;
         gc_pass_over(seed, now, &population, reversed).await;
     }
+}
+
+// ---- #625: the reaper's marks are ones GC really reclaims, on the grace window ----
+
+/// Decode `json` as the record type and re-encode it: the canonical bytes the store's decoders
+/// require.
+macro_rules! canonical {
+    ($record:ty, $json:expr) => {{
+        let value: $record = metadata::decode($json.as_bytes()).expect("a legal record");
+        metadata::encode(&value)
+    }};
+}
+
+/// Every fragment position of `chunk`: fragment `i` on `placement[i]`.
+fn positions(chunk: &ChunkRef) -> Vec<(DServerId, FragmentId)> {
+    chunk
+        .placement
+        .iter()
+        .enumerate()
+        .map(|(i, &dserver)| (dserver, frag(chunk.id, i as u16)))
+        .collect()
+}
+
+const T0: u64 = 100 * 24 * 60 * 60 * 1_000;
+const DAY: u64 = 24 * 60 * 60 * 1_000;
+const RS21: EcScheme = EcScheme::ReedSolomon { k: 2, m: 1 };
+
+/// The fixture of the reaper's leg A against the manual clock at [`T0`], as one batch: `mpuctl`
+/// counting one session under `profile`, and an `Open` session only the idle arm can reap —
+/// created 14 days before `T0`, its newest progress 10 days before, every lease lapsed 9 days
+/// before — holding one committed part over `committed` and a crashed in-flight part's residue
+/// (a slot and an owned entry, no part record) over `in_flight`.
+fn idle_session(
+    id: &UploadId,
+    committed: &ChunkRef,
+    in_flight: &ChunkRef,
+    profile: &Budget,
+) -> WriteBatch {
+    let stored = String::from_utf8(metadata::encode(profile).to_vec()).unwrap();
+    let ledger = format!(
+        "{{\"count\":1,\"max_sessions\":{},\"profile\":{stored}}}",
+        profile.max_sessions()
+    );
+    let session = format!(
+        "{{\"parent\":42,\"object\":\"bucket/object\",\"created_at_millis\":{},\
+         \"clock_source\":\"wall\",\"segment_nonce\":\"{id}\",\"epoch\":0,\"attempts\":0,\
+         \"state\":{{\"kind\":\"Open\"}}}}",
+        T0 - 14 * DAY
+    );
+    let progress = T0 - 10 * DAY;
+    let lapsed = T0 - 9 * DAY;
+    let chunks = String::from_utf8(metadata::encode(&vec![committed.clone()]).to_vec()).unwrap();
+    let digest = "11".repeat(32);
+    let part = format!(
+        "{{\"chunks\":{chunks},\"len\":4096,\"digest\":\"{digest}\",\
+         \"committed_at_millis\":{progress},\"session_epoch\":0}}"
+    );
+    let summary = format!(
+        "{{\"chunks\":1,\"len\":4096,\"digest\":\"{digest}\",\"committed_at_millis\":{progress}}}"
+    );
+    let slot = format!(
+        "{{\"part_number\":2,\"attempt_id\":\"{}\",\"reserved_at_millis\":{progress},\
+         \"lease_expiry_millis\":{lapsed}}}",
+        "ab".repeat(16)
+    );
+    let staged = StagedPlacement::new(RS21, in_flight.placement.clone()).unwrap();
+    let owned = OwnedEntry::new(id.clone(), lapsed, staged).to_pending();
+    let one = PartNumber::new(1).unwrap();
+    let two = PartNumber::new(2).unwrap();
+    WriteBatch::new()
+        .put(MPUCTL_KEY.to_vec(), canonical!(AdmissionRecord, ledger))
+        .put(mpu_key(id), canonical!(SessionRecord, session))
+        .put(part_key(id, one), canonical!(PartRecord, part))
+        .put(psum_key(id, one), canonical!(PartSummary, summary))
+        .put(
+            slot_key(id, SlotIndex::new(0).unwrap()),
+            canonical!(SlotRecord, slot),
+        )
+        .put(sidx_key(id, two, in_flight.id), metadata::encode(&owned))
+}
+
+/// One RS(2,1) chunk on `placement`.
+fn rs21(id: ChunkId, placement: [DServerId; 3]) -> ChunkRef {
+    ChunkRef {
+        id,
+        scheme: RS21,
+        len: 4_096,
+        placement: placement.to_vec(),
+    }
+}
+
+/// **The reaper's acceptance, physically** (#625; the multipart reaper's leg A,
+/// `crates/server/tests/multipart_reaper.rs`, over in-memory stores). An `Open` session only the
+/// idle arm can reap ([`idle_session`]) holds one committed part and a crashed in-flight part's
+/// residue. Fenced and drained to convergence by the reaper's pass (`reconcile_step` with the
+/// reaper and no fleet: the operator one-shot's shape), it leaves an `orphan:` mark on every
+/// fragment position of both byte sets, stamped `T0` by the one clock. The fragments are then on
+/// the fleet, and GC reclaims **none** of them in its one pass a millisecond before the grace
+/// window closes and **every one** in its one pass at it.
+///
+/// Its red is not this test's to show: it calls `reconcile_step` with the reaper input, which a
+/// tree without the reaper does not compile. The same-file red→green is the subprocess test's.
+#[tokio::test]
+async fn reaper_marks_are_reclaimed_by_gc_at_the_grace_window() {
+    const GRACE: u64 = 50_000;
+    let meta = MemMeta::default();
+    let id = UploadId::new("a1".repeat(16)).unwrap();
+    let committed = rs21(0xA1_0001, [1, 2, 3]);
+    let in_flight = rs21(0xA1_0002, [4, 5, 6]);
+    let seeded = idle_session(&id, &committed, &in_flight, &Budget::shipped());
+    assert_eq!(meta.commit(seeded).await.unwrap(), CommitOutcome::Committed);
+
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let clock = ManualClock::new(T0);
+    let policy = ReaperPolicy::default();
+    let reaper = ReaperContext {
+        meta: &meta,
+        clock: &clock,
+        clock_source: WALL_CLOCK_SOURCE,
+        policy: &policy,
+    };
+    // Converge: at most four passes, none held.
+    for pass in 0.. {
+        if meta.get(&mpu_key(&id)).await.unwrap().is_none() {
+            break;
+        }
+        assert!(pass < 4, "the session is torn down within four passes");
+        let outcome = reconcile_step(&zone, &custodian, None, None, None, None, Some(&reaper), T0)
+            .await
+            .unwrap();
+        assert_ne!(outcome, Reconciled::Blocked, "pass {pass}");
+    }
+    for prefix in [
+        b"part:".as_slice(),
+        b"psum:",
+        b"sidx:",
+        b"slot:",
+        b"retire:",
+    ] {
+        assert!(meta.scan(prefix).await.unwrap().is_empty(), "{prefix:?}");
+    }
+
+    // Both byte sets on the fleet: one D server per position.
+    let servers: Vec<MemDServer> = (0..=6).map(|_| MemDServer::default()).collect();
+    let marked: Vec<(DServerId, FragmentId)> = positions(&committed)
+        .into_iter()
+        .chain(positions(&in_flight))
+        .collect();
+    for &(dserver, at) in &marked {
+        servers[dserver as usize].put(at).await;
+        let mark = meta
+            .get(&metadata::orphan_key(dserver, at))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("a mark on {dserver}/{at:?}"));
+        let mark = metadata::decode_orphan_mark(&mark).unwrap();
+        assert_eq!(mark.orphaned_at_millis(), T0, "stamped by the one clock");
+    }
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as DServerId, s as &dyn ChunkStore))
+        .collect();
+    let gc = GcContext {
+        meta: &meta,
+        fleet: &fleet,
+        grace_window_millis: GRACE,
+        expired_pending: ExpiredPendingPolicy::Defer,
+    };
+    let present = || async {
+        let mut present = 0;
+        for &(dserver, at) in &marked {
+            if servers[dserver as usize]
+                .get_fragment(at)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                present += 1;
+            }
+        }
+        present
+    };
+    // ONE GC pass a millisecond inside the grace window: nothing is deleted.
+    reconcile_step(
+        &zone,
+        &custodian,
+        Some(&gc),
+        None,
+        None,
+        None,
+        None,
+        T0 + GRACE - 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        present().await,
+        marked.len(),
+        "nothing is reclaimed inside the grace window"
+    );
+    for &(dserver, at) in &marked {
+        assert!(
+            meta.get(&metadata::orphan_key(dserver, at))
+                .await
+                .unwrap()
+                .is_some(),
+            "the mark on {dserver}/{at:?} stands inside the grace window"
+        );
+    }
+    // ONE GC pass at the grace window: every fragment of both byte sets is deleted, by that pass.
+    let reclaimed = reconcile_step(
+        &zone,
+        &custodian,
+        Some(&gc),
+        None,
+        None,
+        None,
+        None,
+        T0 + GRACE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reclaimed, Reconciled::Changed);
+    assert_eq!(
+        present().await,
+        0,
+        "every fragment is reclaimed by the one pass at the grace window"
+    );
+    for &(dserver, at) in &marked {
+        assert!(
+            meta.get(&metadata::orphan_key(dserver, at))
+                .await
+                .unwrap()
+                .is_none(),
+            "the mark on {dserver}/{at:?} is gone with its fragment"
+        );
+    }
+}
+
+/// One step of the deployed loop's reconstruction pass over `meta` (`run_reconstruction_until`'s
+/// shape): the reconstruction input over `fleet` and the reaper input, one clock behind both.
+async fn deployed_step(
+    meta: &MemMeta,
+    fleet: &[(DServerId, &dyn ChunkStore)],
+    clock: &ManualClock,
+) -> Reconciled {
+    deployed_step_on(meta, fleet, clock).await.unwrap()
+}
+
+/// [`deployed_step`] over any store, answering what the step answered.
+async fn deployed_step_on(
+    meta: &dyn MetadataStore,
+    fleet: &[(DServerId, &dyn ChunkStore)],
+    clock: &ManualClock,
+) -> std::result::Result<Reconciled, ReconcileError> {
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let policy = ReaperPolicy::default();
+    let topology = Topology::default();
+    let ctx = ReconstructionContext {
+        meta,
+        fleet,
+        topology: &topology,
+        unreachable: &[],
+        clock,
+        staged_write_window_millis: W_WRITE_MILLIS,
+        operator_fleet_size: fleet.len(),
+        tombstone: policy.tombstone(),
+    };
+    let reaper = ReaperContext {
+        meta,
+        clock,
+        clock_source: WALL_CLOCK_SOURCE,
+        policy: &policy,
+    };
+    let now = wyrd_testkit::Clock::now_millis(clock);
+    reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        None,
+        Some(&ctx),
+        None,
+        Some(&reaper),
+        now,
+    )
+    .await
+}
+
+/// Every key and value `meta` holds.
+fn snapshot(meta: &MemMeta) -> std::collections::BTreeMap<Vec<u8>, Bytes> {
+    meta.kv
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// **The deployed loop's step, with reconstruction and the reaper both passed** (#625). Under a
+/// ledger whose budget profile is not the custodian's, the step is `Blocked` and changes nothing:
+/// leg A's idle session is not fenced, and an upload already `Aborting` — its `retire:bytes:`
+/// obligation, its part and its owned residue, all work the retirement leg would do in this step
+/// — is byte for byte as it was. Under the custodian's own profile, ONE step fences the idle
+/// session and the retirement leg after the reaper walks and drains it: every fragment position
+/// of both its byte sets carries the walk's mark in that step, and later steps delete it.
+#[tokio::test]
+async fn deployed_step_with_reconstruction_and_reaper_refuses_or_drains_in_one_step() {
+    let servers: Vec<MemDServer> = (0..=6).map(|_| MemDServer::default()).collect();
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as DServerId, s as &dyn ChunkStore))
+        .collect();
+    let clock = ManualClock::new(T0);
+    let id = UploadId::new("d1".repeat(16)).unwrap();
+    let committed = rs21(0xD1_0001, [1, 2, 3]);
+    let in_flight = rs21(0xD1_0002, [4, 5, 6]);
+
+    // Mismatched: the ledger stores twice the shipped `W_ref`.
+    let other: Budget = metadata::decode(
+        String::from_utf8(metadata::encode(&Budget::shipped()).to_vec())
+            .unwrap()
+            .replace(
+                &format!("\"w_ref\":{}", Budget::shipped().w_ref()),
+                &format!("\"w_ref\":{}", 2 * Budget::shipped().w_ref()),
+            )
+            .as_bytes(),
+    )
+    .expect("a legal profile");
+    assert_ne!(other, Budget::shipped());
+    let meta = MemMeta::default();
+    let seeded = idle_session(&id, &committed, &in_flight, &other);
+    assert_eq!(meta.commit(seeded).await.unwrap(), CommitOutcome::Committed);
+    // The upload already `Aborting`: fenced by the one teardown every writer of the edge shares.
+    let ended = UploadId::new("d2".repeat(16)).unwrap();
+    let ended_open = format!(
+        "{{\"parent\":42,\"object\":\"bucket/ended\",\"created_at_millis\":{},\
+         \"clock_source\":\"wall\",\"segment_nonce\":\"{ended}\",\"epoch\":0,\"attempts\":0,\
+         \"state\":{{\"kind\":\"Open\"}}}}",
+        T0 - 14 * DAY
+    );
+    let ended_open: SessionRecord = metadata::decode(ended_open.as_bytes()).unwrap();
+    let teardown = ended_open.open_teardown(&ended).unwrap();
+    let residue = rs21(0xD2_0002, [4, 5, 6]);
+    let staged = StagedPlacement::new(RS21, residue.placement.clone()).unwrap();
+    let owned = OwnedEntry::new(ended.clone(), T0 - 9 * DAY, staged).to_pending();
+    let aborting = WriteBatch::new()
+        .put(mpu_key(&ended), metadata::encode(teardown.session()))
+        .put(
+            teardown.obligation().key(),
+            metadata::encode(teardown.obligation().payload()),
+        )
+        .put(
+            sidx_key(&ended, PartNumber::new(2).unwrap(), residue.id),
+            metadata::encode(&owned),
+        );
+    assert_eq!(
+        meta.commit(aborting).await.unwrap(),
+        CommitOutcome::Committed
+    );
+    let before = snapshot(&meta);
+    assert!(before.contains_key(&teardown.obligation().key()));
+
+    let outcome = deployed_step(&meta, &fleet, &clock).await;
+
+    assert_eq!(outcome, Reconciled::Blocked, "the profile check refuses");
+    assert_eq!(snapshot(&meta), before, "the store is untouched");
+
+    // Matching: the same session under the custodian's own profile.
+    let meta = MemMeta::default();
+    let seeded = idle_session(&id, &committed, &in_flight, &Budget::shipped());
+    assert_eq!(meta.commit(seeded).await.unwrap(), CommitOutcome::Committed);
+
+    let outcome = deployed_step(&meta, &fleet, &clock).await;
+
+    assert_eq!(outcome, Reconciled::Changed);
+    let record = meta
+        .get(&mpu_key(&id))
+        .await
+        .unwrap()
+        .expect("not deleted yet");
+    let record = wyrd_core::multipart::decode_session_record(&record).unwrap();
+    assert_eq!(
+        record.state(),
+        &wyrd_core::multipart::SessionState::Aborting {},
+        "fenced in this step"
+    );
+    for (dserver, at) in positions(&committed)
+        .into_iter()
+        .chain(positions(&in_flight))
+    {
+        assert!(
+            meta.get(&metadata::orphan_key(dserver, at))
+                .await
+                .unwrap()
+                .is_some(),
+            "drained in the same step: {dserver}/{at:?} is marked"
+        );
+    }
+    for _ in 0..4 {
+        if meta.get(&mpu_key(&id)).await.unwrap().is_none() {
+            break;
+        }
+        deployed_step(&meta, &fleet, &clock).await;
+    }
+    assert!(
+        meta.get(&mpu_key(&id)).await.unwrap().is_none(),
+        "deleted within four more steps"
+    );
+}
+
+/// A [`MemMeta`] whose repair-queue read fails every time — the read reconstruction's pass makes
+/// first (`wyrd_core::repair::queued_repairs`), and one neither the reaper nor the retirement leg
+/// makes.
+struct RepairQueueUnreadable(MemMeta);
+
+#[async_trait]
+impl MetadataStore for RepairQueueUnreadable {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.0.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        if prefix.starts_with(wyrd_core::repair::REPAIR_PREFIX) {
+            return Err("an injected repair-queue read fault".into());
+        }
+        self.0.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        if prefix.starts_with(wyrd_core::repair::REPAIR_PREFIX) {
+            return Err("an injected repair-queue read fault".into());
+        }
+        wyrd_testkit::test_double_scan_page(self, prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        self.0.commit(batch).await
+    }
+}
+
+/// **A reconstruction fault does not starve the reaper or the drain** (#625). The deployed loop's
+/// step carries both the reconstruction and the reaper inputs, over a store whose repair-queue
+/// read fails every interval. Each step still returns reconstruction's error — it is not
+/// swallowed — but only after the reaper and the retirement leg ran: the first step fences leg
+/// A's idle session and marks every fragment position of both its byte sets, and within four more
+/// steps the session is deleted and its admission slot released, every one of them answering the
+/// same error.
+#[tokio::test]
+async fn a_reconstruction_fault_does_not_starve_the_reaper_or_the_drain() {
+    let servers: Vec<MemDServer> = (0..=6).map(|_| MemDServer::default()).collect();
+    let fleet: Vec<(DServerId, &dyn ChunkStore)> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (i as DServerId, s as &dyn ChunkStore))
+        .collect();
+    let clock = ManualClock::new(T0);
+    let id = UploadId::new("e1".repeat(16)).unwrap();
+    let committed = rs21(0xE1_0001, [1, 2, 3]);
+    let in_flight = rs21(0xE1_0002, [4, 5, 6]);
+    let meta = RepairQueueUnreadable(MemMeta::default());
+    let seeded = idle_session(&id, &committed, &in_flight, &Budget::shipped());
+    assert_eq!(meta.commit(seeded).await.unwrap(), CommitOutcome::Committed);
+
+    let first = deployed_step_on(&meta, &fleet, &clock).await;
+
+    let fault = first.expect_err("the reconstruction error is returned, not swallowed");
+    assert!(fault.to_string().contains("repair-queue"), "{fault}");
+    let record = meta
+        .get(&mpu_key(&id))
+        .await
+        .unwrap()
+        .expect("not deleted yet");
+    let record = wyrd_core::multipart::decode_session_record(&record).unwrap();
+    assert_eq!(
+        record.state(),
+        &wyrd_core::multipart::SessionState::Aborting {},
+        "the reaper fenced it in the failing step"
+    );
+    for (dserver, at) in positions(&committed)
+        .into_iter()
+        .chain(positions(&in_flight))
+    {
+        assert!(
+            meta.get(&metadata::orphan_key(dserver, at))
+                .await
+                .unwrap()
+                .is_some(),
+            "the drain ran in the failing step: {dserver}/{at:?} is marked"
+        );
+    }
+    for _ in 0..4 {
+        if meta.get(&mpu_key(&id)).await.unwrap().is_none() {
+            break;
+        }
+        assert!(deployed_step_on(&meta, &fleet, &clock).await.is_err());
+    }
+    assert!(
+        meta.get(&mpu_key(&id)).await.unwrap().is_none(),
+        "deleted within four more failing steps"
+    );
+    let ledger = meta.get(MPUCTL_KEY).await.unwrap().expect("the ledger");
+    assert_eq!(
+        wyrd_core::multipart::decode_admission_record(&ledger)
+            .unwrap()
+            .count(),
+        0,
+        "the admission slot is released"
+    );
 }

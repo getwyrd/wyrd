@@ -638,7 +638,7 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
     // PASS 1 — under-replicated: the count RISES. The pass does NOT error on the dead
     // server (it was read around), so the role survives.
     let outcome = service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .expect("the role survives the killed D-server (no crash on the transient fault)");
     assert_eq!(
@@ -655,7 +655,7 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
     // PASS 2 — repaired: the obligation is drained, so the count RETURNS TO ZERO.
     pass_clock.set(600);
     let outcome = service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 600)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 600)
         .await
         .unwrap();
     assert_eq!(
@@ -765,7 +765,7 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
     // distinct data-loss signal, NOT the backlog gauge. Pre-fix (Unrepairable counted on the
     // gauge) this reads 2 and no data-loss metric exists.
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .expect("the role survives the killed D-server");
     assert_eq!(
@@ -785,7 +785,7 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
     // stays pinned at 1.
     pass_clock.set(600);
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 600)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 600)
         .await
         .unwrap();
     assert_eq!(
@@ -878,7 +878,7 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .expect("the role survives the transient outage (no crash)");
 
@@ -930,7 +930,7 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx2), None, 600)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx2), None, None, 600)
         .await
         .unwrap();
     assert_eq!(
@@ -1024,7 +1024,7 @@ async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
     // the repair selector erred and unwound the pass (the `.expect` below would panic). Post-fix
     // the pass SURVIVES and the chunk is routed to the blocked level, off the backlog gauge.
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .expect("a no-free-domain chunk does not unwind the pass (it is blocked, not fatal)");
     assert_eq!(
@@ -1047,7 +1047,7 @@ async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
     // PASS 2 — the condition persists; the backlog gauge must STAY at zero (never floor at 1).
     pass_clock.set(600);
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 600)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 600)
         .await
         .expect("the blocked chunk keeps the pass alive across repeated passes");
     assert_eq!(
@@ -1741,7 +1741,7 @@ async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
     );
 
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .expect("the pass completes; the chunk is simply unrecoverable");
 
@@ -1842,7 +1842,7 @@ async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
     );
 
     service
-        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, 500)
+        .reconcile_pass(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .expect("the pass survives the killed D-server");
 

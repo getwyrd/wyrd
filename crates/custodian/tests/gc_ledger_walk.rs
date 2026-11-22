@@ -530,6 +530,7 @@ impl Walk {
             None,
             None,
             None,
+            None,
             now,
         )
         .await;
@@ -1547,7 +1548,7 @@ async fn guard_a_page_outside_the_scan_page_contract_is_refused_not_walked() {
 
         let coord = MemCoordination::new();
         let (zone, custodian) = elect(&coord).await;
-        let gc = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, NOW).await;
+        let gc = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, NOW).await;
         let Err(err) = gc else {
             panic!(
                 "{fault:?}: the GC pass walked a page outside the contract instead of refusing it"

@@ -521,6 +521,7 @@ impl Gc {
             None,
             None,
             None,
+            None,
             now,
         )
         .with_subscriber(tracing::Dispatch::new(

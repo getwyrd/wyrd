@@ -23,7 +23,11 @@
 //!
 //! [`crate::reconcile_step`] runs the leg on the **reconstruction** input, after the
 //! reconstruction loop, so the deployed custodian runs it every reconstruction pass
-//! (`crates/server/src/custodian.rs`, `run_reconstruction_until`). One pass of the ledger walk
+//! (`crates/server/src/custodian.rs`, `run_reconstruction_until`). With no reconstruction input
+//! but the multipart reaper's ([`crate::reaper`]), it runs the leg **record-only**
+//! ([`reconcile_record_only`]): the operator one-shot `wyrd custodian --reap-abandoned-uploads`,
+//! which has no fleet, so a record that could only be retired by chunk id is held for a pass that
+//! has one. One pass of the ledger walk
 //! (the session leg before it has bounds of its own, [`sessions`]):
 //!
 //! * visits at most [`VISITS_PER_PASS`] obligations, read in pages of [`LEDGER_PAGE`]; every
@@ -284,7 +288,7 @@ pub const COMMITS_PER_PASS: usize = STEPS_PER_PASS + 1;
 /// (`crates/traits/src/lib.rs`, *Operational envelope*). Every key the walk reads is one the store
 /// already holds, so it is within this; a resume point past it is damage, and handed to a
 /// backend as a cursor it would be refused on every pass.
-const LEDGER_KEY_MAX_LEN: usize = 10_000;
+pub(crate) const LEDGER_KEY_MAX_LEN: usize = 10_000;
 
 /// Why an obligation is **held**: left byte-identical this pass, named on the audit seam, and the
 /// pass answers [`Reconciled::Blocked`]. Holding one never stops the walk.
@@ -396,25 +400,41 @@ pub enum Tombstone {
 }
 
 /// What a step needs to retire an untrusted record **by chunk id**: the pass's fleet, to list,
-/// and whether it is the whole operator-configured fleet (module doc, *Untrusted records*).
+/// and whether it is the whole operator-configured fleet (module doc, *Untrusted records*) — or
+/// `None` on a **record-only** pass ([`reconcile_record_only`]), which has no fleet to list.
 pub(crate) struct ByChunk<'c> {
-    fleet: &'c [(DServerId, &'c dyn ChunkStore)],
-    operator_fleet_size: usize,
+    fleet: Option<(Fleet<'c>, usize)>,
 }
+
+/// A pass's fleet: each D server by its stable id.
+type Fleet<'c> = &'c [(DServerId, &'c dyn ChunkStore)];
 
 impl<'c> ByChunk<'c> {
     fn of(ctx: &'c ReconstructionContext<'_>) -> Self {
         Self {
-            fleet: ctx.fleet,
-            operator_fleet_size: ctx.operator_fleet_size,
+            fleet: Some((ctx.fleet, ctx.operator_fleet_size)),
         }
+    }
+
+    /// A record-only pass's: no fleet, so every untrusted record is held as
+    /// [`Hold::PartialFleet`] and nothing is retired by chunk id.
+    fn none() -> Self {
+        Self { fleet: None }
     }
 
     /// Whether this pass's fleet is the whole operator-configured fleet (`fleet.len() ==
     /// operator_fleet_size`, the deployed GC gate, mirrored) — no listing taken — or the hold
-    /// naming `record` for one that is not.
+    /// naming `record` for one that is not, or for a record-only pass, which lists nothing.
     fn whole(&self, record: &[u8]) -> std::result::Result<(), Held> {
-        if self.fleet.len() == self.operator_fleet_size {
+        let Some((fleet, operator_fleet_size)) = self.fleet else {
+            return Err(partial_fleet(
+                record,
+                "a record-only pass (`wyrd custodian --reap-abandoned-uploads`) lists no D \
+                 server: retiring by chunk id waits for a pass that sees the whole fleet"
+                    .to_owned(),
+            ));
+        };
+        if fleet.len() == operator_fleet_size {
             return Ok(());
         }
         Err(partial_fleet(
@@ -422,8 +442,8 @@ impl<'c> ByChunk<'c> {
             format!(
                 "{} of {} operator-configured D server(s) in this pass's fleet: retiring by chunk \
                  id waits for a pass that sees the whole fleet",
-                self.fleet.len(),
-                self.operator_fleet_size
+                fleet.len(),
+                operator_fleet_size
             ),
         ))
     }
@@ -438,9 +458,10 @@ impl<'c> ByChunk<'c> {
         record: &[u8],
     ) -> std::result::Result<Listed, Held> {
         self.whole(record)?;
+        let fleet = self.fleet.map(|(fleet, _)| fleet).unwrap_or_default();
         // Keyed by position, so a server listed twice, or a fragment listed twice, is one position.
         let mut found = BTreeMap::new();
-        for &(dserver, store) in self.fleet {
+        for &(dserver, store) in fleet {
             let listing = match store.list_fragments().await {
                 Ok(listing) => listing,
                 // A server that failed its listing is one this pass did not see: the fleet is not
@@ -525,19 +546,53 @@ struct Pass {
 /// least certified of the two. Every marking step reads its stamp from `ctx.clock`
 /// ([`ReconstructionContext::clock`]), the loop's one time source.
 pub(crate) async fn reconcile(ctx: &ReconstructionContext<'_>) -> Result<Reconciled> {
-    let by_chunk = ByChunk::of(ctx);
+    let drain = Drain {
+        meta: ctx.meta,
+        clock: ctx.clock,
+        tombstone: ctx.tombstone,
+    };
+    run(&drain, &ByChunk::of(ctx)).await
+}
+
+/// The same pass with **no fleet** — the record-only drain the reaper's operator one-shot runs
+/// (`wyrd custodian --reap-abandoned-uploads`, [`crate::reaper`]). Everything the leg does by a
+/// record's own placement runs exactly as on a fleet pass; retiring an untrusted record **by
+/// chunk id** needs the fleet's listings, so every such record is held as
+/// [`Hold::PartialFleet`] and waits, unchanged, for a pass that sees the whole fleet. `clock` is
+/// the one source every marking step stamps from (ADR-0009); `tombstone` is the input the
+/// terminal delete reads for a `Completed` session.
+pub(crate) async fn reconcile_record_only(
+    meta: &dyn MetadataStore,
+    clock: &(dyn Clock + Sync),
+    tombstone: Tombstone,
+) -> Result<Reconciled> {
+    let drain = Drain {
+        meta,
+        clock,
+        tombstone,
+    };
+    run(&drain, &ByChunk::none()).await
+}
+
+/// What the leg reads through, whichever context built it: the store, the loop's one clock and
+/// the tombstone input ([`ReconstructionContext`]'s fields of those names).
+pub(crate) struct Drain<'c> {
+    pub(crate) meta: &'c dyn MetadataStore,
+    pub(crate) clock: &'c (dyn Clock + Sync),
+    pub(crate) tombstone: Tombstone,
+}
+
+/// The session leg, then the ledger walk.
+async fn run(ctx: &Drain<'_>, by_chunk: &ByChunk<'_>) -> Result<Reconciled> {
     // The session leg first (module doc, *The session leg, first*): what it answers joins the
     // ledger walk's, the least certified of the two.
-    let sessions = sessions::reconcile(ctx, &by_chunk).await?;
-    let ledger = walk_ledger(ctx, &by_chunk).await?;
+    let sessions = sessions::reconcile(ctx, by_chunk).await?;
+    let ledger = walk_ledger(ctx, by_chunk).await?;
     Ok(sessions.least_certified(ledger))
 }
 
 /// One pass of the `retire:` ledger walk, within the bounds the module doc states.
-async fn walk_ledger(
-    ctx: &ReconstructionContext<'_>,
-    by_chunk: &ByChunk<'_>,
-) -> Result<Reconciled> {
+async fn walk_ledger(ctx: &Drain<'_>, by_chunk: &ByChunk<'_>) -> Result<Reconciled> {
     let meta = ctx.meta;
     let stored = meta
         .get(LEDGER_CURSOR_KEY)

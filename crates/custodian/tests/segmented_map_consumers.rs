@@ -568,6 +568,7 @@ async fn segmented_objects_fragments_survive_gc_and_scrub_and_a_drain_answers_pe
         Some(&scrub_ctx),
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .await
@@ -662,6 +663,7 @@ async fn one_unreadable_committed_inode_blocks_every_certifying_answer_and_recla
         None,
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .with_subscriber(capturing_dispatch(gc_audit.clone()))
@@ -679,10 +681,19 @@ async fn one_unreadable_committed_inode_blocks_every_certifying_answer_and_recla
 
     // Scrub alone: the identical condition, the identical answer, the same attribution.
     let scrub_audit = Capture::default();
-    let scrub_outcome = reconcile_step(&zone, &custodian, None, Some(&scrub_ctx), None, None, 0)
-        .with_subscriber(capturing_dispatch(scrub_audit.clone()))
-        .await
-        .expect("one unreadable object is contained, not an error that ends the pass");
+    let scrub_outcome = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        Some(&scrub_ctx),
+        None,
+        None,
+        None,
+        0,
+    )
+    .with_subscriber(capturing_dispatch(scrub_audit.clone()))
+    .await
+    .expect("one unreadable object is contained, not an error that ends the pass");
     assert!(
         scrub_outcome != Reconciled::Satisfied && scrub_outcome != Reconciled::Changed,
         "scrub must not certify a store it could only partly read; got {scrub_outcome:?}"
@@ -791,6 +802,7 @@ async fn one_damaged_object_does_not_end_the_walk_the_rest_of_the_store_is_still
         Some(&scrub_ctx),
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .await
@@ -895,6 +907,7 @@ async fn a_structurally_unreadable_committed_root_is_contained_not_propagated() 
         Some(&scrub_ctx),
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .await
@@ -997,6 +1010,7 @@ async fn assert_a_rewritten_root_is_contained(rewrites: Vec<Bytes>, arm: &str) {
         None,
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .with_subscriber(capturing_dispatch(audit.clone()))
@@ -1081,6 +1095,7 @@ async fn two_blockers_whose_keys_are_not_utf8_are_each_attributed_under_their_ow
         None,
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .with_subscriber(capturing_dispatch(audit.clone()))
@@ -1151,6 +1166,7 @@ async fn a_genuine_store_fault_during_resolve_propagates_rather_than_being_absor
         &zone,
         &custodian,
         Some(&gc_ctx),
+        None,
         None,
         None,
         None,
@@ -1253,6 +1269,7 @@ async fn a_blocked_loop_beside_a_converging_one_still_reports_the_blocked_answer
         Some(&scrub_converging),
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .await
@@ -1291,6 +1308,7 @@ async fn a_blocked_loop_beside_a_converging_one_still_reports_the_blocked_answer
         None,
         None,
         None,
+        None,
         GRACE + 1_000,
     )
     .await
@@ -1322,6 +1340,7 @@ async fn a_blocked_loop_beside_a_converging_one_still_reports_the_blocked_answer
         &custodian,
         Some(&gc_converging),
         Some(&scrub_blocked),
+        None,
         None,
         None,
         GRACE + 1_000,

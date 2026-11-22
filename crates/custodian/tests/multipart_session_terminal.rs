@@ -770,7 +770,7 @@ async fn pass(
         tombstone: view.tombstone,
     };
     let now = clock.now_millis();
-    let step = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now);
+    let step = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, now);
     match audit {
         Some(audit) => step.with_subscriber(audit.dispatch()).await,
         None => step.await,
@@ -911,7 +911,7 @@ impl Rig {
             expired_pending: ExpiredPendingPolicy::Defer,
         };
         let now = self.clock.now_millis();
-        reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
+        reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, now)
             .await
             .expect("the GC pass never fails")
     }

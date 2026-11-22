@@ -10,6 +10,7 @@
 
 use crate::gc::{self, GcContext};
 use crate::leadership::{Custodian, FenceError, FencedZone};
+use crate::reaper::{self, Reaped, ReaperContext};
 use crate::rebalance::{self, RebalanceContext};
 use crate::reconstruction::{self, ReconstructionContext};
 use crate::retirement;
@@ -117,7 +118,17 @@ impl std::error::Error for ReconcileError {}
 /// **scrub loop** ([`scrub::reconcile`], `0005:262-267`), `reconstruction` runs the
 /// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`) and, after it, the
 /// **retirement leg** ([`retirement`]: the teardown of multipart sessions that have left `Open`,
-/// `0016:672-674`, then the `retire:` ledger's drain, `0016:668`), `rebalance`
+/// `0016:672-674`, then the `retire:` ledger's drain, `0016:668`), `reaper` runs the
+/// **multipart reaper** ([`reaper`]: it fences abandoned and over-age `Open` sessions to
+/// `Aborting`, `0016:1796-2277`) before that retirement leg, so a session it fences is drained
+/// in the same step — and with no `reconstruction` input it runs the retirement leg itself,
+/// **record-only** (no fleet: nothing is retired by chunk id), the shape the operator one-shot
+/// takes (`wyrd custodian --reap-abandoned-uploads`). When the reaper's budget-profile check
+/// refuses — before its pass, or at the check it makes again as the pass's last read, just before
+/// the retirement leg — the step runs no retirement leg at all and is [`Reconciled::Blocked`]. A
+/// reconstruction error does not cost the reaper and the retirement leg their turn: they run, and
+/// the step then returns that error.
+/// `rebalance`
 /// runs the **rebalance loop** — drain/decommission evacuation ([`rebalance::reconcile`],
 /// `0005:297-303`) — and all `None` exercises the fence alone (no maintenance inputs
 /// wired). When several are supplied the step runs each independent loop and reports the
@@ -133,6 +144,7 @@ pub async fn reconcile_step(
     scrub: Option<&ScrubContext<'_>>,
     reconstruction: Option<&ReconstructionContext<'_>>,
     rebalance: Option<&RebalanceContext<'_>>,
+    reaper: Option<&ReaperContext<'_>>,
     now_millis: u64,
 ) -> Result<Reconciled, ReconcileError> {
     zone.authorize(custodian.term())
@@ -154,21 +166,47 @@ pub async fn reconcile_step(
         );
     }
     if let Some(ctx) = reconstruction {
-        outcome = outcome.least_certified(
-            reconstruction::reconcile(ctx, now_millis)
-                .await
-                .map_err(ReconcileError::Store)?,
-        );
+        let repaired = reconstruction::reconcile(ctx, now_millis)
+            .await
+            .map_err(ReconcileError::Store);
         // The retirement leg runs on the reconstruction input, never GC's: the deployed loop runs
         // a reconstruction pass every interval whatever the fleet's state, while a GC pass waits
         // for the whole fleet, and a GC-only pass reads no `retire:` range
         // (`tests/gc_reclaim_intent.rs`, leg D). After reconstruction, so a store fault in the
-        // drain never costs a pass its repairs.
-        outcome = outcome.least_certified(
-            retirement::reconcile(ctx)
+        // drain never costs a pass its repairs. The reaper runs between the two: after
+        // reconstruction for the same reason, and before the drain so a session it fences is
+        // walked and drained in this step rather than the next.
+        //
+        // Both run whatever reconstruction answered, and its error is returned once they have:
+        // they read neither the repair queue nor anything reconstruction writes, so a fault there
+        // — one that recurs every interval — must not keep every abandoned upload holding its
+        // admission slot, and every fenced one its staged bytes.
+        let retired = async {
+            if reap(reaper, &mut outcome).await? {
+                outcome = outcome.least_certified(
+                    retirement::reconcile(ctx)
+                        .await
+                        .map_err(ReconcileError::Store)?,
+                );
+            }
+            Ok(())
+        }
+        .await;
+        outcome = outcome.least_certified(reconstruction_first(repaired, retired)?);
+    } else if let Some(reaper) = reaper {
+        // No fleet: the reaper, then the retirement leg record-only, from the reaper's own store,
+        // clock and tombstone input (the operator one-shot).
+        if reap(Some(reaper), &mut outcome).await? {
+            outcome = outcome.least_certified(
+                retirement::reconcile_record_only(
+                    reaper.meta,
+                    reaper.clock,
+                    reaper.policy.tombstone(),
+                )
                 .await
                 .map_err(ReconcileError::Store)?,
-        );
+            );
+        }
     }
     if let Some(ctx) = rebalance {
         outcome = outcome.least_certified(
@@ -178,4 +216,64 @@ pub async fn reconcile_step(
         );
     }
     Ok(outcome)
+}
+
+/// What a step's reconstruction pass answered, joined with whether the reaper and the retirement
+/// leg after it failed. Reconstruction's own error comes first — it is the error the step
+/// returned before those legs ran on every answer — then theirs. When both failed, the second is
+/// named on the audit seam rather than lost.
+fn reconstruction_first(
+    repaired: Result<Reconciled, ReconcileError>,
+    retired: Result<(), ReconcileError>,
+) -> Result<Reconciled, ReconcileError> {
+    match (repaired, retired) {
+        (Ok(repaired), Ok(())) => Ok(repaired),
+        (Err(fault), Ok(())) | (Ok(_), Err(fault)) => Err(fault),
+        (Err(fault), Err(also)) => {
+            tracing::warn!(
+                target: "wyrd.custodian.reconcile",
+                error = %also,
+                "the reaper or the retirement leg also failed this step; the reconstruction \
+                 error is the one returned",
+            );
+            Err(fault)
+        }
+    }
+}
+
+/// Run the multipart reaper when the step carries one, joining what it answers into `outcome`,
+/// and answer whether the retirement leg may run after it.
+///
+/// It may not when the reaper's profile check refused ([`Reaped::Refused`]): the stored budget
+/// profile is not the one this custodian is sized for — or it is unknown: the ledger does not
+/// decode, or is absent while sessions exist — and the leg's walks build the staged references
+/// that profile sizes, so the leg writes nothing that step, which is
+/// [`Reconciled::Blocked`]. The reaper makes that check again as its pass's last read, so the leg
+/// is never authorized by a ledger read before the reaper's pass ran — a first Create that installs
+/// another profile while the pass runs refuses the step as a stored mismatch does (the reaper's
+/// module doc, step 5, states what that last read cannot see).
+/// The loops that read no multipart record — reconstruction before it, rebalance after — run as
+/// they would. A session the reaper only *held* is one session's, not the store's: the leg still
+/// runs, and drains every session the reaper never had to judge (a foreign-clocked one's teardown
+/// included, `0016:1891-1909`). With no reaper the leg runs as it always has.
+async fn reap(
+    reaper: Option<&ReaperContext<'_>>,
+    outcome: &mut Reconciled,
+) -> Result<bool, ReconcileError> {
+    let Some(reaper) = reaper else {
+        return Ok(true);
+    };
+    match reaper::reconcile(reaper)
+        .await
+        .map_err(ReconcileError::Store)?
+    {
+        Reaped::Ran(reaped) => {
+            *outcome = outcome.least_certified(reaped);
+            Ok(true)
+        }
+        Reaped::Refused => {
+            *outcome = outcome.least_certified(Reconciled::Blocked);
+            Ok(false)
+        }
+    }
 }

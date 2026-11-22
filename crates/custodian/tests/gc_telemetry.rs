@@ -226,7 +226,7 @@ async fn emits_gc_actions_on_the_durability_seam() {
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 100)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, 100)
         .with_subscriber(subscriber)
         .await
         .unwrap();

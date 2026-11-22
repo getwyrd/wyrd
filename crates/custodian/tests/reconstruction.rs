@@ -376,7 +376,7 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -511,7 +511,7 @@ async fn reconstruction_preserves_object_metadata_across_a_repair() {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -589,7 +589,7 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(outcome, Reconciled::Changed);
@@ -713,7 +713,7 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -854,7 +854,7 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -962,7 +962,7 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
 
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .with_subscriber(subscriber)
         .await
         .unwrap();
@@ -1110,7 +1110,7 @@ async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() 
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -1298,7 +1298,7 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let result = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500).await;
+    let result = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500).await;
     let outcome =
         result.expect("a permanent read fault is read around, not propagated out of assess");
     assert_eq!(
@@ -1404,7 +1404,7 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
 
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let result = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500).await;
+    let result = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500).await;
 
     // The transient fault is propagated to the retry policy, not absorbed as a loss.
     assert!(
@@ -1478,7 +1478,7 @@ async fn emits_the_three_repair_metrics_on_the_durability_seam() {
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .with_subscriber(subscriber)
         .await
         .unwrap();
@@ -1689,7 +1689,7 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .with_subscriber(tracing_subscriber::registry().with(telemetry.metrics_layer()))
         .await
         .unwrap();
@@ -1719,7 +1719,7 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, 600)
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, None, 600)
         .with_subscriber(tracing_subscriber::registry().with(telemetry2.metrics_layer()))
         .await
         .unwrap();
@@ -1828,7 +1828,7 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .with_subscriber(tracing_subscriber::registry().with(telemetry.metrics_layer()))
         .await
         .unwrap();
@@ -1860,7 +1860,7 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, 600)
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx2), None, None, 600)
         .with_subscriber(tracing_subscriber::registry().with(telemetry2.metrics_layer()))
         .await
         .unwrap();
@@ -1974,7 +1974,7 @@ async fn an_aborted_repair_is_not_counted_as_a_successful_repair() {
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
-    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .with_subscriber(subscriber)
         .await
         .unwrap();

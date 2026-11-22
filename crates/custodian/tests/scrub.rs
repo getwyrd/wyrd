@@ -266,7 +266,7 @@ async fn walks_and_verifies_referenced_fragments_through_reconcile_step() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -304,7 +304,7 @@ async fn detects_a_bitflip_excludes_and_enqueues_for_reconstruction() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -373,7 +373,7 @@ async fn detects_a_misplaced_intact_fragment_excludes_and_enqueues_for_reconstru
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -438,7 +438,7 @@ async fn emits_scrub_coverage_and_corruption_on_the_durability_seam() {
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .with_subscriber(subscriber)
         .await
         .unwrap();
@@ -558,7 +558,7 @@ async fn fschunkstore_corruption_is_enqueued_and_the_pass_continues() {
     // propagates it with `?` and ABORTS — `reconcile_step` returns `Err`, so this
     // `unwrap` panics (red). POST-FIX scrub classifies it as corruption, enqueues, and
     // continues over the rest of the D server.
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .with_subscriber(subscriber)
         .await
         .unwrap();
@@ -629,7 +629,7 @@ async fn scrub_propagates_a_transient_get_fault_without_enqueuing() {
     // decide — the other half of the corrupt-vs-transient distinction at scrub's
     // decision point. (Were the two collapsed, this would either be swallowed as a
     // false repair or abort the pass the way real corruption used to.)
-    let result = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0).await;
+    let result = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0).await;
     assert!(
         result.is_err(),
         "a transient get fault propagates for retry; it is not classified as corruption"
@@ -698,7 +698,7 @@ async fn detects_corruption_on_an_empty_placement_none_chunk() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -749,7 +749,7 @@ async fn detects_corruption_on_an_empty_placement_rs_chunk_above_index_zero() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -818,7 +818,7 @@ async fn short_placement_is_malformed_scrub_fails_safe() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -888,7 +888,7 @@ async fn detects_corruption_in_a_full_rs_6_3_placement() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -947,7 +947,7 @@ async fn detects_a_missing_placed_fragment_and_enqueues_for_reconstruction() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -1003,7 +1003,7 @@ async fn does_not_flag_an_in_flight_pending_writes_fragment_as_missing() {
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .unwrap();
     assert_eq!(
@@ -1073,7 +1073,7 @@ async fn an_unreadable_committed_map_blocks_certification_but_still_scrubs_the_r
         fleet: &fleet,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, 0)
+    let outcome = reconcile_step(&zone, &custodian, None, Some(&ctx), None, None, None, 0)
         .await
         .expect("one unreadable object is contained, not an error that ends the pass");
     assert_eq!(
