@@ -1684,11 +1684,11 @@ async fn short_fleet(kinds: &[(u64, Untrusted)], dropped: bool) {
     // Beside held owned entries, a trusted residue entry the walk drains on the short fleet too:
     // a step that holds and commits, which still holds each record once a pass.
     let owned_kinds = !matches!(kinds[0].1, Untrusted::Part);
-    let trusted_at = diagonal(ChunkId::from(n) * 1_000 + 9, &[0, 1, 2]);
+    let sound_at = diagonal(ChunkId::from(n) * 1_000 + 9, &[0, 1, 2]);
     if owned_kinds {
-        let residue = owned(&id, 9, trusted_at[0].1.chunk, RS21, vec![0, 1, 2]);
+        let residue = owned(&id, 9, sound_at[0].1.chunk, RS21, vec![0, 1, 2]);
         rig.store.plant(vec![residue]).await;
-        rig.fleet.store_at(&trusted_at);
+        rig.fleet.store_at(&sound_at);
     }
     rig.abort(&id).await;
     let (obligation, _) = teardown(&id, 0);
@@ -1734,7 +1734,7 @@ async fn short_fleet(kinds: &[(u64, Untrusted)], dropped: bool) {
     rig.reclaim_past_grace().await;
     rig.assert_gone(&fragments);
     if owned_kinds {
-        rig.assert_gone(&trusted_at);
+        rig.assert_gone(&sound_at);
     }
 }
 
@@ -2007,12 +2007,12 @@ async fn e1_a_part_past_one_steps_reads_resumes_from_its_cursor() {
     let committed = rig.committed_object(162, 78).await;
     let id = rig.session(62, &format!("{BUCKET}/e1-past-one-step")).await;
     let mut chunks = Vec::new();
-    let mut trusted = Vec::new();
+    let mut sound = Vec::new();
     let mut found = Vec::new();
     for j in 0..40_u128 {
         if j < 39 {
             let good = chunk(62_000 + j, RS42, vec![0, 1, 2, 3, 4, 5]);
-            trusted.extend(positions(std::slice::from_ref(&good)));
+            sound.extend(positions(std::slice::from_ref(&good)));
             chunks.push(good);
         }
         let bad = 62_500 + j;
@@ -2034,7 +2034,7 @@ async fn e1_a_part_past_one_steps_reads_resumes_from_its_cursor() {
     let record = puts[2].0.clone();
     rig.store.plant(puts).await;
     rig.fleet.store_at(&first_at);
-    rig.fleet.store_at(&trusted);
+    rig.fleet.store_at(&sound);
     rig.fleet.store_at(&found);
     rig.abort(&id).await;
     let (_, event) = teardown(&id, 0);
@@ -2046,7 +2046,7 @@ async fn e1_a_part_past_one_steps_reads_resumes_from_its_cursor() {
     let sent = rig.store.take_sent();
     rig.assert_marked(&first_at, &event).await;
     assert_marked_before_deleted(&sent, &first_at, &first_record);
-    let mut evidenced = trusted.clone();
+    let mut evidenced = sound.clone();
     evidenced.extend(found.iter().copied());
     rig.assert_marked(&evidenced, &event).await;
     assert_marked_before_deleted(&sent, &evidenced, &record);
@@ -2607,8 +2607,8 @@ struct HeldPage {
     held: Vec<Record>,
     held_at: Vec<(DServerId, FragmentId)>,
     reasons: Vec<&'static str>,
-    trusted: Record,
-    trusted_at: Vec<(DServerId, FragmentId)>,
+    sound: Record,
+    sound_at: Vec<(DServerId, FragmentId)>,
 }
 
 impl HeldPage {
@@ -2631,12 +2631,12 @@ impl HeldPage {
                 (true, true) => "record-unreadable",
             });
         }
-        let trusted = owned(&id, 17, base + 17, RS21, vec![0, 1, 2]);
-        let trusted_at = diagonal(base + 17, &[0, 1, 2]);
+        let sound = owned(&id, 17, base + 17, RS21, vec![0, 1, 2]);
+        let sound_at = diagonal(base + 17, &[0, 1, 2]);
         rig.fleet.store_at(&held_at);
-        rig.fleet.store_at(&trusted_at);
+        rig.fleet.store_at(&sound_at);
         let mut puts = held.clone();
-        puts.push(trusted.clone());
+        puts.push(sound.clone());
         rig.store.plant(puts).await;
         let view = if completed {
             rig.plant_parts(&id, &[(20, vec![chunk(base + 20, RS21, vec![0, 1, 2])])])
@@ -2658,8 +2658,8 @@ impl HeldPage {
             held,
             held_at,
             reasons,
-            trusted,
-            trusted_at,
+            sound,
+            sound_at,
         }
     }
 
@@ -2711,7 +2711,7 @@ impl HeldPage {
 /// row read past it says nothing follows. The sixteen stay byte-identical, nothing of their chunks
 /// marked, and the session stays with its slot counted; past the grace the trusted entry's
 /// fragments are gone and theirs stay.
-async fn a_trusted_entry_behind_a_page_of_held_ones_retires(n: u64, completed: bool) -> HeldPage {
+async fn a_sound_entry_behind_a_page_of_held_ones_retires(n: u64, completed: bool) -> HeldPage {
     let page = HeldPage::new(n, completed).await;
     let (rig, id) = (&page.rig, &page.id);
     let event = format!("{id}:{}", rig.epoch_of(id).await);
@@ -2736,18 +2736,18 @@ async fn a_trusted_entry_behind_a_page_of_held_ones_retires(n: u64, completed: b
         moved[0].preconditions
     );
     assert_eq!(rig.store.value(&position).await, Some(sixteenth));
-    assert!(rig.mark_at(page.trusted_at[0]).await.is_none());
+    assert!(rig.mark_at(page.sound_at[0]).await.is_none());
 
     let mut sent = Vec::new();
     let mut passes = 1;
-    while rig.store.value(&page.trusted.0).await.is_some() {
+    while rig.store.value(&page.sound.0).await.is_some() {
         assert!(passes < 3, "the trusted entry retires within 3 passes");
         page.pass_holding_the_page(passes).await;
         sent.extend(rig.store.take_sent());
         passes += 1;
     }
-    rig.assert_marked(&page.trusted_at, &event).await;
-    assert_marked_before_deleted(&sent, &page.trusted_at, &page.trusted.0);
+    rig.assert_marked(&page.sound_at, &event).await;
+    assert_marked_before_deleted(&sent, &page.sound_at, &page.sound.0);
     assert_eq!(
         rig.store.value(&position).await,
         None,
@@ -2771,7 +2771,7 @@ async fn a_trusted_entry_behind_a_page_of_held_ones_retires(n: u64, completed: b
     assert_eq!(rig.sessions_counted().await, counted);
 
     rig.reclaim_past_grace().await;
-    rig.assert_gone(&page.trusted_at);
+    rig.assert_gone(&page.sound_at);
     rig.assert_kept(&page.held_at);
     rig.audit.clear();
     page
@@ -2783,7 +2783,7 @@ async fn a_trusted_entry_behind_a_page_of_held_ones_retires(n: u64, completed: b
 /// session ends, and past the grace every fragment is gone, server 5's included.
 #[tokio::test]
 async fn d_a_trusted_entry_behind_a_page_held_for_a_short_fleet_retires() {
-    let page = a_trusted_entry_behind_a_page_of_held_ones_retires(81, false).await;
+    let page = a_sound_entry_behind_a_page_of_held_ones_retires(81, false).await;
     let (rig, id) = (&page.rig, &page.id);
     let counted = rig.sessions_counted().await;
     rig.drain_until_ended(id, 6).await;
@@ -2800,7 +2800,7 @@ async fn d_a_trusted_entry_behind_a_page_held_for_a_short_fleet_retires() {
 /// trusted entry retires; the sixteen stay, and so does the session.
 #[tokio::test]
 async fn d_a_completed_sessions_trusted_entry_behind_a_page_of_held_ones_retires() {
-    a_trusted_entry_behind_a_page_of_held_ones_retires(82, true).await;
+    a_sound_entry_behind_a_page_of_held_ones_retires(82, true).await;
 }
 
 /// **(D, a position and a session that moved)** The first pass over a page of held entries reads
@@ -2946,26 +2946,26 @@ async fn d_a_trusted_entry_behind_three_held_part_way_retires() {
         held.push(entry);
         held_at.extend(at);
     }
-    let trusted = owned(&id, 4, 85_004, RS21, vec![0, 1, 2]);
-    let trusted_at = diagonal(85_004, &[0, 1, 2]);
-    rig.store.plant(vec![trusted.clone()]).await;
+    let sound = owned(&id, 4, 85_004, RS21, vec![0, 1, 2]);
+    let sound_at = diagonal(85_004, &[0, 1, 2]);
+    rig.store.plant(vec![sound.clone()]).await;
     rig.fleet.store_at(&held_at);
-    rig.fleet.store_at(&trusted_at);
+    rig.fleet.store_at(&sound_at);
     rig.abort(&id).await;
     let event = format!("{id}:{}", rig.epoch_of(&id).await);
     let counted = rig.sessions_counted().await;
     rig.store.take_sent();
 
     let mut passes = 0;
-    while rig.store.value(&trusted.0).await.is_some() {
+    while rig.store.value(&sound.0).await.is_some() {
         assert!(passes < 8, "the trusted entry retires within 8 passes");
         let outcome = rig.drain().await.expect("no pass fails");
         assert_eq!(outcome, Reconciled::Blocked, "pass {passes}");
         passes += 1;
     }
     let sent = rig.store.take_sent();
-    rig.assert_marked(&trusted_at, &event).await;
-    assert_marked_before_deleted(&sent, &trusted_at, &trusted.0);
+    rig.assert_marked(&sound_at, &event).await;
+    assert_marked_before_deleted(&sent, &sound_at, &sound.0);
     let position = walk_position(&id);
     let passed: Vec<&Bytes> = session_leg(&sent)
         .into_iter()
@@ -3025,7 +3025,7 @@ async fn d_a_trusted_entry_behind_three_held_part_way_retires() {
 
     rig.audit.clear();
     rig.reclaim_past_grace().await;
-    rig.assert_gone(&trusted_at);
+    rig.assert_gone(&sound_at);
     rig.assert_kept(&held_at);
 }
 
