@@ -638,6 +638,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
+        None,
         0,
     )
     .await
@@ -725,6 +726,7 @@ async fn kill_reconstruct_restores_full_redundancy_in_distinct_domains() {
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
+        None,
         None,
         0,
     )

@@ -1745,6 +1745,17 @@ pub struct Budget {
 }
 
 impl Budget {
+    /// The **shipped** profile — the five constants of section 14 ([`W_REF`],
+    /// [`MAX_PART_CHUNKS`], [`MAX_PARTS_PER_SESSION`], [`MAX_INFLIGHT_PARTS`],
+    /// [`MAX_STAGED_CHUNKS`]) as one `Budget`. It is the profile a custodian built from this tree
+    /// holds as its own and compares the stored `mpuctl` profile against before it acts
+    /// (`0016:2063-2072`, the reaper's profile check). Not a writer-side constructor: it builds
+    /// no value of a caller's choosing, only the one already held to this type's rules at compile
+    /// time.
+    pub const fn shipped() -> Self {
+        SHIPPED_PROFILE
+    }
+
     /// `W_ref` — the reconcile pass's staged-reference memory budget, in chunk-refs.
     pub const fn w_ref(&self) -> u64 {
         self.w_ref
@@ -2417,6 +2428,18 @@ fn de_segment_nonce<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Segmen
         .map_err(|err| DeError::custom(format!("segment_nonce: {err}")))?;
     SegmentNonce::new(nonce).map_err(|err| DeError::custom(format!("segment_nonce: {err}")))
 }
+
+/// The [`SessionRecord::clock_source`] spelling of the **deployment wall clock**:
+/// `SystemTime::now()`, which madsim virtualises (ADR-0009, `0016:1951-1957`).
+///
+/// A Create that stamps `created_at_millis` from that clock passes exactly this string as
+/// [`create::CreateRequest::clock_source`], and so does every later writer of a stamp into the
+/// session (`0016:1966-1980`). The deployed custodian's reaper judges only sessions that carry
+/// it; a session under any other spelling is foreign to it and never judged against a window
+/// (`0016:1957-1964`). No production caller creates a session yet (#668 is the first), so today
+/// the only writers of it are tests. It names a clock, it does not prove one: the reaper trusts
+/// that a writer naming it read the wall clock.
+pub const WALL_CLOCK_SOURCE: &str = "wall";
 
 /// The wire shape of [`SessionRecord`] — every field the session carries regardless of state,
 /// plus `state` itself, whose own [`SessionState`] `Deserialize` enforces which of the

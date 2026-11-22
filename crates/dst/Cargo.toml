@@ -35,6 +35,8 @@ wyrd-chunk-format.workspace = true
 wyrd-testkit.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
+# The body stream the production `UploadPart` stages from (the pre-first-chunk reaper row).
+futures-util.workspace = true
 # Seed-derived fault selection (which D-server links to drop/corrupt), reproduced
 # from the madsim run seed so a bug-finding seed replays the same faults.
 rand.workspace = true

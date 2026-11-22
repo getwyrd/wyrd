@@ -56,6 +56,11 @@
 //!   beside it; a completed upload's residue is walked away and its record kept. Once the whole
 //!   fleet is visible the entry retires and the aborted upload ends; the completed one's record
 //!   still stays. Passing the live fleet's length, or `Elapsed`, from the loop turns it red.
+//! * [`deployed_loop_reaps_an_idle_open_upload_and_tears_it_down`] — the loop hands its
+//!   reconstruction pass the multipart reaper (#625): an `Open` upload nobody aborted, with one
+//!   committed part and a crashed part's residue, is left alone while it is hours old and, once
+//!   the loop's clock is past the idle window, is fenced and torn down — every record gone, both
+//!   byte sets marked, its admission slot released. Passing no reaper from the loop turns it red.
 //! * [`deployed_run_loop_refuses_duplicate_endpoints`] /
 //!   [`deployed_run_loop_refuses_duplicate_ids`] — the #554 ITERATION-4 correction: the fleet-
 //!   identity uniqueness refusal used to guard ONLY the `--reconcile-after-restore` one-shot, but
@@ -1226,14 +1231,12 @@ impl CreateRuntime for OneIdentity {
     }
 }
 
-/// The production Create of upload `n`, targeting `object`, under a profile admitting sixty-four
-/// sessions.
+/// The production Create of upload `n`, targeting `object`, under the shipped profile: the one
+/// the deployed custodian holds as its own, so its multipart reaper's profile check admits the
+/// pass whose retirement leg this file drives (a stored profile it is not sized for refuses the
+/// whole leg, #625).
 async fn create_upload(meta: &MemMeta, n: u64, object: &str) -> UploadId {
-    let profile: Budget = metadata::decode(
-        b"{\"w_ref\":128,\"max_part_chunks\":1,\"max_parts_per_session\":1,\
-          \"max_inflight_parts\":1,\"max_staged_chunks\":1}",
-    )
-    .expect("a legal profile");
+    let profile = Budget::shipped();
     let request = CreateRequest {
         bucket: BUCKET,
         parent: ROOT,
@@ -1340,6 +1343,7 @@ async fn sessions_counted(meta: &MemMeta) -> u64 {
 /// Drive the REAL run loop for `passes` passes — counted by `probed`'s reachability probes, one a
 /// pass — over `servers`, the operator having wired `operator_fleet_size` endpoints, with the
 /// role built as `wyrd custodian` builds it (`with_logging_to`) and its log sink in `capture`.
+/// The loop's clock reads [`LOOP_NOW`].
 async fn drive_passes(
     meta: &MemMeta,
     servers: &[ConfiguredDServer],
@@ -1347,6 +1351,28 @@ async fn drive_passes(
     probed: &MemDServer,
     passes: u64,
     capture: &Capture,
+) {
+    drive_passes_at(
+        meta,
+        servers,
+        operator_fleet_size,
+        probed,
+        passes,
+        capture,
+        LOOP_NOW,
+    )
+    .await;
+}
+
+/// [`drive_passes`], the loop's clock reading `now_millis` on every read.
+async fn drive_passes_at(
+    meta: &MemMeta,
+    servers: &[ConfiguredDServer],
+    operator_fleet_size: usize,
+    probed: &MemDServer,
+    passes: u64,
+    capture: &Capture,
+    now_millis: u64,
 ) {
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -1367,7 +1393,7 @@ async fn drive_passes(
         operator_fleet_size,
         ExpiredPendingPolicy::Defer,
         Duration::from_millis(1),
-        move || LOOP_NOW,
+        move || now_millis,
         shutdown,
     );
     tokio::time::timeout(Duration::from_secs(120), run)
@@ -1525,4 +1551,113 @@ async fn deployed_retirement_leg_waits_for_the_whole_operator_fleet_and_keeps_co
         "the tombstone still stays"
     );
     assert_eq!(sessions_counted(&meta).await, counted - 1);
+}
+
+// ---- the loop's reconstruction pass carries the multipart REAPER ----
+
+#[tokio::test]
+async fn deployed_loop_reaps_an_idle_open_upload_and_tears_it_down() {
+    // The deployed loop is the reaper's production caller (`custodian.rs`,
+    // `run_reconstruction_until`): every interval its reconstruction pass hands `reconcile_step`
+    // a `ReaperContext`, so an `Open` upload whose client walked away is fenced by the reaper and
+    // drained by the same step's retirement leg. Nothing else in the loop ends an `Open` upload,
+    // so with no reaper passed this one keeps its records and its admission slot for good.
+    enable_log_callsites();
+    let meta = MemMeta::default();
+    meta.commit(WriteBatch::new().put(bucket_key(BUCKET), Bytes::from_static(BUCKET_MARKER)))
+        .await
+        .unwrap();
+    let d: Vec<Arc<MemDServer>> = (0..3).map(|_| Arc::new(MemDServer::default())).collect();
+    let servers: Vec<ConfiguredDServer> = (0..3u16)
+        .map(|i| ConfiguredDServer {
+            id: DServerId::from(i),
+            failure_domain: format!("domain-{i}"),
+            store: dyn_store(&d[usize::from(i)]),
+        })
+        .collect();
+
+    // An upload created at 1 000 ms on the wall clock and never aborted or completed: part 1
+    // committed at 1 500 ms, and the staging entry of a crashed part 2 whose lease ran out at
+    // 20 000 ms. No client touches it again.
+    let idle = create_upload(&meta, 3, &format!("{BUCKET}/idle")).await;
+    const COMMITTED: ChunkId = 0x1D11;
+    const RESIDUE: ChunkId = 0x1D12;
+    let committed = ChunkRef {
+        id: COMMITTED,
+        scheme: RS21,
+        len: 64,
+        placement: vec![0, 1, 2],
+    };
+    let part = part_records(&idle, 1, std::slice::from_ref(&committed));
+    let residue = owned_entry(&idle, 2, RESIDUE, RS21, vec![0, 1, 2]);
+    land(&d, &diagonal(COMMITTED, &[0, 1, 2])).await;
+    land(&d, &diagonal(RESIDUE, &[0, 1, 2])).await;
+    let mut batch = WriteBatch::new();
+    batch.puts.extend(part.iter().cloned());
+    batch.puts.push(residue.clone());
+    meta.commit(batch).await.unwrap();
+    let session = meta.get(&mpu_key(&idle)).await.unwrap().expect("created");
+    assert_eq!(sessions_counted(&meta).await, 1);
+    let capture = Capture::default();
+
+    // Hours old: inside the idle window, so the loop's passes leave every record of it alone.
+    drive_passes(&meta, &servers, servers.len(), &d[0], 3, &capture).await;
+
+    assert_eq!(
+        meta.get(&mpu_key(&idle)).await.unwrap(),
+        Some(session),
+        "an upload that is not idle yet is left Open, byte-identical"
+    );
+    for (key, value) in part.iter().chain([&residue]) {
+        assert_eq!(meta.get(key).await.unwrap().as_ref(), Some(value));
+    }
+    assert_eq!(marks_of(&meta, COMMITTED).await, 0);
+    assert_eq!(marks_of(&meta, RESIDUE).await, 0);
+    assert_eq!(sessions_counted(&meta).await, 1);
+
+    // Eight days on: past the idle window (seven days) with every lease long lapsed, and well
+    // inside the residency ceiling (thirty), so only the reaper's idle arm can end it.
+    const EIGHT_DAYS: u64 = 8 * 24 * 60 * 60 * 1_000;
+    drive_passes_at(
+        &meta,
+        &servers,
+        servers.len(),
+        &d[0],
+        6,
+        &capture,
+        EIGHT_DAYS,
+    )
+    .await;
+
+    assert_eq!(
+        meta.get(&mpu_key(&idle)).await.unwrap(),
+        None,
+        "the idle upload is fenced and its teardown finished (RED if the loop passes no reaper: \
+         nothing else ends an Open upload)"
+    );
+    for prefix in ["part:", "psum:", "sidx:", "slot:", "retire:"] {
+        let left = meta.scan(prefix.as_bytes()).await.unwrap();
+        assert!(left.is_empty(), "{prefix} is drained: {left:?}");
+    }
+    // Every position of both byte sets is marked, each by name, and nothing else of either chunk:
+    // the committed part's through the obligation only a fence installs — no client abort ran, so
+    // the fence was the reaper's — and the crashed part's residue through the owned walk.
+    for chunk in [COMMITTED, RESIDUE] {
+        for (dserver, frag) in diagonal(chunk, &[0, 1, 2]) {
+            assert!(
+                orphan_record_present(&meta, dserver, frag.chunk, frag.index).await,
+                "{frag:?} on server {dserver} is marked"
+            );
+        }
+        assert_eq!(
+            marks_of(&meta, chunk).await,
+            3,
+            "no other mark of {chunk:#x}"
+        );
+    }
+    assert_eq!(
+        sessions_counted(&meta).await,
+        0,
+        "its admission slot is released"
+    );
 }

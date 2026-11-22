@@ -4997,6 +4997,7 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures-util",
  "madsim",
  "madsim-etcd-client",
  "madsim-tokio",
@@ -5094,6 +5095,7 @@ dependencies = [
  "bytes",
  "pollster",
  "redb",
+ "tempfile",
  "wyrd-core",
  "wyrd-metadata-conformance",
  "wyrd-testkit",

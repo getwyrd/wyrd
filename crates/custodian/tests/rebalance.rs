@@ -422,7 +422,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -543,7 +543,7 @@ async fn evacuation_preserves_object_metadata() {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -621,7 +621,7 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -763,7 +763,7 @@ async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() 
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -854,7 +854,7 @@ async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -970,7 +970,7 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
 
@@ -1030,7 +1030,7 @@ async fn emits_per_failure_domain_utilization_on_the_durability_seam() {
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
 
     // A pass with no desired state still emits the capacity plane as a by-product.
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 0)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 0)
         .with_subscriber(subscriber)
         .await
         .unwrap();
@@ -1100,7 +1100,7 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
     assert_eq!(
@@ -1343,7 +1343,7 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
     // Capture the durability seam so the lost-CAS conflict is observable as a metric.
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .with_subscriber(subscriber)
         .await
         .unwrap();
@@ -1467,7 +1467,7 @@ async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
-    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
         .await
         .unwrap();
 

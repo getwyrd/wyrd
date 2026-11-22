@@ -75,11 +75,12 @@ use tracing_subscriber::prelude::*;
 
 use crate::logging::{self, LogConfig};
 use tracing_subscriber::Registry;
+use wyrd_core::multipart::WALL_CLOCK_SOURCE;
 use wyrd_core::placement::Topology;
 use wyrd_custodian::{
     reconcile_after_restore, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone,
-    GcContext, RebalanceContext, ReconcileError, Reconciled, ReconstructionContext, RestoreReport,
-    ScrubContext, Tombstone,
+    GcContext, ReaperContext, ReaperPolicy, RebalanceContext, ReconcileError, Reconciled,
+    ReconstructionContext, RestoreReport, ScrubContext,
 };
 use wyrd_telemetry::DurabilityTelemetry;
 use wyrd_traits::{BoxError, ChunkStore, DServerId, MetadataStore};
@@ -392,6 +393,7 @@ impl CustodianService {
         scrub: Option<&ScrubContext<'_>>,
         reconstruction: Option<&ReconstructionContext<'_>>,
         rebalance: Option<&RebalanceContext<'_>>,
+        reaper: Option<&ReaperContext<'_>>,
         now_millis: u64,
     ) -> Result<Reconciled, ReconcileError> {
         reconcile_step(
@@ -401,6 +403,7 @@ impl CustodianService {
             scrub,
             reconstruction,
             rebalance,
+            reaper,
             now_millis,
         )
         .with_subscriber(self.dispatch.clone())
@@ -445,6 +448,47 @@ impl CustodianService {
             .with_subscriber(self.dispatch.clone())
             .await?;
         Ok(report)
+    }
+
+    /// **One multipart reaper pass** over `meta` — the operator one-shot `wyrd custodian
+    /// --reap-abandoned-uploads` (#625): exactly one fenced [`Self::reconcile_pass`] carrying the
+    /// reaper and nothing else, so [`reconcile_step`] runs the reaper and then the retirement
+    /// leg **record-only** — the same pass the deployed loop dispatches, through the same fenced
+    /// control point (the anti-#141 rule), minus the loops that need a fleet (scrub,
+    /// reconstruction, GC). It needs no `--endpoints`: nothing here lists or touches a D server,
+    /// and the drain retires nothing by chunk id without one.
+    ///
+    /// `clock` is the deployment wall clock the gateway stamps sessions from, read through one
+    /// `LoopClock` for both the judgment and the drain's marks (ADR-0009).
+    pub async fn reap_abandoned_uploads_once<Clock>(
+        &self,
+        zone: &FencedZone,
+        custodian: &Custodian,
+        meta: &dyn MetadataStore,
+        clock: Clock,
+    ) -> Result<Reconciled, ReconcileError>
+    where
+        Clock: FnMut() -> u64 + Send,
+    {
+        let clock = LoopClock::new(clock);
+        let policy = ReaperPolicy::default();
+        let reaper = ReaperContext {
+            meta,
+            clock: &clock,
+            clock_source: WALL_CLOCK_SOURCE,
+            policy: &policy,
+        };
+        self.reconcile_pass(
+            zone,
+            custodian,
+            None,
+            None,
+            None,
+            None,
+            Some(&reaper),
+            clock.now_millis(),
+        )
+        .await
     }
 
     /// The deployable **reconstruction run loop** — the spine the `wyrd custodian` binary
@@ -541,6 +585,9 @@ impl CustodianService {
         // (#814): its pre-mark stamps, its `W_repoint` gate and the mark it leaves on a vacated
         // position.
         let clock = LoopClock::new(clock);
+        // The multipart reaper's windows and profile: the defaults, with no CLI flag (#625). Its
+        // tombstone input is the one the retirement leg reads below.
+        let policy = ReaperPolicy::default();
         loop {
             let (fleet, topology, unreachable) = live_reconstruction_view(configured).await;
             // DERIVE this pass's repair obligations from the committed (gateway-written)
@@ -575,9 +622,20 @@ impl CustodianService {
                 // states: chunk-wide evidence taken from a partial fleet strands what a missing
                 // server holds.
                 operator_fleet_size,
-                // Nothing measures `W_tombstone` yet (#625): every `Completed` multipart session
-                // keeps its record, and its admission slot, until it does.
-                tombstone: Tombstone::Retain,
+                // Routed through the reaper's policy, where `W_tombstone` will be measured: until
+                // it is, every `Completed` multipart session keeps its record, and its admission
+                // slot.
+                tombstone: policy.tombstone(),
+            };
+            // The multipart reaper rides the reconstruction pass below, through the same fenced
+            // control point: it fences abandoned and over-age `Open` sessions, and the same
+            // step's retirement leg drains them. Its judgment reads the loop's one clock, the
+            // source `ctx.clock` and every pass's `now_millis` read (ADR-0009), stamped `wall`.
+            let reaper = ReaperContext {
+                meta,
+                clock: &clock,
+                clock_source: WALL_CLOCK_SOURCE,
+                policy: &policy,
             };
             // Scrub and reconstruction run as TWO passes, not one. `reconcile_step` short-
             // circuits on the first loop's error (scrub's `?`), so a combined pass would let a
@@ -595,6 +653,7 @@ impl CustodianService {
                     Some(&scrub_ctx),
                     None,
                     None,
+                    None,
                     clock.now_millis(),
                 )
                 .await
@@ -608,7 +667,8 @@ impl CustodianService {
                 }
             }
             // Reconstruction pass — drains the shared repair queue (what scrub just enqueued
-            // plus any prior backlog), independent of a scrub blip.
+            // plus any prior backlog), independent of a scrub blip — then the reaper and the
+            // retirement leg.
             match self
                 .reconcile_pass(
                     zone,
@@ -617,6 +677,7 @@ impl CustodianService {
                     None,
                     Some(&ctx),
                     None,
+                    Some(&reaper),
                     clock.now_millis(),
                 )
                 .await
@@ -699,6 +760,7 @@ impl CustodianService {
                         zone,
                         custodian,
                         Some(&gc_ctx),
+                        None,
                         None,
                         None,
                         None,

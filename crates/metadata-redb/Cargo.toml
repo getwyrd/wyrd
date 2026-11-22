@@ -23,6 +23,9 @@ wyrd-core.workspace = true
 wyrd-metadata-conformance.workspace = true
 wyrd-testkit.workspace = true
 pollster.workspace = true
+# `open_existing` is a statement about a file on disk — missing, empty, or a real
+# store — so its tests need real files; the in-memory backend cannot be absent.
+tempfile.workspace = true
 
 # Inherit the workspace lint policy (single source of truth in the root
 # Cargo.toml [workspace.lints.*]).

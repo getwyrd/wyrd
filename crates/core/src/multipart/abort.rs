@@ -16,16 +16,18 @@
 //! fenced session still holds its staged bytes and its `mpu:` record, so it stays counted until
 //! the terminal delete, the one place the count goes down (#659).
 //!
-//! # One batch builder, two writers
+//! # One batch builder, three writers
 //!
 //! [`fence_batch`] is the only place the teardown fence's [`WriteBatch`] is built. The client
-//! Abort here and the post-restore session fence (`crates/custodian/src/restore.rs`,
-//! `fence_session`) both commit what it builds, so the two writers of the `Open → Aborting` edge
-//! cannot drift apart in their preconditions or their puts.
+//! Abort here, the post-restore session fence (`crates/custodian/src/restore.rs`,
+//! `fence_session`) and the custodian's multipart reaper (`crates/custodian/src/reaper.rs`, #625)
+//! all commit what it builds, so the writers of the `Open → Aborting` edge cannot drift apart in
+//! their preconditions or their puts. A fence that loses is classified by one function too,
+//! [`lost`], which the Abort and the reaper share.
 //!
 //! Production calls no client Abort yet: the S3 verb that will is #668, under 0016's rule that
-//! the reaper and operator abort ship in the same release (`0016:236-268`). The restore fence is
-//! the one production caller of [`fence_batch`].
+//! the reaper and operator abort ship in the same release (`0016:236-268`). The restore fence and
+//! the reaper are the production callers of [`fence_batch`].
 //!
 //! # Runtime-free (ADR-0009)
 //!
@@ -356,8 +358,9 @@ pub async fn abort_session(
     }
 }
 
-/// What a fence commit that answered `Conflict` lost to ([`lost`]).
-enum Lost {
+/// What a [`fence_batch`] commit that answered `Conflict` lost to ([`lost`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lost {
     /// The session is no longer the bytes the round read: this is what a read found there.
     Moved(Option<Bytes>),
     /// The session is unchanged and the obligation key absent: nothing a read can see explains
@@ -367,25 +370,29 @@ enum Lost {
     Taken,
 }
 
-/// Classify a fence commit that answered `Conflict`, from what the store holds, never by
-/// inference: the session first; if unchanged, the obligation key; if that is present, the
+/// Classify a [`fence_batch`] commit that answered `Conflict`, from what the store holds, never
+/// by inference: the session first; if unchanged, the obligation key; if that is present, the
 /// session again, since every fence puts its session and its obligation in one batch and each
 /// read is its own transaction, so a rival fence can land between the first two reads.
-async fn lost(
-    store: &impl MetadataStore,
+///
+/// The one classifier for the one fence: the client Abort spends a round on what it finds, and
+/// the custodian's reaper (#625) holds a session whose obligation key is [`Lost::Taken`] rather
+/// than counting it as contention.
+pub async fn lost(
+    store: &(impl MetadataStore + ?Sized),
     session_key: &[u8],
-    read: &Bytes,
+    read: &[u8],
     obligation_key: &[u8],
 ) -> Result<Lost, BoxError> {
     let now = store.get(session_key).await?;
-    if now.as_ref() != Some(read) {
+    if now.as_deref() != Some(read) {
         return Ok(Lost::Moved(now));
     }
     if store.get(obligation_key).await?.is_none() {
         return Ok(Lost::Unexplained);
     }
     let now = store.get(session_key).await?;
-    if now.as_ref() != Some(read) {
+    if now.as_deref() != Some(read) {
         return Ok(Lost::Moved(now));
     }
     Ok(Lost::Taken)

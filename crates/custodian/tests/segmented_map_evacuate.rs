@@ -285,7 +285,7 @@ impl Fixture {
         let json = tracing_subscriber::fmt::layer().json();
         let layer = json.with_writer(Arc::new(audit.reopen().unwrap()));
         let logging = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
-        let step = reconcile_step(&zone, &leader, None, None, None, Some(&ctx), 10_000);
+        let step = reconcile_step(&zone, &leader, None, None, None, Some(&ctx), None, 10_000);
         let answer = step.with_subscriber(logging).await;
         (answer, std::fs::read_to_string(audit.path()).unwrap())
     }

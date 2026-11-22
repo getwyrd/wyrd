@@ -659,7 +659,7 @@ impl Fixture {
             tombstone: wyrd_custodian::Tombstone::Retain,
         };
         let now = self.clock.now_millis();
-        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now).await
+        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, now).await
     }
 
     async fn run(&self) -> Reconciled {

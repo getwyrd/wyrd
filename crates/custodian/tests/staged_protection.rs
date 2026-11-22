@@ -493,7 +493,7 @@ async fn gc_pass(
         grace_window_millis: GRACE,
         expired_pending: ExpiredPendingPolicy::Defer,
     };
-    reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now).await
+    reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, now).await
 }
 
 /// One post-restore pass at [`NOW`].
@@ -543,7 +543,7 @@ async fn reconstruction_pass(
         operator_fleet_size: fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now).await
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, now).await
 }
 
 // ---- the records --------------------------------------------------------------------------------
@@ -2226,7 +2226,8 @@ async fn scrub_result(meta: &Meta, d: &[Disk; 4]) -> std::result::Result<Answers
         meta,
         fleet: &fleet,
     };
-    let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, NOW).await?;
+    let scrubbed =
+        reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, None, NOW).await?;
     Ok(Answers {
         scrub: scrubbed,
         repairs: meta.keys_under(b"repair:"),

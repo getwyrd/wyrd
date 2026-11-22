@@ -190,7 +190,7 @@ async fn delete_orphans_fragment_reclaimed_by_gc_from_the_placed_dserver() {
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
 
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 200)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, 200)
         .await
         .unwrap();
 
@@ -294,7 +294,7 @@ async fn overwrite_orphans_prior_fragments_reclaimed_by_gc_but_keeps_the_current
         grace_window_millis: 50,
         expired_pending: ExpiredPendingPolicy::Reclaim,
     };
-    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, 200)
+    let outcome = reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, 200)
         .await
         .unwrap();
     assert_eq!(

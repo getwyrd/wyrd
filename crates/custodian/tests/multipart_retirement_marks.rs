@@ -635,7 +635,7 @@ impl Rig {
             tombstone: wyrd_custodian::Tombstone::Retain,
         };
         let now = self.clock.now_millis();
-        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now)
+        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, now)
             .with_subscriber(self.audit.dispatch())
             .await
     }
@@ -655,7 +655,7 @@ impl Rig {
             expired_pending: ExpiredPendingPolicy::Defer,
         };
         let now = self.clock.now_millis();
-        reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now)
+        reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, now)
             .await
             .expect("the GC pass never fails")
     }

@@ -450,7 +450,7 @@ async fn attempt(
     let layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(capture.clone());
-    let outcome = reconcile_step(&fenced, &leader, None, None, Some(&ctx), None, NOW)
+    let outcome = reconcile_step(&fenced, &leader, None, None, Some(&ctx), None, None, NOW)
         .with_subscriber(tracing::Dispatch::new(
             tracing_subscriber::registry().with(layer),
         ))
