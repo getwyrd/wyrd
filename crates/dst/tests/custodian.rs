@@ -7089,7 +7089,7 @@ mod reaper_rows {
         PartNumber::new(n).unwrap()
     }
 
-    fn ledger(count: u64) -> (Vec<u8>, Bytes) {
+    pub(super) fn ledger(count: u64) -> (Vec<u8>, Bytes) {
         let profile = String::from_utf8(metadata::encode(&Budget::shipped()).to_vec()).unwrap();
         let json = format!(
             "{{\"count\":{count},\"max_sessions\":{},\"profile\":{profile}}}",
@@ -7424,7 +7424,7 @@ mod reaper_rows {
     }
 
     /// One fenced pass: the reaper, then the retirement leg record-only, at the clock's instant.
-    async fn reap(meta: &dyn MetadataStore, clock: &ManualClock) -> Reconciled {
+    pub(super) async fn reap(meta: &dyn MetadataStore, clock: &ManualClock) -> Reconciled {
         let coord = MemCoordination::new();
         let (zone, custodian) = elect(&coord, "zone-reaper").await;
         let policy = ReaperPolicy::default();
@@ -8146,11 +8146,11 @@ mod reaper_rows {
     }
 
     /// The bucket the Complete race row's session publishes into, and its marker.
-    const BUCKET: &str = "bucket";
-    const MARKER: &[u8] = br#"{"name":"bucket","created_at_millis":1}"#;
+    pub(super) const BUCKET: &str = "bucket";
+    pub(super) const MARKER: &[u8] = br#"{"name":"bucket","created_at_millis":1}"#;
 
     /// Create's runtime for one fixed identity: no jitter, no wait.
-    struct OneIdentity(Option<(UploadId, SegmentNonce)>);
+    pub(super) struct OneIdentity(pub(super) Option<(UploadId, SegmentNonce)>);
 
     impl CreateRuntime for OneIdentity {
         fn mint(&mut self) -> (UploadId, SegmentNonce) {
@@ -8210,11 +8210,11 @@ mod reaper_rows {
     }
 
     /// The dirent parent every object of the row is published under.
-    const COMPLETE_PARENT: InodeId = 0;
+    pub(super) const COMPLETE_PARENT: InodeId = 0;
 
     /// The production `CompleteMultipartUpload` of `id`, naming `parts`, on the wall clock at
     /// `at`.
-    async fn complete(
+    pub(super) async fn complete(
         meta: &impl MetadataStore,
         id: &UploadId,
         parts: &NamedParts,
@@ -8481,6 +8481,963 @@ mod reaper_rows {
     }
 }
 
+// ---- FU-6: the operator abort's fence is one batch, cut at every point (proposal 0016 `:664-665`) ----
+
+/// The operator abort (`wyrd_core::multipart::abort::operator_abort`, FU-6) moves a session to
+/// `Aborting` and installs the obligations that reclaim it **in one batch** (`0016:664-665`). An
+/// end-state scan cannot tell one batch from two, so these rows cut the abort — the operator's
+/// process dying — at every instant of its run over the simulated-TiKV model, whose every read and
+/// commit is a real madsim await, and read what the store then holds. A commit the abort has sent
+/// runs on to land after the cut, as a commit request a real store has received outlives the
+/// client that sent it ([`Sent`]). Each door has exactly two reachable states: the session as
+/// seeded with no obligation, or the session at `Aborting@E+1` with **every** obligation of its
+/// door. A fence split over two commits leaves a third — fenced, with an obligation missing — at a
+/// cut between them: for the `Completing` door, a session whose segments no record names for
+/// deletion (X57). A fence that lands after the operator gave up is then torn down by the drain.
+///
+/// Three rows make the commit's outcome unknown instead ([`Unknown`]): every fence left in flight
+/// until the abort has spent its rounds and returned in doubt, and landing after; a fence that
+/// landed, which the abort may not claim as its own; and one that landed and was torn down before
+/// the abort read again, which it may not call nothing written.
+mod operator_abort_rows {
+    use std::sync::atomic::AtomicU32;
+
+    use super::reaper_rows::{
+        complete, ledger, reap, OneIdentity, BUCKET, COMPLETE_PARENT, MARKER,
+    };
+    use super::support::SIM_TRANSACTION_TIMED_OUT;
+    use super::*;
+    use wyrd_core::metadata::{SegmentGroup, SegmentNonce};
+    use wyrd_core::multipart::abort::{
+        operator_abort, AbortError, OperatorAbortOutcome, Stop, ABORT_ROUNDS,
+    };
+    use wyrd_core::multipart::complete::{CompleteError, NamedParts};
+    use wyrd_core::multipart::create::{create_session, CreateRequest};
+    use wyrd_core::multipart::{
+        decode_admission_record, psum_key, retire_key, retire_session_range, Budget,
+        CompleteOutcome, CreateOutcome, Digest, PartSummary, Refusal, SessionRecord, SessionState,
+        MAX_MAP_CHUNKS, MPUCTL_KEY, WALL_CLOCK_SOURCE,
+    };
+    use wyrd_testkit::ManualClock;
+
+    /// The two doors of the operator abort.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Door {
+        /// `Open@2 → Aborting@3`, with `retire:bytes:s:<id>:2`.
+        Open,
+        /// `Completing@3 → Aborting@4`, with `retire:bytes:s:<id>:3` and
+        /// `retire:records:s:<id>:3` `{seg: <g, 3>}`.
+        Completing,
+    }
+
+    impl Door {
+        const ALL: [Self; 2] = [Self::Open, Self::Completing];
+
+        /// The epoch the door's session is seeded at.
+        const fn epoch(self) -> u64 {
+            match self {
+                Self::Open => 2,
+                Self::Completing => 3,
+            }
+        }
+    }
+
+    /// Every cut is at a half-millisecond, so none ties with a model hop, which sleeps whole
+    /// milliseconds — but madsim sleeps at least 1 ms, so a cut under that falls at 1 ms, after
+    /// the abort's first read, which the cut polls first. The span covers the abort's read, its
+    /// fence request's transit and its commit twice over; a cut past the abort's end lets it
+    /// finish.
+    const CUT_SPAN_MICROS: u64 = 8_000;
+    const CUT_STEP_MICROS: u64 = 250;
+
+    /// How long after a cut the row waits before it reads: past the two hops a sent commit has
+    /// left, so whatever the abort sent has landed.
+    const LAND_MILLIS: u64 = 10;
+
+    fn upload() -> UploadId {
+        UploadId::new("0f".repeat(16)).expect("32 lowercase-hex characters")
+    }
+
+    fn nonce() -> String {
+        "f0".repeat(16)
+    }
+
+    /// The `Completing` attempt's segment group: the range its records obligation names.
+    fn attempt() -> SegmentGroup {
+        SegmentGroup::new(nonce(), 3).expect("the attempt's group")
+    }
+
+    /// The session at `epoch` in `state` (its JSON), stamped under a clock no reaper owns: the
+    /// session only an operator can move. Checked against the codec's own spelling.
+    fn session(epoch: u64, attempts: u32, state: &str) -> Bytes {
+        let json = format!(
+            "{{\"parent\":42,\"object\":\"o\",\"created_at_millis\":100,\
+             \"clock_source\":\"logical\",\"segment_nonce\":\"{}\",\"epoch\":{epoch},\
+             \"attempts\":{attempts},\"state\":{state}}}",
+            nonce()
+        );
+        let record = decode_session_record(json.as_bytes()).expect("a legal session");
+        let bytes = metadata::encode(&record);
+        assert_eq!(bytes, json.as_bytes(), "fixture: the codec's own spelling");
+        bytes
+    }
+
+    /// The door's session as seeded.
+    fn seeded(door: Door) -> Bytes {
+        match door {
+            Door::Open => session(2, 0, "{\"kind\":\"Open\"}"),
+            Door::Completing => session(
+                3,
+                1,
+                "{\"kind\":\"Completing\",\"fenced_at_millis\":100,\"segments_written\":1,\
+                 \"publish_target\":{\"parent\":42,\"name\":\"o\",\"epoch\":3}}",
+            ),
+        }
+    }
+
+    /// The door's session as its fence leaves it.
+    fn fenced(door: Door) -> Bytes {
+        let attempts = u32::from(door == Door::Completing);
+        session(door.epoch() + 1, attempts, "{\"kind\":\"Aborting\"}")
+    }
+
+    fn token(epoch: u64) -> RetireToken {
+        RetireToken::Session {
+            upload_id: upload(),
+            epoch,
+            part: None,
+        }
+    }
+
+    /// What one obligation must owe: the staged residue and every part, or the fence epoch's
+    /// segments.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Owes {
+        SessionAll,
+        AttemptSegments,
+    }
+
+    /// Every obligation the door's fence installs, by key.
+    fn obligations(door: Door) -> Vec<(Vec<u8>, Owes)> {
+        let epoch = door.epoch();
+        let mut owed = vec![(
+            retire_key(RetireMode::Bytes, &token(epoch)),
+            Owes::SessionAll,
+        )];
+        if door == Door::Completing {
+            owed.push((
+                retire_key(RetireMode::Records, &token(epoch)),
+                Owes::AttemptSegments,
+            ));
+        }
+        owed
+    }
+
+    /// Which of its two states a door's store is in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Landing {
+        /// The session as seeded, no obligation.
+        Before,
+        /// `Aborting@E+1` with every obligation of the door.
+        After,
+    }
+
+    /// A store holding the door's session (and, for `Completing`, the segment its attempt wrote)
+    /// and the admission record that counts it.
+    async fn seeded_store(door: Door) -> Arc<SimTikvMetadataStore> {
+        let meta = Arc::new(SimTikvMetadataStore::new());
+        let (ledger_key, ledger_value) = ledger(1);
+        let mut seed = WriteBatch::new()
+            .put(ledger_key, ledger_value)
+            .put(mpu_key(&upload()), seeded(door));
+        if door == Door::Completing {
+            let record = metadata::SegmentRecord::new(
+                vec![ChunkRef {
+                    id: 0x0f_0001,
+                    scheme: EcScheme::None,
+                    len: 5,
+                    placement: vec![1],
+                }],
+                0,
+            )
+            .expect("a segment");
+            seed = seed.put(
+                metadata::seg_key(&attempt(), 0).expect("a segment key"),
+                metadata::encode(&record),
+            );
+        }
+        assert_eq!(
+            meta.commit(seed).await.expect("seeded"),
+            CommitOutcome::Committed
+        );
+        meta
+    }
+
+    /// Which of the door's two states the store is in. Panics on any other: the session neither
+    /// as seeded with no obligation, nor fenced with every obligation of its door and no other.
+    async fn judge(meta: &dyn MetadataStore, door: Door, context: &str) -> Landing {
+        let state = meta
+            .get(&mpu_key(&upload()))
+            .await
+            .expect("read the session");
+        let owed = meta.scan(b"retire:").await.expect("scan the obligations");
+        if state.as_ref() == Some(&seeded(door)) {
+            assert!(
+                owed.is_empty(),
+                "an unfenced session carries no obligation — {context}: {owed:?}"
+            );
+            return Landing::Before;
+        }
+        assert_eq!(
+            state.as_ref(),
+            Some(&fenced(door)),
+            "the session is either as seeded or fenced — {context}"
+        );
+        let expected = obligations(door);
+        let found: Vec<&Vec<u8>> = owed.iter().map(|(key, _)| key).collect();
+        let wanted: Vec<&Vec<u8>> = expected.iter().map(|(key, _)| key).collect();
+        assert_eq!(
+            found, wanted,
+            "a fenced session carries every obligation of its door, and no other — {context}"
+        );
+        for ((key, value), (_, owes)) in owed.iter().zip(&expected) {
+            let (_, _, payload) = decode_retire_obligation(key, value)
+                .unwrap_or_else(|fault| panic!("the obligation decodes ({fault}) — {context}"));
+            match owes {
+                Owes::SessionAll => assert!(
+                    payload.session() && payload.parts() == Some(&PartScope::All),
+                    "{payload:?} — {context}"
+                ),
+                Owes::AttemptSegments => assert_eq!(
+                    payload.segments(),
+                    Some(&attempt()),
+                    "the records obligation names the fence epoch's range — {context}"
+                ),
+            }
+        }
+        Landing::After
+    }
+
+    /// Tear a fenced session down as the operator does after an abort — passes of the reaper and
+    /// its record-only drain, which reads no clock for an `Aborting` session — and assert it is
+    /// reclaimed: its record gone, both of its `retire:` ranges and its attempt's segments
+    /// drained, the admission count back to zero.
+    async fn assert_reclaimed(meta: &dyn MetadataStore, context: &str) {
+        assert_reclaimed_of(meta, &upload(), &attempt(), context).await;
+    }
+
+    /// [`assert_reclaimed`] for upload `id`, whose fenced attempt wrote under `group`.
+    async fn assert_reclaimed_of(
+        meta: &dyn MetadataStore,
+        id: &UploadId,
+        group: &SegmentGroup,
+        context: &str,
+    ) {
+        let key = mpu_key(id);
+        let clock = ManualClock::new(1_000_000);
+        for _ in 0..6 {
+            if meta.get(&key).await.unwrap().is_none() {
+                break;
+            }
+            reap(meta, &clock).await;
+        }
+        assert_eq!(meta.get(&key).await.unwrap(), None, "deleted — {context}");
+        for prefix in [
+            retire_session_range(RetireMode::Bytes, id),
+            retire_session_range(RetireMode::Records, id),
+            metadata::seg_range_prefix(group),
+        ] {
+            assert!(
+                meta.scan(&prefix).await.unwrap().is_empty(),
+                "{} is drained — {context}",
+                String::from_utf8_lossy(&prefix)
+            );
+        }
+        let ledger = meta.get(MPUCTL_KEY).await.unwrap().expect("the ledger");
+        assert_eq!(
+            decode_admission_record(&ledger).unwrap().count(),
+            0,
+            "the admission slot is released — {context}"
+        );
+    }
+
+    /// The simulated-TiKV store with each commit request in transit for one hop and then run on a
+    /// task of its own: a cut during the transit drops the request, which never reached the store;
+    /// once there, it goes on to land though the abort is cut before it is answered. That task is
+    /// the store's side of the commit, so it is deliberately left running when the caller drops
+    /// its handle — the fault these rows inject. Counts the commits that reached the store and
+    /// those answered.
+    struct Sent {
+        inner: Arc<SimTikvMetadataStore>,
+        sent: AtomicU32,
+        answered: AtomicU32,
+    }
+
+    #[async_trait]
+    impl MetadataStore for Sent {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            self.inner.scan(prefix).await
+        }
+
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            self.inner.scan_page(prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            madsim::time::sleep(Duration::from_millis(1)).await;
+            let inner = Arc::clone(&self.inner);
+            self.sent.fetch_add(1, Ordering::SeqCst);
+            let outcome = madsim::task::spawn(async move { inner.commit(batch).await })
+                .await
+                .expect("the commit task");
+            self.answered.fetch_add(1, Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    /// Seed the door's session, cut an operator abort at `cut_micros`, let what it sent land, and
+    /// judge the store: its state, and whether a fence the abort sent was never answered and
+    /// landed after the cut — the operator gave up, and its fence went on — in which case the
+    /// drain must reclaim the session.
+    pub(super) async fn abort_cut_at(door: Door, cut_micros: u64) -> (Landing, bool) {
+        let meta = seeded_store(door).await;
+        let sent = Sent {
+            inner: Arc::clone(&meta),
+            sent: AtomicU32::new(0),
+            answered: AtomicU32::new(0),
+        };
+        let id = upload();
+        let cut = madsim::time::timeout(
+            Duration::from_micros(cut_micros),
+            operator_abort(&sent, &id),
+        )
+        .await;
+        madsim::time::sleep(Duration::from_millis(LAND_MILLIS)).await;
+        let context = format!("{door:?} door, cut at {cut_micros}us: {cut:?}");
+        if let Ok(finished) = &cut {
+            assert!(
+                matches!(finished, Ok(OperatorAbortOutcome::Fenced { .. })),
+                "an abort that ran to its end fenced — {context}"
+            );
+        }
+        let landing = judge(&*meta, door, &context).await;
+        if landing == Landing::Before {
+            assert!(
+                cut.is_err(),
+                "a finished abort left the session unfenced — {context}"
+            );
+        }
+        let late = landing == Landing::After
+            && sent.sent.load(Ordering::SeqCst) > sent.answered.load(Ordering::SeqCst);
+        if late {
+            assert_reclaimed(&*meta, &context).await;
+        }
+        (landing, late)
+    }
+
+    /// **The campaign row, one per door:** a cut drawn from the seed, anywhere in the span.
+    pub(super) async fn prop_operator_abort_cut_never_strands(door: Door, rng: &mut ChaCha8Rng) {
+        let steps = CUT_SPAN_MICROS / CUT_STEP_MICROS;
+        let cut = u64::from(rng.next_u32()) % (steps + 1) * CUT_STEP_MICROS + CUT_STEP_MICROS / 2;
+        abort_cut_at(door, cut).await;
+    }
+
+    /// **Both sides of the commit are reached, per door:** every cut across the span is judged,
+    /// and the sweep must see the session left unfenced by an early cut and fenced by a late one,
+    /// so the commit point lies inside it and every instant around it was tried — and at least
+    /// one cut must fall after the fence was sent and before it was answered, so a fence landing
+    /// after the operator gave up, and its reclamation, are tried too.
+    pub(super) async fn prop_operator_abort_cut_reaches_both_sides(door: Door) {
+        let mut seen = Vec::new();
+        let mut late = 0;
+        let mut cut = CUT_STEP_MICROS / 2;
+        while cut <= CUT_SPAN_MICROS {
+            let (landing, landed_late) = abort_cut_at(door, cut).await;
+            seen.push((cut, landing));
+            late += usize::from(landed_late);
+            cut += CUT_STEP_MICROS;
+        }
+        for landing in [Landing::Before, Landing::After] {
+            assert!(
+                seen.iter().any(|(_, at)| *at == landing),
+                "{door:?} door: no cut left the store {landing:?}: {seen:?}"
+            );
+        }
+        // One flip, never back: a later cut never finds less done than an earlier one.
+        let flips = seen.windows(2).filter(|w| w[0].1 != w[1].1).count();
+        assert_eq!(flips, 1, "{door:?} door: {seen:?}");
+        assert!(
+            late >= 1,
+            "{door:?} door: no cut fell between the fence's send and its answer: {seen:?}"
+        );
+    }
+
+    /// Every door, for the regression replay.
+    pub(super) async fn prop_operator_abort_every_door(rng: &mut ChaCha8Rng) {
+        for door in Door::ALL {
+            prop_operator_abort_cut_never_strands(door, rng).await;
+        }
+    }
+
+    /// What [`Unknown`] does with a fence commit before it answers it with an outcome it does not
+    /// report.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Fate {
+        /// Keeps it in flight, unapplied, and answers 1031 (it may still land); the row lands it
+        /// later ([`Unknown::land_late`]).
+        InFlight,
+        /// Applies it, then answers 1021 (out of flight).
+        Landed,
+        /// Applies it and tears the session down — the drain's passes running between the
+        /// commit and the abort's next read — then answers 1021.
+        LandedAndTornDown,
+    }
+
+    /// The simulated-TiKV store, answering every fence commit (one that puts the session record)
+    /// with an outcome it does not report, after doing with it what [`Fate`] says.
+    struct Unknown {
+        inner: Arc<SimTikvMetadataStore>,
+        fate: Fate,
+        in_flight: Mutex<Vec<WriteBatch>>,
+    }
+
+    impl Unknown {
+        /// Offer every fence still in flight to the store, in the order the abort sent them, and
+        /// what it answers each.
+        async fn land_late(&self) -> Vec<CommitOutcome> {
+            let batches = std::mem::take(&mut *self.in_flight.lock().unwrap());
+            let mut landed = Vec::new();
+            for batch in batches {
+                landed.push(self.inner.commit(batch).await.unwrap());
+            }
+            landed
+        }
+    }
+
+    #[async_trait]
+    impl MetadataStore for Unknown {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            self.inner.scan(prefix).await
+        }
+
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            self.inner.scan_page(prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            let session = mpu_key(&upload());
+            if !batch.puts.iter().any(|(key, _)| *key == session) {
+                return self.inner.commit(batch).await;
+            }
+            let code = if self.fate == Fate::InFlight {
+                self.in_flight.lock().unwrap().push(batch);
+                SIM_TRANSACTION_TIMED_OUT
+            } else {
+                let landed = self.inner.commit(batch).await?;
+                assert_eq!(landed, CommitOutcome::Committed, "the fence lands whole");
+                if self.fate == Fate::LandedAndTornDown {
+                    assert_reclaimed(&*self.inner, "torn down before the abort reads").await;
+                }
+                SIM_COMMIT_UNKNOWN_RESULT
+            };
+            Err(BoxError::from(sim_commit_unknown_result(code)))
+        }
+    }
+
+    /// **An abort whose fence outcomes the store could not report claims no more than it saw.**
+    /// Per door, the session as seeded and every fence commit answered with an unknown outcome
+    /// after `fate`:
+    ///
+    /// * `InFlight` — every fence stays in flight: the abort spends all [`ABORT_ROUNDS`] and
+    ///   returns in doubt, saying a fence may still land, the store as seeded. The operator gives
+    ///   up there. The fences then land late, in order: the first lands whole, every later one is
+    ///   refused, and the drain reclaims the session.
+    /// * `Landed` — the fence landed: the abort finds the session fenced, but may not claim the
+    ///   fence as its own, since a rival fence of the same bytes leaves the same record, so it
+    ///   answers `FencedUnattributed`, never `Fenced`.
+    /// * `LandedAndTornDown` — the fence landed and the drain tore the session down before the
+    ///   abort read again: the abort finds no record, and answers `AbsentAfterDoubt`, never the
+    ///   `NoSuchUpload` that says nothing was written.
+    pub(super) async fn prop_operator_abort_outcome_unknown(door: Door, fate: Fate) {
+        let meta = seeded_store(door).await;
+        let unknown = Unknown {
+            inner: Arc::clone(&meta),
+            fate,
+            in_flight: Mutex::new(Vec::new()),
+        };
+        let outcome = operator_abort(&unknown, &upload()).await;
+        let context = format!("{door:?} door, {fate:?}: {outcome:?}");
+        match fate {
+            Fate::InFlight => {
+                assert!(
+                    matches!(
+                        &outcome,
+                        Err(AbortError::InDoubt(doubt)) if doubt.may_still_commit
+                            && matches!(doubt.cause, Stop::RoundsSpent { rounds } if rounds == ABORT_ROUNDS)
+                    ),
+                    "the abort spends its rounds and says a fence may still land — {context}"
+                );
+                assert_eq!(judge(&*meta, door, &context).await, Landing::Before);
+                let mut landed = vec![CommitOutcome::Conflict; ABORT_ROUNDS as usize];
+                landed[0] = CommitOutcome::Committed;
+                assert_eq!(
+                    unknown.land_late().await,
+                    landed,
+                    "the first fence lands late, whole, and no later one lands — {context}"
+                );
+                assert_eq!(judge(&*meta, door, &context).await, Landing::After);
+                assert_reclaimed(&*meta, &context).await;
+            }
+            Fate::Landed => {
+                assert_eq!(
+                    outcome.as_ref().ok(),
+                    Some(&OperatorAbortOutcome::FencedUnattributed {
+                        epoch: door.epoch() + 1
+                    }),
+                    "{context}"
+                );
+                assert_eq!(judge(&*meta, door, &context).await, Landing::After);
+            }
+            Fate::LandedAndTornDown => {
+                assert_eq!(
+                    outcome.as_ref().ok(),
+                    Some(&OperatorAbortOutcome::AbsentAfterDoubt),
+                    "{context}"
+                );
+            }
+        }
+    }
+
+    // ---- the operator abort against a live Complete ----
+
+    /// The upload the race rows create and complete.
+    fn racer() -> UploadId {
+        UploadId::new("0e".repeat(16)).expect("32 lowercase-hex characters")
+    }
+
+    /// The segment nonce Create mints for it.
+    fn racer_nonce() -> SegmentNonce {
+        SegmentNonce::new("e0".repeat(16)).expect("32 lowercase-hex characters")
+    }
+
+    /// The group the Complete writes its segments under. The session is created at `Open@0`, so
+    /// the Complete's fence puts it at `Completing@1`, and an operator abort that wins fences that
+    /// to `Aborting@2`, naming `seg:<g>:1:`.
+    fn race_group() -> SegmentGroup {
+        SegmentGroup::from_nonce(racer_nonce(), 1)
+    }
+
+    /// The race session's parts, and the chunks of each: together one more than a flat map
+    /// holds, so the Complete writes the attempt's `seg:` records in a segment batch before its
+    /// flip. One segment batch: a second would need about 250 segments to pass the operation
+    /// envelope (`MAX_BATCH_OPS`), some 39,000 planted chunks a run, and adds no new transition —
+    /// every segment batch moves the cursor the abort's fence requires, as this one does.
+    const RACE_PARTS: u32 = 2;
+    const RACE_PART_CHUNKS: u32 = MAX_MAP_CHUNKS / 2 + 1;
+
+    /// The stamps the race's Create and Complete carry, on the wall clock both name.
+    const RACE_CREATED_AT: u64 = 1_000;
+    const RACE_COMPLETED_AT: u64 = 2_000;
+
+    /// The earliest an abort starts after the Complete's fence landed. Half a millisecond off the
+    /// model's grid, so no hop of the abort ties with one of the Complete; and past 1 ms, the
+    /// least madsim sleeps.
+    const RACE_FIRST_START_MICROS: u64 = 1_500;
+
+    /// The latest an abort starts, in whole milliseconds after [`RACE_FIRST_START_MICROS`]. The
+    /// Complete's flip lands about 9 ms after its fence, so the span's last starts find the upload
+    /// `Completed`.
+    const RACE_SPAN_MILLIS: u64 = 12;
+
+    /// A session made by the production Create on the simulated-TiKV model, in a bucket, with
+    /// [`RACE_PARTS`] parts of [`RACE_PART_CHUNKS`] one-fragment chunks planted as the part commit
+    /// writes them (`part:` and `psum:` in one batch, `0016:660`), each in the codec's own
+    /// spelling: the store, and the list a Complete of every part names.
+    async fn race_store() -> (Arc<SimTikvMetadataStore>, NamedParts) {
+        let meta = Arc::new(SimTikvMetadataStore::new());
+        let bucket = WriteBatch::new().put(metadata::bucket_key(BUCKET), MARKER);
+        assert_eq!(meta.commit(bucket).await.unwrap(), CommitOutcome::Committed);
+        let id = racer();
+        let object = format!("{BUCKET}/{id}");
+        let request = CreateRequest {
+            bucket: BUCKET,
+            parent: COMPLETE_PARENT,
+            object: &object,
+            content_type: None,
+            created_at_millis: RACE_CREATED_AT,
+            clock_source: WALL_CLOCK_SOURCE,
+        };
+        let created = create_session(
+            &*meta,
+            &Budget::shipped(),
+            &request,
+            &mut OneIdentity(Some((id.clone(), racer_nonce()))),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(created, CreateOutcome::Created { .. }),
+            "{created:?}"
+        );
+        let mut named = Vec::new();
+        for n in 1..=RACE_PARTS {
+            let number = PartNumber::new(n).unwrap();
+            let chunks: Vec<ChunkRef> = (0..RACE_PART_CHUNKS)
+                .map(|i| ChunkRef {
+                    id: 0x0e_0000 + ChunkId::from(n) * 0x1000 + ChunkId::from(i),
+                    scheme: EcScheme::None,
+                    len: 4_096,
+                    placement: vec![1],
+                })
+                .collect();
+            let len = u64::from(RACE_PART_CHUNKS) * 4_096;
+            let digest = format!("{n:064x}");
+            let json = format!(
+                "{{\"chunks\":{},\"len\":{len},\"digest\":\"{digest}\",\
+                 \"committed_at_millis\":{RACE_CREATED_AT},\"session_epoch\":0}}",
+                String::from_utf8(metadata::encode(&chunks).to_vec()).unwrap()
+            );
+            let record = metadata::encode(&decode_part_record(json.as_bytes()).expect("a part"));
+            assert_eq!(record, json.as_bytes(), "fixture: the codec's own spelling");
+            let digest = Digest::from_hex(&digest).unwrap();
+            let summary = PartSummary {
+                chunks: RACE_PART_CHUNKS,
+                len,
+                digest,
+                committed_at_millis: RACE_CREATED_AT,
+            };
+            let planted = WriteBatch::new()
+                .put(part_key(&id, number), record)
+                .put(psum_key(&id, number), metadata::encode(&summary));
+            assert_eq!(
+                meta.commit(planted).await.unwrap(),
+                CommitOutcome::Committed
+            );
+            named.push((number, digest));
+        }
+        (meta, NamedParts::new(named).unwrap())
+    }
+
+    /// One writer's handle on the shared race store: every call goes through to it, and each
+    /// commit of the writer is logged with what the store answered. The writer's first commit to
+    /// land — for the Complete, its fence — adds a permit to [`Self::landed`].
+    struct Writer {
+        inner: Arc<SimTikvMetadataStore>,
+        commits: Mutex<Vec<CommitOutcome>>,
+        landed: tokio::sync::Semaphore,
+    }
+
+    impl Writer {
+        fn new(inner: &Arc<SimTikvMetadataStore>) -> Self {
+            Self {
+                inner: Arc::clone(inner),
+                commits: Mutex::new(Vec::new()),
+                landed: tokio::sync::Semaphore::new(0),
+            }
+        }
+
+        /// The writer's commits that answered `Conflict`: rounds it lost to the other writer.
+        fn lost(&self) -> usize {
+            self.commits
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|outcome| **outcome == CommitOutcome::Conflict)
+                .count()
+        }
+    }
+
+    #[async_trait]
+    impl MetadataStore for Writer {
+        async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+            self.inner.get(key).await
+        }
+
+        async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+            self.inner.scan(prefix).await
+        }
+
+        async fn scan_page(
+            &self,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<wyrd_traits::ScanPage> {
+            self.inner.scan_page(prefix, after, limit).await
+        }
+
+        async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+            let outcome = self.inner.commit(batch).await;
+            if let Ok(answered) = &outcome {
+                let mut commits = self.commits.lock().unwrap();
+                if *answered == CommitOutcome::Committed
+                    && !commits.contains(&CommitOutcome::Committed)
+                {
+                    self.landed.add_permits(1);
+                }
+                commits.push(*answered);
+            }
+            outcome
+        }
+    }
+
+    /// How a race of the operator abort against a live Complete ended.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum RaceEnd {
+        /// The Complete published, and no fence of the abort landed.
+        Completed,
+        /// The abort fenced the Complete's `Completing@1` to `Aborting@2`; `segments` is whether
+        /// the Complete's segment batch had landed by then.
+        Aborted { segments: bool },
+    }
+
+    /// One race: where the abort started, how it ended, what the abort answered (`None` for an
+    /// error), and how many of the abort's fence commits lost to the Complete.
+    #[derive(Debug, Clone)]
+    pub(super) struct Race {
+        start_micros: u64,
+        end: RaceEnd,
+        answered: Option<OperatorAbortOutcome>,
+        lost: usize,
+    }
+
+    /// **Race an operator abort against a live Complete.** The production Complete of the race
+    /// session runs from the start, and the production operator abort starts `start_micros` after
+    /// the Complete's fence landed, so it reads the session at `Completing@1` or later. The model
+    /// spends a hop on every read and two on every commit, and an abort started off the
+    /// millisecond grid never ties with the Complete: from there the Complete's reads, its segment
+    /// batch and its flip interleave with the abort's reads and fences, each fence requiring the
+    /// exact session bytes its writer last read. [`judge_race`] then judges the end state and runs
+    /// the drain's passes after it.
+    pub(super) async fn race_at(start_micros: u64) -> Race {
+        let (meta, named) = race_store().await;
+        let id = racer();
+        let completer = Writer::new(&meta);
+        let operator = Writer::new(&meta);
+        let complete = complete(&completer, &id, &named, RACE_COMPLETED_AT);
+        let abort = async {
+            let fenced =
+                madsim::time::timeout(Duration::from_secs(10), completer.landed.acquire()).await;
+            assert!(
+                matches!(fenced, Ok(Ok(_))),
+                "the Complete's fence landed first"
+            );
+            madsim::time::sleep(Duration::from_micros(start_micros)).await;
+            operator_abort(&operator, &id).await
+        };
+        let (completed, aborted) = futures_util::future::join(complete, abort).await;
+        let context = format!(
+            "abort started {start_micros}us after the Complete's fence; the Complete answered \
+             {completed:?} over commits {:?}; the abort answered {aborted:?} over commits {:?}",
+            completer.commits.lock().unwrap(),
+            operator.commits.lock().unwrap()
+        );
+        let end = judge_race(&*meta, &completed, &aborted, &context).await;
+        Race {
+            start_micros,
+            end,
+            answered: aborted.ok(),
+            lost: operator.lost(),
+        }
+    }
+
+    /// The two end states a race may leave, and nothing else:
+    ///
+    /// * **`Completed`** — the Complete published, the abort answered the `Completed` upload (or
+    ///   spent its rounds against the live Complete, with none of its fences landed), and **no**
+    ///   obligation names the attempt's `seg:<g>:1:` range, which the published root names. The
+    ///   drain's passes then leave those segments and the object where they are.
+    /// * **`Aborting@2`** — the abort's fence landed and the Complete answered `NoSuchUpload`
+    ///   with nothing published; the store holds exactly the door's two obligations, the records
+    ///   one naming `seg:<g>:1:`; and the drain's passes reclaim the session, the attempt's
+    ///   segments included (X57).
+    async fn judge_race(
+        meta: &dyn MetadataStore,
+        completed: &std::result::Result<CompleteOutcome, CompleteError>,
+        aborted: &std::result::Result<OperatorAbortOutcome, AbortError>,
+        context: &str,
+    ) -> RaceEnd {
+        let id = racer();
+        let group = race_group();
+        let segments_prefix = metadata::seg_range_prefix(&group);
+        let published_at = metadata::dirent_key(COMPLETE_PARENT, &format!("{BUCKET}/{id}"));
+        let session = meta
+            .get(&mpu_key(&id))
+            .await
+            .unwrap()
+            .map(|value| decode_session_record(&value).expect("a valid session"));
+        let owed = meta.scan(b"retire:").await.unwrap();
+        let segments = meta.scan(&segments_prefix).await.unwrap();
+        let published = meta.get(&published_at).await.unwrap();
+        let naming_the_attempt: Vec<&Vec<u8>> = owed
+            .iter()
+            .filter(|(key, value)| {
+                let (_, _, payload) = decode_retire_obligation(key, value)
+                    .unwrap_or_else(|fault| panic!("an obligation decodes ({fault}) — {context}"));
+                payload.segments() == Some(&group)
+            })
+            .map(|(key, _)| key)
+            .collect();
+        match session.as_ref().map(|record| record.state()) {
+            Some(SessionState::Completed { .. }) => {
+                assert!(
+                    matches!(completed, Ok(CompleteOutcome::Published(_))),
+                    "the Complete published — {context}"
+                );
+                assert!(
+                    matches!(
+                        aborted,
+                        Ok(OperatorAbortOutcome::Completed { epoch: 2 })
+                            | Err(AbortError::Stopped {
+                                cause: Stop::RoundsSpent { .. },
+                                ..
+                            })
+                    ),
+                    "the abort refused the Completed upload, or spent its rounds with none of its \
+                     fences landed — {context}"
+                );
+                assert!(
+                    naming_the_attempt.is_empty(),
+                    "no obligation names the published attempt's segments — {context}"
+                );
+                assert!(
+                    !segments.is_empty() && published.is_some(),
+                    "the object is published over the attempt's segments — {context}"
+                );
+                let clock = ManualClock::new(1_000_000);
+                for _ in 0..3 {
+                    reap(meta, &clock).await;
+                }
+                assert_eq!(
+                    meta.scan(&segments_prefix).await.unwrap(),
+                    segments,
+                    "the drain leaves the published segments — {context}"
+                );
+                assert!(
+                    meta.get(&published_at).await.unwrap().is_some(),
+                    "the object stays published — {context}"
+                );
+                RaceEnd::Completed
+            }
+            Some(SessionState::Aborting {}) => {
+                assert_eq!(
+                    session.as_ref().map(SessionRecord::epoch),
+                    Some(2),
+                    "Completing@1 fenced to Aborting@2 — {context}"
+                );
+                assert_eq!(
+                    aborted.as_ref().ok(),
+                    Some(&OperatorAbortOutcome::Fenced { epoch: 2 }),
+                    "{context}"
+                );
+                assert!(
+                    matches!(
+                        completed,
+                        Ok(CompleteOutcome::Refused(Refusal::NoSuchUpload))
+                    ),
+                    "the Complete answers the aborted upload absent — {context}"
+                );
+                assert!(published.is_none(), "nothing published — {context}");
+                let token = RetireToken::Session {
+                    upload_id: id.clone(),
+                    epoch: 1,
+                    part: None,
+                };
+                let records = retire_key(RetireMode::Records, &token);
+                let keys: Vec<&Vec<u8>> = owed.iter().map(|(key, _)| key).collect();
+                assert_eq!(
+                    keys,
+                    vec![&retire_key(RetireMode::Bytes, &token), &records],
+                    "exactly the Completing door's two obligations — {context}"
+                );
+                assert_eq!(
+                    naming_the_attempt,
+                    vec![&records],
+                    "the records obligation names seg:<g>:1: — {context}"
+                );
+                let (_, _, bytes) = decode_retire_obligation(&owed[0].0, &owed[0].1).unwrap();
+                assert!(
+                    bytes.session() && bytes.parts() == Some(&PartScope::All),
+                    "{bytes:?} — {context}"
+                );
+                assert_reclaimed_of(meta, &id, &group, context).await;
+                RaceEnd::Aborted {
+                    segments: !segments.is_empty(),
+                }
+            }
+            other => panic!("a race ends Completed or Aborting, never {other:?} — {context}"),
+        }
+    }
+
+    /// **The race campaign row:** an abort started at a point drawn from the seed, anywhere from
+    /// the Complete's fence to past its flip.
+    pub(super) async fn prop_operator_abort_races_a_live_complete(rng: &mut ChaCha8Rng) {
+        let millis = u64::from(rng.next_u32()) % (RACE_SPAN_MILLIS + 1);
+        race_at(RACE_FIRST_START_MICROS + millis * 1_000).await;
+    }
+
+    /// **Every end of the race is reached:** an abort started at every millisecond from the
+    /// Complete's fence to past its flip. The sweep must see the abort fence the session before
+    /// the segment batch and after it (the flip then loses); the abort lose a round to a commit
+    /// of the Complete and still fence, the session re-read at the cursor that commit moved; the
+    /// flip win over an abort that had read the session `Completing`, whose next round then
+    /// refuses the `Completed` upload; and the Complete finish before the abort reads at all.
+    pub(super) async fn prop_operator_abort_race_reaches_every_end() {
+        let mut seen = Vec::new();
+        for millis in 0..=RACE_SPAN_MILLIS {
+            seen.push(race_at(RACE_FIRST_START_MICROS + millis * 1_000).await);
+        }
+        let runs: Vec<(u64, RaceEnd, &Option<OperatorAbortOutcome>, usize)> = seen
+            .iter()
+            .map(|race| (race.start_micros, race.end, &race.answered, race.lost))
+            .collect();
+        let reached = |what: &str, holds: &dyn Fn(&Race) -> bool| {
+            assert!(
+                seen.iter().any(holds),
+                "no race {what}: (start, end, abort answered, rounds lost) {runs:?}"
+            );
+        };
+        reached("fenced before the segment batch", &|race| {
+            race.end == RaceEnd::Aborted { segments: false }
+        });
+        reached("fenced after the segment batch, before the flip", &|race| {
+            race.end == RaceEnd::Aborted { segments: true }
+        });
+        reached("fenced after losing a round to the Complete", &|race| {
+            matches!(race.end, RaceEnd::Aborted { .. }) && race.lost > 0
+        });
+        reached(
+            "lost to the flip, then refused the Completed upload",
+            &|race| {
+                race.end == RaceEnd::Completed
+                    && race.lost > 0
+                    && race.answered == Some(OperatorAbortOutcome::Completed { epoch: 2 })
+            },
+        );
+        reached("started after the flip", &|race| {
+            race.end == RaceEnd::Completed && race.lost == 0
+        });
+    }
+}
+
 // ---- the seed sweep: each property over the run seed (madsim sweeps MADSIM_TEST_NUM) ----
 
 /// A fresh ChaCha RNG seeded from the madsim run seed, so the whole campaign — *which*
@@ -8732,6 +9689,67 @@ dst_campaign_test! {
 }
 
 dst_campaign_test! {
+    async fn operator_abort_open_door_cut_never_strands() {
+        operator_abort_rows::prop_operator_abort_cut_never_strands(
+            operator_abort_rows::Door::Open,
+            &mut rand_seed(),
+        )
+        .await;
+    }
+}
+
+dst_campaign_test! {
+    async fn operator_abort_completing_door_cut_never_strands() {
+        operator_abort_rows::prop_operator_abort_cut_never_strands(
+            operator_abort_rows::Door::Completing,
+            &mut rand_seed(),
+        )
+        .await;
+    }
+}
+
+dst_campaign_test! {
+    async fn operator_abort_open_door_cut_reaches_both_sides() {
+        operator_abort_rows::prop_operator_abort_cut_reaches_both_sides(
+            operator_abort_rows::Door::Open,
+        )
+        .await;
+    }
+}
+
+dst_campaign_test! {
+    async fn operator_abort_completing_door_cut_reaches_both_sides() {
+        operator_abort_rows::prop_operator_abort_cut_reaches_both_sides(
+            operator_abort_rows::Door::Completing,
+        )
+        .await;
+    }
+}
+
+dst_campaign_test! {
+    async fn operator_abort_races_a_live_complete_and_strands_nothing() {
+        operator_abort_rows::prop_operator_abort_races_a_live_complete(&mut rand_seed()).await;
+    }
+}
+
+dst_campaign_test! {
+    async fn operator_abort_race_with_a_live_complete_reaches_every_end() {
+        operator_abort_rows::prop_operator_abort_race_reaches_every_end().await;
+    }
+}
+
+dst_campaign_test! {
+    async fn operator_abort_outcome_unknown_claims_no_more_than_it_saw() {
+        use operator_abort_rows::{Door, Fate};
+        for door in [Door::Open, Door::Completing] {
+            for fate in [Fate::InFlight, Fate::Landed, Fate::LandedAndTornDown] {
+                operator_abort_rows::prop_operator_abort_outcome_unknown(door, fate).await;
+            }
+        }
+    }
+}
+
+dst_campaign_test! {
     #[ignore = "known gap, accepted at #1015's sign-off: a slot reserved and released between \
                 the reaper's reads and its idle fence is not seen (crates/custodian/src/reaper.rs, \
                 Known gap). Follow-up: the reaper's slot reserve->commit->release race, which \
@@ -8787,6 +9805,7 @@ dst_replay_test! {
             prop_drain_repoint_versus_supersede_is_all_or_nothing(&mut rng).await;
             prop_drain_ceiling_refusal_is_confirmed_on_the_segment(&mut rng).await;
             prop_retirement_restamp_races_gc_swap(&mut rng).await;
+            operator_abort_rows::prop_operator_abort_every_door(&mut rng).await;
         }
     }
 }
