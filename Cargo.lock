@@ -2432,7 +2432,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-proto",
  "opentelemetry_sdk",
- "prost 0.14.4",
+ "prost 0.14.6",
  "thiserror 2.0.18",
  "tokio",
  "tonic 0.14.9",
@@ -2460,7 +2460,7 @@ checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
- "prost 0.14.4",
+ "prost 0.14.6",
  "tonic 0.14.9",
  "tonic-prost",
 ]
@@ -2724,12 +2724,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.14.4"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
+checksum = "3ef0b569d1d907ab3a28596aee62cf1f61dacb0529a4bedcd8e7460e2d5228b4"
 dependencies = [
  "bytes",
- "prost-derive 0.14.4",
+ "prost-derive 0.14.6",
 ]
 
 [[package]]
@@ -2764,7 +2764,7 @@ dependencies = [
  "multimap",
  "petgraph 0.8.3",
  "prettyplease",
- "prost 0.14.4",
+ "prost 0.14.6",
  "prost-types 0.14.4",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
@@ -2801,9 +2801,9 @@ dependencies = [
 
 [[package]]
 name = "prost-derive"
-version = "0.14.4"
+version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
+checksum = "1ad9c5423459fa2f729b8d9235fab810aa29628b171467744fc86d21460ad70d"
 dependencies = [
  "anyhow",
  "itertools 0.13.0",
@@ -2820,7 +2820,7 @@ checksum = "590aa145fee8f7a26b5a6055365e7c5e89a5c1caae9869de76ec0ee73181a2f9"
 dependencies = [
  "logos",
  "miette",
- "prost 0.14.4",
+ "prost 0.14.6",
  "prost-types 0.14.4",
 ]
 
@@ -2839,7 +2839,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
- "prost 0.14.4",
+ "prost 0.14.6",
 ]
 
 [[package]]
@@ -2876,7 +2876,7 @@ checksum = "f43240d7f22cf77d1625885e547acf874dd63cd2790f29f4a38e86256f41996f"
 dependencies = [
  "bytes",
  "miette",
- "prost 0.14.4",
+ "prost 0.14.6",
  "prost-reflect",
  "prost-types 0.14.4",
  "protox-parse",
@@ -4232,7 +4232,7 @@ version = "0.14.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc97d645691d64d96db1afe386d0d2918ac84ab56e2c91e153f22f6349a378cd"
 dependencies = [
- "prost 0.14.4",
+ "prost 0.14.6",
  "tokio",
  "tokio-stream",
  "tonic 0.14.9",
@@ -4246,7 +4246,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba464054e2226f182a34489b8b079bf4c6e3e7ab5fd7fc30e024f24aa92a484"
 dependencies = [
  "bytes",
- "prost 0.14.4",
+ "prost 0.14.6",
  "tonic 0.14.9",
 ]
 
@@ -4272,7 +4272,7 @@ version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73ab1b02061f83d519bba3caa167f88f261ef05720ab8ebc954ade70de3348e8"
 dependencies = [
- "prost 0.14.4",
+ "prost 0.14.6",
  "prost-types 0.14.4",
  "tonic 0.14.9",
 ]
@@ -5114,7 +5114,7 @@ version = "0.0.0"
 dependencies = [
  "madsim-tonic",
  "madsim-tonic-build",
- "prost 0.14.4",
+ "prost 0.14.6",
  "protox",
  "tonic 0.14.9",
  "tonic-prost",
