@@ -28,6 +28,7 @@ pub mod rebalance;
 pub mod reconciliation;
 pub mod reconstruction;
 pub mod restore;
+pub mod retirement;
 pub mod scrub;
 
 pub use backfill::BackfillContext;
