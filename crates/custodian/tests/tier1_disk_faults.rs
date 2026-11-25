@@ -573,13 +573,17 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         .register(3, "D");
 
     let recon_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+    // The D servers judge the repair's write deadline on the wall clock — the deployment clock
+    // `FsChunkStore::open` reads — so the pass reads that one clock too (ADR-0009), with the
+    // deployed write window: a deadline fixed from a logical stamp would be long past.
+    let pass_clock = wyrd_testkit::SystemClock;
     let recon_ctx = ReconstructionContext {
         meta: &meta,
         fleet: &recon_fleet,
         topology: &recon_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(1_000),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: recon_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -592,7 +596,7 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         Some(&recon_ctx),
         None,
         None,
-        1_000,
+        wyrd_testkit::Clock::now_millis(&pass_clock),
     )
     .await;
 

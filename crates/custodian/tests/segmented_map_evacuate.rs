@@ -16,7 +16,8 @@
 //! 3. a repoint that would push a `seg:` record past the value ceiling is refused: nothing is
 //!    written, nothing copied, and the drain does not certify;
 //! 4. a competing writer that takes the `seg:` record before the move commits wins: the move
-//!    writes no metadata, publishes no orphan mark, and the copied fragment is left in place.
+//!    writes no placement and no vacated mark, and the copied fragment is left in place under
+//!    the move's own destination pre-mark, for GC to reclaim.
 //!
 //! Legs 5–11 pin how the drain answers each verdict the move can give before anything is
 //! written, and the objects the scan must contain because the move cannot address them: a
@@ -48,9 +49,9 @@ use tracing_subscriber::prelude::*;
 use wyrd_chunk_format::{encode as encode_fragment, EcSchemeType, FragmentHeader};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::{
-    decode, encode, inode_key, orphan_key, seg_key, ChunkMap, ChunkRef, EcScheme, InodeId,
-    InodeRecord, InodeState, SegmentGroup, SegmentRecord, SegmentRef, SegmentedMap,
-    MAX_VALUE_BYTES,
+    decode, decode_orphan_mark, encode, inode_key, orphan_key, seg_key, ChunkMap, ChunkRef,
+    EcScheme, InodeId, InodeRecord, InodeState, SegmentGroup, SegmentRecord, SegmentRef,
+    SegmentedMap, MAX_VALUE_BYTES,
 };
 use wyrd_core::placement::Topology;
 use wyrd_custodian::desired_state::{
@@ -162,29 +163,70 @@ impl MetadataStore for MemMeta {
         if checks.any(|pre| kv.get(&pre.key).cloned() != pre.expected) {
             return Ok(CommitOutcome::Conflict);
         }
-        assert!(batch.deletes.is_empty(), "no leg deletes metadata");
+        // The only metadata a move deletes is its own destination pre-mark, in the commit that
+        // adopts it (`crate::premark` in the custodian): applied like any other mutation.
         kv.extend(batch.puts);
+        for key in batch.deletes {
+            kv.remove(&key);
+        }
         Ok(CommitOutcome::Committed)
     }
 }
 
-#[derive(Default)]
-struct MemDServer(Mutex<HashMap<FragmentId, Bytes>>);
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// clock the pass that sends it reads — the context's clock, one source (ADR-0009): refused at or
+/// past its deadline before anything is stored (`WriteDeadlineExpired::if_elapsed`), and refused
+/// certification if that clock reads at or past it once the bytes are stored
+/// (`WriteDeadlineExpired::if_publication_unverified`).
+struct MemDServer {
+    frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
+}
+
+impl MemDServer {
+    /// A D server judging deadlines on `clock`, the one the rebalance pass reads.
+    fn on(clock: &wyrd_testkit::ManualClock) -> Self {
+        Self {
+            frags: Mutex::default(),
+            clock: clock.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl ChunkStore for MemDServer {
-    async fn put_fragment(&self, id: FragmentId, bytes: Bytes, _: Option<u64>) -> Result<()> {
-        self.0.lock().unwrap().insert(id, bytes);
+    async fn put_fragment(
+        &self,
+        id: FragmentId,
+        bytes: Bytes,
+        deadline_millis: Option<u64>,
+    ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
+        self.frags.lock().unwrap().insert(id, bytes);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
-        Ok(self.0.lock().unwrap().get(&id).cloned())
+        Ok(self.frags.lock().unwrap().get(&id).cloned())
     }
     async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
-        Ok(self.0.lock().unwrap().keys().copied().collect())
+        Ok(self.frags.lock().unwrap().keys().copied().collect())
     }
     async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
-        self.0.lock().unwrap().remove(&id);
+        self.frags.lock().unwrap().remove(&id);
         Ok(())
     }
     async fn health(&self) -> Result<Health> {
@@ -239,6 +281,8 @@ struct Fixture {
     meta: MemMeta,
     d: [(DServerId, MemDServer); 4],
     topology: Topology,
+    /// The one clock the pass and every D server read (ADR-0009).
+    clock: wyrd_testkit::ManualClock,
 }
 
 impl Fixture {
@@ -254,8 +298,14 @@ impl Fixture {
             .register(SURVIVORS[0], "B")
             .register(SURVIVORS[1], "C")
             .register(FREE, "D");
-        let d = [DRAINING, SURVIVORS[0], SURVIVORS[1], FREE].map(|id| (id, MemDServer::default()));
-        Self { meta, d, topology }
+        let clock = wyrd_testkit::ManualClock::new(10_000);
+        let d = [DRAINING, SURVIVORS[0], SURVIVORS[1], FREE].map(|id| (id, MemDServer::on(&clock)));
+        Self {
+            meta,
+            d,
+            topology,
+            clock,
+        }
     }
 
     /// ONE pass through the real fenced control point, its audit stream captured as JSON into
@@ -276,6 +326,8 @@ impl Fixture {
             meta: &self.meta,
             fleet: &fleet,
             topology: &self.topology,
+            clock: &self.clock,
+            write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         };
         let coord = MemCoordination::new();
         let leader = Custodian::elect(&coord, "zone-722").await.unwrap();
@@ -603,17 +655,20 @@ async fn a_seg_repoint_past_the_value_ceiling_is_refused_and_writes_nothing() {
 
 // ---- leg 4 ----
 
-/// **Leg 4 — a lost CAS writes no metadata and retracts nothing.** A competing writer edits a
+/// **Leg 4 — a lost CAS writes no placement and retracts nothing.** A competing writer edits a
 /// sibling chunk of the same `seg:` record after the move has read it and before its commit.
-/// The record must hold exactly the competing writer's bytes, no orphan mark for this move may
-/// exist, the drain is not certified — and the fragment already copied to [`FREE`] is LEFT IN
-/// PLACE, not deleted: a losing write never retracts what it published.
+/// The record must hold exactly the competing writer's bytes, the drain is not certified — and
+/// the fragment already copied to [`FREE`] is LEFT IN PLACE, not deleted: a losing write never
+/// retracts what it published. The one orphan mark in the store is the move's own destination
+/// pre-mark over that copy, still standing — so GC reclaims it after grace instead of keeping
+/// an unreferenced, unmarked fragment for ever (proposal 0016 X47's losing branch, #1084) — and
+/// the draining position, which the move never vacated, carries none.
 ///
 /// On the base no move is planned, so the racer never fires and this leg is red for that
 /// ordinary reason. Its conflict property is bound by the mutation oracle (delete the `seg:`
 /// precondition and the move overwrites the competing bytes) and by the DST property.
 #[tokio::test]
-async fn a_lost_cas_writes_no_metadata_and_leaves_the_copy_in_place() {
+async fn a_lost_cas_writes_no_placement_and_leaves_the_copy_under_its_pre_mark() {
     let fx = Fixture::new().await;
     let chunk = drained(CHUNK);
     let sibling = settled(SIBLING, CHUNK_LEN);
@@ -643,9 +698,16 @@ async fn a_lost_cas_writes_no_metadata_and_leaves_the_copy_in_place() {
         "the competing write was overwritten"
     );
     let marks = fx.meta.scan(b"orphan:").await.unwrap();
+    let keys: Vec<&[u8]> = marks.iter().map(|(key, _)| key.as_slice()).collect();
+    assert_eq!(
+        keys,
+        vec![orphan_key(FREE, frag(CHUNK, 0)).as_slice()],
+        "the only mark is the move's pre-mark over its copy: {marks:?}"
+    );
+    let premark = decode_orphan_mark(&marks[0].1).expect("a mark of one of the three shapes");
     assert!(
-        marks.is_empty(),
-        "a lost move published orphan evidence: {marks:?}"
+        premark.event().is_some() && !premark.is_reclaiming(),
+        "the copy stands under the move's own pre-mark: {premark:?}"
     );
     assert!(
         fx.holds(FREE, frag(CHUNK, 0)).await,
