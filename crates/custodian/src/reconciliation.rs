@@ -73,7 +73,7 @@ impl Reconciled {
     /// picture has a hole in it. `Changed` and `Partial` both mean "drive again"; `Changed`
     /// wins the pair because it carries the evidence that something converged, and `Partial`
     /// exists only to deny a `Satisfied` that a partial walk could not honestly give.
-    fn least_certified(self, other: Reconciled) -> Reconciled {
+    pub(crate) fn least_certified(self, other: Reconciled) -> Reconciled {
         match (self, other) {
             (Reconciled::Blocked, _) | (_, Reconciled::Blocked) => Reconciled::Blocked,
             (Reconciled::Changed, _) | (_, Reconciled::Changed) => Reconciled::Changed,
@@ -116,7 +116,8 @@ impl std::error::Error for ReconcileError {}
 /// runs the **GC loop** ([`gc::reconcile`], `0005:288-295`), `scrub` runs the
 /// **scrub loop** ([`scrub::reconcile`], `0005:262-267`), `reconstruction` runs the
 /// **reconstruction loop** ([`reconstruction::reconcile`], `0005:269-286`) and, after it, the
-/// **retirement leg** ([`retirement`], the `retire:` ledger's drain, `0016:668`), `rebalance`
+/// **retirement leg** ([`retirement`]: the teardown of multipart sessions that have left `Open`,
+/// `0016:672-674`, then the `retire:` ledger's drain, `0016:668`), `rebalance`
 /// runs the **rebalance loop** — drain/decommission evacuation ([`rebalance::reconcile`],
 /// `0005:297-303`) — and all `None` exercises the fence alone (no maintenance inputs
 /// wired). When several are supplied the step runs each independent loop and reports the

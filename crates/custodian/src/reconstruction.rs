@@ -139,6 +139,20 @@ pub struct ReconstructionContext<'a> {
     /// `G_orphan > W_repoint + W_write + δ_clock` (`0016:1348`), and #800's late-write deadline
     /// (`crate::gc::LATE_WRITE_DEADLINE_MILLIS`) must not be sized below it.
     pub staged_write_window_millis: u64,
+    /// How many D servers the **operator** configured — the deployed loop's
+    /// `operator_fleet_size`, which may exceed [`Self::fleet`]'s length when a server was left
+    /// out at startup or dropped as unreachable this pass. The retirement leg retires an untrusted
+    /// multipart record by chunk id only on a pass whose `fleet.len()` equals it, the gate the
+    /// deployed loop puts on GC for the same reason: chunk-wide evidence taken from a partial
+    /// listing strands what a missing server holds (`crate::retirement`, *Untrusted records*).
+    /// A library or test context whose fleet is the whole fleet passes `fleet.len()`.
+    pub operator_fleet_size: usize,
+    /// Whether a `Completed` multipart session's tombstone window has passed
+    /// ([`crate::retirement::Tombstone`]): the input the retirement leg's terminal session delete
+    /// reads for a `Completed` session (`0016:574`). The deployed loop passes
+    /// [`Tombstone::Retain`](crate::retirement::Tombstone::Retain) until `W_tombstone` is measured
+    /// (#625).
+    pub tombstone: crate::retirement::Tombstone,
 }
 
 /// The **repair priority** of a chunk, derived from how close it is to its durability

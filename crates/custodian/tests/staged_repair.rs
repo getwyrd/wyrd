@@ -655,6 +655,8 @@ impl Fixture {
             unreachable: &self.unreachable,
             clock: &self.clock,
             staged_write_window_millis: self.window,
+            operator_fleet_size: fleet.len(),
+            tombstone: wyrd_custodian::Tombstone::Retain,
         };
         let now = self.clock.now_millis();
         reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now).await

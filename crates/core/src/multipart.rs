@@ -2081,6 +2081,19 @@ impl AdmissionRecord {
             ..*self
         })
     }
+
+    /// This ledger with one session released, or `None` when it counts none: the value the
+    /// **terminal session delete** puts under `require(mpuctl == prior)`, in the batch that deletes
+    /// the session record (`0016:674`, the one place the count goes down). A ledger at zero beside
+    /// a session record to delete is damage the caller holds for a human, never a count it wraps.
+    /// `max_sessions` and `profile` are carried unchanged, so G8 still holds and the encoding is
+    /// the canonical one [`decode_admission_record`] requires back.
+    pub fn release_one(&self) -> Option<Self> {
+        Some(Self {
+            count: self.count.checked_sub(1)?,
+            ..*self
+        })
+    }
 }
 
 /// The wire shape of [`AdmissionRecord`], field order and names exactly as `0016:348` states
@@ -6605,5 +6618,36 @@ mod segment_cursor {
         for state in [r#"{"kind":"Open"}"#, r#"{"kind":"Aborting"}"#, &completed] {
             assert_eq!(session(state).with_segments_written(1), None, "{state}");
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_release {
+    use super::*;
+
+    fn profile() -> Budget {
+        let json = "{\"w_ref\":16,\"max_part_chunks\":1,\"max_parts_per_session\":1,\
+                    \"max_inflight_parts\":1,\"max_staged_chunks\":1}";
+        metadata::decode(json.as_bytes()).expect("a legal profile")
+    }
+
+    /// The terminal session delete's decrement (#1013): one session fewer, the limit and the
+    /// profile carried unchanged, never below zero, and a value decode takes back byte for byte.
+    #[test]
+    fn release_one_lowers_the_count_by_one_and_never_below_zero() {
+        let one = AdmissionRecord::bootstrap(profile());
+        let two = one.admit_one().expect("room for a second session");
+        assert_eq!(two.release_one(), Some(one));
+        let zero = one.release_one().expect("one session to release");
+        assert_eq!(zero.count(), 0);
+        assert_eq!(zero.max_sessions(), one.max_sessions());
+        assert_eq!(zero.profile(), one.profile());
+        assert_eq!(
+            zero.release_one(),
+            None,
+            "a ledger at zero is never wrapped"
+        );
+        let encoded = metadata::encode(&zero);
+        assert_eq!(decode_admission_record(&encoded), Ok(zero));
     }
 }
