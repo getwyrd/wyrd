@@ -25,6 +25,8 @@
 //!   moved, and a read that does find it moved clears it; **(I2)** an out-of-flight outcome no
 //!   read settled stays unknown, and one a read did settle is not kept.
 //! * **(J)** the shared builder puts restore's preconditions and records in restore's order.
+//! * **(O)** the operator abort (`operator_abort`, FU-6) claims a fence it cannot attribute, or an
+//!   absence after a fence in doubt, as no more than its read showed.
 //!
 //! The wrappers keep their state in struct fields, never in a `static` (ADR-0035).
 
@@ -40,7 +42,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_core::metadata::{self, InodeId, SegmentGroup, SegmentNonce};
 use wyrd_core::multipart::abort::{
-    abort_session, fence_batch, AbortError, InDoubt, Stop, ABORT_ROUNDS,
+    abort_session, fence_batch, operator_abort, AbortError, InDoubt, OperatorAbortOutcome, Stop,
+    ABORT_ROUNDS,
 };
 use wyrd_core::multipart::create::{create_session, CreateRequest, CreateRuntime};
 use wyrd_core::multipart::{
@@ -392,6 +395,9 @@ enum OnCommit {
         applied: bool,
         may_still_commit: bool,
     },
+    /// Apply the batch, delete the session record it put — the fenced session's drain finishing
+    /// before the Abort reads again — and answer `CommitUnknownResult { may_still_commit: false }`.
+    UnknownTornDown,
     /// Keep the batch unapplied and answer `CommitUnknownResult { may_still_commit: true }`; it
     /// lands when the test releases it.
     Hold,
@@ -545,6 +551,12 @@ impl MetadataStore for Scripted {
                     assert_eq!(self.inner.commit(batch).await?, CommitOutcome::Committed);
                 }
                 Err(unknown(may_still_commit))
+            }
+            OnCommit::UnknownTornDown => {
+                let gone = WriteBatch::new().delete(mpu_key(&upload_of(&batch)));
+                assert_eq!(self.inner.commit(batch).await?, CommitOutcome::Committed);
+                assert_eq!(self.inner.commit(gone).await?, CommitOutcome::Committed);
+                Err(unknown(false))
             }
             OnCommit::Hold => {
                 self.state().held = Some(batch);
@@ -1370,4 +1382,45 @@ fn j_the_shared_builder_keeps_restores_preconditions_and_puts_in_order() {
 #[test]
 fn the_round_budget_outlasts_every_complete_fence_by_one() {
     assert_eq!(ABORT_ROUNDS, MAX_COMPLETE_ATTEMPTS + 1);
+}
+
+// ─────────────────────── (O) the operator abort's answers ───────────────────────
+
+/// **(O) The operator abort claims no more than its read after an unknown outcome shows.** Its
+/// fence lands and the store answers `CommitUnknownResult`: the re-read finds the session as that
+/// fence leaves it, and a rival fence of the same bytes leaves it the same, so the answer is
+/// `FencedUnattributed`, never `Fenced`. Where the record is gone by that read — the fenced
+/// session torn down by its drain — the answer is `AbsentAfterDoubt`, never the `NoSuchUpload`
+/// that says nothing was written; an abort with nothing in doubt that finds no record answers
+/// `NoSuchUpload`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn o_an_operator_abort_after_an_unknown_outcome_claims_only_what_it_read() {
+    within(async {
+        let (store, id, open, _) = scripted_open().await;
+        store.script(
+            vec![OnCommit::Unknown {
+                applied: true,
+                may_still_commit: false,
+            }],
+            None,
+        );
+        assert_eq!(
+            operator_abort(&store, &id).await.ok(),
+            Some(OperatorAbortOutcome::FencedUnattributed { epoch: 1 })
+        );
+        assert_fenced(&store.inner, &id, &open).await;
+
+        let (store, id, _, _) = scripted_open().await;
+        store.script(vec![OnCommit::UnknownTornDown], None);
+        assert_eq!(
+            operator_abort(&store, &id).await.ok(),
+            Some(OperatorAbortOutcome::AbsentAfterDoubt)
+        );
+        assert_eq!(
+            operator_abort(&store, &id).await.ok(),
+            Some(OperatorAbortOutcome::NoSuchUpload),
+            "a later abort has nothing in doubt"
+        );
+    })
+    .await;
 }

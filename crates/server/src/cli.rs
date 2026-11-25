@@ -26,7 +26,8 @@ use wyrd_chunkstore_fs::FsChunkStore;
 use wyrd_chunkstore_grpc::{FanoutChunkStore, GrpcChunkStore};
 use wyrd_coordination_mem::MemCoordination;
 use wyrd_core::metadata::EcScheme;
-use wyrd_core::multipart::FenceGeneration;
+use wyrd_core::multipart::abort::{operator_abort, OperatorAbortOutcome};
+use wyrd_core::multipart::{FenceGeneration, UploadId};
 use wyrd_core::{read, write};
 use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone, Reconciled};
 use wyrd_metadata_redb::{NoExistingStore, RedbMetadataStore};
@@ -165,6 +166,17 @@ impl MetadataBackend {
                 "unknown metadata backend `{other}` (expected `redb`, `tikv`, or `fdb`)"
             )
             .into()),
+        }
+    }
+
+    /// The `--metadata-backend` value that selects this backend: [`Self::from_config`]'s inverse.
+    fn flag_value(self) -> &'static str {
+        match self {
+            Self::Redb => "redb",
+            #[cfg(feature = "tikv")]
+            Self::Tikv => "tikv",
+            #[cfg(feature = "fdb")]
+            Self::Fdb => "fdb",
         }
     }
 }
@@ -417,6 +429,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         Some("d-server") => cmd_d_server(&args[1..]),
         Some("custodian") => cmd_custodian(&args[1..]),
         Some("s3") => cmd_s3(&args[1..]),
+        Some("mpu") => cmd_mpu(&args[1..]),
         Some("demo") => cmd_demo(),
         Some(other) => {
             eprintln!("wyrd: unknown command `{other}`");
@@ -495,6 +508,18 @@ fn usage() {
     eprintln!("      It is refused with --endpoints/--ids/--failure-domains or --gc-expired-pending (it would ignore them),");
     eprintln!("      and on a redb --data-dir that holds no metadata store (it creates none). Its last line names the store it ran on.");
     eprintln!("  wyrd s3 --access-key KEY --secret-key SECRET [--s3-listen ADDR] [--data-dir DIR] [--chunk-size N] [--region NAME] [--endpoints URL,URL,…] [--metadata-backend redb|tikv|fdb] [--coordination-backend mem|etcd] [--otlp-endpoint URL]");
+    eprintln!(
+        "  wyrd mpu abort --upload-id ID [--data-dir DIR] [--metadata-backend redb|tikv|fdb]"
+    );
+    eprintln!("      Fences ONE multipart upload session, Open or Completing, to Aborting with its retirement");
+    eprintln!("      obligations, in one batch (FU-6): the exit for a session the reaper will not judge, such as");
+    eprintln!("      one stamped under a clock it does not own. It deletes nothing: the teardown is the custodian's,");
+    eprintln!("      so run the `wyrd custodian --reap-abandoned-uploads` line it prints, spelled for the same store, until");
+    eprintln!("      the abort it also prints answers the upload absent; a BLOCKED pass over other uploads is no stall of it,");
+    eprintln!("      but one that holds this upload needs the custodian with --endpoints/--ids/--failure-domains (whole fleet).");
+    eprintln!("      Each flag at most once and with a value: exactly one --upload-id, no wildcard; --data-dir only on redb.");
+    eprintln!("      A Completed (terminal) or absent session is refused, exit 1; an Aborting one is left as it is,");
+    eprintln!("      exit 0. Authority is host access to the store; it moves onto the management API when that lands.");
     eprintln!("  wyrd demo");
     eprintln!();
     eprintln!("  every command also accepts:");
@@ -3197,6 +3222,400 @@ fn cluster_get(
     })
 }
 
+/// `wyrd mpu`: the operator's multipart session verbs (FU-6, proposal 0016 `:255-262`). One verb
+/// today, `abort`.
+///
+/// This is an **interim surface**, under the exception granted on 2026-07-25 because proposal
+/// 0008's management plane is not there yet, and it keeps that grant's three terms: its authority
+/// is host access to the store (no listener, no network surface, no auth path of its own); it
+/// takes exactly one `--upload-id` and no bulk or wildcard form; and it moves onto the management
+/// API when that lands, its semantics and the records it writes unchanged.
+fn cmd_mpu(args: &[String]) -> Result<ExitCode, BoxError> {
+    match args.first().map(String::as_str) {
+        Some("abort") => cmd_mpu_abort(&args[1..]),
+        Some(other) => {
+            eprintln!("wyrd: unknown mpu verb `{other}`");
+            usage();
+            Ok(ExitCode::from(2))
+        }
+        None => {
+            usage();
+            Ok(ExitCode::from(2))
+        }
+    }
+}
+
+/// The flags `wyrd mpu abort` takes, each at most once and each with a value
+/// ([`ParsedArgs::parse_exact`]): no clock-source flag, since the abort judges no clock, and
+/// nothing that names more than one session.
+const MPU_ABORT_FLAGS: &[&str] = &[
+    "upload-id",
+    "data-dir",
+    "metadata-backend",
+    "log-level",
+    "log-format",
+];
+
+/// `wyrd mpu abort --upload-id <ID> --data-dir <DIR>`: fence one session to `Aborting`, from
+/// `Open` or `Completing`, through [`wyrd_core::multipart::abort::operator_abort`], over the
+/// store the cluster wrote ([`resolve_backend`]; a redb store must already exist).
+///
+/// It exits 0 when the session is `Aborting` once it returns — fenced by this run, found so after
+/// a commit of it whose outcome is unknown, or already — and 1, naming what it found, when abort
+/// does not apply (`Completed`, or no record) or the abort could not settle. It deletes nothing:
+/// the teardown is the retirement drain's, and it prints the one-shot that runs it over the same
+/// store and the command that says when this upload's teardown is done ([`StoreSpelling`]).
+///
+/// It writes to the store, so its command line is read strictly rather than guessed at, and every
+/// refusal comes before the store is opened: flags only, each of [`MPU_ABORT_FLAGS`] at most once
+/// and with a value ([`ParsedArgs::parse_exact`]), so a second `--upload-id` is refused (the grant
+/// admits one session per invocation); a stray positional, as `wyrd custodian` refuses one;
+/// `--data-dir` on a networked backend, which would read it and then ignore it; and a path the
+/// printed commands would carry that resolves to no UTF-8 spelling ([`store_spelling`]). A valued
+/// flag with nothing after it at all is refused before that, by the logging pre-parse every
+/// command runs, with the usage exit 2 (#531).
+///
+/// The redb `--data-dir` is made absolute first ([`absolute_path`]), and that one path is the
+/// store opened, the store named and the store the printed commands name.
+fn cmd_mpu_abort(args: &[String]) -> Result<ExitCode, BoxError> {
+    let parsed = ParsedArgs::parse_exact(args, MPU_ABORT_FLAGS).map_err(|refused| {
+        format!(
+            "wyrd mpu abort: {refused}. It takes --upload-id, --data-dir, --metadata-backend, \
+             --log-level and --log-format, each at most once and with a value, and judges no \
+             clock; it aborts exactly one session per invocation."
+        )
+    })?;
+    if let Some(stray) = parsed.positional(0) {
+        return Err(format!(
+            "wyrd mpu abort: unexpected positional argument `{stray}`. This command takes flags \
+             only: name the session with --upload-id."
+        )
+        .into());
+    }
+    let raw = parsed
+        .flag("upload-id")
+        .ok_or("wyrd mpu abort: --upload-id ID is required; it names the one session to abort")?;
+    let upload = UploadId::new(raw).map_err(|refused| {
+        format!(
+            "wyrd mpu abort: `{raw}` is not an upload id ({refused}); it names exactly one \
+             session, so no pattern or wildcard is accepted"
+        )
+    })?;
+    let backend = resolve_backend(&parsed)?;
+    if backend != MetadataBackend::Redb && parsed.flag("data-dir").is_some() {
+        return Err(format!(
+            "wyrd mpu abort: --data-dir names a local redb store, but the metadata backend is \
+             {}, whose address comes from the environment, so the directory would be ignored. \
+             Drop --data-dir, or pass --metadata-backend redb.",
+            backend.flag_value()
+        )
+        .into());
+    }
+    let data_dir = parsed.flag("data-dir").unwrap_or(DEFAULT_DATA_DIR);
+    let data_dir = if backend == MetadataBackend::Redb {
+        absolute_path("--data-dir", data_dir)?
+    } else {
+        data_dir.to_owned()
+    };
+    let store = reaper_store_name(backend, &data_dir);
+    let spelling = store_spelling(backend, &data_dir)?;
+    let runtime = tokio_runtime()?;
+    let outcome = runtime.block_on(operator_abort_over_backend(backend, &data_dir, &upload))?;
+    report_operator_abort(&upload, &store, &spelling, &outcome)
+}
+
+/// `path`, given as `what` (a flag or an environment variable), made absolute against this
+/// process's working directory, as an open of it would resolve it ([`std::path::absolute`]: no
+/// symlink followed, nothing on disk read). The abort opens, names or prints that one path, so the
+/// commands it prints act on the store it acted on from whatever directory they are run in; a path
+/// that resolves to no UTF-8 spelling is refused, before the store is opened, since those commands
+/// could not name it.
+fn absolute_path(what: &str, path: &str) -> Result<String, BoxError> {
+    let absolute = std::path::absolute(path)
+        .map_err(|fault| format!("wyrd mpu abort: cannot resolve {what} {path}: {fault}"))?;
+    absolute.into_os_string().into_string().map_err(|path| {
+        format!(
+            "wyrd mpu abort: {what} resolves to {}, which is not UTF-8, so the commands this \
+             abort prints could not name it",
+            Path::new(&path).display()
+        )
+        .into()
+    })
+}
+
+/// Open the store the cluster wrote for `backend` and run [`operator_abort`] once over it, as
+/// [`run_reaper_once_over_backend`] opens it. A redb store must already exist: aborting in a store
+/// this command had just created would report a session absent from a store that is not the
+/// cluster's.
+async fn operator_abort_over_backend(
+    backend: MetadataBackend,
+    data_dir: &str,
+    upload: &UploadId,
+) -> Result<OperatorAbortOutcome, BoxError> {
+    let outcome = match backend {
+        MetadataBackend::Redb => {
+            let meta = open_existing_local_meta_redb_for(
+                data_dir,
+                "wyrd mpu abort",
+                "The abort acts on the store a cluster already wrote and creates none.",
+            )?;
+            operator_abort(&meta, upload).await?
+        }
+        #[cfg(feature = "tikv")]
+        MetadataBackend::Tikv => {
+            let meta = open_tikv_meta().await?;
+            operator_abort(&meta, upload).await?
+        }
+        #[cfg(feature = "fdb")]
+        MetadataBackend::Fdb => {
+            let meta = open_fdb_meta().await?;
+            operator_abort(&meta, upload).await?
+        }
+    };
+    Ok(outcome)
+}
+
+/// How a command `wyrd mpu abort` prints names the store the abort acted on, so that it acts on
+/// that same store from any shell and any working directory ([`store_spelling`]): the backend by
+/// name, whether a flag or the environment chose it; for redb the directory, absolute; for a
+/// networked backend the environment variables its open reads how to reach the store from, with
+/// the values they resolved to, since the environment the abort ran in may have been scoped to
+/// that one command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoreSpelling {
+    /// The `--metadata-backend` value.
+    backend: &'static str,
+    /// The redb `--data-dir`, absolute; `None` for a networked backend, which takes none.
+    data_dir: Option<String>,
+    /// Each variable a networked backend's open reads, in order, and the value it resolved to;
+    /// empty for redb.
+    environment: Vec<(&'static str, String)>,
+}
+
+impl StoreSpelling {
+    /// `wyrd <words>` over this store, as one POSIX-shell line: the environment as assignments
+    /// scoped to the command, before it, and every value quoted ([`shell_quoted`]).
+    fn command(&self, words: &str) -> String {
+        let mut line = String::new();
+        for (variable, value) in &self.environment {
+            line.push_str(&format!("{variable}={} ", shell_quoted(value)));
+        }
+        line.push_str(&format!("wyrd {words} --metadata-backend {}", self.backend));
+        if let Some(dir) = &self.data_dir {
+            line.push_str(&format!(" --data-dir {}", shell_quoted(dir)));
+        }
+        line
+    }
+}
+
+/// The [`StoreSpelling`] of the store an abort over `backend` opens: redb's `data_dir` (already
+/// absolute, [`absolute_path`]); TiKV's PD endpoints as [`open_tikv_meta`] parses them; for
+/// FoundationDB, the cluster file and the external-client directory ([`path_environment`]).
+/// Each is read from an environment this process never changes, as [`reaper_store_name`] reads
+/// it, so the store spelled is the store opened. A PD address that does not resolve is spelled as
+/// none: the open refuses it before anything is printed. A FoundationDB path that resolves to no
+/// UTF-8 spelling is refused here, before the store is opened.
+fn store_spelling(backend: MetadataBackend, data_dir: &str) -> Result<StoreSpelling, BoxError> {
+    let (data_dir, environment) = match backend {
+        MetadataBackend::Redb => (Some(data_dir.to_owned()), Vec::new()),
+        #[cfg(feature = "tikv")]
+        MetadataBackend::Tikv => (
+            None,
+            std::env::var(TIKV_PD_ENDPOINTS_ENV)
+                .ok()
+                .as_deref()
+                .map(parse_endpoints)
+                .and_then(Result::ok)
+                .map(|endpoints| (TIKV_PD_ENDPOINTS_ENV, endpoints.join(",")))
+                .into_iter()
+                .collect(),
+        ),
+        // The two paths `connect()` reads, each as the driver resolves it: the cluster file (its
+        // default when the variable is unset or blank), and the multi-version client's
+        // external-client directory, when one is in effect.
+        #[cfg(feature = "fdb")]
+        MetadataBackend::Fdb => {
+            use wyrd_metadata_fdb::config;
+            let raw = |variable| std::env::var(variable).ok();
+            (
+                None,
+                path_environment(vec![
+                    (
+                        config::CLUSTER_FILE_ENV,
+                        Some(config::cluster_file(raw(config::CLUSTER_FILE_ENV))),
+                    ),
+                    (
+                        config::EXTERNAL_CLIENT_DIR_ENV,
+                        config::external_client_dir(raw(config::EXTERNAL_CLIENT_DIR_ENV)),
+                    ),
+                ])?,
+            )
+        }
+    };
+    Ok(StoreSpelling {
+        backend: backend.flag_value(),
+        data_dir,
+        environment,
+    })
+}
+
+/// The assignments of a printed command for `paths`: each an environment variable and the path
+/// it resolved to, `None` where none is in effect, which is left out. Each path is made absolute
+/// as the redb directory is ([`absolute_path`]), since a relative one is read against the working
+/// directory and the printed command may be run from another, and one with no UTF-8 spelling is
+/// refused. Only the `fdb` arm calls it, but it is compiled, and unit-tested, in every build.
+#[cfg_attr(not(feature = "fdb"), allow(dead_code))]
+fn path_environment(
+    paths: Vec<(&'static str, Option<String>)>,
+) -> Result<Vec<(&'static str, String)>, BoxError> {
+    paths
+        .into_iter()
+        .filter_map(|(variable, path)| path.map(|path| (variable, path)))
+        .map(|(variable, path)| Ok((variable, absolute_path(variable, &path)?)))
+        .collect()
+}
+
+/// `word` as one POSIX-shell word: in single quotes, each `'` in it closed, escaped and reopened.
+fn shell_quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// Say what an operator abort did, on stderr and on the audit seam, and the exit it ends with:
+/// [`operator_abort_answer`], and the audit line [`operator_abort_audit`] names, if any.
+fn report_operator_abort(
+    upload: &UploadId,
+    store: &str,
+    spelling: &StoreSpelling,
+    outcome: &OperatorAbortOutcome,
+) -> Result<ExitCode, BoxError> {
+    if let Some(audit) = operator_abort_audit(outcome) {
+        tracing::warn!(
+            target: "wyrd.mpu",
+            action = audit.action,
+            upload = upload.as_str(),
+            epoch = audit.epoch,
+            "{}",
+            audit.message
+        );
+    }
+    let (succeeds, said) = operator_abort_answer(upload, store, spelling, outcome);
+    if succeeds {
+        eprintln!("wyrd mpu abort: {said}");
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(format!("mpu abort: {said}").into())
+    }
+}
+
+/// The audit line of an operator abort ([`operator_abort_audit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AbortAudit {
+    /// The line's `action` field.
+    action: &'static str,
+    /// The epoch the session is `Aborting` at.
+    epoch: u64,
+    /// What the line says.
+    message: &'static str,
+}
+
+/// The audit line for `outcome`: one wherever a fence of this abort may be what put the session
+/// at `Aborting` — `operator-abort-fenced` for a fence the store acknowledged,
+/// `operator-abort-fence-unattributed` for one found landed after an unknown outcome, which a
+/// rival fence of the same bytes would leave the same — and none where nothing of it landed.
+fn operator_abort_audit(outcome: &OperatorAbortOutcome) -> Option<AbortAudit> {
+    match *outcome {
+        OperatorAbortOutcome::Fenced { epoch } => Some(AbortAudit {
+            action: "operator-abort-fenced",
+            epoch,
+            message: "an operator fenced an upload session to Aborting",
+        }),
+        OperatorAbortOutcome::FencedUnattributed { epoch } => Some(AbortAudit {
+            action: "operator-abort-fence-unattributed",
+            epoch,
+            message: "an upload session is Aborting after an operator's fence of it whose \
+                      outcome was unknown: that fence or a rival one of the same bytes landed",
+        }),
+        OperatorAbortOutcome::AlreadyAborting { .. }
+        | OperatorAbortOutcome::Completed { .. }
+        | OperatorAbortOutcome::NoSuchUpload
+        | OperatorAbortOutcome::AbsentAfterDoubt => None,
+    }
+}
+
+/// What `wyrd mpu abort` says for `outcome` over `store`, and whether it exits 0. It does while
+/// the session is `Aborting`, and then names what to run next, both spelled for the store
+/// ([`StoreSpelling::command`]): the teardown one-shot, and when to stop running it. That is a
+/// condition on **this** upload — this same abort, run again, answering it absent — because a
+/// one-shot pass reports on the whole store: another held session makes every pass `BLOCKED`
+/// (exit 1) while this upload's teardown goes on. A pass that holds **this** upload will hold it
+/// again, so that one sends the operator to the custodian over the whole fleet instead. It says
+/// the abort fenced only for a commit the store acknowledged, and "nothing written" only where no
+/// fence of it can have landed.
+fn operator_abort_answer(
+    upload: &UploadId,
+    store: &str,
+    spelling: &StoreSpelling,
+    outcome: &OperatorAbortOutcome,
+) -> (bool, String) {
+    let teardown = spelling.command("custodian --reap-abandoned-uploads");
+    let probe = spelling.command(&format!("mpu abort --upload-id {upload}"));
+    let then = format!(
+        "its teardown is the custodian's: run `{teardown}`, pass after pass, until `{probe}` \
+         answers that upload {upload} is absent (its record mpu:{upload} deleted). A pass reports \
+         on the whole store: one that is BLOCKED by held lines naming only other uploads has not \
+         stalled this one, but one whose held lines name upload {upload} (a partial-fleet hold, \
+         say) will not clear by repeating that metadata-only one-shot: stop it, and run the \
+         custodian over the same store without --reap-abandoned-uploads, with --endpoints, \
+         --ids and --failure-domains for the whole fleet"
+    );
+    match outcome {
+        OperatorAbortOutcome::Fenced { epoch } => (
+            true,
+            format!(
+                "upload {upload} fenced to Aborting@{epoch} with its retirement obligations \
+                 [store: {store}]; {then}"
+            ),
+        ),
+        OperatorAbortOutcome::FencedUnattributed { epoch } => (
+            true,
+            format!(
+                "upload {upload} is Aborting@{epoch}, as a fence of this abort leaves it, but \
+                 the store could not report that fence's outcome: this abort or a rival fence of \
+                 the same bytes put it, with the same obligations [store: {store}]; {then}"
+            ),
+        ),
+        OperatorAbortOutcome::AlreadyAborting { epoch } => (
+            true,
+            format!(
+                "upload {upload} is already Aborting@{epoch}; nothing written [store: {store}]; \
+                 {then}"
+            ),
+        ),
+        OperatorAbortOutcome::Completed { epoch } => (
+            false,
+            format!(
+                "upload {upload} is Completed@{epoch}, a terminal session: abort does not apply \
+                 to a terminal session; nothing written [store: {store}]"
+            ),
+        ),
+        OperatorAbortOutcome::NoSuchUpload => (
+            false,
+            format!(
+                "upload {upload} is absent: no session record mpu:{upload}, so there is nothing \
+                 to abort; nothing written [store: {store}]"
+            ),
+        ),
+        OperatorAbortOutcome::AbsentAfterDoubt => (
+            false,
+            format!(
+                "upload {upload} is absent, read after a fence commit of this abort whose outcome \
+                 the store could not report: possibly fenced and already torn down, and nothing \
+                 is left to abort [store: {store}]"
+            ),
+        ),
+    }
+}
+
 /// The flags that take **no value** — `--flag`, not `--flag value`.
 ///
 /// An allowlist, deliberately, rather than "a flag whose next token starts with `--` is a
@@ -3239,6 +3658,34 @@ impl ParsedArgs {
             }
         }
         Ok(Self { positionals, flags })
+    }
+
+    /// [`Self::parse`] for a command that writes to the store and so must not guess at its
+    /// command line: every flag is one of `known`, every one of which takes a value, and is given
+    /// at most once, followed by its value. A value that is missing, empty or itself spelled as a
+    /// flag (`--data-dir --bogus`) is refused rather than taken, so an unknown flag cannot hide as
+    /// another flag's value. Read token by token, before anything is opened; positionals are left
+    /// for the command to refuse.
+    fn parse_exact(args: &[String], known: &[&str]) -> Result<Self, BoxError> {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut tokens = args.iter();
+        while let Some(token) = tokens.next() {
+            let Some(name) = token.strip_prefix("--") else {
+                continue;
+            };
+            if !known.contains(&name) {
+                return Err(format!("unknown flag `--{name}`").into());
+            }
+            if seen.contains(&name) {
+                return Err(format!("`--{name}` is given more than once").into());
+            }
+            seen.push(name);
+            match tokens.next() {
+                Some(value) if !value.is_empty() && !value.starts_with("--") => {}
+                _ => return Err(format!("flag `--{name}` needs a value").into()),
+            }
+        }
+        Self::parse(args)
     }
 
     fn positional(&self, index: usize) -> Option<&str> {
@@ -4370,6 +4817,257 @@ mod tests {
                      ({stale:?}): {printed}"
                 );
             }
+        }
+    }
+
+    /// The commands `wyrd mpu abort` prints name the store it acted on, so they run over it from
+    /// any shell: the backend by name and, for redb, the absolute directory as one shell word,
+    /// whatever quotes or spaces it holds; for a networked backend, each variable its open read,
+    /// as an assignment scoped to the command. The networked spellings are built here by hand, as
+    /// [`store_spelling`]'s `tikv` and `fdb` arms build them; those arms are compiled only with
+    /// their backends, and tested there below.
+    #[test]
+    fn the_printed_commands_name_the_store_the_abort_acted_on() {
+        let redb = store_spelling(MetadataBackend::Redb, "/srv/it's a dir").unwrap();
+        assert_eq!(
+            redb.command("custodian --reap-abandoned-uploads"),
+            r"wyrd custodian --reap-abandoned-uploads --metadata-backend redb --data-dir '/srv/it'\''s a dir'"
+        );
+        let tikv = StoreSpelling {
+            backend: "tikv",
+            data_dir: None,
+            environment: vec![(
+                TIKV_PD_ENDPOINTS_ENV,
+                "http://pd-a:2379,http://pd-b:2379".to_owned(),
+            )],
+        };
+        assert_eq!(
+            tikv.command("custodian --reap-abandoned-uploads"),
+            "WYRD_TIKV_PD_ENDPOINTS='http://pd-a:2379,http://pd-b:2379' wyrd custodian \
+             --reap-abandoned-uploads --metadata-backend tikv"
+        );
+        let fdb = StoreSpelling {
+            backend: "fdb",
+            data_dir: None,
+            environment: vec![
+                ("WYRD_FDB_CLUSTER_FILE", "/clusters/a's.cluster".to_owned()),
+                (
+                    "WYRD_FDB_EXTERNAL_CLIENT_DIR",
+                    "/opt/fdb clients".to_owned(),
+                ),
+            ],
+        };
+        assert_eq!(
+            fdb.command("mpu abort --upload-id X"),
+            r"WYRD_FDB_CLUSTER_FILE='/clusters/a'\''s.cluster' WYRD_FDB_EXTERNAL_CLIENT_DIR='/opt/fdb clients' wyrd mpu abort --upload-id X --metadata-backend fdb"
+        );
+        assert_eq!(shell_quoted("wyrd-data"), "'wyrd-data'");
+        assert_eq!(shell_quoted("''"), r"''\'''\'''");
+    }
+
+    /// The redb directory is resolved against the working directory the abort ran in, once, so
+    /// the store it opens, names and prints is one absolute path; an absolute one is kept.
+    #[test]
+    fn the_abort_resolves_its_redb_directory_to_an_absolute_path() {
+        let here = std::env::current_dir().expect("a working directory");
+        let resolved = absolute_path("--data-dir", "it's a store").expect("resolved");
+        assert!(Path::new(&resolved).is_absolute(), "{resolved}");
+        assert_eq!(Path::new(&resolved), here.join("it's a store"));
+        assert_eq!(
+            absolute_path("--data-dir", "/srv/wyrd").unwrap(),
+            "/srv/wyrd"
+        );
+    }
+
+    /// The `tikv` arm itself: the address spelled is the PD endpoints this process would connect
+    /// to, as the open parses them, worked out here from the variable's literal name. Run with
+    /// the variable set for the one command (`WYRD_TIKV_PD_ENDPOINTS=' http://a:1 , http://b:2'
+    /// cargo test …`), it is that value that reaches the printed command.
+    #[cfg(feature = "tikv")]
+    #[test]
+    fn the_tikv_spelling_carries_the_pd_endpoints_this_process_connects_to() {
+        let address = std::env::var("WYRD_TIKV_PD_ENDPOINTS")
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|endpoint| !endpoint.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .filter(|joined| !joined.is_empty())
+            .map(|joined| ("WYRD_TIKV_PD_ENDPOINTS", joined));
+        assert_eq!(
+            store_spelling(MetadataBackend::Tikv, "unused").unwrap(),
+            StoreSpelling {
+                backend: "tikv",
+                data_dir: None,
+                environment: address.into_iter().collect(),
+            }
+        );
+    }
+
+    /// The environment a printed command carries for a networked backend's paths: each path in
+    /// effect, made absolute against this process's working directory so it names the same path
+    /// from any directory, an absolute one kept, and a variable with none in effect left out.
+    #[test]
+    fn the_printed_environment_carries_each_path_in_effect_absolute() {
+        let here = std::env::current_dir().expect("a working directory");
+        assert_eq!(
+            path_environment(vec![
+                ("CLUSTER", Some("clusters/a.cluster".to_owned())),
+                ("UNSET", None),
+                ("CLIENTS", Some("/opt/fdb clients".to_owned())),
+            ])
+            .unwrap(),
+            vec![
+                (
+                    "CLUSTER",
+                    here.join("clusters/a.cluster")
+                        .into_os_string()
+                        .into_string()
+                        .unwrap()
+                ),
+                ("CLIENTS", "/opt/fdb clients".to_owned()),
+            ]
+        );
+    }
+
+    /// The `fdb` arm itself: the cluster file `connect()` would use — the variable's value, or
+    /// the package default when it is unset or blank — and the external-client directory the
+    /// network boots with, only when one is in effect, each made absolute against this process's
+    /// working directory, worked out here from the literal names. Run with the variables set for
+    /// the one command (`WYRD_FDB_CLUSTER_FILE=a.cluster WYRD_FDB_EXTERNAL_CLIENT_DIR=clients
+    /// cargo test …`), it is those values that reach the printed command.
+    #[cfg(feature = "fdb")]
+    #[test]
+    fn the_fdb_spelling_carries_the_cluster_file_and_client_directory_it_connects_with() {
+        let absolute = |path: &str| {
+            std::env::current_dir()
+                .expect("a working directory")
+                .join(path)
+                .into_os_string()
+                .into_string()
+                .expect("a UTF-8 path")
+        };
+        let in_effect = |variable| {
+            std::env::var(variable)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let cluster_file = in_effect("WYRD_FDB_CLUSTER_FILE")
+            .unwrap_or_else(|| "/etc/foundationdb/fdb.cluster".to_owned());
+        let mut environment = vec![("WYRD_FDB_CLUSTER_FILE", absolute(&cluster_file))];
+        if let Some(dir) = in_effect("WYRD_FDB_EXTERNAL_CLIENT_DIR") {
+            environment.push(("WYRD_FDB_EXTERNAL_CLIENT_DIR", absolute(&dir)));
+        }
+        assert_eq!(
+            store_spelling(MetadataBackend::Fdb, "unused").unwrap(),
+            StoreSpelling {
+                backend: "fdb",
+                data_dir: None,
+                environment,
+            }
+        );
+    }
+
+    /// Every answer of the operator abort, and its exit: 0 while the session is `Aborting`, with
+    /// the teardown one-shot and this upload's own stop condition named then, both spelled for the
+    /// store, and what to do instead when a pass holds this upload itself; a fence claimed only
+    /// for an acknowledged commit; "nothing written" never said after a fence commit whose
+    /// outcome is unknown.
+    #[test]
+    fn the_operator_abort_answers_claim_only_what_the_store_showed() {
+        let upload = UploadId::new("ab".repeat(16)).unwrap();
+        let spelling = store_spelling(MetadataBackend::Redb, "/x").unwrap();
+        let answer = |outcome| operator_abort_answer(&upload, "redb at x", &spelling, &outcome);
+        let teardown =
+            "run `wyrd custodian --reap-abandoned-uploads --metadata-backend redb --data-dir '/x'`";
+        let stop = format!(
+            "until `wyrd mpu abort --upload-id {upload} --metadata-backend redb --data-dir '/x'` \
+             answers that upload {upload} is absent"
+        );
+        let held_here = format!(
+            "one whose held lines name upload {upload} (a partial-fleet hold, say) will not clear \
+             by repeating that metadata-only one-shot: stop it, and run the custodian over the \
+             same store without --reap-abandoned-uploads, with --endpoints, --ids and \
+             --failure-domains for the whole fleet"
+        );
+        let next = |said: &str| {
+            assert!(said.contains(teardown), "{said}");
+            assert!(said.contains(&stop), "{said}");
+            assert!(said.contains("BLOCKED"), "{said}");
+            assert!(said.contains(&held_here), "{said}");
+            assert!(!said.contains("until it reports satisfied"), "{said}");
+        };
+
+        let (succeeds, said) = answer(OperatorAbortOutcome::Fenced { epoch: 3 });
+        assert!(succeeds && said.contains("fenced to Aborting@3"), "{said}");
+        next(&said);
+
+        let (succeeds, said) = answer(OperatorAbortOutcome::FencedUnattributed { epoch: 3 });
+        assert!(succeeds && said.contains("is Aborting@3"), "{said}");
+        assert!(said.contains("rival fence"), "{said}");
+        assert!(
+            !said.contains("fenced to"),
+            "not claimed as this abort's: {said}"
+        );
+        next(&said);
+
+        let (succeeds, said) = answer(OperatorAbortOutcome::AlreadyAborting { epoch: 3 });
+        assert!(succeeds && said.contains("already Aborting@3"), "{said}");
+        next(&said);
+
+        let (succeeds, said) = answer(OperatorAbortOutcome::Completed { epoch: 4 });
+        assert!(!succeeds && said.contains("abort does not apply to a terminal session"));
+
+        let (succeeds, said) = answer(OperatorAbortOutcome::NoSuchUpload);
+        assert!(!succeeds && said.contains("nothing written"), "{said}");
+        assert!(
+            said.contains(&format!("upload {upload} is absent")),
+            "the answer the stop condition waits for: {said}"
+        );
+
+        let (succeeds, said) = answer(OperatorAbortOutcome::AbsentAfterDoubt);
+        assert!(!succeeds, "{said}");
+        assert!(
+            said.contains("possibly fenced and already torn down"),
+            "{said}"
+        );
+        assert!(!said.contains("nothing written"), "{said}");
+    }
+
+    /// The audit line of each answer: `operator-abort-fenced` only for a fence the store
+    /// acknowledged, `operator-abort-fence-unattributed` for one found landed after an unknown
+    /// outcome, each with the epoch the session is `Aborting` at, and none where nothing of the
+    /// abort landed.
+    #[test]
+    fn the_operator_abort_audits_only_a_fence_of_its_own_that_landed() {
+        let fenced = operator_abort_audit(&OperatorAbortOutcome::Fenced { epoch: 3 }).unwrap();
+        assert_eq!((fenced.action, fenced.epoch), ("operator-abort-fenced", 3));
+        let unattributed =
+            operator_abort_audit(&OperatorAbortOutcome::FencedUnattributed { epoch: 4 }).unwrap();
+        assert_eq!(
+            (unattributed.action, unattributed.epoch),
+            ("operator-abort-fence-unattributed", 4)
+        );
+        assert!(
+            unattributed.message.contains("rival"),
+            "{}",
+            unattributed.message
+        );
+        for nothing_landed in [
+            OperatorAbortOutcome::AlreadyAborting { epoch: 3 },
+            OperatorAbortOutcome::Completed { epoch: 4 },
+            OperatorAbortOutcome::NoSuchUpload,
+            OperatorAbortOutcome::AbsentAfterDoubt,
+        ] {
+            assert_eq!(
+                operator_abort_audit(&nothing_landed),
+                None,
+                "{nothing_landed:?}"
+            );
         }
     }
 }

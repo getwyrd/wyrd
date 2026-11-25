@@ -16,18 +16,26 @@
 //! fenced session still holds its staged bytes and its `mpu:` record, so it stays counted until
 //! the terminal delete, the one place the count goes down (#659).
 //!
-//! # One batch builder, three writers
+//! # One batch builder, four writers
 //!
 //! [`fence_batch`] is the only place the teardown fence's [`WriteBatch`] is built. The client
-//! Abort here, the post-restore session fence (`crates/custodian/src/restore.rs`,
-//! `fence_session`) and the custodian's multipart reaper (`crates/custodian/src/reaper.rs`, #625)
-//! all commit what it builds, so the writers of the `Open → Aborting` edge cannot drift apart in
-//! their preconditions or their puts. A fence that loses is classified by one function too,
-//! [`lost`], which the Abort and the reaper share.
+//! Abort here, the operator abort here ([`operator_abort`], FU-6), the post-restore session fence
+//! (`crates/custodian/src/restore.rs`, `fence_session`) and the custodian's multipart reaper
+//! (`crates/custodian/src/reaper.rs`, #625) all commit what it builds, so the writers of the
+//! `Open → Aborting` and `Completing → Aborting` edges cannot drift apart in their preconditions
+//! or their puts. A fence that loses is classified by one function too, [`lost`], which the two
+//! Aborts and the reaper share; the two Aborts also share one round loop.
+//!
+//! # The operator abort
+//!
+//! [`operator_abort`] is the exit 0016 names for a session no clock will judge (`0016:255-262`):
+//! it fences `Open@E` as the client Abort does and `Completing@E` as the restore fence does
+//! ([`SessionRecord::completing_teardown`], `0016:665`), each in one batch, and refuses a
+//! `Completed` or absent session. `wyrd mpu abort` (`crates/server/src/cli.rs`) is its caller.
 //!
 //! Production calls no client Abort yet: the S3 verb that will is #668, under 0016's rule that
-//! the reaper and operator abort ship in the same release (`0016:236-268`). The restore fence and
-//! the reaper are the production callers of [`fence_batch`].
+//! the reaper and operator abort ship in the same release (`0016:236-268`). The restore fence, the
+//! reaper and the operator abort are the production callers of [`fence_batch`].
 //!
 //! # Runtime-free (ADR-0009)
 //!
@@ -36,14 +44,13 @@
 //! and a round that lost is retried at once, with no backoff to wait out.
 
 use std::fmt;
-use std::slice;
 
 use bytes::Bytes;
 use wyrd_traits::{BoxError, CommitOutcome, CommitUnknownResult, MetadataStore, WriteBatch};
 
 use super::{
     abort_answer, decode_session_record, mpu_key, AbortAnswer, AbortOutcome, RecordError, Refusal,
-    RetireObligation, SessionRecord, UploadId, MAX_COMPLETE_ATTEMPTS,
+    RetireObligation, SessionRecord, SessionState, UploadId, MAX_COMPLETE_ATTEMPTS,
 };
 use crate::metadata;
 
@@ -61,6 +68,11 @@ use crate::metadata;
 /// value of that knob, and it bounds the work one Abort does, not its correctness: an Abort that
 /// spends it ends with an error that says whether a fence of it may still land, never with a wrong
 /// answer.
+///
+/// It is sized for the `Open` door. On the operator abort's `Completing` door ([`operator_abort`])
+/// every segment batch of a completer still running also moves the session, so aborting a session
+/// whose completer is live can spend the budget and end [`Stop::RoundsSpent`]: that fails closed,
+/// with no fence landed that the error does not name, and a re-run starts over.
 pub const ABORT_ROUNDS: u32 = MAX_COMPLETE_ATTEMPTS + 1;
 
 /// **The teardown fence's batch** (`0016:665`), the one builder of it: given the session's
@@ -143,7 +155,8 @@ pub struct InDoubt {
 /// What stopped an Abort ([`AbortError::Stopped`], [`InDoubt::cause`]).
 #[derive(Debug)]
 pub enum Stop {
-    /// All [`ABORT_ROUNDS`] fence commits were made and the session was still `Open`.
+    /// All [`ABORT_ROUNDS`] fence commits were made and the session was still in a state the
+    /// Abort fences (`Open`; for [`operator_abort`], `Open` or `Completing`).
     RoundsSpent {
         /// Fence commits made.
         rounds: u32,
@@ -156,7 +169,8 @@ pub enum Stop {
         /// The `retire:` key, as UTF-8 (lossy).
         key: String,
     },
-    /// The session is `Open` at the last epoch, so no fence can bump it (`0016:704-708`).
+    /// The session is at the last epoch in a state the Abort fences, so no fence can bump it
+    /// (`0016:704-708`).
     EpochExhausted,
     /// The stored `mpu:` value is not a valid session record (ADR-0045).
     Record(RecordError),
@@ -193,7 +207,7 @@ impl fmt::Display for Stop {
         match self {
             Self::RoundsSpent { rounds } => write!(
                 f,
-                "all {rounds} fence rounds were spent and the session is still Open"
+                "all {rounds} fence rounds were spent and the session is still not fenced"
             ),
             Self::ObligationKeyTaken { key } => write!(
                 f,
@@ -201,7 +215,7 @@ impl fmt::Display for Stop {
                  is damage a retry cannot settle"
             ),
             Self::EpochExhausted => {
-                f.write_str("the session is Open at the last epoch, so no fence can bump it")
+                f.write_str("the session is at the last epoch, so no fence can bump it")
             }
             Self::Record(torn) => write!(f, "the stored session record is invalid: {torn}"),
             Self::Store(fault) => write!(f, "store fault: {fault}"),
@@ -289,6 +303,193 @@ pub async fn abort_session(
     store: &impl MetadataStore,
     upload_id: &UploadId,
 ) -> Result<AbortOutcome, AbortError> {
+    fence_rounds(
+        store,
+        upload_id,
+        |_| AbortOutcome::Refused(Refusal::NoSuchUpload),
+        |_, _| AbortOutcome::Fenced,
+        |record| {
+            match abort_answer(Some(record.state())) {
+                AbortAnswer::Fences => {}
+                AbortAnswer::AlreadyAborting => {
+                    return Ok(Round::Answer(AbortOutcome::AlreadyAborting))
+                }
+                AbortAnswer::Refused(refusal) => {
+                    return Ok(Round::Answer(AbortOutcome::Refused(refusal)))
+                }
+            }
+            let teardown = record
+                .open_teardown(upload_id)
+                .ok_or(Stop::EpochExhausted)?;
+            Ok(Round::Fence {
+                session: Box::new(teardown.session().clone()),
+                obligations: vec![teardown.obligation().clone()],
+            })
+        },
+    )
+    .await
+}
+
+/// What an operator abort ([`operator_abort`]) answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorAbortOutcome {
+    /// A fence commit of this abort the store acknowledged: the session is at `Aborting@E+1`, with
+    /// its teardown obligations durable beside it.
+    Fenced {
+        /// The epoch the fence put the session at, `E+1`.
+        epoch: u64,
+    },
+    /// The session is at `Aborting@epoch` exactly as a fence of this abort leaves it, found by a
+    /// read after a fence commit of it whose outcome the store could not report. A rival fence
+    /// of the same bytes (the restore fence, the reaper, another operator abort) puts the same
+    /// record and the same obligations, so this does not say whose fence landed.
+    FencedUnattributed {
+        /// The epoch read, `E+1`.
+        epoch: u64,
+    },
+    /// The session was already `Aborting` at `epoch`: nothing was written.
+    AlreadyAborting {
+        /// The epoch read.
+        epoch: u64,
+    },
+    /// The session is `Completed` at `epoch`, a terminal state: abort does not apply to it.
+    /// Nothing was written.
+    Completed {
+        /// The epoch read.
+        epoch: u64,
+    },
+    /// No `mpu:<id>` record: there is no session to abort. Nothing was written.
+    NoSuchUpload,
+    /// No `mpu:<id>` record, read while a fence commit of this abort whose outcome the store
+    /// could not report may have landed unseen: the drain may have torn the fenced session down
+    /// since. Not "nothing was written".
+    AbsentAfterDoubt,
+}
+
+/// **The operator abort** (FU-6, `0016:255-262`, `:572`): fence the session `upload_id` names to
+/// `Aborting`, from `Open` **or** `Completing`, for the operator to run where no other actor will
+/// move the session — a foreign-clocked session the reaper declines to judge (`0016:1984-1998`).
+///
+/// | State read | Answer | Written |
+/// |---|---|---|
+/// | `Open@E` | [`OperatorAbortOutcome::Fenced`] | the [`fence_batch`] of [`SessionRecord::open_teardown`]: the session at `Aborting@E+1` and its `retire:bytes:s:<id>:<E>` `{session, all}` (`0016:664`) |
+/// | `Completing@E` | [`OperatorAbortOutcome::Fenced`] | the [`fence_batch`] of [`SessionRecord::completing_teardown`], the restore fence's one shape (`0016:665`): the session at `Aborting@E+1`, `retire:bytes:s:<id>:<E>` `{session, all}` and `retire:records:s:<id>:<E>` `{seg: <nonce, E>}` |
+/// | `Aborting@E` | [`OperatorAbortOutcome::AlreadyAborting`] | nothing |
+/// | `Completed@E` | [`OperatorAbortOutcome::Completed`] | nothing |
+/// | no record | [`OperatorAbortOutcome::NoSuchUpload`] | nothing |
+///
+/// After a fence commit whose outcome the store could not report, the read that follows answers
+/// it without claiming more than it saw: the session found exactly as that fence leaves it is
+/// [`OperatorAbortOutcome::FencedUnattributed`], since a rival fence of the same bytes leaves it
+/// the same; no record, while that fence is unsettled, is
+/// [`OperatorAbortOutcome::AbsentAfterDoubt`], since the drain deletes the record of a fenced
+/// session. Only a commit the store acknowledged is [`OperatorAbortOutcome::Fenced`].
+///
+/// Each fence is **one** batch: the state change and every obligation it installs commit
+/// together or not at all, under `require` on the exact bytes read and `require_absent` on every
+/// obligation key, so no interleaving leaves a fenced session whose segments or staged bytes have
+/// no reclaimer (X57). The `Completing` door's `{seg}` obligation names the fence epoch's range
+/// `seg:<nonce>:<E>:` only, never the whole group (F18).
+///
+/// Unlike the client Abort ([`abort_session`]), a `Completing` session is fenced here rather than
+/// refused: the operator is the exit 0016 names for a session no clock will judge, and the
+/// restore fence's batch is what a `Completing` teardown is.
+///
+/// The abort tears nothing down. Deleting records, writing `orphan:` marks and releasing the
+/// admission slot stay the retirement drain's, which reads no clock (#659).
+///
+/// Rounds, doubt and termination are [`abort_session`]'s, from the same loop: at most
+/// [`ABORT_ROUNDS`] fence commits, a lost fence classified by [`lost`] on every obligation key it
+/// required absent, and an unknown outcome never read as a conflict. Not cancel-safe once a commit
+/// is sent, for the reason given there.
+pub async fn operator_abort(
+    store: &impl MetadataStore,
+    upload_id: &UploadId,
+) -> Result<OperatorAbortOutcome, AbortError> {
+    fence_rounds(
+        store,
+        upload_id,
+        |in_doubt| {
+            if in_doubt {
+                OperatorAbortOutcome::AbsentAfterDoubt
+            } else {
+                OperatorAbortOutcome::NoSuchUpload
+            }
+        },
+        |session, acknowledged| {
+            let epoch = session.epoch();
+            if acknowledged {
+                OperatorAbortOutcome::Fenced { epoch }
+            } else {
+                OperatorAbortOutcome::FencedUnattributed { epoch }
+            }
+        },
+        |record| {
+            let (session, obligations) = match record.state() {
+                SessionState::Open {} => {
+                    let teardown = record
+                        .open_teardown(upload_id)
+                        .ok_or(Stop::EpochExhausted)?;
+                    (
+                        teardown.session().clone(),
+                        vec![teardown.obligation().clone()],
+                    )
+                }
+                SessionState::Completing { .. } => {
+                    let teardown = record
+                        .completing_teardown(upload_id)
+                        .ok_or(Stop::EpochExhausted)?;
+                    (
+                        teardown.session().clone(),
+                        vec![teardown.bytes().clone(), teardown.records().clone()],
+                    )
+                }
+                SessionState::Aborting {} => {
+                    let epoch = record.epoch();
+                    return Ok(Round::Answer(OperatorAbortOutcome::AlreadyAborting {
+                        epoch,
+                    }));
+                }
+                SessionState::Completed { .. } => {
+                    let epoch = record.epoch();
+                    return Ok(Round::Answer(OperatorAbortOutcome::Completed { epoch }));
+                }
+            };
+            Ok(Round::Fence {
+                session: Box::new(session),
+                obligations,
+            })
+        },
+    )
+    .await
+}
+
+/// What one round of [`fence_rounds`] does with the session it read.
+enum Round<A> {
+    /// Answer with this, writing nothing.
+    Answer(A),
+    /// Commit the [`fence_batch`] putting `session` and installing `obligations`. Boxed: the
+    /// record is far larger than any answer.
+    Fence {
+        session: Box<SessionRecord>,
+        obligations: Vec<RetireObligation>,
+    },
+}
+
+/// The fence loop [`abort_session`] and [`operator_abort`] share: read the session, ask `plan`
+/// what this round does with it, commit the fence it names, and answer from what the store then
+/// holds. `absent` answers a read that found no record, told whether a fence of this loop may
+/// have landed unseen before that read ([`Doubt::may_have_landed`]); `fenced` answers a fence of this loop that
+/// landed, given the session it put and whether the store acknowledged it (`false`: a read found
+/// the session as it puts it, after an unknown outcome). The rules are [`abort_session`]'s,
+/// documented there.
+async fn fence_rounds<A>(
+    store: &impl MetadataStore,
+    upload_id: &UploadId,
+    absent: impl Fn(bool) -> A,
+    fenced: impl Fn(&SessionRecord, bool) -> A,
+    plan: impl Fn(&SessionRecord) -> Result<Round<A>, Stop>,
+) -> Result<A, AbortError> {
     let session_key = mpu_key(upload_id);
     let mut doubt = Doubt::default();
     let mut rounds = 0u32;
@@ -298,45 +499,39 @@ pub async fn abort_session(
     };
     loop {
         // `found` is always the result of a read that succeeded.
-        if doubt.landed(found.as_ref()) {
-            return Ok(AbortOutcome::Fenced);
+        if let Some(session) = doubt.landed(found.as_ref()) {
+            return Ok(fenced(session, false));
         }
+        let in_doubt = doubt.may_have_landed();
         doubt.settle(found.as_ref());
         let Some(read) = found else {
-            return Ok(AbortOutcome::Refused(Refusal::NoSuchUpload));
+            return Ok(absent(in_doubt));
         };
         let record = match decode_session_record(&read) {
             Ok(record) => record,
             Err(torn) => return Err(doubt.end(upload_id, Stop::Record(torn))),
         };
-        match abort_answer(Some(record.state())) {
-            AbortAnswer::Fences => {}
-            AbortAnswer::AlreadyAborting => return Ok(AbortOutcome::AlreadyAborting),
-            AbortAnswer::Refused(refusal) => return Ok(AbortOutcome::Refused(refusal)),
-        }
-        let Some(teardown) = record.open_teardown(upload_id) else {
-            return Err(doubt.end(upload_id, Stop::EpochExhausted));
+        let (session, obligations) = match plan(&record) {
+            Ok(Round::Answer(answer)) => return Ok(answer),
+            Ok(Round::Fence {
+                session,
+                obligations,
+            }) => (*session, obligations),
+            Err(cause) => return Err(doubt.end(upload_id, cause)),
         };
         if rounds == ABORT_ROUNDS {
             return Err(doubt.end(upload_id, Stop::RoundsSpent { rounds }));
         }
         rounds += 1;
-        let obligation = teardown.obligation();
-        let obligation_key = obligation.key();
-        let batch = fence_batch(
-            &session_key,
-            &read,
-            teardown.session(),
-            slice::from_ref(obligation),
-        );
+        let batch = fence_batch(&session_key, &read, &session, &obligations);
         found = match store.commit(batch).await {
-            Ok(CommitOutcome::Committed) => return Ok(AbortOutcome::Fenced),
+            Ok(CommitOutcome::Committed) => return Ok(fenced(&session, true)),
             Ok(CommitOutcome::Conflict) => {
-                match lost(store, &session_key, &read, &obligation_key).await {
-                    Ok(Lost::Moved(now)) => now,
+                match lost_any(store, &session_key, &read, &obligations).await {
+                    Ok((Lost::Moved(now), _)) => now,
                     // Spend the round; the session is still `read`.
-                    Ok(Lost::Unexplained) => Some(read),
-                    Ok(Lost::Taken) => {
+                    Ok((Lost::Unexplained, _)) => Some(read),
+                    Ok((Lost::Taken, obligation_key)) => {
                         let key = String::from_utf8_lossy(&obligation_key).into_owned();
                         return Err(doubt.end(upload_id, Stop::ObligationKeyTaken { key }));
                     }
@@ -348,7 +543,7 @@ pub async fn abort_session(
                     // A definite failure of this batch; an earlier batch's doubt still stands.
                     return Err(doubt.end(upload_id, Stop::Store(fault)));
                 };
-                doubt.observe(unknown, &read, metadata::encode(teardown.session()));
+                doubt.observe(unknown, &read, session);
                 match store.get(&session_key).await {
                     Ok(found) => found,
                     Err(fault) => return Err(doubt.end(upload_id, Stop::Store(fault))),
@@ -356,6 +551,26 @@ pub async fn abort_session(
             }
         };
     }
+}
+
+/// [`lost`] over every obligation key a fence required absent, in the order it required them:
+/// the first key that says [`Lost::Moved`] or [`Lost::Taken`] decides, with the key it was read
+/// at; [`Lost::Unexplained`] only when every key does.
+async fn lost_any(
+    store: &impl MetadataStore,
+    session_key: &[u8],
+    read: &[u8],
+    obligations: &[RetireObligation],
+) -> Result<(Lost, Vec<u8>), BoxError> {
+    let mut last = Vec::new();
+    for obligation in obligations {
+        let key = obligation.key();
+        match lost(store, session_key, read, &key).await? {
+            Lost::Unexplained => last = key,
+            decided => return Ok((decided, key)),
+        }
+    }
+    Ok((Lost::Unexplained, last))
 }
 
 /// What a [`fence_batch`] commit that answered `Conflict` lost to ([`lost`]).
@@ -401,9 +616,10 @@ pub async fn lost(
 /// What this Abort knows about its own fence commits whose outcome the store could not report.
 #[derive(Debug, Default)]
 struct Doubt {
-    /// The session record each such fence puts: `Aborting@E+1` for the `Open@E` it required.
-    /// Finding one of these at `mpu:<id>` is finding that fence landed.
-    puts: Vec<Bytes>,
+    /// The session record each such fence puts, encoded and as built: `Aborting@E+1` for the
+    /// `Open@E` or `Completing@E` it required. Finding one of these at `mpu:<id>` is finding that
+    /// fence landed.
+    puts: Vec<(Bytes, SessionRecord)>,
     /// **Held**: the first outcome that said `may_still_commit`, with the session bytes its batch
     /// requires. Kept, never replaced by a later outcome; only a read that finds the session no
     /// longer those bytes clears it.
@@ -413,8 +629,8 @@ struct Doubt {
 }
 
 impl Doubt {
-    fn observe(&mut self, outcome: &CommitUnknownResult, required: &Bytes, puts: Bytes) {
-        self.puts.push(puts);
+    fn observe(&mut self, outcome: &CommitUnknownResult, required: &Bytes, puts: SessionRecord) {
+        self.puts.push((metadata::encode(&puts), puts));
         if !outcome.may_still_commit {
             self.unsettled = Some(outcome.clone());
         } else if self.held.is_none() {
@@ -422,9 +638,22 @@ impl Doubt {
         }
     }
 
-    /// Whether a read that found `found` found a fence of this Abort landed.
-    fn landed(&self, found: Option<&Bytes>) -> bool {
-        found.is_some_and(|found| self.puts.contains(found))
+    /// The session a fence of this Abort put, when a read that found `found` found that fence
+    /// landed.
+    fn landed(&self, found: Option<&Bytes>) -> Option<&SessionRecord> {
+        let found = found?;
+        self.puts
+            .iter()
+            .find(|(put, _)| put == found)
+            .map(|(_, session)| session)
+    }
+
+    /// Whether a fence of this Abort may have landed unseen: one may still land (`held`), or one
+    /// out of flight has no successful read after it (`unsettled`). Asked before
+    /// [`Self::settle`], a read that then finds no record cannot say that fence never landed: a
+    /// fenced session's record is deleted by its drain.
+    fn may_have_landed(&self) -> bool {
+        self.held.is_some() || self.unsettled.is_some()
     }
 
     /// A successful read of `mpu:<id>` that found `found`, and not a fence of this Abort: no
