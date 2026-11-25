@@ -512,8 +512,18 @@ fn usage() {
     eprintln!("  each list one entry per endpoint (matching each D-server's own --id /");
     eprintln!("  --failure-domain); the role never fabricates identity or topology from endpoint");
     eprintln!(
-        "  order. Omit all three to run the leader-elected role with no reconstruction plane."
+        "  order. Omit all three to run the leader-elected role with no reconstruction plane:"
     );
+    eprintln!("  it then runs the multipart reaper alone, every --interval-secs, until Ctrl-C,");
+    eprintln!("  over a metadata store that must already exist (on redb it creates none). On");
+    eprintln!("  redb it holds the --data-dir store's exclusive lock for as long as it runs, so");
+    eprintln!("  no other wyrd process can open that store until it stops. It is refused with");
+    eprintln!(
+        "  --ids, --failure-domains or --gc-expired-pending, which only a fleet uses, and with"
+    );
+    eprintln!("  --interval-secs 0. If none of the --endpoints is reachable at startup, the role");
+    eprintln!("  runs one reaper pass (none under --reconcile-after-restore) and then fails,");
+    eprintln!("  non-zero, as before.");
     eprintln!();
     eprintln!(
         "  s3: --chunk-size N sets the bytes per chunk (default 1 MiB). Accepted: {} to {}",
@@ -951,6 +961,19 @@ const DEFAULT_CUSTODIAN_CONNECT_TIMEOUT_SECS: u64 = 10;
 /// ([`REAPER_ONE_SHOT_EXCLUDES`]), and on a redb `--data-dir` that holds no store
 /// ([`open_existing_local_meta_redb`]); its outcome line names the store it ran on.
 ///
+/// The multipart reaper runs on **every** startup shape of the ordinary role (#625; 0016
+/// `:234-268`): with a fleet it rides each interval's reconstruction pass, on whatever part of
+/// the fleet is reachable; with no `--endpoints` the role runs it alone every interval
+/// ([`CustodianService::run_reaper_until`], the fleet role's own interval driver) instead of
+/// exiting; and when no configured D server is reachable at startup the role runs one reaper
+/// pass before it panics as it always has — except under `--reconcile-after-restore`, whose store
+/// no pass may touch before the restore pass itself. Both shapes without a fleet open the store
+/// with [`open_no_fleet_meta`], which on redb creates none; the role with no `--endpoints` then
+/// holds that redb store's exclusive lock for as long as it runs, as the role over a fleet does,
+/// so no other `wyrd` process can open the store meanwhile. The role with no `--endpoints` is
+/// refused, before it opens anything, with a flag only a fleet uses ([`NO_FLEET_EXCLUDES`]) and
+/// with `--interval-secs 0`; with `--endpoints` the role takes 0 as it always has.
+///
 /// `pub` so the deployable role's own binary entry — arg parse → [`resolve_backend`] →
 /// backend open → [`connect_fleet`] (with [`require_aligned_topology`] and the concrete
 /// [`GrpcDServerConnector`] dial) → run loop — is driven **end to end** by a test, not only
@@ -1022,6 +1045,31 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
     if reap_abandoned_uploads {
         if let Some(refusal) = reaper_one_shot_conflict(&parsed) {
             return Err(refusal.into());
+        }
+    }
+    // The role with no `--endpoints` runs the multipart reaper alone, every interval, for good
+    // (#625). Its two refusals are made here, before anything is opened, as the reaper one-shot's
+    // are. Neither one-shot is that role: each runs one pass and never waits, and the restore
+    // one-shot has its own refusal without `--endpoints`, below.
+    if endpoints.is_none() && !reap_abandoned_uploads && !reconcile_after_restore {
+        // A flag only a fleet uses would be read here and dropped while the role ran on, never
+        // doing what it asked.
+        if let Some(refusal) = no_fleet_conflict(&parsed) {
+            return Err(refusal.into());
+        }
+        // This role's loop is new with the reaper, and at `--interval-secs 0` it would start pass
+        // after pass with no pause, reading the metadata store as fast as it answers. Only this
+        // shape is refused: with `--endpoints` the role takes 0 as it always has, so its loop
+        // over a fleet and its failure on a fleet none of whose servers is reachable are
+        // unchanged.
+        if interval.is_zero() {
+            return Err(
+                "wyrd custodian: --interval-secs must be at least 1 with no --endpoints. The role \
+                 then runs the multipart reaper alone and waits that long between two passes; at \
+                 0 it would run them back to back, reading the metadata store as fast as it \
+                 answers."
+                    .into(),
+            );
         }
     }
     // GC's expired-pending input is OFF unless the operator arms it. The input's grace is
@@ -1155,10 +1203,22 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
                         .into(),
                 );
             }
+            // No fleet, but not no work: the multipart reaper reads and writes metadata alone, so
+            // the role runs it every interval instead of exiting (#625; 0016 `:234-268`, the
+            // reaper runs wherever the custodian role runs) — the fleet role's own interval
+            // driver with no fleet, record-only, until Ctrl-C. A redb store that is not there
+            // is refused rather than created.
+            let meta = open_no_fleet_meta(backend, data_dir).await?;
             eprintln!(
-                "wyrd custodian: no --endpoints; nothing to reconstruct. Wire --endpoints to \
-                 the D-server fleet to run the reconstruction plane."
+                "wyrd custodian: no --endpoints; nothing to reconstruct. Running the multipart \
+                 reaper alone every {}s [store: {}]; wire --endpoints to the D-server fleet to \
+                 run the reconstruction plane.",
+                interval.as_secs(),
+                reaper_store_name(backend, data_dir),
             );
+            service
+                .run_reaper_until(&zone, &custodian, meta.as_ref(), interval, clock, shutdown)
+                .await?;
             return Ok::<ExitCode, BoxError>(ExitCode::SUCCESS);
         };
 
@@ -1228,6 +1288,40 @@ pub fn cmd_custodian(args: &[String]) -> Result<ExitCode, BoxError> {
             // it and the operator would see a clean vanish on a total fleet outage / a bad
             // `--endpoints`. Panic instead: a non-zero exit + diagnostic is a loud, restartable
             // failure the supervisor and operator both act on.
+            //
+            // Before failing, exactly ONE multipart reaper pass, record-only, under the
+            // leadership elected above (#625): it needs no fleet, and a deployment whose fleet is
+            // down at every restart would otherwise never reap an abandoned upload. The role is
+            // not kept up for more: `connect_fleet` never re-dials, so it would sit on an empty
+            // fleet and vanish from the supervisor's view. Whatever the pass answers, the role
+            // then fails exactly as before; a pass fault (a redb store that is not there among
+            // them: none is created) is logged, never returned, so it cannot turn this panic into
+            // an ordinary error exit. The pass is the one the reaper one-shot runs, held to the
+            // same per-pass budgets, and on TiKV and FoundationDB each store call in it — the
+            // open included — to the adapter's own operation deadline. Like the one-shot it waits
+            // for no stop: the role fails right after it either way, so a Ctrl-C during it ends
+            // the process at once, and what the pass had committed stays for the next start's
+            // pass to go on from.
+            //
+            // None under `--reconcile-after-restore`: that command runs one explicit pass over a
+            // just-restored store with the writers stopped, and fences what the restore
+            // resurrected under its own restore-fence generation. A reaper pass before it would
+            // act on that store first — and here the command fails besides, having changed a
+            // store it was run to reconcile. It fails untouched, as it always has.
+            if !reconcile_after_restore {
+                let pass = async {
+                    let meta = open_no_fleet_meta(backend, data_dir).await?;
+                    service
+                        .reap_abandoned_uploads_once(&zone, &custodian, meta.as_ref(), clock)
+                        .await?;
+                    Ok::<(), BoxError>(())
+                };
+                if let Err(e) = pass.await {
+                    eprintln!(
+                        "wyrd custodian: multipart reaper pass on the empty fleet failed: {e}"
+                    );
+                }
+            }
             panic!(
                 "wyrd custodian: NO configured D server was reachable at startup ({} endpoint(s) \
                  all unreachable) — refusing to run a reconstruction plane over an empty fleet. \
@@ -1712,8 +1806,46 @@ fn reaper_one_shot_conflict(parsed: &ParsedArgs) -> Option<String> {
         })
 }
 
-/// The store a `--reap-abandoned-uploads` run acts on, for its outcome line: **which** store,
-/// not only which kind. The redb file under `data_dir`; the TiKV cluster by its PD endpoints
+/// The flags the custodian role started with **no `--endpoints`** is refused with (#625), each
+/// with the fleet work it selects. With no fleet the role runs the multipart reaper alone, every
+/// interval, for good: accepting one of these would leave the role running with the sweep the
+/// operator armed never run, or with a topology given for a fleet that was never named.
+///
+/// `--interval-secs` and `--connect-timeout-secs` are not here: the one paces the reaper, and the
+/// other only tunes a dial that is never made.
+const NO_FLEET_EXCLUDES: [(&str, &str); 3] = [
+    (
+        "gc-expired-pending",
+        "it arms the GC pass's expired-pending sweep, and GC runs only over a fleet",
+    ),
+    (
+        "ids",
+        "it gives the --endpoints their D-server identities, and none were given",
+    ),
+    (
+        "failure-domains",
+        "it gives the --endpoints their failure domains, and none were given",
+    ),
+];
+
+/// Why `parsed`, which names no `--endpoints`, cannot run as the custodian role with no fleet: the
+/// first flag in it that role would have to ignore ([`NO_FLEET_EXCLUDES`]), or `None`.
+fn no_fleet_conflict(parsed: &ParsedArgs) -> Option<String> {
+    NO_FLEET_EXCLUDES
+        .iter()
+        .find(|(flag, _)| parsed.flag(flag).is_some())
+        .map(|(flag, why)| {
+            format!(
+                "wyrd custodian: --{flag} needs --endpoints: {why}. With no --endpoints the role \
+                 runs the multipart reaper alone, so --{flag} would be silently ignored. Drop \
+                 --{flag}, or wire --endpoints/--ids/--failure-domains for the whole fleet."
+            )
+        })
+}
+
+/// The store a `--reap-abandoned-uploads` run acts on, for its outcome line, and the store the
+/// role with no `--endpoints` reaps, for its banner (#625): **which** store, not only which kind.
+/// The redb file under `data_dir`; the TiKV cluster by its PD endpoints
 /// ([`tikv_store_name`]); the FoundationDB cluster by its cluster file ([`fdb_store_name`]).
 ///
 /// A networked backend's address is its own configuration, read from the environment, not a flag
@@ -1804,6 +1936,35 @@ where
         }
     };
     Ok(outcome)
+}
+
+/// Open the metadata store a custodian role **with no fleet** reaps (#625): the role started with
+/// no `--endpoints`, and the one pass the role runs before it fails on a fleet none of whose
+/// servers was reachable at startup. Neither has anything to do but the multipart reaper, so
+/// neither creates a store: on redb the store must already be there
+/// ([`open_existing_local_meta_redb_for`]). A store made on the spot at a mistyped `--data-dir`
+/// would be reaped, empty, for good, while the store the cluster wrote went unreaped.
+///
+/// The TiKV and FoundationDB opens are the ones every command uses; each is bounded by its
+/// adapter's own deadline. One boxed store, so the caller runs one pass or one loop over it
+/// whatever the backend.
+async fn open_no_fleet_meta(
+    backend: MetadataBackend,
+    data_dir: &str,
+) -> Result<Box<dyn MetadataStore>, BoxError> {
+    Ok(match backend {
+        MetadataBackend::Redb => Box::new(open_existing_local_meta_redb_for(
+            data_dir,
+            "wyrd custodian",
+            "With no fleet the role only reaps multipart uploads, and it creates no store to \
+             reap: one made at a mistyped path would be reaped, empty, while the cluster's store \
+             was not.",
+        )?),
+        #[cfg(feature = "tikv")]
+        MetadataBackend::Tikv => Box::new(open_tikv_meta().await?),
+        #[cfg(feature = "fdb")]
+        MetadataBackend::Fdb => Box::new(open_fdb_meta().await?),
+    })
 }
 
 /// Open the metadata store the cluster wrote to for the configured `backend` and run the
@@ -2157,14 +2318,27 @@ fn open_local_meta_redb(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
 /// no look at the path before it: a check and then a creating open would initialize an empty
 /// file the check had passed, and whatever appeared between the two.
 fn open_existing_local_meta_redb(data_dir: &str) -> Result<RedbMetadataStore, BoxError> {
+    open_existing_local_meta_redb_for(
+        data_dir,
+        "wyrd custodian --reap-abandoned-uploads",
+        "The one-shot reaps the store a cluster already wrote and creates none: reporting that \
+         an empty store it had just made holds nothing to reap would be a false all-clear.",
+    )
+}
+
+/// [`open_existing_local_meta_redb`] for any `command` that must not create the store it acts
+/// on: the refusal of a path that holds no store names `command` and says `why` (#625; the
+/// custodian with no fleet, [`open_no_fleet_meta`], is the other caller).
+fn open_existing_local_meta_redb_for(
+    data_dir: &str,
+    command: &str,
+    why: &str,
+) -> Result<RedbMetadataStore, BoxError> {
     let path = local_meta_redb_path(data_dir);
     RedbMetadataStore::open_existing(&path).map_err(|refusal| {
         match refusal.downcast_ref::<NoExistingStore>() {
             Some(absent) => format!(
-                "wyrd custodian --reap-abandoned-uploads: no metadata store at {}: {absent}. The \
-                 one-shot reaps the store a cluster already wrote and creates none: reporting \
-                 that an empty store it had just made holds nothing to reap would be a false \
-                 all-clear. Check --data-dir.",
+                "{command}: no metadata store at {}: {absent}. {why} Check --data-dir.",
                 path.display()
             )
             .into(),

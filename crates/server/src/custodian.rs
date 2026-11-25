@@ -315,6 +315,18 @@ pub async fn live_reconstruction_view(
     (fleet, topology, unreachable)
 }
 
+/// The fleet a looping custodian role runs over, when it has one (#625): the D servers
+/// [`connect_fleet`] reached, the number the operator wired (GC's whole-fleet gate compares the
+/// two), and GC's expired-pending policy — the inputs [`CustodianService::run_reconstruction_until`]
+/// documents. The role's interval driver takes `None` for a role with no `--endpoints`, and
+/// then runs only the multipart reaper's step.
+#[derive(Clone, Copy)]
+struct FleetPlane<'a> {
+    configured: &'a [ConfiguredDServer],
+    operator_fleet_size: usize,
+    expired_pending: ExpiredPendingPolicy,
+}
+
 /// A running custodian role: it owns the durability-plane [`DurabilityTelemetry`] handle
 /// and drives the fenced reconciliation loop with that handle's metrics bridge installed,
 /// so the durability metrics a pass emits are captured by this role's provider and
@@ -451,10 +463,11 @@ impl CustodianService {
     }
 
     /// **One multipart reaper pass** over `meta` — the operator one-shot `wyrd custodian
-    /// --reap-abandoned-uploads` (#625): exactly one fenced [`Self::reconcile_pass`] carrying the
-    /// reaper and nothing else, so [`reconcile_step`] runs the reaper and then the retirement
-    /// leg **record-only** — the same pass the deployed loop dispatches, through the same fenced
-    /// control point (the anti-#141 rule), minus the loops that need a fleet (scrub,
+    /// --reap-abandoned-uploads` (#625), and the one pass the ordinary role runs before it fails
+    /// on a fleet none of whose servers was reachable at startup: exactly one fenced
+    /// [`Self::reaper_pass`] with no fleet, so [`reconcile_step`] runs the reaper and then the
+    /// retirement leg **record-only** — the same pass the deployed loop dispatches, through the
+    /// same fenced control point (the anti-#141 rule), minus the loops that need a fleet (scrub,
     /// reconstruction, GC). It needs no `--endpoints`: nothing here lists or touches a D server,
     /// and the drain retires nothing by chunk id without one.
     ///
@@ -472,23 +485,78 @@ impl CustodianService {
     {
         let clock = LoopClock::new(clock);
         let policy = ReaperPolicy::default();
+        self.reaper_pass(zone, custodian, meta, &clock, &policy, None)
+            .await
+    }
+
+    /// **The reaper's interval step** — the one dispatch of the multipart reaper that every shape
+    /// of the custodian role runs (#625; 0016 `:234-268`: the actor that drives an abandoned
+    /// upload out exists wherever the custodian role runs). One fenced [`Self::reconcile_pass`]
+    /// carrying the reaper and, when the caller has a fleet, its `reconstruction` input:
+    ///
+    /// * the fleet loop ([`Self::run_reconstruction_until`]) hands its reconstruction context, so
+    ///   the retirement leg after the reaper sees the live fleet and the operator's fleet size
+    ///   (its by-chunk-id retirement keeps its own whole-fleet gate). It runs on whatever part of
+    ///   the fleet is reachable, never behind GC's whole-fleet gate;
+    /// * a role with no fleet — no `--endpoints` ([`Self::run_reaper_until`]), none reachable at
+    ///   startup, or the operator one-shot ([`Self::reap_abandoned_uploads_once`]) — hands `None`,
+    ///   so `reconcile_step` runs the retirement leg **record-only**.
+    ///
+    /// `clock` is the caller's one `LoopClock`: the reaper's judgment, the drain's marks and the
+    /// pass's `now_millis` all read it (ADR-0009). It is the deployment wall clock the gateway
+    /// stamps sessions from, so the reaper's `clock_source` is `wall`.
+    async fn reaper_pass<F>(
+        &self,
+        zone: &FencedZone,
+        custodian: &Custodian,
+        meta: &dyn MetadataStore,
+        clock: &LoopClock<F>,
+        policy: &ReaperPolicy,
+        reconstruction: Option<&ReconstructionContext<'_>>,
+    ) -> Result<Reconciled, ReconcileError>
+    where
+        F: FnMut() -> u64 + Send,
+    {
         let reaper = ReaperContext {
             meta,
-            clock: &clock,
+            clock,
             clock_source: WALL_CLOCK_SOURCE,
-            policy: &policy,
+            policy,
         };
         self.reconcile_pass(
             zone,
             custodian,
             None,
             None,
-            None,
+            reconstruction,
             None,
             Some(&reaper),
             clock.now_millis(),
         )
         .await
+    }
+
+    /// The run loop of the custodian role started with **no `--endpoints`** (#625): the role's one
+    /// interval driver ([`Self::run_until`]) with no fleet, so each interval is the multipart
+    /// reaper's step alone ([`Self::reaper_pass`]), record-only, until `shutdown`. The reaper
+    /// reads and writes metadata alone, so a role with no fleet still has this work; before it
+    /// that role exited at once, and an upload whose client walked away kept its records and its
+    /// admission slot for good. Nothing here probes, scrubs, reconstructs or collects.
+    pub async fn run_reaper_until<Fut, Clock>(
+        &self,
+        zone: &FencedZone,
+        custodian: &Custodian,
+        meta: &dyn MetadataStore,
+        interval: Duration,
+        clock: Clock,
+        shutdown: Fut,
+    ) -> Result<(), ReconcileError>
+    where
+        Fut: Future<Output = ()>,
+        Clock: FnMut() -> u64 + Send,
+    {
+        self.run_until(zone, custodian, meta, None, interval, clock, shutdown)
+            .await
     }
 
     /// The deployable **reconstruction run loop** — the spine the `wyrd custodian` binary
@@ -561,6 +629,9 @@ impl CustodianService {
     /// operator's explicit `--gc-expired-pending` attestation (no writers on this backend)
     /// until the #490 lease-liveness work makes every stamp live. Orphan reclamation — the
     /// #554 headline — is unaffected either way.
+    ///
+    /// The loop is the role's one interval driver ([`Self::run_until`]), the same one the role
+    /// with no `--endpoints` runs ([`Self::run_reaper_until`]).
     #[allow(clippy::too_many_arguments)]
     pub async fn run_reconstruction_until<Fut, Clock>(
         &self,
@@ -578,7 +649,72 @@ impl CustodianService {
         Fut: Future<Output = ()>,
         Clock: FnMut() -> u64 + Send,
     {
+        let plane = FleetPlane {
+            configured,
+            operator_fleet_size,
+            expired_pending,
+        };
+        self.run_until(
+            zone,
+            custodian,
+            meta,
+            Some(plane),
+            interval,
+            clock,
+            shutdown,
+        )
+        .await
+    }
+
+    /// **The custodian role's one interval driver** (#625): every looping shape of `wyrd
+    /// custodian` runs it, and the multipart reaper runs in every interval it drives, whatever the
+    /// fleet (0016 `:234-268`: the actor that drives an abandoned upload out exists wherever the
+    /// custodian role runs).
+    ///
+    /// * **With a fleet** ([`Self::run_reconstruction_until`]): the passes that doc lists — scrub,
+    ///   reconstruction with the reaper's step ([`Self::reaper_pass`]) riding it, then GC behind
+    ///   its whole-fleet gate. The reaper runs on whatever part of the fleet is reachable.
+    /// * **With none** ([`Self::run_reaper_until`]): the reaper's step alone, record-only.
+    ///
+    /// The first interval runs at once and each later one `interval` after the one before it
+    /// ended. `shutdown` is polled once before the first pass, and then only between two
+    /// intervals, never during one: a pass, once started, runs to its end, and a stop requested
+    /// while it runs — the first pass included — ends the loop once that pass is done. The poll
+    /// before the first pass is what registers a stop that registers itself on its first poll, as
+    /// `tokio::signal::ctrl_c()`, the role's stop, does: polled only after the first pass, it
+    /// left SIGINT at its default action through that pass, and a Ctrl-C then killed the process
+    /// mid-pass. Between two intervals the stop is looked at before the interval's timer, so a
+    /// stop that is ready when the timer falls due — raised as the loop's wait ran out, or under
+    /// an `interval` of zero — ends the loop there, and no further pass starts. What bounds a
+    /// pass is the work it may do — the reaper's and the drain's per-pass budgets — and, on TiKV
+    /// and FoundationDB, each store call's own operation deadline in the adapter; on redb each
+    /// call is a synchronous local-disk call. A [`ReconcileError::Store`] degrades one interval
+    /// and is logged; a [`ReconcileError::Fenced`] (a newer term holds the zone) stops the loop.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_until<Fut, Clock>(
+        &self,
+        zone: &FencedZone,
+        custodian: &Custodian,
+        meta: &dyn MetadataStore,
+        plane: Option<FleetPlane<'_>>,
+        interval: Duration,
+        clock: Clock,
+        shutdown: Fut,
+    ) -> Result<(), ReconcileError>
+    where
+        Fut: Future<Output = ()>,
+        Clock: FnMut() -> u64 + Send,
+    {
         tokio::pin!(shutdown);
+        // Armed before the first pass. This poll registers whatever the stop waits on — the
+        // role's `ctrl_c()` installs its SIGINT handler here — so a stop raised during the first
+        // pass is held until that pass ends, as during any later one, instead of finding SIGINT
+        // still at its default action, which kills the process mid-pass. A stop already requested
+        // at this poll is honoured after the first pass; a finished future is never polled again.
+        let stop_requested = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(shutdown.as_mut().poll(cx).is_ready())
+        })
+        .await;
         // The caller's clock, moved into the one `LoopClock` every pass reads: each pass's
         // `now_millis` below and `ReconstructionContext::clock` are two views of this one source,
         // never a wall clock beside a logical one. The staged re-place reads the context's field
@@ -588,7 +724,50 @@ impl CustodianService {
         // The multipart reaper's windows and profile: the defaults, with no CLI flag (#625). Its
         // tombstone input is the one the retirement leg reads below.
         let policy = ReaperPolicy::default();
+        let mut first_interval = true;
         loop {
+            // The loop's one wait, for both shapes: between two intervals, never inside one. The
+            // runtime's timer only paces the passes; no judgment reads it (ADR-0009).
+            if !first_interval {
+                if stop_requested {
+                    return Ok(());
+                }
+                // `biased`, the stop first: when the stop and the timer are both ready at one
+                // poll — a Ctrl-C that landed as the interval ran out — the stop wins, every
+                // time. Unbiased, `select!` picks between two ready branches at random, and
+                // would start another pass after a stop it could already see about half the time.
+                tokio::select! {
+                    biased;
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tokio::time::sleep(interval) => {}
+                }
+            }
+            first_interval = false;
+            let Some(FleetPlane {
+                configured,
+                operator_fleet_size,
+                expired_pending,
+            }) = plane
+            else {
+                // No fleet: the reaper's step alone. `None` for the reconstruction input makes
+                // `reconcile_step` run the retirement leg record-only, from the reaper's own
+                // store, clock and tombstone input.
+                match self
+                    .reaper_pass(zone, custodian, meta, &clock, &policy, None)
+                    .await
+                {
+                    // A hold or a refused profile check is named on the audit seam by the pass.
+                    Ok(_) => {}
+                    Err(e @ ReconcileError::Fenced(_)) => return Err(e),
+                    Err(ReconcileError::Store(e)) => {
+                        eprintln!(
+                            "wyrd custodian: multipart reaper pass failed (retrying next \
+                             interval): {e}"
+                        );
+                    }
+                }
+                continue;
+            };
             let (fleet, topology, unreachable) = live_reconstruction_view(configured).await;
             // DERIVE this pass's repair obligations from the committed (gateway-written)
             // placement rather than only draining ones some other producer already enqueued.
@@ -627,16 +806,6 @@ impl CustodianService {
                 // slot.
                 tombstone: policy.tombstone(),
             };
-            // The multipart reaper rides the reconstruction pass below, through the same fenced
-            // control point: it fences abandoned and over-age `Open` sessions, and the same
-            // step's retirement leg drains them. Its judgment reads the loop's one clock, the
-            // source `ctx.clock` and every pass's `now_millis` read (ADR-0009), stamped `wall`.
-            let reaper = ReaperContext {
-                meta,
-                clock: &clock,
-                clock_source: WALL_CLOCK_SOURCE,
-                policy: &policy,
-            };
             // Scrub and reconstruction run as TWO passes, not one. `reconcile_step` short-
             // circuits on the first loop's error (scrub's `?`), so a combined pass would let a
             // transient scrub fault — a reachable node erroring on a single `get_fragment` —
@@ -668,18 +837,14 @@ impl CustodianService {
             }
             // Reconstruction pass — drains the shared repair queue (what scrub just enqueued
             // plus any prior backlog), independent of a scrub blip — then the reaper and the
-            // retirement leg.
+            // retirement leg: the reaper's interval step ([`Self::reaper_pass`]), the one this
+            // loop runs alone with no fleet, here handed this pass's reconstruction context. It
+            // fences abandoned and over-age `Open` sessions and the same step's retirement leg
+            // drains them, on whatever part of the fleet is reachable — never behind the GC gate
+            // below. Its judgment reads the loop's one clock, the source `ctx.clock` and every
+            // pass's `now_millis` read (ADR-0009), stamped `wall`.
             match self
-                .reconcile_pass(
-                    zone,
-                    custodian,
-                    None,
-                    None,
-                    Some(&ctx),
-                    None,
-                    Some(&reaper),
-                    clock.now_millis(),
-                )
+                .reaper_pass(zone, custodian, meta, &clock, &policy, Some(&ctx))
                 .await
             {
                 Ok(_) => {}
@@ -791,10 +956,6 @@ impl CustodianService {
                     fleet.len(),
                     operator_fleet_size,
                 );
-            }
-            tokio::select! {
-                _ = &mut shutdown => return Ok(()),
-                _ = tokio::time::sleep(interval) => {}
             }
         }
     }
