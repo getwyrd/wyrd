@@ -127,9 +127,24 @@ impl MetadataStore for MemMeta {
 }
 
 /// One D server's fragments, holding the **real** stored bytes so checksums verify.
-#[derive(Default)]
+///
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// server's own clock — which the pass reads too ([`run`] hands the destination's clock to the
+/// context, ADR-0009): refused at or past its deadline before anything is stored
+/// (`WriteDeadlineExpired::if_elapsed`), and refused certification if that clock reads at or past
+/// it once the bytes are stored (`WriteDeadlineExpired::if_publication_unverified`).
 struct MemDServer {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
+}
+
+impl Default for MemDServer {
+    fn default() -> Self {
+        Self {
+            frags: Mutex::default(),
+            clock: wyrd_testkit::ManualClock::new(NOW),
+        }
+    }
 }
 
 #[async_trait]
@@ -138,9 +153,24 @@ impl ChunkStore for MemDServer {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
         self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
 
@@ -418,8 +448,9 @@ async fn run(
         fleet: &fleet,
         topology: &topology,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(NOW),
-        staged_write_window_millis: 0,
+        // The destination's own clock: the one the D server judges the move's deadline on.
+        clock: &d2.clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -429,7 +460,7 @@ async fn run(
         .with_writer(capture.clone());
     meta.inode_scans.store(0, Ordering::SeqCst);
     meta.seg_pages.store(0, Ordering::SeqCst);
-    let outcome = reconcile_step(&zone, &leader, None, None, Some(&ctx), None, NOW)
+    let outcome = reconcile_step(&zone, &leader, None, None, Some(&ctx), None, None, NOW)
         .with_subscriber(tracing::Dispatch::new(
             tracing_subscriber::registry().with(layer),
         ))
@@ -612,8 +643,9 @@ async fn the_committed_namespace_is_read_once_per_pass() {
 
     assert_eq!(
         outcome.expect("the pass completes over a store with a segmented object"),
-        Reconciled::Changed,
-        "the repairs landed: {logged}"
+        Reconciled::Blocked,
+        "three repairs inside the one object lost the CAS the first one's repoint superseded: \
+         they are still owed, so the pass does not certify (#1084): {logged}"
     );
     assert_eq!(
         meta.counts(),

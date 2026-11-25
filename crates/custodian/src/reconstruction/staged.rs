@@ -84,13 +84,13 @@
 //! not certified ([`Assessment::Withheld`]). A destination position whose mark will not decode,
 //! or is already `reclaiming`, is never written: another position is chosen.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use wyrd_core::metadata::{
     self, decode_orphan_mark, encode_orphan_mark, orphan_key, EcScheme, OrphanMark,
 };
 use wyrd_core::multipart::{decode_part_record, decode_session_record, PartRecord, SessionState};
-use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain};
 use wyrd_core::write::encode_ec_fragment;
 use wyrd_core::{erasure, repair};
 use wyrd_traits::{
@@ -103,6 +103,7 @@ use super::{
 };
 use crate::desired_state::desired_key;
 use crate::gc::{object_name, staged_fragments_observing, StagedSet, W_REPOINT_MILLIS};
+use crate::premark::{self, Candidate, DestinationMark};
 
 /// This pass's reading of the staged classes: the protection class every staged reader shares,
 /// and, for each chunk the pass owes a repair on, the committed part record that names it — both
@@ -174,17 +175,6 @@ struct Destination {
     vacated: VacatedMark,
 }
 
-/// The `orphan:` mark at a destination position, as read.
-#[derive(Clone)]
-enum DestinationMark {
-    /// No mark: the pre-mark is written under `require_absent`.
-    Absent,
-    /// A legacy or structured mark from another unreference event — an earlier move's pre-mark
-    /// included. Re-stamped fresh, never reused with its old stamp, under a precondition on these
-    /// exact bytes.
-    Stamped(Vec<u8>),
-}
-
 /// The `orphan:` mark at a position the move vacates, as read.
 enum VacatedMark {
     /// No mark: the adoption writes one, under `require_absent`.
@@ -196,12 +186,6 @@ enum VacatedMark {
     /// mark (`metadata::OrphanMark`), and none needs to: it already evidences the vacated bytes,
     /// and GC finishes the reclaim.
     Reclaiming,
-}
-
-/// A server a rebuilt fragment of the chunk may go to ([`candidate`]).
-struct Candidate {
-    dserver: DServerId,
-    domain: FailureDomain,
 }
 
 /// Read this pass's [`StagedReading`] for `queue`, through the one staged walk
@@ -330,12 +314,12 @@ pub(super) async fn assess(
             },
         });
     }
-    let Some(chosen) = choose_destinations(
-        ctx,
-        stores,
-        chunk,
-        &gathered.missing,
+    let admission = StagedAdmission { ctx, stores, chunk };
+    let Some(chosen) = premark::choose(
+        ctx.topology,
         &gathered.survivor_domains,
+        &gathered.missing,
+        &admission,
     )
     .await?
     else {
@@ -370,156 +354,39 @@ pub(super) async fn assess(
         k,
         m,
         survivors: gathered.survivors,
-        survivor_domains: gathered.survivor_domains,
         missing: gathered.missing,
         placement: chunk_ref.placement.clone(),
         len: chunk_ref.len as usize,
     }))))
 }
 
-/// The positions a choice of destinations has read, keyed by `(server, fragment index)`:
-/// `Some(mark)` for one it may use, `None` for one it may not.
-type Positions = HashMap<(DServerId, usize), Option<DestinationMark>>;
-
-/// Choose a destination for each `missing` fragment — `(fragment index, server, the mark at that
-/// position)`, in `missing` order: servers in failure domains distinct from each other and from
-/// `survivor_domains` (the committed path's selector), each at a position it may take — or `None`
-/// when no such choice exists.
-///
-/// **A position is ruled out, not its server.** Whether a server may hold any fragment of this
-/// chunk is one fact ([`candidate`]: in this pass's fleet, fenced by no desired-state record);
-/// whether it may hold fragment `i` is another ([`position`]: the mark at that position). A mark
-/// that forbids one position leaves the server free to take another of the chunk's missing
-/// fragments, so a chunk missing several fragments is never blocked by one bad position while a
-/// valid assignment exists: the servers swap fragments instead.
-///
-/// The servers considered start as the selector's own pick for all the missing fragments at once
-/// — the committed path's choice, and the answer whenever every position is usable — and grow one
-/// server at a time, in the selector's order, only while no assignment exists over them.
-/// [`assign`] finds an assignment over the positions read usable and those not read yet; each
-/// unread position it relies on is then read, and one ruled out sends it round again. Every round
-/// either considers a new server or reads a new position, of finitely many, so the choice ends.
-///
-/// Each read's await is bounded as every custodian read is, by the `MetadataStore`
-/// implementation's own network bound (#508/#636); a fault fails the pass before anything is
-/// written.
-async fn choose_destinations(
-    ctx: &ReconstructionContext<'_>,
-    stores: &HashMap<DServerId, &dyn ChunkStore>,
+/// What the staged re-place admits as a destination ([`premark::Admission`]): a server in this
+/// pass's fleet, fenced by no desired-state record ([`candidate`]), at a position whose mark
+/// allows a write ([`position`]). The choice itself is the one every move of a chunk's fragments
+/// makes ([`premark::choose`]): a position ruled out never rules out its server, so a chunk
+/// missing several fragments is never blocked by one bad position while a valid assignment
+/// exists — the servers swap fragments instead.
+struct StagedAdmission<'a, 'c> {
+    ctx: &'a ReconstructionContext<'c>,
+    stores: &'a HashMap<DServerId, &'a dyn ChunkStore>,
     chunk: ChunkId,
-    missing: &[usize],
-    survivor_domains: &[FailureDomain],
-) -> Result<Option<Vec<(usize, DServerId, DestinationMark)>>> {
-    let mut considered = BTreeSet::new();
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut positions = Positions::new();
-    loop {
-        let Some(assignment) = assign(missing, &candidates, &positions) else {
-            // No assignment even with every unread position usable: consider more servers — the
-            // selector's pick for every missing fragment first, then one at a time.
-            let want = if considered.is_empty() {
-                missing.len()
-            } else {
-                1
-            };
-            let view = ctx.topology.excluding(&considered);
-            let Ok(picked) =
-                select_distinct_domains_excluding(&view, want as u16, survivor_domains)
-            else {
-                return Ok(None);
-            };
-            for dserver in picked {
-                considered.insert(dserver);
-                if let Some(usable) = candidate(ctx, stores, chunk, dserver).await? {
-                    candidates.push(usable);
-                }
-            }
-            continue;
-        };
-        let mut chosen = Vec::with_capacity(missing.len());
-        for (&index, &at) in missing.iter().zip(&assignment) {
-            let dserver = candidates[at].dserver;
-            let mark = match positions.get(&(dserver, index)) {
-                Some(read) => read.clone(),
-                None => {
-                    let read = position(ctx, chunk, dserver, index).await?;
-                    positions.insert((dserver, index), read.clone());
-                    read
-                }
-            };
-            if let Some(mark) = mark {
-                chosen.push((index, dserver, mark));
-            }
-        }
-        // Complete only if no position read just now ruled itself out; otherwise choose again
-        // without it.
-        if chosen.len() == missing.len() {
-            return Ok(Some(chosen));
-        }
-    }
 }
 
-/// An assignment of each `missing` fragment, by its slot, to one of `candidates`, by its index: in
-/// failure domains distinct from each other, at no position `positions` has ruled out — or `None`
-/// when none exists. Slot by slot, a free domain is taken in the order the candidates were
-/// considered, so while every position is usable fragment `i` goes to the selector's `i`-th pick,
-/// as on the committed path; a domain another slot holds is taken only if that slot can move
-/// (an augmenting path — Kuhn's bipartite matching, slots against domains).
-fn assign(
-    missing: &[usize],
-    candidates: &[Candidate],
-    positions: &Positions,
-) -> Option<Vec<usize>> {
-    let mut held: HashMap<&FailureDomain, (usize, usize)> = HashMap::new();
-    for slot in 0..missing.len() {
-        let mut visited = HashSet::new();
-        if !augment(
-            slot,
-            missing,
-            candidates,
-            positions,
-            &mut held,
-            &mut visited,
-        ) {
-            return None;
-        }
+impl premark::Admission for StagedAdmission<'_, '_> {
+    fn candidate(
+        &self,
+        dserver: DServerId,
+    ) -> impl Future<Output = Result<Option<Candidate>>> + Send {
+        candidate(self.ctx, self.stores, self.chunk, dserver)
     }
-    let mut assignment = vec![0; missing.len()];
-    for &(slot, at) in held.values() {
-        assignment[slot] = at;
-    }
-    Some(assignment)
-}
 
-/// Give `slot` a domain: a free one if a candidate offers it at a usable position, else one whose
-/// holder can move to another (see [`assign`]).
-fn augment<'c>(
-    slot: usize,
-    missing: &[usize],
-    candidates: &'c [Candidate],
-    positions: &Positions,
-    held: &mut HashMap<&'c FailureDomain, (usize, usize)>,
-    visited: &mut HashSet<&'c FailureDomain>,
-) -> bool {
-    for displace in [false, true] {
-        for (at, candidate) in candidates.iter().enumerate() {
-            let ruled_out = matches!(
-                positions.get(&(candidate.dserver, missing[slot])),
-                Some(None)
-            );
-            let holder = held.get(&candidate.domain).map(|&(holder, _)| holder);
-            if ruled_out || holder.is_some() != displace || !visited.insert(&candidate.domain) {
-                continue;
-            }
-            if holder
-                .is_none_or(|holder| augment(holder, missing, candidates, positions, held, visited))
-            {
-                held.insert(&candidate.domain, (slot, at));
-                return true;
-            }
-        }
+    fn position(
+        &self,
+        dserver: DServerId,
+        index: usize,
+    ) -> impl Future<Output = Result<Option<DestinationMark>>> + Send {
+        position(self.ctx, self.chunk, dserver, index)
     }
-    false
 }
 
 /// `dserver` as a server a rebuilt fragment of `chunk` may go to, or `None` when it may take none:
@@ -560,21 +427,28 @@ async fn position(
     dserver: DServerId,
     index: usize,
 ) -> Result<Option<DestinationMark>> {
-    let key = orphan_key(dserver, fragment(chunk, index));
-    Ok(match ctx.meta.get(&key).await? {
-        None => Some(DestinationMark::Absent),
-        Some(current) => match decode_orphan_mark(&current) {
-            Ok(mark) if mark.is_reclaiming() => {
-                emit_passed_over(chunk, &object_name(&key), "reclaiming");
+    let frag = fragment(chunk, index);
+    Ok(
+        match premark::destination_mark(ctx.meta, dserver, frag).await? {
+            Ok(mark) => Some(mark),
+            Err(premark::Unusable::Reclaiming) => {
+                emit_passed_over(
+                    chunk,
+                    &object_name(&orphan_key(dserver, frag)),
+                    "reclaiming",
+                );
                 None
             }
-            Ok(_) => Some(DestinationMark::Stamped(current.to_vec())),
-            Err(fault) => {
-                emit_unreadable_destination(chunk, &object_name(&key), &fault.to_string());
+            Err(premark::Unusable::Unreadable(fault)) => {
+                emit_unreadable_destination(
+                    chunk,
+                    &object_name(&orphan_key(dserver, frag)),
+                    &fault,
+                );
                 None
             }
         },
-    })
+    )
 }
 
 /// Re-place `plan`'s missing fragment(s) of a committed part's chunk: rebuild, pre-mark each
@@ -586,9 +460,10 @@ async fn position(
 /// [`RepairOutcome::Aborted`] when the move stopped before it could adopt anything and is simply
 /// started again next pass — a pre-mark that lost its precondition, a pre-mark `W_repoint` old
 /// before a write was authorized, a write the D server refused past its deadline or could not
-/// certify; [`RepairOutcome::Conflict`] when the adoption lost; [`RepairOutcome::Refused`] when
-/// the repointed part record would cross the value ceiling. A store fault fails the pass, as on
-/// the committed path; every pre-mark already written covers whatever landed.
+/// certify; [`RepairOutcome::Conflict`] when the adoption lost, which the pass does not certify
+/// over, as for a committed repair; [`RepairOutcome::Refused`] when the repointed part record
+/// would cross the value ceiling. A store fault fails the pass, as on the committed path; every
+/// pre-mark already written covers whatever landed.
 pub(super) async fn repair(
     ctx: &ReconstructionContext<'_>,
     stores: &HashMap<DServerId, &dyn ChunkStore>,

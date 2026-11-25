@@ -476,7 +476,7 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         meta: &meta,
         fleet: &scrub_fleet,
     };
-    let scrub_outcome = reconcile_step(&zone, &leader, None, Some(&scrub_ctx), None, None, 0)
+    let scrub_outcome = reconcile_step(&zone, &leader, None, Some(&scrub_ctx), None, None, None, 0)
         .await
         .expect(
             "scrub reconcile_step must succeed: d1's IntegrityFault is a permanent fault that \
@@ -573,19 +573,32 @@ async fn disk_fault_drives_custodian_to_full_redundancy_with_no_read_errors() {
         .register(3, "D");
 
     let recon_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
+    // The D servers judge the repair's write deadline on the wall clock — the deployment clock
+    // `FsChunkStore::open` reads — so the pass reads that one clock too (ADR-0009), with the
+    // deployed write window: a deadline fixed from a logical stamp would be long past.
+    let pass_clock = wyrd_testkit::SystemClock;
     let recon_ctx = ReconstructionContext {
         meta: &meta,
         fleet: &recon_fleet,
         topology: &recon_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(1_000),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: recon_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
 
-    let recon_result =
-        reconcile_step(&zone, &leader, None, None, Some(&recon_ctx), None, 1_000).await;
+    let recon_result = reconcile_step(
+        &zone,
+        &leader,
+        None,
+        None,
+        Some(&recon_ctx),
+        None,
+        None,
+        wyrd_testkit::Clock::now_millis(&pass_clock),
+    )
+    .await;
 
     // The reconcile_step must succeed: EIO on d1 must be classified as a permanent
     // read fault via is_permanent_read_fault (issue #251) and read around — NOT

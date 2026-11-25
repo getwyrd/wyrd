@@ -80,8 +80,12 @@ impl MetadataStore for MemMeta {
         if checks.any(|pre| kv.get(&pre.key).cloned() != pre.expected) {
             return Ok(CommitOutcome::Conflict);
         }
-        assert!(batch.deletes.is_empty(), "no leg deletes metadata");
+        // The only metadata a move deletes is its own destination pre-mark, in the commit that
+        // adopts it (`crate::premark` in the custodian): applied like any other mutation.
         kv.extend(batch.puts);
+        for key in batch.deletes {
+            kv.remove(&key);
+        }
         Ok(CommitOutcome::Committed)
     }
 }
@@ -89,8 +93,26 @@ impl MetadataStore for MemMeta {
 /// One D server's fragment bytes — a dumb `ChunkStore` holding REAL v1 fragments, so an
 /// evacuation that reaches the copy finds an intact one (`repair::fragment_intact`) and really
 /// commits.
-#[derive(Default)]
-struct MemDServer(Mutex<HashMap<FragmentId, Bytes>>);
+///
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// clock the pass that sends it reads — the context's clock, one source (ADR-0009): refused at or
+/// past its deadline before anything is stored (`WriteDeadlineExpired::if_elapsed`), and refused
+/// certification if that clock reads at or past it once the bytes are stored
+/// (`WriteDeadlineExpired::if_publication_unverified`).
+struct MemDServer {
+    frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
+}
+
+impl MemDServer {
+    /// A D server judging deadlines on `clock`, the one the rebalance pass reads.
+    fn on(clock: &wyrd_testkit::ManualClock) -> Self {
+        Self {
+            frags: Mutex::default(),
+            clock: clock.clone(),
+        }
+    }
+}
 
 #[async_trait]
 impl ChunkStore for MemDServer {
@@ -98,19 +120,34 @@ impl ChunkStore for MemDServer {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
-        self.0.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
+        self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
     async fn get_fragment(&self, id: FragmentId) -> Result<Option<Bytes>> {
-        Ok(self.0.lock().unwrap().get(&id).cloned())
+        Ok(self.frags.lock().unwrap().get(&id).cloned())
     }
     async fn list_fragments(&self) -> Result<Vec<FragmentId>> {
-        Ok(self.0.lock().unwrap().keys().copied().collect())
+        Ok(self.frags.lock().unwrap().keys().copied().collect())
     }
     async fn delete_fragment(&self, id: FragmentId) -> Result<()> {
-        self.0.lock().unwrap().remove(&id);
+        self.frags.lock().unwrap().remove(&id);
         Ok(())
     }
     async fn health(&self) -> Result<Health> {
@@ -168,6 +205,8 @@ struct Fixture {
     meta: MemMeta,
     d: [MemDServer; 3],
     topology: Topology,
+    /// The one clock the pass and every D server read (ADR-0009).
+    clock: wyrd_testkit::ManualClock,
 }
 
 impl Fixture {
@@ -177,8 +216,14 @@ impl Fixture {
         set_lifecycle(&meta, DRAINING, Draining).await.unwrap();
         let mut topology = Topology::default();
         topology.register(0, "A").register(1, "B").register(2, "C");
-        let d = Default::default();
-        Self { meta, d, topology }
+        let clock = wyrd_testkit::ManualClock::new(10_000);
+        let d = [0, 1, 2].map(|_| MemDServer::on(&clock));
+        Self {
+            meta,
+            d,
+            topology,
+            clock,
+        }
     }
 
     /// ONE pass through the real fenced control point, its audit stream captured — into a
@@ -199,6 +244,8 @@ impl Fixture {
             meta: &self.meta,
             fleet: &fleet,
             topology: &self.topology,
+            clock: &self.clock,
+            write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         };
         let coord = MemCoordination::new();
         let leader = Custodian::elect(&coord, "zone-696").await.unwrap();
@@ -208,7 +255,7 @@ impl Fixture {
         let json = tracing_subscriber::fmt::layer().json();
         let layer = json.with_writer(Arc::new(audit.reopen().unwrap()));
         let logging = tracing::Dispatch::new(tracing_subscriber::registry().with(layer));
-        let step = reconcile_step(&zone, &leader, None, None, None, Some(&ctx), 10_000);
+        let step = reconcile_step(&zone, &leader, None, None, None, Some(&ctx), None, 10_000);
         let answer = step.with_subscriber(logging).await;
         (answer, std::fs::read_to_string(audit.path()).unwrap())
     }

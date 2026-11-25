@@ -24,9 +24,11 @@
 //! **Reaching the race window:** the resolver reads a group's `seg:` range with `scan_page`,
 //! never `get`; the move's own read is the only `get` on a `seg:` key. So [`MemMeta`] lands a
 //! racing batch **after the resolver's page** (or, for leg 5b, on that `get` itself, once the
-//! resolve has finished), and leg 11 faults that `get`. A root flip lands
-//! **on the way into `commit`**. These are scripted interleavings; the seeded Tier-0 DST
-//! property for the move (repoint versus supersede) is deferred: #682.
+//! resolve has finished), and leg 11 faults that `get`. A root flip lands **on the way into the
+//! adoption** — the commit that rewrites the placement record, after the move's destination
+//! pre-mark and its fragment write (#1084), so the leg shows an adoption losing to a supersede
+//! after the bytes landed. These are scripted interleavings; the seeded Tier-0 DST property for
+//! the move (repoint versus supersede) is deferred: #682.
 
 #![forbid(unsafe_code)]
 
@@ -62,7 +64,9 @@ enum Race {
     /// After the resolver's bounded `seg:` page is materialised: the plan is built from the
     /// pre-race bytes, and the move's own `get` sees the race.
     AfterSegmentPage,
-    /// On the way into a commit, after the resolve (a root moving *during* it restarts it).
+    /// On the way into the move's adoption — the commit that rewrites a placement record — after
+    /// the resolve (a root moving *during* it restarts it), the destination pre-mark and the
+    /// fragment write.
     IntoCommit,
     /// On the move's own `get` of a `seg:` key, before answering it: after the resolve has
     /// finished, so the plan holds the generation the race then supersedes.
@@ -139,7 +143,13 @@ impl MetadataStore for MemMeta {
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
-        self.fire(Race::IntoCommit);
+        let adopts = batch
+            .puts
+            .iter()
+            .any(|(key, _)| key.starts_with(b"inode:") || key.starts_with(b"seg:"));
+        if adopts {
+            self.fire(Race::IntoCommit);
+        }
         let mut kv = self.kv.lock().unwrap();
         for pre in &batch.preconditions {
             if kv.get(&pre.key).cloned() != pre.expected {
@@ -157,9 +167,24 @@ impl MetadataStore for MemMeta {
 }
 
 /// One D server's fragments, holding the **real** stored bytes so checksums verify.
-#[derive(Default)]
+///
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// server's own clock — which the pass reads too ([`attempt`] hands the destination's clock to the
+/// context, ADR-0009): refused at or past its deadline before anything is stored
+/// (`WriteDeadlineExpired::if_elapsed`), and refused certification if that clock reads at or past
+/// it once the bytes are stored (`WriteDeadlineExpired::if_publication_unverified`).
 struct MemDServer {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
+}
+
+impl Default for MemDServer {
+    fn default() -> Self {
+        Self {
+            frags: Mutex::default(),
+            clock: wyrd_testkit::ManualClock::new(NOW),
+        }
+    }
 }
 
 #[async_trait]
@@ -168,9 +193,24 @@ impl ChunkStore for MemDServer {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
         self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
 
@@ -441,8 +481,9 @@ async fn attempt(
         fleet: &fleet,
         topology: &topology,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(NOW),
-        staged_write_window_millis: 0,
+        // The destination's own clock: the one the D server judges the move's deadline on.
+        clock: &free.1.clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -450,7 +491,7 @@ async fn attempt(
     let layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(capture.clone());
-    let outcome = reconcile_step(&fenced, &leader, None, None, Some(&ctx), None, NOW)
+    let outcome = reconcile_step(&fenced, &leader, None, None, Some(&ctx), None, None, NOW)
         .with_subscriber(tracing::Dispatch::new(
             tracing_subscriber::registry().with(layer),
         ))
@@ -474,7 +515,8 @@ fn rewritten(record: &SegmentRecord) -> (Vec<u8>, Bytes) {
 
 /// What a repair that LOST must leave behind: segment 1 holding exactly `record`, the obligation
 /// still queued, no orphan mark (only REPAIR-owned metadata: leg 4 writes a competing root) —
-/// and `Satisfied`, as the flat arm answers: a lost CAS is a retry, not a hole (2026-08-19).
+/// and `Blocked`, as the flat arm answers: a lost CAS is a retry the pass still owes, and a
+/// record that moved does not show this chunk was repaired, so the pass does not certify (#1084).
 /// The loss is counted as ONE conflict and no abort: an abort says the repair could not
 /// proceed, a different operator signal. Named negation: answer the lost race as an abort.
 async fn assert_lost(meta: &MemMeta, (outcome, logged): (Reconciled, String), record: &Bytes) {
@@ -496,8 +538,8 @@ async fn assert_lost(meta: &MemMeta, (outcome, logged): (Reconciled, String), re
     );
     assert_eq!(
         outcome,
-        Reconciled::Satisfied,
-        "a lost CAS is a retry, not a hole: the next pass re-plans onto the winner's bytes"
+        Reconciled::Blocked,
+        "a lost CAS certified: the repair is still queued, and nothing showed it is no longer owed"
     );
     assert_eq!(
         (ticks(&logged, "conflict"), ticks(&logged, "aborted")),
@@ -609,9 +651,11 @@ async fn a_racing_move_of_the_planned_chunk_itself_is_a_conflict() {
 
 // ---- leg 4: a superseded root generation is a conflict (not independently red) ----
 
-/// The root flips to a new generation after the resolve and before the commit. A supersede
-/// moves the root first (`0016:2452-2462`), so the move must lose rather than repoint a
-/// generation nothing references. Named negation: drop the root-generation pin.
+/// The root flips to a new generation after the resolve, the destination pre-mark and the
+/// fragment write, on the way into the adoption. A supersede moves the root first
+/// (`0016:2452-2462`), so the adoption must lose rather than repoint a generation nothing
+/// references — and the rebuilt fragment it wrote stays under its pre-mark, the one mark in the
+/// store, for GC to reclaim (#1084). Named negation: drop the root-generation pin.
 #[tokio::test]
 async fn a_superseded_root_generation_makes_the_repair_lose() {
     let (meta, d0, free) = fixture().await;
@@ -624,9 +668,38 @@ async fn a_superseded_root_generation_makes_the_repair_lose() {
     let root_key = metadata::inode_key(INODE);
     meta.arm(Race::IntoCommit, vec![(root_key, superseding.clone())]);
 
-    let answered = run(&meta, &d0, (FREE, &free)).await;
+    let (outcome, logged) = run(&meta, &d0, (FREE, &free)).await;
 
-    assert_lost(&meta, answered, &segment_before).await;
+    assert!(meta.raced(), "fixture: the race never landed");
+    let rebuilt = FragmentId {
+        chunk: CHUNK,
+        index: 1,
+    };
+    assert!(
+        free.get_fragment(rebuilt).await.unwrap().is_some(),
+        "the supersede landed before the fragment write, not after it"
+    );
+    assert_eq!(
+        orphans(&meta).await,
+        vec![metadata::orphan_key(FREE, rebuilt)],
+        "the written fragment is not under its pre-mark alone"
+    );
+    assert_eq!(
+        &segment(&meta, 1).await,
+        &segment_before,
+        "a lost adoption still rewrote the segment record"
+    );
+    assert_eq!(queued(&meta).await, vec![CHUNK], "the obligation is kept");
+    assert_eq!(
+        outcome,
+        Reconciled::Blocked,
+        "a lost CAS certified: the repair is still queued, and nothing showed it is no longer owed"
+    );
+    assert_eq!(
+        (ticks(&logged, "conflict"), ticks(&logged, "aborted")),
+        (1, 0),
+        "a lost race is ONE conflict, never relabelled an abort: {logged}"
+    );
     assert_eq!(
         root(&meta).await,
         superseding,
@@ -717,10 +790,11 @@ async fn a_repoint_one_byte_past_the_value_ceiling_is_refused() {
 /// move's own read — a new generation under a new group, the old `seg:` records left behind
 /// uncollected. The move weighs the retired record and refuses it with no root pin to lose;
 /// that refusal is a stale plan, not this object's defect, so the pass answers the lost race
-/// (`Satisfied`, one conflict) rather than a ceiling refusal that blocks it. Named negation:
-/// escalate the refusal without confirming the planned generation is still current.
+/// (one conflict, the repair still queued and not certified over) rather than a ceiling refusal
+/// that pages a human. Named negation: escalate the refusal without confirming the planned
+/// generation is still current.
 #[tokio::test]
-async fn a_ceiling_refusal_on_a_superseded_generation_is_a_conflict_not_a_block() {
+async fn a_ceiling_refusal_on_a_superseded_generation_is_a_conflict_not_a_ceiling_fault() {
     let growth = {
         let wide = metadata::encode(&segment_one(vec![SURVIVOR, HUGE], vec![SURVIVOR, LOST]));
         let seeded = metadata::encode(&segment_one(vec![SURVIVOR, LOST], vec![SURVIVOR, LOST]));
@@ -766,8 +840,8 @@ async fn a_ceiling_refusal_on_a_superseded_generation_is_a_conflict_not_a_block(
     );
     assert_eq!(
         outcome,
-        Reconciled::Satisfied,
-        "a stale plan is a retry, not a hole: {logged}"
+        Reconciled::Blocked,
+        "a stale plan certified over a repair still queued: {logged}"
     );
 }
 
@@ -781,7 +855,8 @@ const TORN: &[u8] = b"{not a segment record";
 /// the move's own read, and run one pass: the MOVE meets the damage. The object is contained
 /// exactly ONCE however many obligations meet it, nothing is written or drained, the pass does
 /// not certify, and each dispatched repair is offset as an abort. Named negations: answer the
-/// move's typed error as a conflict (`Satisfied`); drop the abort (a success that never was).
+/// move's typed error as a conflict (the object never named); drop the abort (a success that
+/// never was).
 async fn torn_under_the_move(owed: &[ChunkId]) {
     let (meta, d0, free) = <(MemMeta, MemDServer, MemDServer)>::default();
     seed(&meta, &metadata::inode_key(INODE), &records()).await;
@@ -798,7 +873,7 @@ async fn torn_under_the_move(owed: &[ChunkId]) {
     assert_eq!(
         outcome,
         Reconciled::Blocked,
-        "a record the move cannot rewrite is a hole, not a retry: {logged}"
+        "a record the move cannot rewrite is not certified over: {logged}"
     );
     assert_eq!(queued(&meta).await, owed, "every obligation is kept");
     assert_eq!(

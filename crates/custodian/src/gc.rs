@@ -252,15 +252,23 @@ pub const DELTA_CLOCK_MILLIS: u64 = 1_000;
 /// before its fragment lands there — the staged re-place (`crate::reconstruction`), flat
 /// pre-marking (#723) and multipart teardown — MUST refuse to authorize the write once its mark is
 /// [`W_REPOINT_MILLIS`] old, and MUST write with a deadline no later than [`W_WRITE_MILLIS`] after
-/// that authorization, which the D server enforces. The staged re-place is the one such writer on
-/// `main`: it checks its pre-mark's age once, then authorizes all of a move's writes together and
-/// sends each with the deadline `pre-mark stamp + W_WRITE_MILLIS`, earlier than any later
-/// authorization would fix.
+/// that authorization, which the D server enforces. Every move of a fragment on `main` is such a
+/// writer — the staged re-place, and the committed repair and evacuation (`crate::premark`): each
+/// checks its pre-mark's age once, then authorizes all of a move's writes together and sends each
+/// with the deadline `pre-mark stamp + W_WRITE_MILLIS`, earlier than any later authorization
+/// would fix. Each pre-mark is a structured mark naming its move, which the sweep leaves in place
+/// (below), and each move marks the position it vacates in the commit that repoints.
 /// Every other writer on `main` writes before it marks — unlink marks the placed positions of a
-/// committed map, and a map commits only after every fragment it names is acknowledged;
-/// reconstruction and rebalance write first, and mark only the positions they vacate, in the
-/// repoint commit — and the re-place's pre-mark is a structured mark naming its move, which the
-/// sweep leaves in place (below). So the sweep is sound against today's tree.
+/// committed map, and a map commits only after every fragment it names is acknowledged. So the
+/// sweep is sound against today's tree, with one exception, deferred: #1100. A committed repair
+/// that rebuilds a fragment **in place** — on the server its placement already names — writes
+/// with no mark ahead of it, the position staying named, and an unreference that reads its stamp
+/// after the move's pre-mark batch marks the position no earlier than that batch
+/// (`crate::premark`). The exception is any unreference whose mark is stamped before the in-place
+/// batch and commits after it — a gateway unlink or a flat overwrite that read its stamp before
+/// the batch, or a competing move of the same fragment whose adoption was built before it: the
+/// sweep may retire that mark before the in-place write lands, and the fragment is then left
+/// unreferenced and unmarked — bytes kept, never bytes lost.
 ///
 /// **`D` bounds acceptance, not effect, and the sweep relies on it only for marks written after
 /// their fragment.** A D server judges the deadline before it publishes, but the publishing step
@@ -860,13 +868,17 @@ impl<'p, 'a> Sweep<'p, 'a> {
     ///   reused, so the drain writes no mark for it after its obligation is gone, and nothing else
     ///   would ever delete one — over a fragment GC destroyed before the drain re-marked the
     ///   position, say, or one a compensated attempt never wrote (`0016:1406-1408`). The drain
-    ///   marks only after its obligation is installed, and only positions a record or list names:
-    ///   a fragment lands at a committed record's position before that record commits, so the one
-    ///   write that may still be unsettled there is a compensated attempt's, authorized before
-    ///   its compensation installed the obligation. Its deadline falls at most `W_write` after the
-    ///   mark's stamp, and the listing that licenses the delete at least `D - W_write` after that
-    ///   deadline. A publication that straddles its deadline by longer lands after the sweep and
-    ///   leaves its fragment unmarked, which GC keeps: bytes kept too long, never a fragment lost.
+    ///   marks only after its obligation is installed, and only positions a record or list names.
+    ///   A fragment lands at a committed record's position before that record commits — except
+    ///   one a committed repair rebuilds in place (`crate::premark`), written after the record it
+    ///   lands under committed, but authorized from a pre-mark batch that pinned that record's
+    ///   generation, so with a deadline at most `W_write` after a stamp no later than the drain's
+    ///   mark's. So a write that may still be unsettled there is a compensated attempt's,
+    ///   authorized before its compensation installed the obligation, or such an in-place
+    ///   repair's. Its deadline falls at most `W_write` after the mark's stamp, and the listing
+    ///   that licenses the delete at least `D - W_write` after that deadline. A publication that
+    ///   straddles its deadline by longer lands after the sweep and leaves its fragment unmarked,
+    ///   which GC keeps: bytes kept too long, never a fragment lost.
     /// - it is any other structured mark that is not `reclaiming` — one carrying an unreference
     ///   event (`event-may-await-write`). Such a mark may have been written **ahead of** its
     ///   fragment (a repoint's pre-mark, a teardown's planned placement), and `D` bounds when a

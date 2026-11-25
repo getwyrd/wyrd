@@ -397,9 +397,15 @@ impl MetadataStore for Meta {
 // ---- the D-server double and the fleet ----------------------------------------------------------
 
 /// One D server's fragments.
-#[derive(Default)]
+///
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// clock the fleet shares ([`disks`]) — the one every pass here reads ([`reconstruction_pass`],
+/// ADR-0009): refused at or past its deadline before anything is stored
+/// (`WriteDeadlineExpired::if_elapsed`), and refused certification if that clock reads at or past
+/// it once the bytes are stored (`WriteDeadlineExpired::if_publication_unverified`).
 struct Disk {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
 }
 
 #[async_trait]
@@ -408,9 +414,24 @@ impl ChunkStore for Disk {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
         self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
 
@@ -432,8 +453,13 @@ impl ChunkStore for Disk {
     }
 }
 
+/// Four D servers sharing one clock.
 fn disks() -> [Disk; 4] {
-    Default::default()
+    let clock = wyrd_testkit::ManualClock::new(NOW);
+    std::array::from_fn(|_| Disk {
+        frags: Mutex::default(),
+        clock: clock.clone(),
+    })
 }
 
 fn fleet(d: &[Disk; 4]) -> [(DServerId, &dyn ChunkStore); 4] {
@@ -493,7 +519,7 @@ async fn gc_pass(
         grace_window_millis: GRACE,
         expired_pending: ExpiredPendingPolicy::Defer,
     };
-    reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, now).await
+    reconcile_step(&zone, &custodian, Some(&ctx), None, None, None, None, now).await
 }
 
 /// One post-restore pass at [`NOW`].
@@ -521,10 +547,11 @@ fn four_domains() -> Topology {
 }
 
 /// One reconstruction pass through the fenced control point, at `now`. `clock` and
-/// `staged_write_window_millis` are the seam the staged re-place reads (#814); no leg here
-/// reaches a re-place — each keeps its obligation or drains it — but the clock still reads `now`
-/// itself, so the seam and the pass's own `now_millis` are one source (ADR-0009) — never a wall
-/// clock beside a fixed logical instant.
+/// `staged_write_window_millis` are the seam every move reads — the staged re-place (#814) and the
+/// committed repair (#1084); no leg here reaches a move — each keeps its obligation or drains it —
+/// but the clock still reads `now` itself, and it is the clock the fleet judges a write's deadline
+/// on, so the seam, the D servers and the pass's own `now_millis` are one source (ADR-0009) —
+/// never a wall clock beside a fixed logical instant.
 async fn reconstruction_pass(
     meta: &Meta,
     d: &[Disk; 4],
@@ -533,17 +560,18 @@ async fn reconstruction_pass(
     let (zone, custodian) = elect().await;
     let fleet = fleet(d);
     let topology = four_domains();
+    d[0].clock.set(now);
     let ctx = ReconstructionContext {
         meta,
         fleet: &fleet,
         topology: &topology,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(now),
-        staged_write_window_millis: 0,
+        clock: &d[0].clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
-    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now).await
+    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, now).await
 }
 
 // ---- the records --------------------------------------------------------------------------------
@@ -2226,7 +2254,8 @@ async fn scrub_result(meta: &Meta, d: &[Disk; 4]) -> std::result::Result<Answers
         meta,
         fleet: &fleet,
     };
-    let scrubbed = reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, NOW).await?;
+    let scrubbed =
+        reconcile_step(&zone, &custodian, None, Some(&scrub), None, None, None, NOW).await?;
     Ok(Answers {
         scrub: scrubbed,
         repairs: meta.keys_under(b"repair:"),

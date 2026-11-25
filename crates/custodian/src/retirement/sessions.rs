@@ -88,10 +88,11 @@
 //!
 //! Each position goes through the drain's mark guard ([`super::marks`], *The mark guard*) with
 //! this walk's event identity, `<upload-id>:<epoch>` (`0016:672`), and a stamp read from the loop's
-//! one clock once the step has its page in hand (ADR-0009, [`ReconstructionContext::clock`]). A
-//! `reclaiming` mark is never replaced, and here it is always a hold, never a wait: every position
-//! an entry yields is one GC's staged class protects while the entry stands — its placement, or its
-//! whole chunk — so GC never finishes such a mark first.
+//! one clock once the step has its page in hand (ADR-0009,
+//! [`crate::ReconstructionContext::clock`]). A `reclaiming` mark is never replaced, and here it is
+//! always a hold, never a wait: every position an entry yields is one GC's staged class protects
+//! while the entry stands — its placement, or its whole chunk — so GC never finishes such a mark
+//! first.
 //!
 //! **An entry is deleted only in a step after the one whose commit marked its last position**:
 //! once every position it names already carries this walk's mark — read so in this step, or
@@ -153,12 +154,11 @@ use wyrd_traits::{
 
 use super::marks::{read_arm, Arm, MARK_MAX_BYTES};
 use super::{
-    listing_past_step, ByChunk, Held, Hold, Listed, Pass, Tombstone, LISTED_PER_CHUNK,
+    listing_past_step, ByChunk, Drain, Held, Hold, Listed, Pass, Tombstone, LISTED_PER_CHUNK,
     MARKS_PER_STEP,
 };
 use crate::gc::{checked_page, object_name, staged_placement};
 use crate::reconciliation::Reconciled;
-use crate::reconstruction::ReconstructionContext;
 
 /// The most session records one page of the listing holds: 1.6 MB at the value ceiling.
 const SESSION_PAGE: usize = 16;
@@ -256,10 +256,7 @@ fn decode_bookmark(value: &[u8]) -> Option<(&[u8], u32)> {
 /// [`Reconciled::Blocked`] if it held anything, else [`Reconciled::Changed`] if it committed,
 /// else [`Reconciled::Satisfied`] only if it read the whole listing and no session owed anything
 /// this pass, else [`Reconciled::Partial`].
-pub(super) async fn reconcile(
-    ctx: &ReconstructionContext<'_>,
-    by_chunk: &ByChunk<'_>,
-) -> Result<Reconciled> {
+pub(super) async fn reconcile(ctx: &Drain<'_>, by_chunk: &ByChunk<'_>) -> Result<Reconciled> {
     let mut pass = Pass {
         visits_left: 0,
         steps_left: SESSION_STEPS_PER_PASS,
@@ -326,7 +323,7 @@ enum Ended {
 /// Visit the session at `key`, whose record was listed as `value`: walk its owned range a step
 /// at a time while it has steps, and once the range is empty judge its terminal delete.
 async fn visit(
-    ctx: &ReconstructionContext<'_>,
+    ctx: &Drain<'_>,
     by_chunk: &ByChunk<'_>,
     pass: &mut Pass,
     key: &[u8],
@@ -592,7 +589,7 @@ impl OwnedStep<'_> {
 /// `session` is the session's key and its record as read, `aborting` whether untrusted entries may
 /// be retired by chunk id.
 async fn walk_step(
-    ctx: &ReconstructionContext<'_>,
+    ctx: &Drain<'_>,
     by_chunk: &ByChunk<'_>,
     pass: &mut Pass,
     session: (&[u8], &[u8]),
@@ -915,7 +912,7 @@ async fn walk_step(
 /// Judge the terminal delete of `session`, stored at `key` as `prior`, whose owned range this pass
 /// has just observed empty (module doc, *The terminal delete*), and commit it when it is due.
 async fn terminal(
-    ctx: &ReconstructionContext<'_>,
+    ctx: &Drain<'_>,
     pass: &mut Pass,
     key: &[u8],
     upload_id: &UploadId,

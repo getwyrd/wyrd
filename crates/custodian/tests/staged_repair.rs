@@ -659,7 +659,7 @@ impl Fixture {
             tombstone: wyrd_custodian::Tombstone::Retain,
         };
         let now = self.clock.now_millis();
-        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, now).await
+        reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, now).await
     }
 
     async fn run(&self) -> Reconciled {
@@ -1888,7 +1888,11 @@ async fn gc_reclaiming_the_vacated_position_before_the_adoption_makes_it_lose() 
             fx.disk(2).holds(frag(fx.chunk, 2)),
             "{what}: the written fragment is there, under its pre-mark"
         );
-        assert_ne!(outcome, Reconciled::Changed, "{what}: nothing was adopted");
+        assert_eq!(
+            outcome,
+            Reconciled::Blocked,
+            "{what}: nothing was adopted, and a lost adoption is not certified over"
+        );
         assert_eq!(
             fx.meta.value(&fx.part_key),
             Some(fx.part.clone()),
@@ -2115,8 +2119,8 @@ async fn a_chunk_an_untrusted_owned_entry_holds_is_kept() {
 /// **(E)** A degraded chunk with no usable destination — every server a survivor does not already
 /// occupy carries a desired-state record — is kept: nothing is marked or written, the obligation
 /// stays queued, and each server passed over is named. As for a committed chunk with no free
-/// failure domain, it is off the repairable backlog and not a hole in the pass (`Satisfied`); it
-/// is repaired once a destination is usable again.
+/// failure domain, it is off the repairable backlog, and the pass does not certify over a repair
+/// it still owes (`Blocked`); it is repaired once a destination is usable again.
 #[tokio::test]
 async fn a_degraded_chunk_with_no_usable_destination_is_kept() {
     capture_audit();
@@ -2129,8 +2133,9 @@ async fn a_degraded_chunk_with_no_usable_destination_is_kept() {
 
     assert_eq!(
         outcome,
-        Reconciled::Satisfied,
-        "blocked for want of a destination, as a committed chunk with no free domain is"
+        Reconciled::Blocked,
+        "blocked for want of a destination, as a committed chunk with no free domain is: the \
+         repair is still owed, so the pass does not certify"
     );
     assert!(fx.queued(), "the obligation must be kept");
     assert!(
