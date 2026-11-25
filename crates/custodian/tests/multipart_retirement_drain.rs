@@ -71,8 +71,8 @@ use wyrd_core::read::read_object;
 use wyrd_core::repair::REPAIR_PREFIX;
 use wyrd_custodian::gc::W_WRITE_MILLIS;
 use wyrd_custodian::retirement::{
-    COMMITS_PER_PASS, LEDGER_CURSOR_KEY, LEDGER_PAGE, LEDGER_PAGES_PER_PASS, READS_PER_PASS,
-    READS_PER_STEP, STEPS_PER_PASS, VISITS_PER_PASS,
+    COMMITS_PER_PASS, LEDGER_CURSOR_KEY, LEDGER_PAGE, LEDGER_PAGES_PER_PASS,
+    READS_PER_MARKING_STEP, READS_PER_PASS, READS_PER_STEP, STEPS_PER_PASS, VISITS_PER_PASS,
 };
 use wyrd_custodian::{
     reconcile_after_restore, reconcile_step, Custodian, ExpiredPendingPolicy, FencedZone,
@@ -106,9 +106,14 @@ const AUDIT_TARGET: &str = "wyrd.custodian.retirement.audit";
 const VISIT_BOUND: usize = 64;
 const LEDGER_PAGE_BOUND: usize = 5;
 const STEP_BOUND: usize = 16;
-/// The resume point, the ledger pages, and four per step: a re-read after a lost precondition,
-/// a page of segments, one row past a page the store cut short, the whole-range read.
-const READ_BOUND: usize = 1 + LEDGER_PAGE_BOUND + 4 * STEP_BOUND;
+/// A records step reads at most four times: a re-read after a lost precondition, a page of
+/// segments, one row past a page the store cut short, the whole-range read.
+const RECORDS_STEP_READ_BOUND: usize = 4;
+/// A marking step (#1062) reads at most 252 times: a re-read after a lost precondition, one
+/// `sidx:` row, the session's records obligation, sixteen records and 233 marks.
+const MARKING_STEP_READ_BOUND: usize = 252;
+/// The resume point, the ledger pages, and every step at the marking step's bound — the larger.
+const READ_BOUND: usize = 1 + LEDGER_PAGE_BOUND + MARKING_STEP_READ_BOUND * STEP_BOUND;
 const COMMIT_BOUND: usize = STEP_BOUND + 1;
 
 fn upload(n: u64) -> UploadId {
@@ -640,9 +645,11 @@ fn body_of(n: u32) -> Vec<u8> {
 /// **(B-rec)** Parts 1 to 80 staged with their bytes on the D server, a production Complete
 /// naming the odd ones (#1008): the flip installs `retire:records:{parts}` for the 40 published
 /// parts and `retire:bytes:{parts}` for the 40 unnamed ones. Passes then drain the first: every
-/// published part's `part:` and `psum:` record is gone, the drain wrote **no** `orphan:` record at
-/// all (`0016:1503`), the object reads back byte-identical, and the unnamed parts' records and
-/// their `retire:bytes:` obligation are byte-identical to before — that mode is #1062's.
+/// published part's `part:` and `psum:` record is gone, **no** `orphan:` mark names a published
+/// part's chunk (`0016:1503`), the object reads back byte-identical, and every record a step of
+/// the records obligation deleted is a published part's — the unnamed parts' records go only
+/// through their own `retire:bytes:` obligation, whose drain (#1062) marks them first
+/// (`tests/multipart_retirement_marks.rs`, leg B).
 #[tokio::test]
 async fn b_rec_a_completes_published_part_records_are_drained_and_nothing_else_is_touched() {
     let (store, disk, audit) = (Store::new(), Disk::default(), Audit::default());
@@ -715,12 +722,12 @@ async fn b_rec_a_completes_published_part_records_are_drained_and_nothing_else_i
         store.value(&records_key).await.is_some(),
         "the flip's records obligation"
     );
-    let unnamed_before = unnamed_records(&store, &id, &unnamed).await;
-    let bytes_before = store
-        .value(&bytes_key)
-        .await
-        .expect("the flip's bytes obligation");
+    assert!(
+        store.value(&bytes_key).await.is_some(),
+        "the flip's bytes obligation"
+    );
     let fleet: [(DServerId, &dyn ChunkStore); 1] = [(0, &disk)];
+    store.take_log();
 
     let mut passes = 0;
     while store.value(&records_key).await.is_some() {
@@ -733,34 +740,49 @@ async fn b_rec_a_completes_published_part_records_are_drained_and_nothing_else_i
         assert_eq!(store.value(&part_key(&id, part(n))).await, None, "part:{n}");
         assert_eq!(store.value(&psum_key(&id, part(n))).await, None, "psum:{n}");
     }
-    assert!(
-        store.under(b"orphan:").await.is_empty(),
-        "no orphan: record at all"
-    );
+    let published: Vec<Vec<u8>> = named
+        .iter()
+        .map(|&n| {
+            md::orphan_key(
+                0,
+                FragmentId {
+                    chunk: chunk_of(1, n),
+                    index: 0,
+                },
+            )
+        })
+        .collect();
+    for key in store.under(b"orphan:").await.into_keys() {
+        assert!(
+            !published.contains(&key),
+            "{} marks a published chunk",
+            name(&key)
+        );
+    }
     let read = read_object(&store.inner, &disk, FRESH_INODE).await.unwrap();
     assert_eq!(read.as_deref(), Some(expected.as_slice()), "byte-identical");
-    let unnamed_after = unnamed_records(&store, &id, &unnamed).await;
-    assert_eq!(unnamed_after, unnamed_before, "the unnamed parts' records");
-    assert_eq!(
-        store.value(&bytes_key).await,
-        Some(bytes_before),
-        "their obligation"
-    );
-    assert!(audit.0.lock().unwrap().is_empty(), "nothing held");
-}
-
-/// The `part:` and `psum:` records of `numbers`, as stored.
-async fn unnamed_records(store: &Store, id: &UploadId, numbers: &[u32]) -> Vec<Option<Bytes>> {
-    let mut records = Vec::new();
-    for &n in numbers {
-        records.push(store.value(&part_key(id, part(n))).await);
-        records.push(store.value(&psum_key(id, part(n))).await);
+    let log = store.take_log();
+    let mut owed: Vec<Vec<u8>> = part_records(&id, &named);
+    owed.push(records_key.clone());
+    for step in steps_on(&log.sent, &records_key) {
+        assert!(
+            step.puts.iter().all(|(key, _)| *key == records_key),
+            "no mark"
+        );
+        for key in &step.deletes {
+            assert!(owed.contains(key), "the records mode deleted {}", name(key));
+        }
     }
-    assert!(
-        records.iter().all(Option::is_some),
-        "every unnamed record present"
-    );
-    records
+    let unnamed_owed = part_records(&id, &unnamed);
+    for batch in &log.sent {
+        if batch.deletes.iter().any(|key| unnamed_owed.contains(key)) {
+            assert!(
+                batch.preconditions.iter().any(|p| p.key == bytes_key),
+                "an unnamed part's record goes only through its bytes obligation"
+            );
+        }
+    }
+    assert!(audit.0.lock().unwrap().is_empty(), "nothing held");
 }
 
 // ─────────────────────────────── (C) ───────────────────────────────
@@ -1087,9 +1109,10 @@ fn the_built_bounds_are_the_promised_ones() {
     assert_eq!(LEDGER_PAGE, 16);
     assert_eq!(LEDGER_PAGES_PER_PASS, LEDGER_PAGE_BOUND);
     assert_eq!(STEPS_PER_PASS, STEP_BOUND);
-    assert_eq!(READS_PER_STEP, 4);
+    assert_eq!(READS_PER_STEP, RECORDS_STEP_READ_BOUND);
+    assert_eq!(READS_PER_MARKING_STEP, MARKING_STEP_READ_BOUND);
     assert_eq!(READS_PER_PASS, READ_BOUND);
-    assert_eq!(READ_BOUND, 70);
+    assert_eq!(READ_BOUND, 4_038);
     assert_eq!(COMMITS_PER_PASS, COMMIT_BOUND);
 }
 
@@ -1132,16 +1155,6 @@ async fn plant_one_part_obligation(store: &Store, owner: u64) -> Vec<u8> {
     key
 }
 
-/// Plant one `retire:bytes:` `{parts: [[1,1]]}` obligation for the upload numbered `owner`: one
-/// this build visits and leaves as it is.
-async fn plant_bytes_obligation(store: &Store, owner: u64) -> Vec<u8> {
-    let key = retire_key(RetireMode::Bytes, &token(&upload(owner)));
-    store
-        .plant_obligation(key.clone(), "{\"parts\":[[1,1]]}".to_owned())
-        .await;
-    key
-}
-
 /// `count` one-step `{parts}` obligations, for the uploads numbered from `first`; their keys, in
 /// key order.
 async fn one_step_backlog(store: &Store, first: u64, count: usize) -> Vec<Vec<u8>> {
@@ -1162,19 +1175,15 @@ async fn records_obligations(store: &Store) -> Vec<Vec<u8>> {
 }
 
 /// **(L1, `{parts}`)** A productive backlog three times the visit bound, each obligation one step
-/// from done, behind eight `retire:bytes:` obligations this build leaves alone — so the second
-/// ledger page a pass reads holds more records obligations than the pass has steps left. Every
-/// pass stays within the bounds, takes its sixteen steps in key order, and stops at the first
-/// obligation it has no step for instead of passing it by: after pass `k` exactly the first `16k`
-/// are gone. With the backlog gone, the pass that resumed at its end answers `Partial`, and the
-/// next, reading the whole ledger from its head, `Satisfied`.
+/// from done. Every pass stays within the bounds, reads one page, takes its sixteen steps in key
+/// order and stops when they are spent instead of reading on: after pass `k` exactly the first
+/// `16k` are gone. With the backlog gone, the pass that resumed at its end answers `Partial`, and
+/// the next, reading the whole ledger from its head, `Satisfied`. (Before #1062 the ledger led
+/// with eight `retire:bytes:` obligations the build left alone; every obligation now takes a step,
+/// so a step budget spent mid-page is reached only through lost preconditions, leg S.)
 #[tokio::test]
 async fn l1_a_productive_backlog_drains_in_key_order_within_fixed_per_pass_bounds() {
     let store = Store::new();
-    for owner in 1..=8 {
-        plant_bytes_obligation(&store, owner).await;
-    }
-    let bytes_before = store.under(b"retire:bytes:").await;
     let backlog = 3 * VISIT_BOUND;
     let keys = one_step_backlog(&store, 101, backlog).await;
     let audit = Audit::default();
@@ -1184,11 +1193,8 @@ async fn l1_a_productive_backlog_drains_in_key_order_within_fixed_per_pass_bound
         assert_eq!(pass(&store, &audit).await, Reconciled::Changed, "pass {k}");
         let log = store.take_log();
         assert_pass_bounds(&log);
-        // The first pass reads two pages (eight bytes obligations and eight records ones, then
-        // sixteen records ones, of which it steps eight); every later pass one page of sixteen.
-        // None reads a page it has no step for.
-        let pages = if k == 1 { 2 } else { 1 };
-        assert_eq!(log.ledger_pages, pages, "pass {k}");
+        // One page of sixteen, every one stepped; none reads a page it has no step for.
+        assert_eq!(log.ledger_pages, 1, "pass {k}");
         let left = records_obligations(&store).await;
         assert_eq!(
             left,
@@ -1208,7 +1214,7 @@ async fn l1_a_productive_backlog_drains_in_key_order_within_fixed_per_pass_bound
         Reconciled::Satisfied,
         "from the head"
     );
-    assert_eq!(store.under(b"retire:bytes:").await, bytes_before);
+    assert!(store.under(b"retire:").await.is_empty());
     assert!(store.under(b"part:").await.is_empty());
     assert!(audit.0.lock().unwrap().is_empty(), "nothing held");
 }
@@ -1362,18 +1368,18 @@ fn parts_at(id: &UploadId, numbers: &[u32], n: usize) -> Bytes {
     Bytes::from(value)
 }
 
-/// **(S, resumed)** 63 `retire:bytes:` obligations, then one `retire:records:` obligation over 600
-/// sparse parts, three steps' worth. Each pass that starts at the head spends its last visit on
-/// one step of it, so the pass after resumes past it, at the end of the ledger. That pass read
-/// nothing of the ledger before where it resumed — the half-drained obligation is there — so it
-/// answers `Partial`, never `Satisfied`, and the walk returns to the head. Only a pass that reads
-/// the whole ledger from its head, once the obligation and its records are gone, certifies it.
+/// **(S, resumed)** Fifteen one-step `retire:records:` obligations, then one over 600 sparse parts,
+/// three steps' worth. The first pass spends its last step on one step of the big one, at the end
+/// of a full ledger page, so the pass after resumes past it, at the end of the ledger. That pass
+/// read nothing of the ledger before where it resumed — the half-drained obligation is there — so
+/// it answers `Partial`, never `Satisfied`, and the walk returns to the head. Only a pass that
+/// reads the whole ledger from its head, once the obligation and its records are gone, certifies
+/// it. (Before #1062 the pass ran out of visits on 63 `retire:bytes:` obligations it left alone;
+/// every obligation now takes a step, so the steps are what run out.)
 #[tokio::test]
 async fn s_a_pass_that_resumed_part_way_does_not_certify_the_ledger() {
     let store = Store::new();
-    for owner in 1..=63 {
-        plant_bytes_obligation(&store, owner).await;
-    }
+    one_step_backlog(&store, 1, STEP_BOUND - 1).await;
     let id = upload(64);
     let numbers = sparse(1, 600);
     plant_parts(&store, &id, 64, &numbers).await;
@@ -1395,8 +1401,9 @@ async fn s_a_pass_that_resumed_part_way_does_not_certify_the_ledger() {
     }
 
     let (changed, partial) = (Reconciled::Changed, Reconciled::Partial);
-    let expected = [changed, partial, changed, partial, changed, partial];
-    assert_eq!(outcomes[..6], expected, "{outcomes:?}");
+    let satisfied = Reconciled::Satisfied;
+    let expected = [changed, partial, changed, changed, satisfied];
+    assert_eq!(outcomes, expected, "{outcomes:?}");
     assert!(store.under(b"part:").await.is_empty());
     assert!(store.under(b"psum:").await.is_empty());
     assert!(audit.0.lock().unwrap().is_empty(), "nothing held");
@@ -1599,7 +1606,8 @@ async fn restore_pass(store: &Store, disks: &[Disk; 4]) -> RestoreReport {
 /// Its drain runs **one step at a time**, and after every step the production
 /// `reconcile_after_restore` names nothing of the session — in particular no segment with no
 /// deleter — until the obligation is gone with its last record. The fence's `retire:bytes:`
-/// obligation is never touched.
+/// obligation may mark meanwhile, but deletes no `part:` record while the segments are owed
+/// (segments before parts, #1062; its own drain is `tests/multipart_retirement_marks.rs`, leg G).
 #[tokio::test]
 async fn g_rec_a_restore_fenced_attempt_is_drained_with_restore_naming_nothing_between_steps() {
     let (store, disks, audit) = (Store::new(), <[Disk; 4]>::default(), Audit::default());
@@ -1636,10 +1644,10 @@ async fn g_rec_a_restore_fenced_attempt_is_drained_with_restore_naming_nothing_b
         .expect("the fence's {seg} obligation");
     let (_, _, payload) = decode_retire_obligation(&records, &owed).unwrap();
     assert_eq!(payload.segments(), Some(&group));
-    let bytes_owed = store
-        .value(&bytes)
-        .await
-        .expect("the fence's bytes obligation");
+    assert!(
+        store.value(&bytes).await.is_some(),
+        "the fence's bytes obligation"
+    );
     let range = md::seg_range_prefix(&group);
 
     let mut steps = 0;
@@ -1667,12 +1675,15 @@ async fn g_rec_a_restore_fenced_attempt_is_drained_with_restore_naming_nothing_b
 
     assert!(steps > 1, "more than one step");
     assert!(store.under(&range).await.is_empty());
-    assert_eq!(
-        store.value(&bytes).await,
-        Some(bytes_owed),
-        "the bytes obligation untouched"
+    assert!(
+        store.value(&bytes).await.is_some(),
+        "the bytes obligation is still owed"
     );
-    assert_eq!(store.under(&mp::part_range(&id)).await.len(), parts.len());
+    assert_eq!(
+        store.under(&mp::part_range(&id)).await.len(),
+        parts.len(),
+        "no part record goes while its attempt's segments are owed"
+    );
 }
 
 // ─────────────────────────────── (K, `{seg}`) ───────────────────────────────

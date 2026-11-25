@@ -3,14 +3,21 @@
 //! rule 1, `0016:1081`; the batch inventory's *Retirement drain step* row, `0016:668`).
 //!
 //! An obligation is one small record, installed atomically with the transition that created the
-//! work, and drained here in bounded batches, idempotently. This build drains the
-//! **`retire:records:`** mode (#1061): records to delete whose bytes something else still
-//! protects — a publication's published parts (`{parts}`: each member's `part:` and `psum:`
-//! record, whose bytes the published object now names) and one rolled-back `Completing`
-//! attempt's segments (`{seg}`: the group's `seg:` records, whose chunks the session's own
-//! `part:` records still name), or both in one payload. **It deletes; it never writes an
-//! `orphan:` mark** (the mode lives in the key so it is never a misread field, `0016:434-441`).
-//! A `retire:bytes:` obligation is left byte-identical: marking is the next slice's (#1062).
+//! work, and drained here in bounded batches, idempotently. The mode lives in the key, so it is
+//! never a misread field (`0016:434-441`), and the two modes are opposite instructions:
+//!
+//! * **`retire:records:`** (#1061): records to delete whose bytes something else still protects
+//!   — a publication's published parts (`{parts}`: each member's `part:` and `psum:` record,
+//!   whose bytes the published object now names) and one rolled-back `Completing` attempt's
+//!   segments (`{seg}`: the group's `seg:` records, whose chunks the session's own `part:`
+//!   records still name), or both in one payload. **It deletes; it never writes an `orphan:`
+//!   mark.**
+//! * **`retire:bytes:`** (#1062, [`marks`]): bytes nothing will name once the obligation is
+//!   drained — a session's teardown (`{session}`, `{session, all}`, `{session, parts}`), a
+//!   Complete's unnamed parts (`{parts}`), a losing or re-uploaded part's chunks (`{chunks}`), a
+//!   superseded generation (`{generation}`, flat or segmented). **It marks every position the
+//!   obligation names, and only then deletes the records that named them** (decision 4 rule 2,
+//!   `0016:1123`); the module [`marks`] says how, and what holds an obligation instead.
 //!
 //! # One leg, bounded per pass
 //!
@@ -21,9 +28,11 @@
 //! * visits at most [`VISITS_PER_PASS`] obligations, read in pages of [`LEDGER_PAGE`]; every
 //!   obligation read counts, whether it progresses, cannot progress, or is not this build's to
 //!   drain;
-//! * reads at most [`LEDGER_PAGES_PER_PASS`] ledger pages and [`READS_PER_PASS`] times in all;
-//! * commits at most [`STEPS_PER_PASS`] drain steps, plus one write of its resume point
-//!   ([`COMMITS_PER_PASS`]).
+//! * reads at most [`LEDGER_PAGES_PER_PASS`] ledger pages and [`READS_PER_PASS`] times in all —
+//!   a records step reads at most [`READS_PER_STEP`] times, a marking step at most
+//!   [`READS_PER_MARKING_STEP`];
+//! * commits at most [`STEPS_PER_PASS`] drain steps, of either mode, plus one write of its resume
+//!   point ([`COMMITS_PER_PASS`]).
 //!
 //! None of those depends on the ledger's size. The walk resumes after the last obligation the
 //! previous pass visited and returns to the head once it reaches the end, so an obligation that
@@ -43,12 +52,20 @@
 //! # One step
 //!
 //! Decode the obligation against its key, with its cursor; derive the next batch from the cursor;
-//! commit `require(retire:… == prior)` + the deletes + the obligation put back with the advanced
-//! cursor. The step that deletes the last record deletes the obligation instead, in the same
-//! batch. A step works in one component at a time, in the payload's order (`parts`, then `seg`),
-//! so moving from one component to the next is always a commit boundary. Every batch stays within
+//! commit `require(retire:… == prior)` + the step's work + the obligation put back with the
+//! advanced cursor. The step that finishes the obligation deletes it instead, in the same batch.
+//! A records step's work is its deletes; a marking step's is its marks, each under its own
+//! precondition, and the deletes of records whose positions an earlier step marked ([`marks`]).
+//! A step works in one component at a time, in the payload's order (`parts`, then `seg`), so
+//! moving from one component to the next is always a commit boundary. Every batch stays within
 //! [`MAX_BATCH_BYTES`] and [`MAX_BATCH_OPS`], its precondition counted. A precondition that fails
 //! re-reads the obligation and plans again, within the pass's step budget.
+//!
+//! **A marking step stamps its marks with the loop's one clock, read for that step** (ADR-0009):
+//! [`ReconstructionContext::clock`], the source the deployed loop's `now_millis` is also read
+//! from, read after the step has its obligation in hand — never the pass's `now_millis`, which was
+//! read before the pass's earlier legs ran. An obligation installed while those legs ran gets
+//! marks no older than itself, so its grace runs in full from the drain (`0016:1098-1104`).
 //!
 //! * `{parts}`: the members from the cursor, found by one binary search over the set's runs
 //!   ([`wyrd_core::multipart::PartNumberSet::members_from`]), never a scan from the first run;
@@ -64,13 +81,13 @@
 //!
 //! # What a pass certifies
 //!
-//! [`Reconciled::Satisfied`] says the ledger owes nothing this build drains, so a pass answers it
-//! only when it read the **whole** ledger, from its head to its end, and found no
-//! `retire:records:` obligation in it. A pass that resumed part-way, stopped short of the end, or
-//! read an obligation it did not finish — its step budget spent on preconditions another writer
-//! kept moving, say — answers [`Reconciled::Partial`] when it changed and held nothing: the next
-//! pass goes on from there. A ledger longer than one pass's visits therefore never certifies in
-//! one pass, which is the honest answer while #1062 leaves `retire:bytes:` obligations in it.
+//! [`Reconciled::Satisfied`] says the ledger owes nothing, so a pass answers it only when it read
+//! the **whole** ledger, from its head to its end, and found no obligation of either mode in it.
+//! A pass that resumed part-way, stopped short of the end, or read an obligation it did not
+//! finish — its step budget spent on preconditions another writer kept moving, say, or a marking
+//! step waiting on GC or on its session's segments ([`marks`]) — answers [`Reconciled::Partial`]
+//! when it changed and held nothing: the next pass goes on from there. A ledger longer than one
+//! pass's visits therefore never certifies in one pass.
 //!
 //! # What holds one obligation, and only that one
 //!
@@ -86,12 +103,21 @@
 //! An obligation installed by this build fits: every installer is held to
 //! [`wyrd_core::multipart::RETIRE_VALUE_CEILING`], which leaves the cursor's room under
 //! [`MAX_VALUE_BYTES`]. The ceiling hold is the backstop for one installed without that room.
+//!
+//! A marking step adds its own holds ([`marks`]): a session whose owned `sidx:` range is not empty
+//! ([`Hold::OwnedResidue`]), a record whose placement it cannot trust or cannot read
+//! ([`Hold::UntrustedPlacement`], [`Hold::RecordUnreadable`]), a mark that is none of the three
+//! shapes ([`Hold::UnreadableMark`]), and a `reclaiming` mark over a position a record the drain
+//! keeps still names ([`Hold::ReclaimingRetained`], which needs a human).
+
+mod marks;
 
 use wyrd_core::metadata::{self, seg_key, seg_range_prefix, SegmentGroup, MAX_VALUE_BYTES};
 use wyrd_core::multipart::{
     decode_retire_obligation, part_key, psum_key, PartNumber, PartScope, RetireComponent,
     RetireCursor, RetireMode, RetirePayload, RetireToken, UploadId, MAX_BATCH_BYTES, MAX_BATCH_OPS,
 };
+use wyrd_testkit::Clock;
 use wyrd_traits::{CommitOutcome, MetadataStore, Result, WriteBatch};
 
 use crate::gc::{checked_page, object_name};
@@ -125,21 +151,52 @@ pub const LEDGER_PAGES_PER_PASS: usize = VISITS_PER_PASS / LEDGER_PAGE + 1;
 /// precondition that failed and the re-plan after it spend another step.
 pub const STEPS_PER_PASS: usize = 16;
 
-/// The most store reads one step makes: a re-read of the obligation after its precondition failed,
-/// and for a `{seg}` component a page of the group's records from the cursor, one row past that
-/// page when the store cut it short, and, at the end of the group, one read of its whole range
-/// from the start.
+/// The most store reads one **records** step makes: a re-read of the obligation after its
+/// precondition failed, and for a `{seg}` component a page of the group's records from the
+/// cursor, one row past that page when the store cut it short, and, at the end of the group, one
+/// read of its whole range from the start.
 pub const READS_PER_STEP: usize = 4;
 
-/// The most store reads one pass makes: the resume point, the ledger pages and every step's.
-pub const READS_PER_PASS: usize = 1 + LEDGER_PAGES_PER_PASS + READS_PER_STEP * STEPS_PER_PASS;
+/// The operations every step spends besides its work: the obligation's own precondition, and
+/// its put (the advanced cursor) or its delete (the step that finishes it).
+const STEP_FIXED_OPS: usize = 2;
+
+/// The most entries one **marking** step visits: `part:` records it reads (one keyed read each,
+/// or one page of a session's range) or `seg:` records it reads (one page), and so the most
+/// entries whose records it deletes. One ledger page's worth, so a step holds at most sixteen
+/// record values in memory, 1.6 MB at the value ceiling.
+pub const ENTRIES_PER_MARKING_STEP: usize = 16;
+
+/// The most fragment positions one **marking** step reads the `orphan:` mark of, and so the most
+/// marks it writes. Derived from the operation budget (`0016:668`, `B` marks a batch): every mark
+/// costs two operations, its own precondition and its put, and every entry whose records the step
+/// deletes at most two (a `part:` and its `psum:`), beside the step's fixed two —
+/// `(500 - 2 - 2 × 16) / 2` = 233. Its bytes are far inside [`MAX_BATCH_BYTES`]: a mark's key is
+/// at most 73 bytes and its value at most 328 (`metadata::MAX_ORPHAN_EVENT_LEN`), so 233 of them,
+/// precondition and put, come to under 200 KB.
+pub const MARKS_PER_STEP: usize =
+    (MAX_BATCH_OPS as usize - STEP_FIXED_OPS - 2 * ENTRIES_PER_MARKING_STEP) / 2;
+
+/// The most store reads one **marking** step makes: a re-read of the obligation after its
+/// precondition failed, one row of the session's owned `sidx:` range, the session token's
+/// `retire:records:` obligation (segments before parts, [`marks`]), one read per entry
+/// ([`ENTRIES_PER_MARKING_STEP`]) and one per position ([`MARKS_PER_STEP`]): 252.
+pub const READS_PER_MARKING_STEP: usize = 3 + ENTRIES_PER_MARKING_STEP + MARKS_PER_STEP;
+
+// A marking step is the one that reads most, so it is the per-step bound the pass is sized by.
+const _: () = assert!(READS_PER_MARKING_STEP >= READS_PER_STEP);
+// Its operations fit the batch budget: the fixed two, two per mark, two per deleted entry.
+const _: () = assert!(
+    STEP_FIXED_OPS + 2 * MARKS_PER_STEP + 2 * ENTRIES_PER_MARKING_STEP <= MAX_BATCH_OPS as usize
+);
+
+/// The most store reads one pass makes: the resume point, the ledger pages and every step's, each
+/// at the marking step's bound — 4,038.
+pub const READS_PER_PASS: usize =
+    1 + LEDGER_PAGES_PER_PASS + READS_PER_MARKING_STEP * STEPS_PER_PASS;
 
 /// The most commits one pass makes: one per step, and the resume point when it moved.
 pub const COMMITS_PER_PASS: usize = STEPS_PER_PASS + 1;
-
-/// The operations every step spends besides its deletes: the obligation's own precondition, and
-/// its put (the advanced cursor) or its delete (the step that finishes it).
-const STEP_FIXED_OPS: usize = 2;
 
 /// The longest key a backend accepts — FoundationDB's 10 KB, the tightest in play
 /// (`crates/traits/src/lib.rs`, *Operational envelope*). Every key the walk reads is one the store
@@ -171,6 +228,31 @@ pub enum Hold {
     /// The step's commit failed: a store fault, or an outcome the store could not report. The
     /// next visit re-reads the obligation, which shows whether it landed.
     CommitFailed,
+    /// A `session` component whose session still owns staged residue: its `sidx:` range is not
+    /// empty. The owned walk that empties it is #1013's; until then the obligation is the only
+    /// deleter in reach of those entries, so it stays.
+    OwnedResidue,
+    /// A record — or an obligation's own chunk list — whose placement is not exactly one D server
+    /// per fragment of its scheme (the staged rule, `crate::gc::staged_placement`) or, for a
+    /// committed generation's chunk, neither empty nor that length
+    /// (`ChunkRef::checked_fragments`). The drain marks nothing from it and deletes nothing
+    /// under it: its true positions are unknown. Its fragments stay — GC reclaims none it holds no
+    /// mark for, and its staged class holds every fragment of an untrusted `part:` record's chunk
+    /// whole; #1013 retires such a record by chunk id.
+    UntrustedPlacement,
+    /// A record the obligation names is absent, will not decode, or sits under a key that is not
+    /// the record the obligation names: the positions it held are unknown, so nothing of it is
+    /// marked or deleted.
+    RecordUnreadable,
+    /// An `orphan:` mark the drain met is none of the three shapes
+    /// (`metadata::decode_orphan_mark`): it is kept byte-identical, as GC keeps it, and nothing
+    /// after it is marked.
+    UnreadableMark,
+    /// A `reclaiming` mark over a position a record the drain keeps still names — a `part:` record
+    /// it deletes only once the position carries its own mark. GC never finishes such a mark (the
+    /// staged class outranks it) and the drain never replaces one, so nothing moves without a
+    /// human; no in-tree path makes this state, so it means damage or a store edit.
+    ReclaimingRetained,
 }
 
 impl Hold {
@@ -183,6 +265,11 @@ impl Hold {
             Self::MalformedSegmentKey => "malformed-segment-key",
             Self::CursorRefused => "cursor-refused",
             Self::CommitFailed => "commit-failed",
+            Self::OwnedResidue => "owned-residue",
+            Self::UntrustedPlacement => "untrusted-placement",
+            Self::RecordUnreadable => "record-unreadable",
+            Self::UnreadableMark => "unreadable-mark",
+            Self::ReclaimingRetained => "reclaiming-under-retained-record",
         }
     }
 }
@@ -195,23 +282,21 @@ struct Pass {
     changed: bool,
     /// An obligation was held.
     held: bool,
-    /// A `retire:records:` obligation was read: work was owed, so the pass certifies nothing,
-    /// whatever became of it — drained a step, held, or left after its step budget was spent.
+    /// An obligation was read: work was owed, so the pass certifies nothing, whatever became of
+    /// it — drained a step, held, waiting, or left after its step budget was spent.
     owed: bool,
 }
 
-// deferred: #1062 — seeded Tier-0 DST coverage of the drain arrives with the marking mode and its
-// drain-versus-GC row; this mode writes no mark, and every record it deletes has its bytes named by
-// another record (the published inode for `{parts}`, the session's `part:` records for `{seg}`).
 // deferred: #660 — two drainers of one obligation (the `require(retire:… == prior)` precondition
-// is what serializes them; their interleavings are #660's).
+// is what serializes them; their interleavings are #660's). The one seeded Tier-0 row this leg
+// carries is the marking step's exact-value re-stamp racing GC's swap to `reclaiming`
+// (`crates/dst/tests/custodian.rs`, #1062).
 /// One retirement pass over the store `ctx` names — the leg [`crate::reconcile_step`] runs after
 /// reconstruction. Answers [`Reconciled::Blocked`] if it held any obligation, else
 /// [`Reconciled::Changed`] if it committed a step, else [`Reconciled::Satisfied`] only if it read
-/// the whole ledger from its head to its end and found no `retire:records:` obligation in it, else
-/// [`Reconciled::Partial`] (module doc, *What a pass certifies*). A `retire:bytes:` obligation is
-/// visited and left as it is without withholding certification: this leg certifies the
-/// records-mode ledger, which is all it drains (#1062 adds the other mode).
+/// the whole ledger from its head to its end and found no obligation in it, else
+/// [`Reconciled::Partial`] (module doc, *What a pass certifies*). Every marking step reads its
+/// stamp from `ctx.clock` ([`ReconstructionContext::clock`]), the loop's one time source.
 pub(crate) async fn reconcile(ctx: &ReconstructionContext<'_>) -> Result<Reconciled> {
     let meta = ctx.meta;
     let stored = meta
@@ -260,7 +345,7 @@ pub(crate) async fn reconcile(ctx: &ReconstructionContext<'_>) -> Result<Reconci
                 break 'walk;
             }
             pass.visits_left -= 1;
-            visit(meta, &mut pass, &key, value.to_vec()).await?;
+            visit(meta, ctx.clock, &mut pass, &key, value.to_vec()).await?;
             position = Some(key);
         }
         if next.is_none() {
@@ -302,25 +387,22 @@ pub(crate) async fn reconcile(ctx: &ReconstructionContext<'_>) -> Result<Reconci
     })
 }
 
-/// Visit one obligation read from the ledger as (`key`, `value`): drain it a step if it is a
-/// `retire:records:` obligation and the pass has a step left, hold it if it cannot be, and leave
-/// a `retire:bytes:` one as it is.
+/// Visit one obligation read from the ledger as (`key`, `value`): drain it a step in the mode its
+/// key names if the pass has a step left, or hold it if it cannot be. A marking step reads its
+/// stamp from `clock` here, once its obligation's bytes are in hand — the ledger page's, or the
+/// re-read's after a lost precondition — so the stamp is never older than the obligation it
+/// evidences.
 async fn visit(
     meta: &dyn MetadataStore,
+    clock: &(dyn Clock + Sync),
     pass: &mut Pass,
     key: &[u8],
     value: Vec<u8>,
 ) -> Result<()> {
     let mut prior = value;
     loop {
-        let (token, payload) = match decode_retire_obligation(key, &prior) {
-            Ok((RetireMode::Records, token, payload)) => (token, payload),
-            Ok((RetireMode::Bytes, _, _)) => {
-                // Not this build's to drain (#1062): counted on the durability seam, so a
-                // backlog of them is visible, and left byte-identical.
-                tracing::info!(monotonic_counter.retirement_bytes_obligations_deferred = 1_u64);
-                return Ok(());
-            }
+        let (mode, token, payload) = match decode_retire_obligation(key, &prior) {
+            Ok(decoded) => decoded,
             Err(fault) => {
                 hold(pass, key, Hold::Undecodable, &fault.to_string());
                 return Ok(());
@@ -334,16 +416,43 @@ async fn visit(
             return Ok(());
         }
         pass.steps_left -= 1;
-        let step = match plan(meta, key, &prior, &token, &payload).await? {
-            Ok(step) => step,
-            Err((reason, detail)) => {
-                hold(pass, key, reason, &detail);
+        let planned = match mode {
+            RetireMode::Records => match plan(meta, key, &prior, &token, &payload).await? {
+                Ok(step) => Planned::Step(step),
+                Err((reason, detail)) => Planned::Held(Held::of(reason, detail)),
+            },
+            RetireMode::Bytes => {
+                // The stamp this step's marks carry: the loop's one clock (ADR-0009), read now —
+                // after this step read its obligation — never the pass's `now_millis`, which was
+                // read before reconstruction ran and could predate an obligation installed since.
+                let stamp_millis = clock.now_millis();
+                marks::plan(meta, key, &prior, &token, &payload, stamp_millis).await?
+            }
+        };
+        let step = match planned {
+            Planned::Step(step) => step,
+            Planned::Held(held) => {
+                hold_at(pass, key, &held);
+                return Ok(());
+            }
+            Planned::Wait(reason) => {
+                // Owed, unchanged, and nothing at fault: the pass answers `Partial` for it.
+                emit_wait(key, reason);
                 return Ok(());
             }
         };
-        let deleted = step.deletes.len();
+        let (deleted, marked) = (step.deletes.len(), step.marks.len());
         let mut batch = WriteBatch::new().require(key.to_vec(), prior.clone());
-        batch.deletes = step.deletes;
+        for mark in step.marks {
+            batch = match mark.prior {
+                // Arm (b): the mark the step read, replaced only if it still holds those bytes.
+                Some(read) => batch.require(mark.key.clone(), read),
+                // Arm (c): written only if the position is still unmarked.
+                None => batch.require_absent(mark.key.clone()),
+            }
+            .put(mark.key, mark.value);
+        }
+        batch.deletes.extend(step.deletes);
         batch = match step.value {
             Some(value) => batch.put(key.to_vec(), value),
             None => batch.delete(key.to_vec()),
@@ -351,11 +460,13 @@ async fn visit(
         match meta.commit(batch).await {
             Ok(CommitOutcome::Committed) => {
                 pass.changed = true;
-                emit_step(deleted);
+                emit_step(deleted, marked);
                 return Ok(());
             }
-            // Another writer moved the obligation between the read and the commit: read it again
-            // and plan from what is there now, or stop if it is gone (its drain finished).
+            // Another writer moved the obligation, or a mark, between the read and the commit:
+            // read the obligation again and plan from what is there now — every mark re-read, so
+            // a mark GC moved to `reclaiming` meanwhile is met as one, never re-stamped — or stop
+            // if it is gone (its drain finished).
             Ok(CommitOutcome::Conflict) => match meta.get(key).await? {
                 Some(now) => prior = now.to_vec(),
                 None => return Ok(()),
@@ -368,16 +479,54 @@ async fn visit(
     }
 }
 
-/// One planned step: the records it deletes, and the obligation's next value — `None` when the
-/// step deletes its last record and so deletes the obligation too.
+/// What a step planned: a batch to commit, a hold, or — a marking step only — nothing to do this
+/// step, with nothing at fault ([`marks`], the wait reasons).
+enum Planned {
+    Step(Step),
+    Held(Held),
+    Wait(&'static str),
+}
+
+/// One planned step: the marks it writes, the records it deletes, and the obligation's next value
+/// — `None` when the step finishes its work and so deletes the obligation too. A records step
+/// writes no mark.
 struct Step {
+    marks: Vec<Mark>,
     deletes: Vec<Vec<u8>>,
     value: Option<Vec<u8>>,
 }
 
-/// What a step can do instead of a [`Step`]: hold the obligation, with the reason and the
+/// One `orphan:` mark a marking step writes: its key, the bytes it read there (`None` when the
+/// position was unmarked), and the structured mark it puts.
+struct Mark {
+    key: Vec<u8>,
+    prior: Option<Vec<u8>>,
+    value: Vec<u8>,
+}
+
+/// What a records step can do instead of a [`Step`]: hold the obligation, with the reason and the
 /// detail the audit event carries.
-type Held = (Hold, String);
+type HeldRecords = (Hold, String);
+
+/// A hold, with what the audit event names: the reason, the detail, and — for a marking step —
+/// the `orphan:` position and the record the hold is about.
+struct Held {
+    reason: Hold,
+    detail: String,
+    position: Option<Vec<u8>>,
+    record: Option<Vec<u8>>,
+}
+
+impl Held {
+    fn of(reason: Hold, detail: String) -> Self {
+        Self {
+            reason,
+            detail,
+            position: None,
+            record: None,
+        }
+    }
+}
 
 /// Plan the next step of the `retire:records:` obligation at `key`, whose stored bytes are
 /// `prior`: the component and entry its cursor names (the first component at its start when it
@@ -388,7 +537,7 @@ async fn plan(
     prior: &[u8],
     token: &RetireToken,
     payload: &RetirePayload,
-) -> Result<std::result::Result<Step, Held>> {
+) -> Result<std::result::Result<Step, HeldRecords>> {
     let budget = Budget::for_step(key, prior);
     let cursor = payload.cursor().copied();
     let component = match cursor {
@@ -415,22 +564,41 @@ async fn plan(
     };
     let value = match next {
         None => None,
-        Some(cursor) => match payload.advanced(RetireMode::Records, cursor) {
-            Ok(advanced) => {
-                let value = metadata::encode(&advanced).to_vec();
-                if value.len() > MAX_VALUE_BYTES {
-                    let detail = format!(
-                        "the advanced value is {} bytes, past {MAX_VALUE_BYTES}; it was not sent",
-                        value.len()
-                    );
-                    return Ok(Err((Hold::ValuePastCeiling, detail)));
-                }
-                Some(value)
-            }
-            Err(fault) => return Ok(Err((Hold::CursorRefused, fault.to_string()))),
+        Some(cursor) => match advanced_value(payload, RetireMode::Records, cursor) {
+            Ok(value) => Some(value),
+            Err(held) => return Ok(Err(held)),
         },
     };
-    Ok(Ok(Step { deletes, value }))
+    let marks = Vec::new();
+    Ok(Ok(Step {
+        marks,
+        deletes,
+        value,
+    }))
+}
+
+/// The obligation's value with its drain moved to `cursor`, as the step puts it back: checked as
+/// decode checks a stored cursor ([`RetirePayload::advanced`]), and measured — a value past
+/// [`MAX_VALUE_BYTES`] is held, never sent.
+fn advanced_value(
+    payload: &RetirePayload,
+    mode: RetireMode,
+    cursor: RetireCursor,
+) -> std::result::Result<Vec<u8>, HeldRecords> {
+    match payload.advanced(mode, cursor) {
+        Ok(advanced) => {
+            let value = metadata::encode(&advanced).to_vec();
+            if value.len() > MAX_VALUE_BYTES {
+                let detail = format!(
+                    "the advanced value is {} bytes, past {MAX_VALUE_BYTES}; it was not sent",
+                    value.len()
+                );
+                return Err((Hold::ValuePastCeiling, detail));
+            }
+            Ok(value)
+        }
+        Err(fault) => Err((Hold::CursorRefused, fault.to_string())),
+    }
 }
 
 /// What one step's batch may carry besides its fixed operations (`0016:622-648`: `B` is the
@@ -466,7 +634,7 @@ fn parts_step(
     payload: &RetirePayload,
     entry: u32,
     budget: &Budget,
-) -> std::result::Result<(Vec<Vec<u8>>, Option<RetireCursor>), Held> {
+) -> std::result::Result<(Vec<Vec<u8>>, Option<RetireCursor>), HeldRecords> {
     let (Some(PartScope::Set(set)), RetireToken::Session { upload_id, .. }) =
         (payload.parts(), token)
     else {
@@ -517,7 +685,7 @@ async fn seg_step(
     payload: &RetirePayload,
     entry: u32,
     budget: &Budget,
-) -> Result<std::result::Result<(Vec<Vec<u8>>, Option<RetireCursor>), Held>> {
+) -> Result<std::result::Result<(Vec<Vec<u8>>, Option<RetireCursor>), HeldRecords>> {
     let Some(group) = payload.segments() else {
         let detail = "a `seg` cursor on a payload with no segment group".to_owned();
         return Ok(Err((Hold::CursorRefused, detail)));
@@ -593,7 +761,7 @@ fn segment_index(group: &SegmentGroup, key: &[u8]) -> Option<u32> {
 }
 
 /// The hold for `key`, found under a group's `seg:` range but not one of its segment keys.
-fn stray(key: &[u8]) -> Held {
+fn stray(key: &[u8]) -> HeldRecords {
     let detail = format!("{} is not a segment key of the group", object_name(key));
     (Hold::MalformedSegmentKey, detail)
 }
@@ -601,23 +769,46 @@ fn stray(key: &[u8]) -> Held {
 /// Hold the obligation at `key` for `reason`: nothing written, the pass marked blocked, the
 /// obligation named on the audit seam.
 fn hold(pass: &mut Pass, key: &[u8], reason: Hold, detail: &str) {
+    hold_at(pass, key, &Held::of(reason, detail.to_owned()));
+}
+
+/// [`hold`], naming beside the obligation the `orphan:` position and the record the hold is about,
+/// when it has them (empty when it has not).
+fn hold_at(pass: &mut Pass, key: &[u8], held: &Held) {
     pass.held = true;
+    let name = |key: &Option<Vec<u8>>| key.as_deref().map(object_name).unwrap_or_default();
     tracing::warn!(monotonic_counter.retirement_obligations_held = 1_u64);
     tracing::warn!(
         target: "wyrd.custodian.retirement.audit",
         action = "retire-obligation-held",
         key = %object_name(key),
-        hold = reason.as_str(),
-        detail = %detail,
+        hold = held.reason.as_str(),
+        detail = %held.detail,
+        position = %name(&held.position),
+        record = %name(&held.record),
         "the retirement drain held an obligation it cannot act on; it is left byte-identical and \
          the walk goes on to the next — operator signal",
     );
 }
 
-/// Count one committed step and the records it deleted on the durability seam.
-fn emit_step(deleted: usize) {
+/// Count one committed step, the records it deleted and the marks it wrote on the durability seam.
+fn emit_step(deleted: usize, marked: usize) {
     tracing::info!(monotonic_counter.retirement_steps_committed = 1_u64);
     tracing::info!(monotonic_counter.retirement_records_deleted = deleted as u64);
+    tracing::info!(monotonic_counter.retirement_marks_written = marked as u64);
+}
+
+/// Count a marking step that found nothing to do yet, with nothing at fault: a `reclaiming` mark
+/// GC is still finishing, or its session's segments still to be drained first ([`marks`]).
+fn emit_wait(key: &[u8], reason: &'static str) {
+    tracing::info!(monotonic_counter.retirement_steps_waiting = 1_u64);
+    tracing::debug!(
+        target: "wyrd.custodian.retirement",
+        key = %object_name(key),
+        wait = reason,
+        "the retirement drain left an obligation unchanged this step; it is owed, and the next \
+         pass returns to it",
+    );
 }
 
 /// Name a resume point the walk cannot use: not a `retire:` key, or longer than any key a backend

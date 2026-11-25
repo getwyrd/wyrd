@@ -42,7 +42,10 @@
 //!   byte-identical and is named. (viii) A structured mark that is not `reclaiming` — one that
 //!   may have been written ahead of its fragment — is never swept, however old, and is named
 //!   `event-may-await-write`: a write whose effect the store could not verify may still land under
-//!   it (PR #821 review).
+//!   it (PR #821 review). (ix) The one exception: a retirement drain's mark, whose event is a
+//!   `retire:bytes:` token, is kept while that obligation is present, named `draining-retirement`,
+//!   and swept on its stamp once the obligation is gone — the drain marks only after every write
+//!   under it was authorized, and nothing else would ever delete it (#1062).
 //! * **D** — a sweep never deletes a mark newer than the one it judged, and its accounting matches
 //!   what landed. (i) A mark re-stamped between the pass's read and its delete survives, and is
 //!   neither audited nor counted. (ii) A commit that fails partway through the sweep leaves claimed
@@ -1178,9 +1181,10 @@ async fn b7_each_shape_is_swept_on_its_stamp_and_a_fourth_is_never_swept() {
 /// fragment — a repoint's pre-mark, a teardown's planned placement — and `D` bounds when a write is
 /// accepted, not when it takes effect: a publication straddling the deadline is `WriteEffect::
 /// Unknown` with the bytes possibly landed. So such a mark is never swept on `D`, however old:
-/// with a move nonce or a retirement token for its event, aged `D` and aged far past it, it is
-/// kept byte-identical and named `event-may-await-write`, while the legacy control beside it is
-/// swept. Negation: drop the event-class arm — the first assertion fails.
+/// with a move nonce or an owned-staging walk's `<upload-id>:<epoch>` for its event — neither a
+/// retirement token (B(ix) has those) — aged `D` and aged far past it, it is kept byte-identical
+/// and named `event-may-await-write`, while the legacy control beside it is swept. Negation: drop
+/// the event-class arm — the first assertion fails.
 #[tokio::test]
 async fn b8_a_structured_mark_that_may_await_its_write_is_never_swept_on_the_deadline() {
     install_global_default();
@@ -1191,8 +1195,8 @@ async fn b8_a_structured_mark_that_may_await_its_write_is_never_swept_on_the_dea
     let awaiting: Vec<(FragmentId, Bytes)> = [
         structured(now - D, "move-8007"),
         structured(T0, "move-8007"),
-        structured(now - D, "g:1:1"),
-        structured(T0, "s:0123456789abcdef0123456789abcdef:7"),
+        structured(now - D, "0123456789abcdef0123456789abcdef:7"),
+        structured(T0, "0123456789abcdef0123456789abcdef:7"),
     ]
     .into_iter()
     .enumerate()
@@ -1233,6 +1237,77 @@ async fn b8_a_structured_mark_that_may_await_its_write_is_never_swept_on_the_dea
         pass.counted(),
         1,
         "leg B(viii): only the control is counted"
+    );
+}
+
+/// **B(ix).** A retirement drain's mark — its event a `retire:bytes:` token — is kept while that
+/// obligation is present, however old, and named `draining-retirement`: the drain may still be
+/// marking from it, and GC's protection reads the same key. Once the obligation is gone the mark is
+/// swept on its stamp like a legacy one: a token is never reused, so nothing else would ever
+/// delete it (#1062, `0016:1406-1408`). Fragment-less marks aged `D` and far past it: a generation
+/// token's whose obligation is present (any bytes — presence is the whole answer), kept; a session
+/// token's and a generation token's whose obligations are absent, swept, audited and counted, as
+/// is the control. Negations: drop the obligation read — the first assertion fails; drop the arm
+/// — the swept ones are kept as `event-may-await-write`.
+#[tokio::test]
+async fn b9_a_retirement_mark_is_kept_while_its_obligation_is_present_and_swept_after() {
+    install_global_default();
+    let meta = Meta::default();
+    let disks = disks(3);
+    let fleet = fleet_of(&disks);
+    let now = T0 + 10 * D;
+    meta.seed(b"retire:bytes:g:1:1".to_vec(), Bytes::from_static(b"{}"));
+    let draining = frag(0xE0, 0);
+    let draining_mark = structured(T0, "g:1:1");
+    meta.seed(orphan_key(1, draining), draining_mark.clone());
+    let drained: Vec<FragmentId> = [
+        (
+            0xE1,
+            structured(now - D, "s:0123456789abcdef0123456789abcdef:7"),
+        ),
+        (0xE2, structured(T0, "g:2:5")),
+    ]
+    .into_iter()
+    .map(|(chunk, value)| {
+        let at = frag(chunk, 0);
+        meta.seed(orphan_key(1, at), value);
+        at
+    })
+    .collect();
+    let control = seed_control(&meta, 1, 0xE8, now);
+    let gc = Gc::elect().await;
+
+    let pass = gc.pass(&meta, &fleet, now).await;
+    pass.answer("leg B(ix)");
+    assert_eq!(
+        meta.value(&orphan_key(1, draining)),
+        Some(draining_mark),
+        "leg B(ix): a mark whose retirement is still draining was swept or rewritten"
+    );
+    assert_eq!(
+        pass.mark_skips(1, draining),
+        ["draining-retirement"],
+        "leg B(ix): it must be kept for that reason and named. got: {}",
+        pass.log
+    );
+    for at in &drained {
+        assert!(
+            meta.value(&orphan_key(1, *at)).is_none(),
+            "leg B(ix): {at:?} names a retirement whose obligation is gone and was not swept. \
+             got: {}",
+            pass.log
+        );
+        assert!(
+            pass.swept(1, *at),
+            "leg B(ix): not audited as swept: {}",
+            pass.log
+        );
+    }
+    assert_control_swept("leg B(ix)", &meta, &pass, 1, control);
+    assert_eq!(
+        pass.counted(),
+        3,
+        "leg B(ix): the two drained retirements' marks and the control are counted"
     );
 }
 
