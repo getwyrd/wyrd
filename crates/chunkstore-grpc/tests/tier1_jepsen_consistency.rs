@@ -238,11 +238,12 @@ impl MetadataStore for CrashMeta {
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
-        // The version-conditional repoint is the only commit with a positive precondition
-        // (`.require(key, value)`); crash on it (apply nothing, return Conflict) when armed.
-        // The intent / enqueue / drain commits carry no positive precondition and pass through.
+        // The version-conditional repoint is the only commit that rewrites the inode record;
+        // crash on it (apply nothing, return Conflict) when armed. The destination pre-mark
+        // before it (`wyrd_custodian`'s committed-move rule, #1084) and the intent / enqueue /
+        // drain commits write no inode record and pass through.
         if self.armed.load(Ordering::Relaxed)
-            && batch.preconditions.iter().any(|p| p.expected.is_some())
+            && batch.puts.iter().any(|(key, _)| key.starts_with(b"inode:"))
         {
             return Ok(CommitOutcome::Conflict);
         }
@@ -913,7 +914,8 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
     // the commit (returns Conflict), simulating the custodian dying just before it
     // lands — exactly `0005:385-386`.
     //
-    // Expected: Reconciled::Satisfied (the commit was lost; metadata unchanged).
+    // Expected: Reconciled::Blocked (the commit was lost with the object's root unmoved, so
+    // the repair is still owed and the pass does not certify, #1084; metadata unchanged).
     // Post-condition: server 9 holds a real placed-but-uncommitted orphan fragment;
     // the committed inode is fully old (victim still at placement[0], version=1).
     // ====================================================================
@@ -929,23 +931,23 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await
     .expect("phase 1: reconcile_step (crash mid-repair)");
 
     assert_eq!(
         phase1_outcome,
-        Reconciled::Satisfied,
-        "phase 1 (crash mid-repair): reconcile_step must return Satisfied \
-         when the version-conditional commit is intercepted by CrashMeta"
+        Reconciled::Blocked,
+        "phase 1 (crash mid-repair): reconcile_step must not certify when the \
+         version-conditional commit is intercepted by CrashMeta: the repair is still owed"
     );
 
     // Commit-point-atomic check — property 1 (`0005:385-389`):
@@ -1032,14 +1034,14 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await;
 
@@ -1106,14 +1108,14 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await
     .expect("phase 3: reconcile_step (after partition heal)");
@@ -1176,14 +1178,14 @@ async fn jepsen_consistency_over_repair_under_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await
     .expect("phase 4: reconcile_step (exactly-once check)");
@@ -1500,23 +1502,23 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await
     .expect("phase 1: reconcile_step (crash mid-repair)");
 
     assert_eq!(
         phase1_outcome,
-        Reconciled::Satisfied,
-        "phase 1 (crash mid-repair): reconcile_step must return Satisfied \
-         when the version-conditional commit is intercepted by CrashMeta"
+        Reconciled::Blocked,
+        "phase 1 (crash mid-repair): reconcile_step must not certify when the \
+         version-conditional commit is intercepted by CrashMeta: the repair is still owed"
     );
 
     let frag0_id = FragmentId {
@@ -1600,14 +1602,14 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await;
 
@@ -1667,14 +1669,14 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await
     .expect("phase 3: reconcile_step (after partition heal)");
@@ -1727,14 +1729,14 @@ async fn jepsen_consistency_over_repair_under_live_partition_and_crash() {
             fleet: &fleet,
             topology: &topology,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(0),
-            staged_write_window_millis: 0,
+            clock: &wyrd_testkit::SystemClock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         }),
         None,
         None,
-        0,
+        wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
     )
     .await
     .expect("phase 4: reconcile_step (exactly-once check)");

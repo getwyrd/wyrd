@@ -56,10 +56,13 @@ use wyrd_custodian::{
     DurabilityTelemetry, ExporterConfig, FencedZone, RebalanceContext, Reconciled,
     ReconciliationStatus, ReconstructionContext,
 };
+use wyrd_testkit::ManualClock;
 use wyrd_traits::{
     ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
 };
 
+/// The instant every pass here runs at, and the one its D servers judge write deadlines at.
+const NOW: u64 = 500;
 /// The largest [`DServerId`] there is — the growth vector `crates/core/src/metadata.rs`'s
 /// ceiling note names: one moved placement entry re-encoded from a one-digit id to a
 /// twenty-digit one is ~19 bytes the record did not carry before.
@@ -135,19 +138,30 @@ impl MetadataStore for MemMeta {
 /// dir — which verifies a fragment's identity and checksum on both `put` and `get`, so a
 /// fixture that seeded bytes the loops would not accept fails loudly here instead of quietly
 /// proving nothing.
+///
+/// Every store judges a write's deadline on [`Self::clock`], the one clock each pass's context
+/// reads too (ADR-0009): a move sends its writes with a deadline fixed from its pre-mark's stamp,
+/// which a store on the wall clock would read as long past.
 struct Fleet {
     ids: Vec<DServerId>,
-    stores: Vec<FsChunkStore>,
+    stores: Vec<FsChunkStore<ManualClock>>,
+    clock: ManualClock,
     _dirs: Vec<TempDir>,
 }
 
 impl Fleet {
     fn new(ids: &[DServerId]) -> Self {
+        let clock = ManualClock::new(NOW);
         let dirs: Vec<TempDir> = ids.iter().map(|_| tempfile::tempdir().unwrap()).collect();
-        let open = |dir: &TempDir| FsChunkStore::open(dir.path()).unwrap();
-        let stores = dirs.iter().map(open).collect();
+        let open = |dir: &TempDir| FsChunkStore::open_with_clock(dir.path(), clock.clone());
+        let stores = dirs.iter().map(|dir| open(dir).unwrap()).collect();
         let (ids, _dirs) = (ids.to_vec(), dirs);
-        Self { ids, stores, _dirs }
+        Self {
+            ids,
+            stores,
+            clock,
+            _dirs,
+        }
     }
 
     /// The fleet view a context takes: each id paired with its D server's store.
@@ -156,7 +170,7 @@ impl Fleet {
         self.ids.iter().copied().zip(stores).collect()
     }
 
-    fn store(&self, id: DServerId) -> &FsChunkStore {
+    fn store(&self, id: DServerId) -> &FsChunkStore<ManualClock> {
         let at = self.ids.iter().position(|held| *held == id);
         &self.stores[at.expect("the fixture asked for a D server it never built")]
     }
@@ -265,7 +279,7 @@ async fn pass(
     zone.install(custodian.leadership());
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let subscriber = tracing_subscriber::registry().with(telemetry.metrics_layer());
-    let outcome = reconcile_step(&zone, &custodian, None, None, repair, drain, None, 500)
+    let outcome = reconcile_step(&zone, &custodian, None, None, repair, drain, None, NOW)
         .with_subscriber(subscriber)
         .await
         .unwrap();
@@ -282,8 +296,8 @@ async fn repair_pass(meta: &MemMeta, fleet: &Fleet, topology: &Topology) -> (Rec
         fleet: &view,
         topology,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &fleet.clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: view.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -396,6 +410,8 @@ async fn drain_pass(
         meta: &meta,
         fleet: &view,
         topology: &topology,
+        clock: &fleet.clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let (outcome, exposed) = pass(None, Some(&ctx)).await;
     let on_target = holds(&fleet, HUGE, frag(CHUNK, 1)).await;

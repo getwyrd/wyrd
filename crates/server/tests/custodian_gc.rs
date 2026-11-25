@@ -61,6 +61,21 @@
 //!   committed part and a crashed part's residue, is left alone while it is hours old and, once
 //!   the loop's clock is past the idle window, is fenced and torn down — every record gone, both
 //!   byte sets marked, its admission slot released. Passing no reaper from the loop turns it red.
+//! * [`deployed_loop_reaps_an_idle_upload_on_a_degraded_fleet_while_gc_is_deferred`] — the reaper
+//!   does not wait for the whole fleet (#625, slice 625.2): three servers handed to the loop
+//!   against an operator count of four, so GC is deferred on every pass, and leg A's idle upload
+//!   (`multipart_reaper.rs`) is still fenced and torn down, both byte sets marked. Dispatching the
+//!   reaper only inside GC's whole-fleet branch turns it red.
+//! * [`no_fleet_loop_rides_out_seeded_store_faults_to_leg_a_teardown`] — the role's one interval
+//!   driver with no fleet (`run_reaper_until`, slice 625.2), replayed under seeded store faults
+//!   (`wyrd_testkit::Sim`): a pass a fault fails is logged and the next interval runs another, so
+//!   leg A's teardown still completes and the loop returns `Ok`. Ending the loop on a store fault
+//!   turns it red, and so does a loop that touches the store before it has polled its stop.
+//! * [`no_fleet_loop_stops_when_a_newer_term_holds_the_zone`] — a deposed custodian's no-fleet
+//!   loop returns `Err(Fenced)` from its first pass with the store as seeded.
+//! * [`fleet_loop_polls_its_stop_before_its_first_pass`] — the same driver with a fleet polls its
+//!   stop before the first pass probes the fleet (the role's Ctrl-C registers itself on that poll),
+//!   and a stop requested by then ends the loop after exactly that one pass.
 //! * [`deployed_run_loop_refuses_duplicate_endpoints`] /
 //!   [`deployed_run_loop_refuses_duplicate_ids`] — the #554 ITERATION-4 correction: the fleet-
 //!   identity uniqueness refusal used to guard ONLY the `--reconcile-after-restore` one-shot, but
@@ -114,12 +129,13 @@ use wyrd_core::multipart::{
 };
 use wyrd_core::placement::Topology;
 use wyrd_core::write::write_new_object_placed;
-use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone};
+use wyrd_custodian::{Custodian, ExpiredPendingPolicy, FencedZone, ReconcileError};
 use wyrd_server::custodian::{ConfiguredDServer, CustodianService};
 use wyrd_telemetry::{DurabilityTelemetry, ExporterConfig};
+use wyrd_testkit::Sim;
 use wyrd_traits::{
-    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, Health, MetadataStore,
-    PlacementChunkStore, Result, WriteBatch,
+    ChunkId, ChunkStore, CommitOutcome, CommitUnknownResult, DServerId, FragmentId, Health,
+    MetadataStore, PlacementChunkStore, Result, WriteBatch,
 };
 
 // ---- in-memory trait stores (backend-agnostic; the loop is proven over the seams) ----
@@ -1205,13 +1221,34 @@ impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
 
 /// Install a permissive global `tracing` default once, so no callsite latches `Interest::never`
 /// while another test of this binary runs with no subscriber in scope (the pattern
-/// `custodian_day_one.rs` documents at its `enable_metric_callsites`).
+/// `custodian_day_one.rs` documents at its `enable_metric_callsites`) — and, in the same once,
+/// register the callsites a dropped meter provider logs at ([`register_meter_drop_callsites`]).
 fn enable_log_callsites() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
         let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        register_meter_drop_callsites();
     });
+}
+
+/// Drop one meter provider on this thread, inside no `tracing` dispatch, before the caller builds
+/// a role — so that the log lines the OpenTelemetry SDK writes when a provider is dropped have
+/// their callsites registered here, and not under `tracing`'s dispatcher-list lock.
+///
+/// A role's dispatch owns a meter provider, and the SDK logs through `tracing` as the last
+/// reference to one goes. `tracing` registers a callsite the first time it is hit, which takes
+/// its dispatcher-list lock; and while it registers a dispatch or a callsite it holds that lock
+/// with a temporary reference to every live dispatch (`tracing-core` 0.1.36, `callsite.rs`,
+/// `register_dispatch` and `Rebuilder::for_each`). A test that drops its role at that moment
+/// leaves the temporary reference the last one, so the provider is dropped under the lock, its
+/// first log line goes to register its callsite, and that waits on the lock its own thread
+/// holds: every test of the binary then blocks on that lock for good. It is a race between the
+/// tests of one binary — the more of them build and drop a role as the binary starts, the
+/// likelier — and it needs the provider's callsites to be unregistered still. Once they are
+/// registered, a provider dropped under the lock takes no lock.
+fn register_meter_drop_callsites() {
+    drop(DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap());
 }
 
 /// Create's runtime here: one fixed identity, no jitter, no wait.
@@ -1660,4 +1697,651 @@ async fn deployed_loop_reaps_an_idle_open_upload_and_tears_it_down() {
         0,
         "its admission slot is released"
     );
+}
+
+// ---- the multipart reaper runs on a DEGRADED fleet, outside GC's whole-fleet gate ----
+
+/// Leg A's fixture from `multipart_reaper.rs`, seeded raw at the loop clock `now` (#625, slice
+/// 625.2): an idle `Open` session created 14 days before `now`, its progress stamped 10 days
+/// before, every lease lapsed 9 days before; one committed `part:`/`psum:` pair over `committed`;
+/// the slot and owned `sidx:` entry of a crashed part over `in_flight`; `mpuctl.count = 1`. The
+/// record spellings are copied from that file, not shared.
+fn leg_a_records(
+    id: &UploadId,
+    now: u64,
+    committed: &ChunkRef,
+    in_flight: &ChunkRef,
+) -> Vec<(Vec<u8>, Bytes)> {
+    use wyrd_core::multipart as mp;
+    const DAY: u64 = 24 * 60 * 60 * 1_000;
+    fn canonical<T: serde::Serialize + serde::de::DeserializeOwned>(json: &str) -> Bytes {
+        let value: T = metadata::decode(json.as_bytes()).expect("a legal record");
+        metadata::encode(&value)
+    }
+    let profile = format!(
+        "{{\"w_ref\":{},\"max_part_chunks\":{},\"max_parts_per_session\":{},\
+         \"max_inflight_parts\":{},\"max_staged_chunks\":{}}}",
+        mp::W_REF,
+        mp::MAX_PART_CHUNKS,
+        mp::MAX_PARTS_PER_SESSION,
+        mp::MAX_INFLIGHT_PARTS,
+        mp::MAX_STAGED_CHUNKS
+    );
+    let budget: Budget = metadata::decode(profile.as_bytes()).expect("a legal profile");
+    let ledger = format!(
+        "{{\"count\":1,\"max_sessions\":{},\"profile\":{profile}}}",
+        budget.max_sessions()
+    );
+    let session = format!(
+        "{{\"parent\":42,\"object\":\"bucket/object-{id}\",\"created_at_millis\":{},\
+         \"clock_source\":\"wall\",\"segment_nonce\":\"{}\",\"epoch\":0,\"attempts\":0,\
+         \"state\":{{\"kind\":\"Open\"}}}}",
+        now - 14 * DAY,
+        id.as_str()
+    );
+    let slot = format!(
+        "{{\"part_number\":2,\"attempt_id\":\"{}\",\"reserved_at_millis\":{},\
+         \"lease_expiry_millis\":{}}}",
+        "ab".repeat(16),
+        now - 10 * DAY,
+        now - 9 * DAY
+    );
+    let staged = StagedPlacement::new(in_flight.scheme, in_flight.placement.clone()).unwrap();
+    let owned = OwnedEntry::new(id.clone(), now - 9 * DAY, staged).to_pending();
+    let digest = format!("{:064x}", 1);
+    let chunks_json =
+        String::from_utf8(metadata::encode(&std::slice::from_ref(committed)).to_vec()).unwrap();
+    let at = now - 10 * DAY;
+    let part = format!(
+        "{{\"chunks\":{chunks_json},\"len\":{},\"digest\":\"{digest}\",\
+         \"committed_at_millis\":{at},\"session_epoch\":0}}",
+        committed.len
+    );
+    let summary = format!(
+        "{{\"chunks\":1,\"len\":{},\"digest\":\"{digest}\",\"committed_at_millis\":{at}}}",
+        committed.len
+    );
+    let one = PartNumber::new(1).unwrap();
+    vec![
+        (
+            MPUCTL_KEY.to_vec(),
+            canonical::<mp::AdmissionRecord>(&ledger),
+        ),
+        (mpu_key(id), canonical::<mp::SessionRecord>(&session)),
+        (
+            mp::slot_key(id, mp::SlotIndex::new(0).unwrap()),
+            canonical::<mp::SlotRecord>(&slot),
+        ),
+        (
+            sidx_key(id, PartNumber::new(2).unwrap(), in_flight.id),
+            metadata::encode(&owned),
+        ),
+        (part_key(id, one), canonical::<mp::PartRecord>(&part)),
+        (psum_key(id, one), canonical::<PartSummary>(&summary)),
+    ]
+}
+
+/// Leg A's upload and its two byte sets (#625, slice 625.2), as [`leg_a_records`] spells them.
+struct LegA {
+    id: UploadId,
+    committed: ChunkRef,
+    in_flight: ChunkRef,
+}
+
+impl LegA {
+    fn new() -> Self {
+        Self {
+            id: UploadId::new("a1".repeat(16)).unwrap(),
+            committed: ChunkRef {
+                id: 0xa1_0001,
+                scheme: RS21,
+                len: 4_096,
+                placement: vec![1, 2, 3],
+            },
+            in_flight: ChunkRef {
+                id: 0xa1_0002,
+                scheme: RS21,
+                len: 4_096,
+                placement: vec![4, 5, 6],
+            },
+        }
+    }
+
+    /// Seed `meta` with leg A at the loop clock `now`.
+    async fn seed(&self, meta: &MemMeta, now: u64) {
+        let mut batch = WriteBatch::new();
+        batch.puts.extend(leg_a_records(
+            &self.id,
+            now,
+            &self.committed,
+            &self.in_flight,
+        ));
+        meta.commit(batch).await.unwrap();
+        assert_eq!(sessions_counted(meta).await, 1);
+    }
+
+    /// Assert leg A's transition on `meta`: every record of the upload gone, both of its
+    /// `retire:` ranges empty, its admission slot released, and every position of both byte sets
+    /// marked. `how` names the run, for the message.
+    async fn assert_torn_down(&self, meta: &MemMeta, how: &str) {
+        let id = &self.id;
+        assert_eq!(
+            meta.get(&mpu_key(id)).await.unwrap(),
+            None,
+            "{how}: the idle upload is fenced and its teardown finished"
+        );
+        for prefix in [
+            wyrd_core::multipart::part_range(id),
+            wyrd_core::multipart::psum_range(id),
+            wyrd_core::multipart::sidx_range(id),
+            wyrd_core::multipart::slot_range(id),
+            wyrd_core::multipart::retire_session_range(wyrd_core::multipart::RetireMode::Bytes, id),
+            wyrd_core::multipart::retire_session_range(
+                wyrd_core::multipart::RetireMode::Records,
+                id,
+            ),
+        ] {
+            let left = meta.scan(&prefix).await.unwrap();
+            assert!(left.is_empty(), "{how}: drained: {left:?}");
+        }
+        assert_eq!(
+            sessions_counted(meta).await,
+            0,
+            "{how}: its admission slot is released"
+        );
+        for chunk in [&self.committed, &self.in_flight] {
+            for (index, &dserver) in chunk.placement.iter().enumerate() {
+                assert!(
+                    orphan_record_present(meta, dserver, chunk.id, index as u16).await,
+                    "{how}: fragment {index} of {:#x} on server {dserver} is marked",
+                    chunk.id
+                );
+            }
+            assert_eq!(marks_of(meta, chunk.id).await, 3, "{how}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn deployed_loop_reaps_an_idle_upload_on_a_degraded_fleet_while_gc_is_deferred() {
+    // The operator wired four D servers; one was down at startup, so `connect_fleet` handed the
+    // loop three. GC's whole-fleet gate (`fleet.len() == operator_fleet_size`) defers GC on every
+    // pass — and the multipart reaper must not wait with it: it runs on whatever part of the fleet
+    // is reachable (#625, 0016 `:234-268`). Leg A's idle upload is fenced and torn down with every
+    // byte evidenced.
+    enable_log_callsites();
+    const OPERATOR_FLEET_SIZE: usize = 4;
+    let meta = MemMeta::default();
+    let d: Vec<Arc<MemDServer>> = (0..3).map(|_| Arc::new(MemDServer::default())).collect();
+    let servers: Vec<ConfiguredDServer> = (0..3u16)
+        .map(|i| ConfiguredDServer {
+            id: DServerId::from(i),
+            failure_domain: format!("domain-{i}"),
+            store: dyn_store(&d[usize::from(i)]),
+        })
+        .collect();
+    assert!(
+        servers.len() < OPERATOR_FLEET_SIZE,
+        "a degraded fleet: GC is deferred on every pass"
+    );
+    let leg = LegA::new();
+    leg.seed(&meta, LEG_A_NOW).await;
+
+    let capture = Capture::default();
+    drive_passes_at(
+        &meta,
+        &servers,
+        OPERATOR_FLEET_SIZE,
+        &d[0],
+        6,
+        &capture,
+        LEG_A_NOW,
+    )
+    .await;
+
+    leg.assert_torn_down(
+        &meta,
+        "on the degraded fleet (RED if the reaper is dispatched only inside GC's whole-fleet \
+         branch)",
+    )
+    .await;
+}
+
+// ---- the role's one interval driver: its stop, its retries, its fence (#625, slice 625.2) ----
+
+/// The loop clock leg A is seeded and judged at: far enough past the epoch for its 14-day-old
+/// stamps.
+const LEG_A_NOW: u64 = 40 * 24 * 60 * 60 * 1_000;
+
+/// How many seeds the no-fleet loop's fault run is replayed under.
+const FAULT_SEEDS: u64 = 32;
+
+/// How many of its first store calls a seeded run may fail. Leg A's clean teardown takes three
+/// passes; this window covers the first of them and more, and every call after it is answered,
+/// so a loop that retries converges.
+const FAULT_WINDOW: u64 = 40;
+
+/// Each call inside [`FAULT_WINDOW`] fails with a one-in-this chance, drawn from the seed.
+const FAULT_ONE_IN: u32 = 5;
+
+/// The operator signal the reaper raises for a fence whose commit came back with an outcome the
+/// store could not report (`wyrd_custodian` reaper, `fence_unknown`).
+const FENCE_OUTCOME_UNKNOWN: &str = "reaper-fence-outcome-unknown";
+
+/// A metadata store over [`MemMeta`] that fails a seeded share of its first calls: each of the
+/// first [`FAULT_WINDOW`] fails with a one-in-[`FAULT_ONE_IN`] chance drawn from the run's
+/// [`Sim`], and one of them, drawn too, fails for certain; every later call is answered. A failed
+/// read answers an error and nothing else. A failed commit is applied or not — drawn as well — and
+/// answers the seam's own [`CommitUnknownResult`] either way, as a networked backend answers a
+/// commit it could not confirm: never a plain error, which the contract reads as "nothing was
+/// written" and which would be false of every applied draw. `may_still_commit` is `false`: the
+/// batch is in or out before the error is returned, so one re-read settles it. Both draws are
+/// counted, and so are the calls that came before `armed` was set.
+struct FlakyMeta<'a> {
+    inner: &'a MemMeta,
+    sim: Mutex<Sim>,
+    certain: u64,
+    armed: &'a AtomicBool,
+    calls: AtomicU64,
+    faults: AtomicU64,
+    unknown_applied: AtomicU64,
+    unknown_unapplied: AtomicU64,
+    unarmed_calls: AtomicU64,
+}
+
+impl<'a> FlakyMeta<'a> {
+    fn new(inner: &'a MemMeta, seed: u64, armed: &'a AtomicBool) -> Self {
+        let mut sim = Sim::new(seed);
+        let certain = sim.gen::<u64>() % FAULT_WINDOW;
+        Self {
+            inner,
+            sim: Mutex::new(sim),
+            certain,
+            armed,
+            calls: AtomicU64::new(0),
+            faults: AtomicU64::new(0),
+            unknown_applied: AtomicU64::new(0),
+            unknown_unapplied: AtomicU64::new(0),
+            unarmed_calls: AtomicU64::new(0),
+        }
+    }
+
+    /// Whether this call fails.
+    fn fails(&self) -> bool {
+        if !self.armed.load(Ordering::SeqCst) {
+            self.unarmed_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call >= FAULT_WINDOW {
+            return false;
+        }
+        let drawn = self
+            .sim
+            .lock()
+            .unwrap()
+            .gen::<u32>()
+            .is_multiple_of(FAULT_ONE_IN);
+        let fails = drawn || call == self.certain;
+        if fails {
+            self.faults.fetch_add(1, Ordering::SeqCst);
+        }
+        fails
+    }
+
+    fn fault<T>() -> Result<T> {
+        Err("injected metadata fault".into())
+    }
+}
+
+#[async_trait]
+impl MetadataStore for FlakyMeta<'_> {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        if self.fails() {
+            return Self::fault();
+        }
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        if self.fails() {
+            return Self::fault();
+        }
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        if self.fails() {
+            return Self::fault();
+        }
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        if self.fails() {
+            // Drawn: the batch is sent on and its answer lost, or it is never sent. A batch sent
+            // on whose precondition fails writes nothing, so it counts as not applied.
+            let sent = self.sim.lock().unwrap().gen::<bool>();
+            let applied = sent && self.inner.commit(batch).await? == CommitOutcome::Committed;
+            let drawn = if applied {
+                &self.unknown_applied
+            } else {
+                &self.unknown_unapplied
+            };
+            drawn.fetch_add(1, Ordering::SeqCst);
+            return Err(Box::new(CommitUnknownResult {
+                backend: "flaky-mem",
+                code: None,
+                detail: "injected fault: the answer to this commit was lost".to_owned(),
+                // In or out already: nothing is in flight once this error is returned.
+                may_still_commit: false,
+            }));
+        }
+        self.inner.commit(batch).await
+    }
+}
+
+/// **The no-fleet loop rides out seeded store faults** and finishes leg A's teardown (#625, slice
+/// 625.2). The loop the role with no `--endpoints` runs ([`CustodianService::run_reaper_until`])
+/// is driven over [`FlakyMeta`] under each of [`FAULT_SEEDS`] seeds: reads, listings and commits
+/// fail at seeded calls of its first passes, a failed commit applied or not and answered with
+/// [`CommitUnknownResult`] either way. A pass a fault fails is logged and the next interval runs
+/// another, so the loop must still be running when leg A's session record is gone — its stop is
+/// that — and return `Ok`, with leg A's whole transition on the store. Each seed also checks that
+/// the loop polled its stop before its first store call: the stop here, like the role's Ctrl-C,
+/// registers itself on its first poll.
+///
+/// Over the seeds both draws of a failed commit must have happened — applied and not applied —
+/// and the reaper must have taken at least one of them on its fence, down the path it keeps for a
+/// commit whose outcome the store could not report (its `reaper-fence-outcome-unknown` signal):
+/// the seeds converge through that path, not around it.
+#[tokio::test]
+async fn no_fleet_loop_rides_out_seeded_store_faults_to_leg_a_teardown() {
+    enable_log_callsites();
+    // One role for every seed, built as `wyrd custodian` builds it, its log sink captured: the
+    // reaper names a fence whose outcome it could not learn there.
+    let capture = Capture::default();
+    let log = wyrd_server::logging::LogConfig::new(Some("warn"), None).unwrap();
+    let service = CustodianService::with_logging_to(
+        DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap(),
+        &log,
+        capture.clone(),
+    );
+    let mut unknown_applied = 0;
+    let mut unknown_unapplied = 0;
+    for seed in 0..FAULT_SEEDS {
+        let meta = MemMeta::default();
+        let leg = LegA::new();
+        leg.seed(&meta, LEG_A_NOW).await;
+        let armed = AtomicBool::new(false);
+        let flaky = FlakyMeta::new(&meta, seed, &armed);
+        let coord = MemCoordination::new();
+        let (zone, custodian) = elect(&coord).await;
+        let session = mpu_key(&leg.id);
+        let shutdown = async {
+            // Registered on the first poll, as `ctrl_c()` installs its handler.
+            armed.store(true, Ordering::SeqCst);
+            while meta.get(&session).await.unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let run = service.run_reaper_until(
+            &zone,
+            &custodian,
+            &flaky,
+            Duration::from_millis(1),
+            || LEG_A_NOW,
+            shutdown,
+        );
+        tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .unwrap_or_else(|_| panic!("seed {seed}: leg A's teardown did not converge"))
+            .unwrap_or_else(|e| panic!("seed {seed}: a store fault ended the loop: {e}"));
+
+        assert_eq!(
+            flaky.unarmed_calls.load(Ordering::SeqCst),
+            0,
+            "seed {seed}: the loop called the store before it polled its stop"
+        );
+        assert!(
+            flaky.faults.load(Ordering::SeqCst) >= 1,
+            "seed {seed}: faults were injected"
+        );
+        leg.assert_torn_down(&meta, &format!("seed {seed}")).await;
+        unknown_applied += flaky.unknown_applied.load(Ordering::SeqCst);
+        unknown_unapplied += flaky.unknown_unapplied.load(Ordering::SeqCst);
+    }
+    let unknown_fences = capture.contents().matches(FENCE_OUTCOME_UNKNOWN).count();
+    assert!(
+        unknown_applied >= 1 && unknown_unapplied >= 1,
+        "over {FAULT_SEEDS} seeds a failed commit was drawn both ways: {unknown_applied} applied, \
+         {unknown_unapplied} not applied"
+    );
+    assert!(
+        unknown_fences >= 1,
+        "over {FAULT_SEEDS} seeds the reaper took a failed fence commit as an outcome it could \
+         not learn (`{FENCE_OUTCOME_UNKNOWN}`) at least once"
+    );
+}
+
+/// **The no-fleet loop stops when a newer term holds the zone**, having changed nothing (#625,
+/// slice 625.2). A deposed custodian's [`CustodianService::run_reaper_until`] returns
+/// `Err(Fenced)` from its first pass — a superseded leader must not keep acting — and leg A's
+/// store is exactly as seeded.
+#[tokio::test]
+async fn no_fleet_loop_stops_when_a_newer_term_holds_the_zone() {
+    enable_log_callsites();
+    let meta = MemMeta::default();
+    LegA::new().seed(&meta, LEG_A_NOW).await;
+    let seeded = meta.kv.lock().unwrap().clone();
+
+    let coord = MemCoordination::new();
+    let deposed = Custodian::elect(&coord, "zone-reconstruction")
+        .await
+        .unwrap();
+    let mut zone = FencedZone::new();
+    zone.install(deposed.leadership());
+    let newer = Custodian::elect(&coord, "zone-reconstruction")
+        .await
+        .unwrap();
+    zone.install(newer.leadership());
+    assert!(newer.term() > deposed.term());
+    let service =
+        CustodianService::new(DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap());
+
+    let run = service.run_reaper_until(
+        &zone,
+        &deposed,
+        &meta,
+        Duration::from_millis(1),
+        || LEG_A_NOW,
+        std::future::pending::<()>(),
+    );
+    let err = tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("a fenced loop stops by itself")
+        .expect_err("a deposed custodian's no-fleet loop stops rather than act");
+    assert!(
+        matches!(err, ReconcileError::Fenced(_)),
+        "fenced, not a store fault: {err}"
+    );
+    assert!(
+        *meta.kv.lock().unwrap() == seeded,
+        "the deposed custodian changed the store"
+    );
+}
+
+/// **The fleet loop polls its stop before its first pass, and a stop requested by then ends the
+/// loop after that pass** (#625, slice 625.2). The role's Ctrl-C registers itself only when first
+/// polled; polled after the first pass, a Ctrl-C during that pass killed the process. The stop
+/// here records how many reachability probes — one a pass — the fleet had answered when it was
+/// first polled, and is done at once: it must have been polled before any probe, and the loop must
+/// then run exactly one pass and return `Ok`.
+#[tokio::test]
+async fn fleet_loop_polls_its_stop_before_its_first_pass() {
+    enable_log_callsites();
+    let meta = MemMeta::default();
+    let d: Vec<Arc<MemDServer>> = (0..3).map(|_| Arc::new(MemDServer::default())).collect();
+    let servers: Vec<ConfiguredDServer> = (0..3u16)
+        .map(|i| ConfiguredDServer {
+            id: DServerId::from(i),
+            failure_domain: format!("domain-{i}"),
+            store: dyn_store(&d[usize::from(i)]),
+        })
+        .collect();
+    let coord = MemCoordination::new();
+    let (zone, custodian) = elect(&coord).await;
+    let service =
+        CustodianService::new(DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap());
+    let probes_when_polled = AtomicU64::new(u64::MAX);
+    let shutdown = async {
+        probes_when_polled.store(d[0].probes(), Ordering::SeqCst);
+    };
+
+    let run = service.run_reconstruction_until(
+        &zone,
+        &custodian,
+        &meta,
+        &servers,
+        servers.len(),
+        ExpiredPendingPolicy::Defer,
+        Duration::from_millis(1),
+        || LEG_A_NOW,
+        shutdown,
+    );
+    tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("the loop stops by itself")
+        .expect("and cleanly");
+
+    assert_eq!(
+        probes_when_polled.load(Ordering::SeqCst),
+        0,
+        "the stop is polled before the first pass probes the fleet"
+    );
+    assert_eq!(
+        d[0].probes(),
+        1,
+        "a stop requested before the first pass ends the loop after it, not before"
+    );
+}
+
+/// The tally every reaper pass emits once, at its end (`wyrd_custodian` reaper, `emit_pass`).
+const REAPER_PASS_TALLY: &str = "monotonic_counter.reaper_passes";
+
+/// How many times the both-ready wait is replayed for each shape of the loop. A wait that picks
+/// between two ready branches at random starts no further pass in about half its rounds, so one
+/// round proves nothing; this many all passing by that chance is one in 2^64.
+const BOTH_READY_ROUNDS: usize = 64;
+
+/// **A stop that is ready when the interval's timer is ready wins: the loop starts no further
+/// pass** (#625, slice 625.2). Between two passes the loop waits on its stop and on its
+/// interval's timer together, and a Ctrl-C can land as the interval runs out, so that one poll
+/// finds both ready. Here that happens every round, on a paused clock: the stop is itself a timer
+/// of the loop's own interval, started before the loop is. A paused clock does not move while the
+/// first pass runs, so the timer the loop then starts for its wait falls due at the stop's own
+/// instant, and the clock's one jump to that instant wakes the wait with both ready.
+///
+/// The stop records the clock at each of its polls, and the three it must show say the fixture
+/// held: before the first pass and again as the wait began, the clock unmoved — so the two timers
+/// have one deadline — then once more at that deadline. Each round, the loop with no fleet and
+/// the loop over one must each run exactly one pass and return `Ok`.
+#[tokio::test(start_paused = true)]
+async fn a_stop_ready_with_the_interval_timer_starts_no_further_pass() {
+    enable_log_callsites();
+    const INTERVAL: Duration = Duration::from_secs(1);
+    const BOUND: Duration = Duration::from_secs(60);
+    // One role for every round, its log sink captured: each reaper pass writes its tally there.
+    let capture = Capture::default();
+    let log = wyrd_server::logging::LogConfig::new(Some("info"), None).unwrap();
+    let service = CustodianService::with_logging_to(
+        DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap(),
+        &log,
+        capture.clone(),
+    );
+    let mut tallied = 0;
+    for round in 0..BOTH_READY_ROUNDS {
+        for fleet in [false, true] {
+            let shape = if fleet {
+                "the fleet loop"
+            } else {
+                "the no-fleet loop"
+            };
+            let meta = MemMeta::default();
+            // Leg A's idle upload: a pass that starts has an upload to act on.
+            LegA::new().seed(&meta, LEG_A_NOW).await;
+            let d: Vec<Arc<MemDServer>> = (0..3).map(|_| Arc::new(MemDServer::default())).collect();
+            let servers: Vec<ConfiguredDServer> = (0..3u16)
+                .map(|i| ConfiguredDServer {
+                    id: DServerId::from(i),
+                    failure_domain: format!("domain-{i}"),
+                    store: dyn_store(&d[usize::from(i)]),
+                })
+                .collect();
+            let coord = MemCoordination::new();
+            let (zone, custodian) = elect(&coord).await;
+
+            let started = tokio::time::Instant::now();
+            let due = tokio::time::sleep(INTERVAL);
+            tokio::pin!(due);
+            let polled_at = Mutex::new(Vec::new());
+            let shutdown = std::future::poll_fn(|cx| {
+                polled_at.lock().unwrap().push(tokio::time::Instant::now());
+                due.as_mut().poll(cx)
+            });
+            let ran = if fleet {
+                let run = service.run_reconstruction_until(
+                    &zone,
+                    &custodian,
+                    &meta,
+                    &servers,
+                    servers.len(),
+                    ExpiredPendingPolicy::Defer,
+                    INTERVAL,
+                    || LEG_A_NOW,
+                    shutdown,
+                );
+                tokio::time::timeout(BOUND, run).await
+            } else {
+                let run = service.run_reaper_until(
+                    &zone,
+                    &custodian,
+                    &meta,
+                    INTERVAL,
+                    || LEG_A_NOW,
+                    shutdown,
+                );
+                tokio::time::timeout(BOUND, run).await
+            };
+            ran.unwrap_or_else(|_| panic!("{shape}, round {round}: the loop did not stop"))
+                .unwrap_or_else(|e| panic!("{shape}, round {round}: the loop failed: {e}"));
+
+            assert_eq!(
+                polled_at.into_inner().unwrap(),
+                [started, started, started + INTERVAL],
+                "{shape}, round {round}: the stop is polled before the first pass, again as the \
+                 wait begins with the clock unmoved — the wait's timer and the stop then have one \
+                 deadline — and once more at that deadline, both ready"
+            );
+            let tallies = capture.contents().matches(REAPER_PASS_TALLY).count();
+            let passes = tallies - tallied;
+            tallied = tallies;
+            assert_eq!(
+                passes, 1,
+                "{shape}, round {round}: the stop was ready with the interval's timer, and the \
+                 loop started another pass after it"
+            );
+            if fleet {
+                assert_eq!(
+                    d[0].probes(),
+                    1,
+                    "{shape}, round {round}: one pass probed the fleet, and no other began"
+                );
+            }
+        }
+    }
 }

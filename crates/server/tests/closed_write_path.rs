@@ -171,10 +171,14 @@ fn under_replicated(service: &CustodianService) -> Option<f64> {
 /// runs EXACTLY ONE pass before its short shutdown fires, so the caller reads the gauge at a
 /// single, well-defined moment. Each call reopens the redb the prior dropped (redb is
 /// single-writer), so two calls capture the rise (1) then the return (0).
+///
+/// The loop runs on the wall clock, as the deployed role does: these are real D servers, which
+/// judge the deadline a repair's write carries — fixed from its destination pre-mark's stamp —
+/// on the wall clock (`FsChunkStore::open`), so a fixed logical instant would hand every repair
+/// a deadline already long past (ADR-0009: one clock per lifecycle).
 async fn one_custodian_pass(
     data_dir: &str,
     configured: &[wyrd_server::custodian::ConfiguredDServer],
-    clock: u64,
 ) -> CustodianService {
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -190,7 +194,7 @@ async fn one_custodian_pass(
         configured.len(),
         ExpiredPendingPolicy::Defer,
         Duration::from_secs(3600),
-        move || clock,
+        || wyrd_testkit::Clock::now_millis(&wyrd_testkit::SystemClock),
         async { tokio::time::sleep(Duration::from_millis(60)).await },
     )
     .await
@@ -333,7 +337,7 @@ async fn a_gateway_written_object_is_a_custodian_derived_repair_obligation_and_r
     //         repair paths disagreeing on placement), it would run reconstruction over an
     //         EMPTY queue and read the object as fully healthy (0 obligations) — the "empty
     //         store" symptom the issue names — even though a D-server actually lost data. ----
-    let service1 = one_custodian_pass(&data_dir_path, &configured, 500).await;
+    let service1 = one_custodian_pass(&data_dir_path, &configured).await;
     assert_eq!(
         under_replicated(&service1),
         Some(1.0),
@@ -344,7 +348,7 @@ async fn a_gateway_written_object_is_a_custodian_derived_repair_obligation_and_r
 
     // ---- 4. PASS 2 — a fresh custodian instance reopens the (now-repaired) store and
     //         reassesses: the gauge must RETURN TO ZERO and the obligation must be drained. ----
-    let service2 = one_custodian_pass(&data_dir_path, &configured, 700).await;
+    let service2 = one_custodian_pass(&data_dir_path, &configured).await;
     assert_eq!(
         under_replicated(&service2),
         Some(0.0),

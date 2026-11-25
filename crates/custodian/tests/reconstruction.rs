@@ -110,9 +110,25 @@ impl MetadataStore for MemMeta {
 
 /// One D server's fragment bytes — a deliberately dumb `ChunkStore` holding the **real**
 /// stored fragment bytes (so their checksums verify and the rebuilt shard round-trips).
-#[derive(Default)]
+///
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// clock the pass that sends it reads — the context's clock, one source (ADR-0009): refused at or
+/// past its deadline before anything is stored (`WriteDeadlineExpired::if_elapsed`), and refused
+/// certification if that clock reads at or past it once the bytes are stored
+/// (`WriteDeadlineExpired::if_publication_unverified`).
 struct MemDServer {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
+}
+
+impl MemDServer {
+    /// A D server judging deadlines on `clock`, the one the reconstruction pass reads.
+    fn on(clock: &wyrd_testkit::ManualClock) -> Self {
+        Self {
+            frags: Mutex::default(),
+            clock: clock.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -121,9 +137,24 @@ impl ChunkStore for MemDServer {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
         self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
 
@@ -327,13 +358,14 @@ fn enable_metric_callsites() {
 
 #[tokio::test]
 async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_step() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -368,8 +400,8 @@ async fn kills_a_d_server_and_reconstructs_to_full_redundancy_through_reconcile_
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -471,13 +503,14 @@ async fn stamp_object_meta(meta: &MemMeta, id: InodeId) -> (String, String, u64)
 /// invariant is otherwise VACUOUSLY true.
 #[tokio::test]
 async fn reconstruction_preserves_object_metadata_across_a_repair() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -504,8 +537,8 @@ async fn reconstruction_preserves_object_metadata_across_a_repair() {
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -548,13 +581,14 @@ async fn reconstruction_preserves_object_metadata_across_a_repair() {
 
 #[tokio::test]
 async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -581,8 +615,8 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
         fleet: &full_fleet,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: full_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -642,13 +676,14 @@ async fn a_checksum_failing_fragment_is_excluded_and_reconstructed() {
 /// survivors — never a re-committed short/empty vector.
 #[tokio::test]
 async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_record() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -705,8 +740,8 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -784,14 +819,15 @@ async fn reconstructs_a_pre_m3_chunk_with_empty_placement_to_a_full_length_recor
 /// this goes red (the placement is repointed to `[9, 1, 3]` and the obligation is drained).
 #[tokio::test]
 async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3, d9) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3), (9, &d9)],
@@ -846,8 +882,8 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -912,13 +948,14 @@ async fn short_placement_is_malformed_reconstruction_skips_and_flags_needs_human
 /// red (the malformed `None` placement returns `Unrepairable`, no metric is exported).
 #[tokio::test]
 async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -951,8 +988,8 @@ async fn none_scheme_malformed_placement_reconstruction_flags_needs_human() {
         fleet: &healthy_fleet,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1062,9 +1099,10 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>) -> Vec<u8> {
 /// case above (RS{2,1}) leaves open.
 #[tokio::test]
 async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
-    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
+    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::on(&pass_clock)).collect();
     let fleet = Fleet {
         servers: servers
             .iter()
@@ -1102,8 +1140,8 @@ async fn kills_a_d_server_and_reconstructs_an_rs_6_3_chunk_to_full_redundancy() 
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1251,24 +1289,25 @@ fn transient_fault() -> wyrd_traits::BoxError {
 /// (RED). Post-fix the permanent fault is classified and read around → `Reconciled::Changed`
 /// and the chunk is back to full redundancy (GREEN).
 async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::BoxError) {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let meta = MemMeta::default();
     let (d0, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     // Server 1's disk faults every read (a dead sector / `dm-error` `EIO`), but it is
     // still in the fleet — so `assess` actually calls `get_fragment` on it and must
     // classify the fault, not route around it by absence.
     let faulted1 = FaultGetStore {
-        inner: MemDServer::default(),
+        inner: MemDServer::on(&pass_clock),
         error: make_error,
     };
     {
         // Place the chunk's three fragments on servers 0,1,2 via the real write path.
         // `d1`'s real fragment bytes are irrelevant: the reconstruction fleet swaps in
         // the faulting store at server 1, so the read fault — not absence — is exercised.
-        let d1 = MemDServer::default();
+        let d1 = MemDServer::on(&pass_clock);
         let fleet = Fleet {
             servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         };
@@ -1290,8 +1329,8 @@ async fn reads_around_a_permanent_read_fault(make_error: fn() -> wyrd_traits::Bo
         fleet: &recon_fleet,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: recon_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1362,19 +1401,20 @@ async fn reads_around_a_wrapped_permanent_read_fault_on_a_placed_fragment() {
 /// bump), failing every assertion below.
 #[tokio::test]
 async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let faulted1 = FaultGetStore {
-        inner: MemDServer::default(),
+        inner: MemDServer::on(&pass_clock),
         error: transient_fault,
     };
     {
-        let d1 = MemDServer::default();
+        let d1 = MemDServer::on(&pass_clock);
         let fleet = Fleet {
             servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         };
@@ -1396,8 +1436,8 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
         fleet: &recon_fleet,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: recon_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1437,13 +1477,14 @@ async fn a_transient_fault_is_not_turned_into_a_spurious_re_placement() {
 
 #[tokio::test]
 async fn emits_the_three_repair_metrics_on_the_durability_seam() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -1466,8 +1507,8 @@ async fn emits_the_three_repair_metrics_on_the_durability_seam() {
         fleet: &healthy_fleet,
         topology: &healthy_topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1632,15 +1673,16 @@ fn gauge_value(exposed: &str, name: &str) -> Option<f64> {
 /// pinned above zero by the malformed chunk. Post-fix: **1** then **0** — RED→GREEN.
 #[tokio::test]
 async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     const CHUNK_B: ChunkId = 0x0BAD_0BAD;
     let meta = MemMeta::default();
     let (d0, d1, d2, d3, d9) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3), (9, &d9)],
@@ -1684,8 +1726,8 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1709,13 +1751,14 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
     // PASS 2 — chunk A is repaired (full redundancy → not counted); chunk B is still malformed
     // (queued, still not counted). The gauge RETURNS TO ZERO on the populated store.
     let telemetry2 = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    pass_clock.set(600);
     let ctx2 = ReconstructionContext {
         meta: &meta,
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(600),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1767,14 +1810,15 @@ async fn under_replicated_gauge_excludes_malformed_so_it_returns_to_zero() {
 /// Post-fix: **1** then **0**, with `reconstruction_data_loss` raised — RED→GREEN.
 #[tokio::test]
 async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to_zero() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     const CHUNK_B: ChunkId = 0x0D00_D000;
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -1823,8 +1867,8 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1850,13 +1894,14 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
     // (queued, still un-reconstructable). The backlog gauge RETURNS TO ZERO on the populated
     // store, and the data-loss signal keeps firing while the loss persists.
     let telemetry2 = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
+    pass_clock.set(600);
     let ctx2 = ReconstructionContext {
         meta: &meta,
         fleet: &[(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
         topology: &four_domains(),
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(600),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: 4,
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1904,13 +1949,14 @@ async fn under_replicated_gauge_excludes_unrepairable_data_loss_so_it_returns_to
 /// identity holds.
 #[tokio::test]
 async fn an_aborted_repair_is_not_counted_as_a_successful_repair() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -1962,8 +2008,8 @@ async fn an_aborted_repair_is_not_counted_as_a_successful_repair() {
         fleet: &recon_fleet,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: recon_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };

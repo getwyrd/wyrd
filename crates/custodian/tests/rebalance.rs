@@ -34,8 +34,9 @@
 //!    between the loop's read (`plan_evacuations`) and its commit, the version-conditional
 //!    `MetadataStore::commit` precondition fails — the custodian's repoint is **rejected**,
 //!    the placement record reflects the racing writer (not the custodian), the copied
-//!    fragment is left as **collectable garbage** (no orphan record, no torn chunk), and
-//!    the conflict is surfaced on the durability seam.
+//!    fragment is left as **collectable garbage** under the move's own destination pre-mark
+//!    (no vacated-position mark, no torn chunk), and the conflict is surfaced on the
+//!    durability seam.
 
 #![forbid(unsafe_code)]
 
@@ -117,9 +118,25 @@ impl MetadataStore for MemMeta {
 
 /// One D server's fragment bytes — a deliberately dumb `ChunkStore` holding the **real**
 /// stored fragment bytes (so their checksums verify and the moved fragment round-trips).
-#[derive(Default)]
+///
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// clock the pass that sends it reads — the context's clock, one source (ADR-0009): refused at or
+/// past its deadline before anything is stored (`WriteDeadlineExpired::if_elapsed`), and refused
+/// certification if that clock reads at or past it once the bytes are stored
+/// (`WriteDeadlineExpired::if_publication_unverified`).
 struct MemDServer {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
+}
+
+impl MemDServer {
+    /// A D server judging deadlines on `clock`, the one the rebalance pass reads.
+    fn on(clock: &wyrd_testkit::ManualClock) -> Self {
+        Self {
+            frags: Mutex::default(),
+            clock: clock.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -128,9 +145,24 @@ impl ChunkStore for MemDServer {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
         self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
 
@@ -380,13 +412,14 @@ fn enable_metric_callsites() {
 
 #[tokio::test]
 async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -419,6 +452,8 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_ec_none() {
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -513,13 +548,14 @@ async fn stamp_object_meta(meta: &MemMeta, id: InodeId) -> (String, String, u64)
 /// all-`None` metadata, so this invariant is otherwise VACUOUSLY true.
 #[tokio::test]
 async fn evacuation_preserves_object_metadata() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -540,6 +576,8 @@ async fn evacuation_preserves_object_metadata() {
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -581,13 +619,14 @@ async fn evacuation_preserves_object_metadata() {
 /// identity-resolved fragment set rather than the (empty) raw vector.
 #[tokio::test]
 async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zero() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -618,6 +657,8 @@ async fn evacuates_a_pre_m3_chunk_with_empty_placement_reed_solomon_index_gt_zer
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -728,9 +769,10 @@ async fn write_rs_6_3(meta: &MemMeta, fleet: &Fleet<'_>, topo: &Topology) -> Vec
 /// chunk on n=9 distinct domains throughout.
 #[tokio::test]
 async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
-    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::default()).collect();
+    let servers: Vec<MemDServer> = (0..10).map(|_| MemDServer::on(&pass_clock)).collect();
     let fleet = Fleet {
         servers: servers
             .iter()
@@ -760,6 +802,8 @@ async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() 
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -819,13 +863,14 @@ async fn drains_a_d_server_and_evacuates_an_rs_6_3_chunk_to_a_distinct_domain() 
 
 #[tokio::test]
 async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_step() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -851,6 +896,8 @@ async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -925,12 +972,13 @@ async fn drains_a_d_server_and_evacuates_to_a_distinct_domain_through_reconcile_
 
 #[tokio::test]
 async fn spread_wins_when_no_free_distinct_domain_remains() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2)],
@@ -967,6 +1015,8 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -1001,13 +1051,14 @@ async fn spread_wins_when_no_free_distinct_domain_remains() {
 
 #[tokio::test]
 async fn emits_per_failure_domain_utilization_on_the_durability_seam() {
+    let pass_clock = wyrd_testkit::ManualClock::new(0);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let dyn_fleet: [(DServerId, &dyn ChunkStore); 4] = [(0, &d0), (1, &d1), (2, &d2), (3, &d3)];
 
@@ -1022,6 +1073,8 @@ async fn emits_per_failure_domain_utilization_on_the_durability_seam() {
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
 
     let coord = MemCoordination::new();
@@ -1056,14 +1109,15 @@ async fn emits_per_failure_domain_utilization_on_the_durability_seam() {
 
 #[tokio::test]
 async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3, d4) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3), (4, &d4)],
@@ -1097,6 +1151,8 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -1191,7 +1247,8 @@ async fn evacuates_two_drained_servers_of_one_chunk_in_a_single_commit() {
 // ---- criterion 6: a racing writer loses the version-conditional commit (lost CAS) ----
 
 /// A [`MetadataStore`] that injects a **single** concurrent inode mutation the first time
-/// the custodian attempts a version-conditional commit — modelling a racing writer that
+/// the custodian attempts the version-conditional repoint — the one commit that rewrites the
+/// inode record, after the destination pre-mark and the copy — modelling a racing writer that
 /// supersedes the inode between the rebalance loop's read (`plan_evacuations`) and its
 /// commit. The injected write bumps the inode version (placement unchanged) so the
 /// custodian's `require(prior)` precondition fails: the custodian loses the CAS rather
@@ -1200,7 +1257,7 @@ struct RacingMeta {
     inner: MemMeta,
     /// Becomes `true` once the test has finished setup and wants the race injected.
     armed: Mutex<bool>,
-    /// Ensures the race is injected exactly once (on the first inode-conditional commit).
+    /// Ensures the race is injected exactly once (on the first repoint commit).
     raced: Mutex<bool>,
 }
 
@@ -1213,7 +1270,7 @@ impl RacingMeta {
         }
     }
 
-    /// Arm the race: subsequent inode-conditional commits trigger one concurrent mutation.
+    /// Arm the race: the next repoint commit triggers one concurrent mutation.
     fn arm(&self) {
         *self.armed.lock().unwrap() = true;
     }
@@ -1245,10 +1302,7 @@ impl MetadataStore for RacingMeta {
         let inject = {
             let armed = *self.armed.lock().unwrap();
             let mut raced = self.raced.lock().unwrap();
-            let targets_inode = batch
-                .preconditions
-                .iter()
-                .any(|p| p.key.starts_with(b"inode:"));
+            let targets_inode = batch.puts.iter().any(|(k, _)| k.starts_with(b"inode:"));
             if armed && !*raced && targets_inode {
                 *raced = true;
                 true
@@ -1282,13 +1336,14 @@ impl MetadataStore for RacingMeta {
 
 #[tokio::test]
 async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_garbage() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let racing = RacingMeta::new();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -1336,6 +1391,8 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
         meta: &racing,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
@@ -1375,14 +1432,25 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
 
     // The copied fragment IS at its new home (server 3) — but it is collectable GARBAGE:
     // the atomic commit that would have referenced it and orphaned the source was rejected,
-    // so no orphan record exists and the record never points at it.
+    // so the record never points at it and the source was NOT orphaned (no torn move). The
+    // one mark in the store is the move's own destination pre-mark, still standing over the
+    // copy, which is what lets GC reclaim it after grace rather than keep it for ever (#1084).
     assert!(
         d3.get_fragment(frag(1)).await.unwrap().is_some(),
         "the pre-commit copy landed on server 3 — now unreferenced collectable garbage"
     );
+    let marks = racing.scan(b"orphan:").await.unwrap();
+    let keys: Vec<&[u8]> = marks.iter().map(|(key, _)| key.as_slice()).collect();
+    assert_eq!(
+        keys,
+        vec![metadata::orphan_key(3, frag(1)).as_slice()],
+        "the lost commit was atomic: only the copy's pre-mark stands, the displaced fragment \
+         was NOT orphaned"
+    );
+    let premark = metadata::decode_orphan_mark(&marks[0].1).unwrap();
     assert!(
-        racing.scan(b"orphan:").await.unwrap().is_empty(),
-        "the lost commit was atomic: the displaced fragment was NOT orphaned (no torn move)"
+        premark.event().is_some() && !premark.is_reclaiming(),
+        "the copy stands under the move's own pre-mark: {premark:?}"
     );
 
     // The drain is still unsatisfied — server 1 remains referenced; reconciliation re-tries.
@@ -1429,13 +1497,14 @@ async fn a_racing_writer_loses_the_version_conditional_commit_and_leaves_only_ga
 /// this goes red (the placement is repointed to length 3 and the fragment is moved).
 #[tokio::test]
 async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
-        MemDServer::default(),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
+        MemDServer::on(&pass_clock),
     );
     let fleet = Fleet {
         servers: vec![(0, &d0), (1, &d1), (2, &d2), (3, &d3)],
@@ -1464,6 +1533,8 @@ async fn malformed_placement_rebalance_skips_and_leaves_fragment_in_place() {
         meta: &meta,
         fleet: &dyn_fleet,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;

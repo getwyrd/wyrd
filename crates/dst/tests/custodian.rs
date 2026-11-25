@@ -208,16 +208,26 @@ impl MetadataStore for CrashMeta {
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
-        // The version-conditional repoint is the *only* commit with a positive
-        // precondition; crash on it (apply nothing) when armed. The intent / enqueue /
-        // drain commits carry no positive precondition and are left to apply.
-        if self.armed.load(Ordering::Relaxed)
-            && batch.preconditions.iter().any(|p| p.expected.is_some())
-        {
+        // The version-conditional repoint is the *only* commit that rewrites the placement
+        // record; crash on it (apply nothing) when armed. The destination pre-mark before it
+        // (`wyrd_custodian`'s committed-move rule, #1084) and the intent / enqueue / drain
+        // commits write no placement record and are left to apply.
+        if self.armed.load(Ordering::Relaxed) && rewrites_placement(&batch) {
             return Ok(CommitOutcome::Conflict);
         }
         self.inner.commit(batch).await
     }
+}
+
+/// Whether `batch` rewrites a placement record — a flat object's `inode:` record or one `seg:`
+/// record: the repoint a reconstruction or rebalance move commits last, after the destination
+/// pre-mark and the fragment write. Neither of those earlier commits, nor any intent, enqueue or
+/// drain commit, writes such a key.
+fn rewrites_placement(batch: &WriteBatch) -> bool {
+    batch
+        .puts
+        .iter()
+        .any(|(key, _)| key.starts_with(b"inode:") || key.starts_with(b"seg:"))
 }
 
 /// A **crash-injecting** D server wrapping a [`MemDServer`]: while *armed*, every
@@ -274,9 +284,28 @@ impl ChunkStore for CrashStore<'_> {
 
 /// One D server's fragment bytes — a deliberately dumb `ChunkStore` holding the **real**
 /// stored fragment bytes (so checksums verify and a rebuilt shard round-trips).
+///
+/// A write that carries a deadline is judged as every D server judges one — refused at or past it
+/// before anything is stored (`WriteDeadlineExpired::if_elapsed`), and refused certification if
+/// the clock reads at or past it once the bytes are stored
+/// (`WriteDeadlineExpired::if_publication_unverified`) — on the clock the pass that sent it reads
+/// ([`servers_on`]), so a move's deadline is exactly the one a conforming D server enforces. A
+/// server built with no clock ([`servers`], for a property whose passes send no such write)
+/// refuses to judge one at all: a property cannot run a mover against it unnoticed.
 #[derive(Default)]
 struct MemDServer {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: Option<wyrd_testkit::ManualClock>,
+}
+
+impl MemDServer {
+    /// The clock a deadline-bearing write is judged on.
+    fn judge(&self) -> &wyrd_testkit::ManualClock {
+        self.clock.as_ref().expect(
+            "a deadline-bearing write reached a D server with no clock: build the fleet with \
+             `servers_on` and the clock the pass reads",
+        )
+    }
 }
 
 #[async_trait]
@@ -285,9 +314,24 @@ impl ChunkStore for MemDServer {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(self.judge());
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
         self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(self.judge());
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
 
@@ -609,8 +653,19 @@ async fn assert_full_redundancy(record: &InodeRecord, d: &[MemDServer; 4]) {
     );
 }
 
+/// Four D servers that judge no deadline: for a property whose passes send no deadline-bearing
+/// write ([`MemDServer`]).
 fn servers() -> [MemDServer; 4] {
     Default::default()
+}
+
+/// Four D servers that judge every write's deadline on `clock` — the clock the pass that writes
+/// to them reads (ADR-0009: one clock for the move's lifecycle).
+fn servers_on(clock: &wyrd_testkit::ManualClock) -> [MemDServer; 4] {
+    std::array::from_fn(|_| MemDServer {
+        frags: Mutex::default(),
+        clock: Some(clock.clone()),
+    })
 }
 
 fn fleet_of(d: &[MemDServer; 4]) -> Fleet<'_> {
@@ -623,7 +678,8 @@ fn fleet_of(d: &[MemDServer; 4]) -> Fleet<'_> {
 
 async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
     let meta = MemMeta::default();
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     let data = write_rs_2_1(&meta, &fleet).await;
 
@@ -650,8 +706,8 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -689,7 +745,8 @@ async fn prop_reconstruct_to_full_redundancy(rng: &mut ChaCha8Rng) {
 
 async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
     let meta = CrashMeta::new();
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     let data = write_rs_2_1(&meta, &fleet).await;
 
@@ -701,29 +758,30 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
         .unwrap();
 
     let (topo, healthy) = healthy_view(victim, &d);
-    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
         clock: &pass_clock,
-        staged_write_window_millis: 0,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-crash").await;
 
-    // CRASH the custodian just before its version-conditional commit lands.
+    // CRASH the custodian just before its version-conditional commit lands. The store answers
+    // the dropped commit as a lost CAS with the object's root unmoved, so the pass, where it
+    // lives to answer at all, does not certify: the repair is still owed (#1084).
     meta.arm();
     let outcome = reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
         .await
         .unwrap();
     assert_eq!(
         outcome,
-        Reconciled::Satisfied,
-        "a crash before the commit changes nothing the store committed"
+        Reconciled::Blocked,
+        "a repair whose commit never landed, its object unmoved, was certified"
     );
 
     // FULLY OLD, NEVER A HYBRID: the inode is untouched — version and placement unchanged.
@@ -791,7 +849,8 @@ async fn prop_commit_point_atomic_under_crash(rng: &mut ChaCha8Rng) {
 
 async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
     let meta = MemMeta::default();
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(200);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     let data = write_rs_2_1(&meta, &fleet).await;
 
@@ -841,8 +900,8 @@ async fn prop_scrub_detects_bit_rot_then_reconstructs(rng: &mut ChaCha8Rng) {
         fleet: &full,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(200),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: full.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1039,7 +1098,8 @@ async fn prop_gc_reclaims_only_true_orphans(rng: &mut ChaCha8Rng) {
 
 async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
     let meta = MemMeta::default();
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     write_rs_2_1(&meta, &fleet).await;
 
@@ -1051,14 +1111,13 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
         .unwrap();
 
     let (topo, healthy) = healthy_view(victim, &d);
-    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
         clock: &pass_clock,
-        staged_write_window_millis: 0,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1118,7 +1177,8 @@ async fn prop_fenced_stale_leader_lands_nothing(rng: &mut ChaCha8Rng) {
 
 async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rng) {
     let meta = MemMeta::default();
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     write_rs_2_1(&meta, &fleet).await;
 
@@ -1130,14 +1190,13 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
         .unwrap();
 
     let (topo, healthy) = healthy_view(victim, &d);
-    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
         clock: &pass_clock,
-        staged_write_window_millis: 0,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1209,7 +1268,8 @@ async fn prop_durability_emission_rises_then_returns_to_zero(rng: &mut ChaCha8Rn
 /// never a torn/hybrid chunk and never silent data loss.
 async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
     let meta = MemMeta::default();
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     let data = write_rs_2_1(&meta, &fleet).await;
 
@@ -1241,14 +1301,13 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
             healthy.push((id, &d[id as usize] as &dyn ChunkStore));
         }
     }
-    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
         clock: &pass_clock,
-        staged_write_window_millis: 0,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1338,7 +1397,8 @@ async fn prop_crash_mid_write_commits_nothing(rng: &mut ChaCha8Rng) {
 /// (the new differs from the old at exactly the rebuilt index) — never a per-index mix.
 async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
     let meta = MemMeta::default();
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     let data = write_rs_2_1(&meta, &fleet).await;
 
@@ -1361,8 +1421,8 @@ async fn prop_reader_flips_atomically_across_commit(rng: &mut ChaCha8Rng) {
         fleet: &healthy,
         topology: &topo,
         unreachable: &[],
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: healthy.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -2891,7 +2951,8 @@ fn handoff_landings(events: &[HandoffEvent], upload: &UploadId) -> HandoffLandin
 /// [`Driver::Gc`], its repair obligation under [`Driver::Reconstruction`] — and returns where each
 /// move landed.
 async fn staged_handoffs_under(driver: Driver, gaps: [u64; 3]) -> HandoffLandings {
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(HANDOFF_NOW);
+    let d = servers_on(&pass_clock);
     let meta = Arc::new(HandoffMeta {
         inner: SimTikvMetadataStore::new(),
         events: Mutex::new(Vec::new()),
@@ -3061,8 +3122,8 @@ async fn staged_handoffs_under(driver: Driver, gaps: [u64; 3]) -> HandoffLanding
             fleet: &fleet,
             topology: &topo,
             unreachable: &[],
-            clock: &wyrd_testkit::ManualClock::new(HANDOFF_NOW),
-            staged_write_window_millis: 0,
+            clock: &pass_clock,
+            staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
             operator_fleet_size: fleet.len(),
             tombstone: wyrd_custodian::Tombstone::Retain,
         };
@@ -6025,24 +6086,126 @@ enum DrainRacer {
     /// already on the fleet. The move never rewrites the root, so this write and a landed move
     /// touch different keys — both may commit, in either order.
     Supersede,
-    /// The **`seg:` record**: a competing writer moves the same fragment itself. Same key as
-    /// the move, so whichever commits second loses its CAS and writes nothing.
+    /// The **`seg:` record**: a competing mover moves the same fragment to the same destination
+    /// itself, by the destination-pre-mark rule every committed move keeps (#1084, [`RivalMove`]).
+    /// It pins the same `seg:` record, so whichever adopts second loses and publishes nothing.
     Rewrite,
 }
 
+/// The racing write [`RaceAtDrainMove`] applies inside the move's adoption.
+enum Racer<'a> {
+    /// One batch, applied as it stands: a supersede of the root.
+    Batch(WriteBatch),
+    /// A competing mover of the same fragment ([`RivalMove`]).
+    Mover(RivalMove<'a>),
+}
+
+/// A competing mover keeping the destination-pre-mark rule: it pre-marks the destination —
+/// replacing whatever mark it reads there, pinned to what `metadata::repoint_chunk` pins, the
+/// root generation and the `seg:` record it planned from — writes the fragment beneath its
+/// pre-mark under the deadline the D server enforces, and adopts in one batch under the same pins
+/// that repoints the record, consumes its pre-mark and marks the position it vacates, under a
+/// precondition on the mark it read there. Its outcome is the adoption's — or the pre-mark's,
+/// when that already lost.
+struct RivalMove<'a> {
+    /// The root it planned from: its key and bytes.
+    root: (Vec<u8>, Bytes),
+    seg_key: Vec<u8>,
+    seeded: Bytes,
+    repointed: Bytes,
+    /// The destination server, and its store.
+    to: (DServerId, &'a MemDServer),
+    vacated: DServerId,
+    fragment: FragmentId,
+    bytes: Bytes,
+}
+
+/// The rival mover's stamp: the instant the pass reads.
+const RIVAL_NOW: u64 = 500;
+
 /// A store that applies `pending` inside the move's own commit — the one batch a rebalance
-/// pass sends carrying a positive precondition, as [`CrashMeta`] identifies it.
-/// `move_first` picks the order the two batches are applied in.
-struct RaceAtDrainMove {
+/// pass sends that rewrites the placement record, as [`CrashMeta`] identifies it
+/// ([`rewrites_placement`]). `move_first` picks the order the two are applied in.
+struct RaceAtDrainMove<'a> {
     inner: MemMeta,
-    pending: Mutex<Option<WriteBatch>>,
+    pending: Mutex<Option<Racer<'a>>>,
     move_first: bool,
     /// What the racing write did once applied — `None` until it has run.
     racer_outcome: Mutex<Option<CommitOutcome>>,
 }
 
+impl RaceAtDrainMove<'_> {
+    async fn race(&self, racer: Racer<'_>) -> Result<CommitOutcome> {
+        match racer {
+            Racer::Batch(batch) => self.inner.commit(batch).await,
+            Racer::Mover(rival) => self.rival(rival).await,
+        }
+    }
+
+    async fn rival(&self, rival: RivalMove<'_>) -> Result<CommitOutcome> {
+        let RivalMove {
+            root: (root_key, root),
+            seg_key,
+            seeded,
+            repointed,
+            to: (dserver, store),
+            vacated,
+            fragment,
+            bytes,
+        } = rival;
+        let key = metadata::orphan_key(dserver, fragment);
+        let event = format!("repoint:{}:rival", chunk_hex(fragment.chunk));
+        let premark =
+            metadata::encode_orphan_mark(&metadata::OrphanMark::structured(RIVAL_NOW, event)?);
+        let pins = WriteBatch::new()
+            .require(root_key.clone(), root.clone())
+            .require(seg_key.clone(), seeded.clone());
+        let pin = match self.inner.get(&key).await? {
+            None => pins.require_absent(key.clone()),
+            Some(current) => pins.require(key.clone(), current),
+        };
+        if self
+            .inner
+            .commit(pin.put(key.clone(), premark.clone()))
+            .await?
+            == CommitOutcome::Conflict
+        {
+            return Ok(CommitOutcome::Conflict);
+        }
+        let deadline = RIVAL_NOW + wyrd_custodian::gc::W_WRITE_MILLIS;
+        store.put_fragment(fragment, bytes, Some(deadline)).await?;
+        let vacated_mark = metadata::encode_orphan_mark(&metadata::OrphanMark::legacy(RIVAL_NOW));
+        let adopt = WriteBatch::new()
+            .require(root_key, root)
+            .require(seg_key.clone(), seeded)
+            .require(key.clone(), premark)
+            .delete(key)
+            .put(seg_key, repointed);
+        // The vacated position's mark, read just before the adoption and pinned by it, as the
+        // production adoption writes it: absent, under `require_absent`; a mark of another event,
+        // re-stamped under its exact bytes; `reclaiming` or unreadable, pinned and left as it is.
+        let vacated_key = metadata::orphan_key(vacated, fragment);
+        let adopt = match self.inner.get(&vacated_key).await? {
+            None => adopt
+                .require_absent(vacated_key.clone())
+                .put(vacated_key, vacated_mark),
+            Some(current) => {
+                let restamp =
+                    metadata::decode_orphan_mark(&current).is_ok_and(|mark| !mark.is_reclaiming());
+                let adopt = adopt.require(vacated_key.clone(), current);
+                if restamp {
+                    adopt.put(vacated_key, vacated_mark)
+                } else {
+                    adopt
+                }
+            }
+        };
+        self.inner.commit(adopt).await
+    }
+}
+
 #[async_trait]
-impl MetadataStore for RaceAtDrainMove {
+impl MetadataStore for RaceAtDrainMove<'_> {
     async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.inner.get(key).await
     }
@@ -6061,8 +6224,7 @@ impl MetadataStore for RaceAtDrainMove {
     }
 
     async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
-        let pinned = batch.preconditions.iter().any(|pre| pre.expected.is_some());
-        let racer = if pinned {
+        let racer = if rewrites_placement(&batch) {
             self.pending.lock().unwrap().take()
         } else {
             None
@@ -6072,10 +6234,10 @@ impl MetadataStore for RaceAtDrainMove {
         };
         if self.move_first {
             let landed = self.inner.commit(batch).await?;
-            *self.racer_outcome.lock().unwrap() = Some(self.inner.commit(racer).await?);
+            *self.racer_outcome.lock().unwrap() = Some(self.race(racer).await?);
             Ok(landed)
         } else {
-            *self.racer_outcome.lock().unwrap() = Some(self.inner.commit(racer).await?);
+            *self.racer_outcome.lock().unwrap() = Some(self.race(racer).await?);
             self.inner.commit(batch).await
         }
     }
@@ -6114,7 +6276,8 @@ async fn respell_as_segment(meta: &MemMeta, record: metadata::SegmentRecord) -> 
 }
 
 async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8Rng) {
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(RIVAL_NOW);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     let meta = MemMeta::default();
     write_rs_2_1(&meta, &fleet).await;
@@ -6167,21 +6330,27 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
             let batch = WriteBatch::new()
                 .require(root_key.clone(), root_before.clone())
                 .put(root_key.clone(), metadata::encode(&new_root));
-            (batch, seeded.clone())
+            (Racer::Batch(batch), seeded.clone())
         }
         DrainRacer::Rewrite => {
-            // A competing writer that already moved this very fragment to server 3 — bytes
-            // first, then the record, so whichever write wins names bytes that exist.
+            // A competing mover of this very fragment onto server 3, keeping the rule: its
+            // pre-mark, then the bytes, then the adoption, so whichever move wins names bytes that
+            // exist and leaves no mark on a position it names.
             let bytes = d[drained as usize]
                 .get_fragment(frag(drained))
                 .await
                 .unwrap();
-            let bytes = bytes.expect("the fixture placed every fragment");
-            d[3].put_fragment(frag(drained), bytes, None).await.unwrap();
-            let batch = WriteBatch::new()
-                .require(seg_key.clone(), seeded.clone())
-                .put(seg_key.clone(), repointed.clone());
-            (batch, repointed.clone())
+            let racer = Racer::Mover(RivalMove {
+                root: (root_key.clone(), root_before.clone()),
+                seg_key: seg_key.clone(),
+                seeded: seeded.clone(),
+                repointed: repointed.clone(),
+                to: (3, &d[3]),
+                vacated: u64::from(drained),
+                fragment: frag(drained),
+                bytes: bytes.expect("the fixture placed every fragment"),
+            });
+            (racer, repointed.clone())
         }
     };
 
@@ -6199,12 +6368,23 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
         meta: &store,
         fleet: &all,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-drain-race").await;
-    let answer = reconcile_step(&zone, &custodian, None, None, None, Some(&ctx), None, 500)
-        .await
-        .expect("a raced move is a lost CAS, never an error that ends the pass");
+    let answer = reconcile_step(
+        &zone,
+        &custodian,
+        None,
+        None,
+        None,
+        Some(&ctx),
+        None,
+        RIVAL_NOW,
+    )
+    .await
+    .expect("a raced move is a lost CAS, never an error that ends the pass");
 
     let arm = format!("drained {drained}, racer {racer:?}, move first: {move_first}");
     assert!(
@@ -6212,20 +6392,17 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
         "the racer never fired — the move never reached its commit ({arm})"
     );
     let stored = store.get(&seg_key).await.unwrap().expect("the seg: record");
-    let orphans: Vec<Vec<u8>> = store
-        .scan(b"orphan:")
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|(key, _)| key)
-        .collect();
+    let marks = store.scan(b"orphan:").await.unwrap();
+    let orphans: Vec<Vec<u8>> = marks.iter().map(|(key, _)| key.clone()).collect();
+    let vacated = metadata::orphan_key(u64::from(drained), frag(drained));
+    let destination = metadata::orphan_key(3, frag(drained));
     if move_first {
-        // The move landed WHOLE: placement and orphan mark are one commit.
+        // The move landed WHOLE: placement, the adoption of its destination pre-mark and the
+        // orphan mark are one commit.
         assert_eq!(
             stored, repointed,
             "the move went first and its placement is missing ({arm})"
         );
-        let vacated = metadata::orphan_key(u64::from(drained), frag(drained));
         assert_eq!(
             orphans,
             vec![vacated],
@@ -6236,8 +6413,9 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
             Reconciled::Changed,
             "a landed move converges ({arm})"
         );
-        // A writer that pinned the same record loses; one that pinned only the root does not,
-        // because a move never rewrites the root.
+        // A writer that pinned the same record loses — a rival mover already at its pre-mark,
+        // which pins the record it planned from; one that pinned only the root does not, because
+        // a move never rewrites the root.
         let expected = match racer {
             DrainRacer::Supersede => CommitOutcome::Committed,
             DrainRacer::Rewrite => CommitOutcome::Conflict,
@@ -6249,15 +6427,44 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
             "the racing write's outcome ({arm})"
         );
     } else {
-        // The move lost, so it wrote NOTHING: not the placement, not the orphan mark.
+        // The move lost, so it wrote neither the placement nor the vacated position's mark.
         assert_eq!(
             stored, after_racer,
             "a lost move still rewrote the record ({arm})"
         );
-        assert!(
-            orphans.is_empty(),
-            "a lost move still marked a fragment for reclamation ({arm}): {orphans:?}"
-        );
+        match racer {
+            // The copy it made stands under its own destination pre-mark — the one mark in the
+            // store, at exactly the destination — so GC reclaims it after grace rather than keep
+            // it for ever (#1084).
+            DrainRacer::Supersede => {
+                assert_eq!(
+                    orphans,
+                    vec![destination.clone()],
+                    "the lost move's copy is not under its pre-mark alone ({arm})"
+                );
+                let premark =
+                    metadata::decode_orphan_mark(&marks[0].1).expect("one of the three shapes");
+                // The move's own identity: `repoint:<chunk>:` and a nonce of its own, never the
+                // rival's (#1084, the per-move nonce).
+                let prefix = format!("repoint:{}:", chunk_hex(CHUNK));
+                let rival = format!("repoint:{}:rival", chunk_hex(CHUNK));
+                assert!(
+                    premark
+                        .event()
+                        .is_some_and(|event| event.starts_with(&prefix) && event != rival)
+                        && premark.orphaned_at_millis() == RIVAL_NOW
+                        && !premark.is_reclaiming(),
+                    "the copy is not under the move's own pre-mark ({arm}): {premark:?}"
+                );
+            }
+            // The rival replaced the move's pre-mark with its own and consumed it as it adopted
+            // the copy, so the one mark left is the rival's on the position it vacated.
+            DrainRacer::Rewrite => assert_eq!(
+                orphans,
+                vec![vacated.clone()],
+                "the rival's adoption left more than its vacated mark ({arm})"
+            ),
+        }
         assert_eq!(
             answer,
             Reconciled::Blocked,
@@ -6271,7 +6478,8 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
         );
     }
 
-    // However the race resolved, the LIVE generation names only fragments that exist.
+    // However the race resolved, the LIVE generation names only fragments that exist, and no
+    // position it names carries a mark (C-1, #1084).
     let live = metadata::resolve_current_chunk_map(&store, &root_key)
         .await
         .expect("the live generation resolves")
@@ -6282,6 +6490,15 @@ async fn prop_drain_repoint_versus_supersede_is_all_or_nothing(rng: &mut ChaCha8
             held.is_some(),
             "the live generation names {fragment:?} on server {dserver}, which holds no such \
              bytes ({arm})"
+        );
+        let mark = store
+            .get(&metadata::orphan_key(dserver, fragment))
+            .await
+            .unwrap();
+        assert!(
+            mark.is_none(),
+            "the live generation names {fragment:?} on server {dserver}, which is marked \
+             {mark:?} ({arm})"
         );
     }
 }
@@ -6396,7 +6613,8 @@ fn seg_record_at_the_ceiling(head: ChunkRef) -> metadata::SegmentRecord {
 }
 
 async fn prop_drain_ceiling_refusal_is_confirmed_on_the_segment(rng: &mut ChaCha8Rng) {
-    let d = servers();
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
+    let d = servers_on(&pass_clock);
     let fleet = fleet_of(&d);
     let meta = MemMeta::default();
     write_rs_2_1(&meta, &fleet).await;
@@ -6466,6 +6684,8 @@ async fn prop_drain_ceiling_refusal_is_confirmed_on_the_segment(rng: &mut ChaCha
         meta: &store,
         fleet: &all,
         topology: &topo,
+        clock: &pass_clock,
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord, "zone-drain-refusal").await;
@@ -6514,6 +6734,188 @@ async fn prop_drain_ceiling_refusal_is_confirmed_on_the_segment(rng: &mut ChaCha
     assert!(orphans.is_empty(), "a refused move marked ({arm})");
     let copied = d[3].get_fragment(frag(drained)).await.unwrap();
     assert!(copied.is_none(), "a refused move copied a fragment ({arm})");
+}
+
+// ---- property 21: a committed move's per-move nonce replays under its seed (#1084) ----
+//
+// Every committed move's destination pre-mark carries a fresh per-move nonce (proposal 0016,
+// `0016:1179-1189`; `wyrd_custodian::premark`): unique across moves, so no move's pre-mark can
+// satisfy another's adoption once GC has deleted a key, yet drawn from a source the simulator
+// seeds, so a madsim seed still replays to the same run (ADR-0009). `cargo xtask dst` sets
+// `MADSIM_TEST_NUM` only, never `MADSIM_TEST_CHECK_DETERMINISM`, and no other property compares
+// two runs of one seed, so nothing else would notice a nonce that does not replay. This one runs
+// a fixed seed twice, each on a fresh thread with its own runtime — as madsim's own runner gives
+// each seed a fresh thread, std's hash keys being per thread (the same shape as
+// `run_pinned_race`, `tests/concurrency.rs`) — drives two committed repairs, each onto a fresh
+// destination, through the real `reconcile_step` in the same simulated instant, and compares what
+// each run committed. A nonce drawn from a process-global counter differs between the two runs;
+// one drawn from the wall clock — which the simulator virtualises, so it replays — repeats
+// between the two moves of one run.
+
+/// The seed the nonce's replay test runs twice.
+const PREMARK_REPLAY_SEED: u64 = 0x1084;
+
+/// A store that records the `orphan:` puts of every batch that rewrites no placement record — a
+/// move's destination pre-mark, which the adoption then deletes — in commit order. Instance state
+/// only (never a `static`), so it lives inside the simulated world (ADR-0035), as
+/// [`RecordingMeta`] does.
+#[derive(Default)]
+struct PremarkTap {
+    inner: MemMeta,
+    premarks: Mutex<Vec<(Vec<u8>, Bytes)>>,
+}
+
+#[async_trait]
+impl MetadataStore for PremarkTap {
+    async fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.inner.get(key).await
+    }
+
+    async fn scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Bytes)>> {
+        self.inner.scan(prefix).await
+    }
+
+    async fn scan_page(
+        &self,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<wyrd_traits::ScanPage> {
+        self.inner.scan_page(prefix, after, limit).await
+    }
+
+    async fn commit(&self, batch: WriteBatch) -> Result<CommitOutcome> {
+        let premarks: Vec<(Vec<u8>, Bytes)> = if rewrites_placement(&batch) {
+            Vec::new()
+        } else {
+            batch
+                .puts
+                .iter()
+                .filter(|(key, _)| key.starts_with(b"orphan:"))
+                .cloned()
+                .collect()
+        };
+        let outcome = self.inner.commit(batch).await?;
+        if outcome == CommitOutcome::Committed {
+            self.premarks.lock().unwrap().extend(premarks);
+        }
+        Ok(outcome)
+    }
+}
+
+/// What one run of the replay committed: the pre-marks, each pass's verdict, and the chunk's
+/// placement after them.
+type ReplayRun = (Vec<(Vec<u8>, Bytes)>, Vec<Reconciled>, Vec<DServerId>);
+
+/// One run at `seed`, on a fresh thread with its own runtime, its clock never moved: server 1
+/// loses its fragment of the RS(2,1) chunk and a reconstruction pass rebuilds it onto server 3;
+/// then server 2 loses its fragment and a second pass rebuilds it onto server 1 — each a fresh
+/// destination, each move through the real fenced control point.
+fn premark_replay_run(seed: u64) -> ReplayRun {
+    std::thread::spawn(move || {
+        let runtime =
+            madsim::runtime::Runtime::with_seed_and_config(seed, madsim::Config::default());
+        runtime.block_on(async {
+            let meta = PremarkTap::default();
+            let pass_clock = wyrd_testkit::ManualClock::new(500);
+            let d = servers_on(&pass_clock);
+            let fleet = fleet_of(&d);
+            write_rs_2_1(&meta, &fleet).await;
+            let coord = MemCoordination::new();
+            let (zone, custodian) = elect(&coord, "zone-premark-replay").await;
+            let mut verdicts = Vec::new();
+            // Fragment `i` lives on server `i`; each pass sees the fleet without the server that
+            // lost its fragment, so the one free domain is a server holding none of the chunk.
+            for lost in [1_u16, 2] {
+                d[usize::from(lost)]
+                    .delete_fragment(frag(lost))
+                    .await
+                    .unwrap();
+                repair::enqueue_repair(&meta, CHUNK, "health")
+                    .await
+                    .unwrap();
+                let (topo, healthy) = healthy_view(lost, &d);
+                let ctx = ReconstructionContext {
+                    meta: &meta,
+                    fleet: &healthy,
+                    topology: &topo,
+                    unreachable: &[],
+                    clock: &pass_clock,
+                    staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
+                    operator_fleet_size: healthy.len(),
+                    tombstone: wyrd_custodian::Tombstone::Retain,
+                };
+                let verdict =
+                    reconcile_step(&zone, &custodian, None, None, Some(&ctx), None, None, 500)
+                        .await
+                        .unwrap();
+                verdicts.push(verdict);
+            }
+            let placement = read_inode(&meta).await.chunk_map.as_flat().unwrap()[0]
+                .placement
+                .clone();
+            let premarks = meta.premarks.lock().unwrap().clone();
+            (premarks, verdicts, placement)
+        })
+    })
+    .join()
+    .expect("the replay run panicked")
+}
+
+/// **Property 21 (#1084).** One seed, run twice, commits the same pre-marks — their nonces
+/// included — reaches the same verdicts and leaves the same placement; and within one run, two
+/// moves of the chunk pre-marked in the same instant carry different identities.
+#[test]
+fn a_committed_moves_pre_mark_nonce_replays_under_its_seed() {
+    wyrd_dst::install_dst_barrier();
+    let first = premark_replay_run(PREMARK_REPLAY_SEED);
+    let (premarks, verdicts, placement) = &first;
+    assert_eq!(
+        verdicts,
+        &vec![Reconciled::Changed, Reconciled::Changed],
+        "both repairs landed"
+    );
+    assert_eq!(
+        placement,
+        &vec![0, 3, 1],
+        "each fragment rebuilt onto a fresh destination"
+    );
+    let [(first_key, first_value), (second_key, second_value)] = premarks.as_slice() else {
+        panic!("one pre-mark per move, on its one destination: {premarks:?}");
+    };
+    assert_eq!(
+        first_key,
+        &metadata::orphan_key(3, frag(1)),
+        "the first move's"
+    );
+    assert_eq!(
+        second_key,
+        &metadata::orphan_key(1, frag(2)),
+        "the second move's"
+    );
+    let prefix = format!("repoint:{}:", chunk_hex(CHUNK));
+    let mut events = Vec::new();
+    for value in [first_value, second_value] {
+        let mark = metadata::decode_orphan_mark(value).expect("one of the three shapes");
+        assert!(
+            mark.event().is_some_and(|event| event.starts_with(&prefix))
+                && mark.orphaned_at_millis() == 500
+                && !mark.is_reclaiming(),
+            "a move's own pre-mark, stamped at the one instant: {mark:?}"
+        );
+        events.push(mark.event().map(str::to_owned));
+    }
+    assert_ne!(
+        events[0], events[1],
+        "two moves pre-marked in one instant carry the same identity"
+    );
+
+    let second = premark_replay_run(PREMARK_REPLAY_SEED);
+    assert_eq!(
+        first, second,
+        "a madsim seed no longer replays: the committed move's pre-mark nonce is drawn from a \
+         source the simulator does not seed"
+    );
 }
 
 // ---- property: the retirement drain's re-stamp racing GC's swap to `reclaiming` (#1062) ----
@@ -6805,7 +7207,7 @@ async fn drain_races_gc(lag: i64) -> bool {
                     topology: &topo,
                     unreachable: &[],
                     clock: &clock,
-                    staged_write_window_millis: 0,
+                    staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
                     operator_fleet_size: 0,
                     tombstone: wyrd_custodian::Tombstone::Retain,
                 };
@@ -7518,7 +7920,7 @@ mod reaper_rows {
         let meta = Hooked::new(records, Trigger::BetweenProgressReads(id.clone()), []);
         meta.hold(Hold::PartCommit(id.clone(), part(2)));
         let clock = ManualClock::new(t0);
-        let (d, topology) = (servers(), four_domains());
+        let (d, topology) = (servers_on(&clock), four_domains());
         let fleet = fleet_of(&d);
         let attempt = AttemptId::new("ab".repeat(16)).unwrap();
         let request = stage_request(&id, 2, &attempt, &topology, HOUR);
@@ -7588,7 +7990,7 @@ mod reaper_rows {
             [],
         );
         let clock = ManualClock::new(t0);
-        let (d, topology) = (servers(), four_domains());
+        let (d, topology) = (servers_on(&clock), four_domains());
         let fleet = fleet_of(&d);
         let attempt = AttemptId::new("ab".repeat(16)).unwrap();
         // The body is slow, not gone: its idle bound is past the whole stall.
@@ -7840,7 +8242,7 @@ mod reaper_rows {
             [],
         );
         let clock = ManualClock::new(t0);
-        let d = servers();
+        let d = servers_on(&clock);
         let fleet = fleet_of(&d);
         let topology = four_domains();
         let (attempt, crashed_attempt) = (

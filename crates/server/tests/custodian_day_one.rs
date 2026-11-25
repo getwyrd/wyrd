@@ -133,9 +133,25 @@ impl MetadataStore for MemMeta {
 
 /// One D server's fragment bytes — a deliberately dumb `ChunkStore` holding the **real**
 /// stored fragment bytes (so their checksums verify and the rebuilt shard round-trips).
-#[derive(Default)]
+///
+/// A write that carries a deadline is judged as a D server judges it (`FsChunkStore`), on the
+/// clock the pass that sends it reads — the reconstruction context's, or the run loop's, one
+/// source (ADR-0009): refused at or past its deadline before anything is stored
+/// (`WriteDeadlineExpired::if_elapsed`), and refused certification if that clock reads at or past
+/// it once the bytes are stored (`WriteDeadlineExpired::if_publication_unverified`).
 struct MemDServer {
     frags: Mutex<HashMap<FragmentId, Bytes>>,
+    clock: wyrd_testkit::ManualClock,
+}
+
+impl MemDServer {
+    /// A D server judging deadlines on `clock`, the one the passes that write to it read.
+    fn on(clock: &wyrd_testkit::ManualClock) -> Self {
+        Self {
+            frags: Mutex::default(),
+            clock: clock.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -144,9 +160,24 @@ impl ChunkStore for MemDServer {
         &self,
         id: FragmentId,
         fragment: Bytes,
-        _deadline_millis: Option<u64>,
+        deadline_millis: Option<u64>,
     ) -> Result<()> {
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(refusal) = wyrd_traits::WriteDeadlineExpired::if_elapsed(id, deadline, now)
+            {
+                return Err(Box::new(refusal));
+            }
+        }
         self.frags.lock().unwrap().insert(id, fragment);
+        if let Some(deadline) = deadline_millis {
+            let now = wyrd_testkit::Clock::now_millis(&self.clock);
+            if let Some(unverified) =
+                wyrd_traits::WriteDeadlineExpired::if_publication_unverified(id, deadline, now)
+            {
+                return Err(Box::new(unverified));
+            }
+        }
         Ok(())
     }
 
@@ -548,6 +579,14 @@ async fn write_rs_2_1_as(
 
 /// Erase a concrete `Arc<S>` store to the owned `Arc<dyn ChunkStore>` the fleet now holds
 /// (the fleet is OWNED so [`connect_fleet`] can *return* it — iteration-5 BLOCKING #2b).
+/// The run loop's clock, read from `clock` — the one its D servers judge a write's deadline on,
+/// so the loop's `now_millis`, its passes' context clock and the D servers are one source
+/// (ADR-0009).
+fn loop_clock(clock: &wyrd_testkit::ManualClock) -> impl FnMut() -> u64 + Send {
+    let clock = clock.clone();
+    move || wyrd_testkit::Clock::now_millis(&clock)
+}
+
 fn dyn_store<S: ChunkStore + 'static>(store: &Arc<S>) -> Arc<dyn ChunkStore> {
     store.clone()
 }
@@ -570,13 +609,14 @@ fn configured(servers: [(DServerId, &str, Arc<dyn ChunkStore>); 4]) -> Vec<Confi
 
 #[tokio::test]
 async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     let fleet = Fleet {
         servers: vec![
@@ -616,7 +656,6 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
         "the killed server 1 is dropped from the live fleet; 0,2,3 remain"
     );
 
-    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &live_fleet,
@@ -625,7 +664,7 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
         // unavailable, so `assess` must not raise a false data-loss alarm on them.
         unreachable: &unreachable,
         clock: &pass_clock,
-        staged_write_window_millis: 0,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: live_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -680,15 +719,16 @@ async fn gauge_rises_then_returns_to_zero_surviving_a_killed_dserver() {
 
 #[tokio::test]
 async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_to_zero() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     const CHUNK_LOST: ChunkId = 0x0D00_D000;
     const INODE_LOST: InodeId = 2;
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     let fleet = Fleet {
         servers: vec![
@@ -742,7 +782,6 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
         vec![0, 2, 3],
         "the killed server 1 is dropped; 0,2,3 remain live"
     );
-    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &live_fleet,
@@ -751,7 +790,7 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
         // unavailable, so `assess` must not raise a false data-loss alarm on them.
         unreachable: &unreachable,
         clock: &pass_clock,
-        staged_write_window_millis: 0,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: live_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -824,13 +863,14 @@ async fn a_loss_beyond_tolerance_raises_data_loss_and_the_backlog_gauge_returns_
 /// server, so survivors stay ≥ `k` and the false-alarm path is unexercised.
 #[tokio::test]
 async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     let fleet = Fleet {
         servers: vec![
@@ -872,8 +912,8 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: live_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -919,13 +959,14 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
         unreachable2.is_empty(),
         "with the nodes back, no server is unreachable this pass"
     );
+    pass_clock.set(600);
     let ctx2 = ReconstructionContext {
         meta: &meta,
         fleet: &live_fleet2,
         topology: &live_topo2,
         unreachable: &unreachable2,
-        clock: &wyrd_testkit::ManualClock::new(600),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: live_fleet2.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -960,12 +1001,13 @@ async fn a_transient_below_k_outage_does_not_false_alarm_data_loss_and_recovers(
 /// `reconstruction_repair_blocked` level, the pass survives, and the backlog gauge stays 0.
 #[tokio::test]
 async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     // A MINIMAL cluster: exactly n = 3 servers, one per domain A,B,C — NO spare domain.
     let fleet = Fleet {
@@ -1003,14 +1045,13 @@ async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
         vec![0, 2],
         "the killed server 1 is dropped; only A,C remain — no free domain to re-place into"
     );
-    let pass_clock = wyrd_testkit::ManualClock::new(500);
     let ctx = ReconstructionContext {
         meta: &meta,
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
         clock: &pass_clock,
-        staged_write_window_millis: 0,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: live_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1067,13 +1108,14 @@ async fn a_repair_with_no_free_domain_is_blocked_off_the_backlog_gauge() {
 
 #[tokio::test]
 async fn run_loop_survives_a_dead_dserver_and_keeps_running() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     let fleet = Fleet {
         servers: vec![
@@ -1106,10 +1148,10 @@ async fn run_loop_survives_a_dead_dserver_and_keeps_running() {
     // Ok(()) only at shutdown, having run passes through the whole window (survival is
     // monotonic — any exit-on-kill would return early with the pass through `?`).
     let shutdown = async { tokio::time::sleep(Duration::from_millis(120)).await };
-    let mut now = 500u64;
+    let ticking = pass_clock.clone();
     let clock = move || {
-        now += 1;
-        now
+        ticking.advance(1);
+        wyrd_testkit::Clock::now_millis(&ticking)
     };
     service
         .run_reconstruction_until(
@@ -1145,12 +1187,13 @@ async fn run_loop_survives_a_dead_dserver_and_keeps_running() {
 
 #[tokio::test]
 async fn run_loop_logs_and_continues_on_a_store_fault() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     // Server 1 is REACHABLE (health Ok, so the probe keeps it) but faults every fetch — a
     // server that dies AFTER the probe / a transient metadata blip. Its held fragment makes
@@ -1187,7 +1230,7 @@ async fn run_loop_logs_and_continues_on_a_store_fault() {
             servers.len(),
             ExpiredPendingPolicy::Defer,
             Duration::from_millis(10),
-            || 500,
+            loop_clock(&pass_clock),
             shutdown,
         )
         .await
@@ -1205,9 +1248,10 @@ async fn run_loop_logs_and_continues_on_a_store_fault() {
 
 #[tokio::test]
 async fn run_loop_stops_when_fenced() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
-    let d0 = Arc::new(MemDServer::default());
+    let d0 = Arc::new(MemDServer::on(&pass_clock));
     let servers = configured([
         (0, "A", dyn_store(&d0)),
         (1, "B", dyn_store(&d0)),
@@ -1247,7 +1291,7 @@ async fn run_loop_stops_when_fenced() {
             servers.len(),
             ExpiredPendingPolicy::Defer,
             Duration::from_millis(10),
-            || 500,
+            loop_clock(&pass_clock),
             shutdown,
         )
         .await
@@ -1276,6 +1320,7 @@ async fn run_loop_stops_when_fenced() {
 /// obligation (gauge **0**).
 #[tokio::test]
 async fn gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
 
     // The data dir `open_local_meta_redb(data_dir)` opens `data_dir/meta.redb` under.
@@ -1285,10 +1330,10 @@ async fn gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path() {
     // The persistent D-server fragment stores — these outlive the redb reopen (the fragments
     // stay put while the custodian process reopens the metadata plane).
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
 
     // The "cluster" writes an RS(2,1) object into the REAL redb store + the D-servers, then
@@ -1357,7 +1402,7 @@ async fn gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path() {
         servers.len(),
         ExpiredPendingPolicy::Defer,
         one_pass,
-        || 500,
+        loop_clock(&pass_clock),
         async { tokio::time::sleep(Duration::from_millis(60)).await },
     )
     .await
@@ -1422,13 +1467,14 @@ async fn gauge_rises_then_returns_to_zero_through_the_redb_backend_open_path() {
 /// under-replicated gauge returns to **0** through a custodian that came up mid-incident.
 #[tokio::test]
 async fn connect_fleet_starts_degraded_around_a_startup_down_peer_and_repairs() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     let fleet = Fleet {
         servers: vec![
@@ -1498,10 +1544,10 @@ async fn connect_fleet_starts_degraded_around_a_startup_down_peer_and_repairs() 
     let telemetry = DurabilityTelemetry::new(ExporterConfig::Prometheus).unwrap();
     let service = CustodianService::new(telemetry);
     let shutdown = async { tokio::time::sleep(Duration::from_millis(120)).await };
-    let mut now = 500u64;
+    let ticking = pass_clock.clone();
     let clock = move || {
-        now += 1;
-        now
+        ticking.advance(1);
+        wyrd_testkit::Clock::now_millis(&ticking)
     };
     service
         .run_reconstruction_until(
@@ -1673,15 +1719,16 @@ impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for Capture {
 /// cannot pass vacuously, because an empty buffer contains none of the substrings.
 #[tokio::test]
 async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     const CHUNK_LOST: ChunkId = 0x0D00_D000;
     const INODE_LOST: InodeId = 2;
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     let fleet = Fleet {
         servers: vec![
@@ -1722,8 +1769,8 @@ async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: live_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };
@@ -1788,13 +1835,14 @@ async fn the_data_loss_audit_line_reaches_the_log_sink_naming_the_chunk() {
 /// Pre-fix: `under_replicated` is `None` (the registry is empty) — RED.
 #[tokio::test]
 async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
+    let pass_clock = wyrd_testkit::ManualClock::new(500);
     enable_metric_callsites();
     let meta = MemMeta::default();
     let (d0, d1, d2, d3) = (
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
-        Arc::new(MemDServer::default()),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
+        Arc::new(MemDServer::on(&pass_clock)),
     );
     let fleet = Fleet {
         servers: vec![
@@ -1823,8 +1871,8 @@ async fn a_raised_log_level_does_not_starve_the_durability_metrics() {
         fleet: &live_fleet,
         topology: &live_topo,
         unreachable: &unreachable,
-        clock: &wyrd_testkit::ManualClock::new(500),
-        staged_write_window_millis: 0,
+        clock: &pass_clock,
+        staged_write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
         operator_fleet_size: live_fleet.len(),
         tombstone: wyrd_custodian::Tombstone::Retain,
     };

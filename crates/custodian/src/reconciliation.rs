@@ -210,7 +210,7 @@ pub async fn reconcile_step(
     }
     if let Some(ctx) = rebalance {
         outcome = outcome.least_certified(
-            rebalance::reconcile(ctx, now_millis)
+            rebalance::reconcile(ctx)
                 .await
                 .map_err(ReconcileError::Store)?,
         );

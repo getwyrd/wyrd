@@ -13,11 +13,11 @@
 //!          read checksum failure) ──► an under-replicated chunk
 //! repair:  gather any k surviving fragments ──[verify checksums]──► reconstruct the
 //!          missing shard(s) from the chunk's PER-CHUNK EcScheme
-//!          ──► place the rebuilt fragment(s) on healthy D servers in DISTINCT
-//!              failure domains
+//!          ──► pre-mark each destination ──► place the rebuilt fragment(s) on
+//!              healthy D servers in DISTINCT failure domains
 //!          ──[ONE version-conditional MetadataStore::commit: repoint the placement
-//!             record + drain the obligation + orphan the displaced fragment]──►
-//!             readers flip atomically to the new location
+//!             record + adopt each pre-mark + drain the obligation + orphan the
+//!             displaced fragment]──► readers flip atomically to the new location
 //! gc:      the displaced fragment ──[after GC's reader-safe grace window]──► reclaimed
 //! ```
 //!
@@ -25,8 +25,11 @@
 //!
 //! - **The location update is ONE version-conditional commit** (`0005:277`,
 //!   `0005:200-203`, ADR-0015): the rebuilt fragments are written **before** the
-//!   commit, so a crash mid-repair leaves only **collectable garbage** (orphaned
-//!   fragments GC reclaims), never a torn or hybrid chunk. The repoint is CAS'd on the
+//!   commit, each under a destination pre-mark committed before it — or, rebuilt in place, on
+//!   a position its placement never stops naming, whose stale mark that batch deletes instead
+//!   (`crate::premark`, 0016 X47) — so a crash or a lost commit mid-repair leaves only
+//!   **collectable garbage** (pre-marked fragments GC reclaims), never a torn or hybrid chunk,
+//!   and no mark survives on a position the new placement names. The repoint is CAS'd on the
 //!   root generation, on the record that actually holds the chunk's `ChunkRef` — the flat
 //!   inode record or one `seg:` record — and on that reference itself
 //!   ([`wyrd_core::metadata::repoint_chunk`]), so a superseded custodian or a racing writer
@@ -73,14 +76,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use wyrd_core::metadata::{
     self, ChunkMapError, ChunkRef, EcScheme, InodeId, InodeRecord, InodeState,
 };
-use wyrd_core::placement::{select_distinct_domains_excluding, FailureDomain, Topology};
+use wyrd_core::placement::{FailureDomain, Topology};
 use wyrd_core::write::encode_ec_fragment;
 use wyrd_core::{erasure, repair};
-use wyrd_traits::{
-    ChunkId, ChunkStore, CommitOutcome, DServerId, FragmentId, MetadataStore, Result, WriteBatch,
-};
+use wyrd_traits::{ChunkId, ChunkStore, DServerId, FragmentId, MetadataStore, Result, WriteBatch};
 
 use crate::gc::object_name;
+use crate::premark;
 use crate::reconciliation::Reconciled;
 
 /// What the reconstruction reconciler reads, rebuilds, and re-places over: the
@@ -116,11 +118,12 @@ pub struct ReconstructionContext<'a> {
     /// known-unreachable server, every missing fragment is treated as `confirmed gone` —
     /// exactly the prior semantics, unchanged.
     pub unreachable: &'a [DServerId],
-    /// The [`wyrd_testkit::Clock`] seam (ADR-0024) the staged re-place
-    /// (`reconstruction::staged`) reads its whole lifecycle's time through: the stamp its
-    /// pre-mark carries — read as the pre-mark batch is built, never the pass's start — the
-    /// `W_repoint` gate it checks once before it authorizes all of a move's destination writes
-    /// together, and the stamp of the mark it leaves on each position it vacates. The write's deadline is fixed from the
+    /// The [`wyrd_testkit::Clock`] seam (ADR-0024) every move this pass makes reads its whole
+    /// lifecycle's time through — the staged re-place (`reconstruction::staged`) and the
+    /// committed repair alike (`crate::premark`): the stamp its pre-mark carries — read as the
+    /// pre-mark batch is built, never the pass's start — the `W_repoint` gate it checks once
+    /// before it authorizes all of a move's destination writes together, and the stamp of the
+    /// mark it leaves on each position it vacates. The write's deadline is fixed from the
     /// pre-mark's own stamp ([`Self::staged_write_window_millis`]), and the D server enforces it
     /// on the deployment clock this one reads.
     ///
@@ -131,9 +134,10 @@ pub struct ReconstructionContext<'a> {
     /// puts a `wyrd_testkit::ManualClock` reading that instant here, never the wall clock
     /// beside it.
     pub clock: &'a (dyn wyrd_testkit::Clock + Sync),
-    /// How long after a staged re-place's pre-mark its destination write may still land —
+    /// How long after a move's pre-mark its destination write may still land — a staged
+    /// re-place's and a committed repair's alike, whatever the field's older name says —
     /// proposal 0016's `W_write` (`0016:1551-1576`), fed from this crate's own
-    /// [`crate::gc::W_WRITE_MILLIS`] rather than a second definition. The re-place sends every
+    /// [`crate::gc::W_WRITE_MILLIS`] rather than a second definition. The move sends every
     /// write with the deadline `pre-mark stamp + this`, which the D server refuses at or after
     /// (`wyrd_traits::WriteDeadlineExpired`). 0016 requires
     /// `G_orphan > W_repoint + W_write + δ_clock` (`0016:1348`), and #800's late-write deadline
@@ -181,8 +185,6 @@ struct RepairPlan {
     m: usize,
     /// `(fragment_index, decoded shard bytes)` for each intact survivor.
     survivors: Vec<(usize, Vec<u8>)>,
-    /// The failure domains the survivors occupy (to keep the rebuild disjoint).
-    survivor_domains: Vec<FailureDomain>,
     /// Fragment indices that are missing or checksum-failing (to be rebuilt).
     missing: Vec<usize>,
     /// The chunk's current placement vector (length `n`).
@@ -196,11 +198,21 @@ enum Target {
     /// Where this pass's ONE reading found the chunk ([`Site`]): which committed object holds it
     /// — an index into [`Reading::objects`], never a copy: every obligation inside an N-entry
     /// object shares that one snapshot, so Q obligations cost N decoded entries **once**, not
-    /// Q×N — plus the chunk's own address and reference, which the move is pinned to.
-    Committed(Site),
+    /// Q×N — plus the chunk's own address and reference, which the move is pinned to, and where
+    /// the rebuilt fragments go.
+    Committed(CommittedTarget),
     /// A multipart upload's committed part, in an `Open` session, and where the rebuilt
     /// fragments go ([`staged::StagedTarget`]).
     Staged(staged::StagedTarget),
+}
+
+/// What a committed [`RepairPlan`] repoints and where its rebuilt fragments go, chosen at the
+/// assessment before anything is written ([`premark::choose`]).
+struct CommittedTarget {
+    site: Site,
+    /// One per missing fragment, in the plan's `missing` order: `(fragment index, server, the
+    /// mark at that position as the choice read it)`.
+    chosen: Vec<(usize, DServerId, premark::DestinationMark)>,
 }
 
 /// One reconstruction reconciliation pass over `ctx` at logical time `now_millis`.
@@ -208,9 +220,12 @@ enum Target {
 /// parallel entry. Returns [`Reconciled::Changed`] if any chunk's placement record was
 /// repointed, [`Reconciled::Satisfied`] otherwise — and [`Reconciled::Blocked`] when the pass
 /// cannot certify what it did not do: a committed object it could not read (its reading has a
-/// hole in it, see [`read_committed`] and [`RepairOutcome::Contained`]), or a repair it refused
+/// hole in it, see [`read_committed`] and [`RepairOutcome::Contained`]), a repair it refused
 /// because the repointed record would not survive the backend value ceiling
-/// ([`RepairOutcome::Refused`]).
+/// ([`RepairOutcome::Refused`]), or a repair it still owes and did not make: no free failure
+/// domain to place it ([`Assessment::Blocked`]), a committed repair refused for a reason of
+/// its own ([`Assessment::Refused`], [`RepairOutcome::Stopped`]), or a planned repair that lost
+/// its race ([`RepairOutcome::Conflict`]).
 pub(crate) async fn reconcile(
     ctx: &ReconstructionContext<'_>,
     now_millis: u64,
@@ -332,6 +347,16 @@ pub(crate) async fn reconcile(
     // withholds certification below exactly as `reading.incomplete` does for an object this
     // pass could not read.
     let mut staged_kept = false;
+    // Whether this pass could not make a repair it owes, or REFUSED one — no free failure domain
+    // to place the rebuild (`Assessment::Blocked`), every usable destination ruled out by its
+    // mark (`Assessment::Refused`), a move stopped short of its adoption: the pre-mark too old
+    // to authorize the write, the write refused at its deadline, its landing unverified, or the
+    // pre-mark or the adoption lost on a mark or a `seg:` record while the object's root had not
+    // moved (`RepairOutcome::Stopped`) — or a planned repair that lost its race to a record that
+    // did move (`RepairOutcome::Conflict`). The obligation stays queued and the pass has not
+    // shown the repair is no longer owed, so it may not certify, as evacuation answers a move
+    // that did not persist (`crate::rebalance`).
+    let mut refused = false;
     for &chunk in &queue {
         match assess(ctx, &stores, &reading, &staged, &staged_chunks, chunk).await? {
             Assessment::Repairable(plan) => {
@@ -352,8 +377,20 @@ pub(crate) async fn reconcile(
             // pass. Kept OFF the repairable-backlog gauge (a never-completable repair counted
             // there would floor the binding "returns to zero" signal at ≥1 forever —
             // iteration-7 MUST-FIX) and raised on its own level; the obligation stays queued
-            // and clears when capacity returns.
-            Assessment::Blocked => repair_blocked += 1,
+            // and clears when capacity returns. The repair is still owed, so the pass does not
+            // certify over it — but it is a want of capacity, not a refusal, so no
+            // `repair-refused` line names it.
+            Assessment::Blocked => {
+                repair_blocked += 1;
+                refused = true;
+            }
+            // Refused by a destination's mark rather than for want of capacity: counted on the
+            // same blocked level, never certified over, and named under its own reason.
+            Assessment::Refused => {
+                repair_blocked += 1;
+                refused = true;
+                emit_repair_refused(chunk, "no-usable-destination");
+            }
             // Below `k` survivors (loss beyond the scheme's tolerance) or a scheme with no
             // redundancy (`EcScheme::None`): un-reconstructable — the data is LOST. This is
             // the storage system failing its primary responsibility, *more* severe than a
@@ -429,8 +466,9 @@ pub(crate) async fn reconcile(
     // writes together. What a second obligation inside the same object meets depends on which
     // record holds its chunk ([`metadata::repoint_chunk`]): in a FLAT object the first repoint
     // rewrote the root the second is pinned to, so the second loses the CAS and stays queued
-    // for the next pass, exactly as on `origin/main`; in a SEGMENTED object the root is never
-    // rewritten and each move re-reads its own `seg:` record, so both land in this pass.
+    // for the next pass, exactly as on `origin/main` — and the pass, which still owes it, does
+    // not certify; in a SEGMENTED object the root is never rewritten and each move re-reads its
+    // own `seg:` record, so both land in this pass.
     //
     // A staged plan takes its turn in the same order, through its own fenced sequence
     // (`staged::repair`). **One degraded chunk per part per pass**, accepted for the same reason
@@ -445,16 +483,28 @@ pub(crate) async fn reconcile(
     let mut ceiling_refused = false;
     for plan in &plans {
         let outcome = match &plan.target {
-            Target::Committed(site) => {
-                let object = &reading.objects[site.object];
-                repair_chunk(ctx, &stores, object, site, plan, now_millis).await?
+            Target::Committed(target) => {
+                let object = &reading.objects[target.site.object];
+                repair_chunk(ctx, &stores, object, target, plan).await?
             }
             Target::Staged(target) => staged::repair(ctx, &stores, &staged, target, plan).await?,
         };
         match outcome {
             RepairOutcome::Committed => changed = true,
-            RepairOutcome::Conflict => emit_conflict(plan.chunk_id),
+            // A planned repair that lost its race did not repair this chunk, whatever moved the
+            // record it was pinned to: a supersede, a sibling chunk's repoint in the same flat
+            // root, a competing move of this chunk. The obligation stays queued and nothing here
+            // re-read whether it is still owed, so the pass does not certify over it — the rule
+            // evacuation applies to every move that did not persist (`crate::rebalance`).
+            RepairOutcome::Conflict => {
+                refused = true;
+                emit_conflict(plan.chunk_id);
+            }
             RepairOutcome::Aborted => emit_aborted(plan.chunk_id, "unplaced"),
+            RepairOutcome::Stopped(reason) => {
+                refused = true;
+                emit_aborted(plan.chunk_id, reason);
+            }
             // The move found this object's own records unusable: contained exactly as the
             // reading contains an object it cannot resolve — named once per OBJECT, however many
             // obligations meet it, nothing drained and nothing certified — and offset as an
@@ -498,10 +548,15 @@ pub(crate) async fn reconcile(
 
     // A hole in what this pass may claim: an object it could not read (at the reading or at the
     // move's own re-read), a staged record it could not read, an obligation it kept queued on a
-    // staged record's word rather than a committed one, or one it refused because the record it
-    // would leave behind could not survive. A lost CAS is NOT a hole: nothing repair-owned was
-    // written, the obligation stays queued, and the next pass re-plans onto the winner's bytes.
-    let hole = reading.incomplete || staged_incomplete || staged_kept || ceiling_refused;
+    // staged record's word rather than a committed one, one it refused because the record it
+    // would leave behind could not survive, or a repair it planned and left undone — no free
+    // failure domain, a destination mark, a stale pre-mark, a write refused or unverified, a
+    // pre-mark or an adoption that lost, or a plan the move found stale as it prepared it. A CAS
+    // lost to a root that moved is a hole too: a changed root does not show this chunk was
+    // repaired (a sibling chunk's repoint rewrites a flat root and leaves this one's fragment
+    // missing), the obligation is still queued, and only the next pass's own reading can say
+    // whether it is still owed.
+    let hole = reading.incomplete || staged_incomplete || staged_kept || ceiling_refused || refused;
     Ok(if hole {
         // **This pass certifies only over the reading it performed.** It either could not
         // read every committed object, or held back a repair it may not perform — either way
@@ -750,8 +805,20 @@ enum Assessment {
     /// never-completable repair counted there would floor the day-one "returns to zero"
     /// signal at ≥1 forever (iteration-7 MUST-FIX) — and raised on the distinct
     /// `reconstruction_repair_blocked` level. It clears when capacity returns; the
-    /// obligation stays queued.
+    /// obligation stays queued, and the pass does not certify over a repair it still owes.
     Blocked,
+    /// A committed repair **refused by a destination mark**: no assignment of the rebuilt
+    /// shard(s) to free domains avoids a position whose `orphan:` mark is already `reclaiming`
+    /// or is none of the three shapes, each of which [`premark::choose`] passed over and named.
+    /// Kept off the repairable-backlog gauge, counted on the blocked level and never certified
+    /// over, as [`Self::Blocked`] is, but owed for a reason other than capacity, so the pass
+    /// names it under its own reason ([`emit_repair_refused`]). The obligation stays queued. A
+    /// `reclaiming` mark on a position no placement names clears when GC finishes the reclaim,
+    /// and an unreadable one when a human clears it. A `reclaiming` mark on a position the
+    /// placement still names — the destination of a rebuild in place — does not clear by itself:
+    /// GC reclaims no referenced position, so it never finishes that reclaim, and the refusal
+    /// stands every pass until the mark is cleaned up (#1083).
+    Refused,
     /// The committed placement is **malformed** (non-empty, wrong length): rebuilding
     /// over its fabricated identity tail is forbidden (ADR-0040 decision 4). Skip the
     /// chunk and flag it NEEDS-HUMAN; the obligation stays queued.
@@ -858,30 +925,46 @@ async fn assess(
         return Ok(settled);
     }
     // Repairable in principle (survivors ≥ `k`). But the rebuild must PLACE each missing shard
-    // in a failure domain distinct from every survivor's; if no free distinct domain remains
-    // (a minimal cluster at exactly `n` with a domain down), the repair cannot proceed this
-    // pass. Route it to the distinct `Blocked` signal rather than the repairable-backlog gauge
-    // — a never-completable repair counted there would floor the day-one "returns to zero"
-    // gauge at ≥1 forever (iteration-7 MUST-FIX). It becomes repairable again when a free
-    // distinct domain (capacity) returns. This mirrors the selector `repair_chunk` runs, so a
-    // chunk that WOULD abort in the repair loop is diverted before it inflates the backlog.
-    if select_distinct_domains_excluding(
+    // in a failure domain distinct from every survivor's, at a position a pre-mark may take; if
+    // no such placement exists — no free distinct domain remains (a minimal cluster at exactly
+    // `n` with a domain down), or every assignment over the free ones meets a position whose mark
+    // is already `reclaiming` or is none of the three shapes (each named on the audit seam) — the
+    // repair cannot proceed this pass. Route it to the distinct blocked signal rather than the
+    // repairable-backlog gauge — a never-completable repair counted there would floor the day-one
+    // "returns to zero" gauge at ≥1 forever (iteration-7 MUST-FIX): `Blocked` for want of a free
+    // domain alone, `Refused` once a mark ruled out a position. The pass certifies over neither:
+    // the repair is still owed. It becomes repairable again when a free distinct domain
+    // (capacity) returns, or GC finishes the reclaim. The destinations
+    // are chosen HERE, by the one choice every move of a chunk's fragments makes
+    // ([`premark::choose`], as the staged assessment chooses its own), and `repair_chunk` writes
+    // to exactly these — so a chunk that WOULD abort in the repair loop for want of a place is
+    // diverted before it inflates the backlog.
+    let admission =
+        premark::Committed::new(ctx.meta, ctx.topology, chunk, emit_destination_passed_over);
+    let Some(chosen) = premark::choose(
         ctx.topology,
-        gathered.missing.len() as u16,
         &gathered.survivor_domains,
+        &gathered.missing,
+        &admission,
     )
-    .is_err()
-    {
-        return Ok(Assessment::Blocked);
-    }
+    .await?
+    else {
+        return Ok(if admission.ruled_out() {
+            Assessment::Refused
+        } else {
+            Assessment::Blocked
+        });
+    };
 
     Ok(Assessment::Repairable(Box::new(RepairPlan {
-        target: Target::Committed(site.clone()),
+        target: Target::Committed(CommittedTarget {
+            site: site.clone(),
+            chosen,
+        }),
         chunk_id: chunk,
         k,
         m,
         survivors: gathered.survivors,
-        survivor_domains: gathered.survivor_domains,
         missing: gathered.missing,
         placement,
         len: chunk_ref.len as usize,
@@ -1051,20 +1134,39 @@ fn is_block_read_fault(err: &(dyn std::error::Error + 'static)) -> bool {
 enum RepairOutcome {
     /// The version-conditional commit landed; the rebuilt shard(s) were re-placed.
     Committed,
-    /// The commit lost the CAS race (rebuilt fragments are now collectable garbage).
-    /// Also the answer when the move, as it was prepared, already found the chunk no longer
-    /// as planned ([`metadata::Repoint::Conflict`]) — then nothing at all was written.
+    /// The commit lost the CAS race (each rebuilt fragment written to a new position stays under
+    /// its pre-mark, collectable garbage GC reclaims after grace; one rebuilt in place stays on a
+    /// position the placement still names). Also the answer when the move, as it was prepared,
+    /// already found the chunk no longer as planned ([`metadata::Repoint::Conflict`]) —
+    /// then nothing at all was written. A committed repair answers it for a lost pre-mark or
+    /// adoption only when the object's root has left the generation the move was planned from;
+    /// while the root still holds it, the answer is [`Self::Stopped`] ([`lost`]). Whichever move
+    /// answers it, committed or staged, the chunk was not repaired and its obligation stays
+    /// queued, so the pass does not certify over it: a record that moved does not show this chunk
+    /// is whole.
     Conflict,
     /// The repair could not proceed (e.g. the selector chose a server outside the
     /// fleet view); nothing was committed. Offset on `reconstruction_aborted` so an
     /// aborted plan is not mistaken for a success (see [`emit_aborted`]). Every cause here
-    /// is **transient**: it clears when the server returns to this pass's fleet view — or,
-    /// for a staged re-place ([`staged::repair`]), when the next pass starts the move again
-    /// from a fresh pre-mark: its pre-mark lost its precondition, its pre-mark aged past
-    /// `W_repoint` before a write was authorized, or the D server refused its write past the
-    /// deadline or could not certify it landed in time. Whatever such a move wrote stays
-    /// under its pre-mark.
+    /// is **transient**: it clears when the server returns to this pass's fleet view, or, for a
+    /// staged re-place ([`staged::repair`]), when the next pass starts the move again from a fresh
+    /// pre-mark: its pre-mark lost its precondition, its pre-mark aged past `W_repoint` before a
+    /// write was authorized, or the D server refused its write past the deadline or could not
+    /// certify it landed in time. Whatever such a move wrote stays under its pre-mark, or on a
+    /// position the placement still names. A committed repair stopped by one of those answers
+    /// [`Self::Stopped`] instead.
     Aborted,
+    /// A committed repair ([`premark`]) **stopped short of its adoption**, its reason with it: the
+    /// pre-mark aged past `W_repoint` before the writes were authorized (`pre-mark-stale`), the D
+    /// server refused a write at or past its deadline (`write-deadline-expired`) or could not
+    /// certify it landed in time (`write-unverified`), or the pre-mark or the adoption lost its
+    /// precondition while the object's root still held the generation the move was planned from
+    /// (`pre-mark-lost`, `adoption-lost`; [`lost`]). Nothing was adopted and the obligation
+    /// stays queued — every fragment written to a new position under its pre-mark, one rebuilt
+    /// in place on a position the placement still names. Unlike [`Self::Aborted`], a repair the
+    /// pass still owes for a reason of its own, so the pass does not certify over it, and the
+    /// abort is named by that reason rather than `unplaced` ([`emit_aborted`]).
+    Stopped(&'static str),
     /// The repoint would have crossed the backend value ceiling
     /// ([`metadata::flat_value_ceiling_crossed`]), so it was refused before anything at all
     /// was written — no rebuilt fragment, no record. Distinct from [`Self::Conflict`] and
@@ -1093,22 +1195,25 @@ enum RepairOutcome {
 }
 
 /// Rebuild `plan`'s missing fragment(s), re-place them in distinct failure domains, and
-/// repoint the chunk's placement record with **one version-conditional commit**.
+/// repoint the chunk's placement record with **one version-conditional commit**, by the
+/// destination-pre-mark rule every committed move keeps ([`premark`]).
 ///
 /// `object` is the generation THIS PASS'S ONE READING resolved the chunk's committed object from
-/// — shared rather than re-scanned and re-copied per obligation — and `site` is where in it the
-/// chunk was found. The move ([`metadata::repoint_chunk`]) is conditioned on that generation, on
-/// the record holding the chunk as it re-reads it, and on the chunk's own reference, so nothing a
-/// later reader saw decides this write.
+/// — shared rather than re-scanned and re-copied per obligation — and `target` is where in it the
+/// chunk was found and where the assessment chose to put each rebuilt fragment. The move
+/// ([`metadata::repoint_chunk`]) is conditioned on that generation, on the record holding the
+/// chunk as it re-reads it, and on the chunk's own reference, so nothing a later reader saw
+/// decides this write. Its time is read from the context's clock
+/// ([`ReconstructionContext::clock`]), never from the pass's `now_millis`.
 async fn repair_chunk(
     ctx: &ReconstructionContext<'_>,
     stores: &HashMap<DServerId, &dyn ChunkStore>,
     object: &Object,
-    site: &Site,
+    target: &CommittedTarget,
     plan: &RepairPlan,
-    now_millis: u64,
 ) -> Result<RepairOutcome> {
     let (k, m, chunk_id) = (plan.k, plan.m, plan.chunk_id);
+    let site = &target.site;
 
     // Reconstruct the chunk's logical bytes from any `k` survivors, then re-derive
     // EVERY shard scheme-driven (`erasure::encode` is deterministic, so the rebuilt
@@ -1117,16 +1222,10 @@ async fn repair_chunk(
     let data = erasure::reconstruct(k, m, plan.len, &available)?;
     let all_shards = erasure::encode(k, m, &data)?;
 
-    // Pick re-placement domains for the missing fragments, distinct from each other AND
-    // from the survivors' domains (keeps the chunk on `n` distinct domains, `0005:491`).
-    let new_servers = select_distinct_domains_excluding(
-        ctx.topology,
-        plan.missing.len() as u16,
-        &plan.survivor_domains,
-    )?;
-
-    // Resolve where every rebuilt fragment goes and encode it, WITHOUT writing any of them
-    // yet.
+    // Resolve where every rebuilt fragment goes — the destinations the assessment chose, in
+    // domains distinct from each other AND from the survivors' (keeps the chunk on `n` distinct
+    // domains, `0005:491`), each at a position a pre-mark may take — and encode it, WITHOUT
+    // writing any of them yet.
     //
     // The failure in this loop is TRANSIENT (a target outside this pass's fleet view): the
     // repair aborts and is re-assessed next pass. It is resolved BEFORE the ceiling refusal
@@ -1135,11 +1234,11 @@ async fn repair_chunk(
     // recoverable cause, not by the one that pages a human. The refusal still runs before any
     // write.
     let mut new_placement = plan.placement.clone();
-    let mut displaced = Vec::new();
-    let mut writes = Vec::new();
-    for (slot, &index) in plan.missing.iter().enumerate() {
-        let target = new_servers[slot];
-        let Some(target_store) = stores.get(&target) else {
+    let mut destinations = Vec::with_capacity(target.chosen.len());
+    let mut writes = Vec::with_capacity(target.chosen.len());
+    for (index, dserver, mark) in &target.chosen {
+        let (index, target) = (*index, *dserver);
+        let Some(&target_store) = stores.get(&target) else {
             // The selector chose a server outside the fleet view — cannot place. Abort
             // this chunk's repair (leave the obligation; nothing was committed).
             return Ok(RepairOutcome::Aborted);
@@ -1151,12 +1250,13 @@ async fn repair_chunk(
             chunk: chunk_id,
             index: index as u16,
         };
-        writes.push((*target_store, frag, frag_bytes));
-
-        let old = plan.placement[index];
-        if old != target {
-            displaced.push((old, frag));
-        }
+        writes.push((target_store, frag, frag_bytes));
+        destinations.push(premark::Destination {
+            dserver: target,
+            frag,
+            mark: mark.clone(),
+            vacated: plan.placement[index],
+        });
         new_placement[index] = target;
     }
 
@@ -1164,21 +1264,22 @@ async fn repair_chunk(
     // own targets with no store written yet, so the repair is judged before anything is
     // written. It addresses whichever record holds the chunk's `ChunkRef` — flat root or one
     // `seg:` record — and the caller's own evidence joins the batch it hands back, so ONE
-    // version-conditional mutation repoints the placement, drains the obligation, and orphans
-    // the displaced fragments (`0005:277`, `0005:200-203`, ADR-0015). A racing writer or a
-    // superseded custodian loses there rather than corrupting the record; a sibling chunk's
-    // edit to the same `seg:` record is merged, since the move pins the record as IT re-reads it.
-    // That re-read is bounded as the reading's resolve is: by the `MetadataStore`
-    // implementation (#508/#636), fail-closed either way.
+    // version-conditional mutation repoints the placement, drains the obligation, adopts each
+    // pre-marked destination and orphans the displaced fragments (`0005:277`, `0005:200-203`,
+    // ADR-0015). A racing writer or a superseded custodian loses there rather than corrupting
+    // the record; a sibling chunk's edit to the same `seg:` record is merged, since the move
+    // pins the record as IT re-reads it. That re-read is bounded as the reading's resolve is:
+    // by the `MetadataStore` implementation (#508/#636), fail-closed either way.
     //
     // Every answer but `Prepared` WRITES NOTHING AT ALL — judged after the transient check above
-    // and still ahead of the fragment writes below, so none strands an unreferenced shard. A
+    // and still ahead of the pre-mark below, so none strands an unreferenced shard. A
     // repoint whose record would cross the value ceiling the tightest backend enforces is
     // weighed inside the move (`metadata::flat_value_ceiling_crossed`) on the very bytes it
     // would commit; see `crates/core/src/metadata.rs:333-341` for what committing one costs.
     //
     // deferred: #682 — the seeded Tier-0 DST property for this move (repoint versus supersede);
-    // until it lands, its interleavings are scripted in `tests/segmented_map_repoint.rs`.
+    // until it lands, its interleavings are scripted in `tests/segmented_map_repoint.rs` and
+    // `tests/move_destination_marks.rs`.
     let move_ = metadata::repoint_chunk(
         ctx.meta,
         object.inode_id,
@@ -1192,7 +1293,7 @@ async fn repair_chunk(
         object: metadata::inode_key(object.inode_id),
         fault,
     };
-    let mut batch = match move_ {
+    let batch = match move_ {
         Ok(metadata::Repoint::Prepared(batch)) => batch,
         // The two terminal verdicts are weighed on the PLANNED generation alone: they carry no
         // batch, so no root pin ever tested it. A generation superseded after the reading
@@ -1223,26 +1324,78 @@ async fn repair_chunk(
         },
     };
 
-    // Write the rebuilt fragments to their new D servers FIRST — before the commit, so a
-    // crash here leaves only collectable garbage, never a torn chunk (`0005:277`).
-    for (target_store, frag, frag_bytes) in writes {
-        target_store.put_fragment(frag, frag_bytes, None).await?;
+    // The rest is the destination-pre-mark rule ([`premark`]): pre-mark, authorize, write, and
+    // adopt in the commit that repoints the placement and drains the obligation. A crash at any
+    // point leaves only collectable garbage — each written fragment under its pre-mark, or on a
+    // position the placement still names — never a torn chunk (`0005:277`), and no mark on a
+    // named position.
+    let repoint = batch.delete(repair::repair_key(chunk_id));
+    // PRE-MARK every destination before anything is written — a fragment rebuilt in place gets
+    // none, and its position's stale mark, if any, is deleted instead. A lost precondition is a
+    // lost race with nothing written: the obligation stays queued for the next pass, and the
+    // pass does not certify over it ([`lost`]).
+    let Some(premarked) =
+        premark::premark(ctx.meta, ctx.clock, chunk_id, &repoint, &destinations).await?
+    else {
+        return lost(ctx.meta, object, "pre-mark-lost").await;
+    };
+    // AUTHORIZE every write at once under the `W_repoint` gate, then SEND them together, each
+    // with the deadline the D server enforces. The fan-out is the write path's own
+    // (`wyrd_core::write::write_fragments`): the futures are polled on this task, no task is
+    // spawned, and every write has answered before the move goes on. Each await is bounded as
+    // every fragment write's is, by the D-server client's own request timeout set at composition
+    // — the caller-side half of `W_write` (`crates/chunkstore-grpc/src/client.rs:264-271`).
+    let Some(deadline) = premarked.authorize(ctx.clock, ctx.staged_write_window_millis) else {
+        return Ok(RepairOutcome::Stopped("pre-mark-stale"));
+    };
+    // deferred: #1100 — a write to a position the placement already names (rebuilt in place)
+    // carries no pre-mark, and an unreference whose mark is stamped before the pre-mark batch and
+    // commits after it can leave it unmarked ([`premark`]'s module doc).
+    let sent = writes
+        .into_iter()
+        .map(|(store, frag, bytes)| store.put_fragment(frag, bytes, Some(deadline)));
+    if let Some(reason) = premark::refusal(futures_util::future::join_all(sent).await)? {
+        return Ok(RepairOutcome::Stopped(reason));
     }
+    // ADOPT. Lost: a record or a mark the adoption pins moved under us, and each rebuilt fragment
+    // stays under its pre-mark, or on a position the placement still names; the obligation stays
+    // queued for the next pass, and the pass does not certify over it ([`lost`]).
+    if premarked
+        .adopt(ctx.meta, ctx.clock, repoint, &destinations)
+        .await?
+    {
+        return Ok(RepairOutcome::Committed);
+    }
+    lost(ctx.meta, object, "adoption-lost").await
+}
 
-    batch = batch.delete(repair::repair_key(chunk_id));
-    for (dserver, frag) in &displaced {
-        batch = batch.put(
-            crate::gc::orphan_key(*dserver, *frag),
-            now_millis.to_string().into_bytes(),
-        );
-    }
-
-    match ctx.meta.commit(batch).await? {
-        CommitOutcome::Committed => Ok(RepairOutcome::Committed),
-        // Lost the CAS race: the placement moved under us. The rebuilt fragments are
-        // collectable garbage; the obligation stays queued for the next pass.
-        CommitOutcome::Conflict => Ok(RepairOutcome::Conflict),
-    }
+/// What a committed repair answers when its pre-mark or its adoption lost its precondition —
+/// **how the loss is named; neither answer certifies** ([`reconcile`]), as evacuation answers
+/// every move that did not persist (`crate::rebalance`).
+///
+/// Both pin the object's root generation, the `seg:` record of a segmented map, and the
+/// `orphan:` marks the move read: each destination's, and for the adoption each vacated
+/// position's. If the root no longer holds the generation the move was planned from, another
+/// writer moved the object — a supersede, or a sibling chunk's repoint in a flat map — and the
+/// plan is stale: [`RepairOutcome::Conflict`], named the lost CAS it has always been. That says
+/// nothing about this chunk: a sibling's repoint leaves its fragment missing, so the repair may
+/// well still be owed, and only the next pass's reading can tell. If the root still holds the
+/// generation, the object did not move, so nothing has repaired this chunk in the plan's place —
+/// GC swapped a destination's mark to `reclaiming`, another move re-created it, or a vacated
+/// position's mark changed after the adoption read it: [`RepairOutcome::Stopped`] under
+/// `reason`. A competing move of this very chunk in a segmented map rewrites only the `seg:`
+/// record, and is answered the same way: the next pass finds the chunk whole and drains the
+/// obligation. The root's read is [`still_current`]'s, bounded as that is.
+async fn lost(
+    meta: &dyn MetadataStore,
+    object: &Object,
+    reason: &'static str,
+) -> Result<RepairOutcome> {
+    Ok(if still_current(meta, object).await? {
+        RepairOutcome::Stopped(reason)
+    } else {
+        RepairOutcome::Conflict
+    })
 }
 
 /// Whether the object's root still holds exactly the generation the move was planned from —
@@ -1438,9 +1591,11 @@ fn emit_staged(chunk: ChunkId, reason: &'static str) {
     );
 }
 
-/// Emit a lost-CAS conflict on the same seam: the repoint raced another writer and the
-/// rebuilt fragments are now collectable garbage — a staged re-place's each under the pre-mark
-/// that evidences it (a fence, a rewritten part record, a drain or GC's reclaim moved first).
+/// Emit a lost-CAS conflict on the same seam: the repoint raced another writer (a fence, a
+/// rewritten part or placement record, a drain or GC's reclaim moved first) and the rebuilt
+/// fragments written to new positions are now collectable garbage, each under the pre-mark that
+/// evidences it, while one rebuilt in place stays on a position the placement still names — or
+/// the move lost before it wrote anything.
 fn emit_conflict(chunk: ChunkId) {
     tracing::info!(monotonic_counter.reconstruction_conflict = 1_u64);
     tracing::info!(
@@ -1454,8 +1609,10 @@ fn emit_conflict(chunk: ChunkId) {
 /// Emit an **aborted** repair on the same seam: the dispatched repair could not proceed, so
 /// nothing was committed. `reason` says why: `unplaced` (the selector chose a server outside
 /// the fleet view, or a staged re-place stopped before it could adopt anything, its own audit
-/// line saying why) or `unresolvable-chunk-map` (the move found its object's records unusable;
-/// that action's row names the object). Like
+/// line saying why), `unresolvable-chunk-map` (the move found its object's records unusable;
+/// that action's row names the object), or why a committed repair stopped short of its adoption
+/// ([`RepairOutcome::Stopped`]: `pre-mark-stale`, `write-deadline-expired`,
+/// `write-unverified`, `pre-mark-lost`, `adoption-lost`). Like
 /// [`emit_conflict`], this offsets the up-front [`emit_repaired`] increment — the
 /// obligation stays queued and the durability-plane success identity holds
 /// (`reconstruction_repaired − conflict − aborted − ceiling_refused`), so an aborted plan
@@ -1468,6 +1625,57 @@ fn emit_aborted(chunk: ChunkId, reason: &'static str) {
         reason,
         chunk = %wyrd_traits::chunk_hex(chunk),
         "reconstruction aborted a dispatched repair; nothing was committed and the obligation stays queued",
+    );
+}
+
+/// Emit a destination position a committed repair will not write ([`premark::choose`]) on the
+/// same seam: its `orphan:` mark is already `reclaiming` — GC is deleting whatever the position
+/// holds — or is none of the three mark shapes, which NO writer overwrites (ADR-0045) and which is
+/// left for a human byte for byte: NEEDS-HUMAN. Another position is chosen — the server may still
+/// take another fragment — or, with none left, the chunk is `Blocked` and retried next pass. The
+/// same action strings the staged re-place publishes for the same positions
+/// (`reconstruction::staged`), so one grep finds both.
+fn emit_destination_passed_over(
+    dserver: DServerId,
+    frag: FragmentId,
+    unusable: &premark::Unusable,
+) {
+    let mark = object_name(&metadata::orphan_key(dserver, frag));
+    match unusable {
+        premark::Unusable::Reclaiming => tracing::info!(
+            target: "wyrd.custodian.reconstruction.audit",
+            action = "destination-passed-over",
+            reason = "reclaiming",
+            subject = %mark,
+            chunk = %wyrd_traits::chunk_hex(frag.chunk),
+            "a committed repair passed over a destination GC is reclaiming; another is chosen, or the repair waits for the next pass",
+        ),
+        premark::Unusable::Unreadable(fault) => {
+            tracing::warn!(monotonic_counter.reconstruction_unreadable_destination_marks = 1_u64);
+            tracing::warn!(
+                target: "wyrd.custodian.reconstruction.audit",
+                action = "unreadable-destination-mark",
+                chunk = %wyrd_traits::chunk_hex(frag.chunk),
+                mark = %mark,
+                fault = %fault,
+                "a committed repair passed over a destination whose orphan mark it cannot read; the mark is left in place and another position is chosen, or the repair waits — NEEDS-HUMAN",
+            );
+        }
+    }
+}
+
+/// Emit a committed repair **refused at its assessment** on the same seam: every usable
+/// destination position was ruled out by its mark (`no-usable-destination`; each position is
+/// named by [`emit_destination_passed_over`]). Nothing was written, the obligation stays queued,
+/// and the pass does not certify — the repair is still owed. No `reconstruction_aborted` offset:
+/// a refused assessment never counted a dispatched repair ([`emit_repaired`]).
+fn emit_repair_refused(chunk: ChunkId, reason: &'static str) {
+    tracing::info!(
+        target: "wyrd.custodian.reconstruction.audit",
+        action = "repair-refused",
+        reason,
+        chunk = %wyrd_traits::chunk_hex(chunk),
+        "reconstruction refused a repair it owes: no usable destination position; nothing was written, the obligation stays queued, and this pass does not certify",
     );
 }
 

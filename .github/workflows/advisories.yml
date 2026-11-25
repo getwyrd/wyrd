@@ -32,7 +32,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-deny
 
@@ -65,7 +65,7 @@ jobs:
             gh issue create -R "$REPO" --title "$title" --body "$text"
             exit 0
           fi
-          seen=$(gh issue view "$issue" -R "$REPO" --comments --json body,comments \
+          seen=$(gh issue view "$issue" -R "$REPO" --json body,comments \
             --jq '[.body] + [.comments[].body] | join("\n")')
           new=""
           for id in $ids; do

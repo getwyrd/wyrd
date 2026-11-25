@@ -24,6 +24,7 @@ pub mod backfill;
 pub mod desired_state;
 pub mod gc;
 pub mod leadership;
+mod premark;
 pub mod reaper;
 pub mod rebalance;
 pub mod reconciliation;

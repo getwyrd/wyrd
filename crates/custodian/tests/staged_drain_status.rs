@@ -642,6 +642,8 @@ async fn rebalance_leaves_staged_bytes_alone_while_the_drain_stays_pending() {
         meta: &meta,
         fleet: &fleet,
         topology: &topology,
+        clock: &wyrd_testkit::ManualClock::new(NOW),
+        write_window_millis: wyrd_custodian::gc::W_WRITE_MILLIS,
     };
     let coord = MemCoordination::new();
     let (zone, custodian) = elect(&coord).await;
